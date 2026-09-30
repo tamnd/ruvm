@@ -92,7 +92,7 @@ impl Node {
     }
 
     /// `bdrv_snapshot_list()` with `bdrv_snapshot_fallback()`. `None` is `-ENOTSUP`.
-    fn snapshot_list(&self) -> Option<Result<Vec<SnapshotEntry>>> {
+    pub(crate) fn snapshot_list(&self) -> Option<Result<Vec<SnapshotEntry>>> {
         match self.driver.snapshot_list(self) {
             Some(r) => Some(r),
             None => self.snapshot_fallback()?.snapshot_list(),
@@ -115,7 +115,7 @@ impl Node {
     }
 
     /// `bdrv_snapshot_create()`. `None` is `-ENOTSUP`.
-    fn snapshot_create(&self, sn: &SnapshotEntry) -> Option<Result<()>> {
+    pub(crate) fn snapshot_create(&self, sn: &SnapshotEntry) -> Option<Result<()>> {
         match self.driver.snapshot_create(self, sn) {
             Some(r) => Some(r),
             None => self.snapshot_fallback()?.snapshot_create(sn),
@@ -134,7 +134,12 @@ impl Node {
     }
 
     /// `bdrv_snapshot_delete()`. `device` names the node in errors.
-    fn snapshot_delete(&self, id: Option<&str>, name: Option<&str>, device: &str) -> Result<()> {
+    pub(crate) fn snapshot_delete(
+        &self,
+        id: Option<&str>,
+        name: Option<&str>,
+        device: &str,
+    ) -> Result<()> {
         assert!(self.quiesce_counter.load(std::sync::atomic::Ordering::SeqCst) > 0);
         if id.is_none() && name.is_none() {
             return Err(Error::generic("snapshot_id and name are both NULL"));
@@ -430,7 +435,7 @@ impl BlockGraph {
     }
 
     /// `qmp_get_root_bs()`: the node `name` names, which must have no node above it.
-    fn root_bs(&self, name: &str) -> Result<Arc<Node>> {
+    pub(crate) fn root_bs(&self, name: &str) -> Result<Arc<Node>> {
         let bs = self.lookup_bs(name)?;
         // bdrv_is_root_node()
         if !bs.parent_nodes().is_empty() {

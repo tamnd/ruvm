@@ -49,6 +49,8 @@ pub fn perm_names(perm: u64) -> String {
 /// What a driver's `child_perm` gets to look at, the arguments of `.bdrv_child_perm` other
 /// than the parents' permissions.
 pub(crate) struct PermCtx<'a> {
+    /// The parent node, whose driver answers.
+    pub parent: &'a Node,
     /// The child node.
     pub child: &'a Arc<Node>,
     /// The `BDRV_CHILD_*` role of the edge.

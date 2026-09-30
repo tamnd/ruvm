@@ -156,6 +156,9 @@ pub(crate) struct NodeFlags {
     pub inactive: bool,
     /// `BDRV_O_NO_IO`: opened only to look at metadata.
     pub no_io: bool,
+    /// `BDRV_O_CHECK`: opened for `qemu-img check`, so a format must not repair or give up on
+    /// what the check is about to look at.
+    pub check: bool,
     /// `BDRV_O_ALLOW_RDWR`: reopen may make the node writable.
     pub allow_rdwr: bool,
 }
@@ -214,6 +217,8 @@ pub(crate) struct BlockDriverInfo {
     /// Offset at which the VM state can be saved, 0 if not possible.
     pub vm_state_offset: i64,
     pub is_dirty: bool,
+    /// Every write must be a compressed write (streamOptimized VMDK).
+    pub needs_compressed_writes: bool,
 }
 
 /// `BlockFragInfo`.
@@ -450,6 +455,13 @@ pub(crate) trait Driver: Send + Sync {
         None
     }
 
+    /// The persistent dirty bitmap hooks (`.bdrv_supports_persistent_dirty_bitmap`,
+    /// `.bdrv_co_can_store_new_dirty_bitmap` and `.bdrv_co_remove_persistent_dirty_bitmap`),
+    /// for a format that stores bitmaps in its image.
+    fn persistent_bitmaps(&self) -> Option<&dyn crate::bitmap::PersistentBitmaps> {
+        None
+    }
+
     /// `.bdrv_get_specific_info`.
     fn get_specific_info(&self, bs: &Node) -> Result<Option<ImageInfoSpecific>> {
         let _ = bs;
@@ -519,6 +531,18 @@ pub(crate) trait Driver: Send + Sync {
     /// `.bdrv_snapshot_list`. `None` is `-ENOTSUP`.
     fn snapshot_list(&self, bs: &Node) -> Option<Result<Vec<SnapshotEntry>>> {
         let _ = bs;
+        None
+    }
+
+    /// `.bdrv_snapshot_load_tmp`: makes the read-only node read the snapshot with `id`
+    /// and/or `name` until it is closed. `None` is `-ENOTSUP`.
+    fn snapshot_load_tmp(
+        &self,
+        bs: &Node,
+        id: Option<&str>,
+        name: Option<&str>,
+    ) -> Option<Result<()>> {
+        let _ = (bs, id, name);
         None
     }
 
@@ -682,6 +706,10 @@ pub(crate) trait ParentOps: Send + Sync {
     /// The edge now points at `node`, `bdrv_replace_child_noperm()` for parents that are not
     /// nodes. Node parents keep their children themselves and never see this.
     fn set_node(&self, _node: Arc<Node>) {}
+    /// `BdrvChildClass.stay_at_node`: `bdrv_replace_node()` leaves this edge alone.
+    fn stay_at_node(&self) -> bool {
+        false
+    }
 }
 
 /// One parent of a node and what it holds, a `BdrvChild` seen from the child.
@@ -1147,6 +1175,7 @@ impl Node {
         let index = self.children.read().unwrap().iter().position(|k| k.edge == c.edge);
         let flags = crate::perm::flags_after_reopen(self, q);
         let ctx = PermCtx {
+            parent: self,
             child: &c.node,
             role: c.role,
             index: index.unwrap_or(0),
@@ -1548,12 +1577,19 @@ impl Node {
         tran: &mut PermTran,
     ) -> Result<()> {
         for p in from.parents() {
-            if !Self::should_update_child(p.id, to) {
+            let stays = p.ops.as_ref().is_some_and(|o| o.stay_at_node());
+            if stays || !Self::should_update_child(p.id, to) {
                 if auto_skip {
                     continue;
                 }
                 return Err(Error::generic(format!(
                     "Should not change '{}' link to '{}'",
+                    p.child_name, from.name
+                )));
+            }
+            if crate::job::blocker::link_is_frozen(p.id) {
+                return Err(Error::generic(format!(
+                    "Cannot change '{}' link to '{}'",
                     p.child_name, from.name
                 )));
             }
@@ -1571,6 +1607,31 @@ impl Node {
         let _wr = crate::graph_lock::wrlock();
         let mut tran = PermTran::default();
         let r = Self::replace_node_noperm(from, to, true, &mut tran)
+            .and_then(|()| refresh_perms(&[from.clone(), to.clone()], None, &mut tran));
+        match r {
+            Ok(()) => {
+                tran.commit();
+                Ok(())
+            }
+            Err(e) => {
+                tran.abort();
+                Err(e)
+            }
+        }
+    }
+
+    /// `bdrv_replace_node_common()`: [`Node::replace_node`] that fails on a parent that
+    /// would close a loop unless `auto_skip`, as `bdrv_drop_intermediate()` wants.
+    pub(crate) fn replace_node_common(
+        from: &Arc<Node>,
+        to: &Arc<Node>,
+        auto_skip: bool,
+    ) -> Result<()> {
+        let _d1 = from.drained();
+        let _d2 = to.drained();
+        let _wr = crate::graph_lock::wrlock();
+        let mut tran = PermTran::default();
+        let r = Self::replace_node_noperm(from, to, auto_skip, &mut tran)
             .and_then(|()| refresh_perms(&[from.clone(), to.clone()], None, &mut tran));
         match r {
             Ok(()) => {
@@ -1809,7 +1870,7 @@ impl Node {
 
     /// `bdrv_backing_overridden()`: whether the backing node is not the one the image header
     /// names. May say yes when opening the header's backing file would give the same node.
-    fn backing_overridden(&self, backing: Option<&Child>) -> bool {
+    pub(crate) fn backing_overridden(&self, backing: Option<&Child>) -> bool {
         let auto = self.meta.lock().unwrap().auto_backing_file.clone();
         match backing {
             Some(b) => auto != b.node.meta.lock().unwrap().filename,
