@@ -25,8 +25,8 @@
 //!   `virtqueue_pop()`. The messages are not word for word the same.
 //! - The in use counter counts chains, not descriptors, for packed rings as well.
 //!
-//! Not ported: VMState, trace points, QOM registration, ioeventfd and irqfd, host notifiers,
-//! vhost, the IOMMU and memory listener integration, per-queue vectors beyond storing them,
+//! Not ported: VMState, trace points, QOM registration, ioeventfd and irqfd, host notifiers
+//! (vhost has its own notifiers, see the `vhost` module), the IOMMU and memory listener integration, per-queue vectors beyond storing them,
 //! `VIRTIO_F_NOTIFICATION_DATA` and `VIRTIO_F_IN_ORDER` handling, and queue reset through the
 //! transport (the per-queue reset bit is still offered by default as QEMU does, but the MMIO
 //! transport has no register for it).
@@ -766,6 +766,76 @@ impl VirtIODevice {
         }
     }
 
+    /// `virtio_queue_get_last_avail_idx()`: where the device will pop next on queue `n`, in
+    /// the form vhost's `SET_VRING_BASE` and `GET_VRING_BASE` use.
+    ///
+    /// For a split ring that is the next available index. For a packed ring the low half has
+    /// the next available offset with its wrap counter in bit 15 and the high half the same
+    /// for the used side. A queue without a ring reads as zero.
+    pub fn last_avail_idx(&self, n: u16) -> u32 {
+        match self.queue(n).and_then(|q| q.ring.as_ref()) {
+            Some(Ring::Split(q)) => u32::from(q.next_avail()),
+            Some(Ring::Packed(q)) => {
+                let avail = u32::from(q.next_avail()) | (u32::from(q.avail_wrap_counter()) << 15);
+                let used = u32::from(q.next_used()) | (u32::from(q.used_wrap_counter()) << 15);
+                avail | (used << 16)
+            }
+            None => 0,
+        }
+    }
+
+    /// `virtio_queue_set_last_avail_idx()`: the reverse of [`last_avail_idx`](Self::last_avail_idx),
+    /// used when a vhost backend hands a ring back.
+    pub fn set_last_avail_idx(&mut self, n: u16, idx: u32) {
+        let Some(q) = self.vqs.get_mut(usize::from(n)) else {
+            return;
+        };
+        let bad = match q.ring.as_mut() {
+            Some(Ring::Split(q)) => {
+                q.set_next_avail(idx as u16);
+                false
+            }
+            Some(Ring::Packed(q)) => {
+                let avail = q.set_avail_state((idx & 0x7fff) as u16, idx & 0x8000 != 0);
+                let used = q.set_used_state(((idx >> 16) & 0x7fff) as u16, idx & 0x8000_0000 != 0);
+                avail.is_err() || used.is_err()
+            }
+            None => false,
+        };
+        if bad {
+            self.error(&format!("virtio: bad ring state {idx:#x} for queue {n}"));
+        }
+    }
+
+    /// `virtio_queue_update_used_idx()`: reloads the device's used index for queue `n` from the
+    /// used ring in guest memory, after a vhost backend has been writing it. Packed rings keep
+    /// the used position in [`set_last_avail_idx`](Self::set_last_avail_idx) instead.
+    pub fn update_used_idx(&mut self, n: u16) {
+        let mem = Arc::clone(&self.mem);
+        let Some(q) = self.vqs.get_mut(usize::from(n)) else {
+            return;
+        };
+        let used = q.used;
+        if let Some(Ring::Split(ring)) = q.ring.as_mut() {
+            if let Ok(idx) = mem.read_u16(used + 2) {
+                ring.set_next_used(idx);
+            }
+        }
+    }
+
+    /// `virtio_queue_restore_last_avail_idx()`: when a vhost backend could not report where it
+    /// stopped, carries on from the used index in guest memory, as if every request the
+    /// backend took had completed. Split rings only.
+    pub fn restore_last_avail_idx(&mut self, n: u16) {
+        self.update_used_idx(n);
+        if let Some(Ring::Split(ring)) =
+            self.vqs.get_mut(usize::from(n)).and_then(|q| q.ring.as_mut())
+        {
+            let used = ring.next_used();
+            ring.set_next_avail(used);
+        }
+    }
+
     /// `virtio_queue_get_notification()`.
     pub fn queue_notification(&self, n: u16) -> bool {
         self.queue(n).is_some_and(|q| q.notification)
@@ -832,6 +902,15 @@ impl VirtIODevice {
             let vector = self.queue(n).map_or(VIRTIO_NO_VECTOR, |q| q.vector);
             self.notify_vector(vector);
         }
+    }
+
+    /// `virtio_notify_irqfd()`: interrupts the driver for queue `n` without looking at the
+    /// ring. This is for queues a vhost backend runs, which has already decided a notification
+    /// is due when it signals its call eventfd.
+    pub fn notify_irqfd(&mut self, n: u16) {
+        self.set_isr(1);
+        let vector = self.queue(n).map_or(VIRTIO_NO_VECTOR, |q| q.vector);
+        self.notify_vector(vector);
     }
 
     fn should_notify(&mut self, n: u16) -> bool {

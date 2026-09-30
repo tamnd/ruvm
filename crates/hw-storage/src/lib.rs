@@ -7,6 +7,9 @@
 //! `hw/ide/core.c` and `hw/ide/atapi.c`. Drives read and write a [`BlockBackend`];
 //! [`VecBackend`] keeps an image in memory.
 //!
+//! The [`scsi`] module has the SCSI core, `scsi-hd` and `scsi-cd`, for SCSI host adapters such
+//! as virtio-scsi. It uses the same [`BlockBackend`].
+//!
 //! # The ATA and ATAPI subset
 //!
 //! Hard disks implement IDENTIFY DEVICE, READ and WRITE SECTORS (and MULTIPLE, and the EXT
@@ -51,6 +54,7 @@ mod atapi;
 mod block;
 mod ich;
 mod ide;
+pub mod scsi;
 
 pub use ahci::DmaMemory;
 pub use block::{BlockBackend, VecBackend};

@@ -8,6 +8,9 @@
 //! - [`pci`]: the virtio-pci transport, modern, transitional and legacy, with MSI-X.
 //! - [`rng`], [`console`] and [`blk`]: virtio-rng, a single port virtio-console and virtio-blk.
 //! - [`net`] and [`balloon`]: virtio-net with a small peer trait, and virtio-balloon.
+//! - [`scsi`]: virtio-scsi on the SCSI bus and disks of `ruvm-hw-storage`.
+//! - `vhost`, `vsock` and `fs` (Unix only): the shared vhost device glue, vhost-vsock,
+//!   vhost-user-vsock and vhost-user-fs.
 //! - [`memory`]: lets the rings live in a `ruvm-mem` address space.
 //!
 //! A device is put together in three steps: build the device model, realize it on guest memory
@@ -23,21 +26,35 @@
 pub mod balloon;
 pub mod blk;
 pub mod console;
+#[cfg(unix)]
+pub mod fs;
 pub mod memory;
 pub mod mmio;
 pub mod net;
 pub mod pci;
 pub mod rng;
+pub mod scsi;
+#[cfg(unix)]
+pub mod vhost;
 pub mod virtio;
+#[cfg(unix)]
+pub mod vsock;
 
 pub use balloon::{BalloonBackend, BalloonOp, RecordingBalloonBackend, VirtioBalloon};
 pub use blk::{BlockBackend, MemBlockBackend, VirtioBlk, VirtioBlkConf};
 pub use console::{ConsoleBackend, VirtioConsole};
+#[cfg(unix)]
+pub use fs::{VhostUserFs, VhostUserFsConf};
 pub use memory::AddressSpaceMemory;
 pub use mmio::VirtioMmio;
 pub use net::{NetPeer, RxOutcome, VirtioNet, VirtioNetConf, VirtioNetHdr};
 pub use pci::{VirtioPci, VirtioPciProps, VirtioPciVariant};
 pub use rng::{EntropySource, RandomFile, VirtioRng, VirtioRngConf};
+pub use scsi::{VirtioScsi, VirtioScsiConf};
+#[cfg(unix)]
+pub use vhost::{VhostDev, VhostMemRegion, VhostUserChardev};
 pub use virtio::{
     SharedGuestMemory, VirtIODevice, VirtQueue, VirtioBackend, VirtioDeviceClass, VirtioTransport,
 };
+#[cfg(unix)]
+pub use vsock::{OnOffAuto, VhostUserVsock, VhostUserVsockConf, VhostVsock, VhostVsockConf};
