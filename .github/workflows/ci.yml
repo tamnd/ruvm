@@ -126,6 +126,47 @@ jobs:
           "./target/$PROFILE_DIR/ruvm$exe" --version
           "./target/$PROFILE_DIR/ruvm$exe" qemu-system-x86_64 --version | grep -q '^QEMU emulator version 11\.1\.0 (ruvm '
 
+  # Boots a pinned Linux kernel on microvm and q35 under KVM and checks the microvm start latency
+  # budget from spec/21-performance.md. See xtask/src/boot_smoke.rs for what is measured and why.
+  # Hosted runners are nested virtualization and noisy, so this is a smoke test, not the perf gate
+  # of spec/21, and it is not in the required `ci` job until it has been green on main for a while.
+  boot:
+    name: boot smoke on KVM
+    needs: quick
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: boot
+      - name: allow access to /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # SeaBIOS for q35, and qboot and the linuxboot option ROMs for microvm, in the directories
+      # ruvm searches by default.
+      - name: install firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-data seabios
+      - name: cargo xtask boot-smoke
+        env:
+          RUVM_REQUIRE_KVM: 1
+        run: cargo xtask boot-smoke
+      - name: keep the serial logs and results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boot-smoke
+          path: |
+            target/boot-smoke/*.log
+            target/boot-smoke/*.stderr
+            target/boot-smoke/results.json
+          if-no-files-found: ignore
+
   docs:
     name: documentation
     needs: quick
