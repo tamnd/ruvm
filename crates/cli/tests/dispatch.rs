@@ -101,3 +101,27 @@ fn the_reported_version_is_the_vendored_tag() {
     let (_, out) = run(&["qemu-system-x86_64", "--version"]);
     assert!(out.starts_with(&format!("QEMU emulator version {tag} ")), "{out}");
 }
+
+#[test]
+fn system_option_errors_read_like_qemu() {
+    let out = Command::new(ruvm()).args(["qemu-system-x86_64", "-S", "-foo"]).output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "qemu-system-x86_64: -foo: invalid option\n"
+    );
+    let out = Command::new(ruvm()).args(["qemu-system-aarch64", "--qmp"]).output().unwrap();
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "qemu-system-aarch64: --qmp: requires an argument\n"
+    );
+}
+
+#[test]
+fn system_help() {
+    let (ok, out) = run(&["qemu-system-x86_64", "-help"]);
+    assert!(ok);
+    assert!(out.contains("\nusage: qemu-system-x86_64 [options] [disk_image]\n"), "{out}");
+    assert!(out.contains("\n-machine [type=]name[,prop=value[,...]]\n"));
+    assert!(out.ends_with("More information on the QEMU project at <https://qemu.org>.\n"));
+}

@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod config;
+pub mod hx;
 pub mod introspect;
 pub mod parser;
 pub mod rust;

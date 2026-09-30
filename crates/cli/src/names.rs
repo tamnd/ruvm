@@ -166,7 +166,7 @@ impl Personality {
         all
     }
 
-    /// The personality for a program name, as it appears in argv[0].
+    /// The personality for a program name, as it appears in `argv[0]`.
     ///
     /// Only the file name counts, and on Windows a trailing `.exe` is ignored, so
     /// `C:\qemu\qemu-img.exe` and `/usr/bin/qemu-img` are the same program. Case matters
