@@ -524,6 +524,11 @@ version = "0.2.1"
 [[package]]
 name = "ruvm-hw-storage"
 version = "0.2.1"
+dependencies = [
+ "ruvm-base",
+ "ruvm-hw-pci",
+ "ruvm-mem",
+]
 
 [[package]]
 name = "ruvm-hw-timer"
