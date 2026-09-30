@@ -25,8 +25,12 @@
 //! segments of hw/pci-host/pam.c and the MMCONFIG window of hw/pci/pcie_host.c. The MCH
 //! register constants are in [`q35`].
 //!
-//! Not ported: VMState, trace points, QOM registration and properties, hotplug, AER, SR-IOV,
-//! ATS, PCIe capabilities and extended capabilities, IOMMU and bus master address spaces, VGA
+//! PCI Express: the capability and extended capability helpers are in [`pcie`] (hw/pci/pcie.c)
+//! and the generic root port with native hotplug is [`PcieRootPort`]. AER is only a register
+//! stub there.
+//!
+//! Not ported: VMState, trace points, QOM registration and properties, SHPC and ACPI hotplug,
+//! error injection, SR-IOV, ATS, IOMMU and bus master address spaces, VGA
 //! registration and bridge VGA windows, option ROM files, `pci_route_intx_to_irq()`, the MSI-X
 //! vector notifiers and the Xen paths.
 
@@ -39,7 +43,9 @@ mod host;
 mod msi;
 mod msix;
 mod pam;
+pub mod pcie;
 mod pcie_host;
+mod pcie_root_port;
 pub mod q35;
 pub mod regs;
 
@@ -60,5 +66,15 @@ pub use pcie_host::{
     PCIE_MMCFG_DEVFN_BIT, PCIE_MMCFG_DEVFN_MASK, PCIE_MMCFG_SIZE_MAX, PCIE_MMCFG_SIZE_MIN,
     PcieHost, pcie_mmcfg_bus, pcie_mmcfg_confoffset, pcie_mmcfg_data_read, pcie_mmcfg_data_write,
     pcie_mmcfg_devfn,
+};
+pub use pcie_root_port::{
+    GEN_PCIE_ROOT_DEFAULT_IO_RANGE, GEN_PCIE_ROOT_PORT_ACS_OFFSET, GEN_PCIE_ROOT_PORT_AER_OFFSET,
+    GEN_PCIE_ROOT_PORT_MSIX_NR_VECTOR, PCI_DEVICE_ID_REDHAT_PCIE_RP, PCI_SSVID_SIZEOF,
+    PCI_SSVID_SSID, PCI_SSVID_SVID, PciResReserve, PcieChassisRegistry, PcieRootPort,
+    PcieRootPortConfig, PcieUnplugFn, REDHAT_PCI_CAP_RES_RESERVE_BUS_RES,
+    REDHAT_PCI_CAP_RES_RESERVE_IO, REDHAT_PCI_CAP_RES_RESERVE_MEM,
+    REDHAT_PCI_CAP_RES_RESERVE_PREF_MEM_32, REDHAT_PCI_CAP_RES_RESERVE_PREF_MEM_64,
+    REDHAT_PCI_CAP_RES_RESERVE_SIZEOF, REDHAT_PCI_CAP_RESOURCE_RESERVE, REDHAT_PCI_CAP_TYPE_OFFSET,
+    pci_bridge_qemu_reserve_cap_init, pci_bridge_ssvid_init, pcie_port_init_reg,
 };
 pub use q35::{Mch, Q35Config, Q35PciHost, pci_bus_get_w64_range};

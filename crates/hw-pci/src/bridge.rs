@@ -90,7 +90,7 @@ struct Windows {
     io: PciBridgeWindow,
 }
 
-struct BridgeInner {
+pub(crate) struct BridgeInner {
     memory: Arc<MemorySystem>,
     sec_bus: Arc<PciBus>,
     /// The secondary bus's containers, `address_space_mem` and `address_space_io`.
@@ -103,6 +103,11 @@ struct BridgeInner {
 }
 
 impl BridgeInner {
+    /// The secondary bus.
+    pub(crate) fn sec_bus(&self) -> &Arc<PciBus> {
+        &self.sec_bus
+    }
+
     fn windows(&self) -> std::sync::MutexGuard<'_, Windows> {
         self.windows.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -162,12 +167,9 @@ impl BridgeInner {
     }
 }
 
-/// The config and reset hooks of a bridge.
-struct BridgeOps(Arc<BridgeInner>);
-
-impl PciDeviceOps for BridgeOps {
+impl BridgeInner {
     /// `pci_bridge_write_config()`.
-    fn config_write(&self, dev: &PciDevice, addr: u32, val: u32, len: u32) {
+    pub(crate) fn write_config(&self, dev: &PciDevice, addr: u32, val: u32, len: u32) {
         let oldctl = pci_get_word(&dev.config_bytes(), PCI_BRIDGE_CONTROL);
         dev.default_write_config(addr, val, len);
 
@@ -180,18 +182,18 @@ impl PciDeviceOps for BridgeOps {
             // VGA enable.
             || ranges_overlap(a, l, PCI_BRIDGE_CONTROL as u64, 2)
         {
-            self.0.update_mappings(dev);
+            self.update_mappings(dev);
         }
 
         let newctl = pci_get_word(&dev.config_bytes(), PCI_BRIDGE_CONTROL);
         if !oldctl & newctl & PCI_BRIDGE_CTL_BUS_RESET != 0 {
             // A hot reset on the 0 to 1 transition.
-            self.0.sec_bus.reset();
+            self.sec_bus.reset();
         }
     }
 
     /// `pci_bridge_reset()`, plus the reset of everything on the secondary bus.
-    fn reset(&self, dev: &PciDevice) {
+    pub(crate) fn reset(&self, dev: &PciDevice) {
         dev.with_config(|c| {
             let conf = c.config;
             conf[PCI_PRIMARY_BUS] = 0;
@@ -217,8 +219,21 @@ impl PciDeviceOps for BridgeOps {
             let cmd = pci_get_word(conf, PCI_COMMAND) & !(PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
             pci_set_word(conf, PCI_COMMAND, cmd);
         });
-        self.0.update_mappings(dev);
-        self.0.sec_bus.reset();
+        self.update_mappings(dev);
+        self.sec_bus.reset();
+    }
+}
+
+/// The config and reset hooks of a bridge.
+struct BridgeOps(Arc<BridgeInner>);
+
+impl PciDeviceOps for BridgeOps {
+    fn config_write(&self, dev: &PciDevice, addr: u32, val: u32, len: u32) {
+        self.0.write_config(dev, addr, val, len);
+    }
+
+    fn reset(&self, dev: &PciDevice) {
+        self.0.reset(dev);
     }
 }
 
@@ -285,6 +300,11 @@ impl PciBridge {
         Ok(PciBridge { dev, inner })
     }
 
+    /// The shared bridge state, for models that wrap the bridge hooks with their own.
+    pub(crate) fn inner(&self) -> &Arc<BridgeInner> {
+        &self.inner
+    }
+
     /// The bridge function on the parent bus.
     pub fn device(&self) -> &Arc<PciDevice> {
         &self.dev
@@ -317,20 +337,25 @@ impl PciBridge {
 
     /// `pci_bridge_disable_base_limit()`: closes all windows by setting base above limit.
     pub fn disable_base_limit(&self) {
-        self.dev.with_config(|c| {
-            let conf = c.config;
-            conf[PCI_IO_BASE] |= PCI_IO_RANGE_MASK;
-            conf[PCI_IO_LIMIT] &= !PCI_IO_RANGE_MASK;
-            let v = pci_get_word(conf, PCI_MEMORY_BASE) | PCI_MEMORY_RANGE_MASK;
-            pci_set_word(conf, PCI_MEMORY_BASE, v);
-            let v = pci_get_word(conf, PCI_MEMORY_LIMIT) & !PCI_MEMORY_RANGE_MASK;
-            pci_set_word(conf, PCI_MEMORY_LIMIT, v);
-            let v = pci_get_word(conf, PCI_PREF_MEMORY_BASE) | PCI_PREF_RANGE_MASK;
-            pci_set_word(conf, PCI_PREF_MEMORY_BASE, v);
-            let v = pci_get_word(conf, PCI_PREF_MEMORY_LIMIT) & !PCI_PREF_RANGE_MASK;
-            pci_set_word(conf, PCI_PREF_MEMORY_LIMIT, v);
-            pci_set_long(conf, PCI_PREF_BASE_UPPER32, 0);
-            pci_set_long(conf, PCI_PREF_LIMIT_UPPER32, 0);
-        });
+        disable_base_limit(&self.dev);
     }
+}
+
+/// `pci_bridge_disable_base_limit()` on any bridge function.
+pub(crate) fn disable_base_limit(dev: &PciDevice) {
+    dev.with_config(|c| {
+        let conf = c.config;
+        conf[PCI_IO_BASE] |= PCI_IO_RANGE_MASK;
+        conf[PCI_IO_LIMIT] &= !PCI_IO_RANGE_MASK;
+        let v = pci_get_word(conf, PCI_MEMORY_BASE) | PCI_MEMORY_RANGE_MASK;
+        pci_set_word(conf, PCI_MEMORY_BASE, v);
+        let v = pci_get_word(conf, PCI_MEMORY_LIMIT) & !PCI_MEMORY_RANGE_MASK;
+        pci_set_word(conf, PCI_MEMORY_LIMIT, v);
+        let v = pci_get_word(conf, PCI_PREF_MEMORY_BASE) | PCI_PREF_RANGE_MASK;
+        pci_set_word(conf, PCI_PREF_MEMORY_BASE, v);
+        let v = pci_get_word(conf, PCI_PREF_MEMORY_LIMIT) & !PCI_PREF_RANGE_MASK;
+        pci_set_word(conf, PCI_PREF_MEMORY_LIMIT, v);
+        pci_set_long(conf, PCI_PREF_BASE_UPPER32, 0);
+        pci_set_long(conf, PCI_PREF_LIMIT_UPPER32, 0);
+    });
 }
