@@ -8,3 +8,4 @@
 #![forbid(unsafe_code)]
 
 pub mod i8259;
+pub mod ioapic;
