@@ -873,6 +873,11 @@ version = "0.2.2"
 [[package]]
 name = "ruvm-vhost"
 version = "0.2.2"
+dependencies = [
+ "libc",
+ "rustix",
+ "vmm-sys-util",
+]
 
 [[package]]
 name = "ruvm-vhost-backends"
