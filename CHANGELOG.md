@@ -6,6 +6,18 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.2.0
+
+M1 is done. The core runtime pieces that every machine sits on are ported and checked against QEMU: QOM, QAPI and QMP, the monitor, chardevs, the option parser, vmstate, the memory API and the block layer core. ruvm still cannot run a guest, that is what M2 is for.
+
+`ruvm-mem` has memory regions, flat views, address spaces and dirty tracking, ported from system/memory.c and physmem.c (#47). Flat views are rendered the same way QEMU renders them, and a property test compares them against a straight port of the reference algorithm. It passed a million cases for both the narrow and the wide address space variants before this release.
+
+The `none` machine has sysbus and shows its memory regions in the QOM tree (#48), so `qom-list` and `info mtree` style queries line up with QEMU.
+
+`ruvm-block` has the node graph with the `null-co`, `null-aio` and `blkdebug` drivers, plus `blockdev-add` and `blockdev-del` with QEMU's errors (#49). The `query-qmp-schema` comparison now uses a checked-in normalization list, so a schema drift shows up as a diff in review (#50).
+
+M2 work has started. `ruvm-firmware` has an AML builder, the BIOS linker and loader, and the full ACPI table sets for microvm (#51) and q35 (#52, #53). Every table in the default bios-tables-test runs for both machines matches QEMU byte for byte, including the q35 DSDT with PCI and CPU hotplug.
+
 ## 0.1.5
 
 ruvm starts a machine now. It is only the empty `none` machine with the `qtest` accelerator, but that is how QEMU's own tests launch QEMU, so a libqtest style command line comes up. It serves QMP and the qtest protocol on its sockets and shuts down cleanly on `quit` or a signal.
