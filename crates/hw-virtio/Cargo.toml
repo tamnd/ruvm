@@ -16,6 +16,7 @@ unsafe-budget = 0
 [dependencies]
 ruvm-base.workspace = true
 ruvm-hw-core.workspace = true
+ruvm-hw-pci.workspace = true
 ruvm-mem.workspace = true
 ruvm-virtio-queue.workspace = true
 

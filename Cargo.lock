@@ -557,6 +557,7 @@ version = "0.2.1"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
+ "ruvm-hw-pci",
  "ruvm-mem",
  "ruvm-virtio-queue",
 ]
