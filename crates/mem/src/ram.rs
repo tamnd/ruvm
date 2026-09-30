@@ -2,12 +2,12 @@
 
 //! RAM blocks, the backing of RAM, ROM and ROM device regions.
 //!
-//! For now a block's bytes are an array of `AtomicU8` on the Rust heap and every access copies
-//! through relaxed atomic loads and stores. That keeps the crate free of unsafe code while still
-//! being sound when vCPU threads and device threads touch the same guest memory at once, which a
-//! plain `Vec<u8>` behind a shared reference would not be. Host mappings (mmap, memfd, shared
-//! files) and the opaque copy routines from spec/05 replace the storage later without changing
-//! this interface.
+//! A block's bytes are an anonymous host mapping from ruvm-sys, seen as an array of `AtomicU8`,
+//! and every access copies through relaxed atomic loads and stores. That keeps this crate free of
+//! unsafe code while still being sound when vCPU threads, the kernel and device threads touch the
+//! same guest memory at once. The mapping is page aligned and has a stable address, so
+//! accelerators can hand it to the hypervisor. Memfd and file backed blocks and the opaque copy
+//! routines from spec/05 replace the storage later without changing this interface.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -17,11 +17,12 @@ use std::sync::Arc;
 
 use crate::dirty::{DirtyBitmap, DirtyClient, DirtyMask, DirtySnapshot};
 use crate::error::MemError;
+use ruvm_sys::HostMemory;
 
 /// One contiguous piece of guest RAM, `RAMBlock`.
 pub struct RamBlock {
     name: String,
-    bytes: Box<[AtomicU8]>,
+    mem: HostMemory,
     page_bits: u32,
     dirty: [ArcSwapOption<DirtyBitmap>; 3],
 }
@@ -33,10 +34,22 @@ impl RamBlock {
         let len = usize::try_from(size).map_err(|_| MemError::TooLarge(u128::from(size)))?;
         Ok(RamBlock {
             name: name.to_string(),
-            bytes: (0..len).map(|_| AtomicU8::new(0)).collect(),
+            mem: HostMemory::new(len).map_err(|e| {
+                MemError::Alloc(format!("cannot set up guest memory '{name}': {e}"))
+            })?,
             page_bits,
             dirty: Default::default(),
         })
+    }
+
+    fn bytes(&self) -> &[AtomicU8] {
+        self.mem.as_slice()
+    }
+
+    /// The host address of the first byte, `ramblock_ptr(block, 0)`, for accelerators that map
+    /// guest RAM into the hypervisor.
+    pub fn host_addr(&self) -> usize {
+        self.mem.host_addr()
     }
 
     /// The block's name, `idstr`.
@@ -46,12 +59,12 @@ impl RamBlock {
 
     /// The size in bytes, `used_length`.
     pub fn len(&self) -> u64 {
-        self.bytes.len() as u64
+        self.bytes().len() as u64
     }
 
     /// Whether the block has no bytes.
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.bytes().is_empty()
     }
 
     /// Dirty tracking granularity as a shift, `TARGET_PAGE_BITS`.
@@ -62,7 +75,7 @@ impl RamBlock {
     fn range(&self, offset: u64, len: usize) -> Result<&[AtomicU8], MemError> {
         let start = usize::try_from(offset).map_err(|_| MemError::OutOfRange)?;
         let end = start.checked_add(len).ok_or(MemError::OutOfRange)?;
-        self.bytes.get(start..end).ok_or(MemError::OutOfRange)
+        self.bytes().get(start..end).ok_or(MemError::OutOfRange)
     }
 
     /// Copies bytes at `offset` into `buf`.

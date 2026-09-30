@@ -570,6 +570,7 @@ version = "0.2.0"
 dependencies = [
  "arc-swap",
  "proptest",
+ "ruvm-sys",
 ]
 
 [[package]]

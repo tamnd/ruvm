@@ -34,6 +34,8 @@ pub enum MemError {
     NoSuchAddressSpace,
     /// A listener refused `log_global_start`.
     Listener(String),
+    /// The host could not map memory for a RAM block. The message is QEMU's.
+    Alloc(String),
 }
 
 impl fmt::Display for MemError {
@@ -54,7 +56,7 @@ impl fmt::Display for MemError {
             MemError::OutOfRange => f.write_str("access outside the RAM block"),
             MemError::NoSuchListener => f.write_str("no such memory listener"),
             MemError::NoSuchAddressSpace => f.write_str("no such address space"),
-            MemError::Listener(m) => f.write_str(m),
+            MemError::Listener(m) | MemError::Alloc(m) => f.write_str(m),
         }
     }
 }
