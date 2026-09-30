@@ -568,10 +568,13 @@ version = "0.2.3"
 name = "ruvm-hw-virtio"
 version = "0.2.3"
 dependencies = [
+ "rustix",
  "ruvm-base",
  "ruvm-hw-core",
  "ruvm-hw-pci",
+ "ruvm-hw-storage",
  "ruvm-mem",
+ "ruvm-vhost",
  "ruvm-virtio-queue",
 ]
 

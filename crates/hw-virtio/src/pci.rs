@@ -246,6 +246,7 @@ fn device_table(id: u16) -> (Option<u16>, u16, Option<&'static str>) {
         5 => (Some(PCI_DEVICE_ID_VIRTIO_BALLOON), PCI_CLASS_OTHERS, Some("virtio-balloon")),
         8 => (Some(PCI_DEVICE_ID_VIRTIO_SCSI), PCI_CLASS_STORAGE_SCSI, Some("virtio-scsi")),
         9 => (Some(PCI_DEVICE_ID_VIRTIO_9P), PCI_BASE_CLASS_NETWORK, Some("virtio-9p")),
+        19 => (None, PCI_CLASS_COMMUNICATION_OTHER, Some("vhost-vsock")),
         20 => (None, PCI_CLASS_OTHERS, Some("virtio-crypto")),
         26 => (None, PCI_CLASS_STORAGE_OTHER, Some("vhost-user-fs")),
         _ => (None, PCI_CLASS_OTHERS, None),
@@ -337,7 +338,8 @@ fn default_vectors(backend: &VirtioBackend) -> u32 {
             None => vdev.num_queues() as u32 + 1,
         },
         // virtio-blk and virtio-scsi use one per request queue plus one for config.
-        2 | 8 => vdev.num_queues() as u32 + 1,
+        2 | 8 | 26 => vdev.num_queues() as u32 + 1,
+        19 => 3,
         _ => 2,
     }
 }

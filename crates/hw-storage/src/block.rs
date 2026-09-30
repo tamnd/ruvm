@@ -32,6 +32,32 @@ pub trait BlockBackend: Send + Sync + fmt::Debug {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Whether the image refuses writes, QEMU's `blk_is_writable()` turned around.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    /// Tells the backend that `len` bytes at `offset` are no longer needed. Backends that cannot
+    /// release space ignore it, which is what QEMU does with `discard=ignore`.
+    fn discard(&self, offset: u64, len: u64) -> io::Result<()> {
+        let _ = (offset, len);
+        Ok(())
+    }
+
+    /// Writes `len` zero bytes at `offset`. The default goes through [`BlockBackend::write_at`]
+    /// in chunks.
+    fn write_zeroes(&self, offset: u64, len: u64) -> io::Result<()> {
+        const CHUNK: u64 = 64 * 1024;
+        let zeroes = vec![0u8; CHUNK.min(len) as usize];
+        let mut done = 0;
+        while done < len {
+            let n = CHUNK.min(len - done);
+            self.write_at(offset + done, &zeroes[..n as usize])?;
+            done += n;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -39,6 +65,7 @@ struct VecInner {
     data: Vec<u8>,
     flushes: u64,
     failing: bool,
+    read_only: bool,
 }
 
 /// An in-memory disk image.
@@ -77,6 +104,11 @@ impl VecBackend {
     /// How many times [`BlockBackend::flush`] has been called.
     pub fn flush_count(&self) -> u64 {
         self.lock().flushes
+    }
+
+    /// Marks the image read-only, like `-drive readonly=on`.
+    pub fn set_read_only(&self, read_only: bool) {
+        self.lock().read_only = read_only;
     }
 
     /// Makes every later request fail with an I/O error, to test error reporting.
@@ -126,5 +158,20 @@ impl BlockBackend for VecBackend {
 
     fn len(&self) -> u64 {
         self.lock().data.len() as u64
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.lock().read_only
+    }
+
+    fn discard(&self, offset: u64, len: u64) -> io::Result<()> {
+        let mut g = self.lock();
+        check(&g)?;
+        let count =
+            usize::try_from(len).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // Discarded blocks read back as zeros.
+        let r = range(g.data.len(), offset, count)?;
+        g.data[r].fill(0);
+        Ok(())
     }
 }
