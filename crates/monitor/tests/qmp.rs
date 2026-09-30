@@ -2,7 +2,7 @@
 
 //! The QMP server against the behavior of monitor/qmp.c, driven the way a chardev drives it.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -146,6 +146,11 @@ fn control_commands() {
             _ => panic!(),
         })
         .collect();
+    // The fd passing commands only exist where SCM_RIGHTS does.
+    let fd_cmds: &[&str] =
+        if cfg!(unix) { &["query-fdsets", "remove-fd", "add-fd", "closefd", "getfd"] } else { &[] };
+    let names: Vec<&str> =
+        names.iter().map(String::as_str).filter(|n| !fd_cmds.contains(n)).collect();
     assert_eq!(
         names,
         [
@@ -343,6 +348,7 @@ fn throttled_events() {
 #[cfg(unix)]
 #[test]
 fn serve_over_a_socket() {
+    use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixStream;
 
     let qmp = Qmp::new();
