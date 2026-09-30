@@ -13,7 +13,7 @@
 #![forbid(unsafe_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 
 use ruvm_base::{Error, Result};
@@ -22,6 +22,7 @@ use ruvm_qapi::types::{ChardevBackend, ChardevBackendU, ChardevInfo};
 
 pub mod conn;
 pub mod opts;
+pub mod qom;
 pub mod socket;
 
 pub use conn::Connection;
@@ -36,6 +37,30 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// when [`Connection::recv`] gives 0.
 pub trait Frontend: Send + Sync {
     fn serve(&self, conn: &mut Connection) -> std::io::Result<()>;
+}
+
+/// Holds frontends back until the main loop runs. QEMU only hands chardev input to a
+/// frontend from its main loop, so nothing a client sends is seen before startup is over.
+#[derive(Debug, Default)]
+struct Gate {
+    held: Mutex<bool>,
+    released: Condvar,
+}
+
+impl Gate {
+    fn wait(&self) {
+        let mut held = lock(&self.held);
+        while *held {
+            held = self.released.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn set(&self, hold: bool) {
+        *lock(&self.held) = hold;
+        if !hold {
+            self.released.notify_all();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -57,12 +82,17 @@ pub struct Chardev {
     /// Held by the thread serving a frontend. A frontend attached right after another one
     /// detached waits here until the old thread has let go of the connection.
     serving: Arc<Mutex<()>>,
+    gate: Arc<Gate>,
 }
 
 impl Chardev {
     /// `chardev_new()` and the backend's open. Sockets connect, or listen and maybe wait for a
     /// client, before this returns.
     pub fn open(label: &str, backend: &ChardevBackend) -> Result<Arc<Chardev>> {
+        Self::open_gated(label, backend, Arc::default())
+    }
+
+    fn open_gated(label: &str, backend: &ChardevBackend, gate: Arc<Gate>) -> Result<Arc<Chardev>> {
         let backend = match &backend.u {
             ChardevBackendU::Null(_) => Backend::Null,
             ChardevBackendU::Socket(s) => Backend::Socket(SocketChardev::open(&s.data)?),
@@ -78,6 +108,7 @@ impl Chardev {
             backend,
             busy: AtomicBool::new(false),
             serving: Arc::new(Mutex::new(())),
+            gate,
         }))
     }
 
@@ -120,6 +151,7 @@ impl Chardev {
                 let stop = stop.clone();
                 let name = format!("chardev-{}", self.label);
                 let spawned = std::thread::Builder::new().name(name).spawn(move || {
+                    chr.gate.wait();
                     let serving = chr.serving.clone();
                     let _g = lock(&serving);
                     let Backend::Socket(s) = &chr.backend else { unreachable!("checked above") };
@@ -173,11 +205,31 @@ impl Drop for Attachment {
 #[derive(Debug, Default)]
 pub struct Chardevs {
     list: Mutex<Vec<Arc<Chardev>>>,
+    /// Where the objects for each chardev go, once there is a QOM tree.
+    registry: OnceLock<ruvm_qom::Registry>,
+    gate: Arc<Gate>,
 }
 
 impl Chardevs {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Keeps frontends of every chardev from seeing clients until [`Chardevs::release`], as
+    /// `suspend_mux_open()` and the main loop not running yet do in QEMU.
+    pub fn hold(&self) {
+        self.gate.set(true);
+    }
+
+    /// Lets frontends serve their clients, once the main loop runs.
+    pub fn release(&self) {
+        self.gate.set(false);
+    }
+
+    /// Puts an object for each chardev under `/chardevs` of `registry`, from now on. The
+    /// chardev types have to be registered there.
+    pub fn set_registry(&self, registry: &ruvm_qom::Registry) {
+        let _ = self.registry.set(registry.clone());
     }
 
     /// `qemu_chr_find()`.
@@ -195,13 +247,16 @@ impl Chardevs {
         if self.find(id).is_some() {
             return Err(Error::generic(format!("Chardev with id '{id}' already exists")));
         }
-        let chr = Chardev::open(id, backend)?;
+        let chr = Chardev::open_gated(id, backend, self.gate.clone())?;
         let mut list = lock(&self.list);
         // Opening a waiting server can take a while, and the id may be taken by now.
         if list.iter().any(|c| c.label == id) {
             return Err(Error::generic(format!(
                 "attempt to add duplicate property '{id}' to object (type 'container')"
             )));
+        }
+        if let Some(registry) = self.registry.get() {
+            qom::add_object(registry, &chr)?;
         }
         list.push(chr.clone());
         Ok(chr)
@@ -235,6 +290,9 @@ impl Chardevs {
             return Err(Error::generic(format!("Chardev '{id}' is busy")));
         }
         list.remove(pos);
+        if let Some(registry) = self.registry.get() {
+            qom::remove_object(registry, id);
+        }
         Ok(())
     }
 

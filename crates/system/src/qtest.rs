@@ -12,6 +12,70 @@ use ruvm_base::report::{error_report, report_error};
 use ruvm_base::{Error, Result};
 use ruvm_chardev::opts::{chardev_opts, parse_compat};
 use ruvm_chardev::{Attachment, Chardevs, Connection, Frontend};
+use ruvm_hw_core::Machine;
+use ruvm_mem::{AddressSpace, MemTxAttrs};
+use ruvm_qom::{
+    Object, Registry, StrGetter, StrSetter, TYPE_OBJECT, TYPE_USER_CREATABLE, TypeInfo,
+    UserCreatableClass,
+};
+
+/// `TYPE_QTEST`.
+pub const TYPE_QTEST: &str = "qtest";
+
+/// `QTest`: the object `-qtest` puts at `/machine/qtest`.
+#[derive(Debug, Default)]
+struct QtestObject {
+    chardev: std::sync::Mutex<Option<String>>,
+    log: std::sync::Mutex<Option<String>>,
+}
+
+fn qtest_state(o: &Object) -> Arc<QtestObject> {
+    o.state::<QtestObject>().expect("a qtest object")
+}
+
+/// Registers `qtest`. Only `-qtest` makes one for now, `-object qtest` is refused when it
+/// completes.
+pub fn register_types(registry: &Registry) {
+    let ty = TypeInfo::new(TYPE_QTEST)
+        .parent(TYPE_OBJECT)
+        .interface(TYPE_USER_CREATABLE)
+        .instance_state(QtestObject::default)
+        .class_init(|k| {
+            for (name, log) in [("chardev", false), ("log", true)] {
+                let get: StrGetter = Arc::new(move |o: &Object| {
+                    let q = qtest_state(o);
+                    let v = if log { &q.log } else { &q.chardev };
+                    Ok(v.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default())
+                });
+                let set: StrSetter = Arc::new(move |o: &Object, value: &str| {
+                    let q = qtest_state(o);
+                    let v = if log { &q.log } else { &q.chardev };
+                    *v.lock().unwrap_or_else(|e| e.into_inner()) = Some(value.to_string());
+                    Ok(())
+                });
+                k.property_add_str(name, Some(get), Some(set));
+            }
+            let uc = k.interface(TYPE_USER_CREATABLE).expect("qtest is user creatable");
+            uc.set_ext(UserCreatableClass {
+                complete: Some(Arc::new(|_: &Object| {
+                    Err(Error::generic("-object qtest is not supported by ruvm yet, use -qtest"))
+                })),
+                prepare_delete: None,
+            });
+        });
+    registry.register(ty);
+}
+
+/// The `/machine/qtest` object `qtest_server_init()` adds.
+pub fn add_object(machine: &Object, log: Option<&str>) -> Result<()> {
+    let obj = machine.registry().object_new(TYPE_QTEST)?;
+    obj.property_set_str("chardev", "qtest")?;
+    if let Some(log) = log {
+        obj.property_set_str("log", log)?;
+    }
+    machine.property_try_add_child("qtest", &obj)?;
+    Ok(())
+}
 
 /// `QEMU_CLOCK_VIRTUAL` while qtest drives it. Nothing runs on it yet, so it only moves when
 /// the test steps it.
@@ -49,12 +113,14 @@ pub fn target_big_endian(target: &str) -> bool {
     )
 }
 
-/// Machine `none`: no RAM, no devices and nothing on the I/O ports. Reads from unassigned
-/// memory give zeroes and reads from unassigned ports give all ones, as they do in QEMU.
+/// The machine side of the protocol: memory and port accesses go to the system memory and
+/// I/O address spaces, as they do in QEMU when there is no CPU.
 #[derive(Debug)]
 struct NoneMachine {
     big_endian: bool,
     clock: Arc<VirtualClock>,
+    memory: Arc<AddressSpace>,
+    io: Arc<AddressSpace>,
 }
 
 impl QtestBackend for NoneMachine {
@@ -64,17 +130,34 @@ impl QtestBackend for NoneMachine {
         self.big_endian
     }
 
-    fn memory_read(&mut self, _addr: u64, buf: &mut [u8]) {
+    fn memory_read(&mut self, addr: u64, buf: &mut [u8]) {
         buf.fill(0);
+        let _ = self.memory.read(addr, MemTxAttrs::UNSPECIFIED, buf);
     }
 
-    fn memory_write(&mut self, _addr: u64, _buf: &[u8]) {}
-
-    fn port_read(&mut self, _addr: u16, _size: usize) -> u32 {
-        u32::MAX
+    fn memory_write(&mut self, addr: u64, buf: &[u8]) {
+        let _ = self.memory.write(addr, MemTxAttrs::UNSPECIFIED, buf);
     }
 
-    fn port_write(&mut self, _addr: u16, _size: usize, _value: u32) {}
+    /// `cpu_inb()` and friends: the bytes come back in target order.
+    fn port_read(&mut self, addr: u16, size: usize) -> u32 {
+        let mut buf = [0u8; 4];
+        let buf = &mut buf[..size.min(4)];
+        let _ = self.io.read(u64::from(addr), MemTxAttrs::UNSPECIFIED, buf);
+        let v = buf.iter().fold(0u32, |v, b| (v << 8) | u32::from(*b));
+        if self.big_endian { v } else { v.swap_bytes() >> (32 - 8 * buf.len() as u32) }
+    }
+
+    /// `cpu_outb()` and friends.
+    fn port_write(&mut self, addr: u16, size: usize, value: u32) {
+        let size = size.min(4);
+        let bytes = if self.big_endian {
+            value.to_be_bytes()[4 - size..].to_vec()
+        } else {
+            value.to_le_bytes()[..size].to_vec()
+        };
+        let _ = self.io.write(u64::from(addr), MemTxAttrs::UNSPECIFIED, &bytes);
+    }
 
     fn clock_get_ns(&mut self) -> i64 {
         self.clock.get_ns()
@@ -136,6 +219,7 @@ pub fn server_init(
     log: Option<&str>,
     target: &str,
     clock: Arc<VirtualClock>,
+    machine: &Machine,
 ) -> Result<Attachment> {
     let failed = || Error::generic(format!("Failed to initialize device for qtest: \"{chrdev}\""));
     let mut list = chardev_opts();
@@ -149,7 +233,12 @@ pub fn server_init(
     let handle = parse_compat(&mut list, "qtest", chrdev, false).map_err(reported)?;
     let opts = list.get(handle).expect("just parsed");
     let chr = chardevs.new_from_opts(opts).map_err(|e| reported(Some(e)))?.ok_or_else(failed)?;
-    let machine = NoneMachine { big_endian: target_big_endian(target), clock };
+    let machine = NoneMachine {
+        big_endian: target_big_endian(target),
+        clock,
+        memory: machine.address_space_memory.clone(),
+        io: machine.address_space_io.clone(),
+    };
     let qtest = Qtest::new(machine);
     qtest.set_log(open_log(log));
     chr.attach(Arc::new(QtestFrontend(qtest)))

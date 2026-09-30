@@ -11,8 +11,8 @@ use ruvm_chardev::BACKENDS;
 use ruvm_monitor::{Commands, MonitorQmp};
 use ruvm_qapi::commands::*;
 use ruvm_qapi::types::{
-    ChardevBackendInfo, ChardevReturn, NameInfo, ObjectOptions, ObjectPropertiesValues,
-    ObjectPropertyInfo, ObjectTypeInfo, ShutdownCause,
+    ChardevBackendInfo, ChardevReturn, MachineInfo, NameInfo, ObjectOptions,
+    ObjectPropertiesValues, ObjectPropertyInfo, ObjectTypeInfo, ShutdownCause,
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, QObjectOutputVisitor, Visit, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
@@ -58,6 +58,22 @@ pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
     register_x_exit_preconfig(cmds, move |_: &MonitorQmp| v.exit_preconfig());
     // Machine "none" has no CPUs.
     register_query_cpus_fast(cmds, |_: &MonitorQmp| Ok(Vec::new()));
+    // `qmp_query_machines()` over the one machine ruvm has, with the values QEMU gives `none`.
+    register_query_machines(cmds, |_: &MonitorQmp, arg| {
+        Ok(vec![MachineInfo {
+            name: "none".into(),
+            alias: None,
+            is_default: None,
+            cpu_max: 1,
+            hotpluggable_cpus: false,
+            numa_mem_supported: false,
+            deprecated: false,
+            default_cpu_type: None,
+            default_ram_id: Some("ram".into()),
+            acpi: false,
+            compat_props: arg.compat_props.unwrap_or(false).then(Vec::new),
+        }])
+    });
     register_human_monitor_command(cmds, |_: &MonitorQmp, _| {
         Err(Error::generic("ruvm has no human monitor yet"))
     });
