@@ -396,6 +396,10 @@ version = "0.1.3"
 [[package]]
 name = "ruvm-monitor"
 version = "0.1.3"
+dependencies = [
+ "ruvm-base",
+ "ruvm-qapi",
+]
 
 [[package]]
 name = "ruvm-nbd"
