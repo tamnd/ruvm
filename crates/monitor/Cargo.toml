@@ -17,6 +17,7 @@ unsafe-budget = 0
 ruvm-base.workspace = true
 ruvm-chardev.workspace = true
 ruvm-qapi.workspace = true
+ruvm-qom.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true

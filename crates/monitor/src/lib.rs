@@ -15,6 +15,7 @@ pub mod control;
 pub mod event;
 #[cfg(unix)]
 pub mod fds;
+pub mod object;
 pub mod qmp;
 
 pub use qmp::{Commands, MonitorQmp, QMP_REQ_QUEUE_LEN_MAX, Qmp};
