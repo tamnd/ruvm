@@ -21,6 +21,10 @@
 //! - Config accesses from the host are also capped at the function's own config space size.
 //! - A bridge updates its windows after reset.
 //!
+//! The Q35 chipset lives here too: [`Q35PciHost`] and its [`Mch`] (hw/pci-host/q35.c), the PAM
+//! segments of hw/pci-host/pam.c and the MMCONFIG window of hw/pci/pcie_host.c. The MCH
+//! register constants are in [`q35`].
+//!
 //! Not ported: VMState, trace points, QOM registration and properties, hotplug, AER, SR-IOV,
 //! ATS, PCIe capabilities and extended capabilities, IOMMU and bus master address spaces, VGA
 //! registration and bridge VGA windows, option ROM files, `pci_route_intx_to_irq()`, the MSI-X
@@ -34,6 +38,9 @@ mod device;
 mod host;
 mod msi;
 mod msix;
+mod pam;
+mod pcie_host;
+pub mod q35;
 pub mod regs;
 
 pub use bridge::{PciBridge, PciBridgeWindow, pci_bridge_get_base, pci_bridge_get_limit};
@@ -47,3 +54,11 @@ pub use host::{
 };
 pub use msi::PCI_MSI_VECTORS_MAX;
 pub use msix::MsixLayout;
+pub use pam::*;
+pub use pcie_host::{
+    PCIE_BASE_ADDR_UNMAPPED, PCIE_MMCFG_BUS_BIT, PCIE_MMCFG_BUS_MASK, PCIE_MMCFG_CONFOFFSET_MASK,
+    PCIE_MMCFG_DEVFN_BIT, PCIE_MMCFG_DEVFN_MASK, PCIE_MMCFG_SIZE_MAX, PCIE_MMCFG_SIZE_MIN,
+    PcieHost, pcie_mmcfg_bus, pcie_mmcfg_confoffset, pcie_mmcfg_data_read, pcie_mmcfg_data_write,
+    pcie_mmcfg_devfn,
+};
+pub use q35::{Mch, Q35Config, Q35PciHost, pci_bus_get_w64_range};
