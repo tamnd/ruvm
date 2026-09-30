@@ -2,16 +2,21 @@
 
 //! `-chardev` and the old `-serial`/`-monitor` strings: the `chardev` option list,
 //! `qemu_chr_parse_opts()` and `qemu_chr_parse_compat()` from chardev/char.c, with the socket
-//! backend's `tcp_chr_parse()`.
+//! backends' `chr_parse` hooks.
 
 use ruvm_base::{Error, Result};
 use ruvm_qapi::opts::{OptsHandle, QemuOptDesc, QemuOptType, QemuOpts, QemuOptsList};
 use ruvm_qapi::types::{
-    ChardevBackend, ChardevBackendU, ChardevCommon, ChardevCommonWrapper, ChardevSocket,
-    ChardevSocketWrapper, FdSocketAddress, FdSocketAddressWrapper, InetSocketAddress,
+    ChardevBackend, ChardevBackendU, ChardevCommon, ChardevCommonWrapper, ChardevFile,
+    ChardevFileWrapper, ChardevHostdev, ChardevHostdevWrapper, ChardevMux, ChardevMuxWrapper,
+    ChardevRingbuf, ChardevRingbufWrapper, ChardevSocket, ChardevSocketWrapper, ChardevStdio,
+    ChardevStdioWrapper, FdSocketAddress, FdSocketAddressWrapper, InetSocketAddress,
     InetSocketAddressWrapper, SocketAddressLegacy, SocketAddressLegacyU, UnixSocketAddress,
     UnixSocketAddressWrapper,
 };
+
+#[cfg(unix)]
+use ruvm_qapi::types::{ChardevPty, ChardevPtyWrapper};
 
 use QemuOptType::{Bool, Number, Size, String as Str};
 
@@ -198,6 +203,67 @@ fn parse_socket(opts: &QemuOpts) -> Result<ChardevSocket> {
     })
 }
 
+/// `file_chr_parse()`.
+fn parse_file(opts: &QemuOpts) -> Result<ChardevFile> {
+    let Some(path) = opts.get("path") else {
+        return Err(Error::generic("chardev: file: no filename given"));
+    };
+    let inpath = opts.get("input-path");
+    #[cfg(windows)]
+    if inpath.is_some() {
+        return Err(Error::generic("chardev: file: input-path not supported on Windows"));
+    }
+    let c = parse_common(opts);
+    Ok(ChardevFile {
+        logfile: c.logfile,
+        logappend: c.logappend,
+        logtimestamp: c.logtimestamp,
+        in_: inpath.map(str::to_string),
+        out: path.to_string(),
+        append: Some(opts.get_bool("append", false)),
+    })
+}
+
+/// `pipe_chr_parse()`.
+fn parse_pipe(opts: &QemuOpts) -> Result<ChardevHostdev> {
+    let Some(device) = opts.get("path") else {
+        return Err(Error::generic("chardev: pipe: no device path given"));
+    };
+    let c = parse_common(opts);
+    Ok(ChardevHostdev {
+        logfile: c.logfile,
+        logappend: c.logappend,
+        logtimestamp: c.logtimestamp,
+        device: device.to_string(),
+    })
+}
+
+/// `mux_chr_parse()`.
+fn parse_mux(opts: &QemuOpts) -> Result<ChardevMux> {
+    let Some(chardev) = opts.get("chardev") else {
+        return Err(Error::generic("chardev: mux: no chardev given"));
+    };
+    let c = parse_common(opts);
+    Ok(ChardevMux {
+        logfile: c.logfile,
+        logappend: c.logappend,
+        logtimestamp: c.logtimestamp,
+        chardev: chardev.to_string(),
+    })
+}
+
+/// `ringbuf_chr_parse()`. QEMU keeps the size in an `int` on the way, so it does too.
+fn parse_ringbuf(opts: &QemuOpts) -> ChardevRingbuf {
+    let c = parse_common(opts);
+    let size = opts.get_size("size", 0) as i32;
+    ChardevRingbuf {
+        logfile: c.logfile,
+        logappend: c.logappend,
+        logtimestamp: c.logtimestamp,
+        size: (size != 0).then_some(i64::from(size)),
+    }
+}
+
 /// `qemu_chr_parse_opts()`: the backend `-chardev` describes. Backends ruvm does not have are
 /// accepted here and refused when opened.
 pub fn parse_opts(opts: &QemuOpts) -> Result<ChardevBackend> {
@@ -221,6 +287,34 @@ pub fn parse_opts(opts: &QemuOpts) -> Result<ChardevBackend> {
     let u = match name {
         "socket" => ChardevBackendU::Socket(ChardevSocketWrapper { data: parse_socket(opts)? }),
         "null" => ChardevBackendU::Null(ChardevCommonWrapper { data: parse_common(opts) }),
+        "file" => ChardevBackendU::File(ChardevFileWrapper { data: parse_file(opts)? }),
+        "pipe" => ChardevBackendU::Pipe(ChardevHostdevWrapper { data: parse_pipe(opts)? }),
+        "mux" => ChardevBackendU::Mux(ChardevMuxWrapper { data: parse_mux(opts)? }),
+        "ringbuf" => ChardevBackendU::Ringbuf(ChardevRingbufWrapper { data: parse_ringbuf(opts) }),
+        "memory" => ChardevBackendU::Memory(ChardevRingbufWrapper { data: parse_ringbuf(opts) }),
+        "stdio" => {
+            let c = parse_common(opts);
+            ChardevBackendU::Stdio(ChardevStdioWrapper {
+                data: ChardevStdio {
+                    logfile: c.logfile,
+                    logappend: c.logappend,
+                    logtimestamp: c.logtimestamp,
+                    signal: Some(opts.get_bool("signal", true)),
+                },
+            })
+        }
+        #[cfg(unix)]
+        "pty" => {
+            let c = parse_common(opts);
+            ChardevBackendU::Pty(ChardevPtyWrapper {
+                data: ChardevPty {
+                    logfile: c.logfile,
+                    logappend: c.logappend,
+                    logtimestamp: c.logtimestamp,
+                    path: opts.get("path").map(str::to_string),
+                },
+            })
+        }
         _ => {
             return Err(Error::generic(format!(
                 "chardev backend '{name}' is not supported by ruvm yet"
@@ -378,4 +472,26 @@ pub fn parse_compat(
             Err(e)
         }
     }
+}
+
+/// The old style strings `-nographic` gives the default serial port, monitor and parallel
+/// port, as `qemu_create_default_devices()` picks them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NographicDefaults {
+    pub serial: Option<&'static str>,
+    pub monitor: Option<&'static str>,
+    pub parallel: Option<&'static str>,
+}
+
+/// Which of the defaults are still wanted decides where they go: a serial port and a monitor
+/// share stdio through a mux, and either one alone gets stdio for itself.
+pub fn nographic_defaults(serial: bool, monitor: bool, parallel: bool) -> NographicDefaults {
+    let mut d = NographicDefaults { parallel: parallel.then_some("null"), ..Default::default() };
+    if serial && monitor {
+        d.serial = Some("mon:stdio");
+    } else {
+        d.serial = serial.then_some("stdio");
+        d.monitor = monitor.then_some("stdio");
+    }
+    d
 }
