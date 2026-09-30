@@ -435,6 +435,11 @@ dependencies = [
 [[package]]
 name = "ruvm-hw-acpi"
 version = "0.2.1"
+dependencies = [
+ "ruvm-base",
+ "ruvm-hw-core",
+ "ruvm-mem",
+]
 
 [[package]]
 name = "ruvm-hw-audio"
