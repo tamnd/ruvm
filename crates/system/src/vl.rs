@@ -133,6 +133,7 @@ fn name_opts() -> QemuOptsList {
 }
 
 /// `qemu_run_with_opts`.
+#[cfg(unix)]
 fn run_with_opts() -> QemuOptsList {
     let mut desc = Vec::new();
     if cfg!(target_os = "linux") {
@@ -165,6 +166,8 @@ struct Config {
     qtest_log: Option<String>,
     /// `have_custom_ram_size`: `-machine memory.size` was given.
     have_custom_ram_size: bool,
+    /// `-run-with exit-with-parent=on`, which Windows builds never set.
+    #[cfg_attr(not(unix), allow(dead_code))]
     exit_with_parent: bool,
     mon_deprecation_warned: bool,
 }
@@ -339,6 +342,7 @@ fn parse_options(
             Opt::Audio => parse_audio(arg)?,
             Opt::Qtest => cfg.qtest = Some(arg.to_string()),
             Opt::QtestLog => cfg.qtest_log = Some(arg.to_string()),
+            #[cfg(unix)]
             Opt::RunWith => parse_run_with(cfg, arg)?,
             _ => return Err(fail_msg("this option is not supported by ruvm yet")),
         }
@@ -453,7 +457,8 @@ fn parse_audio(arg: &str) -> Flow<()> {
     Ok(())
 }
 
-/// The `-run-with` case of the option loop.
+/// The `-run-with` case of the option loop. QEMU only has the option on POSIX hosts.
+#[cfg(unix)]
 fn parse_run_with(cfg: &mut Config, arg: &str) -> Flow<()> {
     let mut list = run_with_opts();
     let Some(opts) = list.parse_noisily(arg, false) else { return Err(Exit(1)) };

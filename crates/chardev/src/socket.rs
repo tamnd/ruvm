@@ -20,9 +20,10 @@ use std::time::Duration;
 
 use ruvm_base::report::info_report;
 use ruvm_base::{Error, Result};
+#[cfg(unix)]
+use ruvm_qapi::types::UnixSocketAddress;
 use ruvm_qapi::types::{
     ChardevSocket, InetSocketAddress, SocketAddress, SocketAddressLegacyU, SocketAddressU,
-    UnixSocketAddress,
 };
 
 use crate::conn::{Connection, POLL_INTERVAL, Stream};
