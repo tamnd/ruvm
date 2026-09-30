@@ -1,0 +1,196 @@
+# Tagged releases: check the tag, build ruvm on every host CI covers, attest the archives and
+# publish them to GitHub with the changelog section as the notes.
+#
+# The version rule is in CHANGELOG.md: the minor version counts finished milestones and patch
+# releases come in between. Nothing goes to crates.io yet, every crate has publish = false until
+# the APIs are worth promising anything about.
+#
+# The matrix is split in two because GitHub's hosted macOS queue can leave a job unassigned for a
+# long time with everything else green. The release waits for the hosts that start now, and the
+# macOS archives are attached when they are ready, so a queue does not decide when a release
+# exists. This is the lesson tamnd/rudb learned on two of its first releases.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        # Every job checks this tag out, so a dispatch rebuilds an existing tag rather than the
+        # default branch. That is how a release whose archives did not all make it gets finished.
+        description: the tag to build
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  # A tag that does not pass the gate does not become a release. Cheaper to find out here than
+  # after the archives are uploaded.
+  verify:
+    name: verify the tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - name: the version in the tag matches the workspace
+        run: |
+          set -euo pipefail
+          want="${TAG#v}"
+          have=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$want" != "$have" ]; then
+            echo "tag $TAG says $want but Cargo.toml says $have"
+            exit 1
+          fi
+          echo "releasing $have"
+      - name: the changelog has an entry
+        run: |
+          set -euo pipefail
+          grep -qx "## ${TAG#v}" CHANGELOG.md || {
+            echo "CHANGELOG.md has no section for ${TAG#v}"
+            exit 1
+          }
+      - run: cargo xtask ci
+      - name: the binary reports the tag
+        run: |
+          set -euo pipefail
+          cargo run -q --bin ruvm -- --version | tee version.txt
+          grep -qx "ruvm ${TAG#v}" <(head -1 version.txt)
+
+  # The hosts whose runners start right away. The release waits for these.
+  build:
+    name: build for ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: ./.github/actions/build-archive
+        with:
+          target: ${{ matrix.target }}
+          tag: ${{ env.TAG }}
+
+  # The same steps on macOS, in a job of their own so that waiting for the queue is not waiting for
+  # the release.
+  build-queued:
+    name: build for ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-26
+          - target: x86_64-apple-darwin
+            os: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: ./.github/actions/build-archive
+        with:
+          target: ${{ matrix.target }}
+          tag: ${{ env.TAG }}
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      # Provenance attestation, so that someone who downloads an archive can check which workflow
+      # run and which commit produced it with `gh attestation verify`.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: list what is being published
+        run: ls -l dist
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      # The notes are the changelog section, written by hand, rather than a list of commit
+      # subjects. GitHub's list of merged pull requests is appended after it.
+      - name: take the release notes from the changelog
+        run: |
+          set -euo pipefail
+          awk -v want="## ${TAG#v}" '
+            $0 == want { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section for $TAG"; exit 1; }
+          cat notes.md
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ env.TAG }}
+          files: dist/*
+          body_path: notes.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  # The macOS archives, put on the release once they exist. `--clobber` so that re-running a
+  # release ends in the same place rather than in an error about a file that is already there.
+  attach:
+    name: attach the rest
+    needs: [publish, build-queued]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*-apple-darwin
+          merge-multiple: true
+          path: dist
+      - name: list what is being attached
+        run: ls -l dist
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      - name: put them on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh release upload "$TAG" dist/* --clobber --repo "$REPO"
