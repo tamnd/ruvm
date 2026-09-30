@@ -63,3 +63,41 @@ fn unimplemented_programs_fail_rather_than_pretend() {
     let (ok, _) = run(&["qemu-nonsense"]);
     assert!(!ok);
 }
+
+/// The target tables in `names.rs` are QEMU's `configs/targets/`, which is vendored. A sync that
+/// adds or drops a target fails here until the dispatcher learns about it.
+#[test]
+fn every_vendored_target_is_a_name() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor-qemu/targets");
+    let (_, out) = run(&["--list"]);
+    let names: Vec<&str> = out.lines().collect();
+    let mut want = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let file = entry.unwrap().file_name().into_string().unwrap();
+        let Some(stem) = file.strip_suffix(".mak") else { continue };
+        if let Some(target) = stem.strip_suffix("-softmmu") {
+            want.push(format!("qemu-system-{target}"));
+        } else if let Some(target) =
+            stem.strip_suffix("-linux-user").or_else(|| stem.strip_suffix("-bsd-user"))
+        {
+            want.push(format!("qemu-{target}"));
+        }
+    }
+    assert!(want.len() > 60);
+    for name in &want {
+        assert!(names.contains(&name.as_str()), "{name} is a QEMU target but not a ruvm name");
+    }
+    let count = |prefix: &str| names.iter().filter(|n| n.starts_with(prefix)).count();
+    let system = want.iter().filter(|n| n.starts_with("qemu-system-")).count();
+    assert_eq!(count("qemu-system-"), system, "ruvm answers to a system target QEMU does not have");
+}
+
+/// The version ruvm reports is the version of the QEMU it vendors.
+#[test]
+fn the_reported_version_is_the_vendored_tag() {
+    let upstream = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor-qemu/UPSTREAM");
+    let text = std::fs::read_to_string(upstream).unwrap();
+    let tag = text.lines().find_map(|l| l.strip_prefix("tag v")).unwrap();
+    let (_, out) = run(&["qemu-system-x86_64", "--version"]);
+    assert!(out.starts_with(&format!("QEMU emulator version {tag} ")), "{out}");
+}

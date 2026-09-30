@@ -16,6 +16,7 @@ mod layers;
 mod provenance;
 mod style;
 mod unsafe_audit;
+mod upstream;
 mod workspace;
 
 fn main() -> ExitCode {
@@ -26,6 +27,8 @@ fn main() -> ExitCode {
         Some("provenance") => provenance::check(&root),
         Some("unsafe-audit") => unsafe_audit::check(&root),
         Some("style") => style::check(&root),
+        Some("upstream-sync") => upstream::sync(&root, &args[1..]),
+        Some("vendor-check") => upstream::check(&root),
         Some("ci") => ci(&root),
         Some("help" | "--help" | "-h") | None => {
             usage();
@@ -53,6 +56,9 @@ fn usage() {
   provenance     check that no permissive crate depends on a GPL crate, and the SPDX headers
   unsafe-audit   count unsafe items per crate against the budget in its manifest
   style          check the prose rules in every markdown file
+  upstream-sync  refresh vendor-qemu/ from a QEMU tag and print what changed
+                 cargo xtask upstream-sync <tag> [--from <qemu checkout>]
+  vendor-check   check vendor-qemu/ against its MANIFEST
   ci             everything CI runs, in the order it runs it"
     );
 }
@@ -69,6 +75,7 @@ fn ci(root: &Path) -> Result<(), String> {
     step("provenance", || provenance::check(root))?;
     step("unsafe-audit", || unsafe_audit::check(root))?;
     step("style", || style::check(root))?;
+    step("vendor-check", || upstream::check(root))?;
     step("fmt", || cargo(&["fmt", "--all", "--check"]))?;
     step("clippy", || cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))?;
     step("test", || cargo(&["test", "--workspace"]))?;
