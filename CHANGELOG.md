@@ -6,6 +6,20 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.1.4
+
+The pieces a QMP monitor needs are in place, though nothing starts one from the command line yet. That is the next step.
+
+`ruvm-monitor` is a QMP server ported from monitor/qmp.c (#34). It does capability negotiation, out of band commands, the request queue with its limit and the event rate limiting. File descriptors can be passed with `getfd`, `add-fd` and fd sets (#35). Monitors are QOM objects now, so `object-add` and `object-del` create and remove them with QEMU's error messages (#41).
+
+`ruvm-chardev` has the `null` and `socket` backends, Unix and TCP, client and server, and serves QMP through them (#38). `-chardev` options and the old compat strings like `tcp:host:port,server=on` parse the same way as in QEMU (#39).
+
+The option table is generated from qemu-options.hx (#36), and `QemuOpts` and the keyval parser are ported with their error messages (#37).
+
+`ruvm-sys` turns SIGINT, SIGHUP and SIGTERM into a callback on a normal thread, keeping the sender's pid for the log line (#40).
+
+`ruvm-vmstate` can save and load state from VMState descriptions, checked against the byte streams in test-vmstate.c (#42).
+
 ## 0.1.3
 
 QMP commands can be marshalled and dispatched now. There is no socket to send them over yet, that comes with the monitor.
