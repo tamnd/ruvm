@@ -13,3 +13,14 @@ pub mod json;
 mod qvalue;
 
 pub use qvalue::{QDict, QType, QValue};
+
+/// The `query-qmp-schema` reply for this build, as QEMU would print it.
+///
+/// It is computed at build time from the vendored schema, with each `'if'` decided by the table
+/// in build.rs, so returning it costs a copy.
+pub static QMP_SCHEMA_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/qmp-schema.json"));
+
+/// [`QMP_SCHEMA_JSON`] as a value.
+pub fn qmp_schema() -> QValue {
+    json::from_str(QMP_SCHEMA_JSON).expect("the build script writes valid JSON")
+}
