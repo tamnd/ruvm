@@ -56,6 +56,50 @@ pub fn rtc_mc146818(scope: &mut Aml, io_base: u16, isairq: u8) {
     scope.append(&dev);
 }
 
+/// `i8042_build_aml()`, the keyboard and the PS/2 mouse behind it.
+pub fn i8042(scope: &mut Aml, kbd_irq: u8, mouse_irq: u8) {
+    let mut crs = aml::resource_template();
+    crs.append(&aml::io(aml::IoDecode::Decode16, 0x0060, 0x0060, 0x01, 0x01));
+    crs.append(&aml::io(aml::IoDecode::Decode16, 0x0064, 0x0064, 0x01, 0x01));
+    crs.append(&aml::irq_no_flags(kbd_irq));
+    let mut kbd = aml::device("KBD");
+    kbd.append(&aml::name_decl("_HID", &aml::eisaid("PNP0303")));
+    kbd.append(&aml::name_decl("_STA", &aml::int(0xf)));
+    kbd.append(&aml::name_decl("_CRS", &crs));
+
+    let mut crs = aml::resource_template();
+    crs.append(&aml::irq_no_flags(mouse_irq));
+    let mut mou = aml::device("MOU");
+    mou.append(&aml::name_decl("_HID", &aml::eisaid("PNP0F13")));
+    mou.append(&aml::name_decl("_STA", &aml::int(0xf)));
+    mou.append(&aml::name_decl("_CRS", &crs));
+
+    scope.append(&kbd);
+    scope.append(&mou);
+}
+
+/// `parallel_isa_build_aml()`. `index` is zero based, so LPT1 is 0.
+pub fn parallel_isa(scope: &mut Aml, index: u32, iobase: u16, isairq: u8) {
+    let mut crs = aml::resource_template();
+    crs.append(&aml::io(aml::IoDecode::Decode16, iobase, iobase, 0x08, 0x08));
+    crs.append(&aml::irq_no_flags(isairq));
+    let mut dev = aml::device(&format!("LPT{}", index + 1));
+    dev.append(&aml::name_decl("_HID", &aml::eisaid("PNP0400")));
+    dev.append(&aml::name_decl("_UID", &aml::int((index + 1).into())));
+    dev.append(&aml::name_decl("_STA", &aml::int(0xf)));
+    dev.append(&aml::name_decl("_CRS", &crs));
+    scope.append(&dev);
+}
+
+/// `build_vga_aml()`: the display is off in S1 to S3, except that qxl keeps state in S3.
+pub fn vga_pci(scope: &mut Aml, qxl: bool) {
+    for (name, d) in [("_S1D", 0), ("_S2D", 0), ("_S3D", if qxl { 3 } else { 0 })] {
+        let mut method = aml::method(name, 0, aml::Serialize::NotSerialized);
+        method.append(&aml::return_(&aml::int(d)));
+        scope.append(&method);
+    }
+}
+
 /// `ACPI_POWER_BUTTON_DEVICE`.
 pub const POWER_BUTTON_DEVICE: &str = "PWRB";
 /// `ACPI_APEI_ERROR_DEVICE`.
@@ -223,6 +267,10 @@ pub enum IsaDevice {
     Serial { index: u32, iobase: u16, irq: u8 },
     /// mc146818rtc, see [`rtc_mc146818`].
     Rtc { io_base: u16, irq: u8 },
+    /// i8042, see [`i8042`].
+    I8042 { kbd_irq: u8, mouse_irq: u8 },
+    /// isa-parallel, see [`parallel_isa`].
+    Parallel { index: u32, iobase: u16, irq: u8 },
 }
 
 impl IsaDevice {
@@ -231,6 +279,8 @@ impl IsaDevice {
         match *self {
             IsaDevice::Serial { index, iobase, irq } => serial_isa(scope, index, iobase, irq),
             IsaDevice::Rtc { io_base, irq } => rtc_mc146818(scope, io_base, irq),
+            IsaDevice::I8042 { kbd_irq, mouse_irq } => i8042(scope, kbd_irq, mouse_irq),
+            IsaDevice::Parallel { index, iobase, irq } => parallel_isa(scope, index, iobase, irq),
         }
     }
 }

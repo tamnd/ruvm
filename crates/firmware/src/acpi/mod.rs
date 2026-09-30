@@ -4,9 +4,12 @@
 //! and the per machine table sets.
 
 pub mod aml;
+pub mod cpuhp;
 pub mod devices;
 pub mod linker;
 pub mod microvm;
+pub mod pci;
+pub mod pcihp;
 pub mod q35;
 pub mod table;
 pub mod x86;
