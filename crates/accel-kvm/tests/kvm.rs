@@ -34,8 +34,15 @@ struct Guest {
     mmio: Arc<Recorder>,
 }
 
+/// The guests here end in `hlt`. With the local APIC in the kernel KVM handles that itself and
+/// waits for an interrupt that never comes, so these tests keep the irqchip in userspace, where
+/// `hlt` exits to us.
 fn open() -> Option<KvmAccel> {
-    match KvmAccel::new(&KvmOptions::default(), false) {
+    let opts = KvmOptions {
+        kernel_irqchip: Some(ruvm_accel_kvm::KernelIrqchip::Off),
+        ..KvmOptions::default()
+    };
+    match KvmAccel::new(&opts, false) {
         Ok(a) => Some(a),
         Err(e @ (KvmError::Open(_) | KvmError::Unavailable)) => {
             eprintln!("skipping: {e}");
