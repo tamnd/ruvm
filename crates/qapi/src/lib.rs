@@ -9,8 +9,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cutils;
+pub mod ghash;
 pub mod json;
 mod qvalue;
+pub mod visit;
 
 pub use qvalue::{QDict, QType, QValue};
 

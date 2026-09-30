@@ -2,11 +2,14 @@
 
 //! Builds the `query-qmp-schema` reply from the vendored QAPI schema.
 //!
-//! The QObject and JSON code is shared with the library through `#[path]`, so the reply is
+//! The QObject, JSON and number formatting code is shared with the library through `#[path]`, so the reply is
 //! printed by the same writer QMP uses and comes out byte for byte as QEMU prints it.
 
 use std::path::Path;
 
+#[allow(dead_code, unreachable_pub)]
+#[path = "src/cutils.rs"]
+mod cutils;
 #[allow(dead_code, unreachable_pub)]
 #[path = "src/json.rs"]
 mod json;

@@ -789,27 +789,7 @@ pub fn quoted_str(out: &mut String, s: &str) {
 
 /// C's `printf("%.17g")`, which is how QEMU prints every double.
 pub fn format_g17(v: f64) -> String {
-    const P: i32 = 17;
-    if v.is_nan() {
-        return if v.is_sign_negative() { "-nan".into() } else { "nan".into() };
-    }
-    if v.is_infinite() {
-        return if v < 0.0 { "-inf".into() } else { "inf".into() };
-    }
-    let sci = format!("{:.*e}", (P - 1) as usize, v);
-    let (mantissa, exp) = sci.split_once('e').expect("exponent form");
-    let exp: i32 = exp.parse().expect("exponent");
-    if (-4..P).contains(&exp) {
-        let fixed = format!("{:.*}", (P - 1 - exp) as usize, v);
-        strip_zeros(&fixed).to_string()
-    } else {
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{}e{}{:02}", strip_zeros(mantissa), sign, exp.abs())
-    }
-}
-
-fn strip_zeros(s: &str) -> &str {
-    if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.') } else { s }
+    crate::cutils::format_g(v, 17)
 }
 
 #[cfg(test)]
