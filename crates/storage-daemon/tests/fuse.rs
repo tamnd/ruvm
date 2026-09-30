@@ -173,8 +173,11 @@ fn growable() {
     let f = OpenOptions::new().write(true).open(&mnt).unwrap();
     f.write_all_at(&[9; 1000], LEN as u64 + 100).unwrap();
     drop(f);
-    assert_eq!(blk.getlength().unwrap(), LEN as u64 + 1100);
-    assert_eq!(fs::metadata(&mnt).unwrap().len(), LEN as u64 + 1100);
+    // The file grows to exactly LEN + 1100, but a node's length is counted in whole sectors,
+    // so bdrv_getlength() and the size FUSE reports round up to 512, as they do in QEMU.
+    let sectors = (LEN as u64 + 1100).next_multiple_of(512);
+    assert_eq!(blk.getlength().unwrap(), sectors);
+    assert_eq!(fs::metadata(&mnt).unwrap().len(), sectors);
     exp.shutdown();
     let data = fs::read(&img).unwrap();
     assert_eq!(data.len(), LEN + 1100);
