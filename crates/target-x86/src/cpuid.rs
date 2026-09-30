@@ -744,8 +744,8 @@ impl X86Cpu {
         }
     }
 
-    /// `x86_has_cpuid_0x1f()`.
-    fn has_cpuid_0x1f(&self) -> bool {
+    /// `x86_has_cpuid_0x1f()`: whether leaf 0x1f is reported.
+    pub fn has_cpuid_0x1f(&self) -> bool {
         self.force_cpuid_0x1f || self.topo.has_extended_topo()
     }
 
@@ -1152,6 +1152,30 @@ impl X86Cpu {
     /// `MCG_CAP` as set up by `mce_init()`.
     pub fn mcg_cap(&self) -> u64 {
         self.mcg_cap
+    }
+
+    /// The host snapshot when running under KVM.
+    pub fn host(&self) -> Option<&HostCpuid> {
+        match &self.accel {
+            Accel::Tcg => None,
+            Accel::Kvm(h) => Some(h),
+        }
+    }
+
+    /// The `kvm` property: whether the KVM signature leaves are shown to the
+    /// guest.
+    pub fn expose_kvm(&self) -> bool {
+        self.expose_kvm
+    }
+
+    /// TSC frequency in kHz exactly as the user gave it, or 0.
+    pub fn user_tsc_khz(&self) -> i64 {
+        self.user_tsc_khz
+    }
+
+    /// The XSAVE state components with their offsets.
+    pub fn ext_save_areas(&self) -> &ExtSaveAreas {
+        &self.ext_save_areas
     }
 
     /// Copies the machine check setup of `mce_init()` into `state`.
