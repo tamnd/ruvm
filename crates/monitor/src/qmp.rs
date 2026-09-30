@@ -406,6 +406,9 @@ pub struct Qmp {
     event_clock: RwLock<Arc<dyn Fn() -> i64 + Send + Sync>>,
     policy: RwLock<CompatPolicy>,
     machine_ready: AtomicBool,
+    /// The monitor whose in-band request the dispatcher is running,
+    /// `qmp_dispatcher_current_mon`.
+    current: Mutex<Option<Weak<MonitorQmp>>>,
     #[cfg(unix)]
     fdsets: Mutex<FdSets>,
 }
@@ -435,6 +438,7 @@ impl Qmp {
             event_clock: RwLock::new(Arc::new(move || start.elapsed().as_nanos() as i64)),
             policy: RwLock::new(CompatPolicy::default()),
             machine_ready: AtomicBool::new(true),
+            current: Mutex::new(None),
             #[cfg(unix)]
             fdsets: Mutex::new(FdSets::new()),
         })
@@ -529,6 +533,12 @@ impl Qmp {
         mon.close();
     }
 
+    /// Whether the dispatcher is running a request from `mon` right now,
+    /// `monitor_qmp_dispatcher_is_servicing()`.
+    pub fn is_servicing(&self, mon: &Arc<MonitorQmp>) -> bool {
+        lock(&self.current).as_ref().is_some_and(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(mon)))
+    }
+
     pub fn monitors(&self) -> Vec<Arc<MonitorQmp>> {
         lock(&self.monitors).list.iter().cloned().collect()
     }
@@ -555,11 +565,13 @@ impl Qmp {
         Some((mon, req, oob))
     }
 
-    fn process(self: &Arc<Self>, mon: &MonitorQmp, req: Request, oob: bool) {
+    fn process(self: &Arc<Self>, mon: &Arc<MonitorQmp>, req: Request, oob: bool) {
+        *lock(&self.current) = Some(Arc::downgrade(mon));
         match req {
             Ok(req) => mon.dispatch(self, &req),
             Err(e) => mon.send(&qmp_error_response(&e)),
         }
+        *lock(&self.current) = None;
         if !oob {
             mon.resume();
         }

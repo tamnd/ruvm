@@ -445,6 +445,7 @@ dependencies = [
  "ruvm-base",
  "ruvm-chardev",
  "ruvm-qapi",
+ "ruvm-qom",
 ]
 
 [[package]]
