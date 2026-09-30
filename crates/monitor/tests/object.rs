@@ -98,7 +98,7 @@ fn hmp_cannot_be_deleted() {
 fn properties_and_monitor_new() {
     let e = env();
     e.null("c");
-    let obj = monitor_new(&e.registry, "compat_monitor0", Some("c"), true, true).unwrap();
+    let obj = monitor_new(&e.registry, Some("compat_monitor0"), Some("c"), true, true).unwrap();
     assert_eq!(obj.property_get_str("chardev").unwrap(), "c");
     assert!(obj.property_get_bool("pretty").unwrap());
     assert_eq!(obj.property_get_str("close-action").unwrap(), "none");
@@ -106,7 +106,7 @@ fn properties_and_monitor_new() {
 
     let e = env();
     e.null("h");
-    let obj = monitor_new(&e.registry, "compat_monitor0", Some("h"), false, false).unwrap();
+    let obj = monitor_new(&e.registry, None, Some("h"), false, false).unwrap();
     assert!(obj.property_get_bool("readline").unwrap());
     assert!(e.qmp.monitors().is_empty());
 }

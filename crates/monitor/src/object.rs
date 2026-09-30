@@ -227,15 +227,22 @@ pub fn register_types(registry: &Registry, qmp: &Arc<Qmp>, chardevs: &Arc<Charde
     registry.register_all([monitor, monitor_qmp, monitor_hmp]);
 }
 
+/// `monitor_compat_id()`: `compat_monitor0`, `compat_monitor1` and so on.
+pub fn monitor_compat_id() -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    format!("compat_monitor{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 /// `monitor_new_qmp()` and `monitor_new_hmp()` for `-mon`, `-qmp` and `-monitor`: a monitor
-/// object under `/objects` named `id`.
+/// object under `/objects` named `id`, or a compat id when there is none.
 pub fn monitor_new(
     registry: &Registry,
-    id: &str,
+    id: Option<&str>,
     chardev: Option<&str>,
     qmp_mode: bool,
     pretty: bool,
 ) -> Result<Object> {
+    let id = id.map_or_else(monitor_compat_id, str::to_string);
     let parent = registry.objects_root();
     let mut props = Vec::new();
     if let Some(chardev) = chardev {
@@ -243,9 +250,9 @@ pub fn monitor_new(
     }
     if qmp_mode {
         props.push(("pretty", if pretty { "yes" } else { "no" }));
-        registry.object_new_with_props(TYPE_MONITOR_QMP, Some((&parent, id)), &props)
+        registry.object_new_with_props(TYPE_MONITOR_QMP, Some((&parent, &id)), &props)
     } else {
         props.push(("readline", "on"));
-        registry.object_new_with_props(TYPE_MONITOR_HMP, Some((&parent, id)), &props)
+        registry.object_new_with_props(TYPE_MONITOR_HMP, Some((&parent, &id)), &props)
     }
 }

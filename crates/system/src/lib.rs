@@ -6,3 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod options;
+mod qmp_cmds;
+pub mod qtest;
+pub mod runstate;
+pub mod vl;

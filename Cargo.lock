@@ -511,8 +511,14 @@ dependencies = [
 name = "ruvm-system"
 version = "0.1.4"
 dependencies = [
+ "ruvm-accel-qtest",
  "ruvm-base",
+ "ruvm-chardev",
+ "ruvm-monitor",
+ "ruvm-qapi",
  "ruvm-qapi-gen",
+ "ruvm-qom",
+ "ruvm-sys",
 ]
 
 [[package]]
