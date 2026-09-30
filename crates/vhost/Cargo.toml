@@ -11,9 +11,19 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 4
 
 [dependencies]
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+vmm-sys-util.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true
