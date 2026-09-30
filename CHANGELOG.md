@@ -6,6 +6,16 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.2.3
+
+With this patch, the command line can pick the microvm and q35 boards and run their vCPUs on KVM (#87). The boot tests need a guest kernel in `RUVM_TEST_KERNEL` and have not yet run on a host with KVM, so the boards should still be called unproven. Firmware, ACPI and a boot smoke test are next.
+
+More devices: virtio-net and virtio-balloon (#81), PCIe root ports (#82), pvpanic, isa-debug-exit and the ICH9 SMBus with its EEPROMs (#83).
+
+On the backend side, `ruvm-block` has the file protocol, the raw format, `BlockBackend` and `-drive` (#84). `ruvm-vhost` has the vhost-user frontend and the vhost kernel backend (#85), and it is MIT or Apache-2.0 licensed like the virtqueue crate. `ruvm-net` has the netdev core, hubs, tap, socket, stream and dgram (#86). User networking over libslirp, passt and vhost-user came later (#89). libslirp is loaded when the netdev is created, so building ruvm does not need it. `ruvm-chardev` gained the file, pipe, stdio, pty, ringbuf and mux backends (#88).
+
+CI had a bug where every run on main shared one concurrency group, so a stuck run cancelled all the ones after it, and the KVM tests never ran. Each push to main now gets its own group. The Linux x86-64 job fails if `/dev/kvm` is missing, rather than quietly skipping the KVM tests (#80). The Windows build is fixed too.
+
 ## 0.2.2
 
 This patch fills in most of the hardware the M2 boards need. Both boards now exist as objects with their devices wired up, but ruvm does not run vCPUs against them from the command line yet. That wiring is the next piece of work.
