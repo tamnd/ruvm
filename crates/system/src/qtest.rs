@@ -5,14 +5,13 @@
 
 use std::io::{self, Read};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 
 use ruvm_accel_qtest::{IrqHandler, Qtest, QtestBackend, open_log};
 use ruvm_base::report::{error_report, report_error};
 use ruvm_base::{Error, Result};
 use ruvm_chardev::opts::{chardev_opts, parse_compat};
 use ruvm_chardev::{Attachment, Chardevs, Connection, Frontend};
-use ruvm_hw_core::Machine;
+use ruvm_hw_core::{Clock, Machine};
 use ruvm_mem::{AddressSpace, MemTxAttrs};
 use ruvm_qom::{
     Object, Registry, StrGetter, StrSetter, TYPE_OBJECT, TYPE_USER_CREATABLE, TypeInfo,
@@ -77,21 +76,9 @@ pub fn add_object(machine: &Object, log: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `QEMU_CLOCK_VIRTUAL` while qtest drives it. Nothing runs on it yet, so it only moves when
-/// the test steps it.
-#[derive(Debug, Default)]
-pub struct VirtualClock(AtomicI64);
-
-impl VirtualClock {
-    pub fn get_ns(&self) -> i64 {
-        self.0.load(Ordering::Acquire)
-    }
-
-    /// `qemu_clock_advance_virtual_time()`: the clock never goes back.
-    pub fn advance_to(&self, dest: i64) -> i64 {
-        self.0.fetch_max(dest, Ordering::AcqRel).max(dest)
-    }
-}
+/// `QEMU_CLOCK_VIRTUAL` while qtest drives it: it only moves when the test steps it, and each
+/// step runs the device timers that come due on the way.
+pub type VirtualClock = Clock;
 
 /// `target_big_endian()` for a `qemu-system-<target>` name.
 pub fn target_big_endian(target: &str) -> bool {
@@ -164,7 +151,7 @@ impl QtestBackend for NoneMachine {
     }
 
     fn clock_deadline_ns_all(&mut self) -> i64 {
-        -1
+        self.clock.deadline_ns()
     }
 
     fn clock_advance_virtual_time(&mut self, dest: i64) -> i64 {
@@ -247,10 +234,11 @@ pub fn server_init(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ruvm_base::ClockType;
 
     #[test]
     fn clock_only_moves_forward() {
-        let c = VirtualClock::default();
+        let c = Clock::manual(ClockType::Virtual);
         assert_eq!(c.advance_to(100), 100);
         assert_eq!(c.advance_to(50), 100);
         assert_eq!(c.get_ns(), 100);
