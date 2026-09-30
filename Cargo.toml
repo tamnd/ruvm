@@ -127,7 +127,7 @@ mio = { version = "1.2.3", default-features = false, features = ["os-poll", "os-
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 syn = { version = "2.0.110", default-features = false, features = ["full", "visit", "parsing"] }
-toml = "0.9.8"
+toml = "1.1.6"
 
 # The lint set from spec/24-workspace-layout.md. Unsafe code is where an emulator gets a guest
 # escape, so the three unsafe lints are errors rather than warnings, and `cargo xtask unsafe-audit`
