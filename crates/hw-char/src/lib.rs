@@ -2,4 +2,8 @@
 
 //! Serial ports, parallel ports and board UARTs.
 //!
-//! Empty for now. The plan for this crate is in `spec/24-workspace-layout.md`.
+//! So far this is the 16550. The rest of the plan is in `spec/24-workspace-layout.md`.
+
+#![forbid(unsafe_code)]
+
+pub mod serial;
