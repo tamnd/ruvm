@@ -174,7 +174,10 @@ fn raw_window() {
     assert_eq!(err(r#""size": 1000,"#), "Specified size is not multiple of 512");
     assert!(g.node("x").is_none() && g.node("x-file").is_none());
 
-    // Without a size the window runs to the end of the file and follows it.
+    // Without a size the window runs to the end of the file and follows it. A fresh graph, because
+    // on Linux the OFD locks of the nodes above would conflict with this open.
+    drop(g);
+    let g = BlockGraph::new();
     add_raw(&g, "tail", &path, r#""offset": 4096,"#).unwrap();
     let blk = BlockBackend::new(&g, "tail", RW | ruvm_block::BLK_PERM_RESIZE, SHARED).unwrap();
     assert_eq!(blk.getlength().unwrap(), 4096);
@@ -198,7 +201,11 @@ fn read_only() {
     let mut b = [0u8; 2];
     blk.pread(250, &mut b).unwrap();
     assert_eq!(b, [250, 0]);
-    // A backend without the write permission cannot write to a writable node either.
+    // A backend without the write permission cannot write to a writable node either. Close the
+    // read-only node first, because OFD locks on Linux conflict inside one process too.
+    drop(blk);
+    drop(g);
+    let g = BlockGraph::new();
     add_raw(&g, "rw", &path, "").unwrap();
     let blk = BlockBackend::new(&g, "rw", BLK_PERM_CONSISTENT_READ, SHARED).unwrap();
     assert_eq!(errno(&blk.pwrite(0, b"x").unwrap_err()), libc::EPERM);
@@ -325,7 +332,10 @@ fn discard_and_write_zeroes() {
     assert_eq!(read(32767, 1)[0], (32767 % 251) as u8);
     assert_eq!(fs::metadata(&path).unwrap().len(), 65536);
 
-    // Without discard=unmap on the raw node discard does nothing at all.
+    // Without discard=unmap on the raw node discard does nothing at all. Close the first node
+    // before opening the file again, because OFD locks on Linux conflict inside one process too.
+    drop(blk);
+    drop(g);
     let g = BlockGraph::new();
     add_raw(&g, "r", &path, "").unwrap();
     let blk = BlockBackend::new(&g, "r", RW, SHARED).unwrap();
