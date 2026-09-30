@@ -1,0 +1,22 @@
+[package]
+name = "ruvm-vmstate-macros"
+description = "Derive macros for ruvm-vmstate."
+license = "GPL-2.0-or-later"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+proc-macro = true
+
+[package.metadata.ruvm]
+unsafe-budget = 0
+
+[dependencies]
+
+[lints]
+workspace = true

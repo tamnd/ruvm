@@ -1,0 +1,19 @@
+[package]
+name = "ruvm-hw-net"
+description = "Emulated network cards: e1000, e1000e, igb, rtl8139, pcnet, ne2000, vmxnet3 and board NICs."
+license = "GPL-2.0-or-later"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[package.metadata.ruvm]
+unsafe-budget = 0
+
+[dependencies]
+
+[lints]
+workspace = true

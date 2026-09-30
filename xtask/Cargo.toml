@@ -1,0 +1,19 @@
+[package]
+name = "xtask"
+description = "Check and maintenance tasks for the ruvm workspace."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+
+# serde_json reads `cargo metadata`, toml reads layers.toml and syn walks source files for the
+# unsafe audit. A task runner that parses these by hand is a task runner that is wrong in a way
+# nobody notices until the check it runs has been passing for the wrong reason.
+[dependencies]
+serde_json.workspace = true
+syn.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

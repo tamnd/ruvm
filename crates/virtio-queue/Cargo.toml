@@ -1,0 +1,19 @@
+[package]
+name = "ruvm-virtio-queue"
+description = "Split and packed virtqueue processing, descriptor chains and notification suppression, independent of device and transport."
+license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[package.metadata.ruvm]
+unsafe-budget = 0
+
+[dependencies]
+
+[lints]
+workspace = true
