@@ -180,14 +180,12 @@ impl DriverDef {
     }
 
     /// The `-o` options of `qemu-img amend`, `amend_opts` of the driver.
-    #[allow(dead_code, reason = "for the formats that port their amend options")]
     pub(crate) const fn with_amend_opts_list(mut self, list: &'static [QemuOptDesc]) -> Self {
         self.amend_opts_list = list;
         self
     }
 
     /// `.bdrv_amend_options`, see [`DriverDef::amend_opts`].
-    #[allow(dead_code, reason = "for the formats that port their amend options")]
     pub(crate) const fn with_amend_opts(mut self, f: AmendOptsFn) -> Self {
         self.amend_opts = Some(f);
         self
@@ -212,7 +210,6 @@ impl DriverDef {
     }
 
     /// Images of this format can have a backing file.
-    #[allow(dead_code, reason = "for the format drivers with backing files, qcow2 first")]
     pub(crate) const fn with_backing(mut self) -> Self {
         self.supports_backing = true;
         self
@@ -264,6 +261,7 @@ pub(crate) static DRIVERS: &[&DriverDef] = &[
     &crate::nbd::NBD_UNIX,
     &crate::luks::LUKS,
     &crate::qcow::QCOW,
+    &crate::qcow2::QCOW2,
     &crate::qed::QED,
     &crate::parallels::PARALLELS,
     &crate::bochs::BOCHS,
@@ -378,7 +376,6 @@ impl OpenArgs<'_> {
     }
 
     /// Records a child a driver opened some other way.
-    #[allow(dead_code, reason = "for drivers that open children without open_child()")]
     pub(crate) fn add_child(&mut self, name: &str, node: Arc<Node>, role: u32) {
         self.children.push((name.to_string(), node, role));
     }
@@ -397,14 +394,12 @@ impl OpenArgs<'_> {
 
     /// The backing file name and format the image header records, for the generic code to
     /// open unless the options say otherwise.
-    #[allow(dead_code, reason = "for the format drivers with backing files, qcow2 first")]
     pub(crate) fn set_backing_file(&mut self, file: &str, format: Option<&str>) {
         self.meta.backing_file = file.to_string();
         self.meta.backing_format = format.unwrap_or_default().to_string();
     }
 
     /// The `backing` option of drivers that take one.
-    #[allow(dead_code, reason = "for the format drivers with backing files, qcow2 first")]
     pub(crate) fn set_backing_option(&mut self, backing: Option<BlockdevRefOrNull>) {
         self.backing = backing;
     }
