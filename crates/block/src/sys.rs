@@ -2,7 +2,8 @@
 
 //! The host calls the file driver needs that rustix does not wrap: byte range locks through
 //! `fcntl()` (`qemu_lock_fd()`, `qemu_unlock_fd()` and `qemu_lock_fd_test()` from util/osdep.c)
-//! and `F_PUNCHHOLE` on macOS.
+//! and `F_PUNCHHOLE` on macOS, and the block device and CD-ROM ioctls of `host_device` and
+//! `host_cdrom`.
 
 #![allow(unsafe_code)]
 
@@ -155,4 +156,152 @@ pub(crate) fn punch_hole(fd: BorrowedFd<'_>, offset: u64, len: u64) -> io::Resul
         return Err(e);
     }
     Ok(())
+}
+
+/// The device ioctls file-posix issues that rustix does not wrap, each with its argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DevIoctl {
+    /// `BLKROGET`: whether the block device is read-only. Returns 0 or 1.
+    #[cfg(target_os = "linux")]
+    BlkRoGet,
+    /// `BLKSECTGET`: the most sectors one request may carry. Returns it.
+    #[cfg(target_os = "linux")]
+    BlkSectGet,
+    /// `BLKDISCARD` of `(offset, length)`.
+    #[cfg(target_os = "linux")]
+    BlkDiscard(u64, u64),
+    /// `BLKZEROOUT` of `(offset, length)`.
+    #[cfg(target_os = "linux")]
+    BlkZeroOut(u64, u64),
+    /// `CDROM_DRIVE_STATUS` with `CDSL_CURRENT`. Returns the `CDS_*` status.
+    #[cfg(target_os = "linux")]
+    CdromDriveStatus,
+    /// `CDROMEJECT`.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code, reason = "used by the Driver::eject and lock_medium implementations")]
+    CdromEject,
+    /// `CDROMCLOSETRAY`.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code, reason = "used by the Driver::eject and lock_medium implementations")]
+    CdromCloseTray,
+    /// `CDROM_LOCKDOOR` with the door state.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code, reason = "used by the Driver::eject and lock_medium implementations")]
+    CdromLockDoor(bool),
+    /// `DKIOCGETBLOCKSIZE`: the logical block size. Returns it.
+    #[cfg(target_os = "macos")]
+    GetBlockSize,
+    /// `DKIOCGETBLOCKCOUNT`: the number of logical blocks. Returns it.
+    #[cfg(target_os = "macos")]
+    GetBlockCount,
+}
+
+/// `CDS_DISC_OK` from linux/cdrom.h.
+#[cfg(target_os = "linux")]
+pub(crate) const CDS_DISC_OK: u64 = 4;
+
+#[cfg(target_os = "linux")]
+mod dev {
+    use rustix::ioctl::opcode;
+    // linux/fs.h. `_IO()` differs between architectures, rustix knows how.
+    pub(super) const BLKROGET: u32 = opcode::none(0x12, 94) as u32;
+    pub(super) const BLKSECTGET: u32 = opcode::none(0x12, 103) as u32;
+    pub(super) const BLKDISCARD: u32 = opcode::none(0x12, 119) as u32;
+    pub(super) const BLKZEROOUT: u32 = opcode::none(0x12, 127) as u32;
+    // linux/cdrom.h. These are plain numbers, the same everywhere.
+    pub(super) const CDROMEJECT: u32 = 0x5309;
+    pub(super) const CDROMCLOSETRAY: u32 = 0x5319;
+    pub(super) const CDROM_DRIVE_STATUS: u32 = 0x5326;
+    pub(super) const CDROM_LOCKDOOR: u32 = 0x5329;
+    pub(super) const CDSL_CURRENT: usize = i32::MAX as usize;
+}
+
+#[cfg(target_os = "macos")]
+mod dev {
+    // sys/disk.h: `_IOR('d', 24, uint32_t)` and `_IOR('d', 25, uint64_t)`.
+    pub(super) const DKIOCGETBLOCKSIZE: u32 = 0x4004_6418;
+    pub(super) const DKIOCGETBLOCKCOUNT: u32 = 0x4008_6419;
+}
+
+/// Issues one of the device ioctls in [`DevIoctl`] on `fd`, retrying on `EINTR`. The result
+/// is what the ioctl returns or, for the getters, the value it wrote.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn dev_ioctl(fd: BorrowedFd<'_>, req: DevIoctl) -> io::Result<u64> {
+    use std::ffi::c_void;
+    #[cfg(target_os = "linux")]
+    use std::ptr;
+
+    /// Where the result is: the return value, or one of the locals the kernel wrote.
+    /// Not every kind is used on every host.
+    #[allow(dead_code)]
+    #[derive(Clone, Copy)]
+    enum Out {
+        Ret,
+        Int,
+        U16,
+        U32,
+        U64,
+    }
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut int_out: libc::c_int = 0;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut u16_out: u16 = 0;
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut u32_out: u32 = 0;
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut u64_out: u64 = 0;
+    #[cfg(target_os = "linux")]
+    let mut range = match req {
+        DevIoctl::BlkDiscard(off, len) | DevIoctl::BlkZeroOut(off, len) => [off, len],
+        _ => [0u64; 2],
+    };
+    let (code, arg, out): (u32, *mut c_void, Out) = match req {
+        #[cfg(target_os = "linux")]
+        DevIoctl::BlkRoGet => (dev::BLKROGET, (&raw mut int_out).cast(), Out::Int),
+        #[cfg(target_os = "linux")]
+        DevIoctl::BlkSectGet => (dev::BLKSECTGET, (&raw mut u16_out).cast(), Out::U16),
+        #[cfg(target_os = "linux")]
+        DevIoctl::BlkDiscard(..) => (dev::BLKDISCARD, range.as_mut_ptr().cast(), Out::Ret),
+        #[cfg(target_os = "linux")]
+        DevIoctl::BlkZeroOut(..) => (dev::BLKZEROOUT, range.as_mut_ptr().cast(), Out::Ret),
+        #[cfg(target_os = "linux")]
+        DevIoctl::CdromDriveStatus => {
+            (dev::CDROM_DRIVE_STATUS, ptr::without_provenance_mut(dev::CDSL_CURRENT), Out::Ret)
+        }
+        #[cfg(target_os = "linux")]
+        DevIoctl::CdromEject => (dev::CDROMEJECT, ptr::null_mut(), Out::Ret),
+        #[cfg(target_os = "linux")]
+        DevIoctl::CdromCloseTray => (dev::CDROMCLOSETRAY, ptr::null_mut(), Out::Ret),
+        #[cfg(target_os = "linux")]
+        DevIoctl::CdromLockDoor(locked) => {
+            (dev::CDROM_LOCKDOOR, ptr::without_provenance_mut(usize::from(locked)), Out::Ret)
+        }
+        #[cfg(target_os = "macos")]
+        DevIoctl::GetBlockSize => (dev::DKIOCGETBLOCKSIZE, (&raw mut u32_out).cast(), Out::U32),
+        #[cfg(target_os = "macos")]
+        DevIoctl::GetBlockCount => (dev::DKIOCGETBLOCKCOUNT, (&raw mut u64_out).cast(), Out::U64),
+    };
+    let ret = loop {
+        // SAFETY: `fd` is live for the borrow. Every request above is one whose argument is
+        // either a plain integer (passed in the pointer's place, as the C headers do), no
+        // argument at all, or a pointer to a local of exactly the type the kernel reads or
+        // writes for that request: `int` for BLKROGET, `unsigned short` for BLKSECTGET, `uint64_t[2]` for BLKDISCARD and
+        // BLKZEROOUT, `uint32_t` for DKIOCGETBLOCKSIZE and `uint64_t` for DKIOCGETBLOCKCOUNT.
+        // Those locals outlive the call.
+        let ret = unsafe { libc::ioctl(fd.as_raw_fd(), code as _, arg) };
+        if ret != -1 {
+            break ret;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    };
+    Ok(match out {
+        Out::Ret => ret as u64,
+        Out::Int => int_out as u64,
+        Out::U16 => u64::from(u16_out),
+        Out::U32 => u64::from(u32_out),
+        Out::U64 => u64_out,
+    })
 }

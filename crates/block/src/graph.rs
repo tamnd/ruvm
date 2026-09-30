@@ -7,22 +7,23 @@
 //! children, so a child lives as long as some parent does.
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ruvm_base::{Error, Result};
+use ruvm_qapi::QDict;
 use ruvm_qapi::types::{
-    BlockdevDetectZeroesOptions, BlockdevDiscardOptions, BlockdevOptions, BlockdevOptionsBlkdebug,
-    BlockdevOptionsNull, BlockdevOptionsU, BlockdevRef,
+    BlockdevDetectZeroesOptions, BlockdevDiscardOptions, BlockdevOptions, BlockdevRef,
+    BlockdevRefOrNull,
 };
 
 use crate::backend::BlockBackend;
 use crate::drive::DriveInfo;
-use crate::file::file_open;
-use crate::node::{Driver, Node, NodeFlags};
-use crate::raw::{BLOCK_PROBE_BUF_SIZE, probe_format, raw_open};
+use crate::drivers::{self, OpenArgs};
+use crate::node::{
+    BDRV_CHILD_COW, BDRV_CHILD_DATA, BDRV_CHILD_FILTERED, BDRV_CHILD_METADATA, BDRV_CHILD_PRIMARY,
+    Node, NodeFlags, NodeMeta, NodeSpec,
+};
 
 /// `sizeof(bs->node_name)`. A name must leave room for the terminating NUL.
 const NODE_NAME_SIZE: usize = 32;
@@ -53,6 +54,8 @@ struct Entry {
     node: std::sync::Weak<Node>,
     /// The reference `blockdev-add` holds for the monitor.
     owned: Option<Arc<Node>>,
+    /// When the node joined the table: `graph_bdrv_states` is a list in that order.
+    seq: u64,
 }
 
 /// The block graph. One per emulator.
@@ -60,8 +63,9 @@ struct Entry {
 pub struct BlockGraph {
     nodes: Mutex<BTreeMap<String, Entry>>,
     next_id: AtomicU64,
+    next_seq: AtomicU64,
     /// The block backends the monitor knows by name, `monitor_block_backends`.
-    backends: Mutex<BTreeMap<String, Arc<BlockBackend>>>,
+    pub(crate) backends: Mutex<BTreeMap<String, Arc<BlockBackend>>>,
     /// The `-drive` table, `DriveInfo` in QEMU.
     pub(crate) drives: Mutex<Vec<DriveInfo>>,
 }
@@ -76,38 +80,21 @@ pub(crate) fn id_wellformed(id: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
 }
 
-/// `qemu_config_parse()` for the blkdebug config file. Blank lines and comments are fine. The
-/// `[inject-error]` and `[set-state]` rule sections are not implemented yet, so they are
-/// refused rather than silently ignored.
-fn read_blkdebug_config(path: &str) -> Result<()> {
-    // fopen() blocks on a fifo until a writer shows up, and the QMP out-of-band test relies
-    // on that. File::open() behaves the same way.
-    let f = File::open(path).map_err(|e| Error::from_io(format!("Could not open '{path}'"), e))?;
-    for (n, line) in BufReader::new(f).lines().enumerate() {
-        let line = line.map_err(|e| Error::from_io(format!("{path}:{}", n + 1), e))?;
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        return Err(Error::generic(format!(
-            "{path}:{}: blkdebug rules are not supported yet",
-            n + 1
-        )));
-    }
-    Ok(())
-}
-
 /// The nodes one `blockdev-add` opened, not yet in the name table. Dropping it closes them.
 #[derive(Default)]
-struct Pending {
-    nodes: Vec<Arc<Node>>,
+pub(crate) struct Pending {
+    pub(crate) nodes: Vec<Arc<Node>>,
     /// Warnings printed while opening, for callers that want to show them again.
-    warnings: Vec<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 impl Pending {
     fn has(&self, name: &str) -> bool {
         self.nodes.iter().any(|n| n.name == name)
+    }
+
+    fn find(&self, name: &str) -> Option<Arc<Node>> {
+        self.nodes.iter().find(|n| n.name == name).cloned()
     }
 }
 
@@ -122,6 +109,8 @@ pub(crate) struct Inherited {
     pub force_share: bool,
     /// Children default to `discard=unmap`, the root to `ignore`.
     pub unmap: bool,
+    /// `BDRV_O_NATIVE_AIO`: `-drive aio=native`, the default of `aio` for `file` nodes.
+    pub native_aio: bool,
 }
 
 /// How a node is being opened.
@@ -134,62 +123,64 @@ pub(crate) struct OpenCtx {
     pub probed: bool,
     /// `detect-zeroes` as `blockdev_init()` sets it, after the open and without its check.
     pub detect_zeroes: Option<BlockdevDetectZeroesOptions>,
+    /// `BDRV_O_PROTOCOL`: a file name opens a protocol node, without format probing.
+    pub protocol: bool,
 }
 
-/// `null-co` and `null-aio` from block/null.c.
-struct NullDriver {
-    size: u64,
-    read_zeroes: bool,
+/// `bdrv_inherited_options()` for `child_of_bds`: how a child with `role` of a node with
+/// `parent` flags is opened, for what the child's own options leave open. `parent_protocol`
+/// is whether the parent itself was opened as a protocol node.
+pub(crate) fn child_ctx(
+    parent: &NodeFlags,
+    parent_is_format: bool,
+    parent_protocol: bool,
+    role: u32,
+) -> OpenCtx {
+    let cow = role & BDRV_CHILD_COW != 0;
+    let mut protocol = parent_protocol;
+    // Pure data children of non-format nodes are probed.
+    if !parent_is_format
+        && role & BDRV_CHILD_DATA != 0
+        && role & (BDRV_CHILD_METADATA | BDRV_CHILD_FILTERED) == 0
+    {
+        protocol = false;
+    }
+    // Children of format nodes (except backing files) and metadata children never are.
+    if (parent_is_format && !cow) || role & BDRV_CHILD_METADATA != 0 {
+        protocol = true;
+    }
+    OpenCtx {
+        root: false,
+        inherit: Inherited {
+            // Backing files are opened read-only by default.
+            read_only: if cow { true } else { parent.read_only },
+            auto_read_only: if cow { false } else { parent.auto_read_only },
+            direct: parent.direct,
+            no_flush: parent.no_flush,
+            force_share: parent.force_share,
+            unmap: true,
+            native_aio: false,
+        },
+        probed: false,
+        detect_zeroes: None,
+        protocol,
+    }
 }
 
-impl Driver for NullDriver {
-    fn pread(&self, _bs: &Node, _offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        if self.read_zeroes {
-            buf.fill(0);
-        }
-        Ok(())
-    }
-
-    fn pwrite(&self, _bs: &Node, _offset: u64, _buf: &[u8]) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn pwrite_zeroes(&self, _: &Node, _: u64, _: u64, _: bool) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn getlength(&self, _bs: &Node) -> io::Result<u64> {
-        Ok(self.size)
-    }
-}
-
-/// `blkdebug` without rules: every request goes to `image` unchanged.
-struct BlkdebugDriver;
-
-impl Driver for BlkdebugDriver {
-    fn pread(&self, bs: &Node, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        bs.file().pread(offset, buf)
-    }
-
-    fn pwrite(&self, bs: &Node, offset: u64, buf: &[u8]) -> io::Result<()> {
-        bs.file().pwrite(offset, buf)
-    }
-
-    fn pwrite_zeroes(&self, bs: &Node, offset: u64, bytes: u64, unmap: bool) -> io::Result<()> {
-        bs.file().pwrite_zeroes(offset, bytes, unmap)
-    }
-
-    fn pdiscard(&self, bs: &Node, offset: u64, bytes: u64) -> io::Result<()> {
-        bs.file().pdiscard(offset, bytes)
-    }
-
-    fn getlength(&self, bs: &Node) -> io::Result<u64> {
-        bs.file().getlength()
-    }
-
-    fn truncate(&self, bs: &Node, len: u64) -> Result<()> {
-        bs.file().truncate(len)
-    }
+/// How the backing file of a node that is being opened is chosen.
+#[derive(Debug)]
+pub(crate) enum BackingReq {
+    /// From the driver's own `backing` option, as `blockdev-add` gives it.
+    Typed,
+    /// `backing: null`: no backing file.
+    None,
+    /// `backing` names an existing node.
+    Ref(String),
+    /// A new node from these options.
+    Definition(Box<BlockdevOptions>),
+    /// The backing file the image names, with these `backing.*` options, which may name
+    /// another file instead.
+    Options(QDict),
 }
 
 fn not_found(r: &str) -> Error {
@@ -206,11 +197,11 @@ impl BlockGraph {
         NodeInfo {
             node_name: name.to_string(),
             driver: node.driver_name,
-            children: node.children.iter().map(|c| c.node.name.clone()).collect(),
+            children: node.children().iter().map(|c| c.node.name.clone()).collect(),
             parents: node.parent_count(),
             monitor_owned: owned,
             size: node.getlength().unwrap_or(0),
-            read_only: node.flags.read_only,
+            read_only: node.read_only(),
         }
     }
 
@@ -229,6 +220,15 @@ impl BlockGraph {
             .iter()
             .filter_map(|(k, e)| e.node.upgrade().map(|n| Self::info(k, &n, e.owned.is_some())))
             .collect()
+    }
+
+    /// `graph_bdrv_states`: every live named node, in the order they were added.
+    pub(crate) fn named_nodes(&self) -> Vec<Arc<Node>> {
+        let nodes = self.nodes.lock().unwrap();
+        let mut v: Vec<(u64, Arc<Node>)> =
+            nodes.values().filter_map(|e| e.node.upgrade().map(|n| (e.seq, n))).collect();
+        v.sort_by_key(|e| e.0);
+        v.into_iter().map(|e| e.1).collect()
     }
 
     /// `bdrv_find_node()`.
@@ -310,6 +310,16 @@ impl BlockGraph {
         // Opening can block (the blkdebug config may be a fifo), so the lock is only taken to
         // look names up and to commit.
         let root = self.open(opts, ctx, &mut pending)?;
+        self.commit(root, pending, ctx)
+    }
+
+    /// Puts the nodes an open made into the name table.
+    pub(crate) fn commit(
+        &self,
+        root: Arc<Node>,
+        pending: Pending,
+        ctx: OpenCtx,
+    ) -> Result<(Arc<Node>, Vec<String>)> {
         let mut nodes = self.nodes.lock().unwrap();
         let backends = self.backends.lock().unwrap();
         for n in &pending.nodes {
@@ -325,19 +335,33 @@ impl BlockGraph {
         }
         for n in pending.nodes {
             let owned = (ctx.root && Arc::ptr_eq(&n, &root)).then(|| n.clone());
-            nodes.insert(n.name.clone(), Entry { node: Arc::downgrade(&n), owned });
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            nodes.insert(n.name.clone(), Entry { node: Arc::downgrade(&n), owned, seq });
         }
         Ok((root, pending.warnings))
     }
 
-    /// `bdrv_open_inherit()` and `bdrv_open_common()`.
-    fn open(
+    /// `bdrv_open_inherit()` and `bdrv_open_common()` for typed options, as `blockdev-add`
+    /// gives them.
+    pub(crate) fn open(
         &self,
         opts: BlockdevOptions,
         ctx: OpenCtx,
         pending: &mut Pending,
     ) -> Result<Arc<Node>> {
+        self.open_with(opts, ctx, pending, BackingReq::Typed)
+    }
+
+    /// `bdrv_open_inherit()` with the backing file chosen by `backing`.
+    pub(crate) fn open_with(
+        &self,
+        opts: BlockdevOptions,
+        ctx: OpenCtx,
+        pending: &mut Pending,
+        backing: BackingReq,
+    ) -> Result<Arc<Node>> {
         let inh = ctx.inherit;
+        let explicit_options = crate::reopen::flat_options(&opts)?;
         let cache = opts.cache.unwrap_or_default();
         let read_only = opts.read_only.unwrap_or(inh.read_only);
         let auto_read_only = opts.auto_read_only.unwrap_or(inh.auto_read_only);
@@ -345,13 +369,17 @@ impl BlockGraph {
             Some(d) => d == BlockdevDiscardOptions::Unmap,
             None => inh.unmap,
         };
-        let mut flags = NodeFlags {
+        let flags = NodeFlags {
             read_only,
             direct: cache.direct.unwrap_or(inh.direct),
             no_flush: cache.no_flush.unwrap_or(inh.no_flush),
             unmap,
             force_share: opts.force_share.unwrap_or(inh.force_share),
             detect_zeroes: opts.detect_zeroes.unwrap_or_default(),
+            auto_read_only,
+            allow_rdwr: !read_only,
+            inactive: !opts.active.unwrap_or(true),
+            ..NodeFlags::default()
         };
         if flags.force_share && !flags.read_only {
             return Err(Error::generic("force-share=on can only be used with read-only images"));
@@ -362,9 +390,6 @@ impl BlockGraph {
                 "setting detect-zeroes to unmap is not allowed without setting discard \
                  operation to unmap",
             ));
-        }
-        if let Some(dz) = ctx.detect_zeroes {
-            flags.detect_zeroes = dz;
         }
 
         let name = match opts.node_name {
@@ -387,74 +412,157 @@ impl BlockGraph {
             return Err(Error::generic("Node name too long"));
         }
 
-        // What the children inherit, bdrv_inherited_options().
-        let child_ctx = OpenCtx {
-            root: false,
-            inherit: Inherited {
-                read_only: flags.read_only,
-                auto_read_only,
-                direct: flags.direct,
-                no_flush: flags.no_flush,
-                force_share: flags.force_share,
-                unmap: true,
-            },
-            probed: false,
-            detect_zeroes: None,
-        };
         let tag = opts.u.tag();
-        let driver: Box<dyn Driver>;
-        let mut children = Vec::new();
-        match opts.u {
-            BlockdevOptionsU::NullCo(o) | BlockdevOptionsU::NullAio(o) => {
-                driver = Box::new(null_open(&o)?);
-            }
-            BlockdevOptionsU::Blkdebug(o) => {
-                let child = blkdebug_open(self, *o, child_ctx, pending)?;
-                children.push(("image", child));
-                driver = Box::new(BlkdebugDriver);
-            }
-            BlockdevOptionsU::File(o) => {
-                driver = Box::new(file_open(&o, &mut flags, auto_read_only)?);
-            }
-            BlockdevOptionsU::Raw(o) => {
-                let child = self.open_child(*o.file, child_ctx, pending)?;
-                let len =
-                    child.getlength().map_err(|e| Error::from_io("Could not get image size", e))?;
-                if ctx.probed {
-                    probe_check(&child)?;
+        let Some(def) = drivers::find_format(tag.as_str()) else {
+            return Err(Error::generic(format!("Unknown driver '{}'", tag.as_str())));
+        };
+        let meta = NodeMeta::default();
+        let mut args = OpenArgs {
+            graph: self,
+            pending,
+            ctx,
+            def,
+            node_name: name.clone(),
+            flags,
+            children: Vec::new(),
+            meta,
+            backing: None,
+        };
+        let driver = (def.open)(&mut args, opts.u)?;
+        let OpenArgs { mut flags, children, mut meta, backing: typed_backing, .. } = args;
+        if meta.auto_backing_file.is_empty() {
+            meta.auto_backing_file = meta.backing_file.clone();
+        }
+        if let Some(dz) = ctx.detect_zeroes {
+            flags.detect_zeroes = dz;
+        }
+        flags.allow_rdwr = !flags.read_only;
+        let node = Node::build(NodeSpec {
+            name,
+            driver_name: def.format_name,
+            driver,
+            def: Some(def),
+            flags,
+            meta,
+            children,
+        })?;
+        // Children this open created belong to this node: bs->inherits_from.
+        for c in node.children() {
+            if pending.nodes.iter().any(|n| Arc::ptr_eq(n, &c.node)) {
+                let mut m = c.node.meta.lock().unwrap();
+                if m.inherits_from.strong_count() == 0 {
+                    m.inherits_from = Arc::downgrade(&node);
                 }
-                if ctx.probed && !flags.read_only {
-                    let w = format!(
-                        "WARNING: Image format was not specified for '{}' and probing guessed \
-                         raw.\n         Automatically detecting the format is dangerous for \
-                         raw images, write operations on block 0 will be restricted.\n         \
-                         Specify the 'raw' format explicitly to remove the restrictions.",
-                        filename_of(&child)
-                    );
-                    eprintln!("{w}");
-                    pending.warnings.push(w);
-                }
-                driver = Box::new(raw_open(o.offset, o.size, len, ctx.probed)?);
-                children.push(("file", child));
-            }
-            _ => {
-                return Err(Error::generic(format!(
-                    "Driver '{}' is not supported yet",
-                    tag.as_str()
-                )));
             }
         }
-        let node = Node::new(name, tag.as_str(), driver, flags, children)?;
+        crate::reopen::store_open_options(&node, explicit_options);
         pending.nodes.push(node.clone());
+
+        let backing = match backing {
+            BackingReq::Typed => match typed_backing {
+                None => BackingReq::Options(QDict::new()),
+                Some(BlockdevRefOrNull::Null(())) => BackingReq::None,
+                Some(BlockdevRefOrNull::Reference(r)) => BackingReq::Ref(r),
+                Some(BlockdevRefOrNull::Definition(o)) => BackingReq::Definition(o),
+            },
+            b => b,
+        };
+        self.open_backing_file(&node, backing, pending)?;
+        node.refresh_filename();
         Ok(node)
     }
 
-    /// `bdrv_open_child()`: a new node or a reference to an existing one.
-    fn open_child(&self, r: BlockdevRef, ctx: OpenCtx, pending: &mut Pending) -> Result<Arc<Node>> {
+    /// `bdrv_open_child()`: a new node or a reference to an existing one, which may be one
+    /// this open made.
+    pub(crate) fn open_child_ref(
+        &self,
+        r: BlockdevRef,
+        ctx: OpenCtx,
+        pending: &mut Pending,
+    ) -> Result<Arc<Node>> {
         match r {
             BlockdevRef::Definition(opts) => self.open(*opts, ctx, pending),
-            BlockdevRef::Reference(r) => self.lookup_bs(&r),
+            BlockdevRef::Reference(r) => self.lookup_pending(&r, pending),
         }
+    }
+
+    /// `bdrv_lookup_bs()`, also finding the nodes of the open in progress.
+    pub(crate) fn lookup_pending(&self, name: &str, pending: &Pending) -> Result<Arc<Node>> {
+        match pending.find(name) {
+            Some(n) => Ok(n),
+            None => self.lookup_bs(name),
+        }
+    }
+
+    /// `bdrv_open_backing_file()`.
+    fn open_backing_file(
+        &self,
+        bs: &Arc<Node>,
+        req: BackingReq,
+        pending: &mut Pending,
+    ) -> Result<()> {
+        let supports = bs.def.is_some_and(|d| d.supports_backing);
+        let role =
+            if bs.is_filter() { BDRV_CHILD_FILTERED | BDRV_CHILD_PRIMARY } else { BDRV_CHILD_COW };
+        let parent_protocol = bs.def.is_some_and(|d| d.protocol_name.is_some());
+        let ctx = child_ctx(&bs.flags(), bs.is_format(), parent_protocol, role);
+        let no_support = || Error::generic("Driver doesn't support backing files");
+        let backing_hd = match req {
+            BackingReq::Typed | BackingReq::None => return Ok(()),
+            BackingReq::Ref(r) => {
+                if !supports {
+                    return Err(no_support());
+                }
+                self.lookup_pending(&r, pending)
+                    .map_err(|e| e.prepend("Could not open backing file: "))?
+            }
+            BackingReq::Definition(o) => {
+                if !supports {
+                    return Err(no_support());
+                }
+                let n = self
+                    .open(*o, ctx, pending)
+                    .map_err(|e| e.prepend("Could not open backing file: "))?;
+                n.meta.lock().unwrap().inherits_from = Arc::downgrade(bs);
+                n
+            }
+            BackingReq::Options(mut options) => {
+                let meta = bs.meta.lock().unwrap().clone();
+                let names_file = options
+                    .get("file")
+                    .and_then(|f| f.as_dict())
+                    .is_some_and(|f| f.contains_key("filename"));
+                let mut filename = None;
+                let mut implicit = false;
+                if names_file {
+                    // Keep the file name empty, the options say which file.
+                } else if meta.backing_file.is_empty() && options.is_empty() {
+                    return Ok(());
+                } else {
+                    if options.is_empty() {
+                        implicit = meta.auto_backing_file == meta.backing_file;
+                    }
+                    filename = Some(crate::open::full_backing_filename(bs, &meta.backing_file)?);
+                }
+                if !supports {
+                    return Err(no_support());
+                }
+                if !meta.backing_format.is_empty() && !options.contains_key("driver") {
+                    options.put("driver", meta.backing_format.as_str());
+                }
+                let n = self
+                    .open_qdict(filename.as_deref(), options, ctx, pending, true)
+                    .map_err(|e| e.prepend("Could not open backing file: "))?;
+                n.meta.lock().unwrap().inherits_from = Arc::downgrade(bs);
+                if implicit {
+                    n.refresh_filename();
+                    bs.meta.lock().unwrap().auto_backing_file =
+                        n.meta.lock().unwrap().filename.clone();
+                }
+                n
+            }
+        };
+        bs.set_backing_hd(Some(backing_hd))
     }
 
     /// `qmp_blockdev_del()`.
@@ -485,63 +593,8 @@ impl BlockGraph {
     }
 }
 
-/// The file name a node stands for, `bs->filename` for the drivers here.
-fn filename_of(node: &Node) -> String {
-    node.filename().unwrap_or_else(|| node.name.clone())
-}
-
-/// `find_image_format()`: only raw can be opened so far, anything else that probes as
-/// another format is refused rather than exposed to the guest as raw.
-fn probe_check(file: &Node) -> Result<()> {
-    let len = file.getlength().map_err(|e| Error::from_io("Could not get image size", e))?;
-    if len == 0 {
-        return Ok(());
-    }
-    let mut buf = [0u8; BLOCK_PROBE_BUF_SIZE];
-    let n = buf.len().min(usize::try_from(len).unwrap_or(usize::MAX));
-    file.pread(0, &mut buf[..n])
-        .map_err(|e| Error::from_io("Could not read image for determining its format", e))?;
-    match probe_format(&buf[..n]) {
-        "raw" => Ok(()),
-        f => Err(Error::generic(format!("Driver '{f}' is not supported yet"))),
-    }
-}
-
-/// `null_file_open()`.
-fn null_open(o: &BlockdevOptionsNull) -> Result<NullDriver> {
-    if o.latency_ns.is_some_and(|l| l > i64::MAX as u64) {
-        return Err(Error::generic("latency-ns is invalid"));
-    }
-    Ok(NullDriver {
-        size: o.size.unwrap_or(1 << 30).max(0) as u64,
-        read_zeroes: o.read_zeroes.unwrap_or(false),
-    })
-}
-
-/// `blkdebug_open()`: the config file first, then the image child, then the limits.
-fn blkdebug_open(
-    graph: &BlockGraph,
-    o: BlockdevOptionsBlkdebug,
-    ctx: OpenCtx,
-    pending: &mut Pending,
-) -> Result<Arc<Node>> {
-    if let Some(path) = &o.config {
-        read_blkdebug_config(path)?;
-    }
-    if o.inject_error.as_ref().is_some_and(|v| !v.is_empty())
-        || o.set_state.as_ref().is_some_and(|v| !v.is_empty())
-    {
-        return Err(Error::generic("blkdebug rules are not supported yet"));
-    }
-    let child = graph.open_child(*o.image, ctx, pending)?;
-    if let Some(align) = o.align {
-        let a = align as u64;
-        if align != 0 && (align >= i64::from(i32::MAX) || !a.is_power_of_two()) {
-            return Err(Error::generic(format!("Cannot meet constraints with align {a}")));
-        }
-    }
-    Ok(child)
-}
+#[cfg(test)]
+mod graph_mod;
 
 #[cfg(test)]
 mod tests {

@@ -4,21 +4,74 @@
 //! window of them given by `offset` and `size`.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ruvm_base::{Error, Result};
+use ruvm_qapi::types::BlockdevOptionsU;
 
-use crate::node::{BDRV_SECTOR_SIZE, Driver, Node, errno};
+use crate::drivers::{DriverDef, OpenArgs};
+use crate::node::{
+    BDRV_BLOCK_OFFSET_VALID, BDRV_BLOCK_RAW, BDRV_CHILD_DATA, BDRV_CHILD_FILTERED,
+    BDRV_CHILD_PRIMARY, BDRV_REQ_FUA, BDRV_REQ_MAY_UNMAP, BDRV_REQ_NO_FALLBACK,
+    BDRV_REQ_WRITE_UNCHANGED, BDRV_SECTOR_SIZE, BlockLimits, BlockStatus, Driver, Node,
+    ReopenState, errno,
+};
 use crate::perm::{BLK_PERM_RESIZE, BLK_PERM_WRITE};
+use crate::probe::{BLOCK_PROBE_BUF_SIZE, probe_format, raw_probe};
 
-/// `BLOCK_PROBE_BUF_SIZE`.
-pub(crate) const BLOCK_PROBE_BUF_SIZE: usize = 512;
+/// The `raw` format driver, `bdrv_raw`.
+pub(crate) static RAW: DriverDef = DriverDef::format("raw", raw_open_node)
+    .with_probe(raw_probe)
+    .with_mutable_opts(&["offset", "size"])
+    .with_strong_opts(&["offset", "size"]);
+
+/// Takes a size option out of the reopen options, `qemu_opt_get_size_del()` after
+/// `qemu_opts_absorb_qdict()`.
+fn take_size_opt(options: &mut ruvm_qapi::QDict, name: &str) -> Result<Option<i64>> {
+    use ruvm_qapi::QValue;
+    match options.remove(name) {
+        None => Ok(None),
+        Some(QValue::Int(i)) => Ok(Some(i)),
+        Some(QValue::Uint(u)) => Ok(Some(u as i64)),
+        Some(QValue::Str(s)) => {
+            ruvm_qapi::visit::parse_option_size(name, &s).map(|v| Some(v as i64))
+        }
+        Some(_) => {
+            Err(Error::generic(format!("Invalid parameter type for '{name}', expected: size")))
+        }
+    }
+}
+
+/// `raw_open()`: the child is a filtered child without a window, a data child with one.
+fn raw_open_node(args: &mut OpenArgs<'_>, opts: BlockdevOptionsU) -> Result<Box<dyn Driver>> {
+    let BlockdevOptionsU::Raw(o) = opts else { unreachable!("raw driver with other options") };
+    let role = if o.offset.is_some() || o.size.is_some() {
+        BDRV_CHILD_DATA | BDRV_CHILD_PRIMARY
+    } else {
+        BDRV_CHILD_FILTERED | BDRV_CHILD_PRIMARY
+    };
+    let child = args.open_child(*o.file, "file", role)?;
+    let probed = args.is_probed();
+    if probed && !args.flags.read_only {
+        child.refresh_filename();
+        let name = child.meta.lock().unwrap().filename.clone();
+        args.warn(format!(
+            "WARNING: Image format was not specified for '{name}' and probing guessed raw.\n         \
+             Automatically detecting the format is dangerous for raw images, write operations \
+             on block 0 will be restricted.\n         Specify the 'raw' format explicitly to \
+             remove the restrictions."
+        ));
+    }
+    let len = child.getlength().map_err(|e| Error::from_io("Could not get image size", e))?;
+    Ok(Box::new(raw_open(o.offset, o.size, len, probed)?))
+}
 
 /// `BDRVRawState`.
 #[derive(Debug)]
 pub(crate) struct RawDriver {
-    offset: u64,
-    has_size: bool,
+    /// Reopen can change the window, so it sits in atomics.
+    offset: AtomicU64,
+    has_size: AtomicBool,
     /// The size of the window. Without `size` this follows the child, see `getlength`.
     size: AtomicU64,
     /// `bs->probed`: the format was guessed, so block 0 is guarded.
@@ -60,23 +113,55 @@ pub(crate) fn raw_open(
         )));
     }
     let size = if has_size { size } else { file_len - offset };
-    Ok(RawDriver { offset, has_size, size: AtomicU64::new(size), probed })
+    Ok(RawDriver {
+        offset: AtomicU64::new(offset),
+        has_size: AtomicBool::new(has_size),
+        size: AtomicU64::new(size),
+        probed,
+    })
 }
 
 impl RawDriver {
+    fn off(&self) -> u64 {
+        self.offset.load(Ordering::Relaxed)
+    }
+
+    fn has_size(&self) -> bool {
+        self.has_size.load(Ordering::Relaxed)
+    }
+
+    /// The block 0 check of `raw_co_pwritev()` for probed images: the write may not make
+    /// the image look like another format. A write that covers only part of block 0 is
+    /// merged with what is there before the check.
+    fn check_block0(&self, bs: &Node, offset: u64, buf: &[u8]) -> io::Result<()> {
+        if !self.probed || offset >= BLOCK_PROBE_BUF_SIZE as u64 || buf.is_empty() {
+            return Ok(());
+        }
+        let mut block0 = [0u8; BLOCK_PROBE_BUF_SIZE];
+        let end = (offset as usize + buf.len()).min(BLOCK_PROBE_BUF_SIZE);
+        if offset != 0 || end != BLOCK_PROBE_BUF_SIZE {
+            Driver::pread(self, bs, 0, &mut block0)?;
+        }
+        block0[offset as usize..end].copy_from_slice(&buf[..end - offset as usize]);
+        if probe_format(&block0) != "raw" {
+            return Err(errno(libc::EPERM));
+        }
+        Ok(())
+    }
+
     /// Whether the node is a filter over its child, which decides the child's role.
     fn is_filter(&self) -> bool {
-        self.offset == 0 && !self.has_size
+        self.off() == 0 && !self.has_size()
     }
 
     /// `raw_adjust_offset()`.
     fn adjust_offset(&self, offset: u64, bytes: u64, is_write: bool) -> io::Result<u64> {
         let size = self.size.load(Ordering::Relaxed);
-        if self.has_size && (offset > size || bytes > size - offset) {
+        if self.has_size() && (offset > size || bytes > size - offset) {
             // Do not touch anything outside the window the options gave.
             return Err(errno(if is_write { libc::ENOSPC } else { libc::EINVAL }));
         }
-        offset.checked_add(self.offset).filter(|&o| o <= i64::MAX as u64).ok_or(errno(libc::EINVAL))
+        offset.checked_add(self.off()).filter(|&o| o <= i64::MAX as u64).ok_or(errno(libc::EINVAL))
     }
 }
 
@@ -91,17 +176,7 @@ impl Driver for RawDriver {
     /// file pointing at a host file. QEMU makes such images use 512 byte requests. Here a
     /// partial write to block 0 is merged with what is on disk and the result is checked.
     fn pwrite(&self, bs: &Node, offset: u64, buf: &[u8]) -> io::Result<()> {
-        if self.probed && offset < BLOCK_PROBE_BUF_SIZE as u64 {
-            let mut block0 = [0u8; BLOCK_PROBE_BUF_SIZE];
-            let end = (offset as usize + buf.len()).min(BLOCK_PROBE_BUF_SIZE);
-            if offset != 0 || end != BLOCK_PROBE_BUF_SIZE {
-                self.pread(bs, 0, &mut block0)?;
-            }
-            block0[offset as usize..end].copy_from_slice(&buf[..end - offset as usize]);
-            if probe_format(&block0) != "raw" {
-                return Err(errno(libc::EPERM));
-            }
-        }
+        self.check_block0(bs, offset, buf)?;
         let off = self.adjust_offset(offset, buf.len() as u64, true)?;
         bs.file().pwrite(off, buf)
     }
@@ -119,12 +194,12 @@ impl Driver for RawDriver {
     /// `raw_co_getlength()`: what is left of the child after `offset`, capped at `size`.
     fn getlength(&self, bs: &Node) -> io::Result<u64> {
         let len = bs.file().getlength()?;
-        let size = if len < self.offset {
+        let size = if len < self.off() {
             0
-        } else if self.has_size {
-            self.size.load(Ordering::Relaxed).min(len - self.offset)
+        } else if self.has_size() {
+            self.size.load(Ordering::Relaxed).min(len - self.off())
         } else {
-            len - self.offset
+            len - self.off()
         };
         self.size.store(size, Ordering::Relaxed);
         Ok(size)
@@ -132,14 +207,92 @@ impl Driver for RawDriver {
 
     /// `raw_co_truncate()`.
     fn truncate(&self, bs: &Node, len: u64) -> Result<()> {
-        if self.has_size {
+        if self.has_size() {
             return Err(Error::generic("Cannot resize fixed-size raw disks"));
         }
-        if i64::MAX as u64 - len < self.offset {
+        if i64::MAX as u64 - len < self.off() {
             return Err(Error::generic("Disk size too large for the chosen offset"));
         }
         self.size.store(len, Ordering::Relaxed);
-        bs.file().truncate(len + self.offset)
+        bs.file().truncate(len + self.off())
+    }
+
+    /// `raw_co_block_status()`: everything is where the child has it.
+    fn block_status(
+        &self,
+        bs: &Node,
+        _want: u32,
+        offset: u64,
+        bytes: u64,
+    ) -> Option<io::Result<BlockStatus>> {
+        Some(Ok(BlockStatus {
+            ret: BDRV_BLOCK_RAW | BDRV_BLOCK_OFFSET_VALID,
+            pnum: bytes,
+            map: offset + self.off(),
+            file: Some(bs.file()),
+        }))
+    }
+
+    /// `raw_refresh_limits()`: a probed image is written in whole sectors, so a write to
+    /// block 0 always shows the whole of it.
+    fn refresh_limits(&self, _bs: &Node, bl: &mut BlockLimits) -> Result<()> {
+        if self.probed {
+            bl.request_alignment = bl.request_alignment.max(BDRV_SECTOR_SIZE as u32);
+        }
+        Ok(())
+    }
+
+    fn pwrite_flags(&self, bs: &Node, offset: u64, buf: &[u8], flags: u32) -> io::Result<()> {
+        self.check_block0(bs, offset, buf)?;
+        let off = self.adjust_offset(offset, buf.len() as u64, true)?;
+        bs.file().pwrite_flags(off, buf, flags)
+    }
+
+    fn supported_write_flags(&self) -> u32 {
+        BDRV_REQ_WRITE_UNCHANGED | BDRV_REQ_FUA
+    }
+
+    fn pwrite_zeroes_flags(
+        &self,
+        bs: &Node,
+        offset: u64,
+        bytes: u64,
+        flags: u32,
+    ) -> io::Result<()> {
+        let off = self.adjust_offset(offset, bytes, true)?;
+        bs.file().pwrite_zeroes_flags(off, bytes, flags)
+    }
+
+    fn supported_zero_flags(&self) -> u32 {
+        BDRV_REQ_WRITE_UNCHANGED | BDRV_REQ_FUA | BDRV_REQ_MAY_UNMAP | BDRV_REQ_NO_FALLBACK
+    }
+
+    /// `raw_reopen_prepare()`: the window options may not change here, which the generic
+    /// reopen code already refuses for options a driver does not take on reopen.
+    /// `raw_reopen_prepare()`: reads `offset` and `size` again and checks them against
+    /// the file; `raw_reopen_commit()` puts them in place.
+    fn reopen_prepare(&self, bs: &Node, state: &mut ReopenState) -> Option<Result<()>> {
+        Some((|| {
+            let offset = take_size_opt(&mut state.options, "offset")?;
+            let size = take_size_opt(&mut state.options, "size")?;
+            let len =
+                bs.file().getlength().map_err(|e| Error::from_io("Could not get image size", e))?;
+            let new = raw_open(offset, size, len, self.probed)?;
+            state.opaque = Some(Box::new(new));
+            Ok(())
+        })())
+    }
+
+    fn reopen_commit(&self, _bs: &Node, state: &mut ReopenState) {
+        if let Some(new) = state.opaque.take().and_then(|o| o.downcast::<RawDriver>().ok()) {
+            self.offset.store(new.off(), Ordering::Relaxed);
+            self.has_size.store(new.has_size(), Ordering::Relaxed);
+            self.size.store(new.size.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    fn has_truncate(&self) -> bool {
+        true
     }
 
     /// `raw_child_perm()`: a filter without a window, a data child with one. A data child does
@@ -161,51 +314,6 @@ impl Driver for RawDriver {
 fn default_child_perm(_index: usize, perm: u64, shared: u64) -> (u64, u64) {
     use crate::perm::{DEFAULT_PERM_PASSTHROUGH, DEFAULT_PERM_UNCHANGED};
     (perm & DEFAULT_PERM_PASSTHROUGH, (shared & DEFAULT_PERM_PASSTHROUGH) | DEFAULT_PERM_UNCHANGED)
-}
-
-/// `bdrv_probe_all()` over the formats QEMU builds by default, by their magic numbers only.
-/// Anything nobody claims is `raw`, whose probe always scores 1.
-pub(crate) fn probe_format(buf: &[u8]) -> &'static str {
-    let be32 =
-        |off: usize| buf.get(off..off + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-    let le32 =
-        |off: usize| buf.get(off..off + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-    let starts = |magic: &[u8]| buf.starts_with(magic);
-    if starts(b"QFI\xfb") {
-        return match be32(4) {
-            Some(1) => "qcow",
-            Some(v) if v >= 2 => "qcow2",
-            _ => "raw",
-        };
-    }
-    if starts(b"QED\0") {
-        return "qed";
-    }
-    if le32(0x40) == Some(0xbeda_107f) {
-        return "vdi";
-    }
-    if starts(b"KDMV") || starts(b"COWD") || starts(b"# Disk DescriptorFile") {
-        return "vmdk";
-    }
-    if starts(b"vhdxfile") {
-        return "vhdx";
-    }
-    if starts(b"conectix") {
-        return "vpc";
-    }
-    if starts(b"LUKS\xba\xbe") {
-        return "luks";
-    }
-    if starts(b"Bochs Virtual HD Image") {
-        return "bochs";
-    }
-    if starts(b"WithoutFreeSpace") || starts(b"WithouFreSpacExt") {
-        return "parallels";
-    }
-    if starts(b"#!/bin/sh\n#V2.0 Format\n") {
-        return "cloop";
-    }
-    "raw"
 }
 
 #[cfg(test)]
@@ -233,15 +341,5 @@ mod tests {
         assert_eq!(r.adjust_offset(0, 512, false).unwrap(), 512);
         assert_eq!(r.adjust_offset(1, 512, true).unwrap_err().raw_os_error(), Some(libc::ENOSPC));
         assert_eq!(r.adjust_offset(1, 512, false).unwrap_err().raw_os_error(), Some(libc::EINVAL));
-    }
-
-    #[test]
-    fn probing() {
-        let mut b = [0u8; 512];
-        assert_eq!(probe_format(&b), "raw");
-        b[..8].copy_from_slice(b"QFI\xfb\0\0\0\x03");
-        assert_eq!(probe_format(&b), "qcow2");
-        b[..8].copy_from_slice(b"conectix");
-        assert_eq!(probe_format(&b), "vpc");
     }
 }
