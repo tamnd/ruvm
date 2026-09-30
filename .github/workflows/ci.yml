@@ -94,6 +94,18 @@ jobs:
         run: cargo build --workspace --profile ${{ matrix.profile }}
       - name: cargo test
         run: cargo test --workspace --profile ${{ matrix.profile }}
+      # The M0 exit criterion is that the dispatcher answers under QEMU's names on every host, so
+      # it is checked on the binary itself rather than assumed from the tests.
+      - name: ruvm answers as qemu-system-x86_64
+        shell: bash
+        env:
+          PROFILE_DIR: ${{ matrix.profile == 'dev' && 'debug' || 'release' }}
+        run: |
+          set -euo pipefail
+          exe=""
+          if [ "$RUNNER_OS" = "Windows" ]; then exe=".exe"; fi
+          "./target/$PROFILE_DIR/ruvm$exe" --version
+          "./target/$PROFILE_DIR/ruvm$exe" qemu-system-x86_64 --version | grep -q '^QEMU emulator version 11\.1\.0 (ruvm '
 
   docs:
     name: documentation
