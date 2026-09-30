@@ -7,7 +7,8 @@
 //! chardev with [`Chardev::attach`] and then gets each client connection on a thread of its
 //! own, until it detaches. A chardev takes one frontend at a time.
 //!
-//! Backends so far are `null` and `socket` on Unix and TCP sockets.
+//! Backends so far are `null` and `socket` on Unix and TCP sockets. [`opts`] turns `-chardev`
+//! and the old compat strings into backends.
 
 #![forbid(unsafe_code)]
 
@@ -16,9 +17,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use ruvm_base::{Error, Result};
+use ruvm_qapi::opts::{QemuOpts, is_help_option};
 use ruvm_qapi::types::{ChardevBackend, ChardevBackendU, ChardevInfo};
 
 pub mod conn;
+pub mod opts;
 pub mod socket;
 
 pub use conn::Connection;
@@ -202,6 +205,24 @@ impl Chardevs {
         }
         list.push(chr.clone());
         Ok(chr)
+    }
+
+    /// `qemu_chr_new_from_opts()` for a `-chardev` set. Gives `None` after printing the list of
+    /// backends for `-chardev help`.
+    pub fn new_from_opts(&self, opts: &QemuOpts) -> Result<Option<Arc<Chardev>>> {
+        let name = opts.get("backend");
+        if name.is_some_and(is_help_option) {
+            println!("{}", opts::backend_help());
+            return Ok(None);
+        }
+        let Some(id) = opts.id() else {
+            return Err(Error::generic("chardev: no id specified"));
+        };
+        let backend = opts::parse_opts(opts)?;
+        if opts.get_bool("mux", false) {
+            return Err(Error::generic("chardev backend 'mux' is not supported by ruvm yet"));
+        }
+        self.add_inner(id, &backend).map(Some)
     }
 
     /// `qmp_chardev_remove()`.
