@@ -826,6 +826,13 @@ version = "0.2.1"
 [[package]]
 name = "ruvm-target-x86"
 version = "0.2.1"
+dependencies = [
+ "kvm-bindings",
+ "kvm-ioctls",
+ "ruvm-accel-kvm",
+ "ruvm-mem",
+ "vmm-sys-util",
+]
 
 [[package]]
 name = "ruvm-target-xtensa"

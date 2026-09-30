@@ -468,6 +468,8 @@ pub struct X86CpuState {
     pub exception_injected: bool,
     /// The exception has an error code.
     pub has_error_code: bool,
+    /// Error code of the pending or injected exception.
+    pub error_code: u32,
     /// The exception carries a payload (CR2 or DR6).
     pub exception_has_payload: bool,
     /// Exception payload.
@@ -581,6 +583,7 @@ impl Default for X86CpuState {
             exception_pending: false,
             exception_injected: false,
             has_error_code: false,
+            error_code: 0,
             exception_has_payload: false,
             exception_payload: 0,
             triple_fault_pending: false,
