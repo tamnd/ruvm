@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Builds the `query-qmp-schema` reply from the vendored QAPI schema.
+//! Builds the `query-qmp-schema` reply and the Rust types from the vendored QAPI schema.
 //!
 //! The QObject, JSON and number formatting code is shared with the library through `#[path]`, so the reply is
 //! printed by the same writer QMP uses and comes out byte for byte as QEMU prints it.
@@ -134,4 +134,9 @@ fn main() {
     let out =
         Path::new(&std::env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("qmp-schema.json");
     std::fs::write(out, json).expect("write the schema");
+
+    let types = ruvm_qapi_gen::rust::gen_types(&schema, &is_set);
+    let out =
+        Path::new(&std::env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("qapi-types.rs");
+    std::fs::write(out, types).expect("write the types");
 }

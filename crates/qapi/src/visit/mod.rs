@@ -384,5 +384,12 @@ pub trait VisitorExt: Visitor {
 
 impl<V: Visitor + ?Sized> VisitorExt for V {}
 
+/// A type the generated `visit_type_FOO()` function exists for. Input visitors fill `obj` in,
+/// and on failure leave it at its default, the way the C code frees what it built and returns
+/// NULL. Output visitors read it.
+pub trait Visit: Default {
+    fn visit(v: &mut dyn Visitor, name: Option<&str>, obj: &mut Self) -> Result<()>;
+}
+
 #[cfg(test)]
 mod tests;

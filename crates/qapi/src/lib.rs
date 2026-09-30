@@ -15,6 +15,20 @@ pub mod json;
 mod qvalue;
 pub mod visit;
 
+/// The types of the QAPI schema, generated at build time by `ruvm_qapi_gen::rust`. Each has a
+/// [`visit::Visit`] implementation, and structs and unions also have `visit_members()`.
+#[allow(
+    missing_docs,
+    non_camel_case_types,
+    non_snake_case,
+    unused_qualifications,
+    clippy::all,
+    clippy::pedantic
+)]
+pub mod types {
+    include!(concat!(env!("OUT_DIR"), "/qapi-types.rs"));
+}
+
 pub use qvalue::{QDict, QType, QValue};
 
 /// The `query-qmp-schema` reply for this build, as QEMU would print it.

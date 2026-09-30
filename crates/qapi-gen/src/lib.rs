@@ -5,12 +5,13 @@
 //! The port keeps the Python code's structure and error messages so that later changes to
 //! scripts/qapi can be carried over by reading the diff. [`parser`] reads schema files,
 //! [`schema`] builds the entity model, and [`introspect`] produces what `query-qmp-schema`
-//! returns.
+//! returns. [`rust`] generates the Rust types and their visitors.
 
 #![forbid(unsafe_code)]
 
 pub mod introspect;
 pub mod parser;
+pub mod rust;
 pub mod schema;
 
 pub use introspect::{Annotated, Lit, introspect};

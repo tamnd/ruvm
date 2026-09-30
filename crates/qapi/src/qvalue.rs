@@ -7,8 +7,9 @@ use std::fmt;
 
 /// A QAPI value. `Int`, `Uint` and `Double` are the three kinds of `QNum`, kept apart because they
 /// print differently and because the input visitors care which one arrived.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum QValue {
+    #[default]
     Null,
     Bool(bool),
     Int(i64),
