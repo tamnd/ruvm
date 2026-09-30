@@ -6,6 +6,18 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.2.1
+
+This is the first patch on the way to M2, and most of it is the PC chipset. Nothing boots yet, but the devices a microvm or q35 guest touches first are ported and tested against QEMU's behavior at the register level.
+
+Guest RAM is now backed by an anonymous host mapping through `ruvm-sys` (#56), which is what KVM needs to map it into a guest. `ruvm-hw-core` has IRQ lines and device timers (#55) and fw_cfg with the DMA interface (#60).
+
+The legacy devices are in: the 16550 UART (#57), the MC146818 RTC (#58), the i8254 PIT and the i8259 PIC pair (#59), and the HPET and the IOAPIC (#61).
+
+`ruvm-accel-kvm` opens `/dev/kvm` with QEMU's checks and messages, sets up the in-kernel or split irqchip, keeps KVM memory slots in step with the guest memory map and runs vCPUs, sending port and MMIO exits into the address spaces (#62). CI now gives the Linux runner access to `/dev/kvm` so those tests run for real there.
+
+`ruvm-firmware` can work out a direct kernel boot: the bzImage setup header for every boot protocol, initrd placement, PVH kernels and the e820 table, all producing the fw_cfg items QEMU would add (#63).
+
 ## 0.2.0
 
 M1 is done. The core runtime pieces that every machine sits on are ported and checked against QEMU: QOM, QAPI and QMP, the monitor, chardevs, the option parser, vmstate, the memory API and the block layer core. ruvm still cannot run a guest, that is what M2 is for.
