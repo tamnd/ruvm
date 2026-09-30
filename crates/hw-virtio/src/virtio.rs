@@ -415,8 +415,18 @@ impl VirtIODevice {
                 self.name
             )));
         }
-        self.vqs.push(VirtQueue::new(size));
+        let mut q = VirtQueue::new(size);
+        // A queue added after the transport set the legacy alignment, which virtio-net does when
+        // the driver turns multiqueue on, gets the same alignment as the first one.
+        q.align = self.vqs.first().map_or(0, |first| first.align);
+        self.vqs.push(q);
         Ok((self.vqs.len() - 1) as u16)
+    }
+
+    /// `virtio_del_queue()` on every queue from `len` on: drops them from the end so that only
+    /// the first `len` are left.
+    pub fn truncate_queues(&mut self, len: usize) {
+        self.vqs.truncate(len);
     }
 
     /// The QOM type name the device was initialised with.
@@ -798,6 +808,23 @@ impl VirtIODevice {
         (in_total.min(max_in), out_total.min(max_out))
     }
 
+    /// Looks at the chain the next [`pop`](Self::pop) on queue `n` would return, without taking
+    /// it. Nothing in guest memory or in the queue changes. This stands in for
+    /// `virtqueue_unpop()`, which the packed ring code does not have: a device that might have
+    /// to give a chain back looks first instead.
+    pub fn peek(&self, n: u16) -> Option<DescriptorChain> {
+        if self.broken || self.is_disabled() {
+            return None;
+        }
+        let q = self.queue(n)?;
+        if q.desc == 0 {
+            return None;
+        }
+        let mut peek = q.ring.as_ref()?.clone();
+        peek.set_flags(false, has_feature(self.guest_features, VIRTIO_F_INDIRECT_DESC));
+        peek.pop(&*self.mem).ok().flatten()
+    }
+
     /// `virtio_notify()`: raises a used buffer interrupt for queue `n` if the driver wants one.
     pub fn notify(&mut self, n: u16) {
         if self.should_notify(n) {
@@ -907,6 +934,12 @@ pub trait VirtioDeviceClass: Any + Send + fmt::Debug {
 
     /// The driver kicked `queue`.
     fn handle_output(&mut self, vdev: &mut VirtIODevice, queue: u16);
+
+    /// The feature bits a modern transport hides from the driver, `VirtioDeviceClass`
+    /// `legacy_features`. virtio-net adds `VIRTIO_NET_F_GSO` to the common set.
+    fn legacy_features(&self) -> u64 {
+        VIRTIO_LEGACY_FEATURES
+    }
 
     /// For downcasting to the concrete model.
     fn as_any(&self) -> &dyn Any;
