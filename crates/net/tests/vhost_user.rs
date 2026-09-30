@@ -90,7 +90,18 @@ impl Fake {
         Fake { seen, thread: Some(thread) }
     }
 
+    /// The requests seen so far. Messages like SET_OWNER get no reply, so the frontend can
+    /// return before the fake has read them. Wait until the list stops growing first.
     fn requests(&self) -> Vec<u32> {
+        let mut last = usize::MAX;
+        for _ in 0..40 {
+            let n = self.seen.lock().unwrap().len();
+            if n == last {
+                break;
+            }
+            last = n;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         self.seen.lock().unwrap().iter().map(|(r, _)| r.to_owned()).collect()
     }
 
