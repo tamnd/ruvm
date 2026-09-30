@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.1.3
+
+QMP commands can be marshalled and dispatched now. There is no socket to send them over yet, that comes with the monitor.
+
+`ruvm-qapi-gen` generates a Rust type for every enum, struct, union and alternate in the schema, with visitors that make the same calls in the same order as QEMU's generated C, so bad arguments get the same errors (#31). Unions keep the tag inside the branch value, so the two cannot disagree.
+
+`ruvm-qapi` has `qmp_dispatch` and the command table, ported from qmp-dispatch.c and qmp-registry.c, and the build generates a `register_*` function for each of the 227 generated commands and an `event_*` builder for each event (#32). Request errors, the preconfig check, disabled commands, out of band execution and the `-compat` policy all behave as in QEMU.
+
 ## 0.1.2
 
 The object model is in, which is the first M1 piece that everything above it depends on.
