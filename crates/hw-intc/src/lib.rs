@@ -2,4 +2,9 @@
 
 //! Interrupt controllers: 8259, IOAPIC, LAPIC, GIC, PLIC, AIA, XICS, XIVE and board controllers.
 //!
-//! Empty for now. The plan for this crate is in `spec/24-workspace-layout.md`.
+//! So far the 8259 pair and the IOAPIC are here. The rest of the plan is in
+//! `spec/24-workspace-layout.md`.
+
+#![forbid(unsafe_code)]
+
+pub mod i8259;
