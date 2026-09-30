@@ -61,6 +61,10 @@ use crate::perm::{
 pub(crate) static LUKS: DriverDef = DriverDef::format("luks", luks_open_node)
     .with_probe(probe)
     .with_create_opts(create_opts)
+    .with_create_opts_list(&crate::tools::LUKS_CREATE_OPTS)
+    .with_amend_opts_list(&crate::tools::LUKS_AMEND_OPTS)
+    .with_measure(crate::tools::luks_measure)
+    .with_strong_opts(&["key-secret"])
     .with_create(create);
 
 /// `BLOCK_CRYPTO_MAX_IO_SIZE`: the bounce buffer size.

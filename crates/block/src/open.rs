@@ -140,7 +140,7 @@ fn parse_json_filename(filename: &str) -> Result<QDict> {
 }
 
 /// `path_is_absolute()`.
-fn path_is_absolute(p: &str) -> bool {
+pub(crate) fn path_is_absolute(p: &str) -> bool {
     #[cfg(windows)]
     {
         let b = p.as_bytes();
@@ -163,20 +163,27 @@ pub(crate) fn full_backing_filename(bs: &Node, backing: &str) -> Result<String> 
     {
         return Ok(backing.to_string());
     }
-    bs.refresh_filename();
-    let base = bs.meta.lock().unwrap().filename.clone();
-    // bdrv_dirname(): only plain file names have a directory.
-    if base.is_empty() || base.starts_with("json:") {
-        return Err(Error::generic(format!("Cannot use relative backing file names for '{base}'")));
+    Ok(format!("{}{backing}", dirname(bs)?))
+}
+
+/// `bdrv_dirname()`: the directory of the node's file, asked of the primary child where
+/// there is one. No driver has its own `.bdrv_dirname` yet.
+pub(crate) fn dirname(bs: &Node) -> Result<String> {
+    if let Some(child) = bs.primary_bs() {
+        return dirname(&child);
     }
-    let dir = match base.rfind('/') {
-        Some(i) => &base[..=i],
-        None => match drivers::protocol_prefix(&base) {
-            Some(p) => &base[..=p.len()],
-            None => "",
-        },
-    };
-    Ok(format!("{dir}{backing}"))
+    bs.refresh_filename();
+    let exact = bs.meta.lock().unwrap().exact_filename.clone();
+    if exact.is_empty() {
+        return Err(Error::generic(format!(
+            "Cannot generate a base directory for {} nodes",
+            bs.driver_name
+        )));
+    }
+    // path_combine(exact, ""): up to the last slash, or past the first colon.
+    let colon = exact.find(':').map_or(0, |i| i + 1);
+    let slash = exact.rfind('/').map_or(0, |i| i + 1);
+    Ok(exact[..colon.max(slash)].to_string())
 }
 
 impl BlockGraph {

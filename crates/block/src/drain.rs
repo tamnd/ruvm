@@ -44,6 +44,8 @@ pub(crate) fn aio_wait_while(mut cond: impl FnMut() -> bool) {
         let g = WAIT.lock().unwrap();
         let seen = *g;
         drop(g);
+        // The main loop runs its bottom halves while it waits.
+        crate::job::main_loop::poll_bhs();
         if !cond() {
             return;
         }

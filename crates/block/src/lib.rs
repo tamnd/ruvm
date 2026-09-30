@@ -16,6 +16,8 @@
 //! - the filters `blkdebug`, `blkverify`, `throttle` (with throttle groups), `copy-on-read`,
 //!   `preallocate` and `compress`;
 //! - `nbd` and `luks`, which live in their own modules.
+//! - the image formats `qed`, `qcow` (version 1), `parallels`, `dmg`, `cloop` and `bochs`, and
+//!   the `vvfat` protocol (`fat:` file names), each in its own module.
 //!
 //! On top sit [`BlockBackend`] from block/block-backend.c, what devices use, and legacy
 //! `-drive` from blockdev.c ([`BlockGraph::drive_new`]). Requests are synchronous: they run on
@@ -29,7 +31,12 @@
 
 pub mod accounting;
 mod backend;
+mod bitmap;
+mod block_copy;
+mod bochs;
+mod cloop;
 mod create;
+mod dmg;
 mod drain;
 mod drive;
 mod drivers;
@@ -39,21 +46,32 @@ mod file;
 mod filter;
 mod graph;
 mod graph_lock;
+mod imgopts;
 mod io;
+mod job;
 mod luks;
 pub mod nbd;
 mod node;
 mod open;
 mod ops;
+mod parallels;
 mod perm;
 mod probe;
 mod protocol;
+mod qcow;
+mod qed;
 mod query;
 mod raw;
 mod reopen;
 #[cfg(unix)]
 mod sys;
 pub mod throttle;
+pub mod tools;
+mod vdi;
+mod vhdx;
+mod vmdk;
+mod vpc;
+mod vvfat;
 
 pub use backend::BlockBackend;
 pub use drive::{BlockInterfaceType, DriveInfo};

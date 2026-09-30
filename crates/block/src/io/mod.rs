@@ -19,7 +19,7 @@
 //! - A request conflicting with a request of the same thread does not wait for it. In QEMU
 //!   that case is an assertion failure, because it would deadlock.
 //! - The block status cache of protocol nodes (`bdrv_bsc_*`) is not implemented; every
-//!   query goes to the driver. Dirty bitmaps are not updated by writes yet.
+//!   query goes to the driver.
 
 pub(crate) mod status;
 
@@ -91,6 +91,8 @@ pub(crate) struct IoState {
     flush_cond: Condvar,
     wr_highest_offset: AtomicU64,
     write_threshold: AtomicU64,
+    /// `dirty_bitmaps`.
+    pub(crate) dirty_bitmaps: crate::bitmap::DirtyBitmapList,
 }
 
 impl IoState {
@@ -765,9 +767,13 @@ impl Node {
         {
             self.set_total_sectors(end_sector);
             self.parent_cb_resize();
+            self.dirty_bitmap_truncate(end_sector as u64 * BDRV_SECTOR_SIZE);
         }
         if req.bytes > 0 && req.ty == ReqType::Write {
             self.io.wr_highest_offset.fetch_max(offset + bytes, Ordering::SeqCst);
+        }
+        if req.bytes > 0 && (req.ty == ReqType::Write || req.ty == ReqType::Discard) {
+            self.set_dirty(offset, bytes);
         }
     }
 

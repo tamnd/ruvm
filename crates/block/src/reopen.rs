@@ -716,7 +716,6 @@ fn commit(e: &mut Entry) {
 
 impl Node {
     /// `bdrv_reopen()`: reopens this node (and the children it opened) with `options`.
-    #[cfg(test)]
     pub(crate) fn reopen(self: &Arc<Self>, options: QDict, keep_old_opts: bool) -> Result<()> {
         let mut q = ReopenQueue::new(None);
         q.add(self, options, keep_old_opts);
@@ -724,7 +723,6 @@ impl Node {
     }
 
     /// `bdrv_reopen_set_read_only()`.
-    #[cfg(test)]
     pub(crate) fn reopen_set_read_only(self: &Arc<Self>, read_only: bool) -> Result<()> {
         let mut o = QDict::new();
         o.put("read-only", read_only);

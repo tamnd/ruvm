@@ -19,7 +19,16 @@ publish = false
 #   io_destroy, and pushing a submission queue entry onto an io_uring.
 unsafe-budget = 8
 
+[features]
+default = ["dmg-bzip2"]
+# The dmg chunk decompressors QEMU builds as the dmg-bz2 and dmg-lzfse modules. Both decoders
+# are in this crate; without the feature a chunk of that kind fails with QEMU's message for a
+# missing module.
+dmg-bzip2 = []
+dmg-lzfse = []
+
 [dependencies]
+flate2.workspace = true
 libc.workspace = true
 ruvm-base.workspace = true
 ruvm-crypto.workspace = true

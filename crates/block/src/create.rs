@@ -32,6 +32,29 @@ impl BlockGraph {
         create(self, options.u)
     }
 
+    /// `bdrv_create()` as `qemu-img create` calls it: runs the `.bdrv_co_create_opts` of the
+    /// format driver `format` on `filename`. `options` holds the `-o` options as strings, with
+    /// `size`; the driver (and the protocol driver below it) take out what they know, and what
+    /// is left is for the caller to report.
+    pub fn create_image(&self, format: &str, filename: &str, options: &mut QDict) -> Result<()> {
+        let Some(drv) = drivers::find_format(format) else {
+            return Err(Error::generic(format!("Unknown file format '{format}'")));
+        };
+        let Some(create_opts) = drv.create_opts else {
+            return Err(Error::generic(format!(
+                "Driver '{}' does not support image creation",
+                drv.format_name
+            )));
+        };
+        create_opts(filename, options)
+    }
+
+    /// The `create_opts` list of the format driver `format`, in QEMU's declaration order, for
+    /// `qemu-img create -o help` and the `Formatting ...` line. `None` for an unknown format.
+    pub fn create_opts_list(format: &str) -> Option<&'static [ruvm_qapi::opts::QemuOptDesc]> {
+        drivers::find_format(format).map(|d| d.create_opts_list)
+    }
+
     /// `bdrv_co_create_file()`: creates `filename` with the protocol driver its name picks,
     /// from `qemu-img create` style options. The driver takes out the options it knows;
     /// `options` keeps the rest.

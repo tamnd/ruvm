@@ -22,6 +22,9 @@ use crate::probe::{BLOCK_PROBE_BUF_SIZE, probe_format, raw_probe};
 /// The `raw` format driver, `bdrv_raw`.
 pub(crate) static RAW: DriverDef = DriverDef::format("raw", raw_open_node)
     .with_probe(raw_probe)
+    .with_create_opts(crate::tools::raw_co_create_opts)
+    .with_create_opts_list(&crate::tools::RAW_CREATE_OPTS)
+    .with_measure(crate::tools::raw_measure)
     .with_mutable_opts(&["offset", "size"])
     .with_strong_opts(&["offset", "size"]);
 
@@ -166,6 +169,16 @@ impl RawDriver {
 }
 
 impl Driver for RawDriver {
+    /// `raw_co_get_info()`: whatever the file says.
+    fn get_info(&self, bs: &Node) -> Option<io::Result<crate::node::BlockDriverInfo>> {
+        Some(bs.file().get_info())
+    }
+
+    /// `raw_has_zero_init()`: whatever the file says.
+    fn has_zero_init(&self, bs: &Node) -> Option<bool> {
+        Some(bs.file().has_zero_init())
+    }
+
     fn pread(&self, bs: &Node, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let off = self.adjust_offset(offset, buf.len() as u64, false)?;
         bs.file().pread(off, buf)
@@ -215,6 +228,25 @@ impl Driver for RawDriver {
         }
         self.size.store(len, Ordering::Relaxed);
         bs.file().truncate(len + self.off())
+    }
+
+    /// `raw_co_truncate()` with the preallocation mode, which goes on to the child.
+    fn truncate_full(
+        &self,
+        bs: &Node,
+        len: u64,
+        exact: bool,
+        prealloc: ruvm_qapi::types::PreallocMode,
+        flags: u32,
+    ) -> Result<()> {
+        if self.has_size() {
+            return Err(Error::generic("Cannot resize fixed-size raw disks"));
+        }
+        if i64::MAX as u64 - len < self.off() {
+            return Err(Error::generic("Disk size too large for the chosen offset"));
+        }
+        self.size.store(len, Ordering::Relaxed);
+        bs.file().truncate_full((len + self.off()) as i64, exact, prealloc, flags)
     }
 
     /// `raw_co_block_status()`: everything is where the child has it.

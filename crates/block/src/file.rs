@@ -444,6 +444,29 @@ fn translate_err(e: io::Error) -> io::Error {
     }
 }
 
+/// `find_allocation()`: `(data, hole)` around `start`. Where `start` is in data, `data` is
+/// `start` and `hole` where the next hole begins; where it is in a hole that is not at the
+/// end, `hole` is `start` and `data` where the next data begins. `ENXIO` means a trailing
+/// hole or past the end.
+fn find_allocation(file: &File, start: u64) -> io::Result<(u64, u64)> {
+    use rustix::fs::{SeekFrom, seek};
+    let offs = seek(file, SeekFrom::Data(start)).map_err(io::Error::from)?;
+    if offs < start {
+        return Err(errno(libc::EIO));
+    }
+    if offs > start {
+        return Ok((offs, start));
+    }
+    let offs = seek(file, SeekFrom::Hole(start)).map_err(io::Error::from)?;
+    if offs < start {
+        return Err(errno(libc::EIO));
+    }
+    if offs > start {
+        return Ok((start, offs));
+    }
+    Err(errno(libc::EBUSY))
+}
+
 /// `do_fallocate()`: `fallocate()` retried on `EINTR`, with [`translate_err`].
 #[cfg(target_os = "linux")]
 fn do_fallocate(
@@ -824,6 +847,69 @@ impl FileDriver {
 }
 
 impl Driver for FileDriver {
+    /// `raw_co_block_status()`: holes found with `SEEK_DATA` and `SEEK_HOLE` read as zeroes.
+    /// Only the `file` driver has it.
+    fn block_status(
+        &self,
+        bs: &Node,
+        want: u32,
+        offset: u64,
+        bytes: u64,
+    ) -> Option<io::Result<crate::node::BlockStatus>> {
+        use crate::node::{
+            BDRV_BLOCK_DATA, BDRV_BLOCK_OFFSET_VALID, BDRV_BLOCK_ZERO, BDRV_WANT_ZERO,
+            BlockStatus,
+        };
+        if !matches!(self.kind, FileKind::File) {
+            return None;
+        }
+        let me = Some(bs.arc());
+        if want & BDRV_WANT_ZERO == 0 {
+            // No backing file: everything is allocated in this file.
+            let ret = BDRV_BLOCK_DATA | BDRV_BLOCK_OFFSET_VALID;
+            return Some(Ok(BlockStatus { ret, pnum: bytes, map: offset, file: me }));
+        }
+        let r = find_allocation(&self.file.read().unwrap(), offset);
+        let (ret, pnum) = match r {
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => (BDRV_BLOCK_ZERO, bytes),
+            // Nothing known, so pretend there are no holes.
+            Err(_) => (BDRV_BLOCK_DATA, bytes),
+            Ok((data, hole)) if data == offset => {
+                // A partial sector at the end of the file is rounded up.
+                let align = u64::from(self.request_alignment.load(Ordering::Relaxed)).max(1);
+                (BDRV_BLOCK_DATA, (hole - offset).div_ceil(align) * align)
+            }
+            Ok((data, _)) => (BDRV_BLOCK_ZERO, data - offset),
+        };
+        Some(Ok(BlockStatus { ret: ret | BDRV_BLOCK_OFFSET_VALID, pnum, map: offset, file: me }))
+    }
+
+    /// `raw_co_get_info()`: nothing to report, but it succeeds.
+    fn get_info(&self, _bs: &Node) -> Option<io::Result<crate::node::BlockDriverInfo>> {
+        Some(Ok(crate::node::BlockDriverInfo::default()))
+    }
+
+    /// `bdrv_has_zero_init_1()` for regular files; devices have no `.bdrv_has_zero_init`.
+    fn has_zero_init(&self, _bs: &Node) -> Option<bool> {
+        (self.kind == FileKind::File).then_some(true)
+    }
+
+    /// `raw_get_specific_info()`: the extent size hint is never set here.
+    fn get_specific_info(
+        &self,
+        _bs: &Node,
+    ) -> Result<Option<ruvm_qapi::types::ImageInfoSpecific>> {
+        use ruvm_qapi::types::{
+            ImageInfoSpecific, ImageInfoSpecificFile, ImageInfoSpecificFileWrapper,
+            ImageInfoSpecificU,
+        };
+        Ok(Some(ImageInfoSpecific {
+            u: ImageInfoSpecificU::File(ImageInfoSpecificFileWrapper {
+                data: ImageInfoSpecificFile::default(),
+            }),
+        }))
+    }
+
     fn pread(&self, _bs: &Node, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let file = self.file.read().unwrap();
         let align = self.align();
@@ -1185,6 +1271,7 @@ pub(crate) static FILE: DriverDef = DriverDef::protocol("file", "file", file_ope
     .with_needs_filename()
     .with_create(file_co_create)
     .with_create_opts(file_co_create_opts)
+    .with_create_opts_list(&crate::tools::FILE_CREATE_OPTS)
     .with_mutable_opts(MUTABLE_OPTS);
 
 /// `mutable_opts` of the file-posix drivers.
@@ -1316,6 +1403,14 @@ fn raw_co_create(o: BlockdevCreateOptionsFile) -> Result<()> {
     r
 }
 
+/// `allocate_first_block()`: writes zeroes over the first block of a new file, so that the
+/// alignment probing finds allocated data there. Errors are ignored.
+fn allocate_first_block(file: &File, max_size: u64) {
+    const MAX_BLOCKSIZE: usize = 4096;
+    let write_size = if max_size < MAX_BLOCKSIZE as u64 { 512 } else { MAX_BLOCKSIZE };
+    let _ = file.write_all_at(&[0u8; MAX_BLOCKSIZE][..write_size], 0);
+}
+
 /// `handle_aiocb_truncate()`: resizes `file` to `offset` with `prealloc`.
 fn regular_truncate(file: &File, offset: u64, prealloc: PreallocMode) -> Result<()> {
     let current = file.metadata().map_err(|e| Error::from_io("Could not stat file", e))?.len();
@@ -1328,13 +1423,19 @@ fn regular_truncate(file: &File, offset: u64, prealloc: PreallocMode) -> Result<
             if offset == current {
                 return Ok(());
             }
-            rustix::fs::fallocate(
+            let r = rustix::fs::fallocate(
                 file,
                 rustix::fs::FallocateFlags::empty(),
                 current,
                 offset - current,
             )
-            .map_err(|e| Error::from_io("Could not preallocate new data", e.into()))
+            .map_err(|e| Error::from_io("Could not preallocate new data", e.into()));
+            if r.is_ok() && current == 0 {
+                // Reads from a fallocated area succeed at any alignment, so the alignment
+                // probing needs the first block written.
+                allocate_first_block(file, offset);
+            }
+            r
         }
         PreallocMode::Full => (|| {
             file.set_len(offset).map_err(|e| Error::from_io("Could not resize file", e))?;
@@ -1349,7 +1450,12 @@ fn regular_truncate(file: &File, offset: u64, prealloc: PreallocMode) -> Result<
             file.sync_all().map_err(|e| Error::from_io("Could not flush file to disk", e))
         })(),
         PreallocMode::Off => {
-            return file.set_len(offset).map_err(|e| Error::from_io("Could not resize file", e));
+            file.set_len(offset).map_err(|e| Error::from_io("Could not resize file", e))?;
+            if current == 0 && offset > current {
+                // Makes the alignment probing of later opens quicker; failures do not matter.
+                allocate_first_block(file, offset);
+            }
+            return Ok(());
         }
         other => {
             return Err(Error::generic(format!(

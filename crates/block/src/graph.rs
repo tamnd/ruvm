@@ -110,7 +110,10 @@ pub(crate) struct Inherited {
     /// Children default to `discard=unmap`, the root to `ignore`.
     pub unmap: bool,
     /// `BDRV_O_NATIVE_AIO`: `-drive aio=native`, the default of `aio` for `file` nodes.
-    pub native_aio: bool,
+    pub native_aio: bool,    /// `BDRV_O_NO_IO`: the tools open images only to look at their metadata.
+    pub no_io: bool,
+    /// `BDRV_O_CHECK`: opened for `qemu-img check`.
+    pub check: bool,
 }
 
 /// How a node is being opened.
@@ -160,6 +163,8 @@ pub(crate) fn child_ctx(
             force_share: parent.force_share,
             unmap: true,
             native_aio: false,
+            no_io: parent.no_io,
+            check: parent.check,
         },
         probed: false,
         detect_zeroes: None,
@@ -285,7 +290,7 @@ impl BlockGraph {
 
     /// `id_generate(ID_BLOCK)`: `#block` followed by a counter and two digits. QEMU uses a
     /// random number for the last two, a fixed one is just as unique.
-    fn generate_name(&self) -> String {
+    pub(crate) fn generate_name(&self) -> String {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
         format!("#block{n}{:02}", n % 100)
     }
@@ -379,7 +384,8 @@ impl BlockGraph {
             auto_read_only,
             allow_rdwr: !read_only,
             inactive: !opts.active.unwrap_or(true),
-            ..NodeFlags::default()
+            no_io: inh.no_io,
+            check: inh.check,
         };
         if flags.force_share && !flags.read_only {
             return Err(Error::generic("force-share=on can only be used with read-only images"));

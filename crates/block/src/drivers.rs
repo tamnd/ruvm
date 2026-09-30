@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use ruvm_base::{Error, Result};
 use ruvm_qapi::QDict;
+use ruvm_qapi::opts::QemuOptDesc;
 use ruvm_qapi::types::{BlockdevCreateOptionsU, BlockdevOptionsU, BlockdevRef, BlockdevRefOrNull};
 
 use crate::graph::{BlockGraph, OpenCtx, Pending};
@@ -42,6 +43,17 @@ pub(crate) type ParseFilenameFn = fn(filename: &str, options: &mut QDict) -> Res
 /// left is reported as unsupported by the caller.
 pub(crate) type CreateOptsFn = fn(filename: &str, options: &mut QDict) -> Result<()>;
 
+/// `.bdrv_amend_options`: changes the options of an open image from `qemu-img amend -o`
+/// options. `options` holds them as strings; the driver takes out what it knows.
+pub(crate) type AmendOptsFn = fn(bs: &Node, options: &mut QDict, force: bool) -> Result<()>;
+
+/// `.bdrv_measure`: the sizes a new image made from `qemu-img create` style `options` (or
+/// converted from `in_bs`) needs.
+pub(crate) type MeasureFn = fn(
+    options: &mut QDict,
+    in_bs: Option<&Node>,
+) -> Result<ruvm_qapi::types::BlockMeasureInfo>;
+
 /// `.bdrv_co_create`: `blockdev-create` for the driver.
 pub(crate) type CreateFn = fn(graph: &BlockGraph, options: BlockdevCreateOptionsU) -> Result<()>;
 
@@ -57,6 +69,10 @@ pub(crate) struct DriverDef {
     pub probe_device: Option<ProbeDeviceFn>,
     pub parse_filename: Option<ParseFilenameFn>,
     pub create_opts: Option<CreateOptsFn>,
+    /// `create_opts`, the `QemuOptsList` of `-o` options `qemu-img create` takes, in QEMU's
+    /// declaration order (the order of the `Formatting ...` line). Empty for drivers that
+    /// have not ported theirs.
+    pub create_opts_list: &'static [QemuOptDesc],
     pub create: Option<CreateFn>,
     /// `bdrv_needs_filename`: `filename` stays in the options after `parse_filename`.
     pub needs_filename: bool,
@@ -74,6 +90,14 @@ pub(crate) struct DriverDef {
     /// `strong_runtime_opts`: the driver options that change what the node reads and
     /// writes. A name ending in `.` stands for every option with that prefix.
     pub strong_runtime_opts: &'static [&'static str],
+    /// `amend_opts`, the `-o` options `qemu-img amend` takes, in QEMU's declaration order.
+    pub amend_opts_list: &'static [QemuOptDesc],
+    /// `.bdrv_amend_options`. Without it, a driver with an `amend_opts_list` is amended
+    /// through its `x-blockdev-amend` function with the options visited like
+    /// `qobject_input_visitor_new_flat_confused()` does.
+    pub amend_opts: Option<AmendOptsFn>,
+    /// `.bdrv_measure`.
+    pub measure: Option<MeasureFn>,
 }
 
 impl DriverDef {
@@ -86,6 +110,7 @@ impl DriverDef {
             probe_device: None,
             parse_filename: None,
             create_opts: None,
+            create_opts_list: &[],
             create: None,
             needs_filename: false,
             is_filter: false,
@@ -94,6 +119,9 @@ impl DriverDef {
             filtered_child_is_backing: false,
             mutable_opts: &[],
             strong_runtime_opts: &[],
+            amend_opts_list: &[],
+            amend_opts: None,
+            measure: None,
         }
     }
 
@@ -142,6 +170,32 @@ impl DriverDef {
 
     pub(crate) const fn with_create_opts(mut self, f: CreateOptsFn) -> Self {
         self.create_opts = Some(f);
+        self
+    }
+
+    /// The `-o` options of `qemu-img create`, `create_opts` of the driver.
+    pub(crate) const fn with_create_opts_list(mut self, list: &'static [QemuOptDesc]) -> Self {
+        self.create_opts_list = list;
+        self
+    }
+
+    /// The `-o` options of `qemu-img amend`, `amend_opts` of the driver.
+    #[allow(dead_code, reason = "for the formats that port their amend options")]
+    pub(crate) const fn with_amend_opts_list(mut self, list: &'static [QemuOptDesc]) -> Self {
+        self.amend_opts_list = list;
+        self
+    }
+
+    /// `.bdrv_amend_options`, see [`DriverDef::amend_opts`].
+    #[allow(dead_code, reason = "for the formats that port their amend options")]
+    pub(crate) const fn with_amend_opts(mut self, f: AmendOptsFn) -> Self {
+        self.amend_opts = Some(f);
+        self
+    }
+
+    /// `.bdrv_measure`.
+    pub(crate) const fn with_measure(mut self, f: MeasureFn) -> Self {
+        self.measure = Some(f);
         self
     }
 
@@ -203,10 +257,23 @@ pub(crate) static DRIVERS: &[&DriverDef] = &[
     &crate::filter::preallocate::PREALLOCATE,
     &crate::filter::blkverify::BLKVERIFY,
     &crate::filter::throttle::THROTTLE,
+    &crate::filter::copy_before_write::COPY_BEFORE_WRITE,
+    &crate::filter::snapshot_access::SNAPSHOT_ACCESS,
     &crate::nbd::NBD,
     &crate::nbd::NBD_TCP,
     &crate::nbd::NBD_UNIX,
     &crate::luks::LUKS,
+    &crate::qcow::QCOW,
+    &crate::qed::QED,
+    &crate::parallels::PARALLELS,
+    &crate::bochs::BOCHS,
+    &crate::cloop::CLOOP,
+    &crate::dmg::DMG,
+    &crate::vvfat::VVFAT,
+    &crate::vmdk::VMDK,
+    &crate::vhdx::VHDX,
+    &crate::vpc::VPC,
+    &crate::vdi::VDI,
 ];
 
 /// `bdrv_find_format()`.
