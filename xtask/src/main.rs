@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
+mod boot_smoke;
 mod layers;
 mod provenance;
 mod style;
@@ -24,6 +25,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = root();
     let result = match args.first().map(String::as_str) {
+        Some("boot-smoke") => boot_smoke::run(&root),
         Some("layers") => layers::check(&root),
         Some("provenance") => provenance::check(&root),
         Some("unsafe-audit") => unsafe_audit::check(&root),
@@ -54,6 +56,7 @@ fn usage() {
     println!(
         "cargo xtask <task>
 
+  boot-smoke     boot Linux on microvm and q35 under KVM, time it and check the microvm budget
   layers         check the layer rule against xtask/layers.toml
   provenance     check that no permissive crate depends on a GPL crate, and the SPDX headers
   unsafe-audit   count unsafe items per crate against the budget in its manifest
