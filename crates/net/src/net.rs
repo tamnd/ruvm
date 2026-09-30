@@ -8,7 +8,10 @@
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::BuildHasher;
+#[cfg(unix)]
 use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::OwnedSocket as OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -31,8 +34,49 @@ pub const MAX_NICS: usize = 8;
 /// `DEV_NVECTORS_UNSPECIFIED`.
 pub const DEV_NVECTORS_UNSPECIFIED: i32 = -1;
 
-/// The backends `-netdev help` lists.
+/// The backends `-netdev help` lists, in QEMU's order.
+#[cfg(target_os = "linux")]
+pub const AVAILABLE_NETDEVS: &[&str] = &[
+    "socket",
+    "stream",
+    "dgram",
+    "hubport",
+    "tap",
+    "passt",
+    #[cfg(feature = "slirp")]
+    "user",
+    "vhost-user",
+];
+/// The backends `-netdev help` lists, in QEMU's order.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub const AVAILABLE_NETDEVS: &[&str] = &[
+    "socket",
+    "stream",
+    "dgram",
+    "hubport",
+    "tap",
+    #[cfg(feature = "slirp")]
+    "user",
+    "vhost-user",
+];
+/// The backends `-netdev help` lists, in QEMU's order.
+#[cfg(not(unix))]
 pub const AVAILABLE_NETDEVS: &[&str] = &["socket", "stream", "dgram", "hubport", "tap"];
+
+/// A descriptor number as `fd=` gives it. Windows has no such numbers, but the parsing is the same.
+#[cfg(windows)]
+type RawFd = i32;
+
+#[cfg(unix)]
+fn into_raw(fd: OwnedFd) -> RawFd {
+    fd.into_raw_fd()
+}
+
+#[cfg(windows)]
+fn into_raw(fd: OwnedFd) -> RawFd {
+    use std::os::windows::io::IntoRawSocket;
+    fd.into_raw_socket() as RawFd
+}
 
 /// Looks up a descriptor the monitor was given under a name, `monitor_get_fd()`.
 pub type FdResolver = Box<dyn FnMut(&str) -> Result<OwnedFd> + Send>;
@@ -124,6 +168,10 @@ fn init_fun(driver: NetClientDriver) -> Option<InitFn> {
         NetClientDriver::Stream => Some(crate::stream::net_init_stream),
         #[cfg(unix)]
         NetClientDriver::Dgram => Some(crate::dgram::net_init_dgram),
+        #[cfg(all(unix, feature = "slirp"))]
+        NetClientDriver::User => Some(crate::slirp::net_init_slirp),
+        #[cfg(unix)]
+        NetClientDriver::VhostUser => Some(crate::vhost_user::net_init_vhost_user),
         _ => None,
     }
 }
@@ -143,6 +191,8 @@ pub struct Net {
     modern: Vec<Netdev>,
     vm_running: Arc<AtomicBool>,
     fd_resolver: Option<FdResolver>,
+    #[cfg(unix)]
+    pub(crate) chardev_resolver: Option<crate::vhost_user::ChardevResolver>,
     qtest: bool,
 }
 
@@ -191,6 +241,8 @@ impl Net {
             modern: Vec::new(),
             vm_running: Arc::new(AtomicBool::new(true)),
             fd_resolver: None,
+            #[cfg(unix)]
+            chardev_resolver: None,
             qtest: false,
         }
     }
@@ -633,7 +685,7 @@ impl Net {
         let digit = name.as_bytes().first().is_some_and(u8::is_ascii_digit);
         if !digit {
             if let Some(resolve) = self.fd_resolver.as_mut() {
-                return resolve(name).map(IntoRawFd::into_raw_fd);
+                return resolve(name).map(into_raw);
             }
         }
         match name.parse::<i64>() {
@@ -836,9 +888,34 @@ impl Net {
             opts.set_id(Some(id));
         }
         let mut v = OptsVisitor::new(opts);
+        #[cfg(target_os = "linux")]
+        if opts.get("type") == Some("passt") {
+            let (id, passt) = crate::passt::visit_netdev(&mut v)?;
+            return self.passt_init1(&id, &passt, is_netdev);
+        }
         let mut nd = Netdev::default();
         Netdev::visit(&mut v, None, &mut nd)?;
         self.client_init1(&nd, is_netdev)
+    }
+
+    /// `net_client_init1()` for `type=passt`, which has no `Netdev` branch here.
+    #[cfg(target_os = "linux")]
+    fn passt_init1(
+        &mut self,
+        id: &str,
+        passt: &crate::passt::PasstOptions,
+        is_netdev: bool,
+    ) -> Result<()> {
+        let peer = if is_netdev { None } else { Some(self.hub_add_port(0, None, None)) };
+        if self.find_netdev(id).is_some() {
+            return Err(Error::generic(format!("Duplicate ID '{id}'")));
+        }
+        crate::passt::net_init_passt(self, passt, id, peer)?;
+        if is_netdev {
+            let nc = self.find_netdev(id).expect("backend registered its client");
+            nc.set_is_netdev();
+        }
+        Ok(())
     }
 
     /// `net_client_init1()`.
@@ -911,6 +988,51 @@ impl Net {
             return Err(Error::generic("Parameter 'id' expects an identifier"));
         }
         self.client_init1(netdev, true)
+    }
+
+    /// `hostfwd_add [netdev_id] [tcp|udp|unix]:[hostaddr]:hostport-[guestaddr]:guestport`:
+    /// adds a host forwarding rule to the `user` backend `id`, or to the first one.
+    pub fn hostfwd_add(&self, id: Option<&str>, redir: &str) -> Result<()> {
+        #[cfg(all(unix, feature = "slirp"))]
+        return crate::slirp::hostfwd_add(self, id, redir);
+        #[cfg(not(all(unix, feature = "slirp")))]
+        {
+            let _ = redir;
+            Err(self.no_usernet(id))
+        }
+    }
+
+    /// `hostfwd_remove [netdev_id] [tcp|udp]:[hostaddr]:hostport`. A backend that cannot be
+    /// found is an error; otherwise the result is the line the monitor prints, which says
+    /// whether the rule was removed, or "invalid format".
+    pub fn hostfwd_remove(&self, id: Option<&str>, src: &str) -> Result<String> {
+        #[cfg(all(unix, feature = "slirp"))]
+        return crate::slirp::hostfwd_remove(self, id, src);
+        #[cfg(not(all(unix, feature = "slirp")))]
+        {
+            let _ = src;
+            Err(self.no_usernet(id))
+        }
+    }
+
+    /// `info usernet`: the connections of every `user` backend.
+    pub fn info_usernet(&self) -> String {
+        #[cfg(all(unix, feature = "slirp"))]
+        return crate::slirp::info_usernet(self);
+        #[cfg(not(all(unix, feature = "slirp")))]
+        String::new()
+    }
+
+    /// The error `slirp_lookup()` gives when there are no `user` backends at all.
+    #[cfg(not(all(unix, feature = "slirp")))]
+    fn no_usernet(&self, id: Option<&str>) -> Error {
+        match id {
+            Some(id) if self.find_netdev(id).is_none() => {
+                Error::generic(format!("unrecognized netdev id '{id}'"))
+            }
+            Some(_) => Error::generic("invalid device specified"),
+            None => Error::generic("user mode network stack not in use"),
+        }
     }
 }
 

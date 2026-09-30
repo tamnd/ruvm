@@ -47,6 +47,15 @@ pub(crate) enum Flavour {
 /// holds up nobody else.
 pub(crate) type Connector = Box<dyn Fn() -> Result<OwnedFd> + Send + Sync>;
 
+/// What a backend that owns the other end of the stream (passt) does when it goes away.
+pub(crate) trait SockHooks: Send + Sync {
+    /// The connection ended. Returns a fresh connection to use in its place, if there is one.
+    fn restart(&self, nc: &NetClient) -> Option<OwnedFd>;
+
+    /// The client is being deleted.
+    fn cleanup(&self);
+}
+
 /// How to set a [`Sock`] up.
 pub(crate) struct SockConfig {
     pub(crate) framing: Framing,
@@ -66,6 +75,7 @@ pub(crate) struct SockConfig {
     pub(crate) info: String,
     /// A Unix socket path to remove at cleanup.
     pub(crate) unlink: Option<PathBuf>,
+    pub(crate) hooks: Option<Arc<dyn SockHooks>>,
 }
 
 impl SockConfig {
@@ -81,6 +91,7 @@ impl SockConfig {
             dest: None,
             info: String::new(),
             unlink: None,
+            hooks: None,
         }
     }
 }
@@ -104,6 +115,7 @@ pub(crate) struct Sock {
     reconnect_ms: u64,
     reconnect_at: Mutex<Option<Instant>>,
     unlink: Mutex<Option<PathBuf>>,
+    hooks: Option<Arc<dyn SockHooks>>,
     io: OnceLock<IoThread>,
 }
 
@@ -137,6 +149,7 @@ pub(crate) fn new_sock(
         dest,
         info,
         unlink,
+        hooks,
     } = cfg;
     let has_fd = fd.is_some();
     let has_listen = listen_fd.is_some();
@@ -161,6 +174,7 @@ pub(crate) fn new_sock(
             reconnect_ms,
             reconnect_at: Mutex::new(connect_now.then(Instant::now)),
             unlink: Mutex::new(unlink),
+            hooks,
             io: OnceLock::new(),
         });
         state = Some(s.clone());
@@ -301,6 +315,16 @@ impl Sock {
         if self.flavour == Flavour::Stream {
             self.arm_reconnect();
         }
+        if let Some(hooks) = &self.hooks {
+            let Some(nc) = self.nc.upgrade() else {
+                return;
+            };
+            if let Some(fd) = hooks.restart(&nc) {
+                if unblock(&fd).is_ok() {
+                    self.install(fd);
+                }
+            }
+        }
     }
 
     /// `net_stream_arm_reconnect()`.
@@ -312,6 +336,15 @@ impl Sock {
         if at.is_none() {
             self.set_info("connecting");
             *at = Some(Instant::now() + Duration::from_millis(self.reconnect_ms));
+        }
+    }
+
+    /// Hands a connected socket to a client made without one.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn attach(&self, fd: OwnedFd) {
+        if unblock(&fd).is_ok() {
+            self.install(fd);
+            self.wake();
         }
     }
 
@@ -473,6 +506,9 @@ impl NetClientOps for Sock {
         lock(&self.listen_fd).take();
         if let Some(path) = lock(&self.unlink).take() {
             let _ = std::fs::remove_file(path);
+        }
+        if let Some(hooks) = &self.hooks {
+            hooks.cleanup();
         }
     }
 }

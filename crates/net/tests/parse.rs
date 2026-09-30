@@ -14,7 +14,14 @@ fn generic_errors() {
     assert_eq!(netdev_err("nosuch,id=x"), "Parameter 'type' does not accept value 'nosuch'");
     assert_eq!(netdev_err("nic,id=x"), "network backend 'nic' is not compiled into this binary");
     assert_eq!(netdev_err("vde,id=x"), "network backend 'vde' is not compiled into this binary");
-    assert_eq!(netdev_err("user,id=x"), "network backend 'user' is not compiled into this binary");
+    assert_eq!(
+        netdev_err("vhost-vdpa,id=x"),
+        "network backend 'vhost-vdpa' is not compiled into this binary"
+    );
+    assert_eq!(
+        netdev_err("vhost-vdpa,id=x,vhostdev=/dev/vhost-vdpa-0,queues=2,x-svq=on"),
+        "network backend 'vhost-vdpa' is not compiled into this binary"
+    );
 
     let mut net = Net::new();
     net.parse_netdev("hubport,id=d,hubid=0").unwrap();

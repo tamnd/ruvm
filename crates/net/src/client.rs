@@ -145,6 +145,12 @@ pub trait NetClientOps: Send + Sync {
         let _ = (nc, is_be);
         None
     }
+
+    /// The state behind the client, for code that knows its concrete type, the way QEMU uses
+    /// `DO_UPCAST` on a `NetClientState`. `None` for clients that do not offer it.
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {

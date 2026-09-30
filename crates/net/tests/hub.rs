@@ -119,16 +119,11 @@ fn hubport_is_rejected_with_net() {
 }
 
 #[test]
-fn user_backend_is_not_compiled() {
+fn vde_backend_is_not_compiled() {
     let mut net = Net::new();
-    net.parse_net("user,hostfwd=tcp::2222-:22").unwrap();
+    net.parse_net("vde,sock=/tmp/x").unwrap();
     let e = net.init_clients().unwrap_err();
-    assert_eq!(e.message(), "network backend 'user' is not compiled into this binary");
-
-    assert_eq!(
-        common::netdev_err("user,id=u0,net=10.0.2.0/24"),
-        "network backend 'user' is not compiled into this binary"
-    );
+    assert_eq!(e.message(), "network backend 'vde' is not compiled into this binary");
 }
 
 #[test]

@@ -10,8 +10,17 @@ homepage.workspace = true
 authors.workspace = true
 publish = false
 
+# The unsafe items are the descriptor adoption in fd.rs, the libslirp binding in slirp/ffi.rs and
+# the calls into it in slirp/, which cross into C by nature, and the fd 3 setup in passt.rs that
+# runs between fork and exec. Each one carries a SAFETY comment.
 [package.metadata.ruvm]
-unsafe-budget = 4
+unsafe-budget = 40
+
+[features]
+default = ["slirp"]
+# `-netdev user`, through libslirp loaded at run time. Without the library the backend fails with
+# an error rather than the build failing.
+slirp = []
 
 [dependencies]
 ruvm-base.workspace = true
@@ -19,7 +28,8 @@ ruvm-qapi.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-rustix = { workspace = true, features = ["event", "pipe"] }
+rustix = { workspace = true, features = ["event", "pipe", "process"] }
+ruvm-vhost.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 vmm-sys-util.workspace = true

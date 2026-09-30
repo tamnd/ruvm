@@ -60,12 +60,23 @@ impl Waker {
         let _ = rustix::io::write(&self.w, &[1]);
     }
 
-    fn drain(&self) {
+    /// The end of the pipe to poll for wakeups, for threads that run a loop of their own.
+    pub(crate) fn read_fd(&self) -> RawFd {
+        self.r.as_raw_fd()
+    }
+
+    /// Asks the thread to finish and wakes it.
+    pub(crate) fn request_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.wake();
+    }
+
+    pub(crate) fn drain(&self) {
         let mut buf = [0u8; 64];
         while matches!(rustix::io::read(&self.r, &mut buf), Ok(n) if n > 0) {}
     }
 
-    fn stopped(&self) -> bool {
+    pub(crate) fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
 }
