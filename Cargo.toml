@@ -123,17 +123,31 @@ ruvm-vmstate-macros = { version = "=0.2.3", path = "crates/vmstate-macros" }
 
 # External crates. The approved set is in spec/24-workspace-layout.md, and adding one outside it
 # is a reviewed change with a line in deny.toml if its license needs one.
+aes = "0.8.4"
 arc-swap = "1.9.2"
+cast5 = "0.11.1"
+cipher = "0.4.4"
+des = "0.8.1"
+digest = "0.10.7"
+getrandom = "0.3.4"
+hmac = "0.12.1"
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 kvm-ioctls = "0.25"
 libc = "0.2.189"
+md-5 = "0.10.6"
 mio = { version = "1.2.3", default-features = false, features = ["os-poll", "os-ext", "net"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+ripemd = "0.1.3"
 rustix = { version = "1.1.5", default-features = false, features = ["std", "net", "fs"] }
 serde_json = "1.0.145"
+serpent = "0.5.1"
+sha1 = "0.10.6"
 sha2 = "0.10.9"
+sm3 = "0.4.2"
+sm4 = "0.5.1"
 syn = { version = "2.0.110", default-features = false, features = ["full", "visit", "parsing"] }
 toml = "1.1.6"
+twofish = "0.7.1"
 vmm-sys-util = "0.15"
 
 # The lint set from spec/24-workspace-layout.md. Unsafe code is where an emulator gets a guest
@@ -167,6 +181,11 @@ opt-level = 1
 
 [profile.dev.package.ruvm-softfloat]
 opt-level = 1
+
+# PBKDF2 is monomorphized into ruvm-crypto, and LUKS keyslots need hundreds of thousands of
+# iterations, which take minutes unoptimized.
+[profile.dev.package.ruvm-crypto]
+opt-level = 2
 
 # panic = "abort" is deliberate, see spec/24-workspace-layout.md. A panic inside a device model
 # means an invariant broke, and unwinding across a vCPU thread that holds a device lock with guest
