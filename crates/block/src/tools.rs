@@ -789,6 +789,7 @@ const SIZE_OPT: QemuOptDesc = opt("size", QemuOptType::Size, "Virtual disk size"
 pub(crate) static RAW_CREATE_OPTS: [QemuOptDesc; 1] = [SIZE_OPT];
 
 /// `raw_create_opts` of block/file-posix.c.
+#[cfg(unix)]
 pub(crate) static FILE_CREATE_OPTS: [QemuOptDesc; 4] = [
     SIZE_OPT,
     opt("nocow", QemuOptType::Bool, "Turn off copy-on-write (valid only on btrfs)"),

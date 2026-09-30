@@ -474,7 +474,7 @@ fn drive_new() {
     let e = g
         .drive_new(&format!("file={},if=none", qcow2.to_str().unwrap()), BlockInterfaceType::Ide)
         .unwrap_err();
-    assert_eq!(e.message(), "Driver 'qcow2' is not supported yet");
+    assert_eq!(e.message(), "Unsupported cluster size: 2^0");
 
     // The drive table.
     assert_eq!(g.drive_get(BlockInterfaceType::Ide, 0, 0).unwrap().id, "ide0-hd0");

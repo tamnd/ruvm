@@ -59,6 +59,7 @@ mod perm;
 mod probe;
 mod protocol;
 mod qcow;
+mod qcow2;
 mod qed;
 mod query;
 mod raw;
