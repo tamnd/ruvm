@@ -124,6 +124,8 @@ ruvm-vmstate-macros = { version = "=0.2.0", path = "crates/vmstate-macros" }
 # External crates. The approved set is in spec/24-workspace-layout.md, and adding one outside it
 # is a reviewed change with a line in deny.toml if its license needs one.
 arc-swap = "1.9.2"
+kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
+kvm-ioctls = "0.25"
 libc = "0.2.189"
 mio = { version = "1.2.3", default-features = false, features = ["os-poll", "os-ext", "net"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
@@ -132,6 +134,7 @@ serde_json = "1.0.145"
 sha2 = "0.10.9"
 syn = { version = "2.0.110", default-features = false, features = ["full", "visit", "parsing"] }
 toml = "1.1.6"
+vmm-sys-util = "0.15"
 
 # The lint set from spec/24-workspace-layout.md. Unsafe code is where an emulator gets a guest
 # escape, so the three unsafe lints are errors rather than warnings, and `cargo xtask unsafe-audit`

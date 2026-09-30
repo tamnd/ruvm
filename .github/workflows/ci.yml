@@ -93,6 +93,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.profile }}
+      # Hosted Linux runners have /dev/kvm but only root can open it. Opening it up lets the
+      # accel-kvm tests run real guests instead of skipping.
+      - name: allow access to /dev/kvm
+        if: runner.os == 'Linux'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - name: cargo build
         run: cargo build --workspace --profile ${{ matrix.profile }}
       - name: cargo test
