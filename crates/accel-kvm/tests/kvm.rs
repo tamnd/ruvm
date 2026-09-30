@@ -45,6 +45,11 @@ fn open() -> Option<KvmAccel> {
     match KvmAccel::new(&opts, false) {
         Ok(a) => Some(a),
         Err(e @ (KvmError::Open(_) | KvmError::Unavailable)) => {
+            // CI sets this on runners that have KVM, so a broken /dev/kvm fails the job instead of
+            // quietly turning every test here into a skip.
+            if std::env::var_os("RUVM_REQUIRE_KVM").is_some() {
+                panic!("RUVM_REQUIRE_KVM is set but KVM cannot be used: {e}");
+            }
             eprintln!("skipping: {e}");
             None
         }

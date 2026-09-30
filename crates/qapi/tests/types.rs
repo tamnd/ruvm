@@ -31,6 +31,8 @@ fn err<T: Visit + std::fmt::Debug>(text: &str) -> String {
 #[test]
 fn enum_names_and_lookup() {
     assert_eq!(BlockdevDriver::Qcow2.as_str(), "qcow2");
+    // host_device only exists where QEMU has HAVE_HOST_BLOCK_DEVICE, which leaves out Windows.
+    #[cfg(not(windows))]
     assert_eq!(BlockdevDriver::from_name("host_device"), Some(BlockdevDriver::HostDevice));
     assert_eq!(BlockdevDriver::from_name("nope"), None);
     assert_eq!(RunState::default(), RunState::ALL[0]);
