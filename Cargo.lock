@@ -187,6 +187,10 @@ version = "0.1.4"
 [[package]]
 name = "ruvm-accel-qtest"
 version = "0.1.4"
+dependencies = [
+ "ruvm-base",
+ "ruvm-qapi",
+]
 
 [[package]]
 name = "ruvm-accel-whpx"
