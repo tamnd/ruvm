@@ -74,6 +74,19 @@ impl<C> fmt::Debug for QmpCommand<C> {
     }
 }
 
+impl<C> Clone for QmpCommand<C> {
+    fn clone(&self) -> Self {
+        QmpCommand {
+            name: self.name.clone(),
+            func: self.func.clone(),
+            options: self.options,
+            features: self.features,
+            enabled: self.enabled,
+            disable_reason: self.disable_reason.clone(),
+        }
+    }
+}
+
 impl<C> QmpCommand<C> {
     /// `qmp_has_success_response()`.
     pub fn has_success_response(&self) -> bool {
@@ -90,6 +103,12 @@ pub struct QmpCommandList<C> {
 impl<C> fmt::Debug for QmpCommandList<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.cmds.iter().map(|c| &c.name)).finish()
+    }
+}
+
+impl<C> Clone for QmpCommandList<C> {
+    fn clone(&self) -> Self {
+        QmpCommandList { cmds: self.cmds.clone() }
     }
 }
 
