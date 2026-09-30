@@ -335,6 +335,10 @@ version = "0.1.5"
 [[package]]
 name = "ruvm-block"
 version = "0.1.5"
+dependencies = [
+ "ruvm-base",
+ "ruvm-qapi",
+]
 
 [[package]]
 name = "ruvm-bsd-user"
@@ -647,6 +651,7 @@ version = "0.1.5"
 dependencies = [
  "ruvm-accel-qtest",
  "ruvm-base",
+ "ruvm-block",
  "ruvm-chardev",
  "ruvm-hostmem",
  "ruvm-hw-core",

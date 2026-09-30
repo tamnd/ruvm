@@ -74,6 +74,16 @@ pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
             compat_props: arg.compat_props.unwrap_or(false).then(Vec::new),
         }])
     });
+    let v = vm.clone();
+    register_blockdev_add(cmds, move |_: &MonitorQmp, opts| v.block.blockdev_add(opts));
+    let v = vm.clone();
+    register_blockdev_del(cmds, move |_: &MonitorQmp, arg| v.block.blockdev_del(&arg.node_name));
+    // qmp_migrate_pause(): there is no migration, so it is never in a postcopy state.
+    register_migrate_pause(cmds, |_: &MonitorQmp| {
+        Err(Error::generic(
+            "migrate-pause is currently only supported during postcopy-active or postcopy-recover state",
+        ))
+    });
     register_human_monitor_command(cmds, |_: &MonitorQmp, _| {
         Err(Error::generic("ruvm has no human monitor yet"))
     });
