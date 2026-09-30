@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Guest images, benchmark output and fuzz corpora. Large, machine specific, and regenerable.
+/images
+/bench-results
+/fuzz/corpus
+/fuzz/artifacts
+*.qcow2
+*.img
+*.iso
+perf.data
+perf.data.old
+*.profraw
+*.profdata
+flamegraph.svg
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+# Files copied from QEMU are compared byte for byte against the pinned tag by `cargo xtask
+# upstream-sync`, so git must never rewrite their line endings. Marking them vendored also keeps
+# them out of the language statistics.
+vendor-qemu/** -text linguist-vendored
+pc-bios/** binary linguist-vendored
+
+*.bin binary
+*.aml binary
