@@ -13,6 +13,8 @@ pub mod cutils;
 pub mod dispatch;
 pub mod ghash;
 pub mod json;
+pub mod keyval;
+pub mod opts;
 mod qvalue;
 pub mod visit;
 
