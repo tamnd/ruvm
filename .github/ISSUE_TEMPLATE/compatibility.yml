@@ -1,0 +1,50 @@
+name: QEMU compatibility gap
+description: Something QEMU 11.1 does that ruvm does not, or does differently.
+title: "compat: "
+labels: ["kind/compat"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `spec/02-compat-contract.md` splits compatibility into surfaces, and each one has its own oracle. Saying which surface a gap is on decides who looks at it and how urgent it is. A difference a migration stream or a management tool can see is treated as a bug even when no guest notices.
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface
+      options:
+        - Command line, meaning an option, a suboption or a default
+        - QMP or HMP, meaning a command, an event, a reply or an error
+        - Guest visible hardware, meaning a device, a register, a table or a CPU feature
+        - Migration or snapshots, meaning a stream in either direction
+        - Disk images, meaning a format, qemu-img, qemu-nbd or the storage daemon
+        - User mode, meaning a syscall, a signal or /proc
+        - TCG plugins
+        - Something else, described below
+    validations:
+      required: true
+  - type: textarea
+    id: qemu
+    attributes:
+      label: What QEMU 11.1 does
+      description: The command or the QMP exchange, and what QEMU does with it. Paste the actual output.
+    validations:
+      required: true
+  - type: textarea
+    id: ruvm
+    attributes:
+      label: What ruvm does
+      description: The same command against ruvm, and its output.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Where you hit it
+      description: libvirt, a script, a test suite, a real workload. This is what decides the priority, so it is worth a sentence.
+  - type: input
+    id: version
+    attributes:
+      label: Versions
+      description: The output of `ruvm --version` and of the QEMU you compared with.
+    validations:
+      required: true

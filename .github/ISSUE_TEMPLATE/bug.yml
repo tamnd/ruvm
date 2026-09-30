@@ -1,0 +1,45 @@
+name: Bug
+description: A crash, a hang, an error on a valid command line, or a guest that misbehaves.
+title: "bug: "
+labels: ["kind/bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If the same command line works under QEMU 11.1 and does something different under ruvm, the compatibility template asks for the things that make that quick to fix.
+
+        If a guest can crash ruvm or touch host memory under a hardware accelerator, please use a private security report instead.
+  - type: textarea
+    id: command
+    attributes:
+      label: The command line
+      description: The full command, or the libvirt domain XML if libvirt started it.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened
+      description: Paste the error in full, including the backtrace if ruvm printed one.
+    validations:
+      required: true
+  - type: input
+    id: guest
+    attributes:
+      label: The guest
+      description: Operating system and version, and where the image came from if it is public.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `ruvm --version`, or the commit.
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: The host
+      description: CPU, operating system and the accelerator in use (KVM, HVF, WHPX or TCG).
+    validations:
+      required: true

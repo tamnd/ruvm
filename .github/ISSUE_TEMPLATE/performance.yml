@@ -1,0 +1,51 @@
+name: Performance
+description: A guest boots, runs or migrates slower than it should, or ruvm uses more memory than QEMU.
+title: "perf: "
+labels: ["kind/perf", "area/perf"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The rules in `spec/21-performance.md` apply to reports as well as to anything we publish. Compare against QEMU 11.1 built with its release flags on the same host, report the median of several runs rather than the best one, and describe the machine. A number without a machine attached cannot be acted on.
+  - type: dropdown
+    id: which
+    attributes:
+      label: Which one
+      options:
+        - TCG execution speed
+        - Boot time
+        - Device or disk throughput under a hardware accelerator
+        - Migration time or downtime
+        - Memory use
+        - qemu-img or another tool
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: The numbers
+      description: What was measured, against what, with the exact commands for both ruvm and QEMU.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: workload
+    attributes:
+      label: The workload
+      description: The guest and what it was running. A public image and a script are far better than a description.
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: The machine
+      description: CPU, core count, memory, operating system, and whether it is itself a virtual machine.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `ruvm --version`, or the commit.
+    validations:
+      required: true

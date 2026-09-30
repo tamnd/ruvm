@@ -1,5 +1,7 @@
 # ruvm
 
+[![ci](https://github.com/tamnd/ruvm/actions/workflows/ci.yml/badge.svg)](https://github.com/tamnd/ruvm/actions/workflows/ci.yml)
+
 A machine emulator and virtualizer written in Rust that aims to replace QEMU without anyone downstream noticing.
 
 Same binary names, same command line, same QMP schema byte for byte, same machine types, same guest-visible hardware, same disk image formats, same migration stream in both directions, same TCG plugin ABI. Underneath it is a different program: no Big QEMU Lock, one completion-based event loop, a two-tier JIT with verified memory ordering, and a crate graph where every layer can be built, tested and reused on its own.

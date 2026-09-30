@@ -1,0 +1,44 @@
+# cargo-deny configuration, run in CI on every commit. spec/24-workspace-layout.md lists the crates
+# ruvm is allowed to depend on, and this file is what stops the list growing by accident.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Everything here can be carried by both of ruvm's licenses. A dependency under anything else has
+# to be argued for in a pull request that adds it here.
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.93
+
+# Every workspace crate has publish = false until the first crates.io release, and their licenses
+# are checked by `cargo xtask provenance` instead, which knows about the GPL and permissive split.
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+  # spec/03-architecture.md: one completion based event loop per thread, no tokio in the data path.
+  # A second runtime in the process is a second set of threads nobody is accounting for.
+  { name = "tokio", reason = "ruvm-aio is the event loop, see spec/03-architecture.md" },
+  { name = "async-std", reason = "ruvm-aio is the event loop, see spec/03-architecture.md" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,36 @@
+# The dependency list in spec/24-workspace-layout.md is short on purpose. Weekly is often enough
+# for a list that size, and grouping patch and minor bumps keeps the noise down without hiding a
+# major bump, which always gets its own pull request.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels: ["dependencies"]
+    groups:
+      patch:
+        update-types: ["patch"]
+      minor:
+        update-types: ["minor"]
+
+  # Actions are pinned to a patch version on purpose, which means they need something to move
+  # them. This is that something.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    commit-message:
+      prefix: "ci"
+    labels: ["github_actions"]
+    groups:
+      actions:
+        patterns: ["*"]
