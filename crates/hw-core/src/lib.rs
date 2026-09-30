@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bus;
+pub mod fw_cfg;
 pub mod irq;
 pub mod machine;
 pub mod timer;
