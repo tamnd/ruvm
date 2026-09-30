@@ -21,6 +21,8 @@ unsafe-budget = 0
 ruvm-base.workspace = true
 ruvm-img.workspace = true
 ruvm-io.workspace = true
+ruvm-nbd.workspace = true
+ruvm-storage-daemon.workspace = true
 ruvm-system.workspace = true
 
 [dev-dependencies]

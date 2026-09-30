@@ -11,9 +11,27 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 6
 
 [dependencies]
+ruvm-base.workspace = true
+ruvm-block.workspace = true
+ruvm-chardev.workspace = true
+ruvm-img.workspace = true
+ruvm-monitor.workspace = true
+ruvm-qapi.workspace = true
+ruvm-qom.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+ruvm-nbd.workspace = true
+ruvm-sys.workspace = true
+ruvm-vhost.workspace = true
+ruvm-virtio-queue.workspace = true
+rustix = { workspace = true, features = ["pipe", "process", "stdio", "event", "mount", "param"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+ruvm-vhost.workspace = true
 
 [lints]
 workspace = true
