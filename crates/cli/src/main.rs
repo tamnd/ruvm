@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 mod names;
 mod system;
+mod tools;
 mod version;
 
 use names::Personality;
@@ -57,6 +58,9 @@ fn ruvm(args: &[String]) -> ExitCode {
 fn run(personality: &Personality, argv0: &str, args: &[String]) -> ExitCode {
     if let Personality::System(target) = personality {
         return system::run(target, argv0, args);
+    }
+    if let Some(code) = tools::run(personality, argv0, args) {
+        return code;
     }
     if wants_version(personality, args) {
         if let Some(text) = version::text(personality, argv0) {
