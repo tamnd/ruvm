@@ -6,6 +6,18 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.2.2
+
+This patch fills in most of the hardware the M2 boards need. Both boards now exist as objects with their devices wired up, but ruvm does not run vCPUs against them from the command line yet. That wiring is the next piece of work.
+
+Virtqueues come first. `ruvm-virtio-queue` has split and packed rings with descriptor chains, readers and writers, and event index handling (#65). It is MIT or Apache-2.0 licensed and holds no QEMU code. On top of it, `ruvm-hw-virtio` has the virtio device core, the virtio-mmio transport, and the rng, console and blk devices (#70), plus the virtio-pci transport (#77).
+
+The PC side got the i8042 controller with PS/2 keyboard and mouse (#66), and a PCI core with config access, bridges, MSI and MSI-X (#67). The q35 host bridge, PAM and PCIe MMCONFIG followed (#69). Also added: ACPI PM registers, ICH9 PM and the generic event device (#68), the ICH9 LPC bridge with APM (#71), and the ICH9 AHCI controller with ATA and ATAPI disks (#73).
+
+`ruvm-target-x86` has the CPU reset state, the named CPU models, CPUID and MSRs (#72). It can also push that state into a KVM vCPU and read it back (#75). The KVM hlt tests now keep the irqchip in userspace, because a guest `hlt` never exits to userspace when the in-kernel APIC is on (#76).
+
+`ruvm-machine-x86` assembles the microvm board (#74) and the q35 board (#78). Each one has its memory map, interrupt routing, fw_cfg, device tree or ACPI inputs, and reset.
+
 ## 0.2.1
 
 This is the first patch on the way to M2, and most of it is the PC chipset. Nothing boots yet, but the devices a microvm or q35 guest touches first are ported and tested against QEMU's behavior at the register level.
