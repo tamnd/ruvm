@@ -385,3 +385,58 @@ fn serve_over_a_socket() {
     qmp.shutdown();
     dispatcher.join().unwrap();
 }
+
+#[test]
+fn serve_through_a_tcp_chardev() {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpStream;
+
+    use ruvm_chardev::Chardevs;
+    use ruvm_qapi::types::{
+        ChardevBackend, ChardevBackendU, ChardevSocket, ChardevSocketWrapper, InetSocketAddress,
+        InetSocketAddressWrapper, SocketAddressLegacy, SocketAddressLegacyU,
+    };
+
+    let addr = SocketAddressLegacyU::Inet(InetSocketAddressWrapper {
+        data: InetSocketAddress {
+            host: "127.0.0.1".into(),
+            port: "0".into(),
+            ..Default::default()
+        },
+    });
+    let data = ChardevSocket {
+        addr: SocketAddressLegacy { u: addr },
+        server: Some(true),
+        wait: Some(false),
+        ..Default::default()
+    };
+    let backend = ChardevBackend { u: ChardevBackendU::Socket(ChardevSocketWrapper { data }) };
+    let chardevs = Chardevs::new();
+    let chr = chardevs.add("qmp", &backend).unwrap();
+    let name = chr.filename();
+    let port: u16 =
+        name.rsplit(':').next().unwrap().trim_end_matches(",server=on").parse().unwrap();
+
+    let qmp = Qmp::new();
+    let mon = qmp.add_monitor("mon0", false, true);
+    let fe = chr.attach(mon.clone()).unwrap();
+    let dispatcher = {
+        let qmp = qmp.clone();
+        std::thread::spawn(move || qmp.run_dispatcher())
+    };
+    // Each client gets its own greeting and has to negotiate again.
+    for _ in 0..2 {
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut lines = BufReader::new(client.try_clone().unwrap()).lines();
+        assert!(lines.next().unwrap().unwrap().starts_with(r#"{"QMP": "#));
+        client.write_all(br#"{"execute": "query-version"}"#).unwrap();
+        let rsp = lines.next().unwrap().unwrap();
+        assert!(rsp.contains("CommandNotFound"), "{rsp}");
+        client.write_all(br#"{"execute": "qmp_capabilities"}"#).unwrap();
+        assert_eq!(lines.next().unwrap().unwrap(), r#"{"return": {}}"#);
+        assert!(mon.negotiated());
+    }
+    fe.join();
+    qmp.shutdown();
+    dispatcher.join().unwrap();
+}
