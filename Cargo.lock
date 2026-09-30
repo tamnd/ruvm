@@ -747,6 +747,9 @@ version = "0.2.4"
 [[package]]
 name = "ruvm-jit-interp"
 version = "0.2.4"
+dependencies = [
+ "ruvm-jit-core",
+]
 
 [[package]]
 name = "ruvm-jit-loongarch64"
