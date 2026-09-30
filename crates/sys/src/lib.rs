@@ -2,4 +2,8 @@
 
 //! Thin host bindings ruvm needs that no existing crate covers: newer KVM ioctls, Hypervisor.framework, WHPX, MSHV, iommufd, guest_memfd and MAP_JIT.
 //!
-//! Empty for now. The plan for this crate is in `spec/24-workspace-layout.md`.
+//! So far this holds the termination signal handler in [`signal`]. The plan for the rest is in
+//! `spec/24-workspace-layout.md`.
+
+#[cfg(unix)]
+pub mod signal;
