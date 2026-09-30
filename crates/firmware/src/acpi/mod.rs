@@ -7,6 +7,7 @@ pub mod aml;
 pub mod devices;
 pub mod linker;
 pub mod microvm;
+pub mod q35;
 pub mod table;
 pub mod x86;
 

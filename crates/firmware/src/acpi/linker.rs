@@ -164,10 +164,17 @@ impl BiosLinker {
         self.cmd_blob.extend_from_slice(&entry);
     }
 
-    /// Decodes the script.
+    /// Pads the script with zero bytes to a multiple of `align`, like `acpi_align_size()` on
+    /// `linker->cmd_blob`. Firmware skips the all zero entries.
+    pub fn pad_to(&mut self, align: usize) {
+        self.cmd_blob.resize(self.cmd_blob.len().next_multiple_of(align), 0);
+    }
+
+    /// Decodes the script, leaving out padding.
     pub fn commands(&self) -> Vec<Command> {
         self.cmd_blob
             .chunks(ENTRY_SIZE)
+            .filter(|e| get_u32(e, 0) != 0)
             .map(|e| match get_u32(e, 0) {
                 COMMAND_ALLOCATE => Command::Allocate {
                     file: get_name(e, 4),
