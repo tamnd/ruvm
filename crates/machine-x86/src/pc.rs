@@ -8,7 +8,7 @@
 //! 0xf0) or one of the helpers pc.c uses to fill in the CMOS and the fw_cfg tables.
 
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 
 use ruvm_hw_core::IrqLine;
 use ruvm_hw_core::IrqPin;
@@ -102,16 +102,31 @@ pub(crate) fn err<E: fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// A hook in front of the GSI handler, called with the GSI number and level. It returns true
+/// when it took care of the GSI, which is how an accelerator with its own interrupt controllers
+/// (KVM's `KVM_IRQ_LINE`) takes the lines away from the emulated PIC and IOAPIC.
+pub type GsiHook = Arc<dyn Fn(u32, i32) -> bool + Send + Sync>;
+
+/// The slot a board keeps for its [`GsiHook`].
+pub(crate) type GsiHookSlot = Arc<RwLock<Option<GsiHook>>>;
+
 /// `GSIState` and `gsi_handler()`: GSIs 0 to 15 go to the 8259 and the first IOAPIC, 16 to 23
 /// to the first IOAPIC and 24 to 47 to the second.
 pub(crate) struct GsiState {
     pub(crate) i8259: Vec<IrqLine>,
     pub(crate) ioapic: Vec<IrqLine>,
     pub(crate) ioapic2: Vec<IrqLine>,
+    pub(crate) hook: GsiHookSlot,
 }
 
 impl GsiState {
     pub(crate) fn set(&self, n: u32, level: i32) {
+        let hook = self.hook.read().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(h) = hook {
+            if h(n, level) {
+                return;
+            }
+        }
         let n = n as usize;
         let base2 = IO_APIC_SECONDARY_IRQBASE as usize;
         if n < ISA_NUM_IRQS {

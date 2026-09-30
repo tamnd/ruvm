@@ -10,3 +10,4 @@ mod qmp_cmds;
 pub mod qtest;
 pub mod runstate;
 pub mod vl;
+mod x86;

@@ -4,8 +4,9 @@
 //! loop, the order backends and monitors are created in, and the loop that runs until a
 //! shutdown request.
 //!
-//! ruvm behaves like a QEMU build with only the `qtest` accelerator, the `none` machine and no
-//! displays. Options for things that build would leave out fail with QEMU's own messages.
+//! ruvm behaves like a QEMU build with the `qtest` accelerator, the `none` machine and no
+//! displays, plus, for the x86 targets, the `microvm` and `q35` boards on `kvm` (Linux x86_64
+//! hosts only). Options for things that build would leave out fail with QEMU's own messages.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,10 +22,11 @@ use ruvm_chardev::opts::{chardev_opts, parse_compat};
 use ruvm_hostmem::region::RegionObjects;
 use ruvm_hw_core::machine::{MACHINES, machine_type_name};
 use ruvm_hw_core::{Machine, create_machine};
+use ruvm_machine_x86::BoardKind;
 use ruvm_mem::MemorySystem;
 use ruvm_monitor::Qmp;
 use ruvm_monitor::object::{TYPE_MONITOR_HMP, TYPE_MONITOR_QMP, monitor_compat_id, monitor_new};
-use ruvm_qapi::keyval::{keyval_parse, keyval_parse_into};
+use ruvm_qapi::keyval::{keyval_merge, keyval_parse, keyval_parse_into};
 use ruvm_qapi::opts::{OptsHandle, QemuOptDesc, QemuOptType, QemuOptsList, is_help_option};
 use ruvm_qapi::types::{Audiodev, DisplayOptions, MonitorMode, MonitorOptions, ObjectOptions};
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit};
@@ -35,9 +37,18 @@ use crate::options::{Opt, arch_available, help_text, lookup_opt};
 use crate::qmp_cmds::{self, object_options_dict};
 use crate::qtest::{self, VirtualClock};
 use crate::runstate::{Killed, Runstate};
+use crate::x86::{self, Accel, AccelInitError};
 
-/// The accelerators this build has. qtest is left out of `-accel help`, as in QEMU.
-const ACCELS: &[&str] = &["qtest"];
+/// Whether KVM is built in for `target`: the host is Linux on x86_64 and so is the target.
+fn have_kvm(target: &str) -> bool {
+    cfg!(all(target_os = "linux", target_arch = "x86_64")) && x86::is_x86(target)
+}
+
+/// The accelerators this build has for `target`. qtest is left out of `-accel help`, as in
+/// QEMU.
+fn accels(target: &str) -> &'static [&'static str] {
+    if have_kvm(target) { &["kvm", "qtest"] } else { &["qtest"] }
+}
 
 /// The running machine and everything QMP commands reach.
 #[derive(Debug)]
@@ -114,6 +125,20 @@ fn mon_opts() -> QemuOptsList {
     .with_implied_opt_name("chardev")
 }
 
+/// `qemu_mem_opts`.
+fn memory_opts() -> QemuOptsList {
+    QemuOptsList::new(
+        "memory",
+        &[
+            QemuOptDesc::new("size", QemuOptType::Size),
+            QemuOptDesc::new("slots", QemuOptType::Number),
+            QemuOptDesc::new("maxmem", QemuOptType::Size),
+        ],
+    )
+    .with_implied_opt_name("size")
+    .with_merge_lists()
+}
+
 /// `qemu_name_opts`.
 fn name_opts() -> QemuOptsList {
     QemuOptsList::new(
@@ -170,6 +195,12 @@ struct Config {
     #[cfg_attr(not(unix), allow(dead_code))]
     exit_with_parent: bool,
     mon_deprecation_warned: bool,
+    /// `-m`, `qemu_mem_opts`.
+    memory: QemuOptsList,
+    /// The x86 board options: `-L`, `-cpu`, `-serial`, `-drive`, `-device` and friends.
+    x86: x86::Cmdline,
+    /// `-machine kernel-irqchip=`, the sugar for the kvm property.
+    kernel_irqchip: Option<String>,
 }
 
 impl Config {
@@ -190,6 +221,9 @@ impl Config {
             have_custom_ram_size: false,
             exit_with_parent: false,
             mon_deprecation_warned: false,
+            memory: memory_opts(),
+            x86: x86::Cmdline::default(),
+            kernel_irqchip: None,
         }
     }
 
@@ -238,7 +272,7 @@ fn run(p: &Personality<'_>, args: &[String]) -> Flow<()> {
     let mut cfg = Config::new();
     parse_options(p, &registry, args, &mut cfg)?;
     let vm = start(p, Backends { registry, qmp, chardevs, regions }, cfg)?;
-    main_loop(&vm.0);
+    main_loop(&vm.0, &vm.1);
     drop(vm.1);
     Ok(())
 }
@@ -254,6 +288,11 @@ struct Backends {
 /// Backends that live as long as the machine.
 struct Keep {
     _qtest: Option<ruvm_chardev::Attachment>,
+    /// The accelerator, when no board took it over.
+    _accel: Option<Accel>,
+    /// The x86 board on KVM.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    board: Option<x86::Running>,
 }
 
 /// The option loop of `qemu_init()`.
@@ -292,6 +331,7 @@ fn parse_options(
                 cfg.remember("chardev", h);
             }
             Opt::Mon => {
+                cfg.x86.default_monitor = false;
                 if !cfg.mon_deprecation_warned {
                     cfg.mon_deprecation_warned = true;
                     warn_report(
@@ -306,16 +346,23 @@ fn parse_options(
                 if !arg.starts_with("none") {
                     monitor_parse(cfg, arg, "readline", false)?;
                 }
+                cfg.x86.default_monitor = false;
             }
-            Opt::Qmp => monitor_parse(cfg, arg, "control", false)?,
-            Opt::QmpPretty => monitor_parse(cfg, arg, "control", true)?,
+            Opt::Qmp => {
+                monitor_parse(cfg, arg, "control", false)?;
+                cfg.x86.default_monitor = false;
+            }
+            Opt::QmpPretty => {
+                monitor_parse(cfg, arg, "control", true)?;
+                cfg.x86.default_monitor = false;
+            }
             Opt::Object => object_option_parse(registry, cfg, arg)?,
-            Opt::Machine => {
+            Opt::Machine | Opt::M => {
                 let mut help = false;
                 keyval_parse_into(&mut cfg.machine, arg, Some("type"), Some(&mut help))
                     .map_err(|e| fail(&e))?;
                 if help {
-                    print!("{}", machine_help(&cfg.machine));
+                    print!("{}", machine_help(p.target));
                     return Err(Exit(0));
                 }
             }
@@ -323,12 +370,58 @@ fn parse_options(
                 let Some(opts) = cfg.accel.parse_noisily(arg, true) else { return Err(Exit(1)) };
                 if opts.get("accel").is_none_or(is_help_option) {
                     println!("Accelerators supported in QEMU binary:");
-                    for a in ACCELS.iter().filter(|a| **a != "qtest") {
+                    for a in accels(p.target).iter().filter(|a| **a != "qtest") {
                         println!("{a}");
                     }
                     return Err(Exit(0));
                 }
+                let h = opts.handle();
+                cfg.remember("accel", h);
             }
+            Opt::EnableKvm => cfg.machine.put("accel", "kvm"),
+            Opt::LowerM => {
+                if cfg.memory.parse_noisily(arg, true).is_none() {
+                    return Err(Exit(1));
+                }
+            }
+            Opt::Smp => machine_parse_property_opt(cfg, "smp", "cpus", arg)?,
+            Opt::Kernel => cfg.machine.put("kernel", arg),
+            Opt::Initrd => cfg.machine.put("initrd", arg),
+            Opt::Append => cfg.machine.put("append", arg),
+            Opt::Bios => cfg.machine.put("firmware", arg),
+            Opt::Cpu => {
+                if is_help_option(arg) {
+                    return Err(fail_msg("-cpu help is not supported by ruvm yet"));
+                }
+                cfg.x86.cpu = Some(arg.to_string());
+            }
+            Opt::L => {
+                if is_help_option(arg) {
+                    cfg.x86.list_data_dirs = true;
+                } else {
+                    cfg.x86.data_dirs.push(arg.into());
+                }
+            }
+            Opt::Serial => {
+                cfg.x86.serials.push((arg.to_string(), current_location()));
+                cfg.x86.default_serial = false;
+                if arg.starts_with("mon:") {
+                    cfg.x86.default_monitor = false;
+                }
+            }
+            Opt::Nographic => {
+                cfg.machine.put("graphics", "off");
+                cfg.x86.nographic = true;
+            }
+            Opt::Drive => cfg.x86.drives.push((arg.to_string(), current_location())),
+            Opt::Device => {
+                let driver = arg.split(',').next().unwrap_or_default();
+                if is_help_option(driver) || arg.split(',').skip(1).any(is_help_option) {
+                    return Err(fail_msg("-device help is not supported by ruvm yet"));
+                }
+                cfg.x86.devices.push((arg.to_string(), current_location()));
+            }
+            Opt::NoReboot => cfg.x86.no_reboot = true,
             Opt::Name => {
                 if cfg.name.parse_noisily(arg, true).is_none() {
                     return Err(Exit(1));
@@ -336,8 +429,11 @@ fn parse_options(
             }
             Opt::S => cfg.autostart = false,
             Opt::Preconfig => cfg.preconfig = true,
-            // There are no default devices to leave out.
-            Opt::Nodefaults => {}
+            Opt::Nodefaults => {
+                cfg.x86.has_defaults = false;
+                cfg.x86.default_serial = false;
+                cfg.x86.default_monitor = false;
+            }
             Opt::Display => parse_display(arg)?,
             Opt::Audio => parse_audio(arg)?,
             Opt::Qtest => cfg.qtest = Some(arg.to_string()),
@@ -347,7 +443,66 @@ fn parse_options(
             _ => return Err(fail_msg("this option is not supported by ruvm yet")),
         }
     }
+    validate_options(cfg)?;
+    parse_memory_options(cfg)?;
+    if cfg.x86.list_data_dirs {
+        for dir in cfg.x86.firmware().dirs() {
+            println!("{}", dir.display());
+        }
+        return Err(Exit(0));
+    }
     Ok(())
+}
+
+/// `qemu_validate_options()`.
+fn validate_options(cfg: &Config) -> Flow<()> {
+    if cfg.machine.get("kernel").is_none() {
+        if cfg.machine.get("append").is_some() {
+            return Err(fail_msg("-append only allowed with -kernel option"));
+        }
+        if cfg.machine.get("initrd").is_some() {
+            return Err(fail_msg("-initrd only allowed with -kernel option"));
+        }
+    }
+    Ok(())
+}
+
+/// `machine_parse_property_opt()`: `-smp` and the like, as `-machine prop.key=value`.
+fn machine_parse_property_opt(cfg: &mut Config, prop: &str, implied: &str, arg: &str) -> Flow<()> {
+    let mut help = false;
+    let dict = keyval_parse(arg, Some(implied), Some(&mut help)).map_err(|e| fail(&e))?;
+    if help {
+        return Err(fail_msg(&format!("-{prop} help is not supported by ruvm yet")));
+    }
+    let mut opts = QDict::new();
+    opts.put(prop, QValue::Dict(dict));
+    keyval_merge(&mut cfg.machine, &opts).map_err(|e| fail(&e))
+}
+
+/// `parse_memory_options()`: `-m` as `-machine memory.size=...`, where a size without a
+/// suffix is in megabytes.
+fn parse_memory_options(cfg: &mut Config) -> Flow<()> {
+    let Some(opts) = cfg.memory.iter().next() else { return Ok(()) };
+    let mut dict = QDict::new();
+    if let Some(size) = opts.get("size") {
+        if size.is_empty() {
+            return Err(fail_msg("missing 'size' option value"));
+        }
+        let mut size = size.to_string();
+        if size.ends_with(|c: char| c.is_ascii_digit()) {
+            size.push('M');
+        }
+        dict.put("size", size);
+    }
+    if let Some(v) = opts.get("maxmem") {
+        dict.put("max-size", v);
+    }
+    if let Some(v) = opts.get("slots") {
+        dict.put("slots", v);
+    }
+    let mut opts = QDict::new();
+    opts.put("memory", QValue::Dict(dict));
+    keyval_merge(&mut cfg.machine, &opts).map_err(|e| fail(&e))
 }
 
 /// `monitor_parse()` for `-monitor`, `-qmp` and `-qmp-pretty`.
@@ -409,12 +564,20 @@ fn object_option_parse(registry: &Registry, cfg: &mut Config, arg: &str) -> Flow
     Ok(())
 }
 
-/// `machine_help_func()`.
-fn machine_help(machine: &QDict) -> String {
+/// `machine_help_func()`: the machines sorted by name, an alias on the line before its
+/// machine.
+fn machine_help(target: &str) -> String {
+    let mut lines: Vec<(String, String)> = MACHINES
+        .iter()
+        .map(|m| (m.name.to_string(), format!("{:<20} {}\n", m.name, m.desc)))
+        .collect();
+    if x86::is_x86(target) {
+        lines.extend(x86::machine_help_lines());
+    }
+    lines.sort();
     let mut out = String::from("Supported machines are:\n");
-    let _ = machine;
-    for m in MACHINES {
-        out.push_str(&format!("{:<20} {}\n", m.name, m.desc));
+    for (_, text) in lines {
+        out.push_str(&text);
     }
     out
 }
@@ -495,9 +658,16 @@ fn create_objects(vm: &Vm, cfg: &mut Config, pick: fn(&str) -> bool) -> Flow<()>
     Ok(())
 }
 
-/// `select_machine()`: `none` is the only machine, and no target has it as its default.
-/// Returns the type name.
-fn select_machine(cfg: &mut Config) -> Flow<String> {
+/// The machine `-machine type=` picked.
+enum MachineChoice {
+    /// A machine type in the QOM registry, by type name.
+    Qom(String),
+    /// One of the x86 boards.
+    X86(BoardKind),
+}
+
+/// `select_machine()`: no target has a default machine.
+fn select_machine(target: &str, cfg: &mut Config) -> Flow<MachineChoice> {
     let hint = "Use -machine help to list supported machines\n";
     let ty = match cfg.machine.get_str("type") {
         Some(ty) => ty.to_string(),
@@ -506,26 +676,37 @@ fn select_machine(cfg: &mut Config) -> Flow<String> {
             return Err(fail(&e));
         }
     };
+    cfg.machine.remove("type");
+    if x86::is_x86(target) {
+        if let Some(kind) = BoardKind::from_name(&ty) {
+            return Ok(MachineChoice::X86(kind));
+        }
+    }
     if !MACHINES.iter().any(|m| m.name == ty) {
         let e = Error::generic(format!("unsupported machine type: \"{ty}\"")).hint(hint);
         return Err(fail(&e));
     }
-    cfg.machine.remove("type");
-    Ok(machine_type_name(&ty))
+    Ok(MachineChoice::Qom(machine_type_name(&ty)))
 }
 
-/// `qemu_apply_legacy_machine_options()` and `qemu_apply_machine_options()`. Gives the id of
-/// `memory-backend`, which is looked up once the late backends exist.
-fn apply_machine_options(machine: &Machine, cfg: &mut Config) -> Flow<Option<String>> {
+/// `qemu_apply_legacy_machine_options()`: takes out `accel`, `kernel-irqchip` and
+/// `memory-backend`. Gives the id of `memory-backend`, which is looked up once the late
+/// backends exist.
+fn apply_legacy_machine_options(cfg: &mut Config) -> Flow<Option<String>> {
     if let Some(accel) = cfg.machine.get_str("accel") {
         cfg.accelerators = Some(accel.to_string());
         cfg.machine.remove("accel");
+    }
+    if let Some(v) = cfg.machine.remove("kernel-irqchip") {
+        match v {
+            QValue::Str(s) => cfg.kernel_irqchip = Some(s),
+            _ => return Err(fail_msg("Parameter 'kernel-irqchip' expects a string")),
+        }
     }
     let memdev = cfg.machine.get_str("memory-backend").map(str::to_string);
     cfg.machine.remove("memory-backend");
     cfg.have_custom_ram_size =
         matches!(cfg.machine.get("memory"), Some(QValue::Dict(d)) if d.get("size").is_some());
-    machine.object.set_props_from_keyval(&cfg.machine, false).map_err(|e| fail(&e))?;
     Ok(memdev)
 }
 
@@ -542,15 +723,23 @@ fn resolve_machine_memdev(vm: &Vm, machine: &Machine, cfg: &Config, id: &str) ->
     machine.object.property_set_link("memory-backend", Some(&backend)).map_err(|e| fail(&e))
 }
 
-/// `configure_accelerators()`.
-fn configure_accelerators(cfg: &mut Config) -> Flow<()> {
+/// `configure_accelerators()`. `kind` is the x86 board, if that is the machine; it decides
+/// the default of `kernel-irqchip`.
+fn configure_accelerators(target: &str, kind: Option<BoardKind>, cfg: &mut Config) -> Flow<Accel> {
+    let accels = accels(target);
     let mut init_failed = false;
     if cfg.accel.is_empty() {
-        let Some(accelerators) = cfg.accelerators.clone() else {
-            return Err(fail_msg("No accelerator selected and no default accelerator available"));
+        let accelerators = match cfg.accelerators.clone() {
+            Some(a) => a,
+            None if have_kvm(target) => "kvm".to_string(),
+            None => {
+                return Err(fail_msg(
+                    "No accelerator selected and no default accelerator available",
+                ));
+            }
         };
         for a in accelerators.split(':') {
-            if ACCELS.contains(&a) {
+            if accels.contains(&a) {
                 cfg.accel.parse_noisily(a, true);
             } else {
                 init_failed = true;
@@ -562,33 +751,72 @@ fn configure_accelerators(cfg: &mut Config) -> Flow<()> {
     }
 
     // do_configure_accelerator() until one works.
-    let mut found = false;
-    for opts in cfg.accel.iter() {
+    let split = kind.is_some_and(BoardKind::default_kernel_irqchip_split);
+    let handles: Vec<OptsHandle> = cfg.accel.iter().map(|o| o.handle()).collect();
+    let mut chosen = None;
+    for h in handles {
+        let _loc = cfg.loc("accel", h).map(push_location);
+        let opts = cfg.accel.get(h).expect("handle from this list");
         let Some(acc) = opts.get("accel") else {
             report_error(&Error::generic("Parameter 'accel' is missing"));
             return Err(Exit(1));
         };
-        if !ACCELS.contains(&acc) {
+        if !accels.contains(&acc) {
             error_report(&format!("invalid accelerator {acc}"));
             init_failed = true;
             continue;
         }
-        if let Some((name, _)) = opts.iter().find(|(name, _)| *name != "accel") {
-            return Err(fail_msg(&format!("Property '{acc}-accel.{name}' not found")));
+        let props: Vec<(String, String)> = opts
+            .iter()
+            .filter(|(name, _)| *name != "accel")
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        match init_accel(acc, &props, cfg.kernel_irqchip.as_deref(), split) {
+            Ok(a) => {
+                chosen = Some((acc.to_string(), a));
+                break;
+            }
+            Err(AccelInitError::Fatal(e)) => return Err(fail(&e)),
+            Err(AccelInitError::Failed(lines)) => {
+                for line in &lines {
+                    error_report(line);
+                }
+                init_failed = true;
+            }
         }
-        found = true;
-        break;
     }
-    if !found {
+    let Some((name, accel)) = chosen else {
         if !init_failed {
             error_report("no accelerator found");
         }
         return Err(Exit(1));
-    }
+    };
     if init_failed && cfg.qtest.is_none() {
-        error_report("falling back to qtest");
+        error_report(&format!("falling back to {name}"));
     }
-    Ok(())
+    Ok(accel)
+}
+
+/// `accel_init_machine()` for `acc`, given its `-accel` properties and the
+/// `-machine kernel-irqchip=` sugar.
+fn init_accel(
+    acc: &str,
+    props: &[(String, String)],
+    kernel_irqchip: Option<&str>,
+    default_split: bool,
+) -> std::result::Result<Accel, AccelInitError> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if acc == "kvm" {
+        return x86::kvm_init(props, kernel_irqchip, default_split)
+            .map(|a| Accel::Kvm(Box::new(a)));
+    }
+    let _ = (kernel_irqchip, default_split);
+    match props.first() {
+        Some((name, _)) => Err(AccelInitError::Fatal(Error::generic(format!(
+            "Property '{acc}-accel.{name}' not found"
+        )))),
+        None => Ok(Accel::Qtest),
+    }
 }
 
 /// `monitor_new_opts()` for one `mon` set.
@@ -644,9 +872,14 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         }
     }
 
-    let typename = select_machine(&mut cfg)?;
-    let machine = create_machine(&vm.registry, &typename, &vm.regions).map_err(|e| fail(&e))?;
-    let machine = vm.machine.get_or_init(|| machine);
+    let (kind, machine) = match select_machine(p.target, &mut cfg)? {
+        MachineChoice::X86(kind) => (Some(kind), None),
+        MachineChoice::Qom(typename) => {
+            let machine =
+                create_machine(&vm.registry, &typename, &vm.regions).map_err(|e| fail(&e))?;
+            (None, Some(vm.machine.get_or_init(|| machine)))
+        }
+    };
 
     // qemu_create_early_backends()
     create_objects(&vm, &mut cfg, object_create_early)?;
@@ -660,9 +893,28 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             Err(e) => return Err(fail(&e)),
         }
     }
+    // configure_blockdev(): the -drive options, which need to know the machine.
+    let drives = parse_drives(kind, &cfg.x86.drives)?;
 
-    let memdev = apply_machine_options(machine, &mut cfg)?;
-    configure_accelerators(&mut cfg)?;
+    // qemu_apply_legacy_machine_options() and qemu_apply_machine_options()
+    let memdev = apply_legacy_machine_options(&mut cfg)?;
+    let board_opts = match (kind, machine) {
+        (Some(kind), _) => {
+            if memdev.is_some() {
+                return Err(fail_msg("memory-backend is not supported by ruvm yet"));
+            }
+            Some(x86::take_board_options(kind, &cfg.machine).map_err(|e| fail(&e))?)
+        }
+        (None, Some(machine)) => {
+            machine.object.set_props_from_keyval(&cfg.machine, false).map_err(|e| fail(&e))?;
+            None
+        }
+        (None, None) => unreachable!("a QOM machine was created"),
+    };
+    let accel = configure_accelerators(p.target, kind, &mut cfg)?;
+    if kind.is_some() && (matches!(accel, Accel::Qtest) || cfg.qtest.is_some()) {
+        return Err(fail_msg("this machine type is only supported with -accel kvm by ruvm yet"));
+    }
     let clock = VirtualClock::manual(ruvm_base::ClockType::Virtual);
     if cfg.qtest.is_some() {
         // monitor_qapi_event_init() throttles events on the virtual clock under qtest.
@@ -671,8 +923,8 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     }
 
     // qemu_create_late_backends()
-    let qtest = match &cfg.qtest {
-        Some(chrdev) => {
+    let qtest = match (&cfg.qtest, machine) {
+        (Some(chrdev), Some(machine)) => {
             let a = qtest::server_init(
                 &chardevs,
                 chrdev,
@@ -685,7 +937,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             qtest::add_object(&machine.object, cfg.qtest_log.as_deref()).map_err(|e| fail(&e))?;
             Some(a)
         }
-        None => None,
+        _ => None,
     };
     create_objects(&vm, &mut cfg, |ty| !object_create_early(ty))?;
     let handles: Vec<OptsHandle> = cfg.mon.iter().map(|o| o.handle()).collect();
@@ -694,8 +946,24 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         monitor_new_opts(&vm.registry, &cfg, h).map_err(|e| fail(&e))?;
     }
 
-    if let Some(id) = &memdev {
+    if let (Some(id), Some(machine)) = (&memdev, machine) {
         resolve_machine_memdev(&vm, machine, &cfg, id)?;
+    }
+
+    let mut keep = Keep {
+        _qtest: qtest,
+        _accel: None,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        board: None,
+    };
+    match (kind, board_opts) {
+        (Some(kind), Some(opts)) => {
+            if cfg.preconfig {
+                return Err(fail_msg("-preconfig is not supported with this machine by ruvm yet"));
+            }
+            keep = start_x86(&vm, &mut cfg, accel, kind, opts, &drives, keep)?;
+        }
+        _ => keep._accel = Some(accel),
     }
 
     if cfg.preconfig {
@@ -705,11 +973,110 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     }
     // The main loop starts here, and with it the frontends.
     chardevs.release();
-    Ok((vm, Keep { _qtest: qtest }))
+    Ok((vm, keep))
+}
+
+/// `drive_new()` for every `-drive`, in order.
+fn parse_drives(
+    kind: Option<BoardKind>,
+    args: &[(String, Option<Location>)],
+) -> Flow<Vec<x86::Drive>> {
+    let mut list = x86::drive_opts();
+    let mut drives = Vec::new();
+    for (arg, loc) in args {
+        let _loc = loc.clone().map(push_location);
+        let d =
+            x86::parse_drive(&mut list, arg, kind, &drives, loc.clone()).map_err(|e| fail(&e))?;
+        drives.push(d);
+    }
+    Ok(drives)
+}
+
+/// Builds the x86 board and puts it on its vCPUs: `qemu_init_board()`,
+/// `qemu_create_cli_devices()` and the serial port of `qemu_create_late_backends()`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn start_x86(
+    vm: &Arc<Vm>,
+    cfg: &mut Config,
+    accel: Accel,
+    kind: BoardKind,
+    opts: x86::BoardOptions,
+    drives: &[x86::Drive],
+    mut keep: Keep,
+) -> Flow<Keep> {
+    let Accel::Kvm(accel) = accel else { unreachable!("checked by the caller") };
+    cfg.x86.add_default_serial();
+    let serial = connect_serial(vm, cfg)?;
+    let running =
+        x86::start_board(vm, *accel, kind, opts, &cfg.x86, drives, serial).map_err(|errors| {
+            for e in &errors {
+                e.report();
+            }
+            Exit(1)
+        })?;
+    keep.board = Some(running);
+    Ok(keep)
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn start_x86(
+    _vm: &Arc<Vm>,
+    _cfg: &mut Config,
+    _accel: Accel,
+    _kind: BoardKind,
+    _opts: x86::BoardOptions,
+    _drives: &[x86::Drive],
+    _keep: Keep,
+) -> Flow<Keep> {
+    unreachable!("only kvm runs the x86 boards, and this host has no kvm")
+}
+
+/// `serial_parse()` for the first `-serial`: what the board's first serial port is connected
+/// to. The other `-serial` options are not used yet.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn connect_serial(vm: &Vm, cfg: &mut Config) -> Flow<x86::SerialConn> {
+    use x86::{SerialConn, SerialSpec};
+    let Some((dev, loc)) = cfg.x86.serials.first().cloned() else {
+        return Ok(SerialConn::Absent);
+    };
+    let _loc = loc.map(push_location);
+    let not_connected =
+        || fail_msg(&format!("could not connect serial device to character backend '{dev}'"));
+    Ok(match SerialSpec::parse(&dev) {
+        SerialSpec::None => SerialConn::Absent,
+        SerialSpec::Null => SerialConn::Null,
+        // For now this is a local stdio adapter with the monitor left out; it moves to the
+        // chardev stdio backend and mux once those exist.
+        SerialSpec::Stdio { .. } => SerialConn::Stdio,
+        SerialSpec::Chardev(id) => match vm.chardevs.find(&id) {
+            Some(chr) => SerialConn::Chardev(chr),
+            None => return Err(not_connected()),
+        },
+        SerialSpec::Compat(dev) => {
+            let h = match parse_compat(&mut cfg.chardev, "serial0", &dev, true) {
+                Ok(h) => h,
+                Err(e) => {
+                    if let Some(e) = e {
+                        report_error(&e);
+                    }
+                    return Err(not_connected());
+                }
+            };
+            let opts = cfg.chardev.get(h).expect("handle from this list");
+            match vm.chardevs.new_from_opts(opts) {
+                Ok(Some(chr)) => SerialConn::Chardev(chr),
+                Ok(None) => return Err(Exit(0)),
+                Err(e) => {
+                    report_error(&e);
+                    return Err(not_connected());
+                }
+            }
+        }
+    })
 }
 
 /// `qemu_main_loop()` and `qemu_cleanup()`: serve QMP until something asks for a shutdown.
-fn main_loop(vm: &Arc<Vm>) {
+fn main_loop(vm: &Arc<Vm>, keep: &Keep) {
     vm.qmp.run_dispatcher();
     let cause = vm.runstate.take_shutdown_request();
     // qemu_kill_report()
@@ -720,6 +1087,12 @@ fn main_loop(vm: &Arc<Vm>) {
     }
     vm.runstate.send_shutdown_event(cause);
     vm.runstate.vm_shutdown();
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(board) = &keep.board {
+        vm.runstate.set_cpu_hook(None);
+        board.quit();
+    }
+    let _ = keep;
     vm.registry.user_creatable_cleanup();
 }
 

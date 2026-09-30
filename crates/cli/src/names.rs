@@ -182,7 +182,10 @@ impl Personality {
         if name == "ruvm" {
             return Some(Personality::Ruvm);
         }
-        if let Some(target) = name.strip_prefix("qemu-system-") {
+        // ruvm-system-<target> is the same program under ruvm's own name.
+        let system =
+            name.strip_prefix("qemu-system-").or_else(|| name.strip_prefix("ruvm-system-"));
+        if let Some(target) = system {
             return SYSTEM_TARGETS.iter().find(|t| **t == target).map(|t| Personality::System(t));
         }
         if let Some(tool) = TOOLS.iter().find(|t| t.name() == name) {
@@ -205,6 +208,7 @@ mod tests {
     fn paths_and_exe_suffixes_are_ignored() {
         let want = Some(Personality::System("x86_64"));
         assert_eq!(Personality::from_argv0("qemu-system-x86_64"), want);
+        assert_eq!(Personality::from_argv0("/usr/bin/ruvm-system-x86_64"), want);
         assert_eq!(Personality::from_argv0("/usr/bin/qemu-system-x86_64"), want);
         assert_eq!(Personality::from_argv0(r"C:\qemu\qemu-system-x86_64.exe"), want);
     }

@@ -9,9 +9,14 @@ use std::path::Path;
 use ruvm_qapi_gen::config::{self, Config};
 use ruvm_qapi_gen::hx::{self, OptionsEntry};
 
-/// `QEMU_OPTION_add_fd` becomes `AddFd`.
+/// `QEMU_OPTION_add_fd` becomes `AddFd`. Single letter options differ only in case (`-m` and
+/// `-M`, `-s` and `-S`, `-d` and `-D`), so a lower case letter other than `h` becomes
+/// `LowerM` and so on, and an upper case one keeps its name.
 fn variant(enum_name: &str) -> String {
     let base = enum_name.strip_prefix("QEMU_OPTION_").expect("QEMU_OPTION_ prefix");
+    if base.len() == 1 && base != "h" && base.bytes().all(|b| b.is_ascii_lowercase()) {
+        return format!("Lower{}", base.to_ascii_uppercase());
+    }
     base.split('_')
         .filter(|w| !w.is_empty())
         .map(|w| {

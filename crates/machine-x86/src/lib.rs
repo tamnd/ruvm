@@ -6,13 +6,22 @@
 //! parts it shares with the other PC boards ([`pc`]) and the `microvm` board ([`microvm`]).
 //! The plan for this crate is in `spec/24-workspace-layout.md`.
 
-#![forbid(unsafe_code)]
+// The only unsafe code is the KVM_INTERRUPT ioctl in `kvm_run`, which kvm-ioctls does not wrap.
+#![deny(unsafe_code)]
 
+pub mod board;
+pub mod file_backend;
+pub mod firmware;
 pub mod ich9_lpc;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod kvm_run;
 pub mod microvm;
 pub mod pc;
 pub mod q35;
 
+pub use board::{BoardKind, BoardSpec, KernelFiles, X86_BOARDS, X86Board, build_board};
+pub use file_backend::FileBackend;
+pub use firmware::FirmwareSearch;
 pub use ich9_lpc::{Ich9Lpc, Ich9LpcConfig};
 pub use microvm::{Microvm, MicrovmConfig, MicrovmProps};
 pub use q35::{Q35, Q35MachineConfig, Q35Props};

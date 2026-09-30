@@ -1,0 +1,459 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+//! One type for the x86 boards an accelerator can run: [`Microvm`] and [`Q35`].
+//!
+//! The accelerator loop in [`crate::kvm_run`] and the command line code in the system crate do
+//! not care which board they drive, as long as they can reach its address spaces, its
+//! interrupt controllers and its reset. [`X86Board`] gives them that in one place.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::Arc;
+
+use ruvm_firmware::x86_linux::{LINUXBOOT_DMA_ROM, PVH_ROM};
+use ruvm_hw_acpi::SystemRequestHandler;
+use ruvm_hw_char::serial::{Serial, SerialBackend};
+use ruvm_hw_core::{Clock, IrqPin};
+use ruvm_hw_intc::i8259::I8259Pair;
+use ruvm_hw_intc::ioapic::{IoApic, IoApicMsiHandler, IoApics};
+use ruvm_hw_virtio::{
+    AddressSpaceMemory, SharedGuestMemory, VirtioBackend, VirtioDeviceClass, VirtioPci,
+    VirtioPciProps,
+};
+use ruvm_mem::{AddressSpace, MemorySystem};
+
+use crate::firmware::FirmwareSearch;
+use crate::microvm::{
+    KernelConfig, MICROVM_DESC, Microvm, MicrovmConfig, MicrovmProps, OnOffAuto,
+    default_firmware_name,
+};
+use crate::pc::{GsiHook, err};
+use crate::q35::{
+    Q35, Q35_BIOS_FILENAME, Q35_DESC, Q35_MACHINE_ALIAS, Q35_MACHINE_NAME, Q35MachineConfig,
+    Q35Props,
+};
+
+/// The x86 boards the system emulator can build, as `-machine help` lists them: name, alias
+/// and description.
+pub const X86_BOARDS: &[(&str, Option<&str>, &str)] =
+    &[("microvm", None, MICROVM_DESC), (Q35_MACHINE_NAME, Some(Q35_MACHINE_ALIAS), Q35_DESC)];
+
+/// A microvm or q35 board.
+pub enum X86Board {
+    /// `-M microvm`.
+    Microvm(Box<Microvm>),
+    /// `-M q35`, `-M pc-q35-11.1`.
+    Q35(Box<Q35>, Vec<VirtioPci>),
+}
+
+impl fmt::Debug for X86Board {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            X86Board::Microvm(m) => m.fmt(f),
+            X86Board::Q35(m, _) => m.fmt(f),
+        }
+    }
+}
+
+impl From<Microvm> for X86Board {
+    fn from(m: Microvm) -> Self {
+        X86Board::Microvm(Box::new(m))
+    }
+}
+
+impl From<Q35> for X86Board {
+    fn from(m: Q35) -> Self {
+        X86Board::Q35(Box::new(m), Vec::new())
+    }
+}
+
+impl X86Board {
+    /// The machine type name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            X86Board::Microvm(_) => "microvm",
+            X86Board::Q35(..) => Q35_MACHINE_NAME,
+        }
+    }
+
+    /// `default_kernel_irqchip_split` of the machine class: microvm asks for the split
+    /// irqchip, the PC boards for the full in-kernel one.
+    pub fn default_kernel_irqchip_split(&self) -> bool {
+        matches!(self, X86Board::Microvm(_))
+    }
+
+    /// Whether the board wants a PIT at all, the `pit` machine property not being off.
+    pub fn pit_wanted(&self) -> bool {
+        match self {
+            X86Board::Microvm(m) => m.props().pit != OnOffAuto::Off,
+            X86Board::Q35(m, _) => m.props().pit != OnOffAuto::Off,
+        }
+    }
+
+    /// Whether the kernel irqchip on mode sets up the PC GSI routing table,
+    /// `kvm_pc_setup_irq_routing()`. The PC boards do; microvm keeps KVM's default.
+    pub fn sets_up_irq_routing(&self) -> bool {
+        matches!(self, X86Board::Q35(..))
+    }
+
+    /// Plugs a virtio device: into a virtio-mmio transport on microvm, into a new virtio PCI
+    /// function on q35.
+    pub fn attach_virtio(&mut self, class: Box<dyn VirtioDeviceClass>) -> Result<(), String> {
+        match self {
+            X86Board::Microvm(m) => m.attach_virtio(class).map(|_| ()),
+            X86Board::Q35(m, devs) => {
+                let mem: SharedGuestMemory =
+                    Arc::new(AddressSpaceMemory::new(Arc::clone(m.memory_as())));
+                let backend = VirtioBackend::new(class, mem).map_err(err)?;
+                let dev = VirtioPci::new(m.pci_bus(), None, backend, &VirtioPciProps::default())
+                    .map_err(err)?;
+                devs.push(dev);
+                Ok(())
+            }
+        }
+    }
+
+    /// Plugs a `-drive if=ide,index=N` disk. Only q35 has an IDE (AHCI) controller.
+    pub fn attach_ide_drive(
+        &self,
+        index: usize,
+        blk: Arc<dyn ruvm_hw_storage::BlockBackend>,
+    ) -> Result<(), String> {
+        match self {
+            X86Board::Microvm(_) => {
+                Err(format!("machine type does not support if=ide,bus={index},unit=0"))
+            }
+            X86Board::Q35(m, _) => {
+                m.attach_drive(index, ruvm_hw_storage::DriveConfig::hd(), Some(blk))
+            }
+        }
+    }
+
+    /// The machine-done notifiers and the first reset.
+    pub fn machine_done(&mut self) -> Result<(), String> {
+        match self {
+            X86Board::Microvm(m) => m.machine_done(),
+            X86Board::Q35(m, _) => m.machine_done(),
+        }
+    }
+
+    /// The device part of a system reset.
+    pub fn system_reset(&mut self) -> Result<(), String> {
+        match self {
+            X86Board::Microvm(m) => m.system_reset(),
+            X86Board::Q35(m, _) => m.system_reset(),
+        }
+    }
+
+    /// The memory system all regions live in.
+    pub fn memory_system(&self) -> &Arc<MemorySystem> {
+        match self {
+            X86Board::Microvm(m) => m.memory_system(),
+            X86Board::Q35(m, _) => m.memory_system(),
+        }
+    }
+
+    /// `address_space_memory`.
+    pub fn memory_as(&self) -> &Arc<AddressSpace> {
+        match self {
+            X86Board::Microvm(m) => m.memory_as(),
+            X86Board::Q35(m, _) => m.memory_as(),
+        }
+    }
+
+    /// `address_space_io`.
+    pub fn io_as(&self) -> &Arc<AddressSpace> {
+        match self {
+            X86Board::Microvm(m) => m.io_as(),
+            X86Board::Q35(m, _) => m.io_as(),
+        }
+    }
+
+    /// The APIC IDs of the possible CPUs that are present at startup.
+    pub fn apic_ids(&self) -> Vec<u32> {
+        match self {
+            X86Board::Microvm(m) => m.apic_ids(),
+            X86Board::Q35(m, _) => m.apic_ids(),
+        }
+    }
+
+    /// The 8259 pair, if the board has one.
+    pub fn pic(&self) -> Option<&I8259Pair> {
+        match self {
+            X86Board::Microvm(m) => m.pic(),
+            X86Board::Q35(m, _) => m.pic(),
+        }
+    }
+
+    /// The INTR output of the master 8259, what goes to the BSP's LINT0.
+    pub fn pic_output(&self) -> &Arc<IrqPin> {
+        match self {
+            X86Board::Microvm(m) => m.pic_output(),
+            X86Board::Q35(m, _) => m.pic_output(),
+        }
+    }
+
+    /// Every IOAPIC of the board.
+    pub fn ioapics(&self) -> &IoApics {
+        match self {
+            X86Board::Microvm(m) => m.ioapics(),
+            X86Board::Q35(m, _) => m.ioapics(),
+        }
+    }
+
+    /// The IOAPICs in GSI order: the first one and microvm's second one if it has it.
+    pub fn ioapic_list(&self) -> Vec<Arc<IoApic>> {
+        match self {
+            X86Board::Microvm(m) => {
+                let mut v = vec![Arc::clone(m.ioapic())];
+                if let Some(s) = m.ioapic2() {
+                    v.push(Arc::clone(s));
+                }
+                v
+            }
+            X86Board::Q35(m, _) => vec![Arc::clone(m.ioapic())],
+        }
+    }
+
+    /// Replaces the MSI delivery of the IOAPICs and, on q35, of the PCI devices and the HPET.
+    pub fn set_msi_handler(&self, handler: Option<IoApicMsiHandler>) {
+        match self {
+            X86Board::Microvm(m) => m.set_msi_handler(handler),
+            X86Board::Q35(m, _) => m.set_msi_handler(handler),
+        }
+    }
+
+    /// Puts a hook in front of the GSI handler.
+    pub fn set_gsi_hook(&self, hook: Option<GsiHook>) {
+        match self {
+            X86Board::Microvm(m) => m.set_gsi_hook(hook),
+            X86Board::Q35(m, _) => m.set_gsi_hook(hook),
+        }
+    }
+
+    /// Where guest reset and power off requests go: the ICH9 PM block, the i8042 and port
+    /// 0x92 on q35, the generic event device on microvm. A microvm without ACPI has nothing
+    /// to report and ignores the handler.
+    pub fn set_request_handler(&self, handler: SystemRequestHandler) {
+        match self {
+            X86Board::Microvm(m) => {
+                if let Some(g) = m.ged() {
+                    g.set_request_handler(handler);
+                }
+            }
+            X86Board::Q35(m, _) => m.set_request_handler(Some(handler)),
+        }
+    }
+
+    /// The first serial port, if there is one.
+    pub fn serial(&self) -> Option<&Arc<Serial>> {
+        match self {
+            X86Board::Microvm(m) => m.serial(),
+            X86Board::Q35(m, _) => m.serial(),
+        }
+    }
+
+    /// Connects the chardev of the first serial port. Returns false if there is no port.
+    pub fn set_serial_backend(&self, backend: Option<Arc<dyn SerialBackend>>) -> bool {
+        match self {
+            X86Board::Microvm(m) => m.set_serial_backend(backend),
+            X86Board::Q35(m, _) => m.set_serial_backend(backend),
+        }
+    }
+
+    /// The warnings QEMU would have printed while the board was built.
+    pub fn warnings(&self) -> &[String] {
+        match self {
+            X86Board::Microvm(m) => m.warnings(),
+            X86Board::Q35(m, _) => m.warnings(),
+        }
+    }
+}
+
+/// Which board to build.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BoardKind {
+    /// `microvm`.
+    Microvm,
+    /// `pc-q35-11.1`, alias `q35`.
+    Q35,
+}
+
+impl BoardKind {
+    /// The board a `-machine type=` value names, if it is one of these.
+    pub fn from_name(name: &str) -> Option<BoardKind> {
+        match name {
+            "microvm" => Some(BoardKind::Microvm),
+            n if n == Q35_MACHINE_NAME || n == Q35_MACHINE_ALIAS => Some(BoardKind::Q35),
+            _ => None,
+        }
+    }
+
+    /// See [`X86Board::default_kernel_irqchip_split`].
+    pub fn default_kernel_irqchip_split(self) -> bool {
+        self == BoardKind::Microvm
+    }
+}
+
+/// A `-kernel` boot, as file names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KernelFiles {
+    /// `-kernel`.
+    pub kernel: String,
+    /// `-initrd`.
+    pub initrd: Option<String>,
+    /// `-append`.
+    pub append: String,
+}
+
+/// What [`build_board`] needs: the command line after parsing, with nothing read yet.
+pub struct BoardSpec {
+    pub kind: BoardKind,
+    /// The `-machine` properties other than `type`, `accel` and the accelerator ones, in
+    /// command line order.
+    pub props: Vec<(String, String)>,
+    /// `-m`, or `None` for the board's default.
+    pub ram_size: Option<u64>,
+    /// `-smp cpus=`.
+    pub cpus: u32,
+    /// `-smp maxcpus=`, 0 for the same as `cpus`.
+    pub max_cpus: u32,
+    /// Whether the accelerator is KVM.
+    pub kvm: bool,
+    /// `kvm_pit_in_kernel()`.
+    pub pit_in_kernel: bool,
+    /// Whether the accelerator can run SMM.
+    pub smm_available: bool,
+    /// `phys-bits` of the CPU model.
+    pub phys_bits: u32,
+    /// `-bios`.
+    pub bios: Option<String>,
+    /// `-kernel`, `-initrd` and `-append`.
+    pub kernel: Option<KernelFiles>,
+    /// Where firmware and option ROMs are looked up.
+    pub firmware: FirmwareSearch,
+    /// Whether the first serial port has a chardev (`serial_hd(0)`).
+    pub serial_hd: bool,
+    /// `QEMU_CLOCK_VIRTUAL`.
+    pub clock: Arc<Clock>,
+    /// `rtc_clock`.
+    pub rtc_clock: Arc<Clock>,
+}
+
+impl fmt::Debug for BoardSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoardSpec")
+            .field("kind", &self.kind)
+            .field("props", &self.props)
+            .field("ram_size", &self.ram_size)
+            .field("cpus", &self.cpus)
+            .field("bios", &self.bios)
+            .field("kernel", &self.kernel)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The C library's text for an I/O error, without Rust's " (os error N)" suffix.
+fn strerror(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.find(" (os error") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
+}
+
+/// Reads the `-kernel` and `-initrd` files. The errors are those of `x86_load_linux()`.
+pub fn load_kernel(files: &KernelFiles) -> Result<KernelConfig, String> {
+    let data = std::fs::read(&files.kernel)
+        .map_err(|e| format!("qemu: could not load kernel '{}': {}", files.kernel, strerror(&e)))?;
+    let initrd = match &files.initrd {
+        Some(f) => Some(std::fs::read(f).map_err(|e| {
+            format!(
+                "qemu: error reading initrd {f}: Failed to open file \u{201c}{f}\u{201d}: {}",
+                strerror(&e)
+            )
+        })?),
+        None => None,
+    };
+    Ok(KernelConfig {
+        filename: files.kernel.clone(),
+        data,
+        cmdline: files.append.clone(),
+        initrd,
+        ..KernelConfig::default()
+    })
+}
+
+/// Builds the board `spec` describes, with its firmware, option ROMs and kernel loaded. The
+/// devices from `-device` and `-drive` are plugged afterwards, before `machine_done()`.
+/// Also gives the warnings setting the properties produced; the board's own are in
+/// [`X86Board::warnings`].
+pub fn build_board(spec: BoardSpec) -> Result<(X86Board, Vec<String>), String> {
+    let kernel = spec.kernel.as_ref().map(load_kernel).transpose()?;
+    let mut rom_files = BTreeMap::new();
+    if kernel.is_some() {
+        for name in [LINUXBOOT_DMA_ROM, PVH_ROM] {
+            if let Some(data) = spec.firmware.load(name) {
+                rom_files.insert(name.to_string(), data);
+            }
+        }
+    }
+    match spec.kind {
+        BoardKind::Microvm => {
+            let mut props = MicrovmProps::default();
+            for (k, v) in &spec.props {
+                props.set(k, v)?;
+            }
+            let name =
+                spec.bios.clone().unwrap_or_else(|| default_firmware_name(&props).to_string());
+            let mut cfg = MicrovmConfig {
+                cpus: spec.cpus,
+                max_cpus: spec.max_cpus,
+                kvm: spec.kvm,
+                firmware: spec.firmware.load(&name),
+                firmware_name: spec.bios.clone(),
+                props,
+                kernel,
+                rom_files,
+                serial_hd: spec.serial_hd,
+                clock: spec.clock,
+                rtc_clock: spec.rtc_clock,
+                pit_in_kernel: spec.pit_in_kernel,
+                ..MicrovmConfig::default()
+            };
+            if let Some(size) = spec.ram_size {
+                cfg.ram_size = size;
+            }
+            Ok((Microvm::new(cfg)?.into(), Vec::new()))
+        }
+        BoardKind::Q35 => {
+            let mut props = Q35Props::default();
+            let mut warnings = Vec::new();
+            for (k, v) in &spec.props {
+                props.set(k, v, &mut warnings)?;
+            }
+            let name = spec.bios.clone().unwrap_or_else(|| Q35_BIOS_FILENAME.to_string());
+            let mut cfg = Q35MachineConfig {
+                cpus: spec.cpus,
+                max_cpus: spec.max_cpus,
+                kvm: spec.kvm,
+                smm_available: spec.smm_available,
+                phys_bits: spec.phys_bits,
+                firmware: spec.firmware.load(&name),
+                firmware_name: spec.bios.clone(),
+                props,
+                kernel,
+                rom_files,
+                serial_hd: spec.serial_hd,
+                clock: spec.clock,
+                rtc_clock: spec.rtc_clock,
+                pit_in_kernel: spec.pit_in_kernel,
+                ..Q35MachineConfig::default()
+            };
+            if let Some(size) = spec.ram_size {
+                cfg.ram_size = size;
+            }
+            Ok((Q35::new(cfg)?.into(), warnings))
+        }
+    }
+}

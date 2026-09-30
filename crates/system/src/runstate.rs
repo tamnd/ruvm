@@ -132,11 +132,21 @@ struct Inner {
     killed: Option<Killed>,
 }
 
+/// What `pause_all_vcpus()` and `resume_all_vcpus()` do for the machine: called with false
+/// to stop the vCPUs and with true to let them run.
+pub type CpuHook = Arc<dyn Fn(bool) + Send + Sync>;
+
 /// The run state of the machine, with the events QMP clients see when it changes.
-#[derive(Debug)]
 pub struct Runstate {
     inner: Mutex<Inner>,
     qmp: Arc<Qmp>,
+    cpus: Mutex<Option<CpuHook>>,
+}
+
+impl std::fmt::Debug for Runstate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Runstate").field("inner", &self.inner).finish_non_exhaustive()
+    }
 }
 
 impl Runstate {
@@ -150,7 +160,20 @@ impl Runstate {
                 killed: None,
             }),
             qmp,
+            cpus: Mutex::new(None),
         })
+    }
+
+    /// Installs what starts and stops the vCPUs. Without one there are no vCPUs to run.
+    pub fn set_cpu_hook(&self, hook: Option<CpuHook>) {
+        *lock(&self.cpus) = hook;
+    }
+
+    fn cpus(&self, run: bool) {
+        let hook = lock(&self.cpus).clone();
+        if let Some(h) = hook {
+            h(run);
+        }
     }
 
     fn emit(&self, event: Option<ruvm_qapi::QDict>) {
@@ -200,8 +223,13 @@ impl Runstate {
         StatusInfo { running: state == RunState::Running, status: state }
     }
 
-    /// `vm_stop()` from outside a vCPU, which is `do_vm_stop(state, true)`.
+    /// `vm_stop()`, which is `do_vm_stop(state, true)`. On a vCPU thread the vCPUs are only
+    /// asked to stop.
     pub fn vm_stop(&self, state: RunState) {
+        if !is_live(self.get()) {
+            return;
+        }
+        self.cpus(false);
         let mut inner = lock(&self.inner);
         let old = inner.state;
         if !is_live(old) {
@@ -216,6 +244,9 @@ impl Runstate {
     /// `vm_shutdown()`, `do_vm_stop(RUN_STATE_SHUTDOWN, false)`: no STOP event, since the
     /// process is on its way out.
     pub fn vm_shutdown(&self) {
+        if is_live(self.get()) {
+            self.cpus(false);
+        }
         let mut inner = lock(&self.inner);
         if is_live(inner.state) {
             inner.vm_was_suspended = inner.state == RunState::Suspended;
@@ -223,7 +254,7 @@ impl Runstate {
         }
     }
 
-    /// `vm_start()`. There are no vCPUs to resume yet, so this is `vm_prepare_start()`.
+    /// `vm_start()`: `vm_prepare_start()` and then `resume_all_vcpus()`.
     pub fn vm_start(&self) {
         let mut inner = lock(&self.inner);
         if inner.state == RunState::Running {
@@ -235,6 +266,8 @@ impl Runstate {
         inner = lock(&self.inner);
         Self::set_locked(&mut inner, state);
         inner.vm_was_suspended = false;
+        drop(inner);
+        self.cpus(true);
     }
 
     /// `qmp_stop()`.
@@ -323,5 +356,19 @@ mod tests {
         assert_eq!(rs.take_killed(), Some(Killed { signo: 15, pid: 42 }));
         assert!(!caused_by_guest(ShutdownCause::HostQmpQuit));
         assert!(caused_by_guest(ShutdownCause::GuestShutdown));
+    }
+
+    #[test]
+    fn the_cpu_hook_follows_the_runstate() {
+        let rs = Runstate::new(Qmp::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let c = Arc::clone(&calls);
+        rs.set_cpu_hook(Some(Arc::new(move |run| c.lock().unwrap().push(run))));
+        rs.qmp_cont().unwrap();
+        rs.qmp_stop().unwrap();
+        rs.qmp_cont().unwrap();
+        rs.vm_shutdown();
+        rs.vm_shutdown();
+        assert_eq!(*calls.lock().unwrap(), vec![true, false, true, false]);
     }
 }
