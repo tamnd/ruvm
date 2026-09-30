@@ -123,8 +123,10 @@ ruvm-vmstate-macros = { version = "=0.1.5", path = "crates/vmstate-macros" }
 
 # External crates. The approved set is in spec/24-workspace-layout.md, and adding one outside it
 # is a reviewed change with a line in deny.toml if its license needs one.
+arc-swap = "1.9.2"
 libc = "0.2.189"
 mio = { version = "1.2.3", default-features = false, features = ["os-poll", "os-ext", "net"] }
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 rustix = { version = "1.1.5", default-features = false, features = ["std", "net", "fs"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
