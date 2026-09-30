@@ -11,7 +11,7 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 1
 
 [dependencies]
 ruvm-base.workspace = true
@@ -27,6 +27,16 @@ ruvm-hw-timer.workspace = true
 ruvm-hw-virtio.workspace = true
 ruvm-mem.workspace = true
 ruvm-virtio-queue.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+kvm-bindings.workspace = true
+kvm-ioctls.workspace = true
+ruvm-accel-kvm.workspace = true
+ruvm-target-x86.workspace = true
+vmm-sys-util.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
+ruvm-accel-kvm.workspace = true
 
 [lints]
 workspace = true

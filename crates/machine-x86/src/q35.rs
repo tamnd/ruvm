@@ -72,11 +72,11 @@ use crate::ich9_lpc::{Ich9Lpc, Ich9LpcConfig, SmiHandler};
 use crate::microvm::props::OnOffAuto;
 use crate::microvm::{GuestRamRange, KernelConfig, OptionRom};
 use crate::pc::{
-    ACPI_BUILD_PCI_IRQS, FW_CFG_ACPI_TABLES, FW_CFG_HPET, FW_CFG_IRQ0_OVERRIDE, GIB, GsiState,
-    HdGeometry, ISA_BIOS_MAX, IoportF0, MIB, PC_FW_DATA, PC_ROM_MIN_VGA, PC_ROM_SIZE,
-    PCSPK_IO_BASE, PORT92_IO_BASE, PcSpeaker, Port92, REG_EQUIPMENT_BYTE, UnassignedIo, WeakDma,
-    boot_order_nibbles, cmos_init_disks, cmos_set_memory, err, hd_geometry_guess, pci_hole64_start,
-    rtc_set_cpus_count, set_boot_dev,
+    ACPI_BUILD_PCI_IRQS, FW_CFG_ACPI_TABLES, FW_CFG_HPET, FW_CFG_IRQ0_OVERRIDE, GIB, GsiHook,
+    GsiHookSlot, GsiState, HdGeometry, ISA_BIOS_MAX, IoportF0, MIB, PC_FW_DATA, PC_ROM_MIN_VGA,
+    PC_ROM_SIZE, PCSPK_IO_BASE, PORT92_IO_BASE, PcSpeaker, Port92, REG_EQUIPMENT_BYTE,
+    UnassignedIo, WeakDma, boot_order_nibbles, cmos_init_disks, cmos_set_memory, err,
+    hd_geometry_guess, pci_hole64_start, rtc_set_cpus_count, set_boot_dev,
 };
 
 pub use props::{Q35Props, SmbiosEntryPointType};
@@ -180,6 +180,9 @@ pub struct Q35MachineConfig {
     pub rtc_clock: Arc<Clock>,
     /// The date the RTC starts from, `-rtc base=`.
     pub rtc_date: SystemTime,
+    /// `kvm_pit_in_kernel()`: KVM emulates the PIT and the speaker port, so the board leaves
+    /// its own out.
+    pub pit_in_kernel: bool,
 }
 
 impl fmt::Debug for Q35MachineConfig {
@@ -223,6 +226,7 @@ impl Default for Q35MachineConfig {
             clock: Clock::manual(ClockType::Virtual),
             rtc_clock: Clock::manual(ClockType::Host),
             rtc_date: SystemTime::now(),
+            pit_in_kernel: false,
         }
     }
 }
@@ -478,6 +482,7 @@ pub struct Q35 {
     ioapics: IoApics,
     ioapic: Arc<IoApic>,
     msi_hook: Arc<RwLock<Option<IoApicMsiHandler>>>,
+    gsi_hook: GsiHookSlot,
     request_hook: Arc<RwLock<Option<SystemRequestHandler>>>,
     pic: Option<I8259Pair>,
     pic_output: Arc<IrqPin>,
@@ -535,6 +540,7 @@ impl Q35 {
             clock,
             rtc_clock,
             rtc_date,
+            pit_in_kernel,
         } = cfg;
 
         // machine_parse_smp_config(), for a topology given as a CPU count.
@@ -798,10 +804,12 @@ impl Q35 {
             let r = mem.new_io("ioapic", 0x1000, ioapic.clone()).map_err(err)?;
             mem.add_subregion(system, IO_APIC_DEFAULT_ADDRESS, r).map_err(err)?;
         }
+        let gsi_hook: GsiHookSlot = Arc::new(RwLock::new(None));
         let gsi_state = Arc::new(GsiState {
             i8259: pic.as_ref().map(|p| p.irq_set.clone()).unwrap_or_default(),
             ioapic: ioapic.inputs(),
             ioapic2: Vec::new(),
+            hook: Arc::clone(&gsi_hook),
         });
         let gsi = irq::allocate(
             Arc::new(move |n, level| gsi_state.set(n, level)),
@@ -951,7 +959,7 @@ impl Q35 {
             (None, None)
         };
 
-        let (pit, pcspk) = if props.pit != OnOffAuto::Off {
+        let (pit, pcspk) = if props.pit != OnOffAuto::Off && !pit_in_kernel {
             let p = I8254::new(&clock, PIT_IO_BASE as u32);
             match &hpet {
                 Some(h) => {
@@ -1027,6 +1035,7 @@ impl Q35 {
             ioapics,
             ioapic,
             msi_hook,
+            gsi_hook,
             request_hook,
             pic,
             pic_output,
@@ -1416,6 +1425,12 @@ impl Q35 {
     /// there.
     pub fn set_msi_handler(&self, handler: Option<IoApicMsiHandler>) {
         *self.msi_hook.write().unwrap_or_else(PoisonError::into_inner) = handler;
+    }
+
+    /// Puts a hook in front of the GSI handler. KVM with the in-kernel irqchip uses it to send
+    /// the lines to `KVM_IRQ_LINE` instead of the emulated PIC and IOAPIC.
+    pub fn set_gsi_hook(&self, hook: Option<GsiHook>) {
+        *self.gsi_hook.write().unwrap_or_else(PoisonError::into_inner) = hook;
     }
 
     /// Where guest requested resets, shutdowns, suspends and wakeups go: from the LPC's PM

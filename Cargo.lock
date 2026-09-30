@@ -655,6 +655,9 @@ version = "0.2.2"
 name = "ruvm-machine-x86"
 version = "0.2.2"
 dependencies = [
+ "kvm-bindings",
+ "kvm-ioctls",
+ "ruvm-accel-kvm",
  "ruvm-base",
  "ruvm-firmware",
  "ruvm-hw-acpi",
@@ -667,7 +670,9 @@ dependencies = [
  "ruvm-hw-timer",
  "ruvm-hw-virtio",
  "ruvm-mem",
+ "ruvm-target-x86",
  "ruvm-virtio-queue",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -764,12 +769,17 @@ dependencies = [
 name = "ruvm-system"
 version = "0.2.2"
 dependencies = [
+ "ruvm-accel-kvm",
  "ruvm-accel-qtest",
  "ruvm-base",
  "ruvm-block",
  "ruvm-chardev",
  "ruvm-hostmem",
+ "ruvm-hw-char",
  "ruvm-hw-core",
+ "ruvm-hw-storage",
+ "ruvm-hw-virtio",
+ "ruvm-machine-x86",
  "ruvm-mem",
  "ruvm-monitor",
  "ruvm-qapi",

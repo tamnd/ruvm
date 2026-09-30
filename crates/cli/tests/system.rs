@@ -22,15 +22,26 @@ fn system(args: &[&str]) -> (i32, String, String) {
 fn startup_errors() {
     let p = "qemu-system-x86_64: ";
     let hint = "Use -machine help to list supported machines\n";
+    // With KVM built in, it is the default accelerator.
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    for (args, want) in [
+        (
+            &["-machine", "none"][..],
+            format!("{p}No accelerator selected and no default accelerator available\n"),
+        ),
+        (
+            &["-machine", "none", "-accel", "kvm"],
+            format!("{p}-accel kvm: invalid accelerator kvm\n"),
+        ),
+    ] {
+        let (code, _, err) = system(args);
+        assert_eq!((code, err), (1, want), "{args:?}");
+    }
     for (args, want) in [
         (&[][..], format!("{p}No machine specified, and there is no default\n{hint}")),
         (&["-machine", "pc"], format!("{p}unsupported machine type: \"pc\"\n{hint}")),
-        (
-            &["-machine", "none"],
-            format!("{p}No accelerator selected and no default accelerator available\n"),
-        ),
-        (&["-machine", "none", "-accel", "kvm"], format!("{p}invalid accelerator kvm\n")),
-        (&["-m", "512"], format!("{p}-m 512: this option is not supported by ruvm yet\n")),
+        (&["-m", "512"], format!("{p}No machine specified, and there is no default\n{hint}")),
+        (&["-hda", "x.img"], format!("{p}-hda x.img: this option is not supported by ruvm yet\n")),
         (&["-qmp", "tcp:nope"], format!("{p}-qmp tcp:nope: parse error: tcp:nope\n")),
         (
             &["-display", "gtk"],
@@ -58,10 +69,24 @@ fn help_options() {
     let (code, out, _) = system(&["-machine", "help"]);
     assert_eq!(
         (code, out.as_str()),
-        (0, "Supported machines are:\nnone                 empty machine\n")
+        (
+            0,
+            "Supported machines are:\n\
+             microvm              microvm (i386)\n\
+             none                 empty machine\n\
+             q35                  Standard PC (Q35 + ICH9, 2009) (alias of pc-q35-11.1)\n\
+             pc-q35-11.1          Standard PC (Q35 + ICH9, 2009)\n"
+        )
+    );
+    let (code, out, _) = system(&["-L", "/a", "-L", "/b", "-L", "help"]);
+    assert_eq!(code, 0);
+    assert!(
+        out.starts_with("/a\n/b\n/usr/share/qemu\n/usr/share/seabios\n/usr/local/share/qemu\n"),
+        "{out}"
     );
     let (code, out, _) = system(&["-accel", "help"]);
-    assert_eq!((code, out.as_str()), (0, "Accelerators supported in QEMU binary:\n"));
+    let kvm = if cfg!(all(target_os = "linux", target_arch = "x86_64")) { "kvm\n" } else { "" };
+    assert_eq!((code, out), (0, format!("Accelerators supported in QEMU binary:\n{kvm}")));
     let (code, out, _) = system(&["-object", "help"]);
     assert_eq!(
         (code, out.as_str()),
@@ -75,6 +100,142 @@ fn help_options() {
     assert!(out.starts_with("Available display backend types:\nnone\n\n"), "{out}");
     let (code, out, _) = system(&["-audio", "help"]);
     assert_eq!((code, out.as_str()), (0, "Available audio drivers:\nnone\nwav\n"));
+}
+
+/// The x86 boards on the command line. Everything here fails before a vCPU would run, so it
+/// needs no KVM: with `-accel qtest` the boards stop at the accelerator check, and the errors
+/// QEMU finds earlier come first.
+#[test]
+fn x86_board_errors() {
+    let p = "qemu-system-x86_64: ";
+    let q = ["-accel", "qtest"];
+    let only_kvm = format!("{p}this machine type is only supported with -accel kvm by ruvm yet\n");
+    for (args, want) in [
+        (&["-M", "microvm"][..], only_kvm.clone()),
+        (&["-M", "q35", "-m", "256", "-smp", "2", "-nographic"], only_kvm.clone()),
+        (&["-M", "q35", "-append", "x"], format!("{p}-append only allowed with -kernel option\n")),
+        (&["-M", "q35", "-initrd", "x"], format!("{p}-initrd only allowed with -kernel option\n")),
+        (&["-M", "microvm,bogus=on"], format!("{p}Property 'microvm-machine.bogus' not found\n")),
+        (
+            &["-M", "microvm", "-smp", "300"],
+            format!(
+                "{p}Invalid SMP CPUs 300. The max CPUs supported by machine 'microvm' is 288\n"
+            ),
+        ),
+        (
+            &["-M", "q35", "-smp", "cpus=4,sockets=3,cores=1"],
+            format!(
+                "{p}Invalid CPU topology: product of the hierarchy must match maxcpus: sockets (3) * dies (1) * modules (1) * cores (1) * threads (1) != maxcpus (4)\n"
+            ),
+        ),
+        (
+            &["-M", "q35", "-drive", "file=a.img,if=usb"],
+            format!("{p}-drive file=a.img,if=usb: unsupported bus type 'usb'\n"),
+        ),
+        (
+            &["-M", "q35", "-drive", "file=a.img,index=0", "-drive", "file=b.img,index=0"],
+            format!("{p}-drive file=b.img,index=0: drive with bus=0, unit=0 (index=0) exists\n"),
+        ),
+        (
+            &["-M", "microvm", "-device", "help"],
+            format!("{p}-device help: -device help is not supported by ruvm yet\n"),
+        ),
+    ] {
+        let args: Vec<&str> = args.iter().chain(&q).copied().collect();
+        let (code, _, err) = system(&args);
+        assert_eq!((code, err), (1, want), "{args:?}");
+    }
+}
+
+/// Boots Linux on KVM with the command line of the docs and waits for the kernel banner on
+/// stdout. Skipped without `RUVM_TEST_KERNEL` (a bzImage), and without a usable `/dev/kvm`
+/// unless `RUVM_REQUIRE_KVM` is set. `RUVM_TEST_FIRMWARE_DIR` is passed as `-L`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod boot {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn kvm_usable() -> bool {
+        match std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm") {
+            Ok(_) => true,
+            Err(e) => {
+                if std::env::var_os("RUVM_REQUIRE_KVM").is_some() {
+                    panic!("RUVM_REQUIRE_KVM is set but /dev/kvm cannot be opened: {e}");
+                }
+                eprintln!("skipping: /dev/kvm: {e}");
+                false
+            }
+        }
+    }
+
+    fn boot(machine: &str, serial: &[&str]) {
+        if !kvm_usable() {
+            return;
+        }
+        let Some(kernel) = std::env::var_os("RUVM_TEST_KERNEL") else {
+            eprintln!("skipping: RUVM_TEST_KERNEL is not set");
+            return;
+        };
+        let timeout: u64 =
+            std::env::var("RUVM_TEST_BOOT_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        let mut cmd = Command::new(ruvm());
+        cmd.arg("qemu-system-x86_64")
+            .args(["-M", machine, "-accel", "kvm", "-m", "256", "-no-reboot"])
+            .arg("-kernel")
+            .arg(&kernel)
+            .args(["-append", "console=ttyS0 panic=-1"])
+            .args(serial);
+        if let Some(dir) = std::env::var_os("RUVM_TEST_FIRMWARE_DIR") {
+            cmd.arg("-L").arg(dir);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut seen = Vec::new();
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen.extend_from_slice(&buf[..n]),
+                }
+                if String::from_utf8_lossy(&seen).contains("Linux version") {
+                    let _ = tx.send(true);
+                    return;
+                }
+            }
+            let _ = tx.send(false);
+        });
+        let ok = rx.recv_timeout(Duration::from_secs(timeout)).unwrap_or(false);
+        let _ = child.kill();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            ok,
+            "no \"Linux version\" on stdout within {timeout}s; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn microvm_nographic() {
+        boot("microvm", &["-nographic"]);
+    }
+
+    #[test]
+    fn microvm_serial_stdio() {
+        boot("microvm", &["-serial", "stdio", "-display", "none"]);
+    }
+
+    #[test]
+    fn q35_nographic() {
+        boot("q35", &["-nographic"]);
+    }
 }
 
 #[cfg(unix)]

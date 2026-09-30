@@ -65,7 +65,9 @@ use ruvm_virtio_queue::{GuestMemory, MemoryError};
 
 pub use props::{MicrovmProps, OnOffAuto};
 
-use crate::pc::{GsiState, ISA_BIOS_MAX, MIB, UnassignedIo, WeakDma, cmos_set_memory, err};
+use crate::pc::{
+    GsiHook, GsiHookSlot, GsiState, ISA_BIOS_MAX, MIB, UnassignedIo, WeakDma, cmos_set_memory, err,
+};
 
 /// `mc->desc`.
 pub const MICROVM_DESC: &str = "microvm (i386)";
@@ -167,6 +169,9 @@ pub struct MicrovmConfig {
     pub rtc_clock: Arc<Clock>,
     /// The date the RTC starts from, `-rtc base=`.
     pub rtc_date: SystemTime,
+    /// `kvm_pit_in_kernel()`: KVM emulates the PIT (and the speaker port), so the board leaves
+    /// its own out.
+    pub pit_in_kernel: bool,
 }
 
 impl fmt::Debug for MicrovmConfig {
@@ -206,6 +211,7 @@ impl Default for MicrovmConfig {
             clock: Clock::manual(ClockType::Virtual),
             rtc_clock: Clock::manual(ClockType::Host),
             rtc_date: SystemTime::now(),
+            pit_in_kernel: false,
         }
     }
 }
@@ -332,6 +338,7 @@ pub struct Microvm {
     ioapic: Arc<IoApic>,
     ioapic2: Option<Arc<IoApic>>,
     msi_hook: Arc<RwLock<Option<IoApicMsiHandler>>>,
+    gsi_hook: GsiHookSlot,
     pic: Option<I8259Pair>,
     pic_output: Arc<IrqPin>,
     pit: Option<Arc<I8254>>,
@@ -382,6 +389,7 @@ impl Microvm {
             clock,
             rtc_clock,
             rtc_date,
+            pit_in_kernel,
         } = cfg;
 
         // machine_parse_smp_config(), for a topology given as a CPU count.
@@ -577,10 +585,12 @@ impl Microvm {
         let ioapic2 =
             if ioapic_count > 1 { Some(make_ioapic(IO_APIC_SECONDARY_ADDRESS)?) } else { None };
 
+        let gsi_hook: GsiHookSlot = Arc::new(RwLock::new(None));
         let gsi_state = Arc::new(GsiState {
             i8259: pic.as_ref().map(|p| p.irq_set.clone()).unwrap_or_default(),
             ioapic: ioapic.inputs(),
             ioapic2: ioapic2.as_ref().map(|s| s.inputs()).unwrap_or_default(),
+            hook: Arc::clone(&gsi_hook),
         });
         let gsi = irq::allocate(
             Arc::new(move |n, level| gsi_state.set(n, level)),
@@ -629,7 +639,7 @@ impl Microvm {
             None
         };
 
-        let pit = if props.pit != OnOffAuto::Off {
+        let pit = if props.pit != OnOffAuto::Off && !pit_in_kernel {
             let p = I8254::new(&clock, PIT_IO_BASE as u32);
             p.irq.connect(gsi[0].clone());
             let r = mem.new_io("pit", 4, p.clone()).map_err(err)?;
@@ -709,6 +719,7 @@ impl Microvm {
             ioapic,
             ioapic2,
             msi_hook,
+            gsi_hook,
             pic,
             pic_output,
             pit,
@@ -1140,6 +1151,12 @@ impl Microvm {
     /// a local APIC is mapped there.
     pub fn set_msi_handler(&self, handler: Option<IoApicMsiHandler>) {
         *self.msi_hook.write().unwrap_or_else(PoisonError::into_inner) = handler;
+    }
+
+    /// Puts a hook in front of the GSI handler. KVM with the in-kernel irqchip uses it to send
+    /// the lines to `KVM_IRQ_LINE` instead of the emulated PIC and IOAPIC.
+    pub fn set_gsi_hook(&self, hook: Option<GsiHook>) {
+        *self.gsi_hook.write().unwrap_or_else(PoisonError::into_inner) = hook;
     }
 
     /// The 8259 pair, with `pic` not off.
