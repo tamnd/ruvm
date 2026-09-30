@@ -928,7 +928,7 @@ mod tests {
             assert_eq!(VDUSE_VQ_INJECT_IRQ, 0x4004_8117);
         }
         assert_eq!(ioc_size(VDUSE_CREATE_DEV), DEV_CONFIG_SIZE);
-        assert_eq!(VQ_LOG_SIZE, 16400);
+        assert_eq!(VQ_LOG_SIZE, 16448);
     }
 
     #[test]
