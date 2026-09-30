@@ -86,6 +86,8 @@ pub(crate) fn register(cmds: &mut Commands) {
     register_query_version(cmds, |_: &MonitorQmp| Ok(version_info()));
     register_query_commands(cmds, query_commands);
     register_query_qmp_schema(cmds, query_qmp_schema);
+    #[cfg(unix)]
+    crate::fds::register(cmds);
 }
 
 /// `qmp_cap_negotiation_commands`, which holds only `qmp_capabilities`.

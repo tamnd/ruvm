@@ -15,6 +15,10 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -30,6 +34,8 @@ use ruvm_qapi::{QDict, QValue};
 
 use crate::control;
 use crate::event::EventThrottle;
+#[cfg(unix)]
+use crate::fds::{FdSets, NamedFds};
 
 /// `QMP_REQ_QUEUE_LEN_MAX`: how many in-band requests a monitor with OOB enabled may have
 /// queued before it stops reading.
@@ -67,6 +73,12 @@ pub struct MonitorQmp {
     parser: Mutex<Streamer>,
     session: Mutex<Session>,
     resumed: Condvar,
+    /// The descriptors that came with the last read that had any, what the socket chardev
+    /// keeps in `read_msgfds` until a command takes one.
+    #[cfg(unix)]
+    msgfds: Mutex<Vec<OwnedFd>>,
+    #[cfg(unix)]
+    named_fds: Mutex<NamedFds>,
 }
 
 impl std::fmt::Debug for MonitorQmp {
@@ -148,6 +160,36 @@ impl MonitorQmp {
             }
         }
         *lock(&self.parser) = Streamer::new();
+        #[cfg(unix)]
+        {
+            lock(&self.msgfds).clear();
+            if let Some(qmp) = self.qmp() {
+                qmp.fdsets().cleanup();
+            }
+        }
+    }
+
+    /// Stores descriptors that arrived with a read, `tcp_chr_recv()`. A read that brings some
+    /// closes the ones still waiting from before, and a read that brings none leaves them.
+    #[cfg(unix)]
+    pub fn set_msgfds(&self, fds: Vec<OwnedFd>) {
+        if !fds.is_empty() {
+            *lock(&self.msgfds) = fds;
+        }
+    }
+
+    /// `qemu_chr_fe_get_msgfd()`: the first waiting descriptor. Any others are closed, since
+    /// every command that takes one takes exactly one.
+    #[cfg(unix)]
+    pub fn take_msgfd(&self) -> Option<OwnedFd> {
+        let mut fds = std::mem::take(&mut *lock(&self.msgfds));
+        if fds.is_empty() { None } else { Some(fds.swap_remove(0)) }
+    }
+
+    /// The descriptors `getfd` stored in this monitor.
+    #[cfg(unix)]
+    pub fn named_fds(&self) -> MutexGuard<'_, NamedFds> {
+        lock(&self.named_fds)
     }
 
     /// `monitor_can_read()`: a suspended monitor reads nothing.
@@ -286,11 +328,31 @@ impl MonitorQmp {
     /// suspended. This is the monitor side of one client connection, from `CHR_EVENT_OPENED`
     /// to `CHR_EVENT_CLOSED`.
     pub fn serve(&self, mut reader: impl Read, writer: Box<dyn Write + Send>) -> io::Result<()> {
+        self.serve_with(writer, |buf| reader.read(buf))
+    }
+
+    /// Like [`MonitorQmp::serve`] on a Unix socket, where the client can pass descriptors with
+    /// SCM_RIGHTS for `getfd` and `add-fd`.
+    #[cfg(unix)]
+    pub fn serve_unix(&self, stream: UnixStream) -> io::Result<()> {
+        let writer = Box::new(stream.try_clone()?);
+        self.serve_with(writer, |buf| {
+            let (n, fds) = recv_with_fds(&stream, buf)?;
+            self.set_msgfds(fds);
+            Ok(n)
+        })
+    }
+
+    fn serve_with(
+        &self,
+        writer: Box<dyn Write + Send>,
+        mut recv: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> io::Result<()> {
         self.set_output(Some(writer));
         self.open();
         let mut buf = [0u8; 4096];
         let result = loop {
-            let n = match reader.read(&mut buf) {
+            let n = match recv(&mut buf) {
                 Ok(0) => break Ok(()),
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -307,6 +369,40 @@ impl MonitorQmp {
         self.set_output(None);
         result
     }
+}
+
+/// `TCP_MAX_FDS`: how many descriptors one read takes. More than that are dropped by the
+/// kernel with MSG_CTRUNC set, as in QEMU.
+#[cfg(unix)]
+const TCP_MAX_FDS: usize = 16;
+
+/// One `recvmsg()` that keeps the descriptors that came with the bytes, close on exec.
+#[cfg(unix)]
+fn recv_with_fds(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
+    use std::mem::MaybeUninit;
+
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(TCP_MAX_FDS))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    #[cfg(not(target_vendor = "apple"))]
+    let flags = RecvFlags::CMSG_CLOEXEC;
+    #[cfg(target_vendor = "apple")]
+    let flags = RecvFlags::empty();
+    let msg = recvmsg(stream, &mut [io::IoSliceMut::new(buf)], &mut control, flags)?;
+    let mut fds = Vec::new();
+    for m in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(received) = m {
+            fds.extend(received);
+        }
+    }
+    // Without MSG_CMSG_CLOEXEC the flag is set right after, as qio_channel_socket_copy_fds()
+    // does on such hosts.
+    #[cfg(target_vendor = "apple")]
+    for fd in &fds {
+        rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC)?;
+    }
+    Ok((msg.bytes, fds))
 }
 
 struct Monitors {
@@ -326,6 +422,8 @@ pub struct Qmp {
     event_clock: RwLock<Arc<dyn Fn() -> i64 + Send + Sync>>,
     policy: RwLock<CompatPolicy>,
     machine_ready: AtomicBool,
+    #[cfg(unix)]
+    fdsets: Mutex<FdSets>,
 }
 
 impl std::fmt::Debug for Qmp {
@@ -353,6 +451,8 @@ impl Qmp {
             event_clock: RwLock::new(Arc::new(move || start.elapsed().as_nanos() as i64)),
             policy: RwLock::new(CompatPolicy::default()),
             machine_ready: AtomicBool::new(true),
+            #[cfg(unix)]
+            fdsets: Mutex::new(FdSets::new()),
         })
     }
 
@@ -373,6 +473,12 @@ impl Qmp {
     /// Registers commands through one of the generated `register_*` functions.
     pub fn register(&self, f: impl FnOnce(&mut Commands)) {
         self.update_commands(f);
+    }
+
+    /// The fd sets `add-fd` fills, shared by every monitor.
+    #[cfg(unix)]
+    pub fn fdsets(&self) -> MutexGuard<'_, FdSets> {
+        lock(&self.fdsets)
     }
 
     pub fn policy(&self) -> CompatPolicy {
@@ -424,6 +530,10 @@ impl Qmp {
                 suspend_cnt: 0,
             }),
             resumed: Condvar::new(),
+            #[cfg(unix)]
+            msgfds: Mutex::new(Vec::new()),
+            #[cfg(unix)]
+            named_fds: Mutex::new(NamedFds::default()),
         });
         lock(&self.monitors).list.push_back(mon.clone());
         mon
