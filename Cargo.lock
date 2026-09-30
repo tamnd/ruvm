@@ -408,6 +408,12 @@ version = "0.2.0"
 [[package]]
 name = "ruvm-hw-char"
 version = "0.2.0"
+dependencies = [
+ "ruvm-base",
+ "ruvm-chardev",
+ "ruvm-hw-core",
+ "ruvm-mem",
+]
 
 [[package]]
 name = "ruvm-hw-core"
