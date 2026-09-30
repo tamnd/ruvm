@@ -201,6 +201,8 @@ ruvm/
     trace-events/         every trace-events file, path preserved
     hx/                   qemu-options.hx, hmp-commands.hx, hmp-commands-info.hx
     acpi-expected/        tests/data/acpi blobs
+    targets/              configs/targets/*.mak, the list of system and user mode targets
+    MANIFEST              the SHA-256 of every file above, checked by cargo xtask vendor-check
     UPSTREAM              the QEMU commit these files come from
   crates/
     base/ aio/ sys/ virtio-queue/ vhost/ vfio-user/
@@ -223,7 +225,7 @@ ruvm/
   docs/
 ```
 
-`vendor-qemu/` deserves a note. ruvm consumes several QEMU source files as data at build time: the QAPI schema, decodetree files, trace-events, the `.hx` option and command tables, and the expected ACPI blobs. These are copied, not submoduled, so a build never needs network access and so the exact upstream commit is one file (`UPSTREAM`) that code review can see. `cargo xtask upstream-sync <tag>` refreshes them from a QEMU checkout and produces a report of what changed (new QMP commands, new options, new decode patterns, new trace points) that becomes the work list for that sync. Document 02 describes the policy around those syncs.
+`vendor-qemu/` deserves a note. ruvm consumes several QEMU source files as data at build time: the QAPI schema, decodetree files, trace-events, the `.hx` option and command tables, the expected ACPI blobs, and the target configurations. These are copied, not submoduled, so a build never needs network access and so the exact upstream commit is one file (`UPSTREAM`) that code review can see. `cargo xtask upstream-sync <tag>` refreshes them from a QEMU checkout and produces a report of what changed (new QMP commands, new options, new decode patterns, new trace points) that becomes the work list for that sync. Document 02 describes the policy around those syncs.
 
 ## Binaries and argv[0] dispatch
 

@@ -55,6 +55,9 @@ jobs:
         run: cargo xtask unsafe-audit
       - name: prose style
         run: cargo xtask style
+      # vendor-qemu/ is QEMU's, byte for byte. A hand edit there is a quiet fork.
+      - name: vendored QEMU inputs
+        run: cargo xtask vendor-check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets
 
