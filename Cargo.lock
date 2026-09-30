@@ -549,6 +549,12 @@ version = "0.2.1"
 [[package]]
 name = "ruvm-hw-virtio"
 version = "0.2.1"
+dependencies = [
+ "ruvm-base",
+ "ruvm-hw-core",
+ "ruvm-mem",
+ "ruvm-virtio-queue",
+]
 
 [[package]]
 name = "ruvm-img"
