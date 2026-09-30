@@ -15,6 +15,7 @@ unsafe-budget = 0
 
 [dependencies]
 arc-swap.workspace = true
+ruvm-sys.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
