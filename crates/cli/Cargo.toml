@@ -21,5 +21,8 @@ unsafe-budget = 0
 ruvm-base.workspace = true
 ruvm-system.workspace = true
 
+[dev-dependencies]
+ruvm-qapi.workspace = true
+
 [lints]
 workspace = true

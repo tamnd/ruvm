@@ -1,0 +1,20 @@
+# The M1 normalization list for query-qmp-schema.
+#
+# Each line names a build condition that the reference QEMU (Homebrew's qemu-system-x86_64 11.1
+# on macOS, see qmp-schema-macos-homebrew.json) was configured with and ruvm does not build yet.
+# Normalizing the reference reply means leaving out everything the schema guards with these
+# conditions. After that, ruvm's reply has to match byte for byte, which tests/introspect.rs
+# checks. The list must be empty by M11, so remove a line as soon as ruvm builds that subsystem.
+#
+# condition               what it brings into the schema
+CONFIG_AUDIO_COREAUDIO    the coreaudio audiodev driver
+CONFIG_COCOA              the cocoa display
+CONFIG_CURSES             the curses display
+CONFIG_DBUS_DISPLAY       the dbus display and the dbus chardev
+CONFIG_PIXMAN             screendump and the pixman based display types
+CONFIG_REPLICATION        the replication block driver and the COLO commands
+CONFIG_SPICE_PROTOCOL     the qemu-vdagent chardev
+CONFIG_TPM                the TPM commands and types
+CONFIG_VMNET              the vmnet netdevs
+CONFIG_VNC                the VNC commands, events and display options
+CONFIG_ZSTD               zstd compression for qcow2 and multifd migration

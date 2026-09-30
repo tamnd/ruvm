@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use ruvm_qapi::{QDict, QValue};
+use ruvm_qapi_gen::config::Config;
 use ruvm_qapi_gen::{Lit, Schema, introspect};
 
 /// The build conditions Homebrew's QEMU was configured with.
@@ -75,6 +76,64 @@ fn matches_homebrew_qemu_byte_for_byte() {
             &want[from..(at + 200).min(want.len())]
         );
     }
+}
+
+/// The conditions in tests/data/qmp-schema-normalization.txt.
+fn normalization_list() -> Vec<String> {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/qmp-schema-normalization.txt");
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|l| l.split_whitespace().next().unwrap().to_string())
+        .collect()
+}
+
+/// The reference reply with everything the normalization list guards left out.
+fn normalized_reference() -> String {
+    let skip = normalization_list();
+    let trees = introspect(&schema(), false);
+    let list = introspect::resolve(&trees, &|s| {
+        HOMEBREW_MACOS.contains(&s) && !skip.iter().any(|n| n == s)
+    });
+    QValue::List(list.iter().map(to_qvalue).collect()).to_json()
+}
+
+#[test]
+fn normalization_list_is_exact() {
+    // Every entry is something the reference has and ruvm on the same host does not, and
+    // every such condition is listed. A stale line fails here as soon as ruvm builds it.
+    let skip = normalization_list();
+    let ruvm = Config::new("macos", true);
+    for n in &skip {
+        assert!(HOMEBREW_MACOS.contains(&n.as_str()), "{n} is not in the reference build");
+        assert!(!ruvm.is_set(n), "{n} is built now, take it off the normalization list");
+    }
+    for c in HOMEBREW_MACOS {
+        if !ruvm.is_set(c) {
+            assert!(skip.iter().any(|n| n == c), "{c} differs and is not on the list");
+        }
+    }
+    let mut sorted = skip.clone();
+    sorted.sort();
+    assert_eq!(skip, sorted, "keep the normalization list sorted");
+}
+
+#[test]
+fn macos_reply_matches_the_normalized_reference() {
+    let trees = introspect(&schema(), false);
+    let ruvm = Config::new("macos", true);
+    let list = introspect::resolve(&trees, &|s| ruvm.is_set(s));
+    let got = QValue::List(list.iter().map(to_qvalue).collect()).to_json();
+    assert!(got == normalized_reference(), "ruvm's macOS reply differs from the reference");
+}
+
+/// On macOS the reply built into this crate is the one the test above checks.
+#[cfg(target_os = "macos")]
+#[test]
+fn built_in_reply_matches_the_normalized_reference() {
+    assert!(ruvm_qapi::QMP_SCHEMA_JSON == normalized_reference());
 }
 
 #[test]

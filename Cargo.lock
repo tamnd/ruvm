@@ -359,6 +359,7 @@ name = "ruvm-cli"
 version = "0.1.5"
 dependencies = [
  "ruvm-base",
+ "ruvm-qapi",
  "ruvm-system",
 ]
 

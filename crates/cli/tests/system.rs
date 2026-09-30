@@ -223,4 +223,38 @@ mod sockets {
         assert!(err.starts_with("qemu-system-x86_64: terminating on signal 15 from pid "), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The reply goes out over QMP exactly as built. crates/qapi/tests/introspect.rs checks the
+    /// built reply against QEMU's after the normalization list.
+    #[test]
+    fn query_qmp_schema_is_the_built_in_reply() {
+        let dir = std::env::temp_dir().join(format!("ruvm-schema-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ms = dir.join("qmp.sock");
+        let _ = std::fs::remove_file(&ms);
+        let child = Command::new(ruvm())
+            .arg("qemu-system-x86_64")
+            .args(["-machine", "none", "-accel", "qtest", "-display", "none", "-nodefaults"])
+            .args(["-qmp", &format!("unix:{},server=on,wait=off", ms.display())])
+            .spawn()
+            .unwrap();
+        let _child = Machine(child);
+        let m = loop {
+            match UnixStream::connect(&ms) {
+                Ok(m) => break m,
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        let mut qmp =
+            Qmp { reader: BufReader::new(m.try_clone().unwrap()), writer: m, events: Vec::new() };
+        qmp.line();
+        assert_eq!(qmp.cmd(r#"{"execute": "qmp_capabilities"}"#), r#"{"return": {}}"#);
+        // Not cmd(): the reply mentions "event" all over, and there are no events to skip here.
+        writeln!(qmp.writer, r#"{{"execute": "query-qmp-schema"}}"#).unwrap();
+        let reply = qmp.line();
+        let reply = reply.trim_end();
+        let want = format!("{{\"return\": {}}}", ruvm_qapi::QMP_SCHEMA_JSON);
+        assert!(reply == want, "the schema reply differs from the built-in one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
