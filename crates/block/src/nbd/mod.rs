@@ -85,3 +85,9 @@ pub use server::{
     nbd_server_stop,
 };
 pub use uri::{inet_parse, nbd_options_from_qdict, nbd_parse_filename};
+
+/// `qio_channel_socket_connect_sync()`: a blocking connection to `addr`, for tools that run
+/// the handshake themselves with [`nbd_receive_export_list`] or [`nbd_receive_negotiate`].
+pub fn nbd_socket_connect(addr: &ruvm_qapi::types::SocketAddress) -> ruvm_base::Result<NbdStream> {
+    sock::socket_connect(addr)
+}

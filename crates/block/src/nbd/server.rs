@@ -160,6 +160,20 @@ struct Inner {
     state: Mutex<State>,
     cond: Condvar,
     accept_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    on_close: CloseNotify,
+}
+
+/// What [`NbdServer::set_close_notify`] installed: the `close_fn` of `nbd_client_new()`.
+#[derive(Default)]
+struct CloseNotify(Mutex<Option<CloseFn>>);
+
+/// The callback [`NbdServer::set_close_notify`] takes.
+type CloseFn = Arc<dyn Fn(bool) + Send + Sync>;
+
+impl fmt::Debug for CloseNotify {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CloseNotify")
+    }
 }
 
 impl Inner {
@@ -197,6 +211,20 @@ impl NbdServer {
         tls_creds: Option<&str>,
         max_connections: u32,
     ) -> Result<NbdServer> {
+        let s = Self::bind_addr(addr, handshake_max_secs, tls_creds, max_connections)?;
+        s.start_accepting()?;
+        Ok(s)
+    }
+
+    /// [`NbdServer::start_addr`] without accepting connections yet: they wait in the
+    /// listen backlog until [`NbdServer::start_accepting`]. qemu-nbd listens before it opens
+    /// the image and only accepts once the export is there.
+    pub fn bind_addr(
+        addr: &SocketAddress,
+        handshake_max_secs: u32,
+        tls_creds: Option<&str>,
+        max_connections: u32,
+    ) -> Result<NbdServer> {
         let (listener, bound) = socket_listen(addr)?;
         if let Some(id) = tls_creds {
             return Err(Error::generic(format!("No TLS credentials with id '{id}'")));
@@ -209,14 +237,25 @@ impl NbdServer {
             state: Mutex::new(State::default()),
             cond: Condvar::new(),
             accept_thread: Mutex::new(None),
+            on_close: CloseNotify::default(),
         });
-        let i2 = inner.clone();
+        Ok(NbdServer { inner })
+    }
+
+    /// Starts accepting connections on a server made by [`NbdServer::bind_addr`]. Does
+    /// nothing if it already does or has no listening socket.
+    pub fn start_accepting(&self) -> Result<()> {
+        let mut at = self.inner.accept_thread.lock().unwrap_or_else(|e| e.into_inner());
+        if at.is_some() || self.inner.listener.is_none() {
+            return Ok(());
+        }
+        let i2 = self.inner.clone();
         let t = thread::Builder::new()
             .name("nbd-listener".into())
             .spawn(move || accept_loop(&i2))
             .map_err(|e| Error::from_io("Failed to start the NBD listener", e))?;
-        *inner.accept_thread.lock().unwrap() = Some(t);
-        Ok(NbdServer { inner })
+        *at = Some(t);
+        Ok(())
     }
 
     /// A server without a listening socket, for a caller that accepts connections itself and
@@ -231,6 +270,7 @@ impl NbdServer {
                 state: Mutex::new(State::default()),
                 cond: Condvar::new(),
                 accept_thread: Mutex::new(None),
+                on_close: CloseNotify::default(),
             }),
         }
     }
@@ -247,6 +287,13 @@ impl NbdServer {
         spawn_client(&self.inner, stream);
     }
 
+    /// Calls `f` whenever a connection goes away, with whether its handshake had finished:
+    /// the `close_fn` qemu-nbd passes to `nbd_client_new()`. It runs on the connection's
+    /// thread after the connection was removed from [`NbdServer::connections`].
+    pub fn set_close_notify(&self, f: impl Fn(bool) + Send + Sync + 'static) {
+        *self.inner.on_close.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
+    }
+
     /// The number of connections open right now.
     pub fn connections(&self) -> usize {
         self.inner.lock().conns.len()
@@ -255,6 +302,15 @@ impl NbdServer {
     /// The ids of the exports, oldest first.
     pub fn export_ids(&self) -> Vec<String> {
         self.inner.lock().exports.iter().map(|e| e.id.clone()).collect()
+    }
+
+    /// Whether a connection uses the export with id `id`: its `refcount > 1`.
+    pub fn export_in_use(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .conns
+            .values()
+            .any(|c| c.export.as_ref().is_some_and(|e| e.id == id))
     }
 
     /// `blk_exp_add()` with `nbd_export_create()`: `block-export-add` for type `nbd`.
@@ -563,11 +619,16 @@ fn spawn_client(inner: &Arc<Inner>, stream: NbdStream) {
     let i2 = inner.clone();
     let r = thread::Builder::new().name("nbd-client".into()).spawn(move || {
         let mut c = Client::new(i2.clone(), id, stream);
-        c.run();
+        let negotiated = c.run();
         drop(c);
         let mut st = i2.lock();
         st.conns.remove(&id);
         i2.cond.notify_all();
+        drop(st);
+        let hook = i2.on_close.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(hook) = hook {
+            hook(negotiated);
+        }
     });
     if r.is_err() {
         let mut st = inner.lock();
@@ -659,8 +720,9 @@ impl Client {
         }
     }
 
-    /// `nbd_co_client_start()` followed by the request loop.
-    fn run(&mut self) {
+    /// `nbd_co_client_start()` followed by the request loop. Returns whether the handshake
+    /// finished, the `negotiated` of `client_close()`.
+    fn run(&mut self) -> bool {
         let timer = self.start_handshake_timer();
         let r = self.negotiate();
         if let Some(t) = timer {
@@ -668,12 +730,19 @@ impl Client {
             *m.lock().unwrap() = true;
             c.notify_all();
         }
-        match r {
-            Ok(true) => self.transmission(),
-            Ok(false) => {}
-            Err(e) => report(&e),
-        }
+        let negotiated = match r {
+            Ok(true) => {
+                self.transmission();
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                report(&e);
+                false
+            }
+        };
         self.ioc.shutdown();
+        negotiated
     }
 
     #[allow(clippy::type_complexity)]

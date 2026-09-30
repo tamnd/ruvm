@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The tools that are ported: `qemu-img` and `qemu-io` so far.
+//! The tools that are ported: `qemu-img`, `qemu-io`, `qemu-nbd` and `qemu-storage-daemon`.
 
 use std::process::ExitCode;
 
@@ -13,6 +13,8 @@ pub(crate) fn run(personality: &Personality, argv0: &str, args: &[String]) -> Op
     let main: fn(&str, &[String], &str) -> u8 = match tool {
         Tool::Img => ruvm_img::main,
         Tool::Io => ruvm_io::main,
+        Tool::Nbd => ruvm_nbd::main,
+        Tool::StorageDaemon => ruvm_storage_daemon::main,
         _ => return None,
     };
     let version_text = version::text(personality, argv0).unwrap_or_default();

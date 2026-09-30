@@ -504,7 +504,9 @@ dependencies = [
  "ruvm-base",
  "ruvm-img",
  "ruvm-io",
+ "ruvm-nbd",
  "ruvm-qapi",
+ "ruvm-storage-daemon",
  "ruvm-system",
 ]
 
@@ -854,6 +856,16 @@ dependencies = [
 [[package]]
 name = "ruvm-nbd"
 version = "0.2.4"
+dependencies = [
+ "libc",
+ "rustix",
+ "ruvm-base",
+ "ruvm-block",
+ "ruvm-img",
+ "ruvm-qapi",
+ "ruvm-qom",
+ "ruvm-sys",
+]
 
 [[package]]
 name = "ruvm-net"
@@ -906,6 +918,21 @@ version = "0.2.4"
 [[package]]
 name = "ruvm-storage-daemon"
 version = "0.2.4"
+dependencies = [
+ "libc",
+ "rustix",
+ "ruvm-base",
+ "ruvm-block",
+ "ruvm-chardev",
+ "ruvm-img",
+ "ruvm-monitor",
+ "ruvm-nbd",
+ "ruvm-qapi",
+ "ruvm-qom",
+ "ruvm-sys",
+ "ruvm-vhost",
+ "ruvm-virtio-queue",
+]
 
 [[package]]
 name = "ruvm-sys"
