@@ -48,7 +48,7 @@ use ruvm_hw_core::fw_cfg::{
     fw_cfg_init_io_dma,
 };
 use ruvm_hw_core::{Clock, IrqLine, IrqPin, irq};
-use ruvm_hw_intc::i8259::{I8259Pair, ISA_NUM_IRQS, i8259_init};
+use ruvm_hw_intc::i8259::{I8259Pair, i8259_init};
 use ruvm_hw_intc::ioapic::{
     IO_APIC_DEFAULT_ADDRESS, IO_APIC_SECONDARY_ADDRESS, IO_APIC_SECONDARY_IRQBASE, IOAPIC_NUM_PINS,
     IOAPIC_VER_DEF, IoApic, IoApicMsiHandler, IoApics,
@@ -65,8 +65,7 @@ use ruvm_virtio_queue::{GuestMemory, MemoryError};
 
 pub use props::{MicrovmProps, OnOffAuto};
 
-const KIB: u64 = 1 << 10;
-const MIB: u64 = 1 << 20;
+use crate::pc::{GsiState, ISA_BIOS_MAX, MIB, UnassignedIo, WeakDma, cmos_set_memory, err};
 
 /// `mc->desc`.
 pub const MICROVM_DESC: &str = "microvm (i386)";
@@ -104,8 +103,6 @@ pub const RTC_IRQ: u32 = 8;
 pub const RTC_BASE_YEAR: i32 = 2000;
 /// `VIRTIO_CMDLINE_MAXLEN`.
 const VIRTIO_CMDLINE_MAXLEN: usize = 64;
-/// The largest part of the firmware mapped below 1 MiB, `x86_isa_bios_init()`.
-const ISA_BIOS_MAX: u64 = 128 * KIB;
 
 /// A `-kernel` boot.
 #[derive(Clone, Debug, Default)]
@@ -236,20 +233,6 @@ pub struct GuestRamRange {
     pub readonly: bool,
 }
 
-/// fw_cfg DMA through a weak reference, so the address space that maps fw_cfg does not keep
-/// itself alive.
-struct WeakDma(Weak<AddressSpace>);
-
-impl DmaMemory for WeakDma {
-    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
-        self.0.upgrade().is_some_and(|a| a.read(addr, MemTxAttrs::UNSPECIFIED, buf).is_ok())
-    }
-
-    fn write(&self, addr: u64, buf: &[u8]) -> bool {
-        self.0.upgrade().is_some_and(|a| a.write(addr, MemTxAttrs::UNSPECIFIED, buf).is_ok())
-    }
-}
-
 /// Guest memory for virtio devices, weak for the same reason as [`WeakDma`].
 struct WeakGuestMemory(Weak<AddressSpace>);
 
@@ -265,35 +248,6 @@ impl GuestMemory for WeakGuestMemory {
         match self.0.upgrade() {
             Some(a) if a.write(addr, MemTxAttrs::UNSPECIFIED, buf).is_ok() => Ok(()),
             _ => Err(MemoryError::OutOfRange { addr, len: buf.len() as u64 }),
-        }
-    }
-}
-
-/// `GSIState` and `gsi_handler()`: GSIs 0 to 15 go to the 8259 and the first IOAPIC, 16 to 23
-/// to the first IOAPIC and 24 to 47 to the second.
-struct GsiState {
-    i8259: Vec<IrqLine>,
-    ioapic: Vec<IrqLine>,
-    ioapic2: Vec<IrqLine>,
-}
-
-impl GsiState {
-    fn set(&self, n: u32, level: i32) {
-        let n = n as usize;
-        let base2 = IO_APIC_SECONDARY_IRQBASE as usize;
-        if n < ISA_NUM_IRQS {
-            if let Some(l) = self.i8259.get(n) {
-                l.set(level);
-            }
-        }
-        if n < IOAPIC_NUM_PINS {
-            if let Some(l) = self.ioapic.get(n) {
-                l.set(level);
-            }
-        } else if n >= base2 && n < base2 + IOAPIC_NUM_PINS {
-            if let Some(l) = self.ioapic2.get(n - base2) {
-                l.set(level);
-            }
         }
     }
 }
@@ -344,39 +298,6 @@ struct RomBlob {
     addr: u64,
     data: Vec<u8>,
     size: u64,
-}
-
-/// `unassigned_io_ops`, behind `get_system_io()`: ports nobody claimed read as all ones and
-/// ignore writes.
-#[derive(Debug)]
-struct UnassignedIo;
-
-impl MmioOps for UnassignedIo {
-    fn read(&self, _cx: &AccessCtx, _offset: u64, _size: AccessSize) -> MemResult<u64> {
-        Ok(u64::MAX)
-    }
-
-    fn write(
-        &self,
-        _cx: &AccessCtx,
-        _offset: u64,
-        _size: AccessSize,
-        _value: u64,
-    ) -> MemResult<()> {
-        Ok(())
-    }
-
-    fn valid(&self) -> AccessConstraints {
-        AccessConstraints::any_size(1, 4).allow_unaligned()
-    }
-
-    fn impl_constraints(&self) -> AccessConstraints {
-        AccessConstraints::any_size(1, 4).allow_unaligned()
-    }
-}
-
-fn err<E: fmt::Display>(e: E) -> String {
-    e.to_string()
 }
 
 /// A microvm board.
@@ -729,7 +650,7 @@ impl Microvm {
             s.connect_irq(gsi[RTC_IRQ as usize].clone());
             let r = mem.new_io("rtc", 2, s.clone()).map_err(err)?;
             mem.add_subregion(io, RTC_IO_BASE, r).map_err(err)?;
-            set_rtc_cmos(&s, below_4g_mem_size, above_4g_mem_size);
+            cmos_set_memory(&s, below_4g_mem_size, above_4g_mem_size);
             Some(s)
         } else {
             None
@@ -1272,26 +1193,4 @@ impl Microvm {
     pub fn virtio_plugged(&self, index: usize) -> bool {
         self.virtio.get(index).is_some_and(|s| s.is_plugged())
     }
-}
-
-/// `microvm_set_rtc()`: the memory sizes in the CMOS.
-fn set_rtc_cmos(s: &Mc146818Rtc, below: u64, above: u64) {
-    let val = (below / KIB).min(640);
-    s.set_cmos_data(0x15, val as u8);
-    s.set_cmos_data(0x16, (val >> 8) as u8);
-    // extended memory (next 64MiB)
-    let val = if below > MIB { (below - MIB) / KIB } else { 0 }.min(65535);
-    s.set_cmos_data(0x17, val as u8);
-    s.set_cmos_data(0x18, (val >> 8) as u8);
-    s.set_cmos_data(0x30, val as u8);
-    s.set_cmos_data(0x31, (val >> 8) as u8);
-    // memory between 16MiB and 4GiB
-    let val = if below > 16 * MIB { (below - 16 * MIB) / (64 * KIB) } else { 0 }.min(65535);
-    s.set_cmos_data(0x34, val as u8);
-    s.set_cmos_data(0x35, (val >> 8) as u8);
-    // memory above 4GiB
-    let val = above / 65536;
-    s.set_cmos_data(0x5b, val as u8);
-    s.set_cmos_data(0x5c, (val >> 8) as u8);
-    s.set_cmos_data(0x5d, (val >> 16) as u8);
 }
