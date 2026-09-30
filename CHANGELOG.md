@@ -6,6 +6,16 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.2.4
+
+This patch is mostly storage. The M2 boards now have firmware, and most of the M3 block layer is in, along with qemu-img and qemu-io.
+
+For M2: virtio-scsi with scsi-disk and scsi-cd, vhost-user and vhost kernel glue for devices, vhost-vsock and vhost-user-fs (#91). fw_cfg now produces the same bytes QEMU 11.1 does for the same command line, and we check that against dumps taken from QEMU. SMBIOS tables, pflash, `-smbios`, `-uuid` and chardev mux wiring came with it (#92). `cargo xtask boot-smoke` boots a kernel on each board and checks for the login banner, and CI has a job that runs it (#93). None of this has booted a guest on real KVM yet, because none of the machines we have access to right now has `/dev/kvm` and CI runners are backed up.
+
+For M3: `ruvm-crypto` holds the ciphers, hashes and key derivation that LUKS needs, built on RustCrypto (#95). The block core has the node graph, permissions, drain, filters, throttle groups, the file and host_device protocols on io_uring, linux-aio or a thread pool, and the luks driver (#96). There is an NBD client, an NBD server and the nbd driver (#97). Block jobs, dirty bitmaps, fleecing backup and the vmdk, vdi, vhdx, vpc, qed, parallels, dmg, cloop, bochs, vvfat and old qcow formats came next (#99). qemu-img and qemu-io work through the ruvm binary, with golden tests against QEMU 11.1 output (#100).
+
+Fixes: a race in the vhost-user test backend that showed up on Linux (#94), and block io tests that reopened a file while the old handle still held its OFD lock (#98).
+
 ## 0.2.3
 
 With this patch, the command line can pick the microvm and q35 boards and run their vCPUs on KVM (#87). The boot tests need a guest kernel in `RUVM_TEST_KERNEL` and have not yet run on a host with KVM, so the boards should still be called unproven. Firmware, ACPI and a boot smoke test are next.
