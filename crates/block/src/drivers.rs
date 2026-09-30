@@ -203,6 +203,9 @@ pub(crate) static DRIVERS: &[&DriverDef] = &[
     &crate::filter::preallocate::PREALLOCATE,
     &crate::filter::blkverify::BLKVERIFY,
     &crate::filter::throttle::THROTTLE,
+    &crate::nbd::NBD,
+    &crate::nbd::NBD_TCP,
+    &crate::nbd::NBD_UNIX,
     &crate::luks::LUKS,
 ];
 

@@ -41,6 +41,7 @@ mod graph;
 mod graph_lock;
 mod io;
 mod luks;
+pub mod nbd;
 mod node;
 mod open;
 mod ops;
