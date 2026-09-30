@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.1.5
+
+ruvm starts a machine now. It is only the empty `none` machine with the `qtest` accelerator, but that is how QEMU's own tests launch QEMU, so a libqtest style command line comes up. It serves QMP and the qtest protocol on its sockets and shuts down cleanly on `quit` or a signal.
+
+The startup path from system/vl.c is ported to `ruvm-system` (#45). That covers the option loop for the monitor, chardev, object, machine, accel, name, display, audio and qtest options. It also covers the order `qemu_init()` creates things in, the run state with `stop` and `cont` and their events, and the main loop with the SHUTDOWN event. Machines, accelerators and displays a QEMU build could leave out fail with QEMU's own messages. Options ruvm does not handle yet say so and name the option.
+
+`ruvm-accel-qtest` is the qtest protocol server from system/qtest.c, with every command, reply and log line matching QEMU (#44).
+
 ## 0.1.4
 
 The pieces a QMP monitor needs are in place, though nothing starts one from the command line yet. That is the next step.
