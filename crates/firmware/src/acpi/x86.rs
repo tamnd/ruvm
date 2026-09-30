@@ -2,9 +2,9 @@
 
 //! Tables shared by the x86 machines, from hw/i386/acpi-common.c.
 
-use super::aml::append_int_noprefix;
+use super::aml::{AddressSpace, append_int_noprefix};
 use super::linker::BiosLinker;
-use super::table::AcpiTable;
+use super::table::{AcpiTable, append_gas};
 
 /// `APIC_DEFAULT_ADDRESS`, where every local APIC sits.
 pub const APIC_DEFAULT_ADDRESS: u32 = 0xfee0_0000;
@@ -110,5 +110,46 @@ pub fn build_madt(
         // Local APIC NMI for all processors on LINT1.
         table_data.extend_from_slice(&[4, 6, 0xFF, 0, 0, 1]);
     }
+    table.end(Some(linker), table_data);
+}
+
+/// `HPET_BASE`.
+pub const HPET_BASE: u64 = 0xfed0_0000;
+
+/// `build_facs()`, ACPI 1.0b. The FACS has no header and no checksum, and everything after the
+/// length is left for the guest to fill in.
+pub fn build_facs(table_data: &mut Vec<u8>) {
+    table_data.extend_from_slice(b"FACS");
+    append_int_noprefix(table_data, 64, 4);
+    table_data.resize(table_data.len() + 56, 0);
+}
+
+/// `build_hpet()`. The event timer block ID has to match what the emulated HPET reports in its
+/// capabilities register.
+pub fn build_hpet(
+    table_data: &mut Vec<u8>,
+    linker: &mut BiosLinker,
+    oem_id: &str,
+    oem_table_id: &str,
+) {
+    let table = AcpiTable::begin("HPET", 1, oem_id, oem_table_id, table_data);
+    append_int_noprefix(table_data, 0x8086_a201, 4);
+    append_gas(table_data, AddressSpace::SystemMemory, 0, 0, 0, HPET_BASE);
+    append_int_noprefix(table_data, 0, 1); // HPET number
+    append_int_noprefix(table_data, 0, 2); // Minimum clock tick in periodic mode
+    append_int_noprefix(table_data, 0, 1); // Page protection and OEM attribute
+    table.end(Some(linker), table_data);
+}
+
+/// `build_waet()`. The only flag set says the PM timer is good, so Windows reads it once instead
+/// of twice and saves an exit per read.
+pub fn build_waet(
+    table_data: &mut Vec<u8>,
+    linker: &mut BiosLinker,
+    oem_id: &str,
+    oem_table_id: &str,
+) {
+    let table = AcpiTable::begin("WAET", 1, oem_id, oem_table_id, table_data);
+    append_int_noprefix(table_data, 1 << 1, 4);
     table.end(Some(linker), table_data);
 }

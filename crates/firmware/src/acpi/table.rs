@@ -215,6 +215,38 @@ pub fn build_xsdt(
     build_sdt("XSDT", 8, table_data, linker, table_offsets, oem_id, oem_table_id);
 }
 
+/// `AcpiMcfgInfo`, the ECAM window of a PCIe host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct McfgInfo {
+    pub base: u64,
+    pub size: u64,
+}
+
+/// `build_mcfg()` from hw/acpi/pci.c, one allocation for segment 0 starting at bus 0.
+pub fn build_mcfg(
+    table_data: &mut Vec<u8>,
+    linker: &mut BiosLinker,
+    info: &McfgInfo,
+    oem_id: &str,
+    oem_table_id: &str,
+) {
+    let table = AcpiTable::begin("MCFG", 1, oem_id, oem_table_id, table_data);
+    append_int_noprefix(table_data, 0, 8); // Reserved
+    append_int_noprefix(table_data, info.base, 8);
+    append_int_noprefix(table_data, 0, 2); // PCI segment group
+    append_int_noprefix(table_data, 0, 1); // Starting bus
+    // PCIE_MMCFG_BUS(size - 1), each bus takes 1 MiB of ECAM space.
+    append_int_noprefix(table_data, ((info.size - 1) >> 20) & 0xff, 1);
+    append_int_noprefix(table_data, 0, 4); // Reserved
+    table.end(Some(linker), table_data);
+}
+
+/// Grows `blob` with zeros to a multiple of `align`, `acpi_align_size()`. QEMU does this so the
+/// fw_cfg files keep the same size across versions and migration keeps working.
+pub fn align_size(blob: &mut Vec<u8>, align: usize) {
+    blob.resize(blob.len().next_multiple_of(align), 0);
+}
+
 /// `AcpiFadtData`. The three table offsets are `None` when that table does not exist, in which
 /// case the field is left zero.
 #[derive(Clone, Debug, Default)]
