@@ -99,16 +99,21 @@ fn run(
         pit_in_kernel: pit_in_kernel(&accel),
         smm_available: false,
         phys_bits: cpu.phys_bits(),
+        cpu: cpu.ident(),
         bios,
+        pflash: [None, None],
+        uuid: None,
+        smbios: Default::default(),
+        topology: None,
         kernel,
         firmware,
-        serial_hd: true,
+        serial_hds: vec![true],
         clock: Arc::clone(&clock),
         rtc_clock: Arc::clone(&rtc_clock),
     };
     let (board, _) = build_board(spec).unwrap();
     let serial = Arc::new(Capture::default());
-    assert!(board.set_serial_backend(Some(serial.clone())));
+    assert!(board.set_serial_backend(0, Some(serial.clone())));
     let events = Arc::new(Mutex::new(Vec::new()));
     let ev = Arc::clone(&events);
     let machine = KvmMachine::new(
@@ -181,10 +186,15 @@ fn irqchip_off_is_refused() {
         pit_in_kernel: false,
         smm_available: false,
         phys_bits: cpu.phys_bits(),
+        cpu: cpu.ident(),
         bios: None,
+        pflash: [None, None],
+        uuid: None,
+        smbios: Default::default(),
+        topology: None,
         kernel: None,
         firmware: fw,
-        serial_hd: true,
+        serial_hds: vec![true],
         clock: Clock::manual(ClockType::Virtual),
         rtc_clock: Clock::manual(ClockType::Host),
     };

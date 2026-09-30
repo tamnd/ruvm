@@ -1,0 +1,8 @@
+0x0020 0 bios-geometry
+0x0021 0 bootorder
+0x0022 36 etc/acpi/rsdp
+0x0023 686 etc/acpi/tables
+0x0024 4 etc/boot-fail-wait
+0x0025 20 etc/e820
+0x0026 1048576 etc/fdt
+0x0027 1664 etc/table-loader

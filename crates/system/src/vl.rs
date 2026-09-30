@@ -17,8 +17,8 @@ use ruvm_base::report::{
 };
 use ruvm_base::{Error, Result};
 use ruvm_block::BlockGraph;
-use ruvm_chardev::Chardevs;
 use ruvm_chardev::opts::{chardev_opts, parse_compat};
+use ruvm_chardev::{Chardev, Chardevs};
 use ruvm_hostmem::region::RegionObjects;
 use ruvm_hw_core::machine::{MACHINES, machine_type_name};
 use ruvm_hw_core::{Machine, create_machine};
@@ -28,7 +28,9 @@ use ruvm_monitor::Qmp;
 use ruvm_monitor::object::{TYPE_MONITOR_HMP, TYPE_MONITOR_QMP, monitor_compat_id, monitor_new};
 use ruvm_qapi::keyval::{keyval_merge, keyval_parse, keyval_parse_into};
 use ruvm_qapi::opts::{OptsHandle, QemuOptDesc, QemuOptType, QemuOptsList, is_help_option};
-use ruvm_qapi::types::{Audiodev, DisplayOptions, MonitorMode, MonitorOptions, ObjectOptions};
+use ruvm_qapi::types::{
+    Audiodev, DisplayOptions, MonitorMode, MonitorOptions, ObjectOptions, ShutdownCause,
+};
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit};
 use ruvm_qapi::{QDict, QValue, json};
 use ruvm_qom::{Registry, type_print_class_properties, user_creatable_print_types};
@@ -84,6 +86,7 @@ impl Vm {
         if let Some(m) = self.machine.get() {
             if let Err(e) = m.run_board_init(&self.regions) {
                 report_error(&e);
+                ruvm_chardev::stdio::term_exit();
                 std::process::exit(1);
             }
         }
@@ -246,8 +249,20 @@ pub struct Personality<'a> {
     pub version_text: &'a str,
 }
 
+/// Puts the terminal back when `qemu_main()` is left, however that happens: QEMU does it
+/// from `atexit()`. Whoever calls `std::process::exit()` has to call
+/// [`ruvm_chardev::stdio::term_exit`] first, since no destructor runs then.
+struct TermGuard;
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        ruvm_chardev::stdio::term_exit();
+    }
+}
+
 /// `qemu_init()` followed by `qemu_main_loop()` and `qemu_cleanup()`. Returns the exit status.
 pub fn qemu_main(p: &Personality<'_>, args: &[String]) -> u8 {
+    let _term = TermGuard;
     match run(p, args) {
         Ok(()) => 0,
         Err(Exit(code)) => code,
@@ -422,6 +437,8 @@ fn parse_options(
                 cfg.x86.devices.push((arg.to_string(), current_location()));
             }
             Opt::NoReboot => cfg.x86.no_reboot = true,
+            Opt::Uuid => cfg.x86.set_uuid(arg).map_err(|e| fail_msg(&e))?,
+            Opt::Smbios => cfg.x86.add_smbios(arg).map_err(|e| fail_msg(&e))?,
             Opt::Name => {
                 if cfg.name.parse_noisily(arg, true).is_none() {
                     return Err(Exit(1));
@@ -881,6 +898,10 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         }
     };
 
+    // C-a x on a mux.
+    chardevs.set_mux_quit_handler(mux_quit_hook(&runstate));
+    create_default_devices(&mut cfg, kind.is_none())?;
+
     // qemu_create_early_backends()
     create_objects(&vm, &mut cfg, object_create_early)?;
     let handles: Vec<OptsHandle> = cfg.chardev.iter().map(|o| o.handle()).collect();
@@ -945,6 +966,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         let _loc = cfg.loc("mon", h).map(push_location);
         monitor_new_opts(&vm.registry, &cfg, h).map_err(|e| fail(&e))?;
     }
+    let serial_hds = create_serials(&chardevs, &vm.registry, &mut cfg)?;
 
     if let (Some(id), Some(machine)) = (&memdev, machine) {
         resolve_machine_memdev(&vm, machine, &cfg, id)?;
@@ -961,7 +983,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             if cfg.preconfig {
                 return Err(fail_msg("-preconfig is not supported with this machine by ruvm yet"));
             }
-            keep = start_x86(&vm, &mut cfg, accel, kind, opts, &drives, keep)?;
+            keep = start_x86(&vm, &cfg, accel, kind, opts, &drives, &serial_hds, keep)?;
         }
         _ => keep._accel = Some(accel),
     }
@@ -992,85 +1014,124 @@ fn parse_drives(
     Ok(drives)
 }
 
-/// Builds the x86 board and puts it on its vCPUs: `qemu_init_board()`,
-/// `qemu_create_cli_devices()` and the serial port of `qemu_create_late_backends()`.
+/// Builds the x86 board and puts it on its vCPUs: `qemu_init_board()` and
+/// `qemu_create_cli_devices()`. `serial_hds` are the chardevs of the `-serial` options.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
 fn start_x86(
     vm: &Arc<Vm>,
-    cfg: &mut Config,
+    cfg: &Config,
     accel: Accel,
     kind: BoardKind,
     opts: x86::BoardOptions,
     drives: &[x86::Drive],
+    serial_hds: &[Option<Arc<Chardev>>],
     mut keep: Keep,
 ) -> Flow<Keep> {
     let Accel::Kvm(accel) = accel else { unreachable!("checked by the caller") };
-    cfg.x86.add_default_serial();
-    let serial = connect_serial(vm, cfg)?;
-    let running =
-        x86::start_board(vm, *accel, kind, opts, &cfg.x86, drives, serial).map_err(|errors| {
+    let running = x86::start_board(vm, *accel, kind, opts, &cfg.x86, drives, serial_hds).map_err(
+        |errors| {
             for e in &errors {
                 e.report();
             }
             Exit(1)
-        })?;
+        },
+    )?;
     keep.board = Some(running);
     Ok(keep)
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[allow(clippy::too_many_arguments)]
 fn start_x86(
     _vm: &Arc<Vm>,
-    _cfg: &mut Config,
+    _cfg: &Config,
     _accel: Accel,
     _kind: BoardKind,
     _opts: x86::BoardOptions,
     _drives: &[x86::Drive],
+    _serial_hds: &[Option<Arc<Chardev>>],
     _keep: Keep,
 ) -> Flow<Keep> {
     unreachable!("only kvm runs the x86 boards, and this host has no kvm")
 }
 
-/// `serial_parse()` for the first `-serial`: what the board's first serial port is connected
-/// to. The other `-serial` options are not used yet.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn connect_serial(vm: &Vm, cfg: &mut Config) -> Flow<x86::SerialConn> {
-    use x86::{SerialConn, SerialSpec};
-    let Some((dev, loc)) = cfg.x86.serials.first().cloned() else {
-        return Ok(SerialConn::Absent);
+/// `qemu_create_default_devices()` for the serial port and the monitor. `no_serial` is set
+/// for a machine without serial ports.
+fn create_default_devices(cfg: &mut Config, no_serial: bool) -> Flow<()> {
+    let d = cfg.x86.default_devices(no_serial);
+    if let Some(dev) = d.serial {
+        cfg.x86.serials.push((dev.to_string(), None));
+    }
+    if let Some(dev) = d.monitor {
+        monitor_parse(cfg, dev, "readline", false)?;
+    }
+    Ok(())
+}
+
+/// `serial_parse()`: the chardev `-serial devname` makes as the `index`th serial port, or
+/// `None` for `none`. The chardev is called `serialN`, and a `mon:` string also gets an HMP
+/// monitor on its mux, as `qemu_chr_new_mux_mon()` does. The error is the one QEMU reports
+/// last; the chardev layer's own error has been printed before it.
+fn serial_parse(
+    chardevs: &Chardevs,
+    registry: &Registry,
+    list: &mut QemuOptsList,
+    index: usize,
+    devname: &str,
+) -> Result<Option<Arc<Chardev>>> {
+    if devname == "none" {
+        return Ok(None);
+    }
+    let not_connected = || {
+        Error::generic(format!("could not connect serial device to character backend '{devname}'"))
     };
-    let _loc = loc.map(push_location);
-    let not_connected =
-        || fail_msg(&format!("could not connect serial device to character backend '{dev}'"));
-    Ok(match SerialSpec::parse(&dev) {
-        SerialSpec::None => SerialConn::Absent,
-        SerialSpec::Null => SerialConn::Null,
-        // For now this is a local stdio adapter with the monitor left out; it moves to the
-        // chardev stdio backend and mux once those exist.
-        SerialSpec::Stdio { .. } => SerialConn::Stdio,
-        SerialSpec::Chardev(id) => match vm.chardevs.find(&id) {
-            Some(chr) => SerialConn::Chardev(chr),
-            None => return Err(not_connected()),
-        },
-        SerialSpec::Compat(dev) => {
-            let h = match parse_compat(&mut cfg.chardev, "serial0", &dev, true) {
-                Ok(h) => h,
-                Err(e) => {
-                    if let Some(e) = e {
-                        report_error(&e);
-                    }
-                    return Err(not_connected());
-                }
-            };
-            let opts = cfg.chardev.get(h).expect("handle from this list");
-            match vm.chardevs.new_from_opts(opts) {
-                Ok(Some(chr)) => SerialConn::Chardev(chr),
-                Ok(None) => return Err(Exit(0)),
-                Err(e) => {
+    let label = format!("serial{index}");
+    match chardevs.new_from_name(list, &label, devname, true) {
+        Ok((chr, mux)) => {
+            if mux {
+                if let Err(e) = monitor_new(registry, None, Some(&label), false, false) {
                     report_error(&e);
+                    let _ = chardevs.remove(&label);
                     return Err(not_connected());
                 }
             }
+            Ok(Some(chr))
+        }
+        Err(e) => {
+            if let Some(e) = e {
+                report_error(&e);
+            }
+            Err(not_connected())
+        }
+    }
+}
+
+/// `foreach_device_config_or_exit(DEV_SERIAL, serial_parse)`: `serial_hd(i)` for every
+/// `-serial`, in order.
+fn create_serials(
+    chardevs: &Chardevs,
+    registry: &Registry,
+    cfg: &mut Config,
+) -> Flow<Vec<Option<Arc<Chardev>>>> {
+    let serials = cfg.x86.serials.clone();
+    let mut hds = Vec::with_capacity(serials.len());
+    for (index, (dev, loc)) in serials.iter().enumerate() {
+        let _loc = loc.clone().map(push_location);
+        let chr =
+            serial_parse(chardevs, registry, &mut cfg.chardev, index, dev).map_err(|e| fail(&e))?;
+        hds.push(chr);
+    }
+    Ok(hds)
+}
+
+/// What `C-a x` on a mux runs after printing `QEMU: Terminated`: `qmp_quit()`, the same
+/// shutdown request as the QMP `quit` command.
+fn mux_quit_hook(runstate: &Arc<Runstate>) -> ruvm_chardev::Hook {
+    let rs = Arc::downgrade(runstate);
+    Arc::new(move || {
+        if let Some(rs) = rs.upgrade() {
+            rs.shutdown_request(ShutdownCause::HostQmpQuit);
         }
     })
 }
@@ -1110,4 +1171,89 @@ fn pid_name(pid: i32) -> Option<String> {
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let first = cmdline.split(|b| *b == 0).next()?;
     Some(String::from_utf8_lossy(first).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Env {
+        registry: Registry,
+        qmp: Arc<Qmp>,
+        chardevs: Arc<Chardevs>,
+    }
+
+    fn env() -> Env {
+        let registry = Registry::new();
+        let qmp = Qmp::new();
+        let chardevs = Arc::new(Chardevs::new());
+        ruvm_monitor::object::register_types(&registry, &qmp, &chardevs);
+        ruvm_chardev::qom::register_types(&registry);
+        chardevs.set_registry(&registry);
+        Env { registry, qmp, chardevs }
+    }
+
+    impl Env {
+        fn serial(&self, index: usize, devname: &str) -> Result<Option<Arc<Chardev>>> {
+            let mut list = chardev_opts();
+            serial_parse(&self.chardevs, &self.registry, &mut list, index, devname)
+        }
+    }
+
+    #[test]
+    fn serial_parse_names_chardevs_after_the_index() {
+        let e = env();
+        let mut list = chardev_opts();
+        let opts = list.parse("null,id=c0", true).unwrap();
+        e.chardevs.new_from_opts(opts).unwrap().unwrap();
+
+        let null = e.serial(0, "null").unwrap().unwrap();
+        assert_eq!(null.label(), "serial0");
+        assert!(!null.is_mux());
+        // `none` still takes an index.
+        assert!(e.serial(1, "none").unwrap().is_none());
+        assert!(e.chardevs.find("serial1").is_none());
+        let c0 = e.serial(2, "chardev:c0").unwrap().unwrap();
+        assert_eq!(c0.label(), "c0");
+        assert!(e.chardevs.find("serial2").is_none());
+        assert!(e.qmp.monitors().is_empty());
+    }
+
+    #[test]
+    fn serial_parse_puts_a_monitor_on_a_mux() {
+        let e = env();
+        let chr = e.serial(0, "mon:null").unwrap().unwrap();
+        assert_eq!(chr.label(), "serial0");
+        assert!(chr.is_mux());
+        assert!(chr.is_busy());
+        // The monitor is HMP, so the QMP list stays empty.
+        assert!(e.qmp.monitors().is_empty());
+    }
+
+    #[test]
+    fn serial_parse_reports_bad_backends() {
+        let e = env();
+        let err = e.serial(0, "nosuchbackend").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "could not connect serial device to character backend 'nosuchbackend'"
+        );
+        let err = e.serial(1, "chardev:missing").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "could not connect serial device to character backend 'chardev:missing'"
+        );
+        assert!(e.chardevs.find("serial0").is_none());
+    }
+
+    #[test]
+    fn mux_quit_requests_a_shutdown() {
+        let runstate = Runstate::new(Qmp::new());
+        let hook = mux_quit_hook(&runstate);
+        hook();
+        assert_eq!(runstate.take_shutdown_request(), ShutdownCause::HostQmpQuit);
+        // The hook does not keep the runstate alive.
+        drop(runstate);
+        hook();
+    }
 }

@@ -19,8 +19,8 @@ use ruvm_firmware::x86_linux::{
 use ruvm_hw_acpi::SystemRequest;
 use ruvm_hw_storage::{BlockBackend, DriveConfig, VecBackend};
 use ruvm_machine_x86::microvm::KernelConfig;
-use ruvm_machine_x86::q35::q35_ram_split;
-use ruvm_machine_x86::{Q35, Q35MachineConfig, Q35Props};
+use ruvm_machine_x86::q35::{KVMVAPIC_ROM, PflashDrive, q35_ram_split};
+use ruvm_machine_x86::{PflashBacking, Q35, Q35MachineConfig, Q35Props};
 use ruvm_mem::{Endian, MemTxAttrs};
 
 const ATTRS: MemTxAttrs = MemTxAttrs::UNSPECIFIED;
@@ -149,14 +149,15 @@ fn fw_cfg_basics() {
     assert_eq!(le32(&fw_cfg_read(&m, 0x8002, 4)), 1); // IRQ0_OVERRIDE
     assert_eq!(fw_cfg_read(&m, 0x0d, 40), vec![0; 40]); // NUMA
     // The HPET block, packed: count 1, then the event timer block ID and the address.
-    // The HPET block, packed: count 1, then the event timer block ID and the address.
     let hpet = fw_cfg_read(&m, 0x8004, 13);
     assert_eq!(hpet[0], 1);
     assert_eq!(le32(&hpet[1..5]), 0x8086_a201);
     assert_eq!(le64(&hpet[5..13]), 0xfed0_0000);
     assert_eq!(fw_cfg_file(&m, "etc/system-states").unwrap(), [128, 0, 0, 129, 130, 128]);
     assert!(fw_cfg_file(&m, "etc/smi/supported-features").is_some());
-    assert!(fw_cfg_file(&m, "etc/smbios/smbios-tables").is_none());
+    let smbios = fw_cfg_file(&m, "etc/smbios/smbios-anchor").unwrap();
+    assert_eq!(&smbios[..4], b"_SM_");
+    assert!(fw_cfg_file(&m, "etc/smbios/smbios-tables").is_some());
 }
 
 #[test]
@@ -206,14 +207,25 @@ fn kernel_items() {
         ..KernelConfig::default()
     });
     cfg.rom_files.insert(LINUXBOOT_DMA_ROM.into(), vec![0x55, 0xaa, 1, 0xcb]);
+    cfg.rom_files.insert(KVMVAPIC_ROM.into(), vec![0x55, 0xaa, 2, 0xcb]);
     let m = machine(cfg);
     assert_eq!(le32(&fw_cfg_read(&m, FW_CFG_SETUP_SIZE, 4)), 5 * 512);
     assert_eq!(le32(&fw_cfg_read(&m, FW_CFG_KERNEL_SIZE, 4)), 16384 - 5 * 512);
     assert_eq!(le32(&fw_cfg_read(&m, FW_CFG_CMDLINE_SIZE, 4)), 14);
     assert_eq!(fw_cfg_read(&m, FW_CFG_CMDLINE_DATA, 14), b"console=ttyS0\0");
     assert_eq!(fw_cfg_file(&m, "genroms/linuxboot_dma.bin").unwrap(), [0x55, 0xaa, 1, 0xcb]);
+    // The vapic ROM is loaded too but stays out of the boot order.
+    assert_eq!(fw_cfg_file(&m, "genroms/kvmvapic.bin").unwrap(), [0x55, 0xaa, 2, 0xcb]);
     assert_eq!(fw_cfg_file(&m, "bootorder").unwrap(), b"/rom@genroms/linuxboot_dma.bin\0");
-    assert!(m.warnings().is_empty());
+    assert!(m.warnings().is_empty(), "{:?}", m.warnings());
+}
+
+#[test]
+fn missing_kvmvapic_rom_is_a_warning() {
+    let m = machine(config(""));
+    assert!(fw_cfg_file(&m, "genroms/kvmvapic.bin").is_none());
+    assert_eq!(m.warnings().len(), 1);
+    assert!(m.warnings()[0].starts_with("rom: file kvmvapic.bin"), "{:?}", m.warnings());
 }
 
 #[test]
@@ -279,16 +291,18 @@ fn pci_functions_are_enumerated() {
     assert_eq!(pci_read32(&m, 0x00, 0), 0x29c0_8086);
     assert_eq!(pci_read32(&m, 0xf8, 0), 0x2918_8086);
     assert_eq!(pci_read32(&m, 0xfa, 0), 0x2922_8086);
-    // The class codes: host bridge, ISA bridge and AHCI.
+    assert_eq!(pci_read32(&m, 0xfb, 0), 0x2930_8086);
+    // The class codes: host bridge, ISA bridge, AHCI and SMBus.
     assert_eq!(pci_read32(&m, 0x00, 8) >> 16, 0x0600);
     assert_eq!(pci_read32(&m, 0xf8, 8) >> 16, 0x0601);
     assert_eq!(pci_read32(&m, 0xfa, 8) >> 8, 0x01_0601);
-    // Nothing at 00:01.0 or 00:1f.3 (no VGA, no SMBus).
+    assert_eq!(pci_read32(&m, 0xfb, 8) >> 16, 0x0c05);
+    // Nothing at 00:01.0 (no VGA).
     assert_eq!(pci_read32(&m, 0x08, 0), 0xffff_ffff);
-    assert_eq!(pci_read32(&m, 0xfb, 0), 0xffff_ffff);
 
-    let m = machine(config("sata=off"));
+    let m = machine(config("sata=off,smbus=off"));
     assert_eq!(pci_read32(&m, 0xfa, 0), 0xffff_ffff);
+    assert_eq!(pci_read32(&m, 0xfb, 0), 0xffff_ffff);
 }
 
 #[test]
@@ -313,7 +327,7 @@ fn bios_is_mapped_at_4g_and_below_1m() {
     let _ = m.memory_as().write(0xffff_fff0, ATTRS, b"x");
     assert!(m.memory_as().read(0xffff_fff0, ATTRS, &mut b[..1]).is_ok());
     assert_eq!(b[0], b'r');
-    let block = m.memory_system().ram_block(m.bios_region()).unwrap();
+    let block = m.memory_system().ram_block(m.bios_region().unwrap()).unwrap();
     block.write(256 * 1024 - 16, b"x").unwrap();
     assert!(m.memory_as().read(0xffff_fff0, ATTRS, &mut b[..1]).is_ok());
     assert_eq!(b[0], b'x');
@@ -331,6 +345,111 @@ fn bios_errors() {
     cfg.firmware = Some(vec![0; 1000]);
     cfg.firmware_name = Some("x.bin".into());
     assert_eq!(Q35::new(cfg).unwrap_err(), "qemu: could not load PC BIOS 'x.bin'");
+}
+
+/// A pflash image of `size` bytes whose last 16 are the reset vector and whose first byte is
+/// `first`.
+fn flash_image(size: usize, first: u8) -> Vec<u8> {
+    let mut v = vec![0xff; size];
+    v[0] = first;
+    v[size - 16..].copy_from_slice(b"flash vector!!!!");
+    v
+}
+
+fn pflash(name: &str, data: Vec<u8>) -> Option<PflashDrive> {
+    Some(PflashDrive {
+        name: name.into(),
+        size: data.len() as u64,
+        backing: PflashBacking::Bytes(data),
+    })
+}
+
+#[test]
+fn pflash_replaces_the_bios() {
+    // What OVMF looks like: CODE in pflash0 at the top, VARS in pflash1 right below it.
+    let mut cfg = config("");
+    cfg.firmware = None;
+    cfg.pflash = [
+        pflash("pflash0", flash_image(256 << 10, 0xc0)),
+        pflash("pflash1", flash_image(128 << 10, 0xd0)),
+    ];
+    let mut m = machine(cfg);
+    assert_eq!(m.bios_region(), None);
+    assert_eq!(m.flashes().len(), 2);
+    let mut b = [0u8; 16];
+    assert!(m.memory_as().read(0xffff_fff0, ATTRS, &mut b).is_ok());
+    assert_eq!(&b, b"flash vector!!!!");
+    assert!(m.memory_as().read(0xfffc_0000, ATTRS, &mut b[..1]).is_ok());
+    assert_eq!(b[0], 0xc0);
+    assert!(m.memory_as().read(0xfffa_0000, ATTRS, &mut b[..1]).is_ok());
+    assert_eq!(b[0], 0xd0);
+    // The isa-bios alias shows the top 128 KiB of pflash0 below 1 MiB.
+    assert!(m.memory_as().read(0xffff0, ATTRS, &mut b).is_ok());
+    assert_eq!(&b, b"flash vector!!!!");
+
+    // Program a byte of VARS: 0x40 then the data. The flash then reads status until it is
+    // put back in read array mode, or the machine resets.
+    let vars = 0xfffa_0010;
+    assert!(m.memory_as().write(vars, ATTRS, &[0x40]).is_ok());
+    assert!(m.memory_as().write(vars, ATTRS, &[0x5a]).is_ok());
+    assert!(m.memory_as().read(vars, ATTRS, &mut b[..1]).is_ok());
+    assert_eq!(b[0], 0x80, "status: ready");
+    m.system_reset().unwrap();
+    assert!(m.memory_as().read(vars, ATTRS, &mut b[..1]).is_ok());
+    assert_eq!(b[0], 0x5a, "the program survives the reset");
+    assert_eq!(m.flashes()[1].contents()[0x10], 0x5a);
+    // The alias starts 128 KiB into pflash0.
+    assert!(m.memory_as().read(0xe0000, ATTRS, &mut b[..1]).is_ok());
+    assert_eq!(b[0], 0xff);
+}
+
+#[test]
+fn pflash_errors() {
+    let with = |drives: [Option<PflashDrive>; 2]| {
+        let mut cfg = config("");
+        cfg.pflash = drives;
+        Q35::new(cfg).err()
+    };
+    assert_eq!(with([None, pflash("vars", vec![0; 4096])]).unwrap(), "pflash1 requires pflash0");
+    assert_eq!(
+        with([pflash("pflash0", vec![0; 1000]), None]).unwrap(),
+        "system firmware block device pflash0 has invalid size 1000\n\
+         info: its size must be a non-zero multiple of 0x1000"
+    );
+    let big = || pflash("pflash0", vec![0; 8 << 20]);
+    assert_eq!(
+        with([big(), pflash("pflash1", vec![0; 4096])]).unwrap(),
+        "combined size of system firmware exceeds 8388608 bytes"
+    );
+    assert_eq!(with([big(), None]), None);
+}
+
+/// The SeaBIOS QEMU ships, when it is installed: mapped at 4 GiB minus its size with the last
+/// 128 KiB at 0xe0000, so the reset vector at 0xffff0 is a far jump into the F segment.
+#[test]
+fn seabios_256k_from_the_qemu_install() {
+    let dirs = [
+        "/opt/homebrew/share/qemu",
+        "/usr/local/share/qemu",
+        "/usr/share/qemu",
+        "/usr/share/seabios",
+    ];
+    let Some(data) = dirs.iter().find_map(|d| std::fs::read(format!("{d}/bios-256k.bin")).ok())
+    else {
+        eprintln!("bios-256k.bin not found, skipping");
+        return;
+    };
+    assert_eq!(data.len(), 256 << 10);
+    let mut cfg = config("");
+    cfg.firmware = Some(data.clone());
+    let m = machine(cfg);
+    let mut b = [0u8; 16];
+    assert!(m.memory_as().read(0xffff_fff0, ATTRS, &mut b).is_ok());
+    assert_eq!(b[..], data[data.len() - 16..]);
+    assert_eq!(b[0], 0xea, "ljmp");
+    let mut low = vec![0u8; 128 << 10];
+    assert!(m.memory_as().read(0xe0000, ATTRS, &mut low).is_ok());
+    assert_eq!(low[..], data[data.len() - (128 << 10)..]);
 }
 
 #[test]
@@ -424,10 +543,10 @@ fn legacy_devices() {
     assert!(!m.ram_ranges().unwrap().is_empty());
 
     let mut cfg = config("pit=off,pic=off,smm=off");
-    cfg.serial_hd = false;
+    cfg.serial_hds = vec![false];
     let m = machine(cfg);
     assert!(m.pit().is_none() && m.pcspk().is_none() && m.pic().is_none());
-    assert!(m.serial().is_none() && m.smm_as().is_none());
+    assert!(m.serial(0).is_none() && m.smm_as().is_none());
     assert_eq!(inb(&m, 0x3ff), 0xff);
 }
 
@@ -472,8 +591,7 @@ fn acpi_tables_match_the_firmware_builder() {
             limit: u64::from(host.pci_hole_end()) - 1,
         },
         pci_hole64: Some(CrsRange { base: 1 << 32, limit: (1 << 32) + (32 << 30) - 1 }),
-        // bios-tables-test's defaults without the VGA at 00:01.0, the parallel port and the
-        // SMBus controller at 00:1f.3.
+        // bios-tables-test's defaults without the VGA at 00:01.0 and the parallel port.
         pci_devices: vec![
             PciDevice { devfn: 0, acpi_index: None, aml: PciDeviceAml::Plain },
             PciDevice {
@@ -488,6 +606,7 @@ fn acpi_tables_match_the_firmware_builder() {
                 },
             },
             PciDevice { devfn: 0xfa, acpi_index: None, aml: PciDeviceAml::Plain },
+            PciDevice { devfn: 0xfb, acpi_index: None, aml: PciDeviceAml::Plain },
         ],
     };
     assert_eq!(format!("{:?}", m.acpi_input()), format!("{want:?}"));
@@ -500,6 +619,63 @@ fn acpi_tables_match_the_firmware_builder() {
     let m = machine(config("acpi=off"));
     assert!(fw_cfg_file(&m, "etc/acpi/tables").is_none());
     assert!(fw_cfg_file(&m, "etc/e820").is_some());
+}
+
+/// The ISA serial ports of the LPC bridge in the DSDT.
+fn isa_serials(m: &Q35) -> Vec<IsaDevice> {
+    let input = m.acpi_input();
+    let lpc = input.pci_devices.iter().find(|d| d.devfn == 0xf8).unwrap();
+    let PciDeviceAml::Lpc { isa } = &lpc.aml else { panic!("no LPC bridge") };
+    isa.clone()
+}
+
+#[test]
+fn two_serial_ports() {
+    let mut cfg = config("");
+    cfg.serial_hds = vec![true, true];
+    let m = machine(cfg);
+    // The scratch registers of COM1 and COM2.
+    outb(&m, 0x3ff, 0x5a);
+    outb(&m, 0x2ff, 0xa5);
+    assert_eq!((inb(&m, 0x3ff), inb(&m, 0x2ff)), (0x5a, 0xa5));
+    assert_eq!(inb(&m, 0x3ef), 0xff);
+    assert!(m.serial(0).is_some() && m.serial(1).is_some() && m.serial(2).is_none());
+    assert!(m.set_serial_backend(1, None));
+    assert!(!m.set_serial_backend(2, None));
+    // Newest first: the i8042, COM2, COM1 and the RTC from the LPC bridge.
+    assert_eq!(
+        isa_serials(&m),
+        vec![
+            IsaDevice::I8042 { kbd_irq: 1, mouse_irq: 12 },
+            IsaDevice::Serial { index: 1, iobase: 0x2f8, irq: 3 },
+            IsaDevice::Serial { index: 0, iobase: 0x3f8, irq: 4 },
+            IsaDevice::Rtc { io_base: 0x70, irq: 8 },
+        ]
+    );
+    let t = acpi_q35::build(&m.acpi_input());
+    assert_eq!(fw_cfg_file(&m, "etc/acpi/tables").unwrap(), t.table_data);
+}
+
+#[test]
+fn serial_ports_follow_serial_hd_indexes() {
+    // -serial none -serial stdio ... : no COM1, and only four ports at most.
+    let mut cfg = config("");
+    cfg.serial_hds = vec![false, true, true, true, true];
+    let m = machine(cfg);
+    assert!(m.serial(0).is_none() && m.serial(3).is_some() && m.serial(4).is_none());
+    assert_eq!(inb(&m, 0x3ff), 0xff);
+    outb(&m, 0x2ef, 0x11);
+    assert_eq!(inb(&m, 0x2ef), 0x11);
+    let serials: Vec<IsaDevice> =
+        isa_serials(&m).into_iter().filter(|d| matches!(d, IsaDevice::Serial { .. })).collect();
+    assert_eq!(
+        serials,
+        vec![
+            IsaDevice::Serial { index: 3, iobase: 0x2e8, irq: 3 },
+            IsaDevice::Serial { index: 2, iobase: 0x3e8, irq: 4 },
+            IsaDevice::Serial { index: 1, iobase: 0x2f8, irq: 3 },
+        ]
+    );
 }
 
 #[test]

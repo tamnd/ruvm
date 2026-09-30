@@ -20,8 +20,14 @@ use std::path::PathBuf;
 
 use ruvm_base::report::{Location, push_location, report_error};
 use ruvm_base::{Error, Result};
+use ruvm_chardev::opts::{NographicDefaults, nographic_defaults};
+use ruvm_firmware::smbios::{SmbiosOptions, SmbiosTopology, parse_uuid};
 use ruvm_machine_x86::board::X86_BOARDS;
-use ruvm_machine_x86::{BoardKind, FirmwareSearch, KernelFiles, MicrovmProps, Q35Props};
+use ruvm_machine_x86::pflash::raw_block_length;
+use ruvm_machine_x86::q35::PflashDrive;
+use ruvm_machine_x86::{
+    BoardKind, FileBackend, FirmwareSearch, KernelFiles, MicrovmProps, PflashBacking, Q35Props,
+};
 use ruvm_qapi::opts::{QemuOptsList, is_help_option};
 use ruvm_qapi::types::{MemorySizeConfiguration, SMPConfiguration};
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor};
@@ -92,6 +98,10 @@ pub(crate) struct Cmdline {
     pub has_defaults: bool,
     /// `-no-reboot`.
     pub no_reboot: bool,
+    /// `qemu_uuid`: the last of `-uuid` and `-smbios type=1,uuid=`.
+    pub uuid: Option<[u8; 16]>,
+    /// `-smbios`, parsed as it comes like `smbios_entry_add()` does.
+    pub smbios: SmbiosOptions,
 }
 
 impl Default for Cmdline {
@@ -108,63 +118,49 @@ impl Default for Cmdline {
             default_monitor: true,
             has_defaults: true,
             no_reboot: false,
+            uuid: None,
+            smbios: SmbiosOptions::new(),
         }
     }
 }
 
 impl Cmdline {
+    /// `-uuid`: sets `qemu_uuid`, which fw_cfg and the SMBIOS type 1 table report.
+    pub(crate) fn set_uuid(&mut self, arg: &str) -> std::result::Result<(), String> {
+        let uuid =
+            parse_uuid(arg).ok_or("failed to parse UUID string: wrong format".to_string())?;
+        self.uuid = Some(uuid);
+        self.smbios.uuid = Some(uuid);
+        Ok(())
+    }
+
+    /// `-smbios`: `smbios_entry_add()`, where `type=1,uuid=` sets `qemu_uuid` too.
+    pub(crate) fn add_smbios(&mut self, arg: &str) -> std::result::Result<(), String> {
+        let before = self.smbios.uuid;
+        self.smbios.add(arg).map_err(|e| e.message().to_string())?;
+        if self.smbios.uuid != before {
+            self.uuid = self.smbios.uuid;
+        }
+        Ok(())
+    }
+
     /// The firmware search path.
     pub(crate) fn firmware(&self) -> FirmwareSearch {
         FirmwareSearch::new(&self.data_dirs)
     }
 
-    /// `qemu_create_default_devices()` for the serial port: `-nographic` puts it on stdio,
-    /// together with the monitor when neither was given; otherwise it would be a virtual
-    /// console, which without a display is the same as nothing.
-    pub(crate) fn add_default_serial(&mut self) {
-        if !self.default_serial {
-            return;
+    /// `qemu_create_default_devices()` for the serial port and the monitor: the old style
+    /// strings the default `-serial` and `-monitor` get, if any. `no_serial` is the machine's
+    /// `no_serial`, set for `none`. With `-nographic` both go to stdio, sharing a mux when
+    /// both are wanted. Otherwise they would go to a virtual console, and in a build without
+    /// one, like this one, the serial port gets `null` and the monitor nothing. ruvm has no
+    /// parallel port, so the default one is left out.
+    pub(crate) fn default_devices(&self, no_serial: bool) -> NographicDefaults {
+        let serial = self.default_serial && !no_serial;
+        if self.nographic {
+            return nographic_defaults(serial, self.default_monitor, false);
         }
-        let dev = if !self.nographic {
-            "vc:80Cx24C"
-        } else if self.default_monitor {
-            "mon:stdio"
-        } else {
-            "stdio"
-        };
-        self.serials.push((dev.to_string(), None));
-    }
-}
-
-/// Where the first serial port goes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SerialSpec {
-    /// `-serial none`: the board has no serial port.
-    None,
-    /// `null`, or a virtual console, which this build has no display for.
-    Null,
-    /// `stdio`. `mon` is set for `mon:stdio`, whose monitor half ruvm leaves out for now.
-    Stdio { mon: bool },
-    /// `chardev:ID`.
-    Chardev(String),
-    /// Anything else, which the chardev layer parses (`tcp:...`, `unix:...`).
-    Compat(String),
-}
-
-impl SerialSpec {
-    /// `serial_parse()`'s view of a `-serial` value.
-    pub(crate) fn parse(dev: &str) -> SerialSpec {
-        match dev {
-            "none" => SerialSpec::None,
-            "null" => SerialSpec::Null,
-            "stdio" => SerialSpec::Stdio { mon: false },
-            "mon:stdio" => SerialSpec::Stdio { mon: true },
-            d if d == "vc" || d.starts_with("vc:") => SerialSpec::Null,
-            d => match d.strip_prefix("chardev:") {
-                Some(id) => SerialSpec::Chardev(id.to_string()),
-                None => SerialSpec::Compat(d.to_string()),
-            },
-        }
+        NographicDefaults { serial: serial.then_some("null"), ..NographicDefaults::default() }
     }
 }
 
@@ -178,6 +174,10 @@ pub(crate) struct BoardOptions {
     pub kernel: Option<KernelFiles>,
     /// `firmware`, which `-bios` sets.
     pub bios: Option<String>,
+    /// `pflash0` and `pflash1` (q35): the names of the drives for the system flashes.
+    pub pflash: [Option<String>; 2],
+    /// The topology `-smp` resolved to, for the SMBIOS tables.
+    pub topology: Option<SmbiosTopology>,
     /// Everything else, for the board, in command line order.
     pub props: Vec<(String, String)>,
 }
@@ -210,9 +210,18 @@ fn visit_member<T: Visit>(machine: &QDict, name: &str) -> Result<Option<T>> {
     r.map(|()| Some(t))
 }
 
-/// `machine_parse_smp_config()` for the x86 boards, which know dies and modules but not
-/// clusters, books or drawers. Gives (cpus, maxcpus).
+/// [`parse_smp_topology`] without the topology: (cpus, maxcpus).
+#[cfg(test)]
 pub(crate) fn parse_smp(kind: BoardKind, config: &SMPConfiguration) -> Result<(u32, u32)> {
+    parse_smp_topology(kind, config).map(|(cpus, max, _)| (cpus, max))
+}
+
+/// `machine_parse_smp_config()` for the x86 boards, which know dies and modules but not
+/// clusters, books or drawers. Gives (cpus, maxcpus, topology).
+pub(crate) fn parse_smp_topology(
+    kind: BoardKind,
+    config: &SMPConfiguration,
+) -> Result<(u32, u32, SmbiosTopology)> {
     let explicit = [
         config.cpus,
         config.drawers,
@@ -294,7 +303,16 @@ pub(crate) fn parse_smp(kind: BoardKind, config: &SMPConfiguration) -> Result<(u
             board_type_name(kind)
         )));
     }
-    Ok((cpus as u32, maxcpus as u32))
+    // Every count is at most maxcpus now, which fits a u32.
+    let topology = SmbiosTopology {
+        sockets: sockets as u32,
+        dies: dies as u32,
+        clusters: 1,
+        modules: modules as u32,
+        cores: cores as u32,
+        threads: threads as u32,
+    };
+    Ok((cpus as u32, maxcpus as u32, topology))
 }
 
 /// The keyval value of a `-machine` property as a string, the way the property parser sees
@@ -318,7 +336,8 @@ pub(crate) fn take_board_options(kind: BoardKind, machine: &QDict) -> Result<Boa
         o.ram_size = mem.size.map(|s| s.next_multiple_of(8192));
     }
     let smp = visit_member::<SMPConfiguration>(machine, "smp")?.unwrap_or_default();
-    (o.cpus, o.max_cpus) = parse_smp(kind, &smp)?;
+    let (cpus, max_cpus, topology) = parse_smp_topology(kind, &smp)?;
+    (o.cpus, o.max_cpus, o.topology) = (cpus, max_cpus, Some(topology));
 
     let mut kernel = None;
     let mut initrd = None;
@@ -331,6 +350,10 @@ pub(crate) fn take_board_options(kind: BoardKind, machine: &QDict) -> Result<Boa
             "initrd" => initrd = Some(prop_string(name, value)?),
             "append" => append = Some(prop_string(name, value)?),
             "firmware" => o.bios = Some(prop_string(name, value)?),
+            // The link properties pc_pflash_create() aliases onto the machine.
+            "pflash0" | "pflash1" if kind == BoardKind::Q35 => {
+                o.pflash[usize::from(name == "pflash1")] = Some(prop_string(name, value)?);
+            }
             // Generic machine properties that change nothing here.
             "dump-guest-core" | "mem-merge" => {}
             // Only q35 has a use for graphics=, but every machine has the property.
@@ -650,6 +673,49 @@ pub(crate) struct Plan {
     pub virtio: Vec<Plug>,
 }
 
+/// The drives of the q35 system flashes: `-machine pflashN=` names a drive by id, and
+/// `-drive if=pflash` with unit N is taken the way `pflash_cfi01_legacy_drive()` does. The
+/// images are read into the flash and written back with plain file I/O, so the drive only
+/// supplies a file name and the read-only flag.
+pub(crate) fn pflash_drives(
+    kind: BoardKind,
+    opts: &BoardOptions,
+    drives: &[Drive],
+) -> std::result::Result<[Option<PflashDrive>; 2], Located> {
+    let mut out: [Option<PflashDrive>; 2] = [None, None];
+    if kind != BoardKind::Q35 {
+        return Ok(out);
+    }
+    let open = |d: &Drive| -> std::result::Result<PflashDrive, Located> {
+        let Some(file) = &d.file else {
+            // No medium: blk_getlength() fails and the size check catches it.
+            return Ok(PflashDrive { name: d.id.clone(), size: 0, backing: PflashBacking::None });
+        };
+        let size =
+            FileBackend::open(file, d.read_only).map_err(|e| Located::new(&d.loc, e))?.size();
+        Ok(PflashDrive {
+            name: d.id.clone(),
+            size: raw_block_length(size),
+            backing: PflashBacking::File { path: file.into(), read_only: d.read_only },
+        })
+    };
+    for (i, name) in opts.pflash.iter().enumerate() {
+        let Some(name) = name else { continue };
+        let d = drives.iter().find(|d| &d.id == name).ok_or_else(|| {
+            Located::bare(format!("Property 'cfi.pflash01.drive' can't find value '{name}'"))
+        })?;
+        out[i] = Some(open(d)?);
+    }
+    for d in drives.iter().filter(|d| d.iface == DriveIf::Pflash && d.bus == 0 && d.unit < 2) {
+        let i = d.unit as usize;
+        if out[i].is_some() {
+            return Err(Located::new(&d.loc, "clashes with -machine"));
+        }
+        out[i] = Some(open(d)?);
+    }
+    Ok(out)
+}
+
 /// Works out what `-drive` and `-device` plug into a board of kind `kind` (`None` for the
 /// `none` machine). The errors are those of `qdev_device_add()` and
 /// `drive_check_orphaned()`; for orphans every one is listed.
@@ -668,6 +734,12 @@ pub(crate) fn plan(
         for (i, d) in drives.iter().enumerate() {
             if d.iface == DriveIf::Ide && d.unit == 0 && d.bus < 6 {
                 p.ide.push((d.bus, i));
+                used.insert(i);
+            }
+        }
+        // pc_system_firmware_init(): drive_get(IF_PFLASH, 0, i) for the two flashes.
+        for (i, d) in drives.iter().enumerate() {
+            if d.iface == DriveIf::Pflash && d.bus == 0 && d.unit < 2 {
                 used.insert(i);
             }
         }
@@ -808,7 +880,7 @@ pub(crate) fn probe_warning(file: &str) -> String {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) use kvm::{Running, SerialConn, kvm_init, start_board};
+pub(crate) use kvm::{Running, kvm_init, start_board};
 
 /// The accelerator `configure_accelerators()` picked.
 #[derive(Debug)]
@@ -831,8 +903,7 @@ pub(crate) enum AccelInitError {
 /// The KVM side, Linux on x86_64 only.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod kvm {
-    use std::io::{Read, Write};
-    use std::sync::{Arc, Mutex, PoisonError};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use ruvm_accel_kvm::{KernelIrqchip, KvmAccel, KvmOptions};
@@ -855,7 +926,8 @@ mod kvm {
     use ruvm_qapi::types::{GuestPanicAction, GuestPanickedArg, ResetArg, RunState, ShutdownCause};
 
     use super::{
-        AccelInitError, BoardOptions, Cmdline, Drive, Located, VirtioModel, plan, probe_warning,
+        AccelInitError, BoardOptions, Cmdline, Drive, Located, VirtioModel, pflash_drives, plan,
+        probe_warning,
     };
     use crate::vl::Vm;
 
@@ -886,11 +958,11 @@ mod kvm {
         open_accel(&opts, default_split).map_err(AccelInitError::Failed)
     }
 
-    /// The x86 board running on KVM, and what feeds its serial port.
+    /// The x86 board running on KVM, and the chardevs its serial ports are attached to.
     #[derive(Debug)]
     pub(crate) struct Running {
         machine: Arc<KvmMachine>,
-        _serial: Option<Attachment>,
+        _serials: Vec<Attachment>,
     }
 
     impl Running {
@@ -900,84 +972,45 @@ mod kvm {
         }
     }
 
-    /// Where the first serial port goes, resolved.
-    pub(crate) enum SerialConn {
-        /// `-serial none`.
-        Absent,
-        Null,
-        Stdio,
-        Chardev(Arc<Chardev>),
-    }
-
-    /// A `-serial stdio` of its own. The chardev layer has no stdio backend yet, so this
-    /// writes to stdout and feeds stdin to the port as it comes, with the terminal left as it
-    /// is (no raw mode, no mux, no monitor escape).
-    #[derive(Debug)]
-    struct StdioSerial;
-
-    impl SerialBackend for StdioSerial {
-        fn write(&self, bytes: &[u8]) -> usize {
-            let mut out = std::io::stdout().lock();
-            let _ = out.write_all(bytes);
-            let _ = out.flush();
-            bytes.len()
-        }
-    }
-
-    /// Feeds `input` to `serial`, a byte at a time as the port has room.
-    fn feed(serial: &Serial, mut input: impl Read) {
-        let mut buf = [0u8; 256];
-        loop {
-            let n = match input.read(&mut buf) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
-            let mut rest = &buf[..n];
-            while !rest.is_empty() {
-                let room = serial.can_receive();
-                if room == 0 {
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                let k = room.min(rest.len());
-                serial.receive(&rest[..k]);
-                rest = &rest[k..];
+    /// Feeds `input` to `serial`, as much at a time as the port has room for.
+    fn feed(serial: &Serial, mut input: &[u8]) {
+        while !input.is_empty() {
+            let room = serial.can_receive();
+            if room == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
             }
+            let k = room.min(input.len());
+            serial.receive(&input[..k]);
+            input = &input[k..];
         }
     }
 
-    /// A serial port on a chardev: what the guest writes goes to the connected client, what
-    /// the client sends goes to the port.
+    /// A serial port on its chardev, the `chardev` property of `isa-serial`: what the guest
+    /// writes goes to the chardev, what the chardev reads goes to the port.
     struct ChardevSerial {
         serial: Arc<Serial>,
-        out: Mutex<Option<Box<dyn Write + Send>>>,
+        chr: Arc<Chardev>,
     }
 
     impl SerialBackend for ChardevSerial {
         fn write(&self, bytes: &[u8]) -> usize {
-            let mut out = self.out.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(w) = out.as_mut() {
-                if w.write_all(bytes).and_then(|()| w.flush()).is_err() {
-                    *out = None;
-                }
-            }
+            // Output nobody can take is dropped, as serial_xmit() does after an error.
+            let _ = self.chr.write_all(bytes);
             bytes.len()
         }
     }
 
     impl Frontend for ChardevSerial {
         fn serve(&self, conn: &mut Connection) -> std::io::Result<()> {
-            *self.out.lock().unwrap_or_else(PoisonError::into_inner) = Some(conn.writer()?);
             let mut buf = [0u8; 256];
-            let r = loop {
+            loop {
                 match conn.recv(&mut buf) {
-                    Ok(0) => break Ok(()),
+                    Ok(0) => return Ok(()),
                     Ok(n) => feed(&self.serial, &buf[..n]),
-                    Err(e) => break Err(e),
+                    Err(e) => return Err(e),
                 }
-            };
-            *self.out.lock().unwrap_or_else(PoisonError::into_inner) = None;
-            r
+            }
         }
     }
 
@@ -1005,8 +1038,9 @@ mod kvm {
     }
 
     /// `qemu_init_board()`, `qemu_create_cli_devices()` and `qemu_machine_creation_done()`
-    /// for an x86 board on KVM: builds the board, plugs the devices, connects the serial port
-    /// and puts it all on the vCPUs, stopped until `vm_start()`.
+    /// for an x86 board on KVM: builds the board, plugs the devices, connects the serial ports
+    /// to `serial_hds` (`serial_hd(i)` by index) and puts it all on the vCPUs, stopped until
+    /// `vm_start()`.
     pub(crate) fn start_board(
         vm: &Arc<Vm>,
         accel: KvmAccel,
@@ -1014,7 +1048,7 @@ mod kvm {
         opts: BoardOptions,
         cmd: &Cmdline,
         drives: &[Drive],
-        serial: SerialConn,
+        serial_hds: &[Option<Arc<Chardev>>],
     ) -> Result<Running, Vec<Located>> {
         let one = |e: Located| vec![e];
         let cpu = CpuModel::new(&accel, cmd.cpu.as_deref()).map_err(|e| one(Located::bare(e)))?;
@@ -1023,6 +1057,7 @@ mod kvm {
         }
         let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
         let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
+        let pflash = pflash_drives(kind, &opts, drives).map_err(one)?;
         let spec = BoardSpec {
             kind,
             props: opts.props,
@@ -1033,10 +1068,15 @@ mod kvm {
             pit_in_kernel: pit_in_kernel(&accel),
             smm_available: false,
             phys_bits: cpu.phys_bits(),
+            cpu: cpu.ident(),
             bios: opts.bios,
+            pflash,
+            uuid: cmd.uuid,
+            smbios: cmd.smbios.clone(),
+            topology: opts.topology,
             kernel: opts.kernel,
             firmware: cmd.firmware(),
-            serial_hd: !matches!(serial, SerialConn::Absent),
+            serial_hds: serial_hds.iter().map(Option::is_some).collect(),
             clock: Arc::clone(&clock),
             rtc_clock: Arc::clone(&rtc_clock),
         };
@@ -1083,24 +1123,14 @@ mod kvm {
             })?;
         }
 
-        let port = board.serial().cloned();
-        let mut attachment = None;
-        match (&serial, &port) {
-            (SerialConn::Stdio, Some(port)) => {
-                board.set_serial_backend(Some(Arc::new(StdioSerial)));
-                let port = Arc::clone(port);
-                std::thread::Builder::new()
-                    .name("serial stdin".to_string())
-                    .spawn(move || feed(&port, std::io::stdin()))
-                    .map_err(|e| one(Located::bare(format!("could not create thread: {e}"))))?;
-            }
-            (SerialConn::Chardev(chr), Some(port)) => {
-                let fe =
-                    Arc::new(ChardevSerial { serial: Arc::clone(port), out: Mutex::new(None) });
-                board.set_serial_backend(Some(fe.clone()));
-                attachment = Some(chr.attach(fe).map_err(|e| vec![Located(None, e)])?);
-            }
-            _ => {}
+        // The ports the board made take their chardevs; a microvm leaves the ones after the
+        // first unconnected, as QEMU does.
+        let mut attachments = Vec::new();
+        for (index, chr) in serial_hds.iter().enumerate() {
+            let (Some(chr), Some(port)) = (chr, board.serial(index)) else { continue };
+            let fe = Arc::new(ChardevSerial { serial: Arc::clone(port), chr: Arc::clone(chr) });
+            board.set_serial_backend(index, Some(fe.clone()));
+            attachments.push(chr.attach(fe).map_err(|e| vec![Located(None, e)])?);
         }
 
         let rs = Arc::clone(&vm.runstate);
@@ -1145,7 +1175,7 @@ mod kvm {
                 }
             }
         })));
-        Ok(Running { machine, _serial: attachment })
+        Ok(Running { machine, _serials: attachments })
     }
 
     fn attach_ide(
@@ -1211,7 +1241,8 @@ mod tests {
         );
 
         let o = take_board_options(BoardKind::Q35, &QDict::new()).unwrap();
-        assert_eq!(o, BoardOptions { cpus: 1, max_cpus: 1, ..BoardOptions::default() });
+        let one = Some(SmbiosTopology::default());
+        assert_eq!(o, BoardOptions { cpus: 1, max_cpus: 1, topology: one, ..Default::default() });
     }
 
     #[test]
@@ -1293,33 +1324,28 @@ mod tests {
     }
 
     #[test]
-    fn serial_values() {
-        assert_eq!(SerialSpec::parse("stdio"), SerialSpec::Stdio { mon: false });
-        assert_eq!(SerialSpec::parse("mon:stdio"), SerialSpec::Stdio { mon: true });
-        assert_eq!(SerialSpec::parse("none"), SerialSpec::None);
-        assert_eq!(SerialSpec::parse("null"), SerialSpec::Null);
-        assert_eq!(SerialSpec::parse("vc:80Cx24C"), SerialSpec::Null);
-        assert_eq!(SerialSpec::parse("chardev:s0"), SerialSpec::Chardev("s0".into()));
+    fn default_devices_follow_nographic() {
+        let d = |c: Cmdline, no_serial| {
+            let d = c.default_devices(no_serial);
+            (d.serial, d.monitor, d.parallel)
+        };
+        let ng = || Cmdline { nographic: true, ..Cmdline::default() };
+        assert_eq!(d(ng(), false), (Some("mon:stdio"), None, None));
+        // The none machine has no serial port, so the monitor has stdio to itself.
+        assert_eq!(d(ng(), true), (None, Some("stdio"), None));
         assert_eq!(
-            SerialSpec::parse("tcp::4444,server=on"),
-            SerialSpec::Compat("tcp::4444,server=on".into())
+            d(Cmdline { default_monitor: false, ..ng() }, false),
+            (Some("stdio"), None, None)
         );
-    }
-
-    #[test]
-    fn default_serial_follows_nographic() {
-        let mut c = Cmdline { nographic: true, ..Cmdline::default() };
-        c.add_default_serial();
-        assert_eq!(c.serials[0].0, "mon:stdio");
-        let mut c = Cmdline { nographic: true, default_monitor: false, ..Cmdline::default() };
-        c.add_default_serial();
-        assert_eq!(c.serials[0].0, "stdio");
-        let mut c = Cmdline::default();
-        c.add_default_serial();
-        assert_eq!(SerialSpec::parse(&c.serials[0].0), SerialSpec::Null);
-        let mut c = Cmdline { default_serial: false, nographic: true, ..Cmdline::default() };
-        c.add_default_serial();
-        assert!(c.serials.is_empty());
+        assert_eq!(
+            d(Cmdline { default_serial: false, ..ng() }, false),
+            (None, Some("stdio"), None)
+        );
+        assert_eq!(d(Cmdline::default(), false), (Some("null"), None, None));
+        assert_eq!(d(Cmdline::default(), true), (None, None, None));
+        let nodefaults =
+            Cmdline { default_serial: false, default_monitor: false, has_defaults: false, ..ng() };
+        assert_eq!(d(nodefaults, false), (None, None, None));
     }
 
     fn drives(kind: Option<BoardKind>, args: &[&str]) -> Result<Vec<Drive>> {
@@ -1503,5 +1529,95 @@ mod tests {
             "WARNING: Image format was not specified for 'disk.img' and probing guessed raw.\n"
         ));
         assert!(w.ends_with("Specify the 'raw' format explicitly to remove the restrictions.\n"));
+    }
+
+    #[test]
+    fn smp_topology_is_what_smbios_describes() {
+        let k = BoardKind::Q35;
+        let (_, _, t) = parse_smp_topology(k, &smp(|s| s.cpus = Some(4))).unwrap();
+        assert_eq!(t, SmbiosTopology { cores: 4, ..SmbiosTopology::default() });
+        let (_, _, t) = parse_smp_topology(
+            k,
+            &smp(|s| {
+                s.sockets = Some(2);
+                s.threads = Some(2);
+                s.cpus = Some(8);
+            }),
+        )
+        .unwrap();
+        assert_eq!((t.sockets, t.cores, t.threads), (2, 2, 2));
+    }
+
+    #[test]
+    fn uuid_and_smbios_share_qemu_uuid() {
+        let mut c = Cmdline::default();
+        assert_eq!(c.set_uuid("nope").unwrap_err(), "failed to parse UUID string: wrong format");
+        c.set_uuid("12345678-9abc-def0-1234-56789abcdef0").unwrap();
+        assert_eq!(c.uuid.unwrap()[0], 0x12);
+        assert_eq!(c.smbios.uuid, c.uuid);
+        c.add_smbios("type=1,uuid=00000000-0000-0000-0000-000000000001").unwrap();
+        assert_eq!(c.uuid.unwrap()[15], 1);
+        // Options that leave the UUID alone keep the one -uuid gave.
+        c.set_uuid("12345678-9abc-def0-1234-56789abcdef0").unwrap();
+        c.add_smbios("type=1,product=P").unwrap();
+        assert_eq!(c.uuid.unwrap()[0], 0x12);
+        assert!(c.add_smbios("type=1,bogus=x").is_err());
+    }
+
+    #[test]
+    fn pflash_comes_from_the_machine_or_if_pflash() {
+        let dir = std::env::temp_dir().join(format!("ruvm-pflash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let code = dir.join("code.fd");
+        let vars = dir.join("vars.fd");
+        std::fs::write(&code, vec![0u8; 0x1000]).unwrap();
+        std::fs::write(&vars, vec![0u8; 1000]).unwrap();
+        let (code, vars) = (code.to_str().unwrap(), vars.to_str().unwrap());
+        let q35 = BoardKind::Q35;
+
+        let d = drives(
+            Some(q35),
+            &[
+                &format!("if=pflash,format=raw,readonly=on,file={code}"),
+                &format!("if=pflash,format=raw,file={vars}"),
+            ],
+        )
+        .unwrap();
+        let f = pflash_drives(q35, &BoardOptions::default(), &d).unwrap();
+        let f0 = f[0].as_ref().unwrap();
+        assert_eq!((f0.name.as_str(), f0.size), ("pflash0", 0x1000));
+        assert_eq!(f0.backing, PflashBacking::File { path: code.into(), read_only: true });
+        // Raw images are whole 512 byte sectors long.
+        assert_eq!(f[1].as_ref().unwrap().size, 1024);
+        // The board claims both, so neither is an orphan.
+        assert!(plan(Some(q35), &d, &[], false).is_ok());
+        assert!(
+            pflash_drives(BoardKind::Microvm, &BoardOptions::default(), &d).unwrap()[0].is_none()
+        );
+        assert!(plan(Some(BoardKind::Microvm), &d, &[], false).is_err());
+
+        let d = drives(Some(q35), &[&format!("if=none,id=code,file={code}")]).unwrap();
+        let mut m = QDict::new();
+        m.put("pflash0", "code");
+        let o = take_board_options(q35, &m).unwrap();
+        assert_eq!(o.pflash, [Some("code".to_string()), None]);
+        let f = pflash_drives(q35, &o, &d).unwrap();
+        assert_eq!(f[0].as_ref().unwrap().name, "code");
+        let e = pflash_drives(q35, &o, &[]).unwrap_err();
+        assert_eq!(e.1.message(), "Property 'cfi.pflash01.drive' can't find value 'code'");
+
+        let d = drives(
+            Some(q35),
+            &[&format!("if=none,id=code,file={code}"), &format!("if=pflash,file={code}")],
+        )
+        .unwrap();
+        assert_eq!(pflash_drives(q35, &o, &d).unwrap_err().1.message(), "clashes with -machine");
+        let d = drives(Some(q35), &["if=pflash,file=/nonexistent/ruvm.fd"]).unwrap();
+        let e = pflash_drives(q35, &BoardOptions::default(), &d).unwrap_err();
+        assert_eq!(
+            e.1.message(),
+            "Could not open '/nonexistent/ruvm.fd': No such file or directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

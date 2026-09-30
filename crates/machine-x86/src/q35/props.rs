@@ -31,7 +31,7 @@ pub enum SmbiosEntryPointType {
 pub struct Q35Props {
     /// `max-ram-below-4g`: 0 means 4 GiB.
     pub max_ram_below_4g: u64,
-    /// `max-fw-size`: only used by pflash, which is not modelled. Kept for its checks.
+    /// `max-fw-size`: the most the system flashes may hold together.
     pub max_fw_size: u64,
     /// `smm`, from the x86 machine.
     pub smm: OnOffAuto,
@@ -45,7 +45,7 @@ pub struct Q35Props {
     pub hpet: bool,
     /// `sata`: the ICH9 AHCI controller at 00:1f.2.
     pub sata: bool,
-    /// `smbus`: accepted, but the ICH9 SMBus controller is not modelled.
+    /// `smbus`: the ICH9 SMBus controller at 00:1f.3, with eight blank SPD EEPROMs.
     pub smbus: bool,
     /// `i8042`: the PS/2 controller, and with it port 0x92.
     pub i8042: bool,

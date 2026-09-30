@@ -153,10 +153,15 @@ fn spec(kind: BoardKind, firmware: FirmwareSearch) -> BoardSpec {
         pit_in_kernel: true,
         smm_available: false,
         phys_bits: 40,
+        cpu: Default::default(),
         bios: None,
+        pflash: [None, None],
+        uuid: None,
+        smbios: Default::default(),
+        topology: None,
         kernel: None,
         firmware,
-        serial_hd: true,
+        serial_hds: vec![true],
         clock: Clock::manual(ClockType::Virtual),
         rtc_clock: Clock::manual(ClockType::Host),
     }
@@ -172,7 +177,7 @@ fn builds_boards_with_firmware_from_the_search_path() {
     let (mut m, _) = build_board(spec(BoardKind::Microvm, fw.clone())).unwrap();
     assert_eq!(m.name(), "microvm");
     assert_eq!(m.apic_ids(), vec![0]);
-    assert!(m.serial().is_some());
+    assert!(m.serial(0).is_some() && m.serial(1).is_none());
     m.machine_done().unwrap();
 
     let (mut q, _) = build_board(spec(BoardKind::Q35, fw.clone())).unwrap();
