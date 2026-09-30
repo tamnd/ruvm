@@ -8,8 +8,8 @@
 //! displays. Options for things that build would leave out fail with QEMU's own messages.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use ruvm_base::report::{
     Location, current_location, error_report, push_location, report_error, warn_report,
@@ -17,6 +17,10 @@ use ruvm_base::report::{
 use ruvm_base::{Error, Result};
 use ruvm_chardev::Chardevs;
 use ruvm_chardev::opts::{chardev_opts, parse_compat};
+use ruvm_hostmem::region::RegionObjects;
+use ruvm_hw_core::machine::{MACHINES, machine_type_name};
+use ruvm_hw_core::{Machine, create_machine};
+use ruvm_mem::MemorySystem;
 use ruvm_monitor::Qmp;
 use ruvm_monitor::object::{TYPE_MONITOR_HMP, TYPE_MONITOR_QMP, monitor_compat_id, monitor_new};
 use ruvm_qapi::keyval::{keyval_parse, keyval_parse_into};
@@ -31,9 +35,6 @@ use crate::qmp_cmds::{self, object_options_dict};
 use crate::qtest::{self, VirtualClock};
 use crate::runstate::{Killed, Runstate};
 
-/// The machines this build has, `(name, description)`.
-const MACHINES: &[(&str, &str)] = &[("none", "empty machine")];
-
 /// The accelerators this build has. qtest is left out of `-accel help`, as in QEMU.
 const ACCELS: &[&str] = &["qtest"];
 
@@ -44,6 +45,10 @@ pub struct Vm {
     pub qmp: Arc<Qmp>,
     pub chardevs: Arc<Chardevs>,
     pub runstate: Arc<Runstate>,
+    /// The memory regions and the objects that stand for them.
+    pub regions: Arc<RegionObjects>,
+    /// `current_machine`, once `qemu_create_machine()` has run.
+    pub machine: OnceLock<Machine>,
     /// `qemu_name`, from `-name guest=...`.
     pub name: Option<String>,
     autostart: bool,
@@ -60,6 +65,13 @@ impl Vm {
             return Err(Error::generic(
                 "The command is permitted only before machine initialization",
             ));
+        }
+        // qemu_init_board() fails with error_fatal, even under x-exit-preconfig.
+        if let Some(m) = self.machine.get() {
+            if let Err(e) = m.run_board_init(&self.regions) {
+                report_error(&e);
+                std::process::exit(1);
+            }
         }
         self.qmp.set_machine_ready(true);
         if self.autostart {
@@ -148,6 +160,8 @@ struct Config {
     preconfig: bool,
     qtest: Option<String>,
     qtest_log: Option<String>,
+    /// `have_custom_ram_size`: `-machine memory.size` was given.
+    have_custom_ram_size: bool,
     exit_with_parent: bool,
     mon_deprecation_warned: bool,
 }
@@ -167,6 +181,7 @@ impl Config {
             preconfig: false,
             qtest: None,
             qtest_log: None,
+            have_custom_ram_size: false,
             exit_with_parent: false,
             mon_deprecation_warned: false,
         }
@@ -206,9 +221,17 @@ fn run(p: &Personality<'_>, args: &[String]) -> Flow<()> {
     let qmp = Qmp::new();
     let chardevs = Arc::new(Chardevs::new());
     ruvm_monitor::object::register_types(&registry, &qmp, &chardevs);
+    let regions = RegionObjects::new(Arc::new(MemorySystem::new()));
+    ruvm_hostmem::region::register_types(&registry);
+    ruvm_hostmem::register_types(&registry, &regions);
+    ruvm_hw_core::register_types(&registry);
+    qtest::register_types(&registry);
+    ruvm_chardev::qom::register_types(&registry);
+    chardevs.set_registry(&registry);
+    chardevs.hold();
     let mut cfg = Config::new();
     parse_options(p, &registry, args, &mut cfg)?;
-    let vm = start(p, Backends { registry, qmp, chardevs }, cfg)?;
+    let vm = start(p, Backends { registry, qmp, chardevs, regions }, cfg)?;
     main_loop(&vm.0);
     drop(vm.1);
     Ok(())
@@ -219,6 +242,7 @@ struct Backends {
     registry: Registry,
     qmp: Arc<Qmp>,
     chardevs: Arc<Chardevs>,
+    regions: Arc<RegionObjects>,
 }
 
 /// Backends that live as long as the machine.
@@ -382,8 +406,8 @@ fn object_option_parse(registry: &Registry, cfg: &mut Config, arg: &str) -> Flow
 fn machine_help(machine: &QDict) -> String {
     let mut out = String::from("Supported machines are:\n");
     let _ = machine;
-    for (name, desc) in MACHINES {
-        out.push_str(&format!("{name:<20} {desc}\n"));
+    for m in MACHINES {
+        out.push_str(&format!("{:<20} {}\n", m.name, m.desc));
     }
     out
 }
@@ -464,7 +488,8 @@ fn create_objects(vm: &Vm, cfg: &mut Config, pick: fn(&str) -> bool) -> Flow<()>
 }
 
 /// `select_machine()`: `none` is the only machine, and no target has it as its default.
-fn select_machine(cfg: &mut Config) -> Flow<()> {
+/// Returns the type name.
+fn select_machine(cfg: &mut Config) -> Flow<String> {
     let hint = "Use -machine help to list supported machines\n";
     let ty = match cfg.machine.get_str("type") {
         Some(ty) => ty.to_string(),
@@ -473,20 +498,40 @@ fn select_machine(cfg: &mut Config) -> Flow<()> {
             return Err(fail(&e));
         }
     };
-    if !MACHINES.iter().any(|(name, _)| *name == ty) {
+    if !MACHINES.iter().any(|m| m.name == ty) {
         let e = Error::generic(format!("unsupported machine type: \"{ty}\"")).hint(hint);
         return Err(fail(&e));
     }
     cfg.machine.remove("type");
-    // qemu_apply_legacy_machine_options()
+    Ok(machine_type_name(&ty))
+}
+
+/// `qemu_apply_legacy_machine_options()` and `qemu_apply_machine_options()`. Gives the id of
+/// `memory-backend`, which is looked up once the late backends exist.
+fn apply_machine_options(machine: &Machine, cfg: &mut Config) -> Flow<Option<String>> {
     if let Some(accel) = cfg.machine.get_str("accel") {
         cfg.accelerators = Some(accel.to_string());
         cfg.machine.remove("accel");
     }
-    if let Some((key, _)) = cfg.machine.iter().next() {
-        return Err(fail_msg(&format!("Property 'none-machine.{key}' not found")));
+    let memdev = cfg.machine.get_str("memory-backend").map(str::to_string);
+    cfg.machine.remove("memory-backend");
+    cfg.have_custom_ram_size =
+        matches!(cfg.machine.get("memory"), Some(QValue::Dict(d)) if d.get("size").is_some());
+    machine.object.set_props_from_keyval(&cfg.machine, false).map_err(|e| fail(&e))?;
+    Ok(memdev)
+}
+
+/// `qemu_resolve_machine_memdev()`.
+fn resolve_machine_memdev(vm: &Vm, machine: &Machine, cfg: &Config, id: &str) -> Flow<()> {
+    let (backend, _) = vm.registry.resolve_path_type(id, "memory-backend");
+    let Some(backend) = backend else {
+        return Err(fail_msg(&format!("Memory backend '{id}' not found")));
+    };
+    if !cfg.have_custom_ram_size {
+        let size = backend.property_get_uint("size").map_err(|e| fail(&e))?;
+        machine.set_ram_size(size);
     }
-    Ok(())
+    machine.object.property_set_link("memory-backend", Some(&backend)).map_err(|e| fail(&e))
 }
 
 /// `configure_accelerators()`.
@@ -555,7 +600,7 @@ fn monitor_new_opts(registry: &Registry, cfg: &Config, handle: OptsHandle) -> Re
 
 /// The part of `qemu_init()` after the option loop.
 fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Keep)> {
-    let Backends { registry, qmp, chardevs } = b;
+    let Backends { registry, qmp, chardevs, regions } = b;
     let runstate = Runstate::new(qmp.clone());
     let name = cfg.name.iter().next().and_then(|o| o.get("guest")).map(str::to_string);
     let vm = Arc::new(Vm {
@@ -563,6 +608,8 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         qmp: qmp.clone(),
         chardevs: chardevs.clone(),
         runstate: runstate.clone(),
+        regions,
+        machine: OnceLock::new(),
         name,
         autostart: cfg.autostart,
         machine_initialized: AtomicBool::new(false),
@@ -588,7 +635,9 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         }
     }
 
-    select_machine(&mut cfg)?;
+    let typename = select_machine(&mut cfg)?;
+    let machine = create_machine(&vm.registry, &typename, &vm.regions).map_err(|e| fail(&e))?;
+    let machine = vm.machine.get_or_init(|| machine);
 
     // qemu_create_early_backends()
     create_objects(&vm, &mut cfg, object_create_early)?;
@@ -603,6 +652,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         }
     }
 
+    let memdev = apply_machine_options(machine, &mut cfg)?;
     configure_accelerators(&mut cfg)?;
     let clock = Arc::new(VirtualClock::default());
     if cfg.qtest.is_some() {
@@ -614,9 +664,16 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     // qemu_create_late_backends()
     let qtest = match &cfg.qtest {
         Some(chrdev) => {
-            let a =
-                qtest::server_init(&chardevs, chrdev, cfg.qtest_log.as_deref(), p.target, clock)
-                    .map_err(|e| fail(&e))?;
+            let a = qtest::server_init(
+                &chardevs,
+                chrdev,
+                cfg.qtest_log.as_deref(),
+                p.target,
+                clock,
+                machine,
+            )
+            .map_err(|e| fail(&e))?;
+            qtest::add_object(&machine.object, cfg.qtest_log.as_deref()).map_err(|e| fail(&e))?;
             Some(a)
         }
         None => None,
@@ -628,11 +685,17 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         monitor_new_opts(&vm.registry, &cfg, h).map_err(|e| fail(&e))?;
     }
 
+    if let Some(id) = &memdev {
+        resolve_machine_memdev(&vm, machine, &cfg, id)?;
+    }
+
     if cfg.preconfig {
         qmp.set_machine_ready(false);
     } else {
         vm.exit_preconfig().map_err(|e| fail(&e))?;
     }
+    // The main loop starts here, and with it the frontends.
+    chardevs.release();
     Ok((vm, Keep { _qtest: qtest }))
 }
 

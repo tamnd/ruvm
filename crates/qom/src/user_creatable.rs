@@ -40,7 +40,7 @@ fn uc_class(obj: &Object) -> Option<Arc<UserCreatableClass>> {
 }
 
 /// `user_creatable_complete()`.
-pub(crate) fn user_creatable_complete(obj: &Object) -> Result<()> {
+pub fn user_creatable_complete(obj: &Object) -> Result<()> {
     match uc_class(obj).and_then(|c| c.complete.clone()) {
         Some(f) => f(obj),
         None => Ok(()),

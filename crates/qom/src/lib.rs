@@ -39,7 +39,7 @@ pub use property::{
     Resolver, StrGetter, StrSetter, Tm, TmGetter,
 };
 pub use types::{ClassHook, InstanceHook, Registry, TypeInfo};
-pub use user_creatable::UserCreatableClass;
+pub use user_creatable::{UserCreatableClass, user_creatable_complete};
 
 /// `TYPE_OBJECT`, the root of every instantiable type.
 pub const TYPE_OBJECT: &str = "object";

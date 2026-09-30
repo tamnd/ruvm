@@ -20,7 +20,10 @@ use std::time::Duration;
 
 use ruvm_base::report::info_report;
 use ruvm_base::{Error, Result};
-use ruvm_qapi::types::{ChardevSocket, SocketAddressLegacyU};
+use ruvm_qapi::types::{
+    ChardevSocket, InetSocketAddress, SocketAddress, SocketAddressLegacyU, SocketAddressU,
+    UnixSocketAddress,
+};
 
 use crate::conn::{Connection, POLL_INTERVAL, Stream};
 
@@ -342,6 +345,34 @@ impl SocketChardev {
                 format!("disconnected:{}:{host}:{port}{server}", self.protocol())
             }
         }
+    }
+
+    /// The `addr` property: where a server listens, or what a client connects to.
+    pub fn address(&self) -> SocketAddress {
+        let u = match &self.addr {
+            #[cfg(unix)]
+            // `abstract` and `tight` only exist on Linux.
+            #[allow(clippy::needless_update)]
+            Addr::Unix(path) => SocketAddressU::Unix(UnixSocketAddress {
+                path: path.display().to_string(),
+                ..Default::default()
+            }),
+            Addr::Inet { host, port } => {
+                // socket_sockaddr_to_address_inet() says which family the listener is on.
+                let ip = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>();
+                let local = |v4: bool| {
+                    (self.listen && ip.as_ref().is_ok_and(|ip| ip.is_ipv4() == v4)).then_some(true)
+                };
+                SocketAddressU::Inet(InetSocketAddress {
+                    host: host.clone(),
+                    port: port.clone(),
+                    ipv4: local(true),
+                    ipv6: local(false),
+                    ..Default::default()
+                })
+            }
+        };
+        SocketAddress { u }
     }
 
     /// Whether a client is connected, the `connected` property.

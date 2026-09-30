@@ -65,7 +65,10 @@ fn help_options() {
     let (code, out, _) = system(&["-object", "help"]);
     assert_eq!(
         (code, out.as_str()),
-        (0, "List of user creatable objects:\n  monitor-hmp\n  monitor-qmp\n")
+        (
+            0,
+            "List of user creatable objects:\n  memory-backend-ram\n  monitor-hmp\n  monitor-qmp\n  qtest\n"
+        )
     );
     let (code, out, _) = system(&["-display", "help"]);
     assert_eq!(code, 0);

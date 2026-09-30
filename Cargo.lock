@@ -347,6 +347,7 @@ dependencies = [
  "rustix",
  "ruvm-base",
  "ruvm-qapi",
+ "ruvm-qom",
 ]
 
 [[package]]
@@ -384,6 +385,12 @@ version = "0.1.5"
 [[package]]
 name = "ruvm-hostmem"
 version = "0.1.5"
+dependencies = [
+ "ruvm-base",
+ "ruvm-mem",
+ "ruvm-qapi",
+ "ruvm-qom",
+]
 
 [[package]]
 name = "ruvm-hw-acpi"
@@ -400,6 +407,13 @@ version = "0.1.5"
 [[package]]
 name = "ruvm-hw-core"
 version = "0.1.5"
+dependencies = [
+ "ruvm-base",
+ "ruvm-hostmem",
+ "ruvm-mem",
+ "ruvm-qapi",
+ "ruvm-qom",
+]
 
 [[package]]
 name = "ruvm-hw-cxl"
@@ -634,6 +648,9 @@ dependencies = [
  "ruvm-accel-qtest",
  "ruvm-base",
  "ruvm-chardev",
+ "ruvm-hostmem",
+ "ruvm-hw-core",
+ "ruvm-mem",
  "ruvm-monitor",
  "ruvm-qapi",
  "ruvm-qapi-gen",
