@@ -14,6 +14,11 @@ publish = false
 unsafe-budget = 0
 
 [dependencies]
+ruvm-base.workspace = true
+ruvm-hw-acpi.workspace = true
+ruvm-hw-core.workspace = true
+ruvm-hw-pci.workspace = true
+ruvm-mem.workspace = true
 
 [lints]
 workspace = true
