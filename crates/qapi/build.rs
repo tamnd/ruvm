@@ -139,4 +139,9 @@ fn main() {
     let out =
         Path::new(&std::env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("qapi-types.rs");
     std::fs::write(out, types).expect("write the types");
+    let dir = Path::new(&std::env::var("OUT_DIR").expect("cargo sets OUT_DIR")).to_path_buf();
+    let commands = ruvm_qapi_gen::rust::gen_commands(&schema, &is_set);
+    std::fs::write(dir.join("qapi-commands.rs"), commands).expect("write the commands");
+    let events = ruvm_qapi_gen::rust::gen_events(&schema, &is_set);
+    std::fs::write(dir.join("qapi-events.rs"), events).expect("write the events");
 }
