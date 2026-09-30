@@ -14,6 +14,27 @@ publish = false
 unsafe-budget = 0
 
 [dependencies]
+aes.workspace = true
+cast5.workspace = true
+cipher.workspace = true
+des.workspace = true
+digest.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+md-5.workspace = true
+ripemd.workspace = true
+ruvm-base.workspace = true
+ruvm-qapi.workspace = true
+ruvm-qom.workspace = true
+serpent.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+sm3.workspace = true
+sm4.workspace = true
+twofish.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
