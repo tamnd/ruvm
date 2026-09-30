@@ -15,10 +15,16 @@ unsafe-budget = 0
 
 [dependencies]
 ruvm-base.workspace = true
+ruvm-firmware.workspace = true
 ruvm-hw-acpi.workspace = true
+ruvm-hw-char.workspace = true
 ruvm-hw-core.workspace = true
+ruvm-hw-intc.workspace = true
 ruvm-hw-pci.workspace = true
+ruvm-hw-timer.workspace = true
+ruvm-hw-virtio.workspace = true
 ruvm-mem.workspace = true
+ruvm-virtio-queue.workspace = true
 
 [lints]
 workspace = true

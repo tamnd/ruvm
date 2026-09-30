@@ -642,10 +642,16 @@ name = "ruvm-machine-x86"
 version = "0.2.1"
 dependencies = [
  "ruvm-base",
+ "ruvm-firmware",
  "ruvm-hw-acpi",
+ "ruvm-hw-char",
  "ruvm-hw-core",
+ "ruvm-hw-intc",
  "ruvm-hw-pci",
+ "ruvm-hw-timer",
+ "ruvm-hw-virtio",
  "ruvm-mem",
+ "ruvm-virtio-queue",
 ]
 
 [[package]]
