@@ -1,0 +1,19 @@
+[package]
+name = "ruvm-sys"
+description = "Thin host bindings ruvm needs that no existing crate covers: newer KVM ioctls, Hypervisor.framework, WHPX, MSHV, iommufd, guest_memfd and MAP_JIT."
+license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[package.metadata.ruvm]
+unsafe-budget = 0
+
+[dependencies]
+
+[lints]
+workspace = true

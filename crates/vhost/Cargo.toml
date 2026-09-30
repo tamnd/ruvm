@@ -1,0 +1,19 @@
+[package]
+name = "ruvm-vhost"
+description = "The vhost kernel interface, the vhost-user protocol, vhost-vdpa and VDUSE plumbing."
+license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[package.metadata.ruvm]
+unsafe-budget = 0
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "ruvm-hw-ssi"
+description = "SPI and SSI controllers and flash devices."
+license = "GPL-2.0-or-later"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[package.metadata.ruvm]
+unsafe-budget = 0
+
+[dependencies]
+
+[lints]
+workspace = true

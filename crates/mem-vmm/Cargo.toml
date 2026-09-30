@@ -1,0 +1,19 @@
+[package]
+name = "ruvm-mem-vmm"
+description = "An adapter implementing rust-vmm's vm-memory traits over ruvm address spaces."
+license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[package.metadata.ruvm]
+unsafe-budget = 0
+
+[dependencies]
+
+[lints]
+workspace = true

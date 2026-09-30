@@ -1,0 +1,19 @@
+[package]
+name = "ruvm-hw-core"
+description = "The qdev equivalent: devices, buses, properties, GPIO and IRQ lines, clocks, reset, hotplug and lock domains."
+license = "GPL-2.0-or-later"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[package.metadata.ruvm]
+unsafe-budget = 0
+
+[dependencies]
+
+[lints]
+workspace = true

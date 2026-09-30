@@ -1,0 +1,23 @@
+[package]
+name = "ruvm-cli"
+description = "The ruvm multi-call binary, answering to every QEMU binary name."
+license = "GPL-2.0-or-later"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "ruvm"
+path = "src/main.rs"
+
+[package.metadata.ruvm]
+unsafe-budget = 0
+
+[dependencies]
+
+[lints]
+workspace = true

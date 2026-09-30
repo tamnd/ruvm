@@ -1,0 +1,9 @@
+# `cargo xtask <task>` rather than `cargo run -p xtask -- <task>`.
+[alias]
+xtask = "run --quiet --package xtask --"
+
+# Release archives are checked for reproducibility by building twice and comparing. Anything that
+# embeds a build time reads SOURCE_DATE_EPOCH when it is set, so setting it here makes every build
+# comparable and not only the two CI runs.
+[env]
+SOURCE_DATE_EPOCH = "1"
