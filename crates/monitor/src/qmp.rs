@@ -24,6 +24,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use ruvm_base::{Error, ErrorClass, Result};
+use ruvm_chardev::{Connection, Frontend};
 use ruvm_qapi::dispatch::{
     DispatchEnv, QmpCommandList, qmp_dispatch, qmp_error_response, qmp_is_oob,
 };
@@ -337,8 +338,19 @@ impl MonitorQmp {
     pub fn serve_unix(&self, stream: UnixStream) -> io::Result<()> {
         let writer = Box::new(stream.try_clone()?);
         self.serve_with(writer, |buf| {
-            let (n, fds) = recv_with_fds(&stream, buf)?;
+            let (n, fds) = ruvm_chardev::conn::recv_with_fds(&stream, buf)?;
             self.set_msgfds(fds);
+            Ok(n)
+        })
+    }
+
+    /// Serves one client of a chardev the monitor is attached to.
+    pub fn serve_conn(&self, conn: &mut Connection) -> io::Result<()> {
+        let writer = conn.writer()?;
+        self.serve_with(writer, |buf| {
+            let n = conn.recv(buf)?;
+            #[cfg(unix)]
+            self.set_msgfds(conn.take_fds());
             Ok(n)
         })
     }
@@ -371,38 +383,10 @@ impl MonitorQmp {
     }
 }
 
-/// `TCP_MAX_FDS`: how many descriptors one read takes. More than that are dropped by the
-/// kernel with MSG_CTRUNC set, as in QEMU.
-#[cfg(unix)]
-const TCP_MAX_FDS: usize = 16;
-
-/// One `recvmsg()` that keeps the descriptors that came with the bytes, close on exec.
-#[cfg(unix)]
-fn recv_with_fds(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
-    use std::mem::MaybeUninit;
-
-    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
-
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(TCP_MAX_FDS))];
-    let mut control = RecvAncillaryBuffer::new(&mut space);
-    #[cfg(not(target_vendor = "apple"))]
-    let flags = RecvFlags::CMSG_CLOEXEC;
-    #[cfg(target_vendor = "apple")]
-    let flags = RecvFlags::empty();
-    let msg = recvmsg(stream, &mut [io::IoSliceMut::new(buf)], &mut control, flags)?;
-    let mut fds = Vec::new();
-    for m in control.drain() {
-        if let RecvAncillaryMessage::ScmRights(received) = m {
-            fds.extend(received);
-        }
+impl Frontend for MonitorQmp {
+    fn serve(&self, conn: &mut Connection) -> io::Result<()> {
+        self.serve_conn(conn)
     }
-    // Without MSG_CMSG_CLOEXEC the flag is set right after, as qio_channel_socket_copy_fds()
-    // does on such hosts.
-    #[cfg(target_vendor = "apple")]
-    for fd in &fds {
-        rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC)?;
-    }
-    Ok((msg.bytes, fds))
 }
 
 struct Monitors {
