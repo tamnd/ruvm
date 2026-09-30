@@ -15,6 +15,7 @@ use ruvm_base::report::{
     Location, current_location, error_report, push_location, report_error, warn_report,
 };
 use ruvm_base::{Error, Result};
+use ruvm_block::BlockGraph;
 use ruvm_chardev::Chardevs;
 use ruvm_chardev::opts::{chardev_opts, parse_compat};
 use ruvm_hostmem::region::RegionObjects;
@@ -47,6 +48,8 @@ pub struct Vm {
     pub runstate: Arc<Runstate>,
     /// The memory regions and the objects that stand for them.
     pub regions: Arc<RegionObjects>,
+    /// The block graph `blockdev-add` builds.
+    pub block: BlockGraph,
     /// `current_machine`, once `qemu_create_machine()` has run.
     pub machine: OnceLock<Machine>,
     /// `qemu_name`, from `-name guest=...`.
@@ -609,6 +612,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         chardevs: chardevs.clone(),
         runstate: runstate.clone(),
         regions,
+        block: BlockGraph::new(),
         machine: OnceLock::new(),
         name,
         autostart: cfg.autostart,
