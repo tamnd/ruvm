@@ -19,7 +19,7 @@ ruvm-qapi.workspace = true
 ruvm-qom.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-rustix.workspace = true
+rustix = { workspace = true, features = ["event", "pty", "termios"] }
 
 [lints]
 workspace = true

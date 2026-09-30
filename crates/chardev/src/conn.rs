@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! One client connection of a chardev, what `QIOChannelSocket` is to char-socket.c.
+//! One client connection of a chardev, what `QIOChannelSocket` is to char-socket.c. The
+//! backends that are not sockets hand their frontend a connection too, one that reads what the
+//! backend has for it and writes through the chardev.
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -11,6 +13,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use crate::Chardev;
 
 /// How often a blocked read looks at the stop flag. Detaching a frontend waits at most this long
 /// for the reader to notice.
@@ -26,6 +30,31 @@ pub(crate) enum Stream {
     #[cfg(unix)]
     Unix(UnixStream),
     Tcp(TcpStream),
+    /// A chardev that is not a socket, and which of its inputs to read.
+    Local(Arc<Chardev>, Port),
+}
+
+/// Which input of a chardev a local connection reads: the frontend's slot on a mux and the
+/// session of the mux's backend it belongs to. Other chardevs have one input and ignore this.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Port {
+    pub(crate) tag: usize,
+    pub(crate) session: u64,
+}
+
+/// Writes through a chardev, `qemu_chr_fe_write_all()`.
+#[derive(Debug)]
+struct ChrWriter(Arc<Chardev>);
+
+impl Write for ChrWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Stream {
@@ -34,6 +63,7 @@ impl Stream {
             #[cfg(unix)]
             Stream::Unix(s) => Stream::Unix(s.try_clone()?),
             Stream::Tcp(s) => Stream::Tcp(s.try_clone()?),
+            Stream::Local(c, p) => Stream::Local(c.clone(), *p),
         })
     }
 
@@ -43,6 +73,7 @@ impl Stream {
             #[cfg(unix)]
             Stream::Unix(s) => s.shutdown(Shutdown::Both),
             Stream::Tcp(s) => s.shutdown(Shutdown::Both),
+            Stream::Local(..) => Ok(()),
         };
     }
 
@@ -51,6 +82,8 @@ impl Stream {
             #[cfg(unix)]
             Stream::Unix(s) => s.set_read_timeout(t),
             Stream::Tcp(s) => s.set_read_timeout(t),
+            // Local reads never wait longer than POLL_INTERVAL.
+            Stream::Local(..) => Ok(()),
         }
     }
 
@@ -59,7 +92,18 @@ impl Stream {
             #[cfg(unix)]
             Stream::Unix(s) => Box::new(s),
             Stream::Tcp(s) => Box::new(s),
+            Stream::Local(c, _) => Box::new(ChrWriter(c)),
         })
+    }
+
+    /// One write to the peer, for `qemu_chr_write()` on a socket chardev.
+    pub(crate) fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => (&*s).write(buf),
+            Stream::Tcp(s) => (&*s).write(buf),
+            Stream::Local(c, _) => c.write(buf),
+        }
     }
 }
 
@@ -133,6 +177,7 @@ impl Connection {
                 Ok(n)
             }
             Stream::Tcp(s) => s.read(buf),
+            Stream::Local(c, port) => c.read_input(*port, buf),
         }
     }
 

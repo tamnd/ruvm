@@ -313,6 +313,7 @@ impl SocketChardev {
                 let server = if self.listen { ",server=on" } else { "" };
                 format!("{}:{}{server} <-> {}", self.protocol(), fmt(local), fmt(remote))
             }
+            Stream::Local(..) => unreachable!("sockets only make socket streams"),
         };
         let mut st = lock(&self.state);
         st.conn = Some(stream);
@@ -429,6 +430,14 @@ impl SocketChardev {
             if self.connected(stream).is_err() {
                 self.disconnected();
             }
+        }
+    }
+
+    /// `tcp_chr_write()`: what nobody is connected to hear is dropped.
+    pub(crate) fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        match &lock(&self.state).conn {
+            Some(s) => s.write(buf),
+            None => Ok(buf.len()),
         }
     }
 

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use ruvm_chardev::Chardevs;
-use ruvm_chardev::opts::{chardev_opts, parse_compat, parse_opts};
+use ruvm_chardev::opts::{
+    NographicDefaults, chardev_opts, nographic_defaults, parse_compat, parse_opts,
+};
 use ruvm_qapi::opts::QemuOptsList;
 use ruvm_qapi::types::{ChardevBackend, ChardevBackendU, ChardevSocket, SocketAddressLegacyU};
 
@@ -49,7 +51,10 @@ fn bad_options() {
         ("nope,id=a", "'nope' is not a valid char driver name"),
         ("null,id=a,cols=80", "chardev 'a' does not support size options"),
         ("null,id=a,encoding=utf8", "chardev 'a' does not support encoding option"),
-        ("file,id=a,path=x", "chardev backend 'file' is not supported by ruvm yet"),
+        ("udp,id=a,host=x,port=1", "chardev backend 'udp' is not supported by ruvm yet"),
+        ("file,id=a", "chardev: file: no filename given"),
+        ("pipe,id=a", "chardev: pipe: no device path given"),
+        ("mux,id=a", "chardev: mux: no chardev given"),
         ("socket,id=a,path=x,host=y", "None or one of 'path', 'fd' or 'host' option required."),
         ("socket,id=a,host=y", "chardev: socket: no port given"),
         ("socket,id=a,path=x,delay=on,nodelay=on", "'delay' and 'nodelay' are mutually exclusive"),
@@ -131,6 +136,96 @@ fn new_from_opts() {
     let opts = list.parse("null", true).unwrap();
     assert_eq!(chardevs.new_from_opts(opts).unwrap_err().message(), "chardev: no id specified");
     let opts = list.parse("null,id=m,mux=on", true).unwrap();
-    let e = chardevs.new_from_opts(opts).unwrap_err();
-    assert_eq!(e.message(), "chardev backend 'mux' is not supported by ruvm yet");
+    let chr = chardevs.new_from_opts(opts).unwrap().unwrap();
+    assert!(chr.is_mux());
+    assert_eq!(chr.mux_base().unwrap().label(), "m-base");
+    let labels: Vec<String> = chardevs.query().into_iter().map(|i| i.label).collect();
+    assert_eq!(labels, ["m", "m-base", "n0"]);
+    assert_eq!(chardevs.query()[0].filename, "mux");
+}
+
+#[test]
+fn backend_options() {
+    let backend = |params: &str| parse(params).unwrap().u;
+    match backend("file,id=f,path=/tmp/out,append=on") {
+        ChardevBackendU::File(f) => {
+            assert_eq!(
+                (f.data.out.as_str(), f.data.in_, f.data.append),
+                ("/tmp/out", None, Some(true))
+            );
+        }
+        _ => panic!("not a file"),
+    }
+    #[cfg(unix)]
+    match backend("file,id=f,path=o,input-path=i") {
+        ChardevBackendU::File(f) => {
+            assert_eq!((f.data.in_.as_deref(), f.data.append), (Some("i"), Some(false)));
+        }
+        _ => panic!("not a file"),
+    }
+    #[cfg(windows)]
+    assert_eq!(
+        parse("file,id=f,path=o,input-path=i").unwrap_err(),
+        "chardev: file: input-path not supported on Windows"
+    );
+    match backend("pipe,id=p,path=/tmp/p") {
+        ChardevBackendU::Pipe(p) => assert_eq!(p.data.device, "/tmp/p"),
+        _ => panic!("not a pipe"),
+    }
+    match backend("stdio,id=s") {
+        ChardevBackendU::Stdio(s) => assert_eq!(s.data.signal, Some(true)),
+        _ => panic!("not stdio"),
+    }
+    match backend("stdio,id=s,signal=off") {
+        ChardevBackendU::Stdio(s) => assert_eq!(s.data.signal, Some(false)),
+        _ => panic!("not stdio"),
+    }
+    match backend("ringbuf,id=r") {
+        ChardevBackendU::Ringbuf(r) => assert_eq!(r.data.size, None),
+        _ => panic!("not a ringbuf"),
+    }
+    match backend("memory,id=r,size=1k") {
+        ChardevBackendU::Memory(r) => assert_eq!(r.data.size, Some(1024)),
+        _ => panic!("not memory"),
+    }
+    match backend("mux,id=m,chardev=base") {
+        ChardevBackendU::Mux(m) => assert_eq!(m.data.chardev, "base"),
+        _ => panic!("not a mux"),
+    }
+    #[cfg(unix)]
+    match backend("pty,id=p,path=/tmp/link") {
+        ChardevBackendU::Pty(p) => assert_eq!(p.data.path.as_deref(), Some("/tmp/link")),
+        _ => panic!("not a pty"),
+    }
+}
+
+#[test]
+fn compat_backends() {
+    for (filename, want) in [
+        ("stdio", &[("backend", "stdio")][..]),
+        ("pty", &[("backend", "pty")]),
+        ("pty:/tmp/link", &[("backend", "pty"), ("path", "/tmp/link")]),
+        ("pipe:/tmp/p", &[("backend", "pipe"), ("path", "/tmp/p")]),
+        ("mon:tcp::4444", &[("mux", "on"), ("backend", "socket"), ("host", ""), ("port", "4444")]),
+        ("vc", &[("backend", "vc")]),
+    ] {
+        assert_eq!(compat(filename).unwrap(), pairs(want), "{filename}");
+    }
+}
+
+#[test]
+fn nographic() {
+    let d = |s, m, p| nographic_defaults(s, m, p);
+    assert_eq!(
+        d(true, true, true),
+        NographicDefaults { serial: Some("mon:stdio"), monitor: None, parallel: Some("null") }
+    );
+    assert_eq!(
+        d(true, false, false),
+        NographicDefaults { serial: Some("stdio"), monitor: None, parallel: None }
+    );
+    assert_eq!(
+        d(false, true, false),
+        NographicDefaults { serial: None, monitor: Some("stdio"), parallel: None }
+    );
 }
