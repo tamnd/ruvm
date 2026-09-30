@@ -1,0 +1,178 @@
+# The per-commit gate. Everything here is required to merge, through the single `ci` job at the
+# bottom.
+#
+# The matrix is the four hosts M0 promises in spec/23-milestones.md: Linux x86-64, Linux AArch64,
+# macOS AArch64 and Windows x86-64. The conformance suites from spec/22-testing.md are not here
+# yet, because there is no emulator for them to run against, and a job that is red because the
+# thing it calls does not exist teaches everyone to ignore a red run.
+#
+# Actions are pinned to a commit hash, with the version beside it as a comment. A tag is a moving
+# reference that whoever controls the action can repoint, and a workflow that runs with a token
+# should not run code nobody reviewed. Dependabot is what moves the pins, one pull request at a time.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+# A force-push cancels the run it replaced. The default branch is exempt, because a main-branch run
+# is what the badge and the bisect history read from.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  # Cheapest checks first, so a formatting mistake costs seconds rather than a full matrix.
+  quick:
+    name: format, lints and house rules
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      # spec/24-workspace-layout.md: a crate may depend on its own layer or below, never above.
+      - name: layer rule
+        run: cargo xtask layers
+      # A permissive crate that links a GPL crate is a GPL crate, whatever its manifest says.
+      - name: license provenance
+        run: cargo xtask provenance
+      - name: unsafe budgets
+        run: cargo xtask unsafe-audit
+      - name: prose style
+        run: cargo xtask style
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets
+
+  test:
+    name: test on ${{ matrix.name }}
+    needs: quick
+    runs-on: ${{ matrix.os }}
+    # Runner images are named explicitly rather than through `-latest`, so that an image rollout
+    # shows up as a commit rather than as yesterday's green run turning red.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux x86-64, debug
+            os: ubuntu-24.04
+            profile: dev
+          - name: linux x86-64, release
+            os: ubuntu-24.04
+            profile: release
+          - name: linux aarch64
+            os: ubuntu-24.04-arm
+            profile: dev
+          - name: macos aarch64
+            os: macos-26
+            profile: dev
+          - name: windows x86-64
+            os: windows-2025
+            profile: dev
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.profile }}
+      - name: cargo build
+        run: cargo build --workspace --profile ${{ matrix.profile }}
+      - name: cargo test
+        run: cargo test --workspace --profile ${{ matrix.profile }}
+
+  docs:
+    name: documentation
+    needs: quick
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
+
+  msrv:
+    name: minimum supported rust version
+    needs: quick
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: read the floor from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          v=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: install
+        run: rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: msrv
+      # Distributions build QEMU with the compiler they ship, and ruvm has to be buildable the
+      # same way. The floor is raised deliberately, in a commit, and not by a dependency bump.
+      - name: cargo check
+        run: cargo +"${{ steps.msrv.outputs.version }}" check --workspace
+
+  audit:
+    name: supply chain
+    needs: quick
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny
+      # Licenses, advisories, banned crates and unknown registries, all configured in deny.toml.
+      - name: cargo deny
+        run: cargo deny check
+
+  # The workflows themselves are code that runs with a token, so they get linted like code.
+  # actionlint catches mistakes in expressions and job graphs, and zizmor catches the security
+  # ones: template injection, unpinned actions and credentials left on disk.
+  workflows:
+    name: workflow lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: actionlint,zizmor
+      - name: actionlint
+        run: actionlint
+      - name: zizmor
+        run: zizmor --min-severity medium .github/workflows
+
+  # A single required check, so branch protection does not have to list every job above.
+  ci:
+    name: ci
+    if: always()
+    needs: [quick, test, docs, msrv, audit, workflows]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: fail if anything upstream failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - name: pass
+        run: echo "all required jobs succeeded"
