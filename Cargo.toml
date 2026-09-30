@@ -147,7 +147,7 @@ sha1 = "0.10.6"
 sha2 = "0.10.9"
 sm3 = "0.4.2"
 sm4 = "0.5.1"
-syn = { version = "2.0.110", default-features = false, features = ["full", "visit", "parsing"] }
+syn = { version = "3.0.6", default-features = false, features = ["full", "visit", "parsing"] }
 toml = "1.1.6"
 twofish = "0.7.1"
 vmm-sys-util = "0.15"
