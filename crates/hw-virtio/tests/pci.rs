@@ -13,12 +13,13 @@ use std::sync::{Arc, Mutex};
 use ruvm_hw_pci::regs::*;
 use ruvm_hw_pci::{PciBridge, PciBus, PciDeviceInfo, PciHostState, pci_swizzle_map_irq_fn};
 use ruvm_hw_virtio::blk::*;
+use ruvm_hw_virtio::net::{VIRTIO_NET_DEFAULT_HOST_FEATURES, VIRTIO_NET_F_MQ};
 use ruvm_hw_virtio::pci::*;
 use ruvm_hw_virtio::virtio::*;
 use ruvm_hw_virtio::{
-    AddressSpaceMemory, EntropySource, MemBlockBackend, VirtioBackend, VirtioBlk, VirtioBlkConf,
-    VirtioConsole, VirtioDeviceClass, VirtioPci, VirtioPciProps, VirtioPciVariant, VirtioRng,
-    VirtioRngConf,
+    AddressSpaceMemory, EntropySource, MemBlockBackend, RecordingBalloonBackend, VirtioBackend,
+    VirtioBalloon, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass, VirtioNet,
+    VirtioNetConf, VirtioPci, VirtioPciProps, VirtioPciVariant, VirtioRng, VirtioRngConf,
 };
 use ruvm_mem::{AddressSpace, Endian, MemTxAttrs, MemorySystem};
 
@@ -1013,4 +1014,64 @@ fn pcie_port_is_modern_only() {
         .unwrap();
     assert!(vp.is_legacy() && vp.is_modern());
     assert!(vp.pci_dev().bar_info(0).is_some_and(|b| b.size == 32));
+}
+
+fn net(pairs: u32) -> Box<dyn VirtioDeviceClass> {
+    let conf = VirtioNetConf {
+        queue_pairs: pairs,
+        host_features: VIRTIO_NET_DEFAULT_HOST_FEATURES | feature(VIRTIO_NET_F_MQ),
+        ..VirtioNetConf::default()
+    };
+    Box::new(VirtioNet::new(conf, None))
+}
+
+fn balloon() -> Box<dyn VirtioDeviceClass> {
+    Box::new(VirtioBalloon::new(RAM_SIZE, Box::new(RecordingBalloonBackend::new())))
+}
+
+#[test]
+fn net_and_balloon_ids_and_vectors() {
+    let m = Machine::new(true);
+    let vp = m.plug(net(1), &VirtioPciProps::default());
+    assert_eq!(m.cfg_read(PCI_DEVICE_ID as u8, 2), u32::from(PCI_DEVICE_ID_VIRTIO_NET));
+    assert_eq!(m.cfg_read(PCI_CLASS_DEVICE as u8, 2), u32::from(PCI_CLASS_NETWORK_ETHERNET));
+    assert_eq!(m.cfg_read(PCI_SUBSYSTEM_ID as u8, 2), 1);
+    // 2 * queue pairs + 2.
+    assert_eq!(vp.nvectors(), 4);
+
+    let m = Machine::new(true);
+    let vp = m.plug(balloon(), &VirtioPciProps::default());
+    assert_eq!(m.cfg_read(PCI_DEVICE_ID as u8, 2), u32::from(PCI_DEVICE_ID_VIRTIO_BALLOON));
+    assert_eq!(m.cfg_read(PCI_CLASS_DEVICE as u8, 2), u32::from(PCI_CLASS_OTHERS));
+    assert_eq!(m.cfg_read(PCI_SUBSYSTEM_ID as u8, 2), 5);
+    assert_eq!(vp.nvectors(), 2);
+    assert_eq!(TYPE_VIRTIO_NET_PCI, "virtio-net-pci");
+    assert_eq!(TYPE_VIRTIO_BALLOON_PCI, "virtio-balloon-pci");
+}
+
+/// The queues a multiqueue virtio-net shows through the common config.
+#[test]
+fn net_multiqueue_on_pci() {
+    let m = Machine::new(true);
+    let vp = m.plug(net(4), &VirtioPciProps::default());
+    assert_eq!(vp.nvectors(), 10);
+    let mut d = Modern::new(m, vp);
+    assert_eq!(d.cr(VIRTIO_PCI_COMMON_NUMQ, 2), 3);
+    let f = d.negotiate(wanted());
+    assert!(has_feature(f, VIRTIO_NET_F_MQ));
+    assert_eq!(d.cr(VIRTIO_PCI_COMMON_NUMQ, 2), 9);
+    let ctrl = d.setup_queue(8);
+    assert_eq!(ctrl.size, 64);
+    d.cw(VIRTIO_PCI_COMMON_Q_SELECT, 2, 9);
+    assert_eq!(d.cr(VIRTIO_PCI_COMMON_Q_SIZE, 2), 0);
+}
+
+/// `oss_fuzz_71649()` from virtio-balloon-test: poking at config space past the capabilities
+/// must not crash.
+#[test]
+fn balloon_oss_fuzz_71649() {
+    let m = Machine::new(false);
+    m.plug(balloon(), &VirtioPciProps::default());
+    m.cfg_write(0x90, 4, 0x2);
+    m.cfg_read(0x91, 4);
 }

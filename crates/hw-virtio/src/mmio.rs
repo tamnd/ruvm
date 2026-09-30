@@ -33,8 +33,8 @@ use ruvm_hw_core::IrqPin;
 use ruvm_mem::{AccessCtx, AccessSize, MemResult, MmioOps};
 
 use crate::virtio::{
-    VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_F_VERSION_1, VIRTIO_LEGACY_FEATURES, VIRTIO_QUEUE_MAX,
-    VirtIODevice, VirtioBackend, VirtioDeviceClass, VirtioTransport, feature,
+    VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_F_VERSION_1, VIRTIO_QUEUE_MAX, VirtIODevice, VirtioBackend,
+    VirtioDeviceClass, VirtioTransport, feature,
 };
 
 /// `TYPE_VIRTIO_MMIO`.
@@ -337,7 +337,7 @@ impl VirtioMmio {
                 }
             }
             VIRTIO_MMIO_DEVICE_FEATURES => {
-                let features = vdev.host_features() & !VIRTIO_LEGACY_FEATURES;
+                let features = vdev.host_features() & !backend.class().legacy_features();
                 (features >> (32 * st.host_features_sel)) as u32
             }
             VIRTIO_MMIO_QUEUE_NUM_MAX => u32::from(vdev.queue_num_max(sel)),

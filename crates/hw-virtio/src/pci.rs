@@ -52,11 +52,11 @@ use ruvm_hw_pci::regs::{
 use ruvm_hw_pci::{PciBus, PciDevice, PciDeviceInfo, PciDeviceOps};
 use ruvm_mem::{AccessCtx, AccessSize, MemResult, MmioOps, RegionId};
 
+use crate::net::VirtioNet;
 use crate::virtio::{
     VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_DRIVER, VIRTIO_CONFIG_S_DRIVER_OK,
-    VIRTIO_F_BAD_FEATURE, VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1, VIRTIO_LEGACY_FEATURES,
-    VIRTIO_NO_VECTOR, VIRTIO_QUEUE_MAX, VirtIODevice, VirtioBackend, VirtioDeviceClass,
-    VirtioTransport, feature,
+    VIRTIO_F_BAD_FEATURE, VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1, VIRTIO_NO_VECTOR,
+    VIRTIO_QUEUE_MAX, VirtIODevice, VirtioBackend, VirtioDeviceClass, VirtioTransport, feature,
 };
 
 /// `TYPE_VIRTIO_PCI`, the abstract parent of every virtio PCI device.
@@ -67,6 +67,10 @@ pub const TYPE_VIRTIO_RNG_PCI: &str = "virtio-rng-pci";
 pub const TYPE_VIRTIO_BLK_PCI: &str = "virtio-blk-pci";
 /// The generic virtio-serial PCI device, which carries virtio-console.
 pub const TYPE_VIRTIO_SERIAL_PCI: &str = "virtio-serial-pci";
+/// The generic virtio-net PCI device.
+pub const TYPE_VIRTIO_NET_PCI: &str = "virtio-net-pci";
+/// The generic virtio-balloon PCI device.
+pub const TYPE_VIRTIO_BALLOON_PCI: &str = "virtio-balloon-pci";
 
 /// `PCI_DEVICE_ID_VIRTIO_10_BASE`: modern-only devices use this plus the virtio device ID.
 pub const PCI_DEVICE_ID_VIRTIO_10_BASE: u16 = 0x1040;
@@ -323,11 +327,17 @@ impl VirtioPciProps {
 }
 
 /// The `vectors` default of each device type's `realize` hook.
-fn default_vectors(vdev: &VirtIODevice) -> u32 {
+fn default_vectors(backend: &VirtioBackend) -> u32 {
+    let vdev = backend.vdev();
     match vdev.device_id() {
-        // virtio-blk and virtio-scsi use one per request queue plus one for config, virtio-net
-        // two per queue pair plus control and config. All of those come to queues + 1.
-        1 | 2 | 8 => vdev.num_queues() as u32 + 1,
+        // virtio-net wants two per queue pair it may ever use, plus control and config. Only the
+        // first pair exists until the driver turns multiqueue on, so this cannot count queues.
+        1 => match backend.class().as_any().downcast_ref::<VirtioNet>() {
+            Some(net) => 2 * u32::from(net.max_queue_pairs().max(1)) + 2,
+            None => vdev.num_queues() as u32 + 1,
+        },
+        // virtio-blk and virtio-scsi use one per request queue plus one for config.
+        2 | 8 => vdev.num_queues() as u32 + 1,
         _ => 2,
     }
 }
@@ -539,7 +549,8 @@ impl Inner {
             VIRTIO_PCI_COMMON_DFSELECT => st.dfselect,
             VIRTIO_PCI_COMMON_DF => {
                 if st.dfselect < 2 {
-                    ((vdev.host_features() & !VIRTIO_LEGACY_FEATURES) >> (32 * st.dfselect)) as u32
+                    ((vdev.host_features() & !st.backend.class().legacy_features())
+                        >> (32 * st.dfselect)) as u32
                 } else {
                     0
                 }
@@ -1020,7 +1031,7 @@ impl VirtioPci {
             express: pcie_port && modern,
             ..PciDeviceInfo::default()
         };
-        let nvectors = props.vectors.unwrap_or_else(|| default_vectors(vdev));
+        let nvectors = props.vectors.unwrap_or_else(|| default_vectors(&backend));
         let config_len = vdev.config_len() as u64;
         let nqueues = vdev.num_queues();
 
