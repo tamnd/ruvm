@@ -618,6 +618,9 @@ version = "0.1.3"
 [[package]]
 name = "ruvm-vmstate"
 version = "0.1.3"
+dependencies = [
+ "ruvm-base",
+]
 
 [[package]]
 name = "ruvm-vmstate-macros"
