@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cutils;
+pub mod dispatch;
 pub mod ghash;
 pub mod json;
 mod qvalue;
@@ -27,6 +28,20 @@ pub mod visit;
 )]
 pub mod types {
     include!(concat!(env!("OUT_DIR"), "/qapi-types.rs"));
+}
+
+/// A `register_*` function for each command, generated like [`types`]. Each wraps a typed
+/// handler into the marshalling function [`dispatch::QmpCommandList`] stores.
+#[allow(missing_docs, unused_imports, unused_qualifications, clippy::all, clippy::pedantic)]
+pub mod commands {
+    include!(concat!(env!("OUT_DIR"), "/qapi-commands.rs"));
+}
+
+/// An `event_*` function for each event, which builds the message QMP sends, and the
+/// [`events::QapiEvent`] enum.
+#[allow(missing_docs, unused_imports, unused_qualifications, clippy::all, clippy::pedantic)]
+pub mod events {
+    include!(concat!(env!("OUT_DIR"), "/qapi-events.rs"));
 }
 
 pub use qvalue::{QDict, QType, QValue};

@@ -89,7 +89,12 @@ pub fn type_name(name: &str) -> String {
     match name.strip_prefix("q_obj_") {
         Some(rest) => {
             let (base, role) = rest.rsplit_once('-').unwrap_or((rest, ""));
-            camel(base) + &camel(role)
+            // Event names are upper case, and their argument types read better in camel case.
+            if base.chars().any(|c| c.is_ascii_lowercase()) {
+                camel(base) + &camel(role)
+            } else {
+                camel(&base.to_ascii_lowercase()) + &camel(role)
+            }
         }
         None => camel(name),
     }
@@ -595,37 +600,211 @@ fn indent_by(s: &str, n: usize) -> String {
     s.lines().map(|l| if l.is_empty() { "\n".to_string() } else { format!("{pad}{l}\n") }).collect()
 }
 
+impl<'a> Gen<'a> {
+    fn new(schema: &'a Schema, is_set: &'a dyn Fn(&str) -> bool) -> (Self, Vec<&'a Entity>) {
+        let mut g = Gen {
+            schema,
+            is_set,
+            out: String::new(),
+            names: HashMap::new(),
+            boxed: HashSet::new(),
+        };
+        let types: Vec<&Entity> = schema
+            .visit_order()
+            .into_iter()
+            .filter(|e| e.info.is_some() && g.on(&e.ifcond))
+            .filter(|e| {
+                matches!(e.kind, Kind::Enum { .. } | Kind::Object { .. } | Kind::Alternate { .. })
+            })
+            .collect();
+
+        let mut taken: HashMap<String, &str> =
+            RESERVED.iter().map(|r| (r.to_string(), "the generated module")).collect();
+        for e in &types {
+            let n = type_name(&e.name);
+            if let Some(other) = taken.insert(n.clone(), &e.name) {
+                panic!("QAPI types {} and {other} both map to the Rust name {n}", e.name);
+            }
+            g.names.insert(&e.name, n);
+        }
+        for e in &types {
+            for t in g.inline_types(e) {
+                if g.reaches(t, &e.name) {
+                    g.boxed.insert((&e.name, t));
+                }
+            }
+        }
+        (g, types)
+    }
+
+    /// The commands or events of the schema whose condition holds, in schema order.
+    fn entities(&self, want: &str) -> Vec<&'a Entity> {
+        self.schema.entities.iter().filter(|e| e.meta() == want && self.on(&e.ifcond)).collect()
+    }
+
+    fn gen_command(&mut self, e: &'a Entity) {
+        let Kind::Command(c) = &e.kind else { unreachable!() };
+        let fname = field_name(&e.name);
+        let arg = c.arg_type.as_deref().map(|t| self.names[t].clone());
+        let ret = c.ret_type.as_deref().map(|t| self.rust_type(t));
+        let mut options = Vec::new();
+        if !c.success_response {
+            options.push("QmpCommandOptions::NO_SUCCESS_RESP");
+        }
+        if c.allow_oob {
+            options.push("QmpCommandOptions::ALLOW_OOB");
+        }
+        if c.allow_preconfig {
+            options.push("QmpCommandOptions::ALLOW_PRECONFIG");
+        }
+        if c.coroutine {
+            options.push("QmpCommandOptions::COROUTINE");
+        }
+        let options =
+            if options.is_empty() { "QmpCommandOptions::NONE".into() } else { options.join(" | ") };
+        let features = features_expr(special_features(&e.features, &|c| self.on(c)));
+        let features = if features.is_empty() { "0".into() } else { features };
+
+        let handler_args = match &arg {
+            Some(a) => format!("&C, {a}"),
+            None => "&C".into(),
+        };
+        let handler_ret = ret.clone().unwrap_or_else(|| "()".into());
+        let _ = writeln!(
+            self.out,
+            "\n/// Registers `{}` with `handler`, the `qmp_marshal_{}()` of QEMU.",
+            e.name,
+            c_name(&e.name)
+        );
+        let _ = writeln!(self.out, "pub fn register_{fname}<C: 'static>(");
+        self.line("    cmds: &mut QmpCommandList<C>,");
+        let _ = writeln!(
+            self.out,
+            "    handler: impl Fn({handler_args}) -> Result<{handler_ret}> + Send + Sync + 'static,"
+        );
+        self.line(") {");
+        self.line("    let func = move |ctx: &C, args: QDict, policy: &CompatPolicy| -> Result<Option<QValue>> {");
+        let mut body = String::new();
+        body.push_str("let mut iv = QObjectInputVisitor::new_qmp(QValue::Dict(args), *policy);\n");
+        body.push_str("let v: &mut dyn Visitor = &mut iv;\n");
+        match &arg {
+            Some(a) => {
+                let _ = writeln!(body, "let mut arg = {a}::default();");
+                body.push_str("v.start_struct(None)?;\n");
+                let _ = writeln!(
+                    body,
+                    "let r = {a}::visit_members(v, &mut arg).and_then(|()| v.check_struct());"
+                );
+            }
+            None => {
+                body.push_str("v.start_struct(None)?;\n");
+                body.push_str("let r = v.check_struct();\n");
+            }
+        }
+        body.push_str("v.end_struct();\nr?;\n");
+        let call = if arg.is_some() { "handler(ctx, arg)?" } else { "handler(ctx)?" };
+        match c.ret_type.as_deref() {
+            Some(t) => {
+                let _ = writeln!(body, "#[allow(unused_mut)]\nlet mut ret = {call};");
+                body.push_str("let mut ov = QObjectOutputVisitor::new_qmp(*policy);\n");
+                body.push_str("let v: &mut dyn Visitor = &mut ov;\n");
+                let _ = writeln!(body, "{}?;", self.visit_expr(t, "&mut ret", "Some(\"unused\")"));
+                body.push_str("Ok(Some(ov.complete()))\n");
+            }
+            None => {
+                let _ = writeln!(body, "{call};");
+                body.push_str("Ok(None)\n");
+            }
+        }
+        self.out.push_str(&indent_by(&body, 8));
+        self.line("    };");
+        let _ = writeln!(
+            self.out,
+            "    cmds.register({:?}, Arc::new(func), {options}, {features});",
+            e.name
+        );
+        self.line("}");
+    }
+
+    fn gen_event(&mut self, e: &'a Entity) {
+        let Kind::Event { arg_type, .. } = &e.kind else { unreachable!() };
+        let fname = field_name(&e.name.to_ascii_lowercase());
+        let features = special_features(&e.features, &|c| self.on(c));
+        let _ = writeln!(
+            self.out,
+            "\n/// Builds the `{}` event, `qapi_event_send_{}()` in QEMU.",
+            e.name,
+            c_name(&e.name.to_ascii_lowercase())
+        );
+        self.line("/// It is `None` when the `-compat` policy hides the event.");
+        let arg = arg_type.as_deref().map(|t| (t, self.names[t].clone()));
+        match &arg {
+            Some((_, a)) => {
+                let _ = writeln!(
+                    self.out,
+                    "pub fn event_{fname}(policy: &CompatPolicy, mut arg: {a}) -> Option<QDict> {{"
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    self.out,
+                    "pub fn event_{fname}(policy: &CompatPolicy) -> Option<QDict> {{"
+                );
+            }
+        }
+        let mut body = String::new();
+        if features != 0 {
+            let _ = writeln!(
+                body,
+                "if compat_policy_output_hidden({}, policy) {{\n    return None;\n}}",
+                features_expr(features)
+            );
+        }
+        let m = if arg.is_some() { "mut " } else { "" };
+        let _ = writeln!(body, "let {m}qmp = qmp_event_build_dict({:?});", e.name);
+        match &arg {
+            Some((t, a)) => {
+                body.push_str("let mut ov = QObjectOutputVisitor::new_qmp(*policy);\n");
+                body.push_str("let v: &mut dyn Visitor = &mut ov;\n");
+                if t.starts_with("q_obj_") {
+                    body.push_str(
+                        "v.start_struct(Some(\"QAPIEvent\")).expect(\"output cannot fail\");\n",
+                    );
+                    let _ = writeln!(
+                        body,
+                        "{a}::visit_members(v, &mut arg).expect(\"output cannot fail\");"
+                    );
+                    body.push_str("v.check_struct().expect(\"output cannot fail\");\n");
+                    body.push_str("v.end_struct();\n");
+                } else {
+                    let _ = writeln!(
+                        body,
+                        "{a}::visit(v, Some(\"QAPIEvent\"), &mut arg).expect(\"output cannot fail\");"
+                    );
+                }
+                body.push_str("if let QValue::Dict(data) = ov.complete() {\n");
+                body.push_str(
+                    "    if !data.is_empty() {\n        qmp.put(\"data\", data);\n    }\n}\n",
+                );
+            }
+            None if features == 0 => body.push_str("let _ = policy;\n"),
+            None => {}
+        }
+        body.push_str("Some(qmp)\n");
+        self.out.push_str(&indent(&body));
+        self.line("}");
+    }
+}
+
+/// The C spelling of a name, which QEMU uses in function names.
+fn c_name(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+}
+
 /// Generates the Rust types for every type of `schema` whose condition holds under `is_set`.
 /// The result is meant to be `include!`d into a module of `ruvm-qapi`.
 pub fn gen_types(schema: &Schema, is_set: &dyn Fn(&str) -> bool) -> String {
-    let mut g =
-        Gen { schema, is_set, out: String::new(), names: HashMap::new(), boxed: HashSet::new() };
-    let types: Vec<&Entity> = schema
-        .visit_order()
-        .into_iter()
-        .filter(|e| e.info.is_some() && g.on(&e.ifcond))
-        .filter(|e| {
-            matches!(e.kind, Kind::Enum { .. } | Kind::Object { .. } | Kind::Alternate { .. })
-        })
-        .collect();
-
-    let mut taken: HashMap<String, &str> =
-        RESERVED.iter().map(|r| (r.to_string(), "the generated module")).collect();
-    for e in &types {
-        let n = type_name(&e.name);
-        if let Some(other) = taken.insert(n.clone(), &e.name) {
-            panic!("QAPI types {} and {other} both map to the Rust name {n}", e.name);
-        }
-        g.names.insert(&e.name, n);
-    }
-    for e in &types {
-        for t in g.inline_types(e) {
-            if g.reaches(t, &e.name) {
-                g.boxed.insert((&e.name, t));
-            }
-        }
-    }
-
+    let (mut g, types) = Gen::new(schema, is_set);
     g.out.push_str(
         "// Generated by ruvm-qapi-gen from the vendored QAPI schema. Do not edit.\n\n\
          use crate::visit::{QEnumLookup, Visit, Visitor, VisitorExt};\n\
@@ -643,6 +822,74 @@ pub fn gen_types(schema: &Schema, is_set: &dyn Fn(&str) -> bool) -> String {
     g.out
 }
 
+/// Generates a `register_*` function for every command of `schema` that QEMU generates a
+/// marshaller for. The result goes into a module next to the one [`gen_types`] fills.
+pub fn gen_commands(schema: &Schema, is_set: &dyn Fn(&str) -> bool) -> String {
+    let (mut g, _) = Gen::new(schema, is_set);
+    g.out.push_str(
+        "// Generated by ruvm-qapi-gen from the vendored QAPI schema. Do not edit.\n\n\
+         use std::sync::Arc;\n\n\
+         use crate::dispatch::{QmpCommandList, QmpCommandOptions};\n\
+         use crate::types::*;\n\
+         use crate::visit::{CompatPolicy, QObjectInputVisitor, QObjectOutputVisitor, Visit, Visitor, VisitorExt};\n\
+         use crate::{QDict, QValue};\n\
+         use ruvm_base::Result;\n",
+    );
+    for e in g.entities("command") {
+        let Kind::Command(c) = &e.kind else { unreachable!() };
+        if c.generate {
+            g.gen_command(e);
+        }
+    }
+    g.out
+}
+
+/// Generates an `event_*` function for every event of `schema`, plus the `QapiEvent` enum.
+pub fn gen_events(schema: &Schema, is_set: &dyn Fn(&str) -> bool) -> String {
+    let (mut g, _) = Gen::new(schema, is_set);
+    g.out.push_str(
+        "// Generated by ruvm-qapi-gen from the vendored QAPI schema. Do not edit.\n\n\
+         use crate::dispatch::qmp_event_build_dict;\n\
+         use crate::types::*;\n\
+         use crate::visit::{CompatPolicy, QObjectOutputVisitor, Visit, Visitor, compat_policy_output_hidden};\n\
+         use crate::{QDict, QValue};\n",
+    );
+    let events = g.entities("event");
+    g.line("\n/// `QAPIEvent`, one value per event.");
+    g.line("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]");
+    g.line("pub enum QapiEvent {");
+    for e in &events {
+        let _ = writeln!(g.out, "    {},", camel(&e.name.to_ascii_lowercase()));
+    }
+    g.line("}\n");
+    g.line("impl QapiEvent {");
+    g.line("    pub const ALL: &[QapiEvent] = &[");
+    for e in &events {
+        let _ = writeln!(g.out, "        QapiEvent::{},", camel(&e.name.to_ascii_lowercase()));
+    }
+    g.line("    ];\n");
+    g.line("    pub fn as_str(self) -> &'static str {");
+    g.line("        match self {");
+    for e in &events {
+        let _ = writeln!(
+            g.out,
+            "            QapiEvent::{} => {:?},",
+            camel(&e.name.to_ascii_lowercase()),
+            e.name
+        );
+    }
+    g.line("        }");
+    g.line("    }\n");
+    g.line("    pub fn from_name(name: &str) -> Option<Self> {");
+    g.line("        Self::ALL.iter().copied().find(|e| e.as_str() == name)");
+    g.line("    }");
+    g.line("}");
+    for e in events {
+        g.gen_event(e);
+    }
+    g.out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,6 +903,7 @@ mod tests {
         assert_eq!(type_name("q_obj_qom-list-arg"), "QomListArg");
         assert_eq!(type_name("q_obj_BlockdevOptions-base"), "BlockdevOptionsBase");
         assert_eq!(type_name("BlockdevOptions"), "BlockdevOptions");
+        assert_eq!(type_name("q_obj_DEVICE_DELETED-arg"), "DeviceDeletedArg");
         assert_eq!(field_name("node-name"), "node_name");
         assert_eq!(field_name("type"), "type_");
     }
