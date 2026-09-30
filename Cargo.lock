@@ -705,6 +705,13 @@ version = "0.2.2"
 [[package]]
 name = "ruvm-net"
 version = "0.2.2"
+dependencies = [
+ "libc",
+ "rustix",
+ "ruvm-base",
+ "ruvm-qapi",
+ "vmm-sys-util",
+]
 
 [[package]]
 name = "ruvm-plugin"
