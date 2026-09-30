@@ -59,6 +59,7 @@ use vmm_sys_util::ioctl::ioctl_with_ref;
 use vmm_sys_util::ioctl_iow_nr;
 
 use crate::board::X86Board;
+use crate::q35::CpuIdent;
 
 // kvm-ioctls has no wrapper for KVM_INTERRUPT, so it is declared here.
 ioctl_iow_nr!(KVM_INTERRUPT, KVMIO, 0x86, kvm_interrupt);
@@ -139,6 +140,7 @@ fn strerror(e: &std::io::Error) -> String {
 pub struct CpuModel {
     cpu: X86Cpu,
     phys_bits: u32,
+    ident: CpuIdent,
     warnings: Vec<String>,
 }
 
@@ -159,7 +161,18 @@ impl CpuModel {
         let mut probe = cpu.clone();
         probe.set_topology(X86CpuTopoInfo::default(), 0);
         probe.realize().map_err(|e| e.to_string())?;
-        Ok(CpuModel { cpu, phys_bits: probe.phys_bits(), warnings: probe.warnings().to_vec() })
+        let ident = CpuIdent::from_cpuid(probe.cpuid(0, 0), probe.cpuid(1, 0));
+        Ok(CpuModel {
+            cpu,
+            phys_bits: probe.phys_bits(),
+            ident,
+            warnings: probe.warnings().to_vec(),
+        })
+    }
+
+    /// The vendor and CPUID signature, for the q35 memory map and SMBIOS.
+    pub fn ident(&self) -> CpuIdent {
+        self.ident
     }
 
     /// The guest physical address width, what the board uses for its memory map.

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use ruvm_firmware::smbios::{SmbiosOptions, SmbiosTopology};
 use ruvm_firmware::x86_linux::{LINUXBOOT_DMA_ROM, PVH_ROM};
 use ruvm_hw_acpi::SystemRequestHandler;
 use ruvm_hw_char::serial::{Serial, SerialBackend};
@@ -29,8 +30,8 @@ use crate::microvm::{
 };
 use crate::pc::{GsiHook, err};
 use crate::q35::{
-    Q35, Q35_BIOS_FILENAME, Q35_DESC, Q35_MACHINE_ALIAS, Q35_MACHINE_NAME, Q35MachineConfig,
-    Q35Props,
+    CpuIdent, KVMVAPIC_ROM, PflashDrive, Q35, Q35_BIOS_FILENAME, Q35_DESC, Q35_MACHINE_ALIAS,
+    Q35_MACHINE_NAME, Q35MachineConfig, Q35Props,
 };
 
 /// The x86 boards the system emulator can build, as `-machine help` lists them: name, alias
@@ -245,19 +246,25 @@ impl X86Board {
         }
     }
 
-    /// The first serial port, if there is one.
-    pub fn serial(&self) -> Option<&Arc<Serial>> {
+    /// The ISA serial port `index`, 0 being COM1, if there is one. microvm has at most COM1,
+    /// q35 up to COM4.
+    pub fn serial(&self, index: usize) -> Option<&Arc<Serial>> {
         match self {
-            X86Board::Microvm(m) => m.serial(),
-            X86Board::Q35(m, _) => m.serial(),
+            X86Board::Microvm(m) => m.serial().filter(|_| index == 0),
+            X86Board::Q35(m, _) => m.serial(index),
         }
     }
 
-    /// Connects the chardev of the first serial port. Returns false if there is no port.
-    pub fn set_serial_backend(&self, backend: Option<Arc<dyn SerialBackend>>) -> bool {
+    /// Connects the chardev of the ISA serial port `index`. Returns false if there is no such
+    /// port.
+    pub fn set_serial_backend(
+        &self,
+        index: usize,
+        backend: Option<Arc<dyn SerialBackend>>,
+    ) -> bool {
         match self {
-            X86Board::Microvm(m) => m.set_serial_backend(backend),
-            X86Board::Q35(m, _) => m.set_serial_backend(backend),
+            X86Board::Microvm(m) => index == 0 && m.set_serial_backend(backend),
+            X86Board::Q35(m, _) => m.set_serial_backend(index, backend),
         }
     }
 
@@ -326,14 +333,25 @@ pub struct BoardSpec {
     pub smm_available: bool,
     /// `phys-bits` of the CPU model.
     pub phys_bits: u32,
+    /// The vendor and CPUID signature of the CPU model (q35 only).
+    pub cpu: CpuIdent,
     /// `-bios`.
     pub bios: Option<String>,
+    /// The drives of pflash0 and pflash1 (q35 only).
+    pub pflash: [Option<PflashDrive>; 2],
+    /// `-uuid`, or the UUID of `-smbios type=1,uuid=`.
+    pub uuid: Option<[u8; 16]>,
+    /// The `-smbios` options (q35 only).
+    pub smbios: SmbiosOptions,
+    /// The `-smp` topology, for the SMBIOS processor tables. `None` for one socket.
+    pub topology: Option<SmbiosTopology>,
     /// `-kernel`, `-initrd` and `-append`.
     pub kernel: Option<KernelFiles>,
     /// Where firmware and option ROMs are looked up.
     pub firmware: FirmwareSearch,
-    /// Whether the first serial port has a chardev (`serial_hd(0)`).
-    pub serial_hd: bool,
+    /// Whether `serial_hd(i)` exists, for each `-serial` in order (`false` for
+    /// `-serial none`). microvm looks at the first only, q35 at the first four.
+    pub serial_hds: Vec<bool>,
     /// `QEMU_CLOCK_VIRTUAL`.
     pub clock: Arc<Clock>,
     /// `rtc_clock`.
@@ -391,6 +409,13 @@ pub fn load_kernel(files: &KernelFiles) -> Result<KernelConfig, String> {
 pub fn build_board(spec: BoardSpec) -> Result<(X86Board, Vec<String>), String> {
     let kernel = spec.kernel.as_ref().map(load_kernel).transpose()?;
     let mut rom_files = BTreeMap::new();
+    // The APIC's kvmvapic device asks for its option ROM on q35 (microvm creates its CPUs
+    // after the option ROMs are loaded, so it never gets one).
+    if spec.kind == BoardKind::Q35 {
+        if let Some(data) = spec.firmware.load(KVMVAPIC_ROM) {
+            rom_files.insert(KVMVAPIC_ROM.to_string(), data);
+        }
+    }
     if kernel.is_some() {
         for name in [LINUXBOOT_DMA_ROM, PVH_ROM] {
             if let Some(data) = spec.firmware.load(name) {
@@ -415,7 +440,8 @@ pub fn build_board(spec: BoardSpec) -> Result<(X86Board, Vec<String>), String> {
                 props,
                 kernel,
                 rom_files,
-                serial_hd: spec.serial_hd,
+                // serial_hds_isa_init(isa_bus, 0, 1)
+                serial_hd: spec.serial_hds.first().copied().unwrap_or(false),
                 clock: spec.clock,
                 rtc_clock: spec.rtc_clock,
                 pit_in_kernel: spec.pit_in_kernel,
@@ -423,6 +449,9 @@ pub fn build_board(spec: BoardSpec) -> Result<(X86Board, Vec<String>), String> {
             };
             if let Some(size) = spec.ram_size {
                 cfg.ram_size = size;
+            }
+            if let Some(uuid) = spec.uuid {
+                cfg.fw_cfg.uuid = uuid;
             }
             Ok((Microvm::new(cfg)?.into(), Vec::new()))
         }
@@ -439,12 +468,17 @@ pub fn build_board(spec: BoardSpec) -> Result<(X86Board, Vec<String>), String> {
                 kvm: spec.kvm,
                 smm_available: spec.smm_available,
                 phys_bits: spec.phys_bits,
-                firmware: spec.firmware.load(&name),
+                cpu: spec.cpu,
+                // With a pflash0 drive the BIOS is never read.
+                firmware: spec.pflash[0].is_none().then(|| spec.firmware.load(&name)).flatten(),
                 firmware_name: spec.bios.clone(),
+                pflash: spec.pflash,
+                smbios: spec.smbios,
+                topology: spec.topology,
                 props,
                 kernel,
                 rom_files,
-                serial_hd: spec.serial_hd,
+                serial_hds: spec.serial_hds,
                 clock: spec.clock,
                 rtc_clock: spec.rtc_clock,
                 pit_in_kernel: spec.pit_in_kernel,
@@ -452,6 +486,9 @@ pub fn build_board(spec: BoardSpec) -> Result<(X86Board, Vec<String>), String> {
             };
             if let Some(size) = spec.ram_size {
                 cfg.ram_size = size;
+            }
+            if let Some(uuid) = spec.uuid {
+                cfg.fw_cfg.uuid = uuid;
             }
             Ok((Q35::new(cfg)?.into(), warnings))
         }

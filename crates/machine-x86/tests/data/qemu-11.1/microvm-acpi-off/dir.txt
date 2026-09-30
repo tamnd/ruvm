@@ -1,0 +1,5 @@
+0x0020 0 bios-geometry
+0x0021 0 bootorder
+0x0022 4 etc/boot-fail-wait
+0x0023 20 etc/e820
+0x0024 1048576 etc/fdt

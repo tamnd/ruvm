@@ -1,0 +1,15 @@
+0x0020 0 bios-geometry
+0x0021 0 bootorder
+0x0022 20 etc/acpi/rsdp
+0x0023 131072 etc/acpi/tables
+0x0024 4 etc/boot-fail-wait
+0x0025 40 etc/e820
+0x0026 31 etc/smbios/smbios-anchor
+0x0027 312 etc/smbios/smbios-tables
+0x0028 1 etc/smi/features-ok
+0x0029 8 etc/smi/requested-features
+0x002a 8 etc/smi/supported-features
+0x002b 6 etc/system-states
+0x002c 4096 etc/table-loader
+0x002d 0 etc/tpm/log
+0x002e 9216 genroms/kvmvapic.bin

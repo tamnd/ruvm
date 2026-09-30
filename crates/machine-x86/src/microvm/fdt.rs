@@ -3,11 +3,13 @@
 //! Just enough of libfdt's read-write API to build the microvm device tree byte for byte.
 //!
 //! `create_device_tree()` makes an empty 1 MiB blob and the board then adds nodes and
-//! properties in place. libfdt puts a new subnode right after its parent's properties, so in
-//! front of older siblings, and a new property right after the node name, so in front of older
-//! properties. Property names go into the strings block, reusing any earlier string that ends
-//! with the same bytes. The tree here keeps each list in blob order so serializing it gives the
-//! same bytes libfdt would leave in the buffer.
+//! properties in place. This keeps the same flat buffer and edits it the way libfdt does:
+//! a new subnode goes right after its parent's properties (so in front of older siblings), a
+//! new property right after the node name (so in front of older properties), and property
+//! names go into the strings block, reusing any earlier string that ends with the same bytes.
+//! Working on the buffer rather than on a tree matters for one detail: libfdt opens a gap with
+//! `memmove()` and only copies the value into it, so the alignment padding after a property
+//! keeps whatever bytes were there before. QEMU's `etc/fdt` has those bytes, and so does ours.
 
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE: u32 = 0x1;
@@ -21,81 +23,212 @@ const OFF_MEM_RSVMAP: usize = 0x30;
 /// The reserve map holds only its terminating entry.
 const OFF_DT_STRUCT: usize = OFF_MEM_RSVMAP + 16;
 
-#[derive(Debug, Default)]
-struct Node {
-    name: String,
-    /// `(name, value)` in blob order.
-    props: Vec<(String, Vec<u8>)>,
-    /// In blob order.
-    children: Vec<Node>,
-}
-
 /// A flattened device tree under construction.
-#[derive(Debug, Default)]
 pub(super) struct Fdt {
-    root: Node,
-    strings: Vec<u8>,
+    /// The whole [`FDT_MAX_SIZE`] buffer; the header fields below are written out by
+    /// [`Fdt::to_blob`].
+    buf: Vec<u8>,
+    off_dt_strings: usize,
+    size_dt_struct: usize,
+    size_dt_strings: usize,
     next_phandle: u32,
 }
 
+impl std::fmt::Debug for Fdt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fdt")
+            .field("size_dt_struct", &self.size_dt_struct)
+            .field("size_dt_strings", &self.size_dt_strings)
+            .finish_non_exhaustive()
+    }
+}
+
+fn tag_align(n: usize) -> usize {
+    (n + 3) & !3
+}
+
 impl Fdt {
-    /// `create_device_tree()`.
+    /// `create_device_tree()`: a root node and nothing else.
     pub(super) fn new() -> Self {
-        Fdt { root: Node::default(), strings: Vec::new(), next_phandle: 0x8000 }
+        let mut buf = vec![0; FDT_MAX_SIZE];
+        let root = [FDT_BEGIN_NODE, 0, FDT_END_NODE, FDT_END];
+        for (i, w) in root.iter().enumerate() {
+            buf[OFF_DT_STRUCT + i * 4..OFF_DT_STRUCT + i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        Fdt {
+            buf,
+            off_dt_strings: OFF_DT_STRUCT + 16,
+            size_dt_struct: 16,
+            size_dt_strings: 0,
+            next_phandle: 0x8000,
+        }
     }
 
-    fn node_mut(&mut self, path: &str) -> &mut Node {
-        let mut node = &mut self.root;
+    fn word(&self, off: usize) -> u32 {
+        let b = &self.buf[off..off + 4];
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    fn put_word(&mut self, off: usize, v: u32) {
+        self.buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
+    }
+
+    /// `fdt_next_tag()`: the tag at `off` (an offset into the buffer) and where the next one
+    /// starts.
+    fn next_tag(&self, off: usize) -> (u32, usize) {
+        let tag = self.word(off);
+        let next = match tag {
+            FDT_BEGIN_NODE => {
+                let name = &self.buf[off + 4..];
+                let len = name.iter().position(|&b| b == 0).expect("node name") + 1;
+                off + 4 + tag_align(len)
+            }
+            FDT_PROP => off + 12 + tag_align(self.word(off + 4) as usize),
+            _ => off + 4,
+        };
+        (tag, next)
+    }
+
+    fn node_name(&self, off: usize) -> &[u8] {
+        let name = &self.buf[off + 4..];
+        &name[..name.iter().position(|&b| b == 0).expect("node name")]
+    }
+
+    /// Where the node's properties end, which is where its first subnode (or its end tag)
+    /// starts.
+    fn after_props(&self, node: usize) -> usize {
+        let (_, mut off) = self.next_tag(node);
+        loop {
+            let (tag, next) = self.next_tag(off);
+            if tag != FDT_PROP {
+                return off;
+            }
+            off = next;
+        }
+    }
+
+    /// `fdt_subnode_offset()`.
+    fn subnode(&self, parent: usize, name: &str) -> Option<usize> {
+        let mut off = self.after_props(parent);
+        loop {
+            let (tag, next) = self.next_tag(off);
+            if tag != FDT_BEGIN_NODE {
+                return None;
+            }
+            if self.node_name(off) == name.as_bytes() {
+                return Some(off);
+            }
+            // Skip the whole subtree.
+            let mut depth = 1;
+            off = next;
+            while depth > 0 {
+                let (tag, next) = self.next_tag(off);
+                match tag {
+                    FDT_BEGIN_NODE => depth += 1,
+                    FDT_END_NODE => depth -= 1,
+                    _ => {}
+                }
+                off = next;
+            }
+        }
+    }
+
+    /// `fdt_path_offset()`.
+    fn node(&self, path: &str) -> usize {
+        let mut node = OFF_DT_STRUCT;
         for part in path.split('/').filter(|p| !p.is_empty()) {
-            let i = node
-                .children
-                .iter()
-                .position(|c| c.name == part)
-                .unwrap_or_else(|| panic!("no FDT node {path}"));
-            node = &mut node.children[i];
+            node = self.subnode(node, part).unwrap_or_else(|| panic!("no FDT node {path}"));
         }
         node
+    }
+
+    /// `fdt_splice_()`: moves everything from `p + oldlen` to the end of the strings block
+    /// so that `oldlen` bytes at `p` become `newlen`. The bytes of a new gap are left as they
+    /// were.
+    fn splice(&mut self, p: usize, oldlen: usize, newlen: usize) {
+        let end = self.off_dt_strings + self.size_dt_strings;
+        assert!(end - oldlen + newlen <= FDT_MAX_SIZE, "device tree too large");
+        self.buf.copy_within(p + oldlen..end, p + newlen);
+    }
+
+    /// `fdt_splice_struct_()`.
+    fn splice_struct(&mut self, p: usize, oldlen: usize, newlen: usize) {
+        self.splice(p, oldlen, newlen);
+        self.size_dt_struct = self.size_dt_struct + newlen - oldlen;
+        self.off_dt_strings = self.off_dt_strings + newlen - oldlen;
+    }
+
+    /// `fdt_find_add_string_()`.
+    fn find_add_string(&mut self, s: &str) -> u32 {
+        let mut needle = s.as_bytes().to_vec();
+        needle.push(0);
+        let strings = &self.buf[self.off_dt_strings..self.off_dt_strings + self.size_dt_strings];
+        if let Some(pos) = strings.windows(needle.len()).position(|w| w == needle.as_slice()) {
+            return pos as u32;
+        }
+        let off = self.size_dt_strings;
+        let p = self.off_dt_strings + off;
+        self.splice(p, 0, needle.len());
+        self.buf[p..p + needle.len()].copy_from_slice(&needle);
+        self.size_dt_strings += needle.len();
+        off as u32
+    }
+
+    fn string_at(&self, off: u32) -> &[u8] {
+        let s = &self.buf[self.off_dt_strings + off as usize..];
+        &s[..s.iter().position(|&b| b == 0).expect("string")]
     }
 
     /// `qemu_fdt_add_subnode()`.
     pub(super) fn add_subnode(&mut self, path: &str) {
         let (parent, name) = path.rsplit_once('/').expect("absolute FDT path");
-        let parent = self.node_mut(parent);
-        parent.children.insert(0, Node { name: name.to_string(), ..Node::default() });
+        let parent = self.node(parent);
+        assert!(self.subnode(parent, name).is_none(), "FDT node {path} exists");
+        let off = self.after_props(parent);
+        let namelen = tag_align(name.len() + 1);
+        self.splice_struct(off, 0, 4 + namelen + 4);
+        self.put_word(off, FDT_BEGIN_NODE);
+        self.buf[off + 4..off + 4 + namelen].fill(0);
+        self.buf[off + 4..off + 4 + name.len()].copy_from_slice(name.as_bytes());
+        self.put_word(off + 4 + namelen, FDT_END_NODE);
     }
 
-    /// `fdt_find_add_string_()`.
-    fn add_string(&mut self, s: &str) {
-        let mut needle = s.as_bytes().to_vec();
-        needle.push(0);
-        if !self.strings.windows(needle.len()).any(|w| w == needle.as_slice()) {
-            self.strings.extend_from_slice(&needle);
-        }
-    }
-
-    fn string_offset(&self, s: &str) -> u32 {
-        let mut needle = s.as_bytes().to_vec();
-        needle.push(0);
-        let pos = self.strings.windows(needle.len()).position(|w| w == needle.as_slice());
-        pos.expect("property name in the strings block") as u32
-    }
-
-    /// `qemu_fdt_setprop()`.
+    /// `qemu_fdt_setprop()`, which is `fdt_setprop()`: resizes the property if the node has
+    /// it, adds it in front of the others if not, then copies the value in.
     pub(super) fn setprop(&mut self, path: &str, name: &str, value: &[u8]) {
-        let exists = {
-            let node = self.node_mut(path);
-            if let Some(p) = node.props.iter_mut().find(|p| p.0 == name) {
-                p.1 = value.to_vec();
-                true
-            } else {
-                false
+        let node = self.node(path);
+        let (_, mut off) = self.next_tag(node);
+        let mut found = None;
+        loop {
+            let (tag, next) = self.next_tag(off);
+            if tag != FDT_PROP {
+                break;
+            }
+            if self.string_at(self.word(off + 8)) == name.as_bytes() {
+                found = Some(off);
+                break;
+            }
+            off = next;
+        }
+        let prop = match found {
+            // fdt_resize_property_()
+            Some(prop) => {
+                let oldlen = self.word(prop + 4) as usize;
+                self.splice_struct(prop + 12, tag_align(oldlen), tag_align(value.len()));
+                prop
+            }
+            // fdt_add_property_()
+            None => {
+                let nameoff = self.find_add_string(name);
+                let (_, prop) = self.next_tag(self.node(path));
+                self.splice_struct(prop, 0, 12 + tag_align(value.len()));
+                self.put_word(prop, FDT_PROP);
+                self.put_word(prop + 8, nameoff);
+                prop
             }
         };
-        if !exists {
-            self.add_string(name);
-            let node = self.node_mut(path);
-            node.props.insert(0, (name.to_string(), value.to_vec()));
-        }
+        self.put_word(prop + 4, value.len() as u32);
+        self.buf[prop + 12..prop + 12 + value.len()].copy_from_slice(value);
     }
 
     /// `qemu_fdt_setprop_string()`.
@@ -130,57 +263,26 @@ impl Fdt {
         p
     }
 
-    fn put_node(&self, node: &Node, out: &mut Vec<u8>) {
-        out.extend_from_slice(&FDT_BEGIN_NODE.to_be_bytes());
-        out.extend_from_slice(node.name.as_bytes());
-        out.push(0);
-        pad4(out);
-        for (name, value) in &node.props {
-            out.extend_from_slice(&FDT_PROP.to_be_bytes());
-            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
-            out.extend_from_slice(&self.string_offset(name).to_be_bytes());
-            out.extend_from_slice(value);
-            pad4(out);
-        }
-        for child in &node.children {
-            self.put_node(child, out);
-        }
-        out.extend_from_slice(&FDT_END_NODE.to_be_bytes());
-    }
-
     /// The whole [`FDT_MAX_SIZE`] buffer, as `fw_cfg_add_file(..., "etc/fdt", fdt, size)` sees
     /// it.
     pub(super) fn to_blob(&self) -> Vec<u8> {
-        let mut dt_struct = Vec::new();
-        self.put_node(&self.root, &mut dt_struct);
-        dt_struct.extend_from_slice(&FDT_END.to_be_bytes());
-
-        let off_strings = OFF_DT_STRUCT + dt_struct.len();
         let header = [
             FDT_MAGIC,
             FDT_MAX_SIZE as u32,
             OFF_DT_STRUCT as u32,
-            off_strings as u32,
+            self.off_dt_strings as u32,
             OFF_MEM_RSVMAP as u32,
             17, // version
             16, // last_comp_version
             0,  // boot_cpuid_phys
-            self.strings.len() as u32,
-            dt_struct.len() as u32,
+            self.size_dt_strings as u32,
+            self.size_dt_struct as u32,
         ];
-        let mut out: Vec<u8> = header.iter().flat_map(|w| w.to_be_bytes()).collect();
-        out.resize(OFF_DT_STRUCT, 0);
-        out.extend_from_slice(&dt_struct);
-        out.extend_from_slice(&self.strings);
-        assert!(out.len() <= FDT_MAX_SIZE, "device tree too large");
-        out.resize(FDT_MAX_SIZE, 0);
+        let mut out = self.buf.clone();
+        for (i, w) in header.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
         out
-    }
-}
-
-fn pad4(out: &mut Vec<u8>) {
-    while out.len() % 4 != 0 {
-        out.push(0);
     }
 }
 
@@ -207,9 +309,29 @@ mod tests {
         f.add_subnode("/b");
         f.setprop_cell("/a", "linux,phandle", 1);
         f.setprop_cell("/a", "phandle", 1);
-        assert_eq!(f.root.children[0].name, "b");
-        assert_eq!(f.root.children[1].props[0].0, "phandle");
-        assert_eq!(f.strings, b"linux,phandle\0");
-        assert_eq!(f.string_offset("phandle"), 6);
+        let blob = f.to_blob();
+        let root = OFF_DT_STRUCT;
+        // "b" comes first, and "phandle" sits in front of "linux,phandle".
+        let b = f.after_props(root);
+        assert_eq!(f.node_name(b), b"b");
+        let a = f.subnode(root, "a").unwrap();
+        let (_, first) = f.next_tag(a);
+        assert_eq!(f.string_at(f.word(first + 8)), b"phandle");
+        assert_eq!(f.word(first + 8), 6);
+        assert_eq!(&blob[f.off_dt_strings..f.off_dt_strings + 14], b"linux,phandle\0");
+    }
+
+    #[test]
+    fn padding_keeps_the_old_bytes() {
+        // The gap for "q" opens where "p" was, and only one byte of it is written, so the
+        // padding keeps the last three bytes of the old value of "p".
+        let mut f = Fdt::new();
+        f.add_subnode("/a");
+        f.setprop("/a", "p", &[1, 2, 3, 4]);
+        f.setprop("/a", "q", &[0xaa]);
+        let a = f.subnode(OFF_DT_STRUCT, "a").unwrap();
+        let (_, prop) = f.next_tag(a);
+        assert_eq!(f.string_at(f.word(prop + 8)), b"q");
+        assert_eq!(&f.buf[prop + 12..prop + 16], &[0xaa, 2, 3, 4]);
     }
 }

@@ -17,6 +17,7 @@ pub mod ich9_lpc;
 pub mod kvm_run;
 pub mod microvm;
 pub mod pc;
+pub mod pflash;
 pub mod q35;
 
 pub use board::{BoardKind, BoardSpec, KernelFiles, X86_BOARDS, X86Board, build_board};
@@ -24,4 +25,5 @@ pub use file_backend::FileBackend;
 pub use firmware::FirmwareSearch;
 pub use ich9_lpc::{Ich9Lpc, Ich9LpcConfig};
 pub use microvm::{Microvm, MicrovmConfig, MicrovmProps};
+pub use pflash::{Pflash, PflashBacking, PflashProps};
 pub use q35::{Q35, Q35MachineConfig, Q35Props};

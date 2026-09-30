@@ -4,26 +4,31 @@
 //! x86-common.c it uses.
 //!
 //! The board is the Q35 host bridge (MCH at 00:00.0), the ICH9 LPC bridge at 00:1f.0 with its
-//! power management block, the ICH9 AHCI controller at 00:1f.2, an 8259 pair, one IOAPIC, the
-//! HPET, the PIT and speaker port, the RTC, COM1, the i8042 with port 0x92, fw_cfg and the
-//! firmware (`bios-256k.bin` by default) at the top of 4 GiB with its last 128 KiB mirrored
-//! below 1 MiB through the PAM registers.
+//! power management block, the ICH9 AHCI controller at 00:1f.2, the ICH9 SMBus controller at
+//! 00:1f.3 with its SPD EEPROMs, an 8259 pair, one IOAPIC, the HPET, the PIT and speaker port,
+//! the RTC, up to four ISA serial ports, the i8042 with port 0x92 and fw_cfg. The firmware is
+//! either ROM (`bios-256k.bin` by default) or, when pflash0 has a drive, the two CFI01 system
+//! flashes OVMF uses. Both sit at the top of 4 GiB with their last 128 KiB mirrored below 1 MiB
+//! through the PAM registers.
 //!
 //! Building a machine goes in three steps, like QEMU's startup:
 //!
 //! 1. [`Q35::new`] is `pc_q35_init()`: memory, fw_cfg, the kernel and the devices.
 //! 2. Devices are plugged: [`Q35::attach_drive`] for `-drive if=ide` and
-//!    [`Q35::set_serial_backend`] for the chardev of COM1. More PCI devices go on
+//!    [`Q35::set_serial_backend`] for the chardevs of COM1 to COM4. More PCI devices go on
 //!    [`Q35::pci_bus`].
 //! 3. [`Q35::machine_done`] runs the machine-done notifiers (ACPI tables, `etc/e820`, the late
 //!    CMOS setup, `bootorder`) and then the first system reset.
 //!
-//! Not modelled: the default VGA (the board behaves like `-vga none`), the ICH9 SMBus
-//! controller at 00:1f.3 (`smbus=on` is accepted), the VMware port, the parallel port, the
-//! i8257 DMA controllers, USB, pflash, the SMBIOS tables (`etc/smbios`), `etc/msr_feature_control`,
-//! memory hotplug and the relocation of RAM above 1 TiB on AMD CPUs. The ACPI tables advertise
-//! PCI and CPU hotplug as QEMU's do, but the hotplug registers at 0xcc0 and 0xcd8 are not
-//! emulated.
+//! fw_cfg carries what QEMU's does: the ACPI tables with their loader script, the SMBIOS
+//! tables, `etc/e820`, `bootorder` and the option ROMs, byte for byte (see
+//! `tests/qemu_fw_cfg.rs`). On AMD CPUs the e820 map has the HyperTransport hole and RAM above
+//! 4 GiB moves past 1 TiB when it would reach it, as in `pc_memory_init()`.
+//!
+//! Not modelled: the default VGA (the board behaves like `-vga none`), the VMware port, the
+//! parallel port, the i8257 DMA controllers, USB, `etc/msr_feature_control` and memory
+//! hotplug. The ACPI tables advertise PCI and CPU hotplug as QEMU's do, but the hotplug
+//! registers at 0xcc0 and 0xcd8 are not emulated.
 //!
 //! vCPUs are not created here. An accelerator takes the address spaces (including the SMM one),
 //! the RAM ranges, the APIC IDs, the 8259 output, the A20 line and the MSI hook from the
@@ -43,9 +48,13 @@ use ruvm_firmware::acpi::pci::CrsRange;
 use ruvm_firmware::acpi::q35::{
     self as acpi_q35, PciDevice as AcpiPciDevice, PciDeviceAml, Q35Acpi,
 };
-use ruvm_firmware::acpi::table::{LOADER_FILE, McfgInfo, RSDP_FILE, TABLE_FILE};
+use ruvm_firmware::acpi::table::{LOADER_FILE, McfgInfo, RSDP_FILE, TABLE_FILE, TPMLOG_FILE};
 use ruvm_firmware::acpi::x86::{MadtConfig, PossibleCpu};
 use ruvm_firmware::e820::{E820_FILE, E820_RAM, E820_RESERVED, E820Table};
+use ruvm_firmware::smbios::{
+    SMBIOS_ANCHOR_FILE, SMBIOS_TABLES_FILE, SmbiosConfig, SmbiosEntryPointType as SmbiosEp,
+    SmbiosOptions, SmbiosPciDevice, SmbiosTopology, mem_array_from_e820, smbios_get_tables,
+};
 use ruvm_firmware::x86_linux::{X86KernelBoot, X86LinuxInput, x86_load_linux};
 use ruvm_hw_acpi::{SystemRequest, SystemRequestHandler};
 use ruvm_hw_char::serial::{SERIAL_BAUDBASE_DEFAULT, SERIAL_IO_SIZE, Serial, SerialBackend};
@@ -54,6 +63,8 @@ use ruvm_hw_core::fw_cfg::{
     FW_CFG_NUMA, FW_CFG_RAM_SIZE, FwCfgIo, FwCfgMachineConfig, FwCfgState, fw_cfg_init_io_dma,
 };
 use ruvm_hw_core::{Clock, IrqLine, IrqPin, irq};
+use ruvm_hw_i2c::smbus_eeprom::SmbusEepromSlave;
+use ruvm_hw_i2c::smbus_ich9::{Ich9Smbus, ich9_smbus_q35_init};
 use ruvm_hw_input::pckbd::{I8042, I8042Props};
 use ruvm_hw_intc::i8259::{I8259Pair, i8259_init};
 use ruvm_hw_intc::ioapic::{
@@ -78,6 +89,7 @@ use crate::pc::{
     UnassignedIo, WeakDma, boot_order_nibbles, cmos_init_disks, cmos_set_memory, err,
     hd_geometry_guess, pci_hole64_start, rtc_set_cpus_count, set_boot_dev,
 };
+use crate::pflash::{FlashDrive, Pflash, PflashBacking, pc_system_flash_map};
 
 pub use props::{Q35Props, SmbiosEntryPointType};
 
@@ -95,6 +107,10 @@ pub const Q35_RAM_ID: &str = "pc.ram";
 pub const Q35_DEFAULT_RAM_SIZE: u64 = 128 * MIB;
 /// The default firmware, from `firmware=bios-256k.bin` in the default machine options.
 pub const Q35_BIOS_FILENAME: &str = "bios-256k.bin";
+/// The option ROM the kvmvapic device registers (`vapic_realize()`), which patches TPR
+/// accesses in Windows XP era guests. It is added with bootindex -1, so it is loaded but not
+/// put in the boot order.
+pub const KVMVAPIC_ROM: &str = "kvmvapic.bin";
 /// The default `-boot order=`.
 pub const PC_DEFAULT_BOOT_ORDER: &str = "cad";
 /// The default `phys-bits` of TCG CPUs.
@@ -103,6 +119,32 @@ pub const TCG_PHYS_ADDR_BITS: u32 = 40;
 pub const AMD_HT_START: u64 = 0xfd_0000_0000;
 /// `AMD_HT_END`.
 pub const AMD_HT_END: u64 = 0xff_ffff_ffff;
+/// `CPUID_HT`, the HTT bit of `CPUID[1].EDX`.
+const CPUID_HT: u32 = 1 << 28;
+/// `AMD_ABOVE_1TB_START`, where RAM above 4 GiB moves when it would overlap the
+/// HyperTransport window.
+pub const AMD_ABOVE_1TB_START: u64 = AMD_HT_END + 1;
+
+/// What the board needs to know about the first CPU: `IS_AMD_CPU()` for the memory map, and
+/// the CPUID signature and feature bits that SMBIOS type 4 reports.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpuIdent {
+    /// Whether the vendor is AuthenticAMD.
+    pub amd: bool,
+    /// `CPUID[1].EAX`.
+    pub version: u32,
+    /// `CPUID[1].EDX`.
+    pub features_edx: u32,
+}
+
+impl CpuIdent {
+    /// Works the identity out of `CPUID[0]` and `CPUID[1]`, each as EAX, EBX, ECX, EDX.
+    pub fn from_cpuid(leaf0: [u32; 4], leaf1: [u32; 4]) -> CpuIdent {
+        // "Auth" "enti" "cAMD" in EBX, EDX, ECX.
+        let amd = leaf0[1] == 0x6874_7541 && leaf0[3] == 0x6974_6e65 && leaf0[2] == 0x444d_4163;
+        CpuIdent { amd, version: leaf1[0], features_edx: leaf1[3] }
+    }
+}
 /// The ports of the PIT.
 pub const PIT_IO_BASE: u64 = 0x40;
 /// The ports of the RTC.
@@ -113,6 +155,12 @@ pub const RTC_IRQ: u32 = 8;
 pub const SERIAL_IO_BASE: u64 = 0x3f8;
 /// The ISA IRQ of COM1.
 pub const SERIAL_IRQ: u32 = 4;
+/// `MAX_ISA_SERIAL_PORTS`: how many ISA serial ports `pc_superio_init()` creates at most.
+pub const MAX_ISA_SERIAL_PORTS: usize = 4;
+/// The ports of COM1 to COM4, `isa_serial_io[]`.
+pub const ISA_SERIAL_IO: [u64; MAX_ISA_SERIAL_PORTS] = [0x3f8, 0x2f8, 0x3e8, 0x2e8];
+/// The ISA IRQs of COM1 to COM4, `isa_serial_irq[]`.
+pub const ISA_SERIAL_IRQ: [u32; MAX_ISA_SERIAL_PORTS] = [4, 3, 4, 3];
 /// The i8042 data port.
 pub const I8042_DATA_PORT: u64 = 0x60;
 /// The i8042 command and status port.
@@ -137,6 +185,17 @@ const SMI_F_CPU_HOT_UNPLUG_BIT: u32 = 2;
 /// Receives the A20 line: true when address bit 20 is passed through.
 pub type A20Handler = Arc<dyn Fn(bool) + Send + Sync>;
 
+/// A drive of one of the system flashes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PflashDrive {
+    /// The block backend name QEMU prints in errors, "pflash0" or "pflash1".
+    pub name: String,
+    /// The image size as the block layer reports it, see [`raw_block_length`](crate::pflash::raw_block_length).
+    pub size: u64,
+    /// The image.
+    pub backing: PflashBacking,
+}
+
 /// Everything [`Q35::new`] needs: the command line after parsing, with files already read.
 pub struct Q35MachineConfig {
     /// `-m`.
@@ -152,12 +211,20 @@ pub struct Q35MachineConfig {
     pub smm_available: bool,
     /// `phys-bits` of the CPU model, for the address space check of `pc_memory_init()`.
     pub phys_bits: u32,
+    /// The first CPU. The default is a CPU that is not AMD, with zero CPUID values; note
+    /// that QEMU's `qemu64` is AuthenticAMD under TCG, while KVM uses the host vendor.
+    pub cpu: CpuIdent,
     /// The `-machine` properties.
     pub props: Q35Props,
     /// `-bios`, or `None` for [`Q35_BIOS_FILENAME`].
     pub firmware_name: Option<String>,
-    /// The contents of the firmware file, `None` if it could not be found.
+    /// The contents of the firmware file, `None` if it could not be found. Not used when
+    /// pflash0 has a drive.
     pub firmware: Option<Vec<u8>>,
+    /// The drives of the two system flashes, `-machine pflash0=,pflash1=` or
+    /// `-drive if=pflash`. With a pflash0 drive the board maps CFI01 flashes below 4 GiB
+    /// instead of loading the BIOS as ROM, which is how OVMF boots.
+    pub pflash: [Option<PflashDrive>; 2],
     /// `-kernel` and friends.
     pub kernel: Option<KernelConfig>,
     /// `-option-rom`, in command line order.
@@ -165,12 +232,17 @@ pub struct Q35MachineConfig {
     /// ROM files by name: the `-option-rom` files and the boot ROMs the kernel loader asks
     /// for (`linuxboot_dma.bin`, `pvh.bin`). A missing file gets QEMU's warning and is skipped.
     pub rom_files: BTreeMap<String, Vec<u8>>,
-    /// Whether `serial_hd(0)` exists, which is what creates COM1.
-    pub serial_hd: bool,
-    /// The chardev behind COM1. It can also be set later.
-    pub serial_backend: Option<Arc<dyn SerialBackend>>,
+    /// Whether `serial_hd(i)` exists, for each `-serial` in order. `-serial none` leaves a
+    /// hole. COM1 to COM4 are created for the first four that exist, and their chardevs are
+    /// connected later with [`Q35::set_serial_backend`].
+    pub serial_hds: Vec<bool>,
     /// `-boot order=`.
     pub boot_order: String,
+    /// The `-smbios` options, in command line order. `-uuid` goes in [`Self::fw_cfg`].
+    pub smbios: SmbiosOptions,
+    /// The `-smp` topology the SMBIOS processor tables describe. `None` is what `-smp N`
+    /// gives on current machine types: one socket with `max_cpus` cores.
+    pub topology: Option<SmbiosTopology>,
     /// `-uuid`, `-boot` and the display options fw_cfg reports. `enable_graphics` is taken
     /// from the `graphics` property.
     pub fw_cfg: FwCfgMachineConfig,
@@ -194,9 +266,10 @@ impl fmt::Debug for Q35MachineConfig {
             .field("kvm", &self.kvm)
             .field("props", &self.props)
             .field("firmware_name", &self.firmware_name)
+            .field("pflash", &self.pflash)
             .field("kernel", &self.kernel.as_ref().map(|k| &k.filename))
             .field("option_roms", &self.option_roms)
-            .field("serial_hd", &self.serial_hd)
+            .field("serial_hds", &self.serial_hds)
             .field("boot_order", &self.boot_order)
             .finish_non_exhaustive()
     }
@@ -213,15 +286,18 @@ impl Default for Q35MachineConfig {
             kvm: false,
             smm_available: true,
             phys_bits: TCG_PHYS_ADDR_BITS,
+            cpu: CpuIdent::default(),
             props: Q35Props::default(),
             firmware_name: None,
             firmware: None,
+            pflash: [None, None],
             kernel: None,
             option_roms: Vec::new(),
             rom_files: BTreeMap::new(),
-            serial_hd: true,
-            serial_backend: None,
+            serial_hds: vec![true],
             boot_order: PC_DEFAULT_BOOT_ORDER.to_string(),
+            smbios: SmbiosOptions::new(),
+            topology: None,
             fw_cfg: FwCfgMachineConfig::default(),
             clock: Clock::manual(ClockType::Virtual),
             rtc_clock: Clock::manual(ClockType::Host),
@@ -229,6 +305,65 @@ impl Default for Q35MachineConfig {
             pit_in_kernel: false,
         }
     }
+}
+
+/// `pc_system_firmware_init()` for q35: the CFI01 flashes when pflash0 has a drive, else the
+/// BIOS as ROM (`x86_bios_rom_init()`). Either way the top 128 KiB are aliased read only
+/// below 1 MiB as "isa-bios". Returns `pc.bios` with its contents, or the flashes.
+///
+/// QEMU refuses pflash under KVM without `KVM_CAP_READONLY_MEM`. Every kernel ruvm runs on
+/// has it (Linux 3.7 and later), so that check is left out.
+#[allow(clippy::type_complexity)]
+fn pc_system_firmware_init(
+    mem: &Arc<MemorySystem>,
+    rom_memory: RegionId,
+    firmware_name: Option<String>,
+    firmware: Option<Vec<u8>>,
+    pflash: [Option<PflashDrive>; 2],
+    props: &Q35Props,
+) -> Result<(Option<(RegionId, Vec<u8>)>, Vec<Arc<Pflash>>), String> {
+    let drives = [0, 1]
+        .map(|i| pflash[i].as_ref().map(|d| FlashDrive { name: d.name.clone(), size: d.size }));
+    let map = pc_system_flash_map(&drives, props.max_fw_size).map_err(|e| match e.info() {
+        Some(info) => format!("{e}\ninfo: {info}"),
+        None => e.to_string(),
+    })?;
+    if map.flashes.is_empty() {
+        // x86_bios_rom_init(.., rom_memory, false)
+        let bios_name = firmware_name.unwrap_or_else(|| Q35_BIOS_FILENAME.to_string());
+        let bios_data = match firmware {
+            Some(d) if !d.is_empty() && d.len() as u64 % 65536 == 0 => d,
+            _ => return Err(format!("qemu: could not load PC BIOS '{bios_name}'")),
+        };
+        let bios_size = bios_data.len() as u64;
+        let bios = mem.new_ram("pc.bios", bios_size).map_err(err)?;
+        mem.set_readonly(bios, true).map_err(err)?;
+        mem.add_subregion(rom_memory, (1u64 << 32) - bios_size, bios).map_err(err)?;
+        let isa_bios_size = bios_size.min(ISA_BIOS_MAX);
+        let isa_bios = mem
+            .new_alias("isa-bios", bios, bios_size - isa_bios_size, isa_bios_size.into())
+            .map_err(err)?;
+        mem.add_subregion_overlap(rom_memory, MIB - isa_bios_size, isa_bios, 1).map_err(err)?;
+        mem.set_readonly(isa_bios, true).map_err(err)?;
+        return Ok((Some((bios, bios_data)), Vec::new()));
+    }
+    // pc_system_flash_map()
+    let mut pflash = pflash;
+    let mut flashes = Vec::new();
+    for f in &map.flashes {
+        let backing = pflash[f.index].take().map_or(PflashBacking::None, |d| d.backing);
+        let dev = Pflash::new(mem, f.name, f.props, backing)?;
+        mem.add_subregion(rom_memory, f.base, dev.region()).map_err(err)?;
+        flashes.push(dev);
+    }
+    if let (Some(isa), Some(flash0)) = (map.isa_bios, flashes.first()) {
+        let alias = mem
+            .new_alias(isa.name, flash0.region(), isa.flash_offset, isa.size.into())
+            .map_err(err)?;
+        mem.set_readonly(alias, isa.readonly).map_err(err)?;
+        mem.add_subregion_overlap(rom_memory, isa.addr, alias, isa.priority).map_err(err)?;
+    }
+    Ok((None, flashes))
 }
 
 /// The RAM split of `pc_q35_init()`: returns `(below_4g, above_4g)` and a warning QEMU would
@@ -298,7 +433,8 @@ struct AcpiSource {
     pic: bool,
     i8042: bool,
     hpet: bool,
-    serial: bool,
+    /// The indexes of the ISA serial ports that exist, COM1 being 0.
+    serials: Vec<usize>,
 }
 
 impl AcpiSource {
@@ -320,15 +456,17 @@ impl AcpiSource {
                 });
                 let aml = if bus.parent_dev().is_none() && devfn == ICH9_LPC_DEVFN {
                     let mut isa = Vec::new();
-                    // qbus_build_aml() walks the ISA bus newest first.
+                    // qbus_build_aml() walks the ISA bus newest first. pc_superio_init()
+                    // creates the serial ports in index order and the i8042 after them, and
+                    // the RTC came with the LPC bridge before all of them.
                     if self.i8042 {
                         isa.push(IsaDevice::I8042 { kbd_irq: 1, mouse_irq: 12 });
                     }
-                    if self.serial {
+                    for &index in self.serials.iter().rev() {
                         isa.push(IsaDevice::Serial {
-                            index: 0,
-                            iobase: SERIAL_IO_BASE as u16,
-                            irq: SERIAL_IRQ as u8,
+                            index: index as u32,
+                            iobase: ISA_SERIAL_IO[index] as u16,
+                            irq: ISA_SERIAL_IRQ[index] as u8,
                         });
                     }
                     isa.push(IsaDevice::Rtc { io_base: RTC_IO_BASE as u16, irq: RTC_IRQ as u8 });
@@ -450,6 +588,11 @@ pub struct Q35 {
     cpus: u32,
     max_cpus: u32,
     props: Q35Props,
+    cpu: CpuIdent,
+    /// `-uuid`, if one was given.
+    uuid: Option<[u8; 16]>,
+    smbios: SmbiosOptions,
+    topology: SmbiosTopology,
     kvm: bool,
     smm_enabled: bool,
     vmport: bool,
@@ -464,8 +607,10 @@ pub struct Q35 {
     io_as: Arc<AddressSpace>,
     smm_root: Option<RegionId>,
     smm_as: Option<Arc<AddressSpace>>,
-    bios: RegionId,
-    bios_data: Vec<u8>,
+    /// `pc.bios`, when the firmware is ROM rather than pflash.
+    bios: Option<(RegionId, Vec<u8>)>,
+    /// pflash0 and pflash1, when pflash0 has a drive.
+    flashes: Vec<Arc<Pflash>>,
     roms: Vec<RomBlob>,
 
     fw_cfg: FwCfgIo,
@@ -477,6 +622,8 @@ pub struct Q35 {
     host: Arc<Q35PciHost>,
     lpc: Arc<Ich9Lpc>,
     ahci: Option<Arc<Ich9Ahci>>,
+    /// The ICH9 SMBus controller at 00:1f.3 and its eight empty SPD EEPROMs.
+    smbus: Option<(Arc<Ich9Smbus>, Vec<Arc<SmbusEepromSlave>>)>,
     drives: Mutex<[Option<PluggedDrive>; ICH9_AHCI_PORTS]>,
     gsi: Vec<IrqLine>,
     ioapics: IoApics,
@@ -491,7 +638,8 @@ pub struct Q35 {
     hpet: Option<Arc<Hpet>>,
     hpet_fw: HpetFwConfig,
     rtc: Arc<Mc146818Rtc>,
-    serial: Option<Arc<Serial>>,
+    /// COM1 to COM4 by index, `None` where `serial_hd(i)` does not exist.
+    serials: Vec<Option<Arc<Serial>>>,
     i8042: Option<Arc<I8042>>,
     port92: Option<Arc<Port92>>,
     a20: Arc<A20Line>,
@@ -527,15 +675,18 @@ impl Q35 {
             kvm,
             smm_available,
             phys_bits,
+            cpu,
             props,
             firmware_name,
             firmware,
+            pflash,
             kernel,
             option_roms,
             rom_files,
-            serial_hd,
-            serial_backend,
+            serial_hds,
             boot_order: boot_devices,
+            smbios,
+            topology,
             fw_cfg: mut fw_cfg_cfg,
             clock,
             rtc_clock,
@@ -582,8 +733,8 @@ impl Q35 {
         let (below_4g_mem_size, above_4g_mem_size, warning) =
             q35_ram_split(ram_size, props.max_ram_below_4g);
         warnings.extend(warning);
-        let above_4g_mem_start = 1u64 << 32;
-        let hole64_start = pci_hole64_start(above_4g_mem_start, above_4g_mem_size);
+        let mut above_4g_mem_start = 1u64 << 32;
+        let mut hole64_start = pci_hole64_start(above_4g_mem_start, above_4g_mem_size);
 
         let mem = Arc::new(MemorySystem::new());
         let system = mem.new_container("system", 1 << 64).map_err(err)?;
@@ -594,6 +745,18 @@ impl Q35 {
 
         // pc_memory_init()
         let host_cfg_pci_hole64_size = Q35Config::new(pci, pci, system, io).pci_hole64_size;
+        let mut e820 = E820Table::new();
+        // The HyperTransport window near 1 TiB exists only on AMD hosts, so RAM above 4 GiB
+        // moves past it (and the window is advertised) only for AMD CPUs.
+        if cpu.amd {
+            if hole64_start + host_cfg_pci_hole64_size > AMD_HT_START {
+                above_4g_mem_start = AMD_ABOVE_1TB_START;
+                hole64_start = pci_hole64_start(above_4g_mem_start, above_4g_mem_size);
+            }
+            if phys_bits >= 40 {
+                e820.add_entry(AMD_HT_START, AMD_HT_END - AMD_HT_START + 1, E820_RESERVED);
+            }
+        }
         let maxusedaddr = hole64_start + host_cfg_pci_hole64_size - 1;
         let maxphysaddr = if phys_bits >= 64 { u64::MAX } else { (1u64 << phys_bits) - 1 };
         if maxphysaddr < maxusedaddr {
@@ -605,7 +768,6 @@ impl Q35 {
         let ram = mem.new_ram(Q35_RAM_ID, ram_size).map_err(err)?;
         let below = mem.new_alias("ram-below-4g", ram, 0, below_4g_mem_size.into()).map_err(err)?;
         mem.add_subregion(system, 0, below).map_err(err)?;
-        let mut e820 = E820Table::new();
         e820.add_entry(0, below_4g_mem_size, E820_RAM);
         if above_4g_mem_size > 0 {
             let above = mem
@@ -614,28 +776,9 @@ impl Q35 {
             mem.add_subregion(system, above_4g_mem_start, above).map_err(err)?;
             e820.add_entry(above_4g_mem_start, above_4g_mem_size, E820_RAM);
         }
-        // The HyperTransport window is advertised when the address space reaches it. RAM is
-        // not moved above 1 TiB, which QEMU only does for AMD CPUs.
-        if maxusedaddr >= AMD_HT_START && phys_bits >= 40 {
-            e820.add_entry(AMD_HT_START, AMD_HT_END - AMD_HT_START + 1, E820_RESERVED);
-        }
 
-        // pc_system_firmware_init() without pflash: x86_bios_rom_init(.., rom_memory, false).
-        let bios_name = firmware_name.unwrap_or_else(|| Q35_BIOS_FILENAME.to_string());
-        let bios_data = match firmware {
-            Some(d) if !d.is_empty() && d.len() as u64 % 65536 == 0 => d,
-            _ => return Err(format!("qemu: could not load PC BIOS '{bios_name}'")),
-        };
-        let bios_size = bios_data.len() as u64;
-        let bios = mem.new_ram("pc.bios", bios_size).map_err(err)?;
-        mem.set_readonly(bios, true).map_err(err)?;
-        mem.add_subregion(pci, (1u64 << 32) - bios_size, bios).map_err(err)?;
-        let isa_bios_size = bios_size.min(ISA_BIOS_MAX);
-        let isa_bios = mem
-            .new_alias("isa-bios", bios, bios_size - isa_bios_size, isa_bios_size.into())
-            .map_err(err)?;
-        mem.add_subregion_overlap(pci, MIB - isa_bios_size, isa_bios, 1).map_err(err)?;
-        mem.set_readonly(isa_bios, true).map_err(err)?;
+        let (bios, flashes) =
+            pc_system_firmware_init(&mem, pci, firmware_name, firmware, pflash, &props)?;
 
         let option_rom_mr = mem.new_ram("pc.rom", PC_ROM_SIZE).map_err(err)?;
         mem.set_readonly(option_rom_mr, true).map_err(err)?;
@@ -643,6 +786,8 @@ impl Q35 {
 
         // fw_cfg_arch_create()
         fw_cfg_cfg.enable_graphics = props.graphics;
+        // qemu_uuid_set: an all-zero UUID gives the same tables as none.
+        let uuid = (fw_cfg_cfg.uuid != [0; 16]).then_some(fw_cfg_cfg.uuid);
         let dma: Arc<dyn DmaMemory> = Arc::new(WeakDma(Arc::downgrade(&memory_as)));
         let fw_cfg = fw_cfg_init_io_dma(FW_CFG_IO_BASE, dma, &fw_cfg_cfg).map_err(err)?;
         {
@@ -667,8 +812,13 @@ impl Q35 {
         // FW_CFG_HPET is added once the HPET exists, so it has its final contents.
         fwc.add_bytes(FW_CFG_NUMA, vec![0; (1 + apic_id_limit as usize) * 8]);
 
-        // x86_load_linux() and the option ROMs.
+        // x86_load_linux() and the option ROMs. The `-option-rom` files come first, then the
+        // one the kvmvapic device asks for when the APIC is realized (it needs at least 1 MiB
+        // of RAM to map it), then the kernel's boot ROM.
         let mut option_roms = option_roms;
+        if ram_size >= 1 << 20 {
+            option_roms.push(OptionRom { name: KVMVAPIC_ROM.to_string(), bootindex: -1 });
+        }
         let mut roms = Vec::new();
         let mut kernel_boot = None;
         if let Some(k) = &kernel {
@@ -920,16 +1070,19 @@ impl Q35 {
             None => rtc.connect_irq(gsi[RTC_IRQ as usize].clone()),
         }
 
-        // pc_superio_init()
-        let serial = if serial_hd {
-            let s = Serial::new(Arc::clone(&clock), SERIAL_BAUDBASE_DEFAULT, serial_backend);
-            s.irq().connect(gsi[SERIAL_IRQ as usize].clone());
+        // pc_superio_init(): serial_hds_isa_init(isa_bus, 0, MAX_ISA_SERIAL_PORTS).
+        let mut serials = Vec::with_capacity(MAX_ISA_SERIAL_PORTS);
+        for index in 0..MAX_ISA_SERIAL_PORTS {
+            if !serial_hds.get(index).copied().unwrap_or(false) {
+                serials.push(None);
+                continue;
+            }
+            let s = Serial::new(Arc::clone(&clock), SERIAL_BAUDBASE_DEFAULT, None);
+            s.irq().connect(gsi[ISA_SERIAL_IRQ[index] as usize].clone());
             let r = mem.new_io("serial", SERIAL_IO_SIZE.into(), s.clone()).map_err(err)?;
-            mem.add_subregion(io, SERIAL_IO_BASE, r).map_err(err)?;
-            Some(s)
-        } else {
-            None
-        };
+            mem.add_subregion(io, ISA_SERIAL_IO[index], r).map_err(err)?;
+            serials.push(Some(s));
+        }
         let a20 = Arc::new(A20Line { level: AtomicBool::new(true), handler: RwLock::new(None) });
         let (i8042, port92) = if props.i8042 {
             let k = I8042::new(Arc::clone(&clock), I8042Props::default()).map_err(err)?;
@@ -986,6 +1139,9 @@ impl Q35 {
         } else {
             None
         };
+        // The SMBus controller with blank SPD EEPROMs; QEMU still leaves their data empty.
+        let smbus =
+            if props.smbus { Some(ich9_smbus_q35_init(host.bus()).map_err(err)?) } else { None };
 
         let acpi_src = Arc::new(AcpiSource {
             host: Arc::clone(&host),
@@ -996,7 +1152,7 @@ impl Q35 {
             pic: pic.is_some(),
             i8042: i8042.is_some(),
             hpet: hpet.is_some(),
-            serial: serial.is_some(),
+            serials: (0..MAX_ISA_SERIAL_PORTS).filter(|&i| serials[i].is_some()).collect(),
         });
 
         Ok(Q35 {
@@ -1006,6 +1162,11 @@ impl Q35 {
             cpus,
             max_cpus,
             props,
+            cpu,
+            uuid,
+            smbios,
+            topology: topology
+                .unwrap_or(SmbiosTopology { cores: max_cpus, ..SmbiosTopology::default() }),
             kvm,
             smm_enabled,
             vmport,
@@ -1020,7 +1181,7 @@ impl Q35 {
             smm_root,
             smm_as,
             bios,
-            bios_data,
+            flashes,
             roms,
             fw_cfg,
             e820,
@@ -1030,6 +1191,7 @@ impl Q35 {
             host,
             lpc,
             ahci,
+            smbus,
             drives: Mutex::new([None; ICH9_AHCI_PORTS]),
             gsi,
             ioapics,
@@ -1044,7 +1206,7 @@ impl Q35 {
             hpet,
             hpet_fw,
             rtc,
-            serial,
+            serials,
             i8042,
             port92,
             a20,
@@ -1079,9 +1241,14 @@ impl Q35 {
         Ok(())
     }
 
-    /// Connects the chardev of COM1. Returns false if there is no port.
-    pub fn set_serial_backend(&self, backend: Option<Arc<dyn SerialBackend>>) -> bool {
-        match &self.serial {
+    /// Connects the chardev of the ISA serial port `index`, 0 being COM1. Returns false if
+    /// there is no such port.
+    pub fn set_serial_backend(
+        &self,
+        index: usize,
+        backend: Option<Arc<dyn SerialBackend>>,
+    ) -> bool {
+        match self.serial(index) {
             Some(s) => {
                 s.set_backend(backend);
                 true
@@ -1120,11 +1287,7 @@ impl Q35 {
             c.loader = loader.clone();
             c.rsdp = t.rsdp.clone();
         }
-        for (name, which, data) in [
-            (TABLE_FILE, AcpiBlob::Table, t.table_data),
-            (LOADER_FILE, AcpiBlob::Loader, loader),
-            (RSDP_FILE, AcpiBlob::Rsdp, t.rsdp),
-        ] {
+        let add = |name: &str, which: AcpiBlob, data: Vec<u8>| {
             let src = Arc::clone(&self.acpi_src);
             let cache = Arc::clone(&self.acpi_cache);
             fwc.add_file_callback(
@@ -1134,8 +1297,51 @@ impl Q35 {
                 data,
                 true,
             )
-            .map_err(err)?;
+            .map_err(err)
+        };
+        add(TABLE_FILE, AcpiBlob::Table, t.table_data)?;
+        add(LOADER_FILE, AcpiBlob::Loader, loader)?;
+        // QEMU built with TPM support always adds the event log, empty without a TPM.
+        fwc.add_file(TPMLOG_FILE, Vec::new()).map_err(err)?;
+        add(RSDP_FILE, AcpiBlob::Rsdp, t.rsdp)?;
+        Ok(())
+    }
+
+    /// `fw_cfg_build_smbios()`: the SMBIOS tables and their entry point, for the firmware to
+    /// install.
+    fn build_smbios(&self) -> Result<(), String> {
+        let mut cfg = SmbiosConfig::q35();
+        cfg.uuid = self.uuid;
+        cfg.ep_type = match self.props.smbios_entry_point_type {
+            SmbiosEntryPointType::Ep32 => SmbiosEp::Ep32,
+            SmbiosEntryPointType::Ep64 => SmbiosEp::Ep64,
+            SmbiosEntryPointType::Auto => SmbiosEp::Auto,
+        };
+        cfg.topology = self.topology;
+        cfg.cpuid_version = self.cpu.version;
+        cfg.cpuid_features = self.cpu.features_edx;
+        // x86_cpu_realizefn() sets HTT whenever a package has more than one thread.
+        if self.topology.threads_per_socket() > 1 {
+            cfg.cpuid_features |= CPUID_HT;
         }
+        cfg.ram_size = self.ram_size;
+        cfg.mem_array = mem_array_from_e820(self.e820.entries());
+        cfg.pci_devices = self
+            .host
+            .bus()
+            .devices()
+            .iter()
+            .map(|d| SmbiosPciDevice {
+                id: d.id().unwrap_or_default().to_string(),
+                bus: 0,
+                devfn: d.devfn(),
+                on_root_bus: true,
+            })
+            .collect();
+        let t = smbios_get_tables(&cfg, &self.smbios).map_err(|e| e.message().to_string())?;
+        let fwc = self.fw_cfg.state();
+        fwc.add_file(SMBIOS_TABLES_FILE, t.tables).map_err(err)?;
+        fwc.add_file(SMBIOS_ANCHOR_FILE, t.anchor).map_err(err)?;
         Ok(())
     }
 
@@ -1177,6 +1383,7 @@ impl Q35 {
         if self.props.acpi_enabled() {
             self.acpi_setup()?;
         }
+        self.build_smbios()?;
         fwc.add_file(E820_FILE, self.e820.to_blob()).map_err(err)?;
         fwc.modify_i16(FW_CFG_NB_CPUS, self.cpus as u16);
         self.cmos_init_late()?;
@@ -1202,7 +1409,7 @@ impl Q35 {
             p.reset();
         }
         self.rtc.reset();
-        if let Some(s) = &self.serial {
+        for s in self.serials.iter().flatten() {
             s.reset();
         }
         if let Some(k) = &self.i8042 {
@@ -1219,9 +1426,15 @@ impl Q35 {
         // acpi_build_reset()
         self.acpi_cache.lock().unwrap_or_else(PoisonError::into_inner).patched = false;
 
+        // pflash_cfi01_reset(): back to read array mode. The contents stay.
+        for f in &self.flashes {
+            f.reset();
+        }
         // rom_reset()
-        let block = self.mem.ram_block(self.bios).ok_or("pc.bios has no RAM block")?;
-        block.write(0, &self.bios_data).map_err(err)?;
+        if let Some((bios, data)) = &self.bios {
+            let block = self.mem.ram_block(*bios).ok_or("pc.bios has no RAM block")?;
+            block.write(0, data).map_err(err)?;
+        }
         for rom in &self.roms {
             let mut data = rom.data.clone();
             data.resize(rom.size as usize, 0);
@@ -1286,9 +1499,14 @@ impl Q35 {
         self.mem.ram_block(self.ram)
     }
 
-    /// The firmware region, `pc.bios`.
-    pub fn bios_region(&self) -> RegionId {
-        self.bios
+    /// The firmware region, `pc.bios`, or `None` when the firmware is in pflash.
+    pub fn bios_region(&self) -> Option<RegionId> {
+        self.bios.as_ref().map(|b| b.0)
+    }
+
+    /// The system flashes, pflash0 first. Empty unless pflash0 has a drive.
+    pub fn flashes(&self) -> &[Arc<Pflash>] {
+        &self.flashes
     }
 
     /// Every RAM backed range of system memory after overlaps and the PAM settings are
@@ -1400,6 +1618,11 @@ impl Q35 {
         &self.lpc
     }
 
+    /// The SMBus controller at 00:1f.3, with `smbus=on`.
+    pub fn smbus(&self) -> Option<&Arc<Ich9Smbus>> {
+        self.smbus.as_ref().map(|s| &s.0)
+    }
+
     /// The AHCI controller at 00:1f.2, with `sata=on`.
     pub fn ahci(&self) -> Option<&Arc<Ich9Ahci>> {
         self.ahci.as_ref()
@@ -1485,9 +1708,9 @@ impl Q35 {
         &self.rtc
     }
 
-    /// COM1, when present.
-    pub fn serial(&self) -> Option<&Arc<Serial>> {
-        self.serial.as_ref()
+    /// The ISA serial port `index`, 0 being COM1, when present.
+    pub fn serial(&self, index: usize) -> Option<&Arc<Serial>> {
+        self.serials.get(index).and_then(Option::as_ref)
     }
 
     /// The i8042, with `i8042=on`.
