@@ -11,9 +11,20 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 4
 
 [dependencies]
+ruvm-base.workspace = true
+ruvm-mem.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+kvm-bindings.workspace = true
+kvm-ioctls.workspace = true
+libc.workspace = true
+vmm-sys-util.workspace = true
+
+[dev-dependencies]
+ruvm-mem.workspace = true
 
 [lints]
 workspace = true
