@@ -157,6 +157,21 @@ impl<C> TimerList<C> {
         }
     }
 
+    /// Pops the earliest timer due at or before `now`, disarmed, or `None` if nothing is due.
+    /// Callers that must run each callback with no lock held use this instead of `expire()`.
+    pub fn pop_expired(&mut self, now: i64) -> Option<TimerId> {
+        self.drop_stale();
+        match self.heap.peek() {
+            Some(Reverse((d, ..))) if *d <= now => {}
+            _ => return None,
+        }
+        let Reverse((_, _, slot, _)) = self.heap.pop().expect("peeked");
+        let s = &mut self.slots[slot as usize];
+        s.deadline = None;
+        s.generation = s.generation.wrapping_add(1);
+        Some(TimerId(slot))
+    }
+
     pub fn callback(&self, id: TimerId) -> Option<&C> {
         self.slots.get(id.0 as usize)?.callback.as_ref()
     }

@@ -658,7 +658,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
 
     let memdev = apply_machine_options(machine, &mut cfg)?;
     configure_accelerators(&mut cfg)?;
-    let clock = Arc::new(VirtualClock::default());
+    let clock = VirtualClock::manual(ruvm_base::ClockType::Virtual);
     if cfg.qtest.is_some() {
         // monitor_qapi_event_init() throttles events on the virtual clock under qtest.
         let c = clock.clone();
