@@ -502,6 +502,8 @@ name = "ruvm-cli"
 version = "0.2.3"
 dependencies = [
  "ruvm-base",
+ "ruvm-img",
+ "ruvm-io",
  "ruvm-qapi",
  "ruvm-system",
 ]
@@ -708,10 +710,25 @@ dependencies = [
 [[package]]
 name = "ruvm-img"
 version = "0.2.3"
+dependencies = [
+ "libc",
+ "ruvm-base",
+ "ruvm-block",
+ "ruvm-crypto",
+ "ruvm-qapi",
+ "ruvm-qom",
+]
 
 [[package]]
 name = "ruvm-io"
 version = "0.2.3"
+dependencies = [
+ "libc",
+ "ruvm-base",
+ "ruvm-block",
+ "ruvm-img",
+ "ruvm-qapi",
+]
 
 [[package]]
 name = "ruvm-jit"

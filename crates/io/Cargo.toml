@@ -11,9 +11,16 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 1
 
 [dependencies]
+ruvm-base.workspace = true
+ruvm-block.workspace = true
+ruvm-img.workspace = true
+ruvm-qapi.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true
