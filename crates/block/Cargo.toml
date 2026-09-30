@@ -11,17 +11,25 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-# Two fcntl() calls rustix does not wrap: the byte range locks file-posix takes (OFD on Linux,
-# POSIX elsewhere) and F_PUNCHHOLE on macOS. Both are in src/sys.rs.
-unsafe-budget = 2
+# Calls rustix does not wrap, one unsafe block each:
+# - src/sys.rs: the fcntl() byte range locks file-posix takes (OFD on Linux, POSIX elsewhere),
+#   the F_PUNCHHOLE fcntl() on macOS, and ioctl() for the block device and CD-ROM requests
+#   (BLKROGET, BLKSECTGET, BLKDISCARD, BLKZEROOUT, CDROM_*, DKIOCGETBLOCKSIZE/COUNT).
+# - src/protocol/aio.rs: the linux-aio system calls io_setup, io_submit, io_getevents and
+#   io_destroy, and pushing a submission queue entry onto an io_uring.
+unsafe-budget = 8
 
 [dependencies]
 libc.workspace = true
 ruvm-base.workspace = true
+ruvm-crypto.workspace = true
 ruvm-qapi.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-rustix.workspace = true
+rustix = { workspace = true, features = ["param"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring.workspace = true
 
 [lints]
 workspace = true

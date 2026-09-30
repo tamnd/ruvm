@@ -131,6 +131,7 @@ des = "0.8.1"
 digest = "0.10.7"
 getrandom = "0.3.4"
 hmac = "0.12.1"
+io-uring = "0.7.15"
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 kvm-ioctls = "0.25"
 libc = "0.2.189"

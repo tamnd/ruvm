@@ -12,12 +12,13 @@ use std::sync::Arc;
 use ruvm_base::{Error, Result, report};
 use ruvm_qapi::opts::QemuOptsList;
 use ruvm_qapi::types::{BlockdevDetectZeroesOptions, BlockdevOnError, BlockdevOptions};
-use ruvm_qapi::visit::{QObjectInputVisitor, Visit, qapi_bool_parse};
+use ruvm_qapi::visit::qapi_bool_parse;
 use ruvm_qapi::{QDict, QValue};
 
 use crate::backend::BlockBackend;
 use crate::graph::{BlockGraph, Inherited, OpenCtx};
 use crate::perm::{BLK_PERM_ALL, BLK_PERM_CONSISTENT_READ};
+use crate::throttle::{BucketType, ThrottleConfig};
 
 /// `BlockInterfaceType`: the kind of controller a `-drive` is for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -231,6 +232,59 @@ fn is_common_opt(k: &str) -> bool {
     k.starts_with("throttling.") || k.starts_with("stats-")
 }
 
+/// The `throttling.*` options of `extract_common_blockdev_options()`: the group and the
+/// limits, which must be valid.
+fn throttle_options(o: &mut DriveOpts) -> Result<(Option<String>, ThrottleConfig)> {
+    use BucketType::*;
+    let group = o.take("throttling.group");
+    let mut cfg = ThrottleConfig::new();
+    for (t, name) in [
+        (BpsTotal, "bps-total"),
+        (BpsRead, "bps-read"),
+        (BpsWrite, "bps-write"),
+        (OpsTotal, "iops-total"),
+        (OpsRead, "iops-read"),
+        (OpsWrite, "iops-write"),
+    ] {
+        let avg = o.take_number(&format!("throttling.{name}"))?.unwrap_or(0);
+        let max = o.take_number(&format!("throttling.{name}-max"))?.unwrap_or(0);
+        let len = o.take_number(&format!("throttling.{name}-max-length"))?.unwrap_or(1);
+        let b = cfg.bucket_mut(t);
+        b.avg = avg;
+        b.max = max;
+        b.burst_length = len;
+    }
+    cfg.op_size = o.take_number("throttling.iops-size")?.unwrap_or(0);
+    cfg.is_valid()?;
+    Ok((group, cfg))
+}
+
+/// The `stats-intervals.N` options, as `qdict_array_split()` takes them out: the values of
+/// the indexes from 0 on, while there are any. Anything else under `stats-intervals.` is an
+/// error.
+fn stats_intervals(o: &mut DriveOpts) -> Result<Vec<String>> {
+    let mut list = Vec::new();
+    while let Some(v) = o.take(&format!("stats-intervals.{}", list.len())) {
+        list.push(v);
+    }
+    if let Some((k, _)) = o.0.iter().find(|(k, _)| k.starts_with("stats-intervals.")) {
+        let key = &k["stats-intervals.".len()..];
+        return Err(Error::generic(format!("Invalid option stats-intervals.{key}")));
+    }
+    Ok(list)
+}
+
+/// One string entry of `parse_stats_intervals()`.
+fn parse_stats_interval(blk: &BlockBackend, s: &str) -> Result<()> {
+    match s.parse::<u64>() {
+        Ok(n) if n > 0 && n <= u64::from(u32::MAX) && s.bytes().all(|b| b.is_ascii_digit()) => {
+            blk.acct_stats().add_interval(n as u32);
+            Ok(())
+        }
+        _ => Err(Error::generic(format!("Invalid interval length: {s}"))),
+    }
+}
+
 impl BlockGraph {
     /// `drive_new()`: parses a `-drive` argument, opens its node tree and adds its block
     /// backend under the drive id. `default_if` is the machine's `block_default_type`.
@@ -411,9 +465,10 @@ impl BlockGraph {
                 _ => return Err(Error::generic(format!("invalid parameter value: {v}"))),
             },
         };
-        let throttled =
-            o.0.iter()
-                .any(|(k, v)| k.starts_with("throttling.") && k != "throttling.group" && v != "0");
+        let account_invalid = o.take_bool("stats-account-invalid")?;
+        let account_failed = o.take_bool("stats-account-failed")?;
+        let intervals = stats_intervals(&mut o)?;
+        let (throttling_group, throttle_cfg) = throttle_options(&mut o)?;
         o.0.retain(|(k, _)| !is_common_opt(k));
         let format = o.take("format");
         if format.is_some() && o.has("driver") {
@@ -426,12 +481,6 @@ impl BlockGraph {
         if snapshot {
             return Err(Error::generic("snapshot=on is not supported yet"));
         }
-        if copy_on_read {
-            return Err(Error::generic("copy-on-read=on is not supported yet"));
-        }
-        if throttled {
-            return Err(Error::generic("I/O throttling is not supported yet"));
-        }
 
         let filename = filename.filter(|f| !f.is_empty());
         let (blk, node_name, blockdev) = if filename.is_none() && format.is_none() && o.0.is_empty()
@@ -440,16 +489,21 @@ impl BlockGraph {
             let blk = BlockBackend::new_empty(Some(id.clone()), 0, BLK_PERM_ALL, read_only);
             (blk, None, None)
         } else {
-            let probed = format.is_none() && !o.has("driver");
-            let opts = self.drive_options(o, filename, format, read_only, native_aio)?;
+            let d = self.drive_options(o, filename.is_some(), format, read_only)?;
             let ctx = OpenCtx {
-                root: false,
-                inherit: Inherited { auto_read_only: true, ..Inherited::default() },
-                probed,
+                inherit: Inherited { auto_read_only: true, native_aio, ..Inherited::default() },
                 detect_zeroes: Some(detect_zeroes),
+                ..OpenCtx::default()
             };
-            let (node, w) = self.open_nodes(opts.clone(), ctx)?;
+            let (node, opts, w) = self.open_nodes_qdict(filename.as_deref(), d, ctx)?;
             warnings.extend(w);
+            if copy_on_read {
+                // bdrv_open_common() with BDRV_O_COPY_ON_READ.
+                if node.read_only() {
+                    return Err(Error::generic("Can't use copy-on-read on read-only device"));
+                }
+                node.enable_copy_on_read();
+            }
             let name = node.name.clone();
             // blk_new_open(): without BDRV_O_RDWR in the flags only consistent read.
             let blk = BlockBackend::with_node(
@@ -458,8 +512,16 @@ impl BlockGraph {
                 BLK_PERM_CONSISTENT_READ,
                 BLK_PERM_ALL,
             )?;
+            blk.acct_stats().setup(account_invalid, account_failed, &[])?;
+            for i in &intervals {
+                parse_stats_interval(&blk, i)?;
+            }
             (blk, Some(name), Some(opts))
         };
+        if throttle_cfg.enabled() {
+            blk.io_limits_enable(throttling_group.as_deref().unwrap_or(&id));
+            blk.set_io_limits(&throttle_cfg);
+        }
         blk.set_enable_write_cache(!writethrough);
         let blk = Arc::new(blk);
         self.monitor_add_blk(&id, blk)?;
@@ -491,16 +553,14 @@ impl BlockGraph {
         Ok(info)
     }
 
-    /// The node options `bdrv_open()` gets from `blockdev_init()`: the format node, or the
-    /// protocol node when `driver` names one, with the file name in the right place.
+    /// The node options `bdrv_open()` gets from `blockdev_init()`, nested at the dots.
     fn drive_options(
         &self,
         o: DriveOpts,
-        filename: Option<String>,
+        has_filename: bool,
         format: Option<String>,
         read_only: bool,
-        native_aio: bool,
-    ) -> Result<BlockdevOptions> {
+    ) -> Result<QDict> {
         let mut d = QDict::new();
         for (k, v) in &o.0 {
             put_path(&mut d, k, v)?;
@@ -522,41 +582,19 @@ impl BlockGraph {
         if !d.contains_key("auto-read-only") {
             d.put("auto-read-only", "on");
         }
-        let driver = match (format, d.get_str("driver")) {
-            (Some(f), _) => f,
-            (None, Some(drv)) => drv.to_string(),
-            // Probed, only raw is known so far. The open code checks the guess.
-            (None, None) => "raw".to_string(),
-        };
-        d.put("driver", driver.as_str());
-        if is_protocol(&driver) {
-            if let Some(f) = filename {
-                d.put("filename", f);
-            }
-            if native_aio && driver == "file" && !d.contains_key("aio") {
-                d.put("aio", "native");
-            }
-        } else if let Some(f) = filename {
-            if !d.contains_key("file") {
-                d.put("file", QDict::new());
-            }
-            let Some(file) = d.get_mut("file").and_then(QValue::as_dict_mut) else {
-                return Err(Error::generic("Cannot specify both 'file' and 'file.*' options"));
-            };
-            if !file.contains_key("driver") {
-                file.put("driver", "file");
-            }
-            file.put("filename", f);
-            if native_aio && file.get_str("driver") == Some("file") && !file.contains_key("aio") {
-                file.put("aio", "native");
-            }
-        } else if !d.contains_key("file") {
+        if let Some(f) = format {
+            d.put("driver", f);
+        }
+        // A format without a file: raw_open() and the other formats fail to open their
+        // child. Say so before the options visitor complains about a missing member.
+        let protocol = d
+            .get_str("driver")
+            .and_then(crate::drivers::find_format)
+            .is_none_or(|drv| drv.protocol_name.is_some());
+        if !protocol && !has_filename && !d.contains_key("file") {
             return Err(Error::generic("A block device must be specified for \"file\""));
         }
-        let mut v = QObjectInputVisitor::new_keyval(QValue::Dict(d));
-        let mut opts = BlockdevOptions::default();
-        BlockdevOptions::visit(&mut v, None, &mut opts)?;
-        Ok(opts)
+        Ok(d)
     }
 
     /// `drive_get()`: the drive at `bus` and `unit` of an interface.
@@ -583,11 +621,6 @@ impl BlockGraph {
     pub fn drives(&self) -> Vec<DriveInfo> {
         self.drives.lock().unwrap().clone()
     }
-}
-
-/// Whether `driver` is a protocol driver that takes a `filename` itself.
-fn is_protocol(driver: &str) -> bool {
-    matches!(driver, "file" | "host_device" | "host_cdrom" | "null-co" | "null-aio")
 }
 
 #[cfg(test)]
