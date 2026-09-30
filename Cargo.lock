@@ -227,6 +227,10 @@ version = "0.1.3"
 [[package]]
 name = "ruvm-cli"
 version = "0.1.3"
+dependencies = [
+ "ruvm-base",
+ "ruvm-system",
+]
 
 [[package]]
 name = "ruvm-crypto"
@@ -492,6 +496,10 @@ version = "0.1.3"
 [[package]]
 name = "ruvm-system"
 version = "0.1.3"
+dependencies = [
+ "ruvm-base",
+ "ruvm-qapi-gen",
+]
 
 [[package]]
 name = "ruvm-target-alpha"

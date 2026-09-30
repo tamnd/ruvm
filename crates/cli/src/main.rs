@@ -3,13 +3,14 @@
 //! The ruvm multi-call binary, answering to every QEMU binary name.
 //!
 //! An installer puts `ruvm` on disk once and symlinks every QEMU name to it. At startup the file
-//! name in argv[0] decides which program this is, the way busybox does it. `ruvm --list` prints
+//! name in `argv[0]` decides which program this is, the way busybox does it. `ruvm --list` prints
 //! the names, and `ruvm <name> [args]` runs a personality without a symlink, which is how the
 //! tests reach them.
 
 use std::process::ExitCode;
 
 mod names;
+mod system;
 mod version;
 
 use names::Personality;
@@ -54,6 +55,9 @@ fn ruvm(args: &[String]) -> ExitCode {
 }
 
 fn run(personality: &Personality, argv0: &str, args: &[String]) -> ExitCode {
+    if let Personality::System(target) = personality {
+        return system::run(target, argv0, args);
+    }
     if wants_version(personality, args) {
         if let Some(text) = version::text(personality, argv0) {
             print!("{text}");

@@ -18,6 +18,8 @@ path = "src/main.rs"
 unsafe-budget = 0
 
 [dependencies]
+ruvm-base.workspace = true
+ruvm-system.workspace = true
 
 [lints]
 workspace = true
