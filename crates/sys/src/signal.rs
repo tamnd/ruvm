@@ -88,3 +88,17 @@ pub fn on_termination(on_signal: impl Fn(Killed) + Send + 'static) -> io::Result
     }
     Ok(())
 }
+
+/// `set_exit_with_parent()` for `-run-with exit-with-parent=on`: calls `on_exit` with a SIGTERM
+/// from the parent once the parent process is gone. The macOS version of QEMU does the same
+/// from a thread, and this polls the parent pid so it works the same way everywhere.
+pub fn on_parent_exit(on_exit: impl FnOnce(Killed) + Send + 'static) -> io::Result<()> {
+    let ppid = std::os::unix::process::parent_id();
+    std::thread::Builder::new().name("exit-parent".into()).spawn(move || {
+        while std::os::unix::process::parent_id() == ppid {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        on_exit(Killed { signo: libc::SIGTERM, pid: ppid as i32 });
+    })?;
+    Ok(())
+}

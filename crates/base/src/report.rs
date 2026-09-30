@@ -54,6 +54,12 @@ impl Drop for LocationGuard {
     }
 }
 
+/// The current location, for code that reports on it later as QEMU does with the `loc` a
+/// `QemuOpts` keeps.
+pub fn current_location() -> Option<Location> {
+    LOCATIONS.with(|l| l.borrow().last().cloned())
+}
+
 /// The current location, formatted the way `error_print_loc()` does, or an empty string.
 pub fn location_prefix() -> String {
     LOCATIONS.with(|l| match l.borrow().last() {

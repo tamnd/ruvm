@@ -42,7 +42,13 @@ The Rust VMMs (Firecracker, Cloud Hypervisor, crosvm and the rust-vmm crates und
 
 ## Status
 
-Nothing runs a guest yet. M0 is finished and released as 0.1.0: the workspace, the checks, CI, the vendored QEMU inputs and a `ruvm` binary that answers `--version` under every QEMU name. The milestones, in order:
+Nothing runs a guest yet. M0 is finished and released as 0.1.0: the workspace, the checks, CI, the vendored QEMU inputs and a `ruvm` binary that answers `--version` under every QEMU name. M1 is in progress. `qemu-system-*` can start the empty `none` machine with the `qtest` accelerator, the way QEMU's own tests start it, and serve QMP and the qtest protocol on sockets:
+
+```sh
+ruvm qemu-system-x86_64 -machine none -accel qtest -qmp unix:/tmp/qmp.sock,server=on,wait=off
+```
+
+The milestones, in order:
 
 | Milestone | What it delivers |
 |---|---|

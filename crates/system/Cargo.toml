@@ -14,7 +14,15 @@ publish = false
 unsafe-budget = 0
 
 [dependencies]
+ruvm-accel-qtest.workspace = true
 ruvm-base.workspace = true
+ruvm-chardev.workspace = true
+ruvm-monitor.workspace = true
+ruvm-qapi.workspace = true
+ruvm-qom.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+ruvm-sys.workspace = true
 
 [build-dependencies]
 ruvm-qapi-gen.workspace = true
