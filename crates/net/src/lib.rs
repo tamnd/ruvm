@@ -12,7 +12,8 @@
 //! `netdev_del`). Device models attach through [`Net::new_nic`] with their own
 //! [`NetClientOps`].
 //!
-//! Backends here: `tap`, `socket`, `stream`, `dgram` and `hubport`. Each backend with a file
+//! Backends here: `tap`, `socket`, `stream`, `dgram`, `hubport`, `user` (libslirp, loaded when
+//! the backend is first used), `passt` (Linux only) and `vhost-user`. Each backend with a file
 //! descriptor runs a small I/O thread that watches it, since there is no shared event loop yet.
 
 #![deny(unsafe_code)]
@@ -21,6 +22,7 @@ mod client;
 mod hub;
 mod net;
 mod opts_visitor;
+mod passt;
 mod util;
 
 #[cfg(unix)]
@@ -29,6 +31,8 @@ mod dgram;
 mod fd;
 #[cfg(unix)]
 mod poll;
+#[cfg(all(unix, feature = "slirp"))]
+mod slirp;
 #[cfg(unix)]
 mod sock;
 #[cfg(unix)]
@@ -39,6 +43,8 @@ mod stream;
 mod tap;
 #[cfg(target_os = "linux")]
 mod tap_linux;
+#[cfg(unix)]
+mod vhost_user;
 
 pub use client::{
     ETH_ZLEN, MAX_QUEUE_NUM, NET_BUFSIZE, NetClient, NetClientOps, NetOffloads, NetQueue,
@@ -51,8 +57,15 @@ pub use net::{
     netdev_is_modern, parse_modern, show_netdevs,
 };
 pub use opts_visitor::OptsVisitor;
+pub use passt::{PasstOptions, passt_args};
+#[cfg(all(unix, feature = "slirp"))]
+pub use slirp::libslirp_version;
 #[cfg(unix)]
 pub use tap::{DEFAULT_NETWORK_DOWN_SCRIPT, DEFAULT_NETWORK_SCRIPT, TapState};
 pub use util::{
     MacAddr, SocketReadState, convert_host_port, inet_aton, parse_host_port, parse_macaddr,
+};
+#[cfg(unix)]
+pub use vhost_user::{
+    ChardevResolver, VHOST_USER_NET_PROTOCOL_FEATURES, VhostUserChardev, VhostUserNet,
 };

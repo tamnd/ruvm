@@ -715,6 +715,7 @@ dependencies = [
  "rustix",
  "ruvm-base",
  "ruvm-qapi",
+ "ruvm-vhost",
  "vmm-sys-util",
 ]
 

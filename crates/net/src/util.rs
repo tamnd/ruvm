@@ -252,6 +252,50 @@ impl SocketReadState {
     }
 }
 
+/// Makes a new file or directory in the temporary directory, named `prefix` plus six random
+/// characters plus `suffix`, the way `g_file_open_tmp()` and `g_dir_make_tmp()` fill in their
+/// `XXXXXX`. Only the owner may use it.
+#[cfg(unix)]
+pub(crate) fn make_temp(
+    prefix: &str,
+    suffix: &str,
+    dir: bool,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let base = std::env::temp_dir();
+    let mut last = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+    for attempt in 0..100u32 {
+        let mut n = RandomState::new().hash_one((std::process::id(), attempt));
+        let mut name = String::from(prefix);
+        for _ in 0..6 {
+            name.push(char::from(CHARS[(n % CHARS.len() as u64) as usize]));
+            n /= CHARS.len() as u64;
+        }
+        name.push_str(suffix);
+        let path = base.join(name);
+        let r = if dir {
+            std::fs::DirBuilder::new().mode(0o700).create(&path)
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .map(drop)
+        };
+        match r {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
