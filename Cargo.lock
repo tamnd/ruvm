@@ -476,6 +476,11 @@ version = "0.2.1"
 [[package]]
 name = "ruvm-hw-input"
 version = "0.2.1"
+dependencies = [
+ "ruvm-base",
+ "ruvm-hw-core",
+ "ruvm-mem",
+]
 
 [[package]]
 name = "ruvm-hw-intc"
