@@ -412,6 +412,9 @@ version = "0.1.0"
 [[package]]
 name = "ruvm-qapi"
 version = "0.1.0"
+dependencies = [
+ "ruvm-base",
+]
 
 [[package]]
 name = "ruvm-qapi-gen"
