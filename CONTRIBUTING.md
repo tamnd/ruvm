@@ -32,3 +32,7 @@ Documentation, pull request descriptions, issue comments and commit messages fol
 ## Commits and pull requests
 
 One logical change per pull request. The title says what changes in the imperative, like "Add the PL011 UART". The body says what was wrong or missing, what the change does, and how it was tested. If it implements part of a milestone, say which one, and the milestone issue gets its checkbox ticked when the pull request merges.
+
+## Releases
+
+`cargo xtask version 0.1.1` moves the workspace version and every internal pin in one go. Add a `## 0.1.1` section to the changelog in the same pull request, merge it, then push the tag `v0.1.1`. The release workflow refuses a tag that does not match the version in `Cargo.toml` or that has no changelog section, builds the archives for Linux, macOS and Windows, attests them and publishes the release with that changelog section as its notes.

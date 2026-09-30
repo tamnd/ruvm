@@ -17,6 +17,7 @@ mod provenance;
 mod style;
 mod unsafe_audit;
 mod upstream;
+mod version;
 mod workspace;
 
 fn main() -> ExitCode {
@@ -29,6 +30,7 @@ fn main() -> ExitCode {
         Some("style") => style::check(&root),
         Some("upstream-sync") => upstream::sync(&root, &args[1..]),
         Some("vendor-check") => upstream::check(&root),
+        Some("version") => version::set(&root, args.get(1).map(String::as_str)),
         Some("ci") => ci(&root),
         Some("help" | "--help" | "-h") | None => {
             usage();
@@ -59,6 +61,7 @@ fn usage() {
   upstream-sync  refresh vendor-qemu/ from a QEMU tag and print what changed
                  cargo xtask upstream-sync <tag> [--from <qemu checkout>]
   vendor-check   check vendor-qemu/ against its MANIFEST
+  version        set the workspace version and every internal pin, cargo xtask version <x.y.z>
   ci             everything CI runs, in the order it runs it"
     );
 }
@@ -92,7 +95,7 @@ fn step(name: &str, run: impl FnOnce() -> Result<(), String>) -> Result<(), Stri
     Ok(())
 }
 
-fn cargo(args: &[&str]) -> Result<(), String> {
+pub(crate) fn cargo(args: &[&str]) -> Result<(), String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let status = Command::new(cargo)
         .args(args)

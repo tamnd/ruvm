@@ -1,6 +1,10 @@
 # The dependency list in spec/24-workspace-layout.md is short on purpose. Weekly is often enough
 # for a list that size, and grouping patch and minor bumps keeps the noise down without hiding a
 # major bump, which always gets its own pull request.
+#
+# The cooldown holds a new release back for a week before a bump is proposed. Most malicious
+# releases of a real package are caught and yanked within days, and nothing in an emulator needs a
+# dependency the day it comes out.
 
 version: 2
 updates:
@@ -11,6 +15,8 @@ updates:
       day: monday
       time: "06:00"
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "deps"
     labels: ["dependencies"]
@@ -28,6 +34,8 @@ updates:
       interval: weekly
       day: monday
       time: "06:00"
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "ci"
     labels: ["github_actions"]

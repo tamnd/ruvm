@@ -1,0 +1,70 @@
+# Build ruvm for one target and package it as the archives a release publishes.
+#
+# A composite action rather than steps in the workflow, because the release matrix is split in two
+# (see release.yml) and both halves run exactly these steps. The caller checks the repository out,
+# since a local action is read from the workspace.
+
+name: build archive
+description: build ruvm and ruvm-ga for one target and package them with their checksums
+
+inputs:
+  target:
+    description: the Rust target triple to build
+    required: true
+  tag:
+    description: the tag the archives are named after
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: add the target
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      run: rustup target add "$TARGET"
+    - name: build
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      # The dist profile is fat LTO with one codegen unit, which is what spec/21-performance.md
+      # measures, so what people download is what the numbers are about.
+      run: cargo build --locked --profile dist --bin ruvm --bin ruvm-ga --target "$TARGET"
+    - name: package
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        name="ruvm-$TAG-$TARGET"
+        mkdir -p "dist/$name"
+        exe=""
+        if [ "$RUNNER_OS" = "Windows" ]; then exe=".exe"; fi
+        cp "target/$TARGET/dist/ruvm$exe" "target/$TARGET/dist/ruvm-ga$exe" "dist/$name/"
+        cp README.md CHANGELOG.md LICENSE-GPL-2.0 LICENSE-MIT LICENSE-APACHE "dist/$name/"
+        cd dist
+        # Both formats, because the people who want a .zip and the people who want a .tar.gz do not
+        # overlap and neither group should have to install a tool.
+        tar --format=ustar -czf "$name.tar.gz" "$name"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          7z a -tzip "$name.zip" "$name" > /dev/null
+        else
+          zip -qr "$name.zip" "$name"
+        fi
+        for f in "$name.tar.gz" "$name.zip"; do
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$f" > "$f.sha256"
+          else
+            shasum -a 256 "$f" > "$f.sha256"
+          fi
+        done
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: dist-${{ inputs.target }}
+        path: |
+          dist/*.tar.gz
+          dist/*.zip
+          dist/*.sha256
+        if-no-files-found: error
+        retention-days: 7
