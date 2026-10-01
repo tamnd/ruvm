@@ -194,7 +194,8 @@ fn commit(
 /// The work of the active commit job, from `mirror_run()` on.
 fn copy_to_base(bs: &str, base_bs: &str, rate_limit: i64) -> Result<()> {
     let g = graph();
-    let job_err = |e: std::io::Error| Error::generic(strerror(&e));
+    // common_block_job_cb(): what the job fails with reaches the user as "Block job failed".
+    let job_err = |e: std::io::Error| Error::generic(format!("Block job failed: {}", strerror(&e)));
     let source: Arc<BlockBackend> =
         BlockBackend::new(g, bs, BLK_PERM_CONSISTENT_READ, BLK_PERM_ALL)?;
     let target = BlockBackend::new(

@@ -109,7 +109,7 @@ pub(crate) fn run(cmd: &Cmd, args: Vec<String>) -> Flow<i32> {
     let mut fmt = None;
     let mut cache = BDRV_DEFAULT_CACHE.to_string();
     let mut fix = 0;
-    let mut flags = OpenFlags::default();
+    let mut flags = OpenFlags { check: true, ..OpenFlags::default() };
     let mut quiet = false;
     let mut image_opts = false;
     let mut force_share = false;

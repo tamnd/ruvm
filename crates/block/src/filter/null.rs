@@ -22,12 +22,14 @@ use crate::node::{
 /// `bdrv_null_co`.
 pub(crate) static NULL_CO: DriverDef = DriverDef::protocol("null-co", "null-co", null_open)
     .with_parse_filename(null_co_parse_filename)
-    .with_strong_opts(NULL_STRONG_OPTS);
+    .with_strong_opts(NULL_STRONG_OPTS)
+    .with_size_opts(&["size"]);
 
 /// `bdrv_null_aio`.
 pub(crate) static NULL_AIO: DriverDef = DriverDef::protocol("null-aio", "null-aio", null_open)
     .with_parse_filename(null_aio_parse_filename)
-    .with_strong_opts(NULL_STRONG_OPTS);
+    .with_strong_opts(NULL_STRONG_OPTS)
+    .with_size_opts(&["size"]);
 
 /// `null_strong_runtime_opts`.
 const NULL_STRONG_OPTS: &[&str] = &["size", "read-zeroes"];

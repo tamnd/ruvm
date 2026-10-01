@@ -102,7 +102,25 @@ fn make_images(dir: &Path) {
     if qcow2() {
         img(&["create", "-q", "-f", "qcow2", "-b", "a.raw", "-F", "raw", "q.qcow2"]);
         io(dir, &["-f", "qcow2", "-c", "write -P 0x66 512k 64k", "q.qcow2"]);
+        img(&["create", "-q", "-f", "qcow2", "s.qcow2", "1M"]);
+        img(&["snapshot", "-c", "s1", "s.qcow2"]);
+        // A fresh 1 MiB qcow2 has its refcount block in the third cluster, and in it the 16-bit
+        // refcounts of the header, the refcount table, the block itself and the L1 table. One
+        // image gets a refcount for a fifth cluster that nothing uses, which is a leak, and
+        // one loses the refcount of its header, which is corruption.
+        img(&["create", "-q", "-f", "qcow2", "leak.qcow2", "1M"]);
+        let leak = std::fs::OpenOptions::new().write(true).open(dir.join("leak.qcow2")).unwrap();
+        leak.set_len(5 * 65536).unwrap();
+        poke(&leak, 0x20008, &[0, 1]);
+        img(&["create", "-q", "-f", "qcow2", "bad.qcow2", "1M"]);
+        let bad = std::fs::OpenOptions::new().write(true).open(dir.join("bad.qcow2")).unwrap();
+        poke(&bad, 0x20000, &[0, 0]);
     }
+}
+
+fn poke(file: &std::fs::File, offset: u64, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(bytes, offset).unwrap();
 }
 
 fn qcow2() -> bool {
@@ -247,6 +265,30 @@ fn same_image(a: &Path, b: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// How many times a case runs before a difference in allocated size counts.
+const ALLOCATION_ATTEMPTS: usize = 3;
+
+/// Whether the two runs differ only in the allocated size of an image: `disk size` in the human
+/// output and `actual-size` in the JSON. Both come from `st_blocks`, and APFS, most visibly on a
+/// nearly full disk, now and then reports a freshly written sparse file as fully allocated for
+/// either program, with the same writes and the same flushes that give the sparse size on every
+/// other run. A case that differs only there is run again with fresh files, so a difference that
+/// is really ours still fails, and one that is the file system's does not.
+fn only_allocation_differs(q: &[Step], r: &[Step]) -> bool {
+    let size_line = |l: &str| l.contains("disk size: ") || l.contains("\"actual-size\": ");
+    q != r
+        && q.len() == r.len()
+        && q.iter().zip(r).all(|(a, b)| {
+            let (al, bl): (Vec<_>, Vec<_>) =
+                (a.stdout.lines().collect(), b.stdout.lines().collect());
+            a.args == b.args
+                && a.status == b.status
+                && a.stderr == b.stderr
+                && al.len() == bl.len()
+                && al.iter().zip(&bl).all(|(x, y)| x == y || (size_line(x) && size_line(y)))
+        })
+}
+
 /// Runs each case through both programs and fails with every difference.
 fn check(name: &str, cases: &[&[&str]]) {
     if !available() {
@@ -259,19 +301,28 @@ fn check(name: &str, cases: &[&[&str]]) {
 
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
-        let mut results = Vec::new();
-        let mut dirs = Vec::new();
-        for (who, bin) in [("qemu", QEMU_IMG), ("ruvm", OURS)] {
-            // Both copies live at paths of the same length, so the texts line up.
-            let dir = scratch.0.join(format!("{i:03}-{who}"));
-            std::fs::create_dir_all(&dir).unwrap();
-            for e in std::fs::read_dir(&template).unwrap() {
-                let e = e.unwrap();
-                std::fs::copy(e.path(), dir.join(e.file_name())).unwrap();
+        let mut attempt = 0;
+        let (results, dirs) = loop {
+            let mut results = Vec::new();
+            let mut dirs = Vec::new();
+            for (who, bin) in [("qemu", QEMU_IMG), ("ruvm", OURS)] {
+                // Both copies live at paths of the same length, so the texts line up.
+                let dir = scratch.0.join(format!("{i:03}{attempt}-{who}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                for e in std::fs::read_dir(&template).unwrap() {
+                    let e = e.unwrap();
+                    std::fs::copy(e.path(), dir.join(e.file_name())).unwrap();
+                }
+                results.push(run_case(bin, &dir, case));
+                dirs.push(dir);
             }
-            results.push(run_case(bin, &dir, case));
-            dirs.push(dir);
-        }
+            // See `only_allocation_differs` for why a case gets another go.
+            attempt += 1;
+            if attempt == ALLOCATION_ATTEMPTS || !only_allocation_differs(&results[0], &results[1])
+            {
+                break (results, dirs);
+            }
+        };
         if results[0] != results[1] {
             for (q, r) in results[0].iter().zip(&results[1]) {
                 if q != r {
@@ -554,6 +605,19 @@ fn qcow2_images() {
             &["bitmap --add q.qcow2 b0", "info q.qcow2"],
             &["commit q.qcow2", "info q.qcow2"],
             &["amend -o compat=0.10 q.qcow2", "info q.qcow2"],
+            &["snapshot -l s.qcow2"],
+            &["info s.qcow2"],
+            &["snapshot -a s1 s.qcow2", "snapshot -d s1 s.qcow2", "snapshot -l s.qcow2"],
+            &["snapshot -d nosuch s.qcow2"],
+            &["info --limits q.qcow2"],
+            &["check leak.qcow2"],
+            &["check --output=json leak.qcow2"],
+            &["check -r leaks leak.qcow2", "check leak.qcow2"],
+            &["check bad.qcow2"],
+            &["check --output=json bad.qcow2"],
+            &["check -r all bad.qcow2", "check bad.qcow2"],
+            &["compare q.qcow2 bad.qcow2"],
+            &["compare -s s.qcow2 leak.qcow2"],
         ],
     );
 }
@@ -588,4 +652,66 @@ fn other_formats() {
             ],
         );
     }
+}
+
+/// Images made by either program pass `qemu-img check` from the other, for every format that has
+/// a check, whether they are freshly created, written by qemu-io or converted with data in them.
+#[test]
+fn cross_check() {
+    if !available() {
+        return;
+    }
+    let scratch = Scratch::new("cross");
+    let dir = &scratch.0;
+    make_images(dir);
+    let mut failures = Vec::new();
+    for fmt in ["qcow2", "qed", "vdi", "vhdx", "vmdk", "parallels"] {
+        if !ruvm_block::tools::format_exists(fmt) {
+            eprintln!("skipping {fmt}: the driver is not registered");
+            continue;
+        }
+        for (maker, checker) in [(QEMU_IMG, OURS), (OURS, QEMU_IMG)] {
+            let who = if maker == OURS { "ruvm" } else { "qemu" };
+            // Each command line makes the image named last in the pair.
+            let mut made = vec![
+                (format!("create -q -f {fmt} {who}-new.{fmt} 8M"), format!("{who}-new.{fmt}")),
+                (format!("convert -O {fmt} t.qed {who}-conv.{fmt}"), format!("{who}-conv.{fmt}")),
+            ];
+            if fmt == "qcow2" {
+                made.push((
+                    format!("convert -c -O qcow2 a.raw {who}-comp.qcow2"),
+                    format!("{who}-comp.qcow2"),
+                ));
+                made.push((
+                    format!(
+                        "create -q -f qcow2 -o cluster_size=4096,refcount_bits=1 -b a.raw -F raw \
+                         {who}-back.qcow2"
+                    ),
+                    format!("{who}-back.qcow2"),
+                ));
+            }
+            for (line, _) in &made {
+                run_ok(dir, maker, &line.split_whitespace().collect::<Vec<_>>());
+            }
+            // Data written by QEMU's qemu-io on top, so the new image has allocations too.
+            let new = &made[0].1;
+            io(dir, &["-f", fmt, "-c", "write -P 0x77 1M 192k", "-c", "write -z 4M 64k", new]);
+            for (_, img) in &made {
+                let out = Command::new(checker)
+                    .args(["check", "-f", fmt, img])
+                    .current_dir(dir)
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&out.stdout);
+                if out.status.code() != Some(0) || !text.contains("No errors were found") {
+                    failures.push(format!(
+                        "{img} made by {who}, checked by the other: status {:?}\n{text}{}",
+                        out.status.code(),
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Image creation: `blockdev-create` from block/create.c, `bdrv_co_create_file()` and the
-//! helpers the format drivers' create functions use from block.c and block-backend.c.
+//! Image creation: `blockdev-create` from block/create.c, `bdrv_co_create_file()`,
+//! `bdrv_co_create_opts_simple()` for the protocol drivers that can only "create" on something
+//! that exists (host devices and NBD), and the helpers the format drivers' create functions use
+//! from block.c and block-backend.c.
 //!
 //! Difference from QEMU: `blockdev-create` is a job in QEMU. Here [`BlockGraph::blockdev_create`]
 //! runs the driver's create function to the end on the caller's thread; the job wrapper comes
 //! with the job layer.
 
+use std::io;
 use std::sync::Arc;
 
 use ruvm_base::{Error, Result};
 use ruvm_qapi::QDict;
-use ruvm_qapi::types::{BlockdevCreateOptions, BlockdevRef};
+use ruvm_qapi::types::{BlockdevCreateOptions, BlockdevRef, PreallocMode};
+use ruvm_qapi::visit::parse_option_size;
 
 use crate::backend::BlockBackend;
-use crate::drivers;
+use crate::drivers::{self, DriverDef};
 use crate::graph::{BlockGraph, OpenCtx};
-use crate::node::Node;
+use crate::node::{BDRV_SECTOR_SIZE, Node, is_enotsup};
 use crate::perm::{BLK_PERM_ALL, BLK_PERM_RESIZE, BLK_PERM_WRITE};
 
 impl BlockGraph {
@@ -160,4 +164,84 @@ mod tests {
             "Could not create '/nonexistent-dir/x.img': No such file or directory"
         );
     }
+}
+
+fn error_is_enotsup(e: &Error) -> bool {
+    std::error::Error::source(e).and_then(|c| c.downcast_ref::<io::Error>()).is_some_and(is_enotsup)
+}
+
+/// `bdrv_co_create_opts_simple()`: "creating" an image on a device opens it, checks that it
+/// is large enough and zeroes its first sector.
+pub(crate) fn create_opts_simple(
+    drv: &DriverDef,
+    filename: &str,
+    options: &mut QDict,
+) -> Result<()> {
+    let take = |o: &mut QDict, k: &str| o.remove(k).and_then(|v| v.as_str().map(str::to_owned));
+    let size = match take(options, "size") {
+        Some(v) => parse_option_size("size", &v)?,
+        None => 0,
+    };
+    let prealloc = match take(options, "preallocation") {
+        Some(v) => PreallocMode::from_name(&v)
+            .ok_or_else(|| Error::generic(format!("invalid parameter value: {v}")))?,
+        None => PreallocMode::Off,
+    };
+    if prealloc != PreallocMode::Off {
+        return Err(Error::generic(format!(
+            "Unsupported preallocation mode '{}'",
+            prealloc.as_str()
+        )));
+    }
+
+    let graph = BlockGraph::new();
+    let mut open_opts = QDict::new();
+    open_opts.put("driver", drv.format_name);
+    open_opts.put("read-only", "off");
+    let ctx = OpenCtx { protocol: true, ..OpenCtx::default() };
+    let blk = graph
+        .open_nodes_qdict(Some(filename), open_opts, ctx)
+        .and_then(|(bs, _, _)| {
+            BlockBackend::with_node(None, bs, BLK_PERM_WRITE | BLK_PERM_RESIZE, BLK_PERM_ALL)
+        })
+        .map_err(|e| {
+            e.prepend(format_args!(
+                "Protocol driver '{}' does not support creating new images, so an existing \
+                 image must be selected as the target; however, opening the given target as \
+                 an existing image failed: ",
+                drv.format_name
+            ))
+        })?;
+    let Some(bs) = blk.root() else {
+        return Err(Error::generic("No medium inserted"));
+    };
+
+    // create_file_fallback_truncate()
+    let truncated = bs.truncate_full(size as i64, false, PreallocMode::Off, 0);
+    if let Err(e) = &truncated {
+        if !error_is_enotsup(e) {
+            return truncated;
+        }
+    }
+    let len = blk
+        .getlength()
+        .map_err(|e| Error::from_io("Failed to inquire the new image file's length", e))?;
+    if len < size {
+        return match truncated {
+            Err(e) => Err(e),
+            Ok(()) => Err(Error::with_cause(
+                "Failed to inquire the new image file's length",
+                crate::node::errno(libc::ENOTSUP),
+            )),
+        };
+    }
+
+    // create_file_fallback_zero_first_sector()
+    let alignment = u64::from(bs.limits().pwrite_zeroes_alignment);
+    let bytes_to_clear = len.min(BDRV_SECTOR_SIZE.max(alignment));
+    if bytes_to_clear != 0 {
+        blk.pwrite_zeroes(0, bytes_to_clear, true)
+            .map_err(|e| Error::from_io("Failed to clear the new image's first sector", e))?;
+    }
+    Ok(())
 }

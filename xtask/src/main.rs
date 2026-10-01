@@ -13,6 +13,7 @@ use std::process::{Command, ExitCode};
 use std::time::Instant;
 
 mod boot_smoke;
+mod iotests;
 mod layers;
 mod provenance;
 mod style;
@@ -26,6 +27,7 @@ fn main() -> ExitCode {
     let root = root();
     let result = match args.first().map(String::as_str) {
         Some("boot-smoke") => boot_smoke::run(&root),
+        Some("iotests") => iotests::run(&root, &args[1..]),
         Some("layers") => layers::check(&root),
         Some("provenance") => provenance::check(&root),
         Some("unsafe-audit") => unsafe_audit::check(&root),
@@ -57,6 +59,8 @@ fn usage() {
         "cargo xtask <task>
 
   boot-smoke     boot Linux on microvm and q35 under KVM, time it and check the microvm budget
+  iotests        run QEMU's qemu-iotests with QEMU's tools and with ours, and compare
+                 cargo xtask iotests --qemu-build <dir> [--formats qcow2,raw,nbd] [TEST...]
   layers         check the layer rule against xtask/layers.toml
   provenance     check that no permissive crate depends on a GPL crate, and the SPDX headers
   unsafe-audit   count unsafe items per crate against the budget in its manifest

@@ -18,6 +18,14 @@ A permissive crate (MIT OR Apache-2.0) must not contain code ported from QEMU. I
 
 Behavior that a guest, a management tool or a migration stream can observe must match QEMU 11.1 unless it is listed in `conformance/divergences.toml` with a reason from [`spec/02-compat-contract.md`](spec/02-compat-contract.md) section 2.
 
+## QEMU's iotests
+
+The storage tools are checked against QEMU's own `tests/qemu-iotests`. The harness needs a QEMU 11.1 tree built on a Linux host with the tools (`./configure --target-list=x86_64-softmmu --enable-tools` and then `ninja qemu-system-x86_64 qemu-img qemu-io qemu-nbd storage-daemon/qemu-storage-daemon` in its build directory), plus bash, python3 and GNU coreutils.
+
+`cargo xtask iotests --qemu-build ~/qemu/build` runs the `quick` and `auto` groups for qcow2, raw and nbd twice: once with QEMU's tools, to find out what passes on this host, and once with ruvm's `qemu-img`, `qemu-io`, `qemu-nbd` and `qemu-storage-daemon` in their place. `QEMU_PROG` stays the real `qemu-system-x86_64` in both runs. The tools are built by the harness and called through wrappers in `target/iotests/bin` that stop any tool after `--timeout` seconds (600 by default), so a hang fails its test instead of the run. Name tests to run only those, pick formats with `--formats raw,nbd`, groups with `--groups quick`, and parallelism with `-j`. `--reuse-baseline` skips the QEMU run and uses the results the last one left in `target/iotests`. `RUVM_IOTESTS_QEMU_BUILD` can stand in for `--qemu-build`.
+
+A test that passes with QEMU has to pass with ruvm, unless it is listed in `xtask/ruvm-iotests-expected.toml` under its format with a one line reason. The run fails on any other difference, and it prints the listed tests that pass now so that their entries can go. The output of a failing test is in `tests/qemu-iotests/scratch/<format>-<protocol>-<test>/<test>.out.bad` under the QEMU build directory.
+
 ## Prose
 
 Documentation, pull request descriptions, issue comments and commit messages follow the same rules:

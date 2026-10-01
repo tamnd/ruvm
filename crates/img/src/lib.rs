@@ -27,8 +27,7 @@
 //!   (the same as `-n`); `io_uring` is refused as in a QEMU build without liburing.
 //! - `bitmap` makes the open images give up their permissions before the nodes are
 //!   inactivated, which is what `blk_root_inactivate()` does in QEMU.
-//! - Images are not opened with `BDRV_O_CHECK`, and there is no SIGUSR1 handler to print
-//!   the progress on demand.
+//! - There is no SIGUSR1 handler to print the progress on demand.
 //! - Errors carry messages rather than errno values, so where QEMU tests for a particular
 //!   errno (`-ENOTSUP` of `blk_make_empty()`, `-ENOSPC` when changing the backing file) the
 //!   message is looked at instead.
@@ -112,11 +111,7 @@ static CMDS: &[Cmd] = &[
         handler: convert::run,
         description: "Copy one or more images to another with optional format conversion",
     },
-    Cmd {
-        name: "create",
-        handler: create::run,
-        description: "Create and format a new image file",
-    },
+    Cmd { name: "create", handler: create::run, description: "Create and format a new image file" },
     Cmd {
         name: "dd",
         handler: dd::run,

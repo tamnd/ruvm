@@ -8,6 +8,7 @@ use std::io;
 use std::sync::Arc;
 
 use ruvm_base::Error;
+use ruvm_qapi::types::BlkdebugEvent;
 
 use super::bitmap::Bitmap;
 use super::cache::Cache;
@@ -335,6 +336,11 @@ impl State {
     pub(crate) fn has_data_file(&self) -> bool {
         self.data_file.is_some()
             || (self.flags.no_io && self.incompatible_features & QCOW2_INCOMPAT_DATA_FILE != 0)
+    }
+
+    /// `BLKDBG_EVENT(bs->file, event)`.
+    pub(crate) fn event(&self, event: BlkdebugEvent) {
+        self.file.debug_event(event);
     }
 
     /// `s->data_file`: the external data file, or the image file itself.

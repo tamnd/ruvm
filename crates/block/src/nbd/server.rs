@@ -306,11 +306,7 @@ impl NbdServer {
 
     /// Whether a connection uses the export with id `id`: its `refcount > 1`.
     pub fn export_in_use(&self, id: &str) -> bool {
-        self.inner
-            .lock()
-            .conns
-            .values()
-            .any(|c| c.export.as_ref().is_some_and(|e| e.id == id))
+        self.inner.lock().conns.values().any(|c| c.export.as_ref().is_some_and(|e| e.id == id))
     }
 
     /// `blk_exp_add()` with `nbd_export_create()`: `block-export-add` for type `nbd`.

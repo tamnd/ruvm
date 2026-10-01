@@ -7,7 +7,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ruvm_base::{Error, Result};
-use ruvm_qapi::types::BlockdevOptionsU;
+use ruvm_qapi::types::{BlkdebugEvent, BlockdevOptionsU};
 
 use crate::drivers::{DriverDef, OpenArgs};
 use crate::node::{
@@ -181,6 +181,7 @@ impl Driver for RawDriver {
 
     fn pread(&self, bs: &Node, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let off = self.adjust_offset(offset, buf.len() as u64, false)?;
+        bs.file().debug_event(BlkdebugEvent::ReadAio);
         bs.file().pread(off, buf)
     }
 
@@ -191,6 +192,7 @@ impl Driver for RawDriver {
     fn pwrite(&self, bs: &Node, offset: u64, buf: &[u8]) -> io::Result<()> {
         self.check_block0(bs, offset, buf)?;
         let off = self.adjust_offset(offset, buf.len() as u64, true)?;
+        bs.file().debug_event(BlkdebugEvent::WriteAio);
         bs.file().pwrite(off, buf)
     }
 
@@ -277,6 +279,7 @@ impl Driver for RawDriver {
     fn pwrite_flags(&self, bs: &Node, offset: u64, buf: &[u8], flags: u32) -> io::Result<()> {
         self.check_block0(bs, offset, buf)?;
         let off = self.adjust_offset(offset, buf.len() as u64, true)?;
+        bs.file().debug_event(BlkdebugEvent::WriteAio);
         bs.file().pwrite_flags(off, buf, flags)
     }
 

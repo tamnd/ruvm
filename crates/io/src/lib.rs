@@ -31,16 +31,13 @@
 //! - Block statistics are counted by the block backend for every request, so `aio_flush` and
 //!   the `aio_*` commands add no accounting of their own; nothing in qemu-io prints them.
 //! - `sigraise` on Windows ends the process with `abort()` whatever the signal.
-//! - Standard output is line buffered even into a pipe or file, so when it shares one with
-//!   standard error the lines come out in the order they were written. QEMU buffers standard
-//!   output fully there, so its error messages come first.
 //! - Options that the block driver does not know fail with "Parameter 'x' is unexpected" from
 //!   the block layer rather than "Block format 'raw' does not support the option 'x'".
 
 #![deny(unsafe_code)]
 
-use std::io::Write;
-use std::sync::Arc;
+use std::io::{IsTerminal, Write};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ruvm_base::report::{error_report, report_error, set_program_name};
 use ruvm_block::BlockBackend;
@@ -54,9 +51,45 @@ use ruvm_qapi::opts::QemuOptsList;
 mod cmds;
 pub mod fmt;
 
-/// Writes to standard output the way `printf()` does, ignoring a closed pipe.
+/// The size of the stdio buffer glibc gives a standard output that is a pipe or a file.
+const STDOUT_BUFSIZ: usize = 4096;
+
+/// What `printf()` has buffered and not written yet, when standard output is not a terminal.
+static STDOUT_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Whether standard output is fully buffered, as stdio does when it is not a terminal.
+fn fully_buffered() -> bool {
+    static FULL: OnceLock<bool> = OnceLock::new();
+    *FULL.get_or_init(|| !std::io::stdout().is_terminal())
+}
+
+/// Writes to standard output the way `printf()` does, ignoring a closed pipe. Into a pipe or a
+/// file the output is written in blocks of [`STDOUT_BUFSIZ`] bytes and the rest at
+/// [`flush_out`], so the messages on standard error come out in the same place relative to it
+/// as QEMU's.
 pub(crate) fn out(s: &str) {
-    let _ = std::io::stdout().write_all(s.as_bytes());
+    if !fully_buffered() {
+        let _ = std::io::stdout().write_all(s.as_bytes());
+        return;
+    }
+    let mut buf = STDOUT_BUF.lock().unwrap_or_else(|e| e.into_inner());
+    buf.extend_from_slice(s.as_bytes());
+    if buf.len() >= STDOUT_BUFSIZ {
+        let whole = buf.len() / STDOUT_BUFSIZ * STDOUT_BUFSIZ;
+        let mut o = std::io::stdout().lock();
+        let _ = o.write_all(&buf[..whole]);
+        let _ = o.flush();
+        buf.drain(..whole);
+    }
+}
+
+/// `fflush(stdout)`.
+pub(crate) fn flush_out() {
+    let mut buf = STDOUT_BUF.lock().unwrap_or_else(|e| e.into_inner());
+    let mut o = std::io::stdout().lock();
+    let _ = o.write_all(&buf);
+    let _ = o.flush();
+    buf.clear();
 }
 
 /// `printf()`.
@@ -249,12 +282,12 @@ fn command_loop(state: &mut State, cmdline: &[String], prompt: &str) -> i32 {
         return last_error;
     }
 
-    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let tty = std::io::stdin().is_terminal();
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     while !state.quit {
         out(prompt);
-        let _ = std::io::stdout().flush();
+        flush_out();
         let Some(line) = fetchline(&mut input) else {
             if tty {
                 out("\n");
@@ -302,7 +335,7 @@ pub fn main(argv0: &str, args: &[String], version: &str) -> u8 {
     set_program_name(prgname);
     register_object_types();
     let r = run(prgname, argv0, args, version);
-    let _ = std::io::stdout().flush();
+    flush_out();
     match r {
         Ok(code) => code,
         Err(Exit(code)) => code,

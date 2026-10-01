@@ -1117,14 +1117,31 @@ pub(crate) struct NbdDriver {
 }
 
 /// `bdrv_nbd`, `bdrv_nbd_tcp` and `bdrv_nbd_unix`: one driver under three protocol names.
-pub(crate) static NBD: DriverDef =
-    DriverDef::protocol("nbd", "nbd", open_nbd).with_parse_filename(nbd_parse_filename);
+pub(crate) static NBD: DriverDef = DriverDef::protocol("nbd", "nbd", open_nbd)
+    .with_parse_filename(nbd_parse_filename)
+    .with_create_opts(nbd_co_create_opts);
 /// `bdrv_nbd_tcp`.
-pub(crate) static NBD_TCP: DriverDef =
-    DriverDef::protocol("nbd", "nbd+tcp", open_nbd).with_parse_filename(nbd_parse_filename);
+pub(crate) static NBD_TCP: DriverDef = DriverDef::protocol("nbd", "nbd+tcp", open_nbd)
+    .with_parse_filename(nbd_parse_filename)
+    .with_create_opts(nbd_tcp_co_create_opts);
 /// `bdrv_nbd_unix`.
-pub(crate) static NBD_UNIX: DriverDef =
-    DriverDef::protocol("nbd", "nbd+unix", open_nbd).with_parse_filename(nbd_parse_filename);
+pub(crate) static NBD_UNIX: DriverDef = DriverDef::protocol("nbd", "nbd+unix", open_nbd)
+    .with_parse_filename(nbd_parse_filename)
+    .with_create_opts(nbd_unix_co_create_opts);
+
+/// `bdrv_co_create_opts_simple()` is what the three NBD drivers have for creating an image:
+/// the export must exist, be large enough, and gets its first sector zeroed.
+fn nbd_co_create_opts(filename: &str, options: &mut ruvm_qapi::QDict) -> Result<()> {
+    crate::create::create_opts_simple(&NBD, filename, options)
+}
+
+fn nbd_tcp_co_create_opts(filename: &str, options: &mut ruvm_qapi::QDict) -> Result<()> {
+    crate::create::create_opts_simple(&NBD_TCP, filename, options)
+}
+
+fn nbd_unix_co_create_opts(filename: &str, options: &mut ruvm_qapi::QDict) -> Result<()> {
+    crate::create::create_opts_simple(&NBD_UNIX, filename, options)
+}
 
 fn open_nbd(args: &mut OpenArgs<'_>, opts: BlockdevOptionsU) -> Result<Box<dyn Driver>> {
     let BlockdevOptionsU::Nbd(o) = opts else {

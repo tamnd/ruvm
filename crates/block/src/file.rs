@@ -857,8 +857,7 @@ impl Driver for FileDriver {
         bytes: u64,
     ) -> Option<io::Result<crate::node::BlockStatus>> {
         use crate::node::{
-            BDRV_BLOCK_DATA, BDRV_BLOCK_OFFSET_VALID, BDRV_BLOCK_ZERO, BDRV_WANT_ZERO,
-            BlockStatus,
+            BDRV_BLOCK_DATA, BDRV_BLOCK_OFFSET_VALID, BDRV_BLOCK_ZERO, BDRV_WANT_ZERO, BlockStatus,
         };
         if !matches!(self.kind, FileKind::File) {
             return None;
@@ -895,10 +894,7 @@ impl Driver for FileDriver {
     }
 
     /// `raw_get_specific_info()`: the extent size hint is never set here.
-    fn get_specific_info(
-        &self,
-        _bs: &Node,
-    ) -> Result<Option<ruvm_qapi::types::ImageInfoSpecific>> {
+    fn get_specific_info(&self, _bs: &Node) -> Result<Option<ruvm_qapi::types::ImageInfoSpecific>> {
         use ruvm_qapi::types::{
             ImageInfoSpecific, ImageInfoSpecificFile, ImageInfoSpecificFileWrapper,
             ImageInfoSpecificU,

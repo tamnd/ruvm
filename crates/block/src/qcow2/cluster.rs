@@ -10,6 +10,8 @@
 
 use std::io;
 
+use ruvm_qapi::types::BlkdebugEvent;
+
 use super::cache::{CacheId, get_be64, set_be64};
 use super::header::L1_SIZE_OFFSET;
 use super::state::*;
@@ -94,6 +96,7 @@ impl State {
             return Ok(());
         }
         let new_l1_size = exact_size as usize;
+        self.event(BlkdebugEvent::L1ShrinkWriteTable);
         let r = self
             .file
             .pwrite_zeroes(
@@ -110,6 +113,7 @@ impl State {
             }
             return Err(e);
         }
+        self.event(BlkdebugEvent::L1ShrinkFreeL2Clusters);
         for i in (new_l1_size..self.l1_size as usize).rev() {
             let off = self.l1_table[i] & L1E_OFFSET_MASK;
             if off == 0 {
@@ -146,17 +150,20 @@ impl State {
         let mut new_table = self.l1_table.clone();
         new_table.resize(new_l1_size as usize, 0);
 
+        self.event(BlkdebugEvent::L1GrowAllocTable);
         let new_offset = self.alloc_clusters(new_l1_size2)?;
         let r = (|| {
             self.cache_flush(CacheId::Refcount)?;
             // The L1 position is not updated yet, so these clusters must really be free.
             self.pre_write_overlap_check(0, new_offset, new_l1_size2, false)?;
+            self.event(BlkdebugEvent::L1GrowWriteTable);
             let mut buf = vec![0u8; new_l1_size2 as usize];
             for (i, v) in new_table.iter().enumerate() {
                 set_be64(&mut buf, i, *v);
             }
             self.file.pwrite(new_offset, &buf)?;
             self.file.flush()?;
+            self.event(BlkdebugEvent::L1GrowActivateTable);
             let mut data = [0u8; 12];
             data[..4].copy_from_slice(&(new_l1_size as u32).to_be_bytes());
             data[4..].copy_from_slice(&new_offset.to_be_bytes());
@@ -188,6 +195,7 @@ impl State {
     pub(crate) fn write_l1_entry(&mut self, l1_index: usize) -> io::Result<()> {
         let off = self.l1_table_offset + L1E_SIZE * l1_index as u64;
         self.pre_write_overlap_check(OL_ACTIVE_L1, off, L1E_SIZE, false)?;
+        self.event(BlkdebugEvent::L1Update);
         self.file.pwrite(off, &self.l1_table[l1_index].to_be_bytes())?;
         self.file.flush()
     }
@@ -220,6 +228,7 @@ impl State {
                     self.l2_table_cache.table_mut(slot).fill(0);
                 } else {
                     let old_off = (old_l2_offset & L1E_OFFSET_MASK) + slice * slice_size2;
+                    self.event(BlkdebugEvent::L2AllocCowRead);
                     let old = match self.cache_get(CacheId::L2, old_off) {
                         Ok(o) => o,
                         Err(e) => {
@@ -231,6 +240,7 @@ impl State {
                     self.l2_table_cache.table_mut(slot).copy_from_slice(&data);
                     self.cache_put(CacheId::L2, old);
                 }
+                self.event(BlkdebugEvent::L2AllocWrite);
                 self.l2_table_cache.mark_dirty(slot);
                 self.cache_put(CacheId::L2, slot);
             }
@@ -559,6 +569,7 @@ impl State {
         assert_eq!(nb_csectors & self.csize_mask, nb_csectors);
         let entry = cluster_offset | QCOW_OFLAG_COMPRESSED | (nb_csectors << self.csize_shift);
         // Compressed clusters never have the COPIED flag.
+        self.event(BlkdebugEvent::L2UpdateCompressed);
         self.l2_table_cache.mark_dirty(slot);
         self.l2_set(slot, l2_index, entry);
         if self.has_subclusters() {
@@ -600,6 +611,9 @@ impl State {
             let mut all = start_buf;
             all.extend_from_slice(data);
             all.extend_from_slice(&end_buf);
+            // QEMU has a write_aio event here and a cow_write one in the write itself, for
+            // one single I/O operation.
+            self.event(BlkdebugEvent::WriteAio);
             self.cow_write(m.alloc_offset, start.offset, &all)?;
         } else {
             self.cow_write(m.alloc_offset, start.offset, &start_buf)?;
@@ -616,6 +630,7 @@ impl State {
         if buf.is_empty() {
             return Ok(());
         }
+        self.event(BlkdebugEvent::CowRead);
         self.check_usable()?;
         self.preadv(offset, buf)
     }
@@ -632,6 +647,7 @@ impl State {
         }
         let off = cluster_offset + offset_in_cluster;
         self.pre_write_overlap_check(0, off, buf.len() as u64, true)?;
+        self.event(BlkdebugEvent::CowWrite);
         self.data().pwrite(off, buf)
     }
 

@@ -7,6 +7,8 @@
 
 use std::io;
 
+use ruvm_qapi::types::BlkdebugEvent;
+
 use crate::node::{CheckResult, Node};
 
 use super::table::{is_unalloc_cluster, is_zero_cluster, write_table};
@@ -110,6 +112,7 @@ impl QedCheck {
             let header = s.header;
             let num_invalid_l2 = self.check_l2_table(s, &header, &mut table);
             let r = if num_invalid_l2 > 0 && self.fix {
+                file.debug_event(BlkdebugEvent::L2Update);
                 write_table(file, offset, &table, 0, table.len(), false)
             } else {
                 Ok(())

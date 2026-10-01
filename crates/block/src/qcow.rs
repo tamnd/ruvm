@@ -36,10 +36,6 @@
 //! - When an L2 table cannot be read, QEMU leaves the cache slot it was loading into with the
 //!   old offset but clobbered contents. Here the table is read into a separate buffer first
 //!   and the slot is only replaced on success.
-//! - The typed `BlockdevOptions` of `qcow` require `encrypt.format` whenever an `encrypt`
-//!   option is given, where QEMU's open takes `encrypt.key-secret` on its own. The format can
-//!   only be `aes`, so the "Header reported 'aes' encryption format but options specify ..."
-//!   error cannot happen here; it is kept for fidelity.
 //! - A failed write in `blockdev-create` gives the `strerror()` text, as QEMU's job does, and
 //!   "Could not create image: ..." from `qemu-img create`, as QEMU's `bdrv_co_create()` does.
 //! - Like QEMU, a compressed write to a cluster that is already allocated writes the

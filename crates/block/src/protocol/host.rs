@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The `host_device` and `host_cdrom` protocol drivers from block/file-posix.c: probing,
-//! file names, opening and `bdrv_co_create_opts_simple()` from block.c. The request handling
-//! is the `file` driver's, in `file.rs`.
+//! file names and opening. Creating an image on one is `bdrv_co_create_opts_simple()`, in
+//! `create.rs`, and the request handling is the `file` driver's, in `file.rs`.
 //!
 //! Differences from QEMU:
 //!
@@ -14,19 +14,13 @@
 //!   not supported. `probe_blocksizes` is therefore always `ENOTSUP`, as it is in QEMU on any
 //!   host but s390x.
 
-use std::io;
-
-use ruvm_base::{Error, Result, report};
+use ruvm_base::{Result, report};
 use ruvm_qapi::QDict;
-use ruvm_qapi::types::{BlockdevOptionsU, PreallocMode};
-use ruvm_qapi::visit::parse_option_size;
+use ruvm_qapi::types::BlockdevOptionsU;
 
-use crate::backend::BlockBackend;
 use crate::drivers::{DriverDef, OpenArgs};
 use crate::file::{FileKind, MUTABLE_OPTS, file_open, parse_filename_strip_prefix};
-use crate::graph::{BlockGraph, OpenCtx};
-use crate::node::{BDRV_SECTOR_SIZE, Driver, is_enotsup};
-use crate::perm::{BLK_PERM_ALL, BLK_PERM_RESIZE, BLK_PERM_WRITE};
+use crate::node::Driver;
 
 /// The `host_device` protocol driver, `bdrv_host_device`.
 pub(crate) static HOST_DEVICE: DriverDef =
@@ -146,88 +140,12 @@ fn cdrom_open(args: &mut OpenArgs<'_>, opts: BlockdevOptionsU) -> Result<Box<dyn
 }
 
 fn hdev_co_create_opts(filename: &str, options: &mut QDict) -> Result<()> {
-    create_opts_simple(&HOST_DEVICE, filename, options)
+    crate::create::create_opts_simple(&HOST_DEVICE, filename, options)
 }
 
 #[cfg(target_os = "linux")]
 fn cdrom_co_create_opts(filename: &str, options: &mut QDict) -> Result<()> {
-    create_opts_simple(&HOST_CDROM, filename, options)
-}
-
-fn error_is_enotsup(e: &Error) -> bool {
-    std::error::Error::source(e).and_then(|c| c.downcast_ref::<io::Error>()).is_some_and(is_enotsup)
-}
-
-/// `bdrv_co_create_opts_simple()`: "creating" an image on a device opens it, checks that it
-/// is large enough and zeroes its first sector.
-fn create_opts_simple(drv: &DriverDef, filename: &str, options: &mut QDict) -> Result<()> {
-    let take = |o: &mut QDict, k: &str| o.remove(k).and_then(|v| v.as_str().map(str::to_owned));
-    let size = match take(options, "size") {
-        Some(v) => parse_option_size("size", &v)?,
-        None => 0,
-    };
-    let prealloc = match take(options, "preallocation") {
-        Some(v) => PreallocMode::from_name(&v)
-            .ok_or_else(|| Error::generic(format!("invalid parameter value: {v}")))?,
-        None => PreallocMode::Off,
-    };
-    if prealloc != PreallocMode::Off {
-        return Err(Error::generic(format!(
-            "Unsupported preallocation mode '{}'",
-            prealloc.as_str()
-        )));
-    }
-
-    let graph = BlockGraph::new();
-    let mut open_opts = QDict::new();
-    open_opts.put("driver", drv.format_name);
-    open_opts.put("read-only", "off");
-    let ctx = OpenCtx { protocol: true, ..OpenCtx::default() };
-    let blk = graph
-        .open_nodes_qdict(Some(filename), open_opts, ctx)
-        .and_then(|(bs, _, _)| {
-            BlockBackend::with_node(None, bs, BLK_PERM_WRITE | BLK_PERM_RESIZE, BLK_PERM_ALL)
-        })
-        .map_err(|e| {
-            e.prepend(format_args!(
-                "Protocol driver '{}' does not support creating new images, so an existing \
-                 image must be selected as the target; however, opening the given target as \
-                 an existing image failed: ",
-                drv.format_name
-            ))
-        })?;
-    let Some(bs) = blk.root() else {
-        return Err(Error::generic("No medium inserted"));
-    };
-
-    // create_file_fallback_truncate()
-    let truncated = bs.truncate_full(size as i64, false, PreallocMode::Off, 0);
-    if let Err(e) = &truncated {
-        if !error_is_enotsup(e) {
-            return truncated;
-        }
-    }
-    let len = blk
-        .getlength()
-        .map_err(|e| Error::from_io("Failed to inquire the new image file's length", e))?;
-    if len < size {
-        return match truncated {
-            Err(e) => Err(e),
-            Ok(()) => Err(Error::with_cause(
-                "Failed to inquire the new image file's length",
-                crate::node::errno(libc::ENOTSUP),
-            )),
-        };
-    }
-
-    // create_file_fallback_zero_first_sector()
-    let alignment = u64::from(bs.limits().pwrite_zeroes_alignment);
-    let bytes_to_clear = len.min(BDRV_SECTOR_SIZE.max(alignment));
-    if bytes_to_clear != 0 {
-        blk.pwrite_zeroes(0, bytes_to_clear, true)
-            .map_err(|e| Error::from_io("Failed to clear the new image's first sector", e))?;
-    }
-    Ok(())
+    crate::create::create_opts_simple(&HOST_CDROM, filename, options)
 }
 
 #[cfg(test)]

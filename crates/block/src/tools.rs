@@ -617,7 +617,12 @@ impl BlockGraph {
 
     /// `bdrv_snapshot_load_tmp()`: makes the read-only `node` read the snapshot with `id`
     /// and/or `name`.
-    pub fn snapshot_load_tmp(&self, node: &str, id: Option<&str>, name: Option<&str>) -> Result<()> {
+    pub fn snapshot_load_tmp(
+        &self,
+        node: &str,
+        id: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<()> {
         let bs = self.lookup_bs(node)?;
         if id.is_none() && name.is_none() {
             return Err(Error::generic("snapshot_id and name are both NULL"));
@@ -678,12 +683,24 @@ impl BlockGraph {
     /// `bdrv_amend_options()`: changes the options of the image `node` from `qemu-img amend
     /// -o` options (as strings). What the driver does not take is left in `options`.
     pub fn amend_options(&self, node: &str, options: &mut QDict, force: bool) -> Result<()> {
+        self.amend_options_status(node, options, &mut |_, _| {}, force)
+    }
+
+    /// `bdrv_amend_options()` with its `status_cb`, which gets the progress as (done, total)
+    /// work units from the drivers that report it.
+    pub fn amend_options_status(
+        &self,
+        node: &str,
+        options: &mut QDict,
+        status: &mut dyn FnMut(u64, u64),
+        force: bool,
+    ) -> Result<()> {
         let bs = self.lookup_bs(node)?;
         let Some(def) = bs.def else {
             return Err(Error::generic("Driver does not support amending options"));
         };
         if let Some(f) = def.amend_opts {
-            return f(&bs, options, force);
+            return f(&bs, options, status, force);
         }
         let mut d = std::mem::take(options);
         d.put("driver", def.format_name);

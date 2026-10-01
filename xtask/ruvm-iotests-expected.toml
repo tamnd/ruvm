@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# qemu-iotests that pass with QEMU 11.1's tools and are allowed to fail with ruvm's, one table per
+# format that `cargo xtask iotests` runs, each entry the test name and a one-line reason. The M3
+# bar in spec/14-block-layer-and-tools.md is that every other test passing with QEMU passes with
+# ruvm, so an entry here is a known gap or a deliberate difference, reviewed like code. The harness
+# names entries that pass again so that they get dropped.
+
+[qcow2]
+046 = "qemu-io runs aio requests one at a time, so writes held at a blkdebug breakpoint do not interleave with later ones; concurrent cluster allocation reads back the wrong pattern"
+052 = "qemu-io -s (snapshot=on, a temporary overlay) is not supported yet"
+060 = "the aio_write held at a blkdebug breakpoint never reaches the qcow2 overlap check concurrently, so 'Marking image as corrupt' and the later 'No medium found' errors are missing"
+071 = "blkverify opened through a filename reports a contents mismatch at offset 0 on the first read where QEMU's matches"
+074 = "qemu-img compare prints 'Warning: Image size mismatch!' before the read error: Rust's stdout is line-buffered where C stdio fully buffers a pipe, so the 2>&1 order differs"
+110 = "no quorum driver"
+223 = "qemu-nbd -B does not find the persistent qcow2 bitmap the VM made ('Bitmap 'b' is not found'), so the qemu:dirty-bitmap context cannot be exported"
+244 = "with an external data file, opening the data file a second time fails on the shared 'resize' lock where QEMU shares it, and compare then reports a mismatch"
+271 = "qemu-io runs aio requests one at a time, so the blkdebug-suspended subcluster allocation does not race the next write; pattern verification fails"
+287 = "built without zstd: the test is not run with ruvm's tools"
+303 = "built without zstd: the test is not run with ruvm's tools"
+312 = "no quorum driver"
+qemu-img-bitmaps = "qemu-nbd -B does not find persistent qcow2 bitmaps ('Bitmap 'b3' is not found'), so the qemu:dirty-bitmap contexts cannot be exported"
+qemu-img-close-errors = "qemu-img commit does not report a persistent bitmap that fails to be written on close (injected ENOSPC) and exits 0 instead of 1"
+qsd-jobs = "qemu-storage-daemon quitting with a commit job running does not cancel it, so BLOCK_JOB_CANCELLED is missing"
+qsd-migrate = "a writable NBD export with allow-inactive=true on an active=off node is refused ('Block node is read-only'): BlockBackend has no disable_perm/force_allow_inactivate yet"
+
+[raw]
+052 = "qemu-io -s (snapshot=on, a temporary overlay) is not supported yet"
+077 = "qemu-io runs aio requests one at a time, so writes held at a blkdebug breakpoint do not interleave with later ones; the RMW serialization reads back the wrong pattern"
+081 = "no quorum driver"
+148 = "no quorum driver: the test skips itself with ruvm's tools"
+qsd-migrate = "a writable NBD export with allow-inactive=true on an active=off node is refused ('Block node is read-only'): BlockBackend has no disable_perm/force_allow_inactivate yet"
+
+[nbd]
+077 = "qemu-io runs aio requests one at a time, so writes held at a blkdebug breakpoint do not interleave with later ones; the RMW serialization reads back the wrong pattern"
+241 = "qemu-nbd advertises a minimum block size of 1 for an unaligned raw file and maps its sector-rounding tail as a separate zero extent, where QEMU advertises 512 and one data extent"

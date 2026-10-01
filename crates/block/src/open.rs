@@ -15,8 +15,10 @@
 //! - Drivers read typed QAPI options rather than `QemuOpts`, so an option a driver does not
 //!   know fails the options visitor ("Parameter 'x' is unexpected") rather than giving
 //!   "Block format '%s' does not support the option '%s'".
-//! - Children other than `file` and `backing` must have a `driver` when given as a
-//!   dictionary; QEMU would open them by file name too.
+//! - Children other than `file` and `backing` given as a dictionary with a `filename` and no
+//!   `driver` get the protocol driver of the file name, which is what QEMU's
+//!   `bdrv_open_child()` ends up with for the children of filters. Format probing is not
+//!   done for them.
 
 use std::sync::Arc;
 
@@ -95,6 +97,82 @@ fn to_keyval(v: QValue) -> QValue {
         ),
         v => v,
     }
+}
+
+/// The driver's `QEMU_OPT_SIZE` options given as strings, turned into numbers the way
+/// `qemu_opts_absorb_qdict()` reads them, so that the QAPI visitor that follows sees `4096` for
+/// `4k`.
+fn size_opts(options: &mut QDict) -> Result<()> {
+    let Some(d) = options.get_str("driver").and_then(drivers::find_format) else { return Ok(()) };
+    for &name in d.size_opts {
+        if let Some(QValue::Str(s)) = options.get(name) {
+            let v = ruvm_qapi::visit::parse_option_size(name, s)?;
+            options.put(name, QValue::Uint(v));
+        }
+    }
+    Ok(())
+}
+
+/// Other children given as a dictionary with a `filename` but no `driver`, such as the
+/// `image` of blkdebug: fills in the protocol driver the way `bdrv_fill_options()` does for
+/// a protocol node, and that driver's size options.
+fn child_drivers(options: &mut QDict) -> Result<()> {
+    let keys: Vec<String> = options.iter_inserted().map(|(k, _)| k.to_string()).collect();
+    for k in keys {
+        if k == "file" || k == "backing" {
+            continue;
+        }
+        let Some(QValue::Dict(child)) = options.get_mut(&k) else { continue };
+        if child.contains_key("driver") {
+            continue;
+        }
+        let Some(f) = child.get_str("filename").map(str::to_string) else { continue };
+        let d = drivers::find_protocol(&f, true)?;
+        child.put("driver", d.format_name);
+        if let Some(pf) = d.parse_filename {
+            pf(&f, child)?;
+            if !d.needs_filename {
+                child.remove("filename");
+            }
+            *child = crumple(std::mem::take(child))?;
+        }
+        size_opts(child)?;
+    }
+    Ok(())
+}
+
+/// `encrypt.*` options of a qcow2 or qcow image without `encrypt.format`: the typed options
+/// need the format, where `qcow2_update_options_prepare()` and `qcow_open()` take it from the
+/// crypt method in the image header, and drop the options when the header has none.
+fn encrypt_format(options: &mut QDict, file: Option<&Node>) -> Result<()> {
+    let offset = match options.get_str("driver") {
+        Some("qcow2") => 32,
+        Some("qcow") => 36,
+        _ => return Ok(()),
+    };
+    let Some(QValue::Dict(e)) = options.get("encrypt") else { return Ok(()) };
+    if e.contains_key("format") {
+        return Ok(());
+    }
+    let Some(file) = file else { return Ok(()) };
+    let mut buf = [0u8; 4];
+    if file.pread(offset, &mut buf).is_err() {
+        // The format driver reports the header it cannot read.
+        return Ok(());
+    }
+    let format = match u32::from_be_bytes(buf) {
+        1 => "aes",
+        2 => "luks",
+        0 => {
+            options.remove("encrypt");
+            return Ok(());
+        }
+        _ => return Ok(()),
+    };
+    if let Some(QValue::Dict(e)) = options.get_mut("encrypt") {
+        e.put("format", format);
+    }
+    Ok(())
 }
 
 /// A boolean option as either a JSON boolean or a command line string.
@@ -180,8 +258,12 @@ pub(crate) fn dirname(bs: &Node) -> Result<String> {
             bs.driver_name
         )));
     }
-    // path_combine(exact, ""): up to the last slash, or past the first colon.
-    let colon = exact.find(':').map_or(0, |i| i + 1);
+    // path_combine(exact, ""): up to the last slash, or past the first colon when the name
+    // has a protocol prefix.
+    let colon = match drivers::protocol_prefix(&exact) {
+        Some(_) => exact.find(':').map_or(0, |i| i + 1),
+        None => 0,
+    };
     let slash = exact.rfind('/').map_or(0, |i| i + 1);
     Ok(exact[..colon.max(slash)].to_string())
 }
@@ -270,6 +352,8 @@ impl BlockGraph {
                 if !d.needs_filename {
                     options.remove("filename");
                 }
+                // The parsers add flat keys such as `server.path`.
+                options = crumple(options)?;
             }
         }
 
@@ -337,6 +421,9 @@ impl BlockGraph {
             options.put("driver", d.format_name);
         }
 
+        size_opts(&mut options)?;
+        child_drivers(&mut options)?;
+        encrypt_format(&mut options, file.as_deref())?;
         let mut v = QObjectInputVisitor::new_keyval(to_keyval(QValue::Dict(options)));
         let mut opts = BlockdevOptions::default();
         BlockdevOptions::visit(&mut v, None, &mut opts)?;

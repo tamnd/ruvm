@@ -10,6 +10,8 @@
 
 use std::io;
 
+use ruvm_qapi::types::BlkdebugEvent;
+
 use super::state::{Hx, OL_ACTIVE_L2, OL_REFCOUNT_BLOCK, State};
 use crate::node::errno;
 
@@ -159,6 +161,10 @@ impl State {
         };
         let size = self.cache(id).table_size as u64;
         self.pre_write_overlap_check(ign, e.offset, size, false)?;
+        self.event(match id {
+            CacheId::Refcount => BlkdebugEvent::RefblockUpdatePart,
+            CacheId::L2 => BlkdebugEvent::L2Update,
+        });
         self.file.pwrite(e.offset, self.cache(id).table(i))?;
         self.cache_mut(id).entries[i].dirty = false;
         Ok(())
@@ -265,6 +271,9 @@ impl State {
         self.cache_entry_flush(id, i)?;
         self.cache_mut(id).entries[i].offset = 0;
         if read_from_disk {
+            if id == CacheId::L2 {
+                self.event(BlkdebugEvent::L2Load);
+            }
             let file = self.file.clone();
             file.pread(offset, self.cache_mut(id).table_mut(i))?;
         }

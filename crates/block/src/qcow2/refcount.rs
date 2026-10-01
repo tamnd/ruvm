@@ -7,6 +7,7 @@
 use std::io;
 
 use ruvm_base::{Error, Result};
+use ruvm_qapi::types::BlkdebugEvent;
 
 use super::cache::{CacheId, get_be64, set_be64};
 use super::header::REFCOUNT_TABLE_OFFSET_OFFSET;
@@ -116,6 +117,7 @@ impl State {
         buf.try_reserve_exact(bytes as usize).map_err(|_| errno(libc::ENOMEM))?;
         buf.resize(bytes as usize, 0);
         if table_size > 0 {
+            self.event(BlkdebugEvent::ReftableLoad);
             self.file.pread(self.refcount_table_offset, &mut buf)?;
         }
         self.refcount_table =
@@ -170,6 +172,7 @@ impl State {
         cluster_index: u64,
         rb: &mut Option<usize>,
     ) -> io::Result<()> {
+        self.event(BlkdebugEvent::RefblockAlloc);
         let rt_index = cluster_index >> self.refcount_block_bits;
         if rt_index < self.refcount_table.len() as u64 {
             let rb_offset = self.refcount_table[rt_index as usize] & REFT_OFFSET_MASK;
@@ -184,6 +187,7 @@ impl State {
                     );
                     return Err(errno(libc::EIO));
                 }
+                self.event(BlkdebugEvent::RefblockLoad);
                 *rb = Some(self.cache_get(CacheId::Refcount, rb_offset)?);
                 return Ok(());
             }
@@ -230,11 +234,13 @@ impl State {
         }
 
         let i = rb.unwrap();
+        self.event(BlkdebugEvent::RefblockAllocWrite);
         self.refcount_block_cache.mark_dirty(i);
         self.cache_flush(CacheId::Refcount)?;
 
         // If the table is big enough, just hook the block up.
         if rt_index < self.refcount_table.len() as u64 {
+            self.event(BlkdebugEvent::RefblockAllocHookup);
             self.file.pwrite(
                 self.refcount_table_offset + rt_index * REFTABLE_ENTRY_SIZE,
                 &new_block.to_be_bytes(),
@@ -252,11 +258,13 @@ impl State {
 
         // The table has to grow. New refcount blocks go at the end of the image and describe
         // themselves and the new table, so the switch happens at once.
+        self.event(BlkdebugEvent::ReftableGrow);
         let blocks_used = (cluster_index + 1)
             .max((new_block >> self.cluster_bits) + 1)
             .div_ceil(self.refcount_block_size);
         let meta_offset = blocks_used * self.refcount_block_size * self.cluster_size;
         self.refcount_area(meta_offset, 0, false, rt_index, new_block)?;
+        self.event(BlkdebugEvent::RefblockLoad);
         *rb = Some(self.cache_get(CacheId::Refcount, new_block)?);
 
         // The new metadata may sit where the caller wanted to allocate.
@@ -355,18 +363,21 @@ impl State {
         }
         assert_eq!(block_offset, table_offset);
 
+        self.event(BlkdebugEvent::RefblockAllocWriteBlocks);
         self.cache_flush(CacheId::Refcount)?;
 
         let mut buf = vec![0u8; (table_size * REFTABLE_ENTRY_SIZE) as usize];
         for (i, v) in new_table.iter().enumerate() {
             set_be64(&mut buf, i, *v);
         }
+        self.event(BlkdebugEvent::RefblockAllocWriteTable);
         self.file.pwrite(table_offset, &buf)?;
         self.file.flush()?;
 
         let mut data = [0u8; 12];
         data[..8].copy_from_slice(&table_offset.to_be_bytes());
         data[8..].copy_from_slice(&(table_clusters as u32).to_be_bytes());
+        self.event(BlkdebugEvent::RefblockAllocSwitchTable);
         self.file.pwrite(REFCOUNT_TABLE_OFFSET_OFFSET, &data)?;
         self.file.flush()?;
 
@@ -581,6 +592,7 @@ impl State {
 
     /// `qcow2_alloc_clusters()`.
     pub(crate) fn alloc_clusters(&mut self, size: u64) -> io::Result<u64> {
+        self.event(BlkdebugEvent::ClusterAlloc);
         loop {
             let offset = self.alloc_clusters_noref(size, QCOW_MAX_CLUSTER_OFFSET)?;
             match self.update_refcount(offset, size, 1, false, DiscardType::Never) {
@@ -619,6 +631,7 @@ impl State {
 
     /// `qcow2_alloc_bytes()`: space for compressed data, packed into shared clusters.
     pub(crate) fn alloc_bytes(&mut self, size: u64) -> io::Result<u64> {
+        self.event(BlkdebugEvent::ClusterAllocBytes);
         assert!(size > 0 && size <= self.cluster_size);
         assert!(self.free_byte_offset == 0 || self.offset_into_cluster(self.free_byte_offset) != 0);
         let mut offset = self.free_byte_offset;
@@ -670,6 +683,7 @@ impl State {
 
     /// `qcow2_free_clusters()`.
     pub(crate) fn free_clusters(&mut self, offset: u64, size: u64, ty: DiscardType) {
+        self.event(BlkdebugEvent::ClusterFree);
         if let Err(e) = self.update_refcount(offset, size, 1, true, ty) {
             eprintln!("qcow2_free_clusters failed: {}", ruvm_base::error::strerror(&e));
         }
@@ -972,17 +986,14 @@ impl State {
         }
         if chk & OL_INACTIVE_L2 != 0 {
             for sn in &self.snapshots {
-                if self
-                    .validate_table(
-                        sn.l1_table_offset,
-                        sn.l1_size as u64,
-                        L1E_SIZE,
-                        QCOW_MAX_L1_SIZE,
-                        "",
-                    )
-                    .is_err()
-                {
-                    return Err(errno(libc::EFBIG));
+                if let Err((_, code)) = self.validate_table(
+                    sn.l1_table_offset,
+                    sn.l1_size as u64,
+                    L1E_SIZE,
+                    QCOW_MAX_L1_SIZE,
+                    "",
+                ) {
+                    return Err(errno(code));
                 }
                 let mut l1 = vec![0u8; sn.l1_size as usize * 8];
                 self.file.pread(sn.l1_table_offset, &mut l1)?;

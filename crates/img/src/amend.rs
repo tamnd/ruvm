@@ -187,7 +187,11 @@ fn amend(
         }
     };
     progress::print(0.0, 0);
-    let r = graph().amend_options(&node, &mut dict, force);
+    // amend_status_cb().
+    let mut status = |offset: u64, total: u64| {
+        progress::print(100.0 * offset as f32 / total as f32, 0);
+    };
+    let r = graph().amend_options_status(&node, &mut dict, &mut status, force);
     progress::print(100.0, 0);
     match r {
         Ok(()) => 0,

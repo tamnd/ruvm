@@ -129,7 +129,15 @@ impl Node {
         }
         match self.snapshot_infos() {
             Some(Ok(v)) if !v.is_empty() => info.snapshots = Some(v),
-            Some(Err(e)) => return Err(e),
+            // -ENOMEDIUM and -ENOTSUP are recoverable: the image just has no snapshots to show.
+            Some(Err(e)) => {
+                let code = std::error::Error::source(&e)
+                    .and_then(|c| c.downcast_ref::<io::Error>())
+                    .and_then(io::Error::raw_os_error);
+                if code != Some(libc::ENOTSUP) && code != Some(crate::node::ENOMEDIUM) {
+                    return Err(e);
+                }
+            }
             _ => {}
         }
         if !flat {
