@@ -38,7 +38,8 @@ use crate::node::{
 use crate::perm::{BLK_PERM_RESIZE, BLK_PERM_WRITE, PermCtx, default_perms};
 
 /// `bdrv_preallocate_filter`.
-pub(crate) static PREALLOCATE: DriverDef = DriverDef::filter("preallocate", preallocate_open);
+pub(crate) static PREALLOCATE: DriverDef = DriverDef::filter("preallocate", preallocate_open)
+    .with_size_opts(&["prealloc-align", "prealloc-size"]);
 
 const MIB: u64 = 1 << 20;
 const EINVAL: i64 = -(libc::EINVAL as i64);

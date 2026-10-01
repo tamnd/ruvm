@@ -45,14 +45,13 @@ pub(crate) type CreateOptsFn = fn(filename: &str, options: &mut QDict) -> Result
 
 /// `.bdrv_amend_options`: changes the options of an open image from `qemu-img amend -o`
 /// options. `options` holds them as strings; the driver takes out what it knows.
-pub(crate) type AmendOptsFn = fn(bs: &Node, options: &mut QDict, force: bool) -> Result<()>;
+pub(crate) type AmendOptsFn =
+    fn(bs: &Node, options: &mut QDict, status: &mut dyn FnMut(u64, u64), force: bool) -> Result<()>;
 
 /// `.bdrv_measure`: the sizes a new image made from `qemu-img create` style `options` (or
 /// converted from `in_bs`) needs.
-pub(crate) type MeasureFn = fn(
-    options: &mut QDict,
-    in_bs: Option<&Node>,
-) -> Result<ruvm_qapi::types::BlockMeasureInfo>;
+pub(crate) type MeasureFn =
+    fn(options: &mut QDict, in_bs: Option<&Node>) -> Result<ruvm_qapi::types::BlockMeasureInfo>;
 
 /// `.bdrv_co_create`: `blockdev-create` for the driver.
 pub(crate) type CreateFn = fn(graph: &BlockGraph, options: BlockdevCreateOptionsU) -> Result<()>;
@@ -90,6 +89,12 @@ pub(crate) struct DriverDef {
     /// `strong_runtime_opts`: the driver options that change what the node reads and
     /// writes. A name ending in `.` stands for every option with that prefix.
     pub strong_runtime_opts: &'static [&'static str],
+    /// The options whose QAPI type is `int` but which the driver reads as `QEMU_OPT_SIZE`, so
+    /// that a command line value such as `align=4k` takes a size suffix.
+    pub size_opts: &'static [&'static str],
+    /// `.bdrv_join_options`: merges the old options of a reopen into the new ones, both
+    /// flat. Without it, the old ones fill in what the new ones leave out.
+    pub join_options: Option<fn(&mut QDict, QDict)>,
     /// `amend_opts`, the `-o` options `qemu-img amend` takes, in QEMU's declaration order.
     pub amend_opts_list: &'static [QemuOptDesc],
     /// `.bdrv_amend_options`. Without it, a driver with an `amend_opts_list` is amended
@@ -119,6 +124,8 @@ impl DriverDef {
             filtered_child_is_backing: false,
             mutable_opts: &[],
             strong_runtime_opts: &[],
+            size_opts: &[],
+            join_options: None,
             amend_opts_list: &[],
             amend_opts: None,
             measure: None,
@@ -224,6 +231,18 @@ impl DriverDef {
     /// The options that change the data of the node, `strong_runtime_opts`.
     pub(crate) const fn with_strong_opts(mut self, opts: &'static [&'static str]) -> Self {
         self.strong_runtime_opts = opts;
+        self
+    }
+
+    /// The options read as `QEMU_OPT_SIZE`, see [`DriverDef::size_opts`].
+    pub(crate) const fn with_size_opts(mut self, opts: &'static [&'static str]) -> Self {
+        self.size_opts = opts;
+        self
+    }
+
+    /// `.bdrv_join_options`, see [`DriverDef::join_options`].
+    pub(crate) const fn with_join_options(mut self, f: fn(&mut QDict, QDict)) -> Self {
+        self.join_options = Some(f);
         self
     }
 

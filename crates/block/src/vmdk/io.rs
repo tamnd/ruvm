@@ -8,6 +8,7 @@ use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, 
 use ruvm_base::error::strerror;
 use ruvm_base::report::error_report;
 use ruvm_base::{Error, Result};
+use ruvm_qapi::types::BlkdebugEvent;
 
 use super::open::{cstr, read_cid, strstr};
 use super::{
@@ -62,6 +63,7 @@ fn find_offset_in_cluster(e: &Extent, offset: u64) -> u64 {
 fn l2_update(e: &mut Extent, file: &Node, m: &MetaData, value: u32) -> bool {
     let bytes = value.to_le_bytes();
     let at = u64::from(m.l2_offset) * 512 + u64::from(m.l2_index) * 4;
+    file.debug_event(BlkdebugEvent::L2Update);
     if file.pwrite(at, &bytes).is_err() {
         return false;
     }
@@ -90,11 +92,13 @@ fn read_extent(
     out: &mut [u8],
 ) -> io::Result<()> {
     if !e.compressed {
+        file.debug_event(BlkdebugEvent::ReadAio);
         return file.pread(cluster_offset + offset_in_cluster, out);
     }
     let cluster_bytes = (e.cluster_sectors * 512) as usize;
     // Read two clusters in case the grain marker and the compressed data are larger than one.
     let mut cluster_buf = vec![0u8; cluster_bytes * 2];
+    file.debug_event(BlkdebugEvent::ReadCompressed);
     file.pread(cluster_offset, &mut cluster_buf)?;
     let mut data: &[u8] = &cluster_buf[..cluster_bytes];
     if e.has_marker {
@@ -167,8 +171,10 @@ fn write_extent(
         m.extend_from_slice(&(z.len() as u32).to_le_bytes());
         m.extend_from_slice(&z);
         compressed = m;
+        file.debug_event(BlkdebugEvent::WriteCompressed);
         &compressed
     } else {
+        file.debug_event(BlkdebugEvent::WriteAio);
         data
     };
 
@@ -267,20 +273,25 @@ impl VmdkDriver {
         let (ss, se) = (skip_start as usize, skip_end as usize);
         if skip_start > 0 {
             if let (true, Some(b)) = (copy_from_backing, &backing) {
+                // qcow2 emits this on bs->file instead of bs->backing
+                file.debug_event(BlkdebugEvent::CowRead);
                 if b.pread(offset, &mut grain[..ss]).is_err() {
                     return false;
                 }
             }
+            file.debug_event(BlkdebugEvent::CowWrite);
             if file.pwrite(cluster_offset, &grain[..ss]).is_err() {
                 return false;
             }
         }
         if skip_end < cluster_bytes {
             if let (true, Some(b)) = (copy_from_backing, &backing) {
+                file.debug_event(BlkdebugEvent::CowRead);
                 if b.pread(offset + skip_end, &mut grain[se..]).is_err() {
                     return false;
                 }
             }
+            file.debug_event(BlkdebugEvent::CowWrite);
             if file.pwrite(cluster_offset + skip_end, &grain[se..]).is_err() {
                 return false;
             }
@@ -372,6 +383,7 @@ impl VmdkDriver {
                 }
                 let at = min_index * l2_size_bytes;
                 let table = &mut e.l2_cache[at..at + l2_size_bytes];
+                file.debug_event(BlkdebugEvent::L2Load);
                 if file.pread(u64::from(l2_offset) * 512, table).is_err() {
                     return Lookup::Error;
                 }
@@ -480,6 +492,8 @@ impl VmdkDriver {
                             if !self.is_cid_valid(bs, cid_checked) {
                                 return Err(errno(libc::EINVAL));
                             }
+                            // qcow2 emits this on bs->file instead of bs->backing
+                            bs.file().debug_event(BlkdebugEvent::ReadBackingAio);
                             b.node.pread(offset, out)?;
                         }
                         _ => out.fill(0),

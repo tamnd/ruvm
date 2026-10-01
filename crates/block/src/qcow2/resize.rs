@@ -5,10 +5,11 @@
 
 use ruvm_base::report::warn_report;
 use ruvm_base::{Error, Result};
+use ruvm_qapi::types::BlkdebugEvent;
 
 use super::cluster::L2Meta;
 use super::header::{L1_SIZE_OFFSET, SIZE_OFFSET};
-use super::io::{Storage, write_zero_buffer};
+use super::io::Storage;
 use super::state::*;
 use crate::node::errno;
 
@@ -26,16 +27,9 @@ pub(crate) fn parse_prealloc(s: &str) -> Result<Prealloc> {
     }
 }
 
-/// `bdrv_co_truncate()` on a file below qcow2. `falloc` makes the file as `off` does: there
-/// is no portable way to reserve space without writing it. `full` writes zeroes.
+/// `bdrv_co_truncate()` on a file below qcow2, see [`Storage::truncate_prealloc`].
 pub(crate) fn storage_truncate(s: &dyn Storage, len: u64, prealloc: Prealloc) -> Result<()> {
-    let old = s.len().map_err(|e| Error::from_io("Failed to get file length", e))?;
-    s.truncate(len)?;
-    if prealloc == Prealloc::Full && len > old {
-        write_zero_buffer(s, old, len - old)
-            .map_err(|e| Error::from_io("Could not write zeros for preallocation", e))?;
-    }
-    Ok(())
+    s.truncate_prealloc(len, prealloc)
 }
 
 impl State {
@@ -317,10 +311,13 @@ impl State {
             e
         };
 
+        self.event(BlkdebugEvent::L1Update);
         if let Err(e) = self.file.pwrite_zeroes(self.l1_table_offset, l1_clusters * cs, false) {
             return Err(broken(self, e));
         }
         self.l1_table.iter_mut().for_each(|e| *e = 0);
+
+        self.event(BlkdebugEvent::EmptyImagePrepare);
 
         // Room for the refcount table, one refcount block and the L1 table right after the
         // header. Overwriting the old tables is fine, the dirty bit is set and all data is to
@@ -331,6 +328,8 @@ impl State {
 
         // The reftable goes right after the header, the L1 table three clusters after it, and
         // the cluster between them is the first refblock.
+        self.event(BlkdebugEvent::L1Update);
+        self.event(BlkdebugEvent::ReftableUpdate);
         let mut b = [0u8; 20];
         b[0..8].copy_from_slice(&(3 * cs).to_be_bytes());
         b[8..16].copy_from_slice(&cs.to_be_bytes());
@@ -344,6 +343,7 @@ impl State {
         self.refcount_table = vec![0; (cs / REFTABLE_ENTRY_SIZE) as usize];
         self.max_refcount_table_index = 0;
 
+        self.event(BlkdebugEvent::RefblockAlloc);
         if let Err(e) =
             self.file.pwrite(cs, &(2 * cs).to_be_bytes()).and_then(|()| self.file.flush())
         {

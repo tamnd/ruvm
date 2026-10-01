@@ -113,6 +113,14 @@ fn join_flat(dst: &mut QDict, src: &QDict) {
     }
 }
 
+/// `bdrv_join_options()`: the driver's merge, or the generic one.
+fn join_options(bs: &Node, options: &mut QDict, old: QDict) {
+    match bs.def.and_then(|d| d.join_options) {
+        Some(f) => f(options, old),
+        None => join_flat(options, &old),
+    }
+}
+
 /// `qdict_copy_default()`.
 fn copy_default(dst: &mut QDict, src: &QDict, key: &str) {
     if !dst.contains_key(key) {
@@ -272,9 +280,9 @@ impl<'g> ReopenQueue<'g> {
         let existing = self.find(bs);
         // Old explicitly set values, which inherited ones do not override.
         if let Some(i) = existing {
-            join_flat(&mut options, &self.entries[i].explicit);
+            join_options(bs, &mut options, self.entries[i].explicit.clone());
         } else if keep_old_opts {
-            join_flat(&mut options, &bs.meta.lock().unwrap().explicit_options.clone());
+            join_options(bs, &mut options, bs.meta.lock().unwrap().explicit_options.clone());
         }
         let explicit = options.clone();
 
@@ -302,7 +310,7 @@ impl<'g> ReopenQueue<'g> {
             None => old,
         };
         if keep_old_opts {
-            join_flat(&mut options, &bs.meta.lock().unwrap().options.clone());
+            join_options(bs, &mut options, bs.meta.lock().unwrap().options.clone());
         }
         // Errors come again from bdrv_reopen_prepare().
         let _ = update_flags_from_options(&mut flags, &options);

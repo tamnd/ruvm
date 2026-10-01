@@ -288,7 +288,10 @@ impl State {
                 }
                 QCOW2_EXT_MAGIC_FEATURE_TABLE => {
                     if want_feature_table {
-                        let v = read(self, "ERROR: ext_feature_table: Could not read table")?;
+                        let mut v = read(self, "ERROR: ext_feature_table: Could not read table")?;
+                        // QEMU pads the table with two zeroed entries, so a short last entry
+                        // still counts.
+                        v.resize(v.len() + 2 * 48, 0);
                         self.feature_table = Some(v);
                     }
                 }

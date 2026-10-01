@@ -10,6 +10,8 @@
 
 use std::io;
 
+use ruvm_qapi::types::BlkdebugEvent;
+
 use super::cluster::{L2Meta, REQUEST_MAX_BYTES};
 use super::compress;
 use super::state::*;
@@ -92,6 +94,7 @@ impl State {
         let mut cbuf = Vec::new();
         cbuf.try_reserve_exact(csize as usize).map_err(|_| errno(libc::ENOMEM))?;
         cbuf.resize(csize as usize, 0);
+        self.event(BlkdebugEvent::ReadCompressed);
         self.file.pread(coffset, &mut cbuf)?;
         let mut out = vec![0u8; self.cluster_size as usize];
         self.decompress(&mut out, &cbuf).map_err(|_| errno(libc::EIO))?;
@@ -132,6 +135,7 @@ impl State {
                 SubclusterType::ZeroPlain | SubclusterType::ZeroAlloc => cur.fill(0),
                 SubclusterType::UnallocatedPlain | SubclusterType::UnallocatedAlloc => {
                     if self.backing.is_some() {
+                        self.event(BlkdebugEvent::ReadBackingAio);
                         self.backing_read(offset, cur)?;
                     } else {
                         cur.fill(0);
@@ -139,6 +143,7 @@ impl State {
                 }
                 SubclusterType::Compressed => self.read_compressed(host_offset, offset, cur)?,
                 SubclusterType::Normal => {
+                    self.event(BlkdebugEvent::ReadAio);
                     self.data().pread(host_offset, cur)?;
                     if self.crypto.is_some() {
                         self.decrypt(host_offset, offset, cur)?;
@@ -205,6 +210,7 @@ impl State {
             if let Some(i) = merged {
                 metas[i].merge_data = true;
             } else {
+                self.event(BlkdebugEvent::WriteAio);
                 self.data().pwrite(host_offset, data)?;
             }
             // Link the new clusters; what is left over when one fails is aborted below.
@@ -275,6 +281,7 @@ impl State {
         };
         let cluster_offset = self.alloc_compressed_cluster_offset(offset, out_len)?;
         self.pre_write_overlap_check(0, cluster_offset, out_len, true)?;
+        self.data().debug_event(BlkdebugEvent::WriteCompressed);
         self.data().pwrite(cluster_offset, &out[..out_len as usize])?;
         Ok(())
     }
@@ -471,12 +478,14 @@ impl State {
     /// `qcow2_co_save_vmstate()`.
     pub(crate) fn save_vmstate(&mut self, pos: u64, buf: &[u8]) -> io::Result<()> {
         let off = self.vmstate_offset(pos, buf.len())?;
+        self.event(BlkdebugEvent::VmstateSave);
         self.pwritev(off, buf)
     }
 
     /// `qcow2_co_load_vmstate()`.
     pub(crate) fn load_vmstate(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
         let off = self.vmstate_offset(pos, buf.len())?;
+        self.event(BlkdebugEvent::VmstateLoad);
         self.preadv(off, buf)
     }
 }

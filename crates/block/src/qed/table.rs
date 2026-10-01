@@ -11,6 +11,8 @@
 
 use std::io;
 
+use ruvm_qapi::types::BlkdebugEvent;
+
 use crate::node::{BDRV_SECTOR_SIZE, Node};
 
 use super::State;
@@ -64,6 +66,7 @@ impl L2Cache {
             Some(pos) => pos,
             None => {
                 let mut table = vec![0u64; nelems];
+                file.debug_event(BlkdebugEvent::L2Load);
                 read_table(file, offset, &mut table)?;
                 self.commit(CachedL2Table { offset, table });
                 self.entries.len() - 1
@@ -172,6 +175,7 @@ impl State {
 
     /// `qed_write_l1_table()`.
     pub(super) fn write_l1_table(&self, file: &Node, index: usize, n: usize) -> io::Result<()> {
+        file.debug_event(BlkdebugEvent::L1Update);
         write_table(file, self.header.l1_table_offset, &self.l1_table, index, n, false)
     }
 

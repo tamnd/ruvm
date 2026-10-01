@@ -410,15 +410,10 @@ fn init_check(state: &State, ct: &Cmd) -> bool {
         return true;
     }
     if ct.flags & NOFILE_OK == 0 && state.blk.is_none() {
-        flush_stdout();
         eprintln!("no file open, try 'help open'");
         return false;
     }
     true
-}
-
-fn flush_stdout() {
-    let _ = io::stdout().flush();
 }
 
 /// `command()`.
@@ -429,7 +424,6 @@ fn command(state: &mut State, ct: &Cmd, argv: &[String]) -> i32 {
     }
     let argc = argv.len() as i32;
     if argc - 1 < ct.argmin || (ct.argmax != -1 && argc - 1 > ct.argmax) {
-        flush_stdout();
         if ct.argmax == -1 {
             eprintln!(
                 "bad argument count {} to {cmd}, expected at least {} arguments",
@@ -456,16 +450,13 @@ fn command(state: &mut State, ct: &Cmd, argv: &[String]) -> i32 {
             let (perm, shared) = blk.perm();
             if ct.perm & !perm != 0 {
                 if let Err(e) = blk.set_perm(perm | ct.perm, shared) {
-                    flush_stdout();
                     report_error(&e);
                     return -EINVAL;
                 }
             }
         }
     }
-    let ret = (ct.cfunc)(state, argv);
-    flush_stdout();
-    ret
+    (ct.cfunc)(state, argv)
 }
 
 /// `breakline()`: the words of `input`, split at single spaces.
@@ -482,7 +473,6 @@ pub(crate) fn qemuio_command(state: &mut State, cmd: &str) -> i32 {
     match find_command(name) {
         Some(ct) => command(state, ct, &v),
         None => {
-            flush_stdout();
             eprintln!("command \"{name}\" not found");
             -EINVAL
         }
@@ -519,7 +509,6 @@ impl CmdOpts {
                 let c = char::from(self.g.optopt as u8);
                 let known = c != ':' && c != '+' && self.shorts.contains(c);
                 let cmd = &self.g.args()[0];
-                flush_stdout();
                 match (known, cfg!(target_os = "linux")) {
                     (true, true) => eprintln!("{cmd}: option requires an argument -- '{c}'"),
                     (true, false) => eprintln!("{cmd}: option requires an argument -- {c}"),
@@ -890,7 +879,6 @@ fn alloc_from_file(len: usize, file_name: &str) -> Option<Vec<u8>> {
     let mut f = match std::fs::File::open(file_name) {
         Ok(f) => f,
         Err(e) => {
-            flush_stdout();
             eprintln!("{file_name}: {}", strerror(&e));
             return None;
         }
@@ -903,14 +891,12 @@ fn alloc_from_file(len: usize, file_name: &str) -> Option<Vec<u8>> {
             Ok(n) => pattern_len += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => {
-                flush_stdout();
                 eprintln!("{file_name}: {}", strerror(&e));
                 return None;
             }
         }
     }
     if pattern_len == 0 {
-        flush_stdout();
         eprintln!("{file_name}: file is empty");
         return None;
     }
@@ -1419,7 +1405,6 @@ fn truncate_f(state: &mut State, argv: &[String]) -> i32 {
             Some((b'm', optarg)) => match PreallocMode::from_name(&optarg) {
                 Some(m) => prealloc = m,
                 None => {
-                    flush_stdout();
                     error_report(&format!("Invalid preallocation mode '{optarg}'"));
                     return -EINVAL;
                 }
@@ -1438,7 +1423,6 @@ fn truncate_f(state: &mut State, argv: &[String]) -> i32 {
         }
     };
     if let Err(e) = blk.truncate_full(offset as u64, false, prealloc) {
-        flush_stdout();
         report_error(&e);
         return -EINVAL;
     }
@@ -1476,7 +1460,6 @@ fn info_f(state: &mut State, _argv: &[String]) -> i32 {
     p!("vm state offset: {}\n", cvtstr(bdi.vm_state_offset as f64));
     match g.specific_info(&node) {
         Err(e) => {
-            flush_stdout();
             report_error(&e);
             return -EIO;
         }
@@ -1640,7 +1623,6 @@ fn map_f(state: &mut State, _argv: &[String]) -> i32 {
     let mut bytes = match blk.getlength() {
         Ok(b) => b,
         Err(e) => {
-            flush_stdout();
             error_report(&format!("Failed to query image length: {}", strerror(&e)));
             return neg_errno(&e);
         }
@@ -1649,13 +1631,11 @@ fn map_f(state: &mut State, _argv: &[String]) -> i32 {
         let (allocated, n) = match map_is_allocated(&node, offset, bytes) {
             Ok(v) => v,
             Err(e) => {
-                flush_stdout();
                 error_report(&format!("Failed to get allocation status: {}", strerror(&e)));
                 return neg_errno(&e);
             }
         };
         if n == 0 {
-            flush_stdout();
             error_report("Unexpected end of image");
             return -EIO;
         }
@@ -1706,14 +1686,12 @@ fn reopen_f(state: &mut State, argv: &[String]) -> i32 {
         match c {
             b'c' => {
                 if !apply_cache_mode(&optarg, &mut flags, &mut writethrough) {
-                    flush_stdout();
                     error_report(&format!("Invalid cache option: {optarg}"));
                     return -EINVAL;
                 }
                 has_cache_option = true;
             }
             b'o' => {
-                flush_stdout();
                 if state.reopen_opts.parse_noisily(&optarg, false).is_none() {
                     state.reopen_opts.reset();
                     return -EINVAL;
@@ -1721,7 +1699,6 @@ fn reopen_f(state: &mut State, argv: &[String]) -> i32 {
             }
             b'r' | b'w' => {
                 if has_rw_option {
-                    flush_stdout();
                     error_report("Only one -r/-w option may be given");
                     return -EINVAL;
                 }
@@ -1741,7 +1718,6 @@ fn reopen_f(state: &mut State, argv: &[String]) -> i32 {
         return -EINVAL;
     }
     if !writethrough != blk.enable_write_cache() && blk.attached_dev().is_some() {
-        flush_stdout();
         error_report("Cannot change cache.writeback: Device attached");
         state.reopen_opts.reset();
         return -EBUSY;
@@ -1755,7 +1731,6 @@ fn reopen_f(state: &mut State, argv: &[String]) -> i32 {
     state.reopen_opts.reset();
     if opts.contains_key("read-only") {
         if has_rw_option {
-            flush_stdout();
             error_report("Cannot set both -r/-w and 'read-only'");
             return -EINVAL;
         }
@@ -1764,7 +1739,6 @@ fn reopen_f(state: &mut State, argv: &[String]) -> i32 {
     }
     if opts.contains_key("cache.direct") || opts.contains_key("cache.no-flush") {
         if has_cache_option {
-            flush_stdout();
             error_report("Cannot set both -c and the cache options");
             return -EINVAL;
         }
@@ -1773,7 +1747,6 @@ fn reopen_f(state: &mut State, argv: &[String]) -> i32 {
         opts.put("cache.no-flush", flags.no_flush);
     }
     if let Err(e) = g.reopen_node(&node, opts, true) {
-        flush_stdout();
         report_error(&e);
         return -EINVAL;
     }
@@ -1852,7 +1825,7 @@ fn sigraise_f(_state: &mut State, argv: &[String]) -> i32 {
     }
     // Using raise() to kill this process does not necessarily flush all open streams. At
     // least stdout and stderr should be flushed, though.
-    flush_stdout();
+    crate::flush_out();
     let _ = io::stderr().flush();
     raise(sig as i32);
     0
@@ -1959,7 +1932,6 @@ fn open_f(state: &mut State, argv: &[String]) -> i32 {
             b'k' => args.flags.native_aio = true,
             b't' => {
                 if !apply_cache_mode(&optarg, &mut args.flags, &mut args.writethrough) {
-                    flush_stdout();
                     error_report(&format!("Invalid cache option: {optarg}"));
                     state.drive_opts.reset();
                     return -EINVAL;
@@ -1967,7 +1939,6 @@ fn open_f(state: &mut State, argv: &[String]) -> i32 {
             }
             b'd' => {
                 if !parse_discard(&optarg, &mut args.flags) {
-                    flush_stdout();
                     error_report(&format!("Invalid discard option: {optarg}"));
                     state.drive_opts.reset();
                     return -EINVAL;
@@ -1975,7 +1946,6 @@ fn open_f(state: &mut State, argv: &[String]) -> i32 {
             }
             b'i' => {
                 if !parse_aio(&optarg, &mut args.flags) {
-                    flush_stdout();
                     error_report(&format!("Invalid aio option: {optarg}"));
                     state.drive_opts.reset();
                     return -EINVAL;
@@ -1987,7 +1957,6 @@ fn open_f(state: &mut State, argv: &[String]) -> i32 {
                     state.drive_opts.reset();
                     return -EINVAL;
                 }
-                flush_stdout();
                 if state.drive_opts.parse_noisily(&optarg, false).is_none() {
                     state.drive_opts.reset();
                     return -EINVAL;
@@ -2006,7 +1975,6 @@ fn open_f(state: &mut State, argv: &[String]) -> i32 {
     let argc = argv.len();
     let mut optind = o.optind();
     if state.image_opts && optind + 1 == argc {
-        flush_stdout();
         if state.drive_opts.parse_noisily(&argv[optind], false).is_none() {
             state.drive_opts.reset();
             return -EINVAL;

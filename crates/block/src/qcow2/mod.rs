@@ -29,9 +29,6 @@
 //! - Corruption is reported on stderr only; there is no `BLOCK_IMAGE_CORRUPTED` event yet.
 //! - There is no zstd support, as in a QEMU built without it: `compression_type=zstd` is not
 //!   even a valid value, and images that use it cannot be opened.
-//! - `qcow2_join_options()` is not needed: a reopen gets the full option set from the generic
-//!   code already, with the unchanged options filled in.
-//! - `qemu-img amend` reports no progress.
 //! - The driver keeps the image file and data file as they were when it opened them; a
 //!   reopen that replaces `file` updates the state once the reopen is committed.
 
@@ -101,7 +98,50 @@ pub(crate) static QCOW2: DriverDef = DriverDef::format("qcow2", qcow2_open)
     .with_measure(qcow2_measure)
     .with_backing()
     .with_strong_opts(&["encrypt.key-secret"])
-    .with_mutable_opts(&MUTABLE_OPTS);
+    .with_size_opts(&["cache-size", "l2-cache-size", "l2-cache-entry-size", "refcount-cache-size"])
+    .with_mutable_opts(&MUTABLE_OPTS)
+    .with_join_options(qcow2_join_options);
+
+/// `qcow2_join_options()`: a new overlap template drops all the old overlap options, and a
+/// new total cache size the old L2 and refcount cache sizes. Like QEMU, the old
+/// `overlap-check.bitmap-directory` stays.
+fn qcow2_join_options(options: &mut QDict, mut old: QDict) {
+    let has_new_overlap_template =
+        options.contains_key("overlap-check") || options.contains_key("overlap-check.template");
+    let has_new_total_cache_size = options.contains_key("cache-size");
+    if has_new_overlap_template {
+        for k in [
+            "overlap-check",
+            "overlap-check.template",
+            "overlap-check.main-header",
+            "overlap-check.active-l1",
+            "overlap-check.active-l2",
+            "overlap-check.refcount-table",
+            "overlap-check.refcount-block",
+            "overlap-check.snapshot-table",
+            "overlap-check.inactive-l1",
+            "overlap-check.inactive-l2",
+        ] {
+            old.remove(k);
+        }
+    }
+    if has_new_total_cache_size {
+        old.remove("l2-cache-size");
+        old.remove("refcount-cache-size");
+    }
+    for (k, v) in old.iter_inserted() {
+        if !options.contains_key(k) {
+            options.put(k, v.clone());
+        }
+    }
+    // After the merge, an old total size gives way to the others, unless it is new.
+    let has_all_cache_options = options.contains_key("cache-size")
+        || options.contains_key("l2-cache-size")
+        || options.contains_key("refcount-cache-size");
+    if has_all_cache_options && !has_new_total_cache_size {
+        options.remove("cache-size");
+    }
+}
 
 /// `qcow2_mutable_opts`: what a reopen may reset by leaving it out.
 static MUTABLE_OPTS: [&str; 21] = [
@@ -1035,7 +1075,12 @@ fn qcow2_measure(opts: &mut QDict, in_bs: Option<&Node>) -> Result<BlockMeasureI
 
 /// `qcow2_amend_options()`: `qemu-img amend`. Options qcow2 does not know stay in `options`
 /// for the caller to report.
-fn qcow2_amend_options(bs: &Node, options: &mut QDict, force: bool) -> Result<()> {
+fn qcow2_amend_options(
+    bs: &Node,
+    options: &mut QDict,
+    status: &mut dyn FnMut(u64, u64),
+    force: bool,
+) -> Result<()> {
     let Some(d) = bs.driver.as_any().and_then(|a| a.downcast_ref::<Qcow2>()) else {
         return Err(Error::generic("Driver does not support amending options"));
     };
@@ -1048,7 +1093,7 @@ fn qcow2_amend_options(bs: &Node, options: &mut QDict, force: bool) -> Result<()
         }
     }
     let old = d.state().total_size;
-    let r = d.with_bitmaps(bs, true, |s| s.amend_options(&o, &mut |_, _| {}, force));
+    let r = d.with_bitmaps(bs, true, |s| s.amend_options(&o, status, force));
     d.size_changed(bs, old);
     r
 }

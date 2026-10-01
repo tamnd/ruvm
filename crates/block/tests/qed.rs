@@ -479,17 +479,9 @@ fn check_matches_qemu() {
     let r = g.check("q", 0).unwrap();
     assert_eq!(Some(r.corruptions as u64), json_num(&out, "corruptions"), "{out}");
     assert_eq!(Some(r.leaks as u64), json_num(&out, "leaks").or(Some(0)), "{out}");
-    assert_eq!(
-        Some(r.bfi.allocated_clusters),
-        json_num(&out, "allocated-clusters"),
-        "{out}"
-    );
+    assert_eq!(Some(r.bfi.allocated_clusters), json_num(&out, "allocated-clusters"), "{out}");
     assert_eq!(Some(r.bfi.total_clusters), json_num(&out, "total-clusters"), "{out}");
-    assert_eq!(
-        Some(r.bfi.fragmented_clusters),
-        json_num(&out, "fragmented-clusters"),
-        "{out}"
-    );
+    assert_eq!(Some(r.bfi.fragmented_clusters), json_num(&out, "fragmented-clusters"), "{out}");
     assert_eq!(
         Some(r.image_end_offset as u64),
         json_num(&out, "image-end-offset").or(Some(0)),

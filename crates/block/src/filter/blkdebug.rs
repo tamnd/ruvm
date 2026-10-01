@@ -26,12 +26,12 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use ruvm_base::{Error, Result};
-use ruvm_qapi::QDict;
 use ruvm_qapi::cutils::{Errno, bool_parse, strtou64};
 use ruvm_qapi::types::{
     BlkdebugEvent, BlkdebugIOType, BlkdebugInjectErrorOptions, BlkdebugSetStateOptions,
     BlockPermission, BlockdevOptionsBlkdebug, BlockdevOptionsU,
 };
+use ruvm_qapi::{QDict, QValue};
 
 use crate::drivers::{self, DriverDef, OpenArgs};
 use crate::node::{
@@ -53,6 +53,14 @@ pub(crate) static BLKDEBUG: DriverDef = DriverDef::filter("blkdebug", blkdebug_o
         "config",
         "inject-error.",
         "set-state.",
+        "align",
+        "max-transfer",
+        "opt-write-zero",
+        "max-write-zero",
+        "opt-discard",
+        "max-discard",
+    ])
+    .with_size_opts(&[
         "align",
         "max-transfer",
         "opt-write-zero",
@@ -168,6 +176,20 @@ pub(crate) fn put_filename_child(options: &mut QDict, key: &str, filename: &str)
         if !drv.needs_filename {
             child.remove("filename");
         }
+    }
+    // A format driver given for the child opens its own `file` from the name, the way
+    // `bdrv_open_inherit()` does with a file name and a format driver.
+    let format = match options.get(key) {
+        Some(QValue::Dict(d)) => d
+            .get_str("driver")
+            .and_then(drivers::find_format)
+            .is_some_and(|d| d.protocol_name.is_none()),
+        _ => false,
+    };
+    if format {
+        let mut f = QDict::new();
+        f.put("file", child);
+        child = f;
     }
     let mut src = QDict::new();
     src.put(key, child);

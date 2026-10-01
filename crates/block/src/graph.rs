@@ -110,7 +110,8 @@ pub(crate) struct Inherited {
     /// Children default to `discard=unmap`, the root to `ignore`.
     pub unmap: bool,
     /// `BDRV_O_NATIVE_AIO`: `-drive aio=native`, the default of `aio` for `file` nodes.
-    pub native_aio: bool,    /// `BDRV_O_NO_IO`: the tools open images only to look at their metadata.
+    pub native_aio: bool,
+    /// `BDRV_O_NO_IO`: the tools open images only to look at their metadata.
     pub no_io: bool,
     /// `BDRV_O_CHECK`: opened for `qemu-img check`.
     pub check: bool,

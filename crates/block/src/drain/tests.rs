@@ -35,6 +35,9 @@ struct TestState {
     drain_count: AtomicI32,
     /// A read has started.
     read_started: AtomicBool,
+    /// A read has finished in the driver. The drain waits for this, not for the reader's
+    /// thread to come back from the call.
+    read_done: AtomicBool,
 }
 
 struct TestDriver(Arc<TestState>);
@@ -45,6 +48,7 @@ impl Driver for TestDriver {
         // Stay until the drain polls for this request.
         std::thread::sleep(Duration::from_millis(100));
         buf.fill(0);
+        self.0.read_done.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -139,22 +143,20 @@ fn drv_cb_common(t: DrainType, recursive: bool) {
     assert_eq!(count(&backing_s), 0);
 
     // The same while a request is pending.
-    let done = AtomicBool::new(false);
     std::thread::scope(|sc| {
         sc.spawn(|| {
             let mut buf = [0u8; 512];
             blk.pread(0, &mut buf).unwrap();
-            done.store(true, Ordering::SeqCst);
         });
         while !s.read_started.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        assert!(!done.load(Ordering::SeqCst));
+        assert!(!s.read_done.load(Ordering::SeqCst));
         assert_eq!(count(&s), 0);
         assert_eq!(count(&backing_s), 0);
 
         do_drain_begin(t, &bs);
-        assert!(done.load(Ordering::SeqCst));
+        assert!(s.read_done.load(Ordering::SeqCst));
         assert_eq!(count(&s), 1);
         assert_eq!(count(&backing_s), i32::from(recursive));
         do_drain_end(t, &bs);

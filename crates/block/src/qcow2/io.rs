@@ -8,7 +8,8 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 
-use ruvm_base::Result;
+use ruvm_base::{Error, Result};
+use ruvm_qapi::types::{BlkdebugEvent, PreallocMode};
 
 use crate::node::{Node, is_enotsup};
 
@@ -38,6 +39,18 @@ pub(crate) trait Storage: Send + Sync + fmt::Debug {
     /// `bdrv_truncate()` with `exact=true` and no preallocation.
     fn truncate(&self, len: u64) -> Result<()>;
 
+    /// `bdrv_truncate()` with `exact=false` and `prealloc`. The default writes zeroes for
+    /// `full` and handles `falloc` like `off`.
+    fn truncate_prealloc(&self, len: u64, prealloc: PreallocMode) -> Result<()> {
+        let old = self.len().map_err(|e| Error::from_io("Failed to get file length", e))?;
+        self.truncate(len)?;
+        if prealloc == PreallocMode::Full && len > old {
+            write_zero_buffer(self, old, len - old)
+                .map_err(|e| Error::from_io("Could not write zeros for preallocation", e))?;
+        }
+        Ok(())
+    }
+
     /// `bdrv_flush()`.
     fn flush(&self) -> io::Result<()>;
 
@@ -49,6 +62,12 @@ pub(crate) trait Storage: Send + Sync + fmt::Debug {
     /// `bdrv_get_allocated_file_size()`, or `None` where that is unknown.
     fn allocated_size(&self) -> Option<u64> {
         None
+    }
+
+    /// `BLKDBG_EVENT()` on the child. Only a node in the block graph can have a blkdebug
+    /// filter under it, so the default does nothing.
+    fn debug_event(&self, event: BlkdebugEvent) {
+        let _ = event;
     }
 }
 
@@ -101,6 +120,10 @@ impl Storage for NodeStorage {
         self.0.truncate(len)
     }
 
+    fn truncate_prealloc(&self, len: u64, prealloc: PreallocMode) -> Result<()> {
+        self.0.truncate_full(len as i64, false, prealloc, 0)
+    }
+
     fn flush(&self) -> io::Result<()> {
         self.0.flush()
     }
@@ -111,6 +134,10 @@ impl Storage for NodeStorage {
 
     fn allocated_size(&self) -> Option<u64> {
         self.0.allocated_file_size().ok()
+    }
+
+    fn debug_event(&self, event: BlkdebugEvent) {
+        self.0.debug_event(event);
     }
 }
 

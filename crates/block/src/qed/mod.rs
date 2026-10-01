@@ -44,7 +44,7 @@ use ruvm_base::{Error, Result};
 use ruvm_qapi::QDict;
 use ruvm_qapi::opts::QemuOptDesc;
 use ruvm_qapi::types::{
-    BlockdevCreateOptionsQed, BlockdevCreateOptionsU, BlockdevOptionsU, PreallocMode,
+    BlkdebugEvent, BlockdevCreateOptionsQed, BlockdevCreateOptionsU, BlockdevOptionsU, PreallocMode,
 };
 
 use crate::drivers::{DriverDef, OpenArgs};
@@ -321,6 +321,7 @@ impl State {
             let mut table = vec![0u64; self.table_nelems as usize];
             self.update_l2_table(&mut table, index, n, offset);
             // Write out the whole new L2 table
+            file.debug_event(BlkdebugEvent::L2Update);
             write_table(file, l2_offset, &table, 0, table.len(), true)?;
 
             // qed_aio_write_l1_update()
@@ -335,6 +336,7 @@ impl State {
             let mut table = std::mem::take(self.read_l2_table(file, l2_offset)?);
             self.update_l2_table(&mut table, index, n, offset);
             // Write out only the updated part of the L2 table
+            file.debug_event(BlkdebugEvent::L2Update);
             let r = write_table(file, l2_offset, &table, index, n, false);
             if let Some(t) = self.l2_cache.find(l2_offset) {
                 *t = table;
@@ -510,7 +512,10 @@ impl QedDriver {
     /// `qed_read_backing_file()`: the backing file's data at `pos`, or zeroes without one.
     fn read_backing_file(bs: &Node, pos: u64, buf: &mut [u8]) -> io::Result<()> {
         match bs.backing() {
-            Some(b) => b.node.pread(pos, buf),
+            Some(b) => {
+                bs.file().debug_event(BlkdebugEvent::ReadBackingAio);
+                b.node.pread(pos, buf)
+            }
             None => {
                 buf.fill(0);
                 Ok(())
@@ -533,6 +538,7 @@ impl QedDriver {
         }
         let mut buf = vec![0u8; len as usize];
         Self::read_backing_file(bs, pos, &mut buf)?;
+        file.debug_event(BlkdebugEvent::CowWrite);
         file.pwrite(offset, &buf)
     }
 
@@ -579,6 +585,7 @@ impl QedDriver {
             Self::copy_from_backing_file(bs, file, start, tail, offset)?;
 
             // qed_aio_write_main()
+            file.debug_event(BlkdebugEvent::WriteAio);
             file.pwrite(cluster + head, data)?;
 
             if bs.backing().is_some() {
@@ -611,7 +618,10 @@ impl QedDriver {
                     let chunk = &mut out[d..d + l];
                     match found {
                         Cluster::Zero => chunk.fill(0),
-                        Cluster::Found => file.pread(offset, chunk)?,
+                        Cluster::Found => {
+                            file.debug_event(BlkdebugEvent::ReadAio);
+                            file.pread(offset, chunk)?
+                        }
                         Cluster::L2 | Cluster::L1 => Self::read_backing_file(bs, cur_pos, chunk)?,
                     }
                 }
@@ -619,14 +629,20 @@ impl QedDriver {
                 Buf::Write(data) => {
                     let chunk = &data[d..d + l];
                     match found {
-                        Cluster::Found => file.pwrite(offset, chunk)?,
+                        Cluster::Found => {
+                            file.debug_event(BlkdebugEvent::WriteAio);
+                            file.pwrite(offset, chunk)?
+                        }
                         _ => {
                             Self::write_alloc(&mut s, bs, &file, found, cur_pos, len, Some(chunk))?
                         }
                     }
                 }
                 Buf::Zero => match found {
-                    Cluster::Found => file.pwrite(offset, &vec![0u8; l])?,
+                    Cluster::Found => {
+                        file.debug_event(BlkdebugEvent::WriteAio);
+                        file.pwrite(offset, &vec![0u8; l])?
+                    }
                     _ => Self::write_alloc(&mut s, bs, &file, found, cur_pos, len, None)?,
                 },
             }
