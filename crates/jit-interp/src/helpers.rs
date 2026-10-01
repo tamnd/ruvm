@@ -17,7 +17,7 @@ use std::fmt;
 use ruvm_jit_core::ir::{HelperInfo, HelperType};
 use ruvm_jit_core::types::MemOpIdx;
 
-use crate::mem::{GuestMemory, MemFault, guest_load, guest_store, plain};
+use crate::mem::{GuestMemory, MemFault, guest_load_env, guest_store_env, plain};
 
 /// Why control left a translation block early.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -174,6 +174,18 @@ fn sext(v: u128, bits: u32) -> i128 {
 }
 
 fn rmw(e: &mut HelperEnv<'_>, args: &[u64], op: Rmw, new_value: bool) -> Result<u128, Unwind> {
+    e.mem.atomic_begin();
+    let r = rmw_locked(e, args, op, new_value);
+    e.mem.atomic_end();
+    r
+}
+
+fn rmw_locked(
+    e: &mut HelperEnv<'_>,
+    args: &[u64],
+    op: Rmw,
+    new_value: bool,
+) -> Result<u128, Unwind> {
     let wide = args.len() == 5;
     let addr = args[1];
     let val = value(args, 2, wide);
@@ -181,7 +193,7 @@ fn rmw(e: &mut HelperEnv<'_>, args: &[u64], op: Rmw, new_value: bool) -> Result<
     let bits = 8 * oi.memop().size_bytes();
     let mask = if bits == 128 { !0u128 } else { (1u128 << bits) - 1 };
     let val = val & mask;
-    let old = guest_load(e.mem, addr, oi).map_err(Unwind::Mem)? & mask;
+    let old = guest_load_env(e.mem, e.env, addr, oi).map_err(Unwind::Mem)? & mask;
     let new = match op {
         Rmw::Add => old.wrapping_add(val),
         Rmw::And => old & val,
@@ -205,11 +217,18 @@ fn rmw(e: &mut HelperEnv<'_>, args: &[u64], op: Rmw, new_value: bool) -> Result<
         Rmw::Umax => old.max(val),
         Rmw::Xchg => val,
     } & mask;
-    guest_store(e.mem, addr, new, oi).map_err(Unwind::Mem)?;
+    guest_store_env(e.mem, e.env, addr, new, oi).map_err(Unwind::Mem)?;
     Ok(if new_value { new } else { old })
 }
 
 fn cmpxchg(e: &mut HelperEnv<'_>, args: &[u64]) -> Result<u128, Unwind> {
+    e.mem.atomic_begin();
+    let r = cmpxchg_locked(e, args);
+    e.mem.atomic_end();
+    r
+}
+
+fn cmpxchg_locked(e: &mut HelperEnv<'_>, args: &[u64]) -> Result<u128, Unwind> {
     let wide = args.len() == 7;
     let addr = args[1];
     let oi = plain(MemOpIdx(args[args.len() - 1] as u32));
@@ -220,9 +239,9 @@ fn cmpxchg(e: &mut HelperEnv<'_>, args: &[u64]) -> Result<u128, Unwind> {
     } else {
         (value(args, 2, false) & mask, value(args, 3, false) & mask)
     };
-    let old = guest_load(e.mem, addr, oi).map_err(Unwind::Mem)? & mask;
+    let old = guest_load_env(e.mem, e.env, addr, oi).map_err(Unwind::Mem)? & mask;
     if old == cmpv {
-        guest_store(e.mem, addr, newv, oi).map_err(Unwind::Mem)?;
+        guest_store_env(e.mem, e.env, addr, newv, oi).map_err(Unwind::Mem)?;
     }
     Ok(old)
 }
