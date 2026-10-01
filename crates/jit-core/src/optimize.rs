@@ -1481,6 +1481,8 @@ impl Opt<'_> {
                         let c = self.arg_new_constant(self.ty.bits() as u64 - 1);
                         self.set_arg(op, 2, c);
                         self.f.op_mut(op).nargs = 3;
+                        // The high part is no longer what it was before the op.
+                        return self.finish_folding(op);
                     }
                     _ => unreachable!(),
                 }

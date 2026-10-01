@@ -8,9 +8,10 @@
 //! registry go in, an [`ruvm_jit_interp::Exit`] or [`ruvm_jit_interp::InterpError`] comes out.
 //! The interpreter is the reference; the tests run random blocks through both and compare.
 //!
-//! This first tier keeps every temp in memory between ops, with no register allocator, and
-//! covers every scalar op. Vector ops are refused with
-//! [`GenCodeError::Unsupported`], so a caller can fall back to the interpreter for those blocks.
+//! Values live in host registers, placed by the register allocator of
+//! [`ruvm_jit_core::regalloc`], and every scalar op and every 64 and 128 bit vector op is
+//! covered (NEON). Blocks with wider temps are refused with [`GenCodeError::Unsupported`], so a
+//! caller can fall back to the interpreter for those.
 //! Code can be generated on any host, but only run on an AArch64 one.
 //!
 //! All unsafe code is in the code buffer (mapping, writing and flushing executable memory) and
@@ -18,8 +19,8 @@
 
 #[allow(
     dead_code,
-    reason = "the assembler is a whole port of tcg-target.c.inc's encoders; the vector and \
-              register allocated tiers use the parts the first tier does not"
+    reason = "the assembler is a whole port of tcg-target.c.inc's encoders, including parts \
+              such as the softmmu fast path and the atomics that this backend does not use yet"
 )]
 mod asm;
 mod buffer;
