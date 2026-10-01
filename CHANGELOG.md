@@ -6,6 +6,18 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.3.0
+
+M3 is done, so this is the first 0.3 release. The block layer and its tools now pass QEMU's own tests.
+
+For M3: the last formats landed with the qcow2 driver, which has subclusters, external data files, compression, LUKS, persistent bitmaps and internal snapshots (#104). `qemu-nbd` and `qemu-storage-daemon` work, with NBD, vhost-user-blk, FUSE and VDUSE exports (#102, #103). `cargo xtask iotests` runs QEMU 11.1's tests/qemu-iotests suite against the ruvm tools. On Linux the quick and auto groups for qcow2, raw and nbd show no regressions against QEMU, and every test we still skip is listed with a reason (#112). Getting there fixed a long tail of output and behavior differences across qcow2, qed, raw, the filters and the tools. A new test makes each implementation run `qemu-img check` on images the other one wrote, for every format (#113). What is still skipped is tracked in #114.
+
+M4 has started. `ruvm-decode` turns QEMU's decodetree files into Rust decoders (#105). `ruvm-jit-core` has the TCG IR, the optimizer and liveness, and `ruvm-jit-interp` is a portable interpreter that the tests use as a reference (#106). `ruvm-softfloat` is a bit exact port of QEMU's fpu (#107). There are two native backends, aarch64 (#108) and x86-64 with SSE2 through AVX2 (#111). They share a port of the TCG register allocator (#110), and both are checked against the interpreter on random blocks. `ruvm-jit` is the runtime: the TB cache, chaining, the softmmu TLB, `cpu_exec`, MTTCG and exclusive sections (#109). No guest front end runs on it yet, so this is all plumbing for now.
+
+M2 has not changed. The boards still have not booted on real KVM, because none of our machines has `/dev/kvm` right now.
+
+Known issues: two block unit tests are flaky when the suite runs in parallel (#115).
+
 ## 0.2.4
 
 This patch is mostly storage. The M2 boards now have firmware, and most of the M3 block layer is in, along with qemu-img and qemu-io.
