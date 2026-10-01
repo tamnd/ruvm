@@ -250,6 +250,13 @@ pub trait CpuOps: Send + Sync + fmt::Debug {
     fn precise_smc(&self) -> bool {
         false
     }
+
+    /// The target hooks as [`std::any::Any`], so that target helpers can reach their own
+    /// per-CPU-type data (models, I/O address spaces) through [`Cpu::ops`]. QEMU gets there
+    /// with `env_archcpu()`.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 type WorkFn = Box<dyn FnOnce(&mut Cpu<'_>) + Send>;
