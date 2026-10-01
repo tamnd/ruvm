@@ -11,6 +11,7 @@ use ruvm_qapi::types::JobType;
 use super::*;
 use crate::job::block_job::{BlockJobParams, block_job_create};
 use crate::job::core::{ECANCELED, JOB_DEFAULT, JobDriver, JobErr, JobTxn};
+use crate::job::main_loop::bql_lock;
 
 const EINPROGRESS: i32 = -libc::EINPROGRESS;
 const EIO: i32 = -libc::EIO;
@@ -96,6 +97,8 @@ fn wait_results(rs: &[&Arc<AtomicI32>]) {
 }
 
 fn single_job(expected: i32) {
+    // The C test runs with the BQL held, so job_exit() waits until the test polls.
+    let _bql = bql_lock();
     let g = BlockGraph::new();
     let result = Arc::new(AtomicI32::new(EINPROGRESS));
     let txn = JobTxn::new();
@@ -130,6 +133,8 @@ fn single_cancel() {
 }
 
 fn pair_jobs(mut expected1: i32, mut expected2: i32) {
+    // The C test runs with the BQL held, so job_exit() waits until the test polls.
+    let _bql = bql_lock();
     let g = BlockGraph::new();
     let result1 = Arc::new(AtomicI32::new(EINPROGRESS));
     let result2 = Arc::new(AtomicI32::new(EINPROGRESS));
@@ -182,9 +187,23 @@ fn pair_cancel() {
     pair_jobs(0, -ECANCELED);
 }
 
+/// Waits, without running any bottom halves, until the job thread has either parked in a
+/// yield or finished its run and handed the completion to the main loop.
+fn wait_parked(job: &Job) {
+    let end = Instant::now() + Duration::from_secs(10);
+    while !job.with_state(|s| !s.busy || s.deferred_to_main_loop) {
+        assert!(Instant::now() < end, "timed out waiting for the job to park");
+        std::thread::yield_now();
+    }
+}
+
 #[test]
 fn pair_fail_cancel_race() {
     let _s = serial();
+    // The C test runs in the main loop with the BQL held, so job_exit() never runs until the
+    // test polls. Hold the BQL here too, otherwise a job thread runs its exit on its own and
+    // races with the cancel below.
+    let _bql = bql_lock();
     let g = BlockGraph::new();
     let result1 = Arc::new(AtomicI32::new(EINPROGRESS));
     let result2 = Arc::new(AtomicI32::new(EINPROGRESS));
@@ -193,13 +212,18 @@ fn pair_fail_cancel_race() {
     let job2 = test_block_job_start(&g, 2, false, 0, &result2, &txn);
     job1.start();
     job2.start();
+    // job_start() in QEMU runs the coroutine up to its first yield. Here the job runs on its
+    // own thread, and job_enter() does nothing while the job is still busy, so wait for it.
+    wait_parked(&job2);
     {
         let mut jl = job_lock();
         job1.cancel_locked(&mut jl, false);
     }
     // Now make job2 finish before the main loop kicks jobs. This simulates the race between
     // a pending kick and another job completing.
+    wait_parked(&job2);
     job2.enter();
+    wait_parked(&job2);
     job2.enter();
     wait_results(&[&result1, &result2]);
     assert_eq!(result1.load(Ordering::SeqCst), -ECANCELED);

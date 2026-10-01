@@ -574,6 +574,9 @@ impl BlockGraph {
 
     /// `qmp_blockdev_del()`.
     pub fn blockdev_del(&self, node_name: &str) -> Result<()> {
+        // Taken before the name table lock. No drain-all may hold a reference to the node
+        // while it goes away, or its children would keep their parent edge until it lets go.
+        let _owner = crate::drain::DrainAllOwner::acquire();
         let mut nodes = self.nodes.lock().unwrap();
         let Some(entry) = nodes.get(node_name) else {
             return Err(Error::generic(format!(

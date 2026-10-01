@@ -98,12 +98,14 @@ fn owner_release() {
 }
 
 /// Keeps other threads out of drain-all sections while it lives, without draining
-/// anything. The owning thread may still start drain-all sections of its own. Tests hold
-/// it so that a drain-all of another test does not disturb what they count.
-#[cfg(test)]
+/// anything. The owning thread may still start drain-all sections of its own. QEMU gets this
+/// from the BQL: a drain-all and a node delete never overlap there. Here a drain-all briefly
+/// holds a strong reference to every node, so a node deleted meanwhile would be freed late,
+/// by the drain-all thread. [`crate::graph::BlockGraph::blockdev_del`] holds this to keep
+/// the free where it belongs, and tests hold it so that a drain-all of another test does not
+/// disturb what they count.
 pub(crate) struct DrainAllOwner(());
 
-#[cfg(test)]
 impl DrainAllOwner {
     pub(crate) fn acquire() -> Self {
         owner_acquire();
@@ -111,7 +113,6 @@ impl DrainAllOwner {
     }
 }
 
-#[cfg(test)]
 impl Drop for DrainAllOwner {
     fn drop(&mut self) {
         owner_release();
