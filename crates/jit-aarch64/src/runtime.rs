@@ -24,7 +24,7 @@ use ruvm_jit_interp::{
 
 use crate::asm::i;
 use crate::buffer::{BufferError, CodeBuffer};
-use crate::codegen::{self, GenCodeError, NARGS, RET_OFFSET, Request, kind};
+use crate::codegen::{self, GenCodeError, INSN_OFFSET, NARGS, RET_OFFSET, Request, kind};
 
 /// One executable buffer that blocks are compiled into, front to back.
 #[derive(Debug)]
@@ -49,8 +49,8 @@ impl CodeRegion {
         self.buf.size()
     }
 
-    /// Compile `f` into the region, `tcg_gen_code`. Vector ops are refused with
-    /// [`GenCodeError::Unsupported`]; such a block can be run with the interpreter instead.
+    /// Compile `f` into the region, `tcg_gen_code`. A block with temps wider than 128 bits is
+    /// refused with [`GenCodeError::Unsupported`]; it can be run with the interpreter instead.
     pub fn compile(self: &Arc<Self>, f: &Func) -> Result<CompiledTb, GenCodeError> {
         let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let offset = next.next_multiple_of(16);
@@ -140,6 +140,8 @@ impl CompiledTb {
         let mut ctx = RunCtx {
             args: [0; NARGS],
             ret: 0,
+            insn: 0,
+            insn_delivered: 0,
             requests: &self.requests,
             env: env.as_mut_ptr(),
             env_len,
@@ -151,6 +153,7 @@ impl CompiledTb {
             panic: None,
         };
         let k = enter(self.addr(), ctx.env, env_len, &mut ctx, slots.as_mut_ptr())?;
+        deliver_insn_start(&mut ctx);
         *last_insn_start = ctx.insn_start;
         if let Some(p) = ctx.panic.take() {
             resume_unwind(p);
@@ -177,11 +180,15 @@ impl CompiledTb {
 }
 
 /// The state shared by generated code and [`service`] during one run. Generated code only
-/// touches `args` and `ret`, at the offsets [`codegen`] uses.
+/// touches `args`, `ret` and `insn`, at the offsets [`codegen`] uses.
 #[repr(C)]
 pub(crate) struct RunCtx<'a> {
     args: [u64; NARGS],
     ret: u64,
+    /// One more than the index of the request of the last `insn_start` executed, or 0.
+    insn: u64,
+    /// The value of `insn` last reported to the guest memory.
+    insn_delivered: u64,
     requests: &'a [Request],
     /// The CPU state, as a pointer because generated code writes it between service calls.
     env: *mut u8,
@@ -195,6 +202,21 @@ pub(crate) struct RunCtx<'a> {
 }
 
 const _: () = assert!(std::mem::offset_of!(RunCtx<'static>, ret) == RET_OFFSET as usize);
+const _: () = assert!(std::mem::offset_of!(RunCtx<'static>, insn) == INSN_OFFSET as usize);
+
+/// Report the last `insn_start` generated code stored, if it is new, to the context and the
+/// guest memory, as the interpreter does when it executes one.
+fn deliver_insn_start(ctx: &mut RunCtx<'_>) {
+    if ctx.insn == ctx.insn_delivered {
+        return;
+    }
+    ctx.insn_delivered = ctx.insn;
+    let at = (ctx.insn as usize).wrapping_sub(1);
+    if let Some(Request::InsnStart(w)) = ctx.requests.get(at) {
+        ctx.insn_start = Some(*w);
+        ctx.mem.insn_start(w);
+    }
+}
 
 /// Call generated code at `addr`.
 #[cfg(all(unix, target_arch = "aarch64"))]
@@ -260,6 +282,7 @@ enum Leave {
 }
 
 fn serve(ctx: &mut RunCtx<'_>, req: u64) -> Result<(), Leave> {
+    deliver_insn_start(ctx);
     let r = ctx
         .requests
         .get(req as usize)

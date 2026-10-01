@@ -15,7 +15,9 @@
 //! - [`ir::Func::reachable_code_pass`], [`ir::Func::liveness_pass_0`],
 //!   [`ir::Func::liveness_pass_1`] and [`ir::Func::liveness_pass_2`] from `tcg/tcg.c`;
 //! - [`ir::Func::gen_code`], which runs them in QEMU's order and returns the `-d op,op_opt` log;
-//! - [`ir::Func::dump_ops`], `tcg_dump_ops`.
+//! - [`ir::Func::dump_ops`], `tcg_dump_ops`;
+//! - [`regalloc`], the target independent register allocator of `tcg/tcg.c`, which host
+//!   backends drive through [`regalloc::Target`].
 //!
 //! Every op keeps QEMU's semantics bit for bit; `ruvm-jit-interp` is the reference interpreter.
 //!
@@ -45,6 +47,7 @@ pub mod ir;
 pub mod liveness;
 pub mod opcode;
 pub mod optimize;
+pub mod regalloc;
 pub mod tcg_op;
 pub mod tcg_op_ldst;
 pub mod tcg_op_vec;

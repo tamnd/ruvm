@@ -183,7 +183,7 @@ fn jit_write_protect(on: bool) {
     unsafe { libc::pthread_jit_write_protect_np(on as libc::c_int) };
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(all(unix, not(all(target_os = "macos", target_arch = "aarch64"))))]
 fn jit_write_protect(_on: bool) {}
 
 #[cfg(target_os = "macos")]
