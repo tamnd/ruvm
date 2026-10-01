@@ -14,6 +14,13 @@ publish = false
 unsafe-budget = 0
 
 [dependencies]
+ruvm-jit.workspace = true
+ruvm-jit-core.workspace = true
+ruvm-jit-interp.workspace = true
+ruvm-mem.workspace = true
+
+[build-dependencies]
+ruvm-decode.workspace = true
 
 [lints]
 workspace = true

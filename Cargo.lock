@@ -990,6 +990,13 @@ version = "0.3.0"
 [[package]]
 name = "ruvm-target-arm"
 version = "0.3.0"
+dependencies = [
+ "ruvm-decode",
+ "ruvm-jit",
+ "ruvm-jit-core",
+ "ruvm-jit-interp",
+ "ruvm-mem",
+]
 
 [[package]]
 name = "ruvm-target-avr"
