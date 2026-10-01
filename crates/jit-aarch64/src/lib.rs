@@ -1,5 +1,31 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The AArch64 host backend for the ruvm JIT.
+//! The AArch64 host backend for the ruvm JIT, QEMU's `tcg/aarch64`.
 //!
-//! Empty for now. The plan for this crate is in `spec/24-workspace-layout.md`.
+//! [`CodeRegion::compile`] turns a finished [`ruvm_jit_core::Func`] into A64 machine code in an
+//! executable buffer, and [`CompiledTb::run`] runs it with the same inputs and the same results
+//! as [`ruvm_jit_interp::Machine::run`]: the CPU state buffer, guest memory and the helper
+//! registry go in, an [`ruvm_jit_interp::Exit`] or [`ruvm_jit_interp::InterpError`] comes out.
+//! The interpreter is the reference; the tests run random blocks through both and compare.
+//!
+//! This first tier keeps every temp in memory between ops, with no register allocator, and
+//! covers every scalar op. Vector ops are refused with
+//! [`GenCodeError::Unsupported`], so a caller can fall back to the interpreter for those blocks.
+//! Code can be generated on any host, but only run on an AArch64 one.
+//!
+//! All unsafe code is in the code buffer (mapping, writing and flushing executable memory) and
+//! in the two places the runtime crosses into and back out of generated code.
+
+#[allow(
+    dead_code,
+    reason = "the assembler is a whole port of tcg-target.c.inc's encoders; the vector and \
+              register allocated tiers use the parts the first tier does not"
+)]
+mod asm;
+mod buffer;
+mod codegen;
+mod runtime;
+
+pub use buffer::{BufferError, CodeBuffer};
+pub use codegen::GenCodeError;
+pub use runtime::{CodeRegion, CompiledTb};

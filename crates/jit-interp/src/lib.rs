@@ -46,7 +46,10 @@ use ruvm_jit_core::opcode::Opcode;
 use ruvm_jit_core::types::{Cond, INSN_START_WORDS, MemOpIdx, TempKind, Type, bswap};
 
 pub use helpers::{HelperEntry, HelperEnv, HelperFn, HelperRegistry, Unwind};
-pub use mem::{FaultKind, FlatMemory, GuestMemory, MemFault, NoMemory, guest_load, guest_store};
+pub use mem::{
+    FaultKind, FlatMemory, GuestMemory, MemFault, NoMemory, guest_load, guest_load_env,
+    guest_store, guest_store_env,
+};
 
 /// How a run of a translation block ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -347,6 +350,7 @@ impl<'a> Machine<'a> {
                 let mut words = [0u64; INSN_START_WORDS];
                 words.copy_from_slice(&op.args[..INSN_START_WORDS]);
                 self.last_insn_start = Some(words);
+                self.mem.insn_start(&words);
             }
             Opcode::Br => return Ok(Flow::Jump(op.arg_label(0).id())),
             Opcode::Brcond => {
@@ -580,19 +584,21 @@ impl<'a> Machine<'a> {
                 let addr = g!(ai);
                 let oi = MemOpIdx(op.args[ai + 1] as u32);
                 match op.opc {
-                    Opcode::QemuLd | Opcode::QemuLd2 => match guest_load(self.mem, addr, oi) {
-                        Ok(v) => {
-                            s!(0, v as u64);
-                            if two {
-                                s!(1, (v >> 64) as u64);
+                    Opcode::QemuLd | Opcode::QemuLd2 => {
+                        match guest_load_env(self.mem, self.env, addr, oi) {
+                            Ok(v) => {
+                                s!(0, v as u64);
+                                if two {
+                                    s!(1, (v >> 64) as u64);
+                                }
                             }
+                            Err(e) => return Ok(Flow::Exit(Exit::Unwind(Unwind::Mem(e)))),
                         }
-                        Err(e) => return Ok(Flow::Exit(Exit::Unwind(Unwind::Mem(e)))),
-                    },
+                    }
                     _ => {
                         let v =
                             if two { g!(0) as u128 | (g!(1) as u128) << 64 } else { g!(0) as u128 };
-                        if let Err(e) = guest_store(self.mem, addr, v, oi) {
+                        if let Err(e) = guest_store_env(self.mem, self.env, addr, v, oi) {
                             return Ok(Flow::Exit(Exit::Unwind(Unwind::Mem(e))));
                         }
                     }

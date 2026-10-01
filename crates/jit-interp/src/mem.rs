@@ -39,6 +39,53 @@ pub trait GuestMemory {
 
     /// Write `data` starting at `addr`.
     fn write(&mut self, addr: u64, data: &[u8], oi: MemOpIdx) -> Result<(), MemFault>;
+
+    /// [`GuestMemory::read`] for an access made while running a block against `env`. A
+    /// softmmu that has to walk guest page tables needs the CPU state to do it. The default
+    /// ignores `env`.
+    fn read_with_env(
+        &mut self,
+        env: &mut [u8],
+        addr: u64,
+        buf: &mut [u8],
+        oi: MemOpIdx,
+    ) -> Result<(), MemFault> {
+        let _ = env;
+        self.read(addr, buf, oi)
+    }
+
+    /// [`GuestMemory::write`] for an access made while running a block against `env`. The
+    /// default ignores `env`.
+    fn write_with_env(
+        &mut self,
+        env: &mut [u8],
+        addr: u64,
+        data: &[u8],
+        oi: MemOpIdx,
+    ) -> Result<(), MemFault> {
+        let _ = env;
+        self.write(addr, data, oi)
+    }
+
+    /// Called before the load and store of an atomic helper. A memory shared between threads
+    /// takes a lock here so the pair is indivisible. The default does nothing.
+    fn atomic_begin(&mut self) {}
+
+    /// Called after an atomic helper is done with memory, whether it succeeded or not.
+    fn atomic_end(&mut self) {}
+
+    /// Called when an `insn_start` op runs, with its words. A runtime uses this to know which
+    /// guest instruction a fault or helper call belongs to, as QEMU does by searching the
+    /// block's unwind data with the host return address. The default does nothing.
+    fn insn_start(&mut self, words: &[u64; ruvm_jit_core::types::INSN_START_WORDS]) {
+        let _ = words;
+    }
+
+    /// The memory as [`Any`](std::any::Any), so helpers can reach the runtime behind it. The
+    /// default is `None`.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 /// A single flat region of guest memory starting at `base`.
@@ -111,12 +158,34 @@ fn check_align(addr: u64, oi: MemOpIdx, write: bool) -> Result<(), MemFault> {
 /// Load the value a [`MemOpIdx`] describes: up to 16 bytes, byte swapped if the op is big
 /// endian, and sign extended to 128 bits if the op is signed.
 pub fn guest_load(mem: &mut dyn GuestMemory, addr: u64, oi: MemOpIdx) -> Result<u128, MemFault> {
+    load_impl(mem, None, addr, oi)
+}
+
+/// [`guest_load`] through [`GuestMemory::read_with_env`].
+pub fn guest_load_env(
+    mem: &mut dyn GuestMemory,
+    env: &mut [u8],
+    addr: u64,
+    oi: MemOpIdx,
+) -> Result<u128, MemFault> {
+    load_impl(mem, Some(env), addr, oi)
+}
+
+fn load_impl(
+    mem: &mut dyn GuestMemory,
+    env: Option<&mut [u8]>,
+    addr: u64,
+    oi: MemOpIdx,
+) -> Result<u128, MemFault> {
     check_align(addr, oi, false)?;
     let mop = oi.memop();
     let n = mop.size_bytes() as usize;
     assert!(n <= 16, "guest access wider than 16 bytes");
     let mut buf = [0u8; 16];
-    mem.read(addr, &mut buf[..n], oi)?;
+    match env {
+        Some(env) => mem.read_with_env(env, addr, &mut buf[..n], oi)?,
+        None => mem.read(addr, &mut buf[..n], oi)?,
+    }
     if mop.is_bswap() {
         buf[..n].reverse();
     }
@@ -136,6 +205,27 @@ pub fn guest_store(
     val: u128,
     oi: MemOpIdx,
 ) -> Result<(), MemFault> {
+    store_impl(mem, None, addr, val, oi)
+}
+
+/// [`guest_store`] through [`GuestMemory::write_with_env`].
+pub fn guest_store_env(
+    mem: &mut dyn GuestMemory,
+    env: &mut [u8],
+    addr: u64,
+    val: u128,
+    oi: MemOpIdx,
+) -> Result<(), MemFault> {
+    store_impl(mem, Some(env), addr, val, oi)
+}
+
+fn store_impl(
+    mem: &mut dyn GuestMemory,
+    env: Option<&mut [u8]>,
+    addr: u64,
+    val: u128,
+    oi: MemOpIdx,
+) -> Result<(), MemFault> {
     check_align(addr, oi, true)?;
     let mop = oi.memop();
     let n = mop.size_bytes() as usize;
@@ -144,7 +234,10 @@ pub fn guest_store(
     if mop.is_bswap() {
         buf[..n].reverse();
     }
-    mem.write(addr, &buf[..n], oi)
+    match env {
+        Some(env) => mem.write_with_env(env, addr, &buf[..n], oi),
+        None => mem.write(addr, &buf[..n], oi),
+    }
 }
 
 /// The memop with only size and byte order kept, for accesses done by helpers.
