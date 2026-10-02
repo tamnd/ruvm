@@ -18,12 +18,16 @@ use ruvm_jit_core::types::call_flags::NO_RWG_SE;
 use ruvm_jit_core::{HelperInfo, HelperType, MemOp, MemOpIdx};
 use ruvm_jit_interp::{HelperEnv, HelperRegistry, Unwind};
 
-use super::{arm_of, exception_target_el, sysreg};
+use super::{arm_of, exception_target_el, psci, sysreg};
 use crate::cpu::{
-    CpuArmState, EXCP_PREFETCH_ABORT, EXCP_UDEF, PSTATE_DAIF, PSTATE_IL, PSTATE_NRW, PSTATE_NZCV,
-    PSTATE_PAN, PSTATE_SS, PSTATE_UAO, SCTLR_NTWI, SCTLR_UMA,
+    CpuArmState, EXCP_HVC, EXCP_HYP_TRAP, EXCP_PREFETCH_ABORT, EXCP_SMC, EXCP_UDEF, HCR_HCD,
+    HCR_NV, HCR_TGE, HCR_TSC, HCR_TWI, PSTATE_DAIF, PSTATE_IL, PSTATE_NRW, PSTATE_NZCV, PSTATE_PAN,
+    PSTATE_SS, PSTATE_UAO, SCR_HCE, SCR_SMD, SCR_TWI, SCTLR_NTWI, SCTLR_UMA,
 };
-use crate::syndrome::{syn_aa64_sysregtrap, syn_pcalignment, syn_uncategorized, syn_wfx};
+use crate::syndrome::{
+    EC_ADVSIMDFPACCESSTRAP, syn_aa64_sysregtrap, syn_get_ec, syn_pcalignment, syn_uncategorized,
+    syn_wfx,
+};
 
 type R<T> = Result<T, CpuLoopExit>;
 
@@ -66,15 +70,26 @@ fn run(h: &mut HelperEnv<'_>, f: impl FnOnce(&mut Cpu<'_>) -> R<u64>) -> Result<
     }
 }
 
-/// `raise_exception()`: take `excp` with `syndrome` to `target_el`.
+/// `raise_exception()`: take `excp` with `syndrome` to `target_el`, or to EL2 instead of EL1
+/// when HCR_EL2.TGE is set.
 pub(crate) fn raise_exception(
     cpu: &mut Cpu<'_>,
     excp: i32,
-    syndrome: u32,
-    target_el: u32,
+    mut syndrome: u32,
+    mut target_el: u32,
     ra: Ra,
 ) -> CpuLoopExit {
     let mut st = CpuArmState::load(cpu.env);
+    let ops = cpu.ops();
+    if target_el == 1 && st.hcr_el2_eff(arm_of(&ops).features()) & HCR_TGE != 0 {
+        // Redirect NS EL1 exceptions to NS EL2. These are reported with their original
+        // syndrome register value, with the exception of SIMD/FP access traps, which are
+        // reported as uncategorized exceptions.
+        target_el = 2;
+        if syn_get_ec(syndrome) == EC_ADVSIMDFPACCESSTRAP {
+            syndrome = syn_uncategorized();
+        }
+    }
     st.exception_syndrome = syndrome;
     st.exception_target_el = target_el;
     st.store(cpu.env);
@@ -113,6 +128,8 @@ def!(
 def!(GET_SYSREG, "get_sysreg", 0, I64, [Ptr, I32], h_get_sysreg);
 def!(SET_SYSREG, "set_sysreg", 0, Void, [Ptr, I32, I64], h_set_sysreg);
 def!(DC_ZVA, "dc_zva", 0, Void, [Ptr, I64], h_dc_zva);
+def!(PRE_HVC, "pre_hvc", 0, Void, [Ptr], h_pre_hvc);
+def!(PRE_SMC, "pre_smc", 0, Void, [Ptr, I32], h_pre_smc);
 def!(CRC32_64, "crc32_64", NO_RWG_SE, I64, [I64, I64, I32], h_crc32_64);
 def!(CRC32C_64, "crc32c_64", NO_RWG_SE, I64, [I64, I64, I32], h_crc32c_64);
 def!(RBIT64, "rbit64", NO_RWG_SE, I64, [I64], h_rbit64);
@@ -132,6 +149,8 @@ pub(crate) const ALL: &[Def] = &[
     GET_SYSREG,
     SET_SYSREG,
     DC_ZVA,
+    PRE_HVC,
+    PRE_SMC,
     CRC32_64,
     CRC32C_64,
     RBIT64,
@@ -168,23 +187,43 @@ fn h_wfi(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
         let insn_len = a[1];
         let mut st = CpuArmState::load(cpu.env);
-        // check_wfx_trap(): only the EL0 trap controlled by SCTLR_EL1.nTWI exists here.
-        let trap = st.current_el() == 0 && st.sctlr_el[1] & SCTLR_NTWI == 0;
+        let ops = cpu.ops();
+        let target_el = check_wfx_trap(arm_of(&ops).features(), &st);
         if cpu.has_work() {
             // Don't bother to go into our "low power state" if we would just wake up
             // immediately.
             return Ok(0);
         }
-        if trap {
+        if target_el != 0 {
             st.pc = st.pc.wrapping_sub(insn_len);
             st.store(cpu.env);
-            let target_el = exception_target_el(&st);
             return Err(raise_exception(cpu, EXCP_UDEF, syn_wfx(1, 0xe, 0), target_el, Ra::None));
         }
         cpu.core.exception_index = excp::HLT;
         cpu.shared().halted.store(1, Ordering::Release);
         Err(cpu.cpu_loop_exit())
     })
+}
+
+/// `check_wfx_trap()` for WFI: the EL a WFI traps to, or 0 if it does not trap.
+fn check_wfx_trap(f: &crate::cpu::ArmFeatures, st: &CpuArmState) -> u32 {
+    let cur_el = st.current_el();
+    // If we are currently in EL0 then we need to check if SCTLR is set up for WFx
+    // instructions being trapped to EL1. These trap bits don't exist in v7 EL1 or in v7 AArch32
+    // mode.
+    if cur_el < 1 && sysreg::sctlr_el0(f, st) & SCTLR_NTWI == 0 {
+        return exception_target_el(st);
+    }
+    // We are not trapping to EL1; trap to EL2 if HCR_EL2 requires it. No need for ARM_FEATURE
+    // check as if HCR_EL2 doesn't exist the bits will be zero.
+    if cur_el < 2 && st.hcr_el2_eff(f) & HCR_TWI != 0 {
+        return 2;
+    }
+    // We are not trapping to EL1 or EL2; trap to EL3 if SCR_EL3 requires it.
+    if f.el3 && cur_el < 3 && st.scr_el3 & SCR_TWI != 0 {
+        return 3;
+    }
+    0
 }
 
 /// `el_from_spsr()` for a return to AArch64; AArch32 is not implemented, so a return to it
@@ -223,7 +262,7 @@ const PSTATE_M_ALL: u32 = 0xf;
 fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
         let ops = cpu.ops();
-        let feat = arm_of(&ops).model().features;
+        let feat = *arm_of(&ops).features();
         let mut new_pc = a[1];
         let mut st = CpuArmState::load(cpu.env);
         let cur_el = st.current_el();
@@ -233,7 +272,16 @@ fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> 
         // arm_clear_exclusive().
         st.exclusive_addr = u64::MAX;
 
-        match el_from_spsr(spsr).filter(|&el| el <= cur_el) {
+        let hcr = st.hcr_el2_eff(&feat);
+        let legal = |el: u32| {
+            // No AArch32, so the register width check of QEMU is the NRW check in
+            // el_from_spsr(). A return to EL2 needs EL2 enabled, and a return to EL1 is
+            // illegal while HCR_EL2.TGE is set.
+            el <= cur_el
+                && !(el == 2 && !st.is_el2_enabled(&feat))
+                && !(el == 1 && hcr & HCR_TGE != 0)
+        };
+        match el_from_spsr(spsr).filter(|&el| legal(el)) {
             Some(new_el) => {
                 let spsr = spsr as u32 & pstate_valid_mask(feat.pan, feat.uao);
                 st.pstate_write(spsr);
@@ -242,10 +290,14 @@ fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> 
                 st.restore_sp(new_el);
                 // Apply TBI to the exception return address, using the TBII bits of the EL
                 // being returned to.
-                let tbii = (super::tb_flags(&st) >> super::TB_TBII_SHIFT) & 3;
+                let tbii = (super::tb_flags(&feat, &st) >> super::TB_TBII_SHIFT) & 3;
                 if (tbii >> ((new_pc >> 55) & 1)) & 1 != 0 {
-                    // The EL1&0 regime has two ranges.
-                    new_pc = ((new_pc << 8) as i64 >> 8) as u64;
+                    // TBI is enabled.
+                    if super::regime_has_2_ranges(st.mmu_idx(&feat)) {
+                        new_pc = ((new_pc << 8) as i64 >> 8) as u64;
+                    } else {
+                        new_pc &= (1 << 56) - 1;
+                    }
                 }
                 st.pc = new_pc;
             }
@@ -268,10 +320,11 @@ fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> 
     })
 }
 
-/// `daif_check()`: a DAIF update from EL0 is allowed only if SCTLR_EL1.UMA is set.
+/// `daif_check()`: a DAIF update from EL0 is allowed only if SCTLR.UMA is set.
 fn daif_check(cpu: &mut Cpu<'_>, op: u32, imm: u32) -> R<()> {
     let st = CpuArmState::load(cpu.env);
-    if st.current_el() == 0 && st.sctlr_el[1] & SCTLR_UMA == 0 {
+    let ops = cpu.ops();
+    if st.current_el() == 0 && sysreg::sctlr_el0(arm_of(&ops).features(), &st) & SCTLR_UMA == 0 {
         let syn = syn_aa64_sysregtrap(0, op & 7, (op >> 3) & 7, 4, imm, 0x1f, false);
         let target_el = exception_target_el(&st);
         return Err(raise_exception(cpu, EXCP_UDEF, syn, target_el, Ra::None));
@@ -317,21 +370,19 @@ fn h_msr_i_spsel(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
 fn h_access_check_cp_reg(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
         let ops = cpu.ops();
-        let feat = arm_of(&ops).model().features;
+        let feat = arm_of(&ops).features();
         let key = a[1] as u32;
         let syndrome = a[2] as u32;
         let isread = a[3] != 0;
-        let ri = sysreg::lookup(key, &feat).expect("the translator checked the register");
+        let ri = sysreg::lookup(key, feat).expect("the translator checked the register");
         let st = CpuArmState::load(cpu.env);
-        // The checks of this slice do not depend on the direction; the argument is kept to
-        // match QEMU's helper.
-        let _ = isread;
-        let syn = match ri.trap.check(&st) {
+        let (syn, target_el) = match ri.trap.check(feat, &st, isread) {
             sysreg::Access::Ok => return Ok(0),
-            sysreg::Access::TrapEl1 => syndrome,
-            sysreg::Access::Undefined => syn_uncategorized(),
+            sysreg::Access::TrapEl1 => (syndrome, 1),
+            sysreg::Access::TrapEl2 => (syndrome, 2),
+            sysreg::Access::TrapEl3 => (syndrome, 3),
+            sysreg::Access::Undefined => (syn_uncategorized(), exception_target_el(&st)),
         };
-        let target_el = exception_target_el(&st);
         Err(raise_exception(cpu, EXCP_UDEF, syn, target_el, Ra::None))
     })
 }
@@ -359,13 +410,82 @@ fn h_dc_zva(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
         let blocklen = 4u64 << bs;
         let vaddr_in = a[1];
         let vaddr = vaddr_in & !(blocklen - 1);
-        let mmu_idx = CpuArmState::load(cpu.env).mmu_idx() as u32;
+        let mmu_idx = CpuArmState::load(cpu.env).mmu_idx(arm_of(&ops).features()) as u32;
         // Fault on the original address first, as QEMU's probe_write() of it does, so that
         // FAR reports it.
         cpu_st_mmu(cpu, vaddr_in, 0, MemOpIdx::new(MemOp::UB, mmu_idx), Ra::Tb)?;
         let oi = MemOpIdx::new(MemOp::LEUQ, mmu_idx);
         for i in (0..blocklen).step_by(8) {
             cpu_st_mmu(cpu, vaddr + i, 0, oi, Ra::Tb)?;
+        }
+        Ok(0)
+    })
+}
+
+/// `HELPER(pre_hvc)`: the checks before an HVC is taken as an exception.
+fn h_pre_hvc(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
+    run(h, |cpu| {
+        let ops = cpu.ops();
+        let arm = arm_of(&ops);
+        let f = arm.features();
+        if psci::is_psci_call(arm, cpu, EXCP_HVC) {
+            // If PSCI is enabled and this looks like a valid PSCI call then that overrides
+            // the architecturally mandated HVC behaviour.
+            return Ok(0);
+        }
+        let st = CpuArmState::load(cpu.env);
+        let mut undef = if !f.el2 {
+            // If EL2 doesn't exist, HVC always UNDEFs.
+            true
+        } else if f.el3 {
+            // EL3.HCE has priority over EL2.HCD.
+            st.scr_el3 & SCR_HCE == 0
+        } else {
+            st.hcr_el2 & HCR_HCD != 0
+        };
+        // HVC is UNDEFINED at Secure EL1 (there is no Secure EL2 here). We've already trapped
+        // HVC from EL0 at translation time.
+        if st.is_secure_below_el3(f) && st.current_el() == 1 {
+            undef = true;
+        }
+        if undef {
+            let target_el = exception_target_el(&st);
+            return Err(raise_exception(cpu, EXCP_UDEF, syn_uncategorized(), target_el, Ra::None));
+        }
+        Ok(0)
+    })
+}
+
+/// `HELPER(pre_smc)`: the checks before an SMC is taken as an exception.
+fn h_pre_smc(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    run(h, |cpu| {
+        let ops = cpu.ops();
+        let arm = arm_of(&ops);
+        let f = arm.features();
+        let syndrome = a[1] as u32;
+        let st = CpuArmState::load(cpu.env);
+        let cur_el = st.current_el();
+        let hcr = st.hcr_el2_eff(f);
+        let smd = st.scr_el3 & SCR_SMD != 0;
+        let undef = |cpu: &mut Cpu<'_>| {
+            let target_el = exception_target_el(&st);
+            raise_exception(cpu, EXCP_UDEF, syn_uncategorized(), target_el, Ra::None)
+        };
+        if !f.el3 && hcr & HCR_NV == 0 && arm.psci_conduit() != super::PsciConduit::Smc {
+            // If we have no EL3 then traditionally SMC always UNDEFs and can't be trapped to
+            // EL2. PSCI-via-SMC is a sort of ersatz EL3 firmware, and we want an EL2 guest
+            // to be able to forbid its EL1 from making PSCI calls via HCR.TSC, so for these
+            // purposes treat PSCI-via-SMC as implying an EL3.
+            return Err(undef(cpu));
+        }
+        if cur_el == 1 && hcr & HCR_TSC != 0 {
+            // In NS EL1, HCR controlled routing to EL2 has priority over SMD.
+            return Err(raise_exception(cpu, EXCP_HYP_TRAP, syndrome, 2, Ra::None));
+        }
+        // If PSCI is enabled and this looks like a valid PSCI call then suppress the UNDEF
+        // that a set SCR.SMD or a missing EL3 would cause.
+        if !psci::is_psci_call(arm, cpu, EXCP_SMC) && (smd || !f.el3) {
+            return Err(undef(cpu));
         }
         Ok(0)
     })

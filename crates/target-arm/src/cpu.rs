@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! `CPUARMState` for AArch64 and the CPU models: the parts of QEMU's `target/arm/cpu.h`,
-//! `cpu64.c` and `cpu-max.c` this slice needs.
+//! `cpu.c`, `cpu64.c` and `cpu-max.c` this crate needs, including the EL2 and EL3 state, the
+//! HCR_EL2 and SCR_EL3 write masks and `arm_hcr_el2_eff()`.
+//!
+//! The models are `cortex-a57`, `cortex-a72` and `cortex-a76` with their QEMU ID register
+//! values (the A57 reports the 4K granule only, which this crate walks; the A72 adds 64K
+//! and the A76, which has VHE, has all three). They start without EL2 and EL3, the virt
+//! board's default, and [`ArmCpuModel::with_el2`] and [`ArmCpuModel::with_el3`] add them as
+//! `virtualization=on` and `secure=on` do.
 //!
 //! [`CpuArmState`] is a plain struct with `#[repr(C)]`, so `offset_of!` gives the offset of
 //! every field. The runtime keeps the state of a vCPU in a byte buffer (`env`), with the
@@ -76,13 +83,13 @@ macro_rules! arm_state {
 }
 
 arm_state! {
-    /// The AArch64 register state, `CPUARMState` cut down to EL0 and EL1.
+    /// The AArch64 register state, `CPUARMState` cut down to AArch64 at EL0 to EL3.
     ///
     /// As in QEMU, `xregs[31]` is the current stack pointer, the banked stack pointers are in
     /// `sp_el`, and the condition flags are kept apart from `pstate`: `nf` and `vf` hold the
     /// flag in bit 31, `zf` is zero exactly when Z is set, and `cf` is 0 or 1. `daif` holds
     /// the D, A, I and F bits at their PSTATE positions. Per exception level arrays are
-    /// indexed by EL; only index 1 (and 0 for `sp_el` and `tpidr_el`) is used.
+    /// indexed by EL.
     pub struct CpuArmState {
         /// X0 to X30, and the current SP in slot 31.
         pub xregs: [u64; 32],
@@ -100,7 +107,7 @@ arm_state! {
         pub cf: u32,
         /// V in bit 31.
         pub vf: u32,
-        /// SP_EL0 and SP_EL1 while they are not the current SP.
+        /// SP_ELx while it is not the current SP.
         pub sp_el: [u64; 4],
         /// ELR_ELx.
         pub elr_el: [u64; 4],
@@ -122,7 +129,7 @@ arm_state! {
         pub esr_el: [u64; 4],
         /// FAR_ELx.
         pub far_el: [u64; 4],
-        /// TPIDR_EL0 and TPIDR_EL1.
+        /// TPIDR_ELx.
         pub tpidr_el: [u64; 4],
         /// TPIDRRO_EL0.
         pub tpidrro_el0: u64,
@@ -150,14 +157,41 @@ arm_state! {
         pub cntkctl_el1: u64,
         /// CNTFRQ_EL0.
         pub cntfrq_el0: u64,
-        /// CNTP_CTL_EL0.
-        pub cntp_ctl_el0: u64,
-        /// CNTP_CVAL_EL0.
-        pub cntp_cval_el0: u64,
-        /// CNTV_CTL_EL0.
-        pub cntv_ctl_el0: u64,
-        /// CNTV_CVAL_EL0.
-        pub cntv_cval_el0: u64,
+        /// The generic timers' CNT*_CTL registers, indexed by `GTIMER_*`. ISTATUS (bit 2) is
+        /// kept up to date by `gt_recalc_timer()`.
+        pub gt_ctl: [u64; 5],
+        /// The generic timers' CNT*_CVAL registers, indexed by `GTIMER_*`.
+        pub gt_cval: [u64; 5],
+        /// SCR_EL3.
+        pub scr_el3: u64,
+        /// HCR_EL2.
+        pub hcr_el2: u64,
+        /// CPTR_EL2 (index 2) and CPTR_EL3 (index 3).
+        pub cptr_el: [u64; 4],
+        /// MDCR_EL2.
+        pub mdcr_el2: u64,
+        /// MDCR_EL3.
+        pub mdcr_el3: u64,
+        /// HSTR_EL2.
+        pub hstr_el2: u64,
+        /// HACR_EL2 is constant zero; this is VPIDR_EL2.
+        pub vpidr_el2: u64,
+        /// VMPIDR_EL2.
+        pub vmpidr_el2: u64,
+        /// VTCR_EL2.
+        pub vtcr_el2: u64,
+        /// VTTBR_EL2.
+        pub vttbr_el2: u64,
+        /// HPFAR_EL2.
+        pub hpfar_el2: u64,
+        /// CONTEXTIDR_EL2.
+        pub contextidr_el2: u64,
+        /// CNTHCTL_EL2.
+        pub cnthctl_el2: u64,
+        /// CNTVOFF_EL2.
+        pub cntvoff_el2: u64,
+        /// VSESR_EL2.
+        pub vsesr_el2: u64,
         /// The address the exclusive monitor watches, or all ones when it is open.
         pub exclusive_addr: u64,
         /// The value loaded by the last load exclusive.
@@ -313,6 +347,160 @@ pub const EXCP_BKPT: i32 = 7;
 pub const EXCP_HVC: i32 = 11;
 /// `EXCP_SMC`.
 pub const EXCP_SMC: i32 = 13;
+/// `EXCP_HYP_TRAP`.
+pub const EXCP_HYP_TRAP: i32 = 12;
+/// `EXCP_VIRQ`.
+pub const EXCP_VIRQ: i32 = 14;
+/// `EXCP_VFIQ`.
+pub const EXCP_VFIQ: i32 = 15;
+/// `EXCP_VSERR`.
+pub const EXCP_VSERR: i32 = 24;
+
+/// `PSTATE_MODE_EL2t`.
+pub const PSTATE_MODE_EL2T: u32 = 8;
+/// `PSTATE_MODE_EL2h`.
+pub const PSTATE_MODE_EL2H: u32 = 9;
+/// `PSTATE_MODE_EL3t`.
+pub const PSTATE_MODE_EL3T: u32 = 12;
+/// `PSTATE_MODE_EL3h`.
+pub const PSTATE_MODE_EL3H: u32 = 13;
+
+/// `SCR_NS`.
+pub const SCR_NS: u64 = 1 << 0;
+/// `SCR_IRQ`.
+pub const SCR_IRQ: u64 = 1 << 1;
+/// `SCR_FIQ`.
+pub const SCR_FIQ: u64 = 1 << 2;
+/// `SCR_EA`.
+pub const SCR_EA: u64 = 1 << 3;
+/// `SCR_FW`.
+pub const SCR_FW: u64 = 1 << 4;
+/// `SCR_AW`.
+pub const SCR_AW: u64 = 1 << 5;
+/// `SCR_NET`.
+pub const SCR_NET: u64 = 1 << 6;
+/// `SCR_SMD`.
+pub const SCR_SMD: u64 = 1 << 7;
+/// `SCR_HCE`.
+pub const SCR_HCE: u64 = 1 << 8;
+/// `SCR_SIF`.
+pub const SCR_SIF: u64 = 1 << 9;
+/// `SCR_RW`.
+pub const SCR_RW: u64 = 1 << 10;
+/// `SCR_ST`.
+pub const SCR_ST: u64 = 1 << 11;
+/// `SCR_TWI`.
+pub const SCR_TWI: u64 = 1 << 12;
+/// `SCR_TWE`.
+pub const SCR_TWE: u64 = 1 << 13;
+/// `SCR_TLOR`.
+pub const SCR_TLOR: u64 = 1 << 14;
+
+/// `HCR_VM`.
+pub const HCR_VM: u64 = 1 << 0;
+/// `HCR_SWIO`.
+pub const HCR_SWIO: u64 = 1 << 1;
+/// `HCR_PTW`.
+pub const HCR_PTW: u64 = 1 << 2;
+/// `HCR_FMO`.
+pub const HCR_FMO: u64 = 1 << 3;
+/// `HCR_IMO`.
+pub const HCR_IMO: u64 = 1 << 4;
+/// `HCR_AMO`.
+pub const HCR_AMO: u64 = 1 << 5;
+/// `HCR_VF`.
+pub const HCR_VF: u64 = 1 << 6;
+/// `HCR_VI`.
+pub const HCR_VI: u64 = 1 << 7;
+/// `HCR_VSE`.
+pub const HCR_VSE: u64 = 1 << 8;
+/// `HCR_FB`.
+pub const HCR_FB: u64 = 1 << 9;
+/// `HCR_BSU_MASK`.
+pub const HCR_BSU_MASK: u64 = 3 << 10;
+/// `HCR_DC`.
+pub const HCR_DC: u64 = 1 << 12;
+/// `HCR_TWI`.
+pub const HCR_TWI: u64 = 1 << 13;
+/// `HCR_TWE`.
+pub const HCR_TWE: u64 = 1 << 14;
+/// `HCR_TID0`.
+pub const HCR_TID0: u64 = 1 << 15;
+/// `HCR_TID1`.
+pub const HCR_TID1: u64 = 1 << 16;
+/// `HCR_TID2`.
+pub const HCR_TID2: u64 = 1 << 17;
+/// `HCR_TID3`.
+pub const HCR_TID3: u64 = 1 << 18;
+/// `HCR_TSC`.
+pub const HCR_TSC: u64 = 1 << 19;
+/// `HCR_TIDCP`.
+pub const HCR_TIDCP: u64 = 1 << 20;
+/// `HCR_TACR`.
+pub const HCR_TACR: u64 = 1 << 21;
+/// `HCR_TSW`.
+pub const HCR_TSW: u64 = 1 << 22;
+/// `HCR_TPCP`.
+pub const HCR_TPCP: u64 = 1 << 23;
+/// `HCR_TPU`.
+pub const HCR_TPU: u64 = 1 << 24;
+/// `HCR_TTLB`.
+pub const HCR_TTLB: u64 = 1 << 25;
+/// `HCR_TVM`.
+pub const HCR_TVM: u64 = 1 << 26;
+/// `HCR_TGE`.
+pub const HCR_TGE: u64 = 1 << 27;
+/// `HCR_TDZ`.
+pub const HCR_TDZ: u64 = 1 << 28;
+/// `HCR_HCD`.
+pub const HCR_HCD: u64 = 1 << 29;
+/// `HCR_TRVM`.
+pub const HCR_TRVM: u64 = 1 << 30;
+/// `HCR_RW`.
+pub const HCR_RW: u64 = 1 << 31;
+/// `HCR_CD`.
+pub const HCR_CD: u64 = 1 << 32;
+/// `HCR_ID`.
+pub const HCR_ID: u64 = 1 << 33;
+/// `HCR_E2H`.
+pub const HCR_E2H: u64 = 1 << 34;
+/// `HCR_TLOR`.
+pub const HCR_TLOR: u64 = 1 << 35;
+/// `HCR_MIOCNCE`.
+pub const HCR_MIOCNCE: u64 = 1 << 38;
+/// `HCR_NV`.
+pub const HCR_NV: u64 = 1 << 42;
+/// `HCR_NV1`.
+pub const HCR_NV1: u64 = 1 << 43;
+/// `HCR_FWB`.
+pub const HCR_FWB: u64 = 1 << 46;
+/// `HCR_TID4`.
+pub const HCR_TID4: u64 = 1 << 49;
+/// `HCR_TICAB`.
+pub const HCR_TICAB: u64 = 1 << 50;
+/// `HCR_TOCU`.
+pub const HCR_TOCU: u64 = 1 << 52;
+/// `HCR_ENSCXT`.
+pub const HCR_ENSCXT: u64 = 1 << 53;
+/// `HCR_TTLBIS`.
+pub const HCR_TTLBIS: u64 = 1 << 54;
+/// `HCR_TTLBOS`.
+pub const HCR_TTLBOS: u64 = 1 << 55;
+/// `HCR_TID5`.
+pub const HCR_TID5: u64 = 1 << 58;
+
+/// `GTIMER_PHYS`: the EL1 physical timer.
+pub const GTIMER_PHYS: usize = 0;
+/// `GTIMER_VIRT`: the EL1 virtual timer.
+pub const GTIMER_VIRT: usize = 1;
+/// `GTIMER_HYP`: the EL2 physical timer.
+pub const GTIMER_HYP: usize = 2;
+/// `GTIMER_SEC`: the EL3 (Secure EL1) physical timer.
+pub const GTIMER_SEC: usize = 3;
+/// `GTIMER_HYPVIRT`: the EL2 virtual timer.
+pub const GTIMER_HYPVIRT: usize = 4;
+/// The number of generic timers.
+pub const NUM_GTIMERS: usize = 5;
 
 /// `ARMMMUIdx_E10_0`: EL0 accesses in the EL1&0 regime.
 pub const MMU_IDX_E10_0: usize = 0;
@@ -320,6 +508,16 @@ pub const MMU_IDX_E10_0: usize = 0;
 pub const MMU_IDX_E10_1: usize = 2;
 /// `ARMMMUIdx_E10_1_PAN`: EL1 accesses with PSTATE.PAN set.
 pub const MMU_IDX_E10_1_PAN: usize = 3;
+/// `ARMMMUIdx_E20_0`: EL0 accesses in the EL2&0 regime (E2H and TGE set).
+pub const MMU_IDX_E20_0: usize = 5;
+/// `ARMMMUIdx_E20_2`: EL2 accesses in the EL2&0 regime (E2H set).
+pub const MMU_IDX_E20_2: usize = 7;
+/// `ARMMMUIdx_E20_2_PAN`: EL2 accesses in the EL2&0 regime with PSTATE.PAN set.
+pub const MMU_IDX_E20_2_PAN: usize = 8;
+/// `ARMMMUIdx_E2`: EL2 accesses in the EL2 regime (E2H clear).
+pub const MMU_IDX_E2: usize = 10;
+/// `ARMMMUIdx_E3`: EL3 accesses.
+pub const MMU_IDX_E3: usize = 12;
 /// The number of MMU indexes the runtime is configured with.
 pub const NB_MMU_MODES: usize = 16;
 
@@ -394,26 +592,184 @@ impl CpuArmState {
         self.restore_sp(cur_el);
     }
 
-    /// The MMU index for data accesses at the current EL, `arm_mmu_idx()`.
-    pub fn mmu_idx(&self) -> usize {
-        match self.current_el() {
+    /// `arm_is_secure_below_el3()`: EL3 exists and SCR_EL3.NS is clear. There is no
+    /// Secure EL2.
+    pub fn is_secure_below_el3(&self, f: &ArmFeatures) -> bool {
+        f.el3 && self.scr_el3 & SCR_NS == 0
+    }
+
+    /// `arm_is_el2_enabled()`: EL2 exists and the CPU is in Non-secure state below EL3.
+    pub fn is_el2_enabled(&self, f: &ArmFeatures) -> bool {
+        f.el2 && !self.is_secure_below_el3(f)
+    }
+
+    /// `arm_hcr_el2_eff()`: HCR_EL2 as it affects the CPU, with the bits TGE forces.
+    pub fn hcr_el2_eff(&self, f: &ArmFeatures) -> u64 {
+        if !self.is_el2_enabled(f) {
+            return 0;
+        }
+        let mut ret = self.hcr_el2;
+        if ret & HCR_TGE != 0 {
+            if ret & HCR_E2H != 0 {
+                ret &= !(HCR_VM
+                    | HCR_FMO
+                    | HCR_IMO
+                    | HCR_AMO
+                    | HCR_BSU_MASK
+                    | HCR_DC
+                    | HCR_TWI
+                    | HCR_TWE
+                    | HCR_TID0
+                    | HCR_TID2
+                    | HCR_TPCP
+                    | HCR_TPU
+                    | HCR_TDZ
+                    | HCR_CD
+                    | HCR_ID
+                    | HCR_MIOCNCE
+                    | HCR_TID4
+                    | HCR_TICAB
+                    | HCR_TOCU
+                    | HCR_ENSCXT
+                    | HCR_TTLBIS
+                    | HCR_TTLBOS
+                    | HCR_TID5);
+            } else {
+                ret |= HCR_FMO | HCR_IMO | HCR_AMO;
+            }
+            ret &= !(HCR_SWIO
+                | HCR_PTW
+                | HCR_VF
+                | HCR_VI
+                | HCR_VSE
+                | HCR_FB
+                | HCR_TID1
+                | HCR_TID3
+                | HCR_TSC
+                | HCR_TACR
+                | HCR_TSW
+                | HCR_TTLB
+                | HCR_TVM
+                | HCR_HCD
+                | HCR_TRVM
+                | HCR_TLOR);
+        }
+        ret
+    }
+
+    /// The E2H bit of HCR_EL2 when EL2 is enabled, `el_is_in_host()` without TGE.
+    pub fn e2h(&self, f: &ArmFeatures) -> bool {
+        self.hcr_el2_eff(f) & HCR_E2H != 0
+    }
+
+    /// `arm_mmu_idx_el()`: the MMU index for data accesses at `el`.
+    pub fn mmu_idx_el(&self, f: &ArmFeatures, el: u32) -> usize {
+        let hcr = self.hcr_el2_eff(f);
+        let pan = self.pstate & PSTATE_PAN != 0;
+        match el {
+            0 if hcr & (HCR_E2H | HCR_TGE) == HCR_E2H | HCR_TGE => MMU_IDX_E20_0,
             0 => MMU_IDX_E10_0,
-            _ if self.pstate & PSTATE_PAN != 0 => MMU_IDX_E10_1_PAN,
-            _ => MMU_IDX_E10_1,
+            1 if pan => MMU_IDX_E10_1_PAN,
+            1 => MMU_IDX_E10_1,
+            2 if hcr & HCR_E2H != 0 && pan => MMU_IDX_E20_2_PAN,
+            2 if hcr & HCR_E2H != 0 => MMU_IDX_E20_2,
+            2 => MMU_IDX_E2,
+            _ => MMU_IDX_E3,
         }
     }
 
-    /// The state after a cold reset of `model`: EL1h with DAIF masked, the MMU off and the PC
-    /// at zero, as `arm_cpu_reset_hold()` leaves an AArch64 CPU without EL2 and EL3.
+    /// The MMU index for data accesses at the current EL, `arm_mmu_idx()`.
+    pub fn mmu_idx(&self, f: &ArmFeatures) -> usize {
+        self.mmu_idx_el(f, self.current_el())
+    }
+
+    /// `scr_write()` for an AArch64 only CPU.
+    pub fn scr_write(&mut self, f: &ArmFeatures, value: u64) {
+        let mut valid = 0x3fff & !SCR_NET;
+        if f.lor {
+            valid |= SCR_TLOR;
+        }
+        if !f.el2 {
+            valid &= !SCR_HCE;
+        }
+        self.scr_el3 = (value | SCR_FW | SCR_AW | SCR_RW) & valid;
+    }
+
+    /// `do_hcr_write()` without the interrupt line updates, which `Arm` does after it.
+    /// `psci_smc` is whether the PSCI conduit is SMC.
+    pub fn hcr_write(&mut self, f: &ArmFeatures, psci_smc: bool, value: u64) {
+        let mut valid = (1u64 << 34) - 1;
+        if f.el3 {
+            valid &= !HCR_HCD;
+        } else if !psci_smc {
+            // Without EL3 SMC is only useful for PSCI, so TSC is RES0 unless SMC is the
+            // conduit.
+            valid &= !HCR_TSC;
+        }
+        if f.vh {
+            valid |= HCR_E2H;
+        }
+        if f.lor {
+            valid |= HCR_TLOR;
+        }
+        self.hcr_el2 = (value & valid) | HCR_RW;
+    }
+
+    /// The state after a cold reset of `model`, as `arm_cpu_reset_hold()` leaves an AArch64
+    /// CPU: the highest implemented EL in its h mode with DAIF masked, the MMU off and the PC
+    /// at zero.
     pub fn reset(model: &ArmCpuModel) -> CpuArmState {
+        let f = &model.features;
         let mut s = CpuArmState::default();
-        s.pstate_write(PSTATE_MODE_EL1H | PSTATE_DAIF);
+        let mode = if f.el3 {
+            PSTATE_MODE_EL3H
+        } else if f.el2 {
+            PSTATE_MODE_EL2H
+        } else {
+            PSTATE_MODE_EL1H
+        };
+        s.pstate_write(mode | PSTATE_DAIF);
         s.sctlr_el[1] = model.reset_sctlr;
+        // As in QEMU, SCTLR_EL2 resets to zero and SCTLR_EL3 to the model's SCTLR value.
+        if f.el2 {
+            s.hcr_write(f, false, 0);
+            // VPIDR_EL2 resets to MIDR_EL1. VMPIDR_EL2 resets to MPIDR_EL1, which depends on
+            // the CPU index, so `create_vcpu()` fills it in.
+            s.vpidr_el2 = model.midr;
+        }
+        if f.el3 {
+            s.sctlr_el[3] = model.reset_sctlr;
+            s.scr_write(f, 0);
+        }
         s.cntfrq_el0 = model.cntfrq;
         s.exclusive_addr = u64::MAX;
         // The OS lock is locked out of reset.
         s.oslsr_el1 = 10;
         s
+    }
+
+    /// `arm_emulate_firmware_reset()`: put a CPU that has just been reset into the state
+    /// firmware would leave it in for code entered at `target_el`.
+    pub fn emulate_firmware_reset(&mut self, f: &ArmFeatures, target_el: u32) {
+        match target_el {
+            3 => return,
+            2 if !f.el3 => return,
+            1 if !f.el3 && !f.el2 => return,
+            _ => {}
+        }
+        if f.el3 {
+            self.scr_el3 |= SCR_RW;
+            if target_el == 2 {
+                // If the guest is at EL2 then Linux expects the HVC insn to work.
+                self.scr_el3 |= SCR_HCE;
+            }
+            // Put CPU into non-secure state.
+            self.scr_el3 |= SCR_NS;
+        }
+        if f.el2 && target_el < 2 {
+            self.hcr_el2 |= HCR_RW;
+        }
+        self.pstate_write((target_el << 2) | PSTATE_SP | (self.pstate_read() & !0x1f));
     }
 }
 
@@ -453,6 +809,16 @@ pub struct ArmFeatures {
     pub sha1: bool,
     /// FEAT_SHA256.
     pub sha256: bool,
+    /// `ARM_FEATURE_EL2`.
+    pub el2: bool,
+    /// `ARM_FEATURE_EL3`.
+    pub el3: bool,
+    /// FEAT_VHE: HCR_EL2.E2H.
+    pub vh: bool,
+    /// The 16K translation granule (`aa64_tgran16`).
+    pub tgran16: bool,
+    /// The 64K translation granule (`aa64_tgran64`).
+    pub tgran64: bool,
 }
 
 /// A CPU model: the identification registers and reset values of `aarch64_*_initfn()`.
@@ -494,8 +860,9 @@ pub struct ArmCpuModel {
     pub features: ArmFeatures,
 }
 
-/// `ID_AA64PFR0_EL1` for a CPU with AArch64 only EL0 and EL1, no EL2 or EL3, and FP and
-/// AdvSIMD without half precision (both fields 0).
+/// `ID_AA64PFR0_EL1` for a CPU with AArch64 only EL0 and EL1, no EL2 or EL3 (until
+/// [`ArmCpuModel::with_el2`] and [`ArmCpuModel::with_el3`] add them), and FP and AdvSIMD
+/// without half precision (both fields 0).
 const PFR0_EL01: u64 = 0x0000_0011;
 
 /// `ID_AA64PFR0_EL1` FP and AdvSIMD fields at 1: implemented with half precision.
@@ -562,10 +929,11 @@ impl ArmCpuModel {
             id_aa64isar0: 0x0000_1000_1021_1120,
             // LRCPC 1 and DPB 1.
             id_aa64isar1: 0x0010_0001,
-            // PARange 2, 40 bits.
-            id_aa64mmfr0: MMFR0_4K_ONLY | 2,
-            // PAN 1, LO 1, HPDS 1, HAFDBS 2.
-            id_aa64mmfr1: 0x0011_1002,
+            // PARange 2, 40 bits, and all three granules: QEMU's 0x00101122 without
+            // BigEnd.
+            id_aa64mmfr0: 0x0010_1022,
+            // PAN 1, LO 1, HPDS 1, VH 1, HAFDBS 2.
+            id_aa64mmfr1: 0x0011_1102,
             // UAO 1, CnP 1.
             id_aa64mmfr2: 0x11,
             features: ArmFeatures {
@@ -585,14 +953,69 @@ impl ArmCpuModel {
                 pmull: true,
                 sha1: true,
                 sha256: true,
+                vh: true,
+                tgran16: true,
+                tgran64: true,
+                ..ArmFeatures::default()
             },
         }
     }
 
-    /// The model called `name`, `cortex-a57` or `cortex-a76`.
+    /// `cortex-a72`: ARMv8.0 like the A57 with CRC32 and the crypto extensions, and the 4K
+    /// and 64K granules.
+    pub fn cortex_a72() -> ArmCpuModel {
+        ArmCpuModel {
+            name: "cortex-a72",
+            midr: 0x410f_d083,
+            revidr: 0,
+            ctr: 0x8444_c004,
+            dczid: 4,
+            clidr: 0x0a20_0023,
+            reset_sctlr: 0x00c5_0838,
+            cntfrq: 62_500_000,
+            id_aa64pfr0: PFR0_EL01,
+            id_aa64pfr1: 0,
+            id_aa64dfr0: 0x1030_5106,
+            id_aa64isar0: 0x0001_1120,
+            id_aa64isar1: 0,
+            // QEMU's 0x00001124 without BigEnd: PARange 4, 16 bit ASIDs, 4K and 64K
+            // granules.
+            id_aa64mmfr0: 0x0000_1024,
+            id_aa64mmfr1: 0,
+            id_aa64mmfr2: 0,
+            features: ArmFeatures {
+                crc32: true,
+                aes: true,
+                pmull: true,
+                sha1: true,
+                sha256: true,
+                tgran64: true,
+                ..ArmFeatures::default()
+            },
+        }
+    }
+
+    /// The model with EL2 implemented (AArch64 only), as the virt board's
+    /// `virtualization=on` leaves `ARM_FEATURE_EL2` set. The models start without EL2 and
+    /// EL3, as the virt board's defaults leave them.
+    pub fn with_el2(mut self) -> ArmCpuModel {
+        self.features.el2 = true;
+        self.id_aa64pfr0 = (self.id_aa64pfr0 & !0xf00) | 0x100;
+        self
+    }
+
+    /// The model with EL3 implemented (AArch64 only), as the virt board's `secure=on`.
+    pub fn with_el3(mut self) -> ArmCpuModel {
+        self.features.el3 = true;
+        self.id_aa64pfr0 = (self.id_aa64pfr0 & !0xf000) | 0x1000;
+        self
+    }
+
+    /// The model called `name`, `cortex-a57`, `cortex-a72` or `cortex-a76`.
     pub fn by_name(name: &str) -> Option<ArmCpuModel> {
         match name {
             "cortex-a57" => Some(ArmCpuModel::cortex_a57()),
+            "cortex-a72" => Some(ArmCpuModel::cortex_a72()),
             "cortex-a76" => Some(ArmCpuModel::cortex_a76()),
             _ => None,
         }
