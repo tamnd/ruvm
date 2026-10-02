@@ -11,6 +11,8 @@ pub const IL: u32 = 1 << 25;
 pub const EC_UNCATEGORIZED: u32 = 0x00;
 /// `EC_WFX_TRAP`.
 pub const EC_WFX_TRAP: u32 = 0x01;
+/// `EC_ADVSIMDFPACCESSTRAP`.
+pub const EC_ADVSIMDFPACCESSTRAP: u32 = 0x07;
 /// `EC_ILLEGALSTATE`.
 pub const EC_ILLEGALSTATE: u32 = 0x0e;
 /// `EC_AA64_SVC`.
@@ -38,6 +40,11 @@ pub const fn syn_get_ec(syn: u32) -> u32 {
 /// `syn_uncategorized()`: the syndrome of an UNDEFINED instruction.
 pub const fn syn_uncategorized() -> u32 {
     (EC_UNCATEGORIZED << EC_SHIFT) | IL
+}
+
+/// `syn_a64_fp_access_trap()`: an AArch64 FP or SIMD access trapped by CPACR.
+pub const fn syn_a64_fp_access_trap(cv: u32, cond: u32) -> u32 {
+    (EC_ADVSIMDFPACCESSTRAP << EC_SHIFT) | IL | ((cv & 1) << 24) | ((cond & 0xf) << 20)
 }
 
 /// `syn_aa64_svc()`.

@@ -37,15 +37,15 @@ impl Field for u32 {
     }
 }
 
-impl<const N: usize> Field for [u64; N] {
+impl<T: Field, const N: usize> Field for [T; N] {
     fn put(&self, b: &mut [u8]) {
         for (i, v) in self.iter().enumerate() {
-            v.put(&mut b[8 * i..]);
+            v.put(&mut b[size_of::<T>() * i..]);
         }
     }
     fn get(&mut self, b: &[u8]) {
         for (i, v) in self.iter_mut().enumerate() {
-            v.get(&b[8 * i..]);
+            v.get(&b[size_of::<T>() * i..]);
         }
     }
 }
@@ -170,6 +170,20 @@ arm_state! {
         pub exception_target_el: u32,
         /// `exception.vaddress`.
         pub exception_vaddress: u64,
+        /// The AdvSIMD and FP registers V0 to V31, QEMU's `vfp.zregs` cut down to 128 bits:
+        /// `zregs[n][0]` is the low half of Vn and `zregs[n][1]` the high half.
+        pub zregs: [[u64; 2]; 32],
+        /// FPCR: AHP, DN, FZ, RMode and FZ16 as QEMU keeps them in `vfp.fpcr`, plus the Len
+        /// and Stride bits QEMU keeps apart in `vfp.vec_len` and `vfp.vec_stride`.
+        pub fpcr: u32,
+        /// FPSR: NZCV and the cumulative exception bits that have been folded in. The flags
+        /// still in `fp_status` and the QC bit in `qc` are or-ed in when FPSR is read.
+        pub fpsr: u32,
+        /// `vfp.qc`: FPSR.QC is set while any bit of this is set.
+        pub qc: [u64; 2],
+        /// The packed `float_status` of `FPST_A64` (index 0) and `FPST_A64_F16` (index 1),
+        /// see `tcg::vfp`.
+        pub fp_status: [u64; 2],
     }
 }
 
@@ -205,6 +219,21 @@ pub const EXCLUSIVE_ADDR: usize = env_off(offset_of!(CpuArmState, exclusive_addr
 pub const EXCLUSIVE_VAL: usize = env_off(offset_of!(CpuArmState, exclusive_val));
 /// The `env` offset of `exclusive_high`.
 pub const EXCLUSIVE_HIGH: usize = env_off(offset_of!(CpuArmState, exclusive_high));
+
+/// The `env` offset of the low 64 bits of Vn.
+pub const fn vreg_off(n: usize) -> usize {
+    env_off(offset_of!(CpuArmState, zregs)) + 16 * n
+}
+/// The `env` offset of `fpcr`.
+pub const FPCR: usize = env_off(offset_of!(CpuArmState, fpcr));
+/// The `env` offset of `fpsr`.
+pub const FPSR: usize = env_off(offset_of!(CpuArmState, fpsr));
+/// The `env` offset of `qc`.
+pub const QC: usize = env_off(offset_of!(CpuArmState, qc));
+/// The `env` offset of the packed `FPST_A64` status.
+pub const FPST_A64: usize = env_off(offset_of!(CpuArmState, fp_status));
+/// The `env` offset of the packed `FPST_A64_F16` status.
+pub const FPST_A64_F16: usize = env_off(offset_of!(CpuArmState, fp_status)) + 8;
 
 /// `PSTATE_SP`: SPSel.
 pub const PSTATE_SP: u32 = 1;
@@ -410,6 +439,20 @@ pub struct ArmFeatures {
     pub hpds: bool,
     /// FEAT_DPB: DC CVAP.
     pub dpb: bool,
+    /// FEAT_FP16: half precision arithmetic (`aa64_fp16`).
+    pub fp16: bool,
+    /// FEAT_RDM: SQRDMLAH and SQRDMLSH.
+    pub rdm: bool,
+    /// FEAT_DotProd: SDOT and UDOT.
+    pub dotprod: bool,
+    /// FEAT_AES: AESE, AESD, AESMC and AESIMC.
+    pub aes: bool,
+    /// FEAT_PMULL: PMULL and PMULL2 with 64-bit elements.
+    pub pmull: bool,
+    /// FEAT_SHA1.
+    pub sha1: bool,
+    /// FEAT_SHA256.
+    pub sha256: bool,
 }
 
 /// A CPU model: the identification registers and reset values of `aarch64_*_initfn()`.
@@ -451,9 +494,12 @@ pub struct ArmCpuModel {
     pub features: ArmFeatures,
 }
 
-/// `ID_AA64PFR0_EL1` for a CPU with AArch64 only EL0 and EL1, no EL2 or EL3, and neither FP
-/// nor AdvSIMD (reported as not implemented, 0xf, in this slice).
-const PFR0_EL01_NOFP: u64 = 0x00ff_0011;
+/// `ID_AA64PFR0_EL1` for a CPU with AArch64 only EL0 and EL1, no EL2 or EL3, and FP and
+/// AdvSIMD without half precision (both fields 0).
+const PFR0_EL01: u64 = 0x0000_0011;
+
+/// `ID_AA64PFR0_EL1` FP and AdvSIMD fields at 1: implemented with half precision.
+const PFR0_FP16: u64 = 0x0011_0000;
 
 /// `ID_AA64MMFR0_EL1` fields shared by both models: 16 bit ASIDs, Secure and Non-secure
 /// memory distinguished, 4K granule only (TGran64 reported as 0xf, TGran16 as 0), and no
@@ -461,7 +507,8 @@ const PFR0_EL01_NOFP: u64 = 0x00ff_0011;
 const MMFR0_4K_ONLY: u64 = 0x0f00_1020;
 
 impl ArmCpuModel {
-    /// `cortex-a57`: ARMv8.0 with CRC32 and no LSE.
+    /// `cortex-a57`: ARMv8.0 with CRC32 and the AES, PMULL, SHA1 and SHA256 crypto
+    /// extensions, and no LSE.
     pub fn cortex_a57() -> ArmCpuModel {
         ArmCpuModel {
             name: "cortex-a57",
@@ -472,22 +519,30 @@ impl ArmCpuModel {
             clidr: 0x0a20_0023,
             reset_sctlr: 0x00c5_0838,
             cntfrq: 62_500_000,
-            id_aa64pfr0: PFR0_EL01_NOFP,
+            id_aa64pfr0: PFR0_EL01,
             id_aa64pfr1: 0,
             id_aa64dfr0: 0x6,
-            // CRC32 only: the crypto extensions are AdvSIMD instructions.
-            id_aa64isar0: 0x0001_0000,
+            // AES 2 (with PMULL), SHA1 1, SHA2 1 and CRC32 1, QEMU's 0x00011120.
+            id_aa64isar0: 0x0001_1120,
             id_aa64isar1: 0,
             // PARange 4, 44 bits.
             id_aa64mmfr0: MMFR0_4K_ONLY | 4,
             id_aa64mmfr1: 0,
             id_aa64mmfr2: 0,
-            features: ArmFeatures { crc32: true, ..ArmFeatures::default() },
+            features: ArmFeatures {
+                crc32: true,
+                aes: true,
+                pmull: true,
+                sha1: true,
+                sha256: true,
+                ..ArmFeatures::default()
+            },
         }
     }
 
     /// `cortex-a76`: ARMv8.2 with LSE, PAN, UAO, LOR, LRCPC and hardware access flag and
-    /// dirty state management.
+    /// dirty state management, half precision FP, RDM, the dot product and the AES, PMULL,
+    /// SHA1 and SHA256 crypto extensions.
     pub fn cortex_a76() -> ArmCpuModel {
         ArmCpuModel {
             name: "cortex-a76",
@@ -499,11 +554,12 @@ impl ArmCpuModel {
             reset_sctlr: 0x30c5_0838,
             cntfrq: 62_500_000,
             // CSV2 and CSV3 as in QEMU; RAS is not modelled.
-            id_aa64pfr0: 0x1100_0000_0000_0000 | PFR0_EL01_NOFP,
+            id_aa64pfr0: 0x1100_0000_0000_0000 | PFR0_FP16 | PFR0_EL01,
             id_aa64pfr1: 0,
             id_aa64dfr0: 0x6,
-            // Atomic 2 and CRC32 1; AES, SHA, RDM and DP are AdvSIMD instructions.
-            id_aa64isar0: 0x0021_0000,
+            // DP 1, RDM 1, Atomic 2, CRC32 1, SHA2 1, SHA1 1 and AES 2, QEMU's
+            // 0x0000100010211120.
+            id_aa64isar0: 0x0000_1000_1021_1120,
             // LRCPC 1 and DPB 1.
             id_aa64isar1: 0x0010_0001,
             // PARange 2, 40 bits.
@@ -522,6 +578,13 @@ impl ArmCpuModel {
                 hafdbs: 2,
                 hpds: true,
                 dpb: true,
+                fp16: true,
+                rdm: true,
+                dotprod: true,
+                aes: true,
+                pmull: true,
+                sha1: true,
+                sha256: true,
             },
         }
     }

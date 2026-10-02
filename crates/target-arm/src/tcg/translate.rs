@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The A64 translator: the integer and system parts of QEMU's
-//! `target/arm/tcg/translate-a64.c`.
+//! The A64 translator: QEMU's `target/arm/tcg/translate-a64.c`.
 //!
 //! The decoder comes from `a64.decode` (see `build.rs`); [`S`] implements its `trans_` hooks
-//! for the base integer instructions, and every pattern left out returns false, which raises
-//! an Undefined Instruction exception just as QEMU's `unallocated_encoding()` does.
+//! for the base integer instructions here and for scalar FP and AdvSIMD in `translate_simd.rs`,
+//! and every pattern left out returns false, which raises an Undefined Instruction exception
+//! just as QEMU's `unallocated_encoding()` does.
 //!
 //! QEMU keeps the general registers, the PC, the flags and the exclusive monitor in TCG
 //! globals. This port has no globals: every read loads from `env` and every write stores to it
@@ -23,7 +23,8 @@ use ruvm_mem::Endian;
 use super::helpers::{self, Def};
 use super::sysreg::{self, Kind};
 use super::{
-    TB_ALIGN_MEM, TB_EL_MASK, TB_PAN, TB_PSTATE_IL, TB_TBID_SHIFT, TB_TBII_SHIFT, TB_UNPRIV,
+    TB_ALIGN_MEM, TB_EL_MASK, TB_FPEXC_EL_SHIFT, TB_PAN, TB_PSTATE_IL, TB_TBID_SHIFT,
+    TB_TBII_SHIFT, TB_UNPRIV,
 };
 use crate::cpu::{
     ArmCpuModel, CF, EXCLUSIVE_ADDR, EXCLUSIVE_HIGH, EXCLUSIVE_VAL, EXCP_BKPT, EXCP_SWI, EXCP_UDEF,
@@ -43,6 +44,11 @@ mod decode {
         disas_a64(ctx, insn)
     }
 }
+
+#[path = "translate_simd.rs"]
+mod simd;
+
+use simd::{Chk, Feat, Mov, RA, RF, RM, RN, RP, RZ, cop, fop, nop};
 
 use decode::{
     DisasA64, arg_addsub_ext, arg_addsub_shift, arg_atomic, arg_bitfield, arg_cbz, arg_disas_a6426,
@@ -78,6 +84,8 @@ pub(crate) struct DisasContext {
     tbii: u32,
     tbid: u32,
     mmu_idx: u32,
+    /// The EL that FP and AdvSIMD instructions trap to, or 0 if they do not trap.
+    fp_excp_el: u32,
 }
 
 impl DisasContext {
@@ -93,6 +101,7 @@ impl DisasContext {
             tbii: 0,
             tbid: 0,
             mmu_idx: 0,
+            fp_excp_el: 0,
         }
     }
 }
@@ -1089,6 +1098,11 @@ impl S<'_, '_> {
                 &[env.into(), k.into(), syn.into(), r.into()],
             );
         }
+        // FPCR and FPSR are ARM_CP_FPU registers.
+        let is_fpu = key == sysreg::FPCR || key == sysreg::FPSR;
+        if is_fpu && !self.fp_access_check() {
+            return;
+        }
         match ri.kind {
             Kind::Nop => return,
             Kind::CurrentEl => {
@@ -1146,8 +1160,9 @@ impl S<'_, '_> {
                 }
             }
         }
-        if !isread {
-            // We default to ending the TB on a coprocessor register write.
+        if !isread && key != sysreg::FPSR {
+            // We default to ending the TB on a coprocessor register write; FPSR has
+            // ARM_CP_SUPPRESS_TB_END.
             self.b.is_jmp = DISAS_UPDATE_EXIT;
         }
     }
@@ -1211,6 +1226,8 @@ fn logic_imm_decode_wmask(immn: u32, imms: u32, immr: u32) -> Option<u64> {
 }
 
 impl DisasA64 for S<'_, '_> {
+    simd::simd_trans!();
+
     fn shl_12(&mut self, x: i32) -> i32 {
         x << 12
     }
@@ -2389,6 +2406,7 @@ impl TranslatorOps for DisasContext {
         self.align_mem = flags & TB_ALIGN_MEM != 0;
         self.tbii = (flags >> TB_TBII_SHIFT) & 3;
         self.tbid = (flags >> TB_TBID_SHIFT) & 3;
+        self.fp_excp_el = (flags >> TB_FPEXC_EL_SHIFT) & 3;
         self.mmu_idx = match self.current_el {
             0 => MMU_IDX_E10_0,
             _ if flags & TB_PAN != 0 => MMU_IDX_E10_1_PAN,

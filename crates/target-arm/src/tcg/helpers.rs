@@ -37,7 +37,7 @@ pub(crate) struct Def {
     pub(crate) ret: HelperType,
     /// The argument types.
     pub(crate) args: &'static [HelperType],
-    f: ruvm_jit_interp::HelperFn,
+    pub(crate) f: ruvm_jit_interp::HelperFn,
 }
 
 impl Def {
@@ -55,6 +55,7 @@ macro_rules! def {
             Def { name: $name, flags: $flags, ret: $ret, args: &[$($a),*], f: $f };
     };
 }
+pub(crate) use def;
 
 /// Run `f` on the vCPU behind `h`, turning a guest exception into an [`Unwind`].
 fn run(h: &mut HelperEnv<'_>, f: impl FnOnce(&mut Cpu<'_>) -> R<u64>) -> Result<u128, Unwind> {
@@ -140,7 +141,8 @@ pub(crate) const ALL: &[Def] = &[
 
 /// Register every helper in `r`.
 pub(crate) fn register(r: &mut HelperRegistry) {
-    for d in ALL {
+    let lists = [ALL, super::vfp::ALL, super::vec_helper::ALL, super::crypto::ALL];
+    for d in lists.iter().copied().flatten() {
         r.register_info(&d.info(), d.f);
     }
 }

@@ -19,7 +19,7 @@ use ruvm_jit::cputlb::{
 };
 use ruvm_jit::{Cpu, MmuAccessType};
 
-use super::{Arm, arm_of, ptw};
+use super::{Arm, arm_of, ptw, vfp};
 use crate::cpu::{
     ArmCpuModel, ArmFeatures, CpuArmState, MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN,
     PSTATE_DAIF, PSTATE_PAN, PSTATE_SP, PSTATE_UAO, SCTLR_DZE, SCTLR_UCI, SCTLR_UCT, SCTLR_UMA,
@@ -240,6 +240,10 @@ pub(crate) const TCR_EL1: u32 = key(3, 0, 2, 0, 2);
 pub(crate) const NZCV: u32 = key(3, 3, 4, 2, 0);
 /// DAIF.
 pub(crate) const DAIF: u32 = key(3, 3, 4, 2, 1);
+/// FPCR (`ARM_CP_FPU`).
+pub(crate) const FPCR: u32 = key(3, 3, 4, 4, 0);
+/// FPSR (`ARM_CP_FPU | ARM_CP_SUPPRESS_TB_END`).
+pub(crate) const FPSR: u32 = key(3, 3, 4, 4, 1);
 /// SPSel.
 pub(crate) const SPSEL: u32 = key(3, 0, 4, 2, 0);
 /// PAN.
@@ -325,11 +329,8 @@ static REGS: &[Reg] = &[
         (3, 0, 1, 0, 2),
         PL1_RW,
         None,
-        Kind::Field {
-            off: off!(cpacr_el1),
-            // Only TTA is writable: without FP and AdvSIMD the FPEN field is RES0.
-            mask: 1 << 28,
-        }
+        // cpacr_write() keeps every bit in ARMv8.
+        field(off!(cpacr_el1))
     ),
     // Memory management.
     r!("TTBR0_EL1", (3, 0, 2, 0, 0), PL1_RW, None, Kind::Special),
@@ -345,6 +346,8 @@ static REGS: &[Reg] = &[
     r!("UAO", (3, 0, 4, 2, 4), PL1_RW, None, Kind::Special, has_uao),
     r!("NZCV", (3, 3, 4, 2, 0), PL0_RW, None, Kind::Special),
     r!("DAIF", (3, 3, 4, 2, 1), PL0_RW, Uma, Kind::Special),
+    r!("FPCR", (3, 3, 4, 4, 0), PL0_RW, None, Kind::Special),
+    r!("FPSR", (3, 3, 4, 4, 1), PL0_RW, None, Kind::Special),
     r!("AFSR0_EL1", (3, 0, 5, 1, 0), PL1_RW, None, field(off!(afsr0_el1))),
     r!("AFSR1_EL1", (3, 0, 5, 1, 1), PL1_RW, None, field(off!(afsr1_el1))),
     r!("ESR_EL1", (3, 0, 5, 2, 0), PL1_RW, None, field(off!(esr_el[1]))),
@@ -506,6 +509,8 @@ pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
         TCR_EL1 => st.tcr_el[1],
         NZCV => u64::from(st.nzcv()),
         DAIF => u64::from(st.daif & PSTATE_DAIF),
+        FPCR => u64::from(vfp::get_fpcr(&st)),
+        FPSR => u64::from(vfp::get_fpsr(&st)),
         SPSEL => u64::from(st.pstate & PSTATE_SP),
         PAN => u64::from(st.pstate & PSTATE_PAN),
         UAO => u64::from(st.pstate & PSTATE_UAO),
@@ -558,6 +563,14 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
         }
         DAIF => {
             st.daif = value as u32 & PSTATE_DAIF;
+            st.store(cpu.env);
+        }
+        FPCR => {
+            vfp::set_fpcr(&mut st, value as u32, &arm.model().features);
+            st.store(cpu.env);
+        }
+        FPSR => {
+            vfp::set_fpsr(&mut st, value as u32);
             st.store(cpu.env);
         }
         SPSEL => {
