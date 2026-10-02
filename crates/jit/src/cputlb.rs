@@ -1197,6 +1197,20 @@ pub fn probe_access(
     Ok(host)
 }
 
+/// `probe_access_flags()` with `nonfault` set, for the first fault and non fault loads of a
+/// target: `None` if `addr` cannot be accessed, else whether the page is RAM. A fault in the
+/// page table walk is not raised.
+pub fn probe_access_nonfault(
+    cpu: &mut Cpu<'_>,
+    addr: u64,
+    at: MmuAccessType,
+    mmu_idx: usize,
+    ra: Ra,
+) -> Result<Option<bool>, CpuLoopExit> {
+    let (_, host, full) = probe_access_internal(cpu, addr, 0, at, mmu_idx, true, ra)?;
+    Ok(full.map(|_| host.is_some()))
+}
+
 /// `get_page_addr_code_hostp()`: the `ram_addr` of the code at `addr`, or `u64::MAX` if it is
 /// not in RAM. A fault in the fill is raised.
 pub fn get_page_addr_code(cpu: &mut Cpu<'_>, addr: u64) -> Result<u64, CpuLoopExit> {

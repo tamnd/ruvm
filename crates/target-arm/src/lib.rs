@@ -11,7 +11,12 @@
 //! routed across the four ELs, ERET, WFI, HVC and SMC, PSCI over HVC or SMC behind a board
 //! hook, and the generic timers reported to the board through a callback.
 //!
-//! Not yet covered: SVE and SVE2, AArch32, Secure EL2, 52 bit addresses, and the debug,
+//! The `max` model adds SVE and SVE2 at a vector length set like QEMU's `sve-max-vq`: the
+//! integer, predicate, permute, element count, load, store, first fault, non fault, gather
+//! and scatter instructions, with the ZCR_ELx vector length and the CPACR, CPTR ZEN traps.
+//!
+//! Not yet covered: the SVE floating point, widening, narrowing, dot product and crypto
+//! groups, SME, AArch32, Secure EL2, 52 bit addresses, and the debug,
 //! PMU, pointer authentication and MTE extensions.
 //!
 //! - [`cpu`]: `CPUARMState` as a struct the generated code addresses by offset, and the CPU

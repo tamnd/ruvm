@@ -32,10 +32,12 @@ pub(crate) fn vload(env: &[u8], n: u32) -> V {
     v
 }
 
-/// Write Vd into `env`.
+/// Write Vd into `env`, clearing the rest of the SVE register Zd as `clear_tail()` does up
+/// to the vector length (the bytes above it are always zero).
 pub(crate) fn vstore(env: &mut [u8], d: u32, v: &V) {
     let o = vreg_off(d as usize & 31);
     env[o..o + 16].copy_from_slice(v);
+    env[o + 16..o + crate::cpu::ZREG_SIZE].fill(0);
 }
 
 /// Element `i` of size `1 << esz` bytes, zero extended.
@@ -401,7 +403,7 @@ fn usat(x: i128, esz: u32, sat: &mut bool) -> u64 {
 
 /// `do_sqrshl_bhs()` and `do_sqrshl_d()`: shift the signed `src` of `bits` bits left by
 /// `shift`, right when negative, rounding if asked, saturating if `sat` is given.
-fn sqrshl(src: i64, shift: i32, bits: i32, round: bool, sat: Option<&mut bool>) -> i64 {
+pub(crate) fn sqrshl(src: i64, shift: i32, bits: i32, round: bool, sat: Option<&mut bool>) -> i64 {
     let src = i128::from(src);
     if shift <= -bits {
         // Rounding the sign bit always produces 0.
@@ -428,7 +430,7 @@ fn sqrshl(src: i64, shift: i32, bits: i32, round: bool, sat: Option<&mut bool>) 
 }
 
 /// `do_uqrshl_bhs()` and `do_uqrshl_d()`: the unsigned form of [`sqrshl`].
-fn uqrshl(src: u64, shift: i32, bits: i32, round: bool, sat: Option<&mut bool>) -> u64 {
+pub(crate) fn uqrshl(src: u64, shift: i32, bits: i32, round: bool, sat: Option<&mut bool>) -> u64 {
     let src = u128::from(src);
     if shift <= -(bits + i32::from(round)) {
         return 0;
@@ -454,7 +456,7 @@ fn uqrshl(src: u64, shift: i32, bits: i32, round: bool, sat: Option<&mut bool>) 
 }
 
 /// `do_suqrshl_bhs()` and `do_suqrshl_d()`: signed source, unsigned saturated result.
-fn suqrshl(src: i64, shift: i32, bits: i32, round: bool, sat: &mut bool) -> u64 {
+pub(crate) fn suqrshl(src: i64, shift: i32, bits: i32, round: bool, sat: &mut bool) -> u64 {
     if src < 0 {
         *sat = true;
         return 0;

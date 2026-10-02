@@ -31,6 +31,8 @@ pub const EC_PCALIGNMENT: u32 = 0x22;
 pub const EC_DATAABORT: u32 = 0x24;
 /// `EC_SERROR`.
 pub const EC_SERROR: u32 = 0x2f;
+/// `EC_SVEACCESSTRAP`.
+pub const EC_SVEACCESSTRAP: u32 = 0x19;
 /// `EC_AA64_BKPT`.
 pub const EC_AA64_BKPT: u32 = 0x3c;
 
@@ -47,6 +49,11 @@ pub const fn syn_uncategorized() -> u32 {
 /// `syn_a64_fp_access_trap()`: an AArch64 FP or SIMD access trapped by CPACR.
 pub const fn syn_a64_fp_access_trap(cv: u32, cond: u32) -> u32 {
     (EC_ADVSIMDFPACCESSTRAP << EC_SHIFT) | IL | ((cv & 1) << 24) | ((cond & 0xf) << 20)
+}
+
+/// `syn_sve_access_trap()`: an SVE access trapped by CPACR_EL1.ZEN, CPTR_EL2 or CPTR_EL3.
+pub const fn syn_sve_access_trap() -> u32 {
+    (EC_SVEACCESSTRAP << EC_SHIFT) | IL
 }
 
 /// `syn_aa64_svc()`.

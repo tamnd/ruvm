@@ -746,7 +746,7 @@ fn recpx<F: Fp>(a: F, s: &mut FloatStatus) -> F {
 }
 
 /// `HELPER(recpe_u32)`.
-fn recpe_u32(a: u32) -> u32 {
+pub(crate) fn recpe_u32(a: u32) -> u32 {
     if a & 0x8000_0000 == 0 {
         return 0xffff_ffff;
     }
@@ -754,7 +754,7 @@ fn recpe_u32(a: u32) -> u32 {
 }
 
 /// `HELPER(rsqrte_u32)`.
-fn rsqrte_u32(a: u32) -> u32 {
+pub(crate) fn rsqrte_u32(a: u32) -> u32 {
     if a & 0xc000_0000 == 0 {
         return 0xffff_ffff;
     }

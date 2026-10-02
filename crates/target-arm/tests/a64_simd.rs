@@ -104,7 +104,8 @@ impl World {
 }
 
 fn set_v(st: &mut CpuArmState, n: usize, v: u128) {
-    st.zregs[n] = [v as u64, (v >> 64) as u64];
+    st.zregs[n][0] = v as u64;
+    st.zregs[n][1] = (v >> 64) as u64;
 }
 
 fn get_v(st: &CpuArmState, n: usize) -> u128 {

@@ -349,6 +349,10 @@ fn has_vh(f: &ArmFeatures) -> bool {
     f.vh
 }
 
+fn has_sve(f: &ArmFeatures) -> bool {
+    f.sve
+}
+
 /// The `env` offset of element `i` of an array field.
 macro_rules! off {
     ($f:ident) => {
@@ -403,6 +407,12 @@ pub(crate) const DAIF: u32 = key(3, 3, 4, 2, 1);
 pub(crate) const FPCR: u32 = key(3, 3, 4, 4, 0);
 /// FPSR (`ARM_CP_FPU | ARM_CP_SUPPRESS_TB_END`).
 pub(crate) const FPSR: u32 = key(3, 3, 4, 4, 1);
+/// ZCR_EL1 (`ARM_CP_SVE`).
+pub(crate) const ZCR_EL1: u32 = key(3, 0, 1, 2, 0);
+/// ZCR_EL2 (`ARM_CP_SVE`).
+pub(crate) const ZCR_EL2: u32 = key(3, 4, 1, 2, 0);
+/// ZCR_EL3 (`ARM_CP_SVE`).
+pub(crate) const ZCR_EL3: u32 = key(3, 6, 1, 2, 0);
 /// SPSel.
 pub(crate) const SPSEL: u32 = key(3, 0, 4, 2, 0);
 /// PAN.
@@ -500,6 +510,7 @@ static REGS: &[Reg] = &[
     r!("REVIDR_EL1", (3, 0, 0, 0, 6), PL1_R, Tid1, Kind::Model(|m| m.revidr)),
     r!("ID_AA64PFR0_EL1", (3, 0, 0, 4, 0), PL1_R, Tid3, Kind::Model(|m| m.id_aa64pfr0)),
     r!("ID_AA64PFR1_EL1", (3, 0, 0, 4, 1), PL1_R, Tid3, Kind::Model(|m| m.id_aa64pfr1)),
+    r!("ID_AA64ZFR0_EL1", (3, 0, 0, 4, 4), PL1_R, Tid3, Kind::Model(|m| m.id_aa64zfr0)),
     r!("ID_AA64DFR0_EL1", (3, 0, 0, 5, 0), PL1_R, Tid3, Kind::Model(|m| m.id_aa64dfr0)),
     r!("ID_AA64ISAR0_EL1", (3, 0, 0, 6, 0), PL1_R, Tid3, Kind::Model(|m| m.id_aa64isar0)),
     r!("ID_AA64ISAR1_EL1", (3, 0, 0, 6, 1), PL1_R, Tid3, Kind::Model(|m| m.id_aa64isar1)),
@@ -523,6 +534,10 @@ static REGS: &[Reg] = &[
         // cpacr_write() keeps every bit in ARMv8.
         field(off!(cpacr_el1))
     ),
+    // zcr_reginfo, all three in this table as QEMU registers them whatever the ELs.
+    r!("ZCR_EL1", (3, 0, 1, 2, 0), PL1_RW, None, Kind::Special, has_sve),
+    r!("ZCR_EL2", (3, 4, 1, 2, 0), PL2_RW, None, Kind::Special, has_sve),
+    r!("ZCR_EL3", (3, 6, 1, 2, 0), PL3_RW, None, Kind::Special, has_sve),
     // Memory management.
     r!("TTBR0_EL1", (3, 0, 2, 0, 0), PL1_RW, Tvm, Kind::Special),
     r!("TTBR1_EL1", (3, 0, 2, 0, 1), PL1_RW, Tvm, Kind::Special),
@@ -734,6 +749,7 @@ static EL3_REGS: &[Reg] = &[
 static E2H_REDIRECTS: &[(u32, u32)] = &[
     (key(3, 0, 1, 0, 0), key(3, 4, 1, 0, 0)),   // SCTLR
     (key(3, 0, 1, 0, 2), key(3, 4, 1, 1, 2)),   // CPACR, CPTR_EL2
+    (key(3, 0, 1, 2, 0), key(3, 4, 1, 2, 0)),   // ZCR
     (key(3, 0, 2, 0, 0), key(3, 4, 2, 0, 0)),   // TTBR0
     (key(3, 0, 2, 0, 1), key(3, 4, 2, 0, 1)),   // TTBR1
     (key(3, 0, 2, 0, 2), key(3, 4, 2, 0, 2)),   // TCR
@@ -919,6 +935,7 @@ pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
         PAN => u64::from(st.pstate & PSTATE_PAN),
         UAO => u64::from(st.pstate & PSTATE_UAO),
         OSLSR_EL1 => st.oslsr_el1,
+        ZCR_EL1 | ZCR_EL2 | ZCR_EL3 => st.zcr_el[el_of(key_)],
         CNTPCT_EL0 => gtimer::phys_count(arm, &st),
         CNTVCT_EL0 => gtimer::virt_count(arm, &st),
         _ => panic!("no read for system register key 0x{key_:x}"),
@@ -1047,6 +1064,19 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
         OSLAR_EL1 => {
             // oslar_write(): OSLSR_EL1.OSLK follows bit 0.
             st.oslsr_el1 = (st.oslsr_el1 & !2) | ((value & 1) << 1);
+            st.store(cpu.env);
+        }
+        ZCR_EL1 | ZCR_EL2 | ZCR_EL3 => {
+            // zcr_write(): bits other than [3:0] are RAZ/WI. Because we arrived here, we
+            // know both FP and SVE are enabled; otherwise we would have trapped access to the
+            // ZCR_ELn register.
+            let cur_el = st.current_el();
+            let old_len = super::sve_vqm1_for_el(f, &st, cur_el);
+            st.zcr_el[el_of(key_)] = value & 0xf;
+            let new_len = super::sve_vqm1_for_el(f, &st, cur_el);
+            if new_len < old_len {
+                super::sve_narrow_vq(&mut st, new_len as usize + 1);
+            }
             st.store(cpu.env);
         }
         _ if key_ >> 14 == 1 && (key_ >> 7) & 0xf == 7 => at(arm, cpu, &st, key_, value),
