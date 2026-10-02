@@ -610,7 +610,6 @@ fn pc_relative() {
 fn undefined_encodings() {
     let undef: &[(u32, &str)] = &[
         (0x8bc2_2020, "add x0, x1, x2, ror #8 (reserved shift)"),
-        (0x1e62_2820, "fadd d0, d1, d2 (FP is the second slice)"),
         (0xd400_0002, "hvc #0 (no EL2)"),
         (0xd400_0003, "smc #0 (no EL3)"),
         (0xd440_0000, "hlt #0 (no semihosting)"),

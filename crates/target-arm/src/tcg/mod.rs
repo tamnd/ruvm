@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The AArch64 TCG front end, first slice: the port of the integer parts of QEMU's
+//! The AArch64 TCG front end: the port of the integer, scalar FP and AdvSIMD parts of QEMU's
 //! `target/arm/tcg/translate-a64.c`, `helper-a64.c` and `op_helper.c`, the AArch64 EL0 and
 //! EL1 parts of `helper.c` (system registers, exception entry) and `ptw.c` (the stage 1 page
 //! walk), run by `ruvm-jit`.
@@ -34,14 +34,34 @@
 //! up to 48 bits, both TTBRs, TBI, hierarchical permissions, PAN, WXN, and the hardware access
 //! flag and dirty state when the model has them.
 //!
-//! **Scalar floating point, AdvSIMD and SVE are not implemented in this slice.** Every FP and
-//! vector instruction, including the FP and SIMD loads and stores, raises an Undefined
-//! Instruction exception (uncategorized), and ID_AA64PFR0_EL1 reports FP and AdvSIMD as absent.
-//! They come in the second slice, built on `ruvm-softfloat`. SVE, SME, EL2 and EL3 are later
-//! slices.
+//! Scalar floating point and AdvSIMD (the second slice) are in `translate_simd.rs`, with the
+//! helpers in `vfp.rs` (QEMU's `vfp_helper.c` and the FP parts of `helper-a64.c`),
+//! `vec_helper.rs` (`vec_helper.c`, `neon_helper.c` and the AdvSIMD parts of
+//! `helper-a64.c`) and `crypto.rs` (`crypto_helper.c`). Every FP operation goes through
+//! `ruvm-softfloat` with the float_status QEMU derives from FPCR, so the rounding modes, FZ,
+//! FZ16, DN, AHP and the cumulative FPSR flags match QEMU. Covered: every scalar FP data
+//! processing, compare, conditional select, FMOV (register, general and immediate), FRINT*,
+//! FCVT* with saturation, SCVTF and UCVTF (integer and fixed point), half precision when the model has FEAT_FP16, the AdvSIMD integer, widening,
+//! narrowing, saturating, rounding doubling (RDM), dot product, shift, permute, EXT, table
+//! lookup, across-lanes, copy, modified immediate, by-element and FP vector instructions, the
+//! FP and SIMD loads and stores in every addressing mode with the structure loads and stores
+//! (LD1 to LD4, ST1 to ST4, LD1R to LD4R), and AES, SHA1, SHA256 and PMULL (64 bit) as the
+//! models' ID_AA64ISAR0_EL1 says. FP and SIMD accesses trap to EL1 with EC 0x07 when
+//! CPACR_EL1.FPEN asks for it. SVE, SME, EL2 and EL3 are later slices.
 //!
 //! Deliberate differences from QEMU:
 //!
+//! - FP and AdvSIMD instructions call one out of line helper per instruction (per element
+//!   loop) where QEMU expands TCG gvec operations inline; the results and flags are the same.
+//! - FEAT_AFP (FPCR.AH, FPCR.NEP, FPCR.FIZ), FEAT_RPRES and FEAT_FPRCVT are not implemented,
+//!   matching the models' ID registers; the FPRCVT forms (FCVT* to and from a SIMD register,
+//!   SCVTF and UCVTF from a SIMD register of the other size) are unallocated.
+//! - The FP access check looks only at CPACR_EL1.FPEN, since there is no EL2 or EL3 (CPTR_EL2
+//!   and CPTR_EL3 cannot trap), and SME streaming mode does not exist.
+//! - FP and SIMD data accesses are little endian only (SCTLR.EE and E0E are ignored, as for
+//!   the integer loads and stores) and there are no MTE tag checks or SP alignment checks.
+//! - FHM, FCMA, JSCVT (FJCVTZS), FRINTTS (FRINT32 and FRINT64), BF16, I8MM, SHA512, SHA3, SM3
+//!   and SM4 are absent, as in the models: they raise UNDEF.
 //! - The translator keeps no TCG globals for X0 to X30, SP, the PC, NZCV or the exclusive
 //!   monitor: every access is a load from or store to `env` at the field's offset. The
 //!   generated code computes the same values; it only does more memory traffic.
@@ -82,10 +102,13 @@
 //! - QEMU logs accesses to unknown system registers with `LOG_UNIMP` and illegal exception
 //!   returns with `LOG_GUEST_ERROR`; this crate has no logging and stays silent.
 
+mod crypto;
 mod helpers;
 mod ptw;
 mod sysreg;
 mod translate;
+mod vec_helper;
+mod vfp;
 
 use std::fmt;
 use std::sync::Arc;
@@ -120,6 +143,9 @@ pub const TB_ALIGN_MEM: u32 = 1 << 5;
 pub const TB_TBII_SHIFT: u32 = 6;
 /// TB flags: the shift of the two TBID bits, top byte ignore for data addresses.
 pub const TB_TBID_SHIFT: u32 = 8;
+/// TB flags: the shift of the two bits of `fp_excp_el`, the EL that FP and AdvSIMD accesses
+/// trap to (0 when they do not trap).
+pub const TB_FPEXC_EL_SHIFT: u32 = 10;
 
 /// The AArch64 CPU: the [`CpuOps`] of vCPUs translated by the A64 front end.
 pub struct Arm {
@@ -207,7 +233,23 @@ pub(crate) fn tb_flags(st: &CpuArmState) -> u32 {
     let tcr = st.tcr_el[1];
     let tbid = ((tcr >> 37) & 3) as u32;
     let tbii = tbid & !(((tcr >> 51) & 3) as u32);
-    flags | (tbii << TB_TBII_SHIFT) | (tbid << TB_TBID_SHIFT)
+    flags
+        | (tbii << TB_TBII_SHIFT)
+        | (tbid << TB_TBID_SHIFT)
+        | (fp_exception_el(st) << TB_FPEXC_EL_SHIFT)
+}
+
+/// `fp_exception_el()` without EL2 and EL3: the EL that FP and AdvSIMD instructions trap to
+/// under CPACR_EL1.FPEN, or 0 when they are enabled.
+pub(crate) fn fp_exception_el(st: &CpuArmState) -> u32 {
+    let el = st.current_el();
+    match (st.cpacr_el1 >> 20) & 3 {
+        // Trap from EL0 only.
+        1 if el == 0 => 1,
+        1 | 3 => 0,
+        // 0 and 2: trap from EL0 and EL1.
+        _ => 1,
+    }
 }
 
 /// `exception_target_el()` without EL2 and EL3.

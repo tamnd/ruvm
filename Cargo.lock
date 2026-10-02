@@ -996,6 +996,7 @@ dependencies = [
  "ruvm-jit-core",
  "ruvm-jit-interp",
  "ruvm-mem",
+ "ruvm-softfloat",
 ]
 
 [[package]]
