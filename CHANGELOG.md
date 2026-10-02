@@ -6,6 +6,16 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.3.1
+
+This patch brings the first guest front ends for M4. ruvm can now translate and run x86 and AArch64 guest code on its JIT, although nothing boots on it yet.
+
+For AArch64 (`ruvm-target-arm`): every A64 base integer instruction, the LSE atomics, the EL0 and EL1 system registers, the 4K page walk and exception entry through VBAR_EL1 (#118). Scalar FP and AdvSIMD go through `ruvm-softfloat`, along with AES, SHA1, SHA256 and PMULL. About 2150 test cases match an Apple M4 bit for bit (#119). EL2 and EL3 came after that, with VHE, stage 2 translation in all three granules, HVC and SMC routing, PSCI through a board hook, the generic timers and broadcast TLBI (#120).
+
+For x86 (`ruvm-target-x86`): every integer instruction with lazy flags, string ops with REP, LOCK atomics, the 4 and 5 level page walk, exceptions through the IDT, SYSCALL and SYSRET, and the switch from real mode to long mode (#121). x87, SSE and AVX still raise #UD.
+
+Fixes: two block tests that failed now and then turned out to be a real race. Deleting a node while another thread drained every node freed it late, on the wrong thread. `blockdev_del` now keeps drain-all sections out, and the job transaction tests hold the BQL like QEMU's do (#117).
+
 ## 0.3.0
 
 M3 is done, so this is the first 0.3 release. The block layer and its tools now pass QEMU's own tests.
