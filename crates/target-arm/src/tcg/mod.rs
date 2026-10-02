@@ -49,20 +49,26 @@
 //! outputs through [`ArmBoard::gt_timer_update`].
 //!
 //! Scalar floating point and AdvSIMD (the second slice) are in `translate_simd.rs`, with the
-//! helpers in `vfp.rs` (QEMU's `vfp_helper.c` and the FP parts of `helper-a64.c`),
-//! `vec_helper.rs` (`vec_helper.c`, `neon_helper.c` and the AdvSIMD parts of
-//! `helper-a64.c`) and `crypto.rs` (`crypto_helper.c`). Every FP operation goes through
-//! `ruvm-softfloat` with the float_status QEMU derives from FPCR, so the rounding modes, FZ,
-//! FZ16, DN, AHP and the cumulative FPSR flags match QEMU. Covered: every scalar FP data
-//! processing, compare, conditional select, FMOV (register, general and immediate), FRINT*,
-//! FCVT* with saturation, SCVTF and UCVTF (integer and fixed point), half precision when
-//! the model has FEAT_FP16, the AdvSIMD integer, widening, narrowing, saturating, rounding doubling (RDM), dot product, shift, permute, EXT, table
-//! lookup, across-lanes, copy, modified immediate, by-element and FP vector instructions, the
-//! FP and SIMD loads and stores in every addressing mode with the structure loads and stores
-//! (LD1 to LD4, ST1 to ST4, LD1R to LD4R), and AES, SHA1, SHA256 and PMULL (64 bit) as the
-//! models' ID_AA64ISAR0_EL1 says. FP and SIMD accesses trap with EC 0x07 as CPACR_EL1.FPEN,
-//! CPTR_EL2 (in either format) and CPTR_EL3.TFP ask, as `fp_exception_el()` does. SVE and SME
-//! are later slices.
+//! helpers in `vfp.rs` (QEMU's `vfp_helper.c` and the FP parts of `helper-a64.c`), `vec_helper.rs`
+//! (`vec_helper.c`, `neon_helper.c` and the AdvSIMD parts of `helper-a64.c`) and `crypto.rs`
+//! (`crypto_helper.c`). Every FP operation goes through `ruvm-softfloat` with the float_status QEMU
+//! derives from FPCR, so the rounding modes, FZ, FZ16, DN, AHP and the cumulative FPSR flags match
+//! QEMU. Covered: every scalar FP data processing, compare, conditional select, FMOV (register,
+//! general and immediate), FRINT*, FCVT* with saturation, SCVTF and UCVTF (integer and fixed
+//! point), half precision when the model has FEAT_FP16, the AdvSIMD integer, widening, narrowing,
+//! saturating, rounding doubling (RDM), dot product, shift, permute, EXT, table lookup,
+//! across-lanes, copy, modified immediate, by-element and FP vector instructions, the FP and SIMD
+//! loads and stores in every addressing mode with the structure loads and stores (LD1 to LD4, ST1
+//! to ST4, LD1R to LD4R), and AES, SHA1, SHA256 and PMULL (64 bit) as the models' ID_AA64ISAR0_EL1
+//! says. FP and SIMD accesses trap with EC 0x07 as CPACR_EL1.FPEN, CPTR_EL2 (in either format) and
+//! CPTR_EL3.TFP ask, as `fp_exception_el()` does.
+//!
+//! SVE and SVE2 (`translate_sve.rs`, `sve_helper.rs`) cover the integer, predicate, permute,
+//! element count and memory groups, including first fault and non fault loads, gathers and
+//! scatters. The vector length comes from ZCR_EL1 to ZCR_EL3 and the model's `sve-max-vq`
+//! (`sve_vqm1_for_el()`) and is a TB flag, as is the EL SVE instructions trap to under
+//! CPACR_EL1.ZEN, CPTR_EL2 and CPTR_EL3 (`sve_exception_el()`). A ZCR_ELx write or an EL
+//! change that shortens the vector length zeroes the bits above it. SME is a later slice.
 //!
 //! Deliberate differences from QEMU:
 //!
@@ -127,6 +133,7 @@ mod gtimer;
 mod helpers;
 mod psci;
 mod ptw;
+mod sve_helper;
 mod sysreg;
 mod translate;
 mod vec_helper;
@@ -182,6 +189,10 @@ pub const TB_TBID_SHIFT: u32 = 8;
 pub const TB_FPEXC_EL_SHIFT: u32 = 10;
 /// TB flags: the shift of the four bits of the core MMU index (`TBFLAG_ANY.MMUIDX`).
 pub const TB_MMUIDX_SHIFT: u32 = 12;
+/// Where the SVE exception EL (`SVEEXC_EL`, 2 bits) sits in the TB flags.
+pub const TB_SVEEXC_EL_SHIFT: u32 = 16;
+/// Where the SVE vector length in quadwords minus one (`VL`, 4 bits) sits in the TB flags.
+pub const TB_VL_SHIFT: u32 = 18;
 
 /// `CPU_INTERRUPT_FIQ`.
 pub const INTERRUPT_FIQ: u32 = 0x0010;
@@ -592,16 +603,32 @@ pub(crate) fn tb_flags(f: &ArmFeatures, st: &CpuArmState) -> u32 {
     }
     let (tbid, tbid_bits) = tbi_bits(st.tcr_el[rel], mmu_idx);
     let tbii = tbid & !tbid_bits;
-    flags
-        | (tbii << TB_TBII_SHIFT)
-        | (tbid << TB_TBID_SHIFT)
-        | (fp_exception_el(f, st) << TB_FPEXC_EL_SHIFT)
+    let fp_el = fp_exception_el(f, st);
+    if f.sve {
+        let mut sve_el = sve_exception_el(f, st, el);
+        // If either FP or SVE are disabled, translator does not need len. If SVE EL >
+        // FP EL, FP exception has precedence, and translator does not need SVE EL. Save
+        // potential re-translations by forcing the unneeded data to zero.
+        if fp_el != 0 {
+            if sve_el > fp_el {
+                sve_el = 0;
+            }
+        } else if sve_el == 0 {
+            flags |= sve_vqm1_for_el(f, st, el) << TB_VL_SHIFT;
+        }
+        flags |= sve_el << TB_SVEEXC_EL_SHIFT;
+    }
+    flags | (tbii << TB_TBII_SHIFT) | (tbid << TB_TBID_SHIFT) | (fp_el << TB_FPEXC_EL_SHIFT)
 }
 
 /// `fp_exception_el()`: the EL that FP and AdvSIMD instructions trap to under CPACR_EL1,
 /// CPTR_EL2 and CPTR_EL3, or 0 when they are enabled.
 pub(crate) fn fp_exception_el(f: &ArmFeatures, st: &CpuArmState) -> u32 {
-    let cur_el = st.current_el();
+    fp_exception_el_at(f, st, st.current_el())
+}
+
+/// `fp_exception_el()` for code running at `cur_el`.
+pub(crate) fn fp_exception_el_at(f: &ArmFeatures, st: &CpuArmState, cur_el: u32) -> u32 {
     let hcr = st.hcr_el2_eff(f);
     // The CPACR controls traps to EL1: 0 and 2 trap EL0 and EL1 accesses, 1 traps only EL0
     // accesses and 3 traps nothing. It is ignored if E2H and TGE are both set.
@@ -630,6 +657,95 @@ pub(crate) fn fp_exception_el(f: &ArmFeatures, st: &CpuArmState) -> u32 {
         return 3;
     }
     0
+}
+
+/// `el_is_in_host()`: whether `el` runs in the EL2&0 host regime.
+fn el_is_in_host(f: &ArmFeatures, st: &CpuArmState, el: u32) -> bool {
+    if el & 1 != 0 {
+        return false;
+    }
+    let mask = if el != 0 { HCR_E2H } else { HCR_E2H | HCR_TGE };
+    st.hcr_el2 & mask == mask && st.is_el2_enabled(f)
+}
+
+/// `sve_exception_el()`: the EL that SVE instructions at `el` trap to under CPACR_EL1.ZEN,
+/// CPTR_EL2 and CPTR_EL3.EZ, or 0 when they are enabled.
+pub(crate) fn sve_exception_el(f: &ArmFeatures, st: &CpuArmState, el: u32) -> u32 {
+    if el <= 1 && !el_is_in_host(f, st, el) {
+        match (st.cpacr_el1 >> 16) & 3 {
+            1 if el != 0 => {}
+            3 => {}
+            _ => return 1,
+        }
+    }
+    if el <= 2 && st.is_el2_enabled(f) {
+        // CPTR_EL2 changes format with HCR_EL2.E2H (regardless of TGE).
+        if st.hcr_el2 & HCR_E2H != 0 {
+            match (st.cptr_el[2] >> 16) & 3 {
+                1 if el != 0 || st.hcr_el2 & HCR_TGE == 0 => {}
+                3 => {}
+                _ => return 2,
+            }
+        } else if st.cptr_el[2] & (1 << 8) != 0 {
+            return 2;
+        }
+    }
+    // CPTR_EL3. Since EZ is negative we must check for EL3.
+    if f.el3 && st.cptr_el[3] & (1 << 8) == 0 {
+        return 3;
+    }
+    0
+}
+
+/// `sve_vqm1_for_el()`: the vector length at `el` in quadwords minus one, from the ZCR_ELx
+/// LEN fields and the supported lengths (every length up to `sve-max-vq`).
+pub(crate) fn sve_vqm1_for_el(f: &ArmFeatures, st: &CpuArmState, el: u32) -> u32 {
+    let mut len = crate::cpu::ARM_MAX_VQ as u32 - 1;
+    if el <= 1 && !el_is_in_host(f, st, el) {
+        len = len.min(st.zcr_el[1] as u32 & 0xf);
+    }
+    if el <= 2 && st.is_el2_enabled(f) {
+        len = len.min(st.zcr_el[2] as u32 & 0xf);
+    }
+    if f.el3 {
+        len = len.min(st.zcr_el[3] as u32 & 0xf);
+    }
+    len.min(f.sve_max_vq.max(1) - 1)
+}
+
+/// `aarch64_sve_narrow_vq()`: zero the parts of the Z and P registers and FFR above `vq`
+/// quadwords.
+pub(crate) fn sve_narrow_vq(st: &mut CpuArmState, vq: usize) {
+    for z in st.zregs.iter_mut() {
+        z[2 * vq..].fill(0);
+    }
+    let mut pmask = if vq & 3 != 0 { !(u64::MAX << (16 * (vq & 3))) } else { 0 };
+    for j in vq / 4..crate::cpu::ARM_MAX_VQ / 4 {
+        for p in st.pregs.iter_mut() {
+            p[j] &= pmask;
+        }
+        pmask = 0;
+    }
+}
+
+/// `aarch64_sve_change_el()`: clear the state an exception entry or return from `old_el`
+/// to `new_el` makes inaccessible by shortening the vector length. Every EL is AArch64.
+pub(crate) fn sve_change_el(f: &ArmFeatures, st: &mut CpuArmState, old_el: u32, new_el: u32) {
+    if !f.sve {
+        return;
+    }
+    // Nothing to do if FP is disabled in either EL.
+    if fp_exception_el_at(f, st, old_el) != 0 || fp_exception_el_at(f, st, new_el) != 0 {
+        return;
+    }
+    let len = |el| {
+        if sve_exception_el(f, st, el) != 0 { 0 } else { sve_vqm1_for_el(f, st, el) }
+    };
+    let (old_len, new_len) = (len(old_el), len(new_el));
+    // When changing vector length, clear inaccessible state.
+    if new_len < old_len {
+        sve_narrow_vq(st, new_len as usize + 1);
+    }
 }
 
 /// `exception_target_el()`: the EL synchronous exceptions from the current EL go to before
@@ -704,6 +820,8 @@ impl Arm {
         let cur_el = st.current_el();
         let mut addr = st.vbar_el[ne];
         let old_mode = st.pstate_read();
+
+        sve_change_el(self.features(), &mut st, cur_el, new_el);
 
         if cur_el < new_el {
             // Entry vector offset depends on whether the implemented EL immediately lower

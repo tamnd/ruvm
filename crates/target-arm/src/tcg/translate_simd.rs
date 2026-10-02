@@ -20,7 +20,10 @@
 //!   scalar results always clear the rest of the vector register, and the FPRCVT forms
 //!   (`FCVT*` to and `SCVTF`/`UCVTF` from a general register size in a SIMD register) are
 //!   unallocated, as they are in QEMU for CPUs without the feature.
-//! - SVE is not implemented, so writes never have to clear bits above 128.
+//! - With SVE, QEMU clears the bits of the Z register above 128 (up to the vector length)
+//!   on every AdvSIMD and FP write except the single structure loads, and so does this port
+//!   (the helpers clear all 2048 bits, which is the same because the bits above the vector
+//!   length are always zero, see `sve_narrow_vq()`).
 //! - Data accesses are always little endian, and MTE tag checks are not done.
 //! - QEMU checks the SP alignment of SIMD loads and stores through SP when the CPU asks for
 //!   it; this port never does (as for the integer loads and stores).
@@ -290,6 +293,21 @@ impl S<'_, '_> {
             None => self.c64(0),
         };
         self.st_env64(hi, off + 8);
+        self.clear_sve(reg);
+    }
+
+    /// The part of `clear_vec_high()` above 128 bits: with SVE, zero the bytes of the Z
+    /// register from 16 up to the vector length.
+    pub(super) fn clear_sve(&mut self, reg: i32) {
+        let vl = self.d.vl as usize;
+        if !self.feat().sve || vl <= 16 {
+            return;
+        }
+        let z = self.c64(0);
+        let off = vreg_off(reg as usize);
+        for o in (16..vl).step_by(8) {
+            self.st_env64(z, off + o);
+        }
     }
 
     /// `write_fp_dreg()`: the low 64 bits, clearing the rest.
@@ -301,6 +319,7 @@ impl S<'_, '_> {
     fn clear_high(&mut self, reg: i32) {
         let z = self.c64(0);
         self.st_env64(z, vreg_off(reg as usize) + 8);
+        self.clear_sve(reg);
     }
 
     /// Replicate the low element of `t` across 64 bits, in place.
@@ -651,6 +670,7 @@ impl S<'_, '_> {
             Mov::Ux => {
                 let t = self.reg(a.rn);
                 self.st_env64(t, vreg_off(a.rd as usize) + 8);
+                self.clear_sve(a.rd);
             }
             Mov::Xh => {
                 let t = self.read_elem(a.rn, 0, 1, false);
@@ -856,6 +876,7 @@ impl S<'_, '_> {
         if self.fp_access_check() {
             let t = self.reg(a.rn);
             self.write_elem(a.rd, idx, esz, t);
+            self.clear_sve(a.rd);
         }
         true
     }
@@ -868,6 +889,7 @@ impl S<'_, '_> {
         if self.fp_access_check() {
             let t = self.read_elem(a.rn, sidx, esz, false);
             self.write_elem(a.rd, didx, esz, t);
+            self.clear_sve(a.rd);
         }
         true
     }
@@ -1057,9 +1079,13 @@ impl S<'_, '_> {
                 }
             }
         }
-        if is_load && a.q == 0 {
+        if is_load {
             for r in 0..a.rpt * a.selem {
-                self.clear_high((a.rt + r) % 32);
+                if a.q == 0 {
+                    self.clear_high((a.rt + r) % 32);
+                } else {
+                    self.clear_sve((a.rt + r) % 32);
+                }
             }
         }
         self.ldst_writeback(a.rn, base, a.p, a.rm, total);

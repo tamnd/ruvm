@@ -24,7 +24,7 @@ use super::helpers::{self, Def};
 use super::sysreg::{self, Kind};
 use super::{
     TB_ALIGN_MEM, TB_E2H, TB_EL_MASK, TB_FPEXC_EL_SHIFT, TB_MMUIDX_SHIFT, TB_PSTATE_IL,
-    TB_TBID_SHIFT, TB_TBII_SHIFT, TB_UNPRIV, regime_has_2_ranges,
+    TB_SVEEXC_EL_SHIFT, TB_TBID_SHIFT, TB_TBII_SHIFT, TB_UNPRIV, TB_VL_SHIFT, regime_has_2_ranges,
 };
 use crate::cpu::{
     ArmCpuModel, CF, EXCLUSIVE_ADDR, EXCLUSIVE_HIGH, EXCLUSIVE_VAL, EXCP_BKPT, EXCP_HVC, EXCP_SMC,
@@ -49,6 +49,9 @@ mod decode {
 
 #[path = "translate_simd.rs"]
 mod simd;
+
+#[path = "translate_sve.rs"]
+mod sve;
 
 use simd::{Chk, Feat, Mov, RA, RF, RM, RN, RP, RZ, cop, fop, nop};
 
@@ -90,6 +93,10 @@ pub(crate) struct DisasContext {
     e2h: bool,
     /// The EL that FP and AdvSIMD instructions trap to, or 0 if they do not trap.
     fp_excp_el: u32,
+    /// The EL that SVE instructions trap to, or 0 if they do not trap.
+    sve_excp_el: u32,
+    /// The SVE vector length in bytes.
+    vl: u32,
 }
 
 impl DisasContext {
@@ -107,6 +114,8 @@ impl DisasContext {
             mmu_idx: 0,
             e2h: false,
             fp_excp_el: 0,
+            sve_excp_el: 0,
+            vl: 16,
         }
     }
 }
@@ -1128,7 +1137,10 @@ impl S<'_, '_> {
         }
         // FPCR and FPSR are ARM_CP_FPU registers.
         let is_fpu = key == sysreg::FPCR || key == sysreg::FPSR;
-        if is_fpu && !self.fp_access_check() {
+        let is_sve = matches!(key, sysreg::ZCR_EL1 | sysreg::ZCR_EL2 | sysreg::ZCR_EL3);
+        let denied =
+            if is_fpu { !self.fp_access_check() } else { is_sve && !self.sve_access_check() };
+        if denied {
             return;
         }
         match ri.kind {
@@ -2464,6 +2476,8 @@ impl TranslatorOps for DisasContext {
         self.fp_excp_el = (flags >> TB_FPEXC_EL_SHIFT) & 3;
         self.mmu_idx = (flags >> TB_MMUIDX_SHIFT) & 0xf;
         self.e2h = flags & TB_E2H != 0;
+        self.sve_excp_el = (flags >> TB_SVEEXC_EL_SHIFT) & 3;
+        self.vl = (((flags >> TB_VL_SHIFT) & 0xf) + 1) * 16;
 
         // Bound the number of insns to execute to those left on the page.
         let bound = (db.pc_first | !0xfff).wrapping_neg() / 4;
@@ -2506,7 +2520,7 @@ impl TranslatorOps for DisasContext {
             return Ok(());
         }
 
-        if !decode::disas(&mut s, insn) {
+        if !decode::disas(&mut s, insn) && !sve::disas(&mut s, insn) {
             s.unallocated_encoding();
         }
         Ok(())

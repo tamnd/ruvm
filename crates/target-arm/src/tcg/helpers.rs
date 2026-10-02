@@ -62,7 +62,10 @@ macro_rules! def {
 pub(crate) use def;
 
 /// Run `f` on the vCPU behind `h`, turning a guest exception into an [`Unwind`].
-fn run(h: &mut HelperEnv<'_>, f: impl FnOnce(&mut Cpu<'_>) -> R<u64>) -> Result<u128, Unwind> {
+pub(crate) fn run(
+    h: &mut HelperEnv<'_>,
+    f: impl FnOnce(&mut Cpu<'_>) -> R<u64>,
+) -> Result<u128, Unwind> {
     let mut cpu = Cpu::from_helper_env(h).expect("arm helpers run under the runtime");
     match f(&mut cpu) {
         Ok(v) => Ok(u128::from(v)),
@@ -160,7 +163,8 @@ pub(crate) const ALL: &[Def] = &[
 
 /// Register every helper in `r`.
 pub(crate) fn register(r: &mut HelperRegistry) {
-    let lists = [ALL, super::vfp::ALL, super::vec_helper::ALL, super::crypto::ALL];
+    let lists =
+        [ALL, super::vfp::ALL, super::vec_helper::ALL, super::crypto::ALL, super::sve_helper::ALL];
     for d in lists.iter().copied().flatten() {
         r.register_info(&d.info(), d.f);
     }
@@ -300,6 +304,7 @@ fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> 
                     }
                 }
                 st.pc = new_pc;
+                super::sve_change_el(&feat, &mut st, cur_el, new_el);
             }
             None => {
                 // Illegal return events of various kinds have architecturally mandated

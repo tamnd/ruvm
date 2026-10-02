@@ -204,9 +204,17 @@ arm_state! {
         pub exception_target_el: u32,
         /// `exception.vaddress`.
         pub exception_vaddress: u64,
-        /// The AdvSIMD and FP registers V0 to V31, QEMU's `vfp.zregs` cut down to 128 bits:
-        /// `zregs[n][0]` is the low half of Vn and `zregs[n][1]` the high half.
-        pub zregs: [[u64; 2]; 32],
+        /// The SVE registers Z0 to Z31, QEMU's `vfp.zregs`, each [`ARM_MAX_VQ`] quadwords
+        /// long. The AdvSIMD and FP register Vn is the low 128 bits of Zn: `zregs[n][0]` is
+        /// its low half and `zregs[n][1]` its high half. Bytes beyond the current vector
+        /// length are kept zero, as `aarch64_sve_narrow_vq()` leaves them.
+        pub zregs: [[u64; 32]; 32],
+        /// The SVE predicate registers P0 to P15 and FFR (index 16), QEMU's `vfp.pregs`: one
+        /// bit per byte of a Z register, element `i` of a predicate on `1 << esz` byte
+        /// elements being bit `i << esz`.
+        pub pregs: [[u64; 4]; 17],
+        /// ZCR_ELx, indexed by EL (index 0 unused): only the LEN field, bits 3 to 0.
+        pub zcr_el: [u64; 4],
         /// FPCR: AHP, DN, FZ, RMode and FZ16 as QEMU keeps them in `vfp.fpcr`, plus the Len
         /// and Stride bits QEMU keeps apart in `vfp.vec_len` and `vfp.vec_stride`.
         pub fpcr: u32,
@@ -254,9 +262,26 @@ pub const EXCLUSIVE_VAL: usize = env_off(offset_of!(CpuArmState, exclusive_val))
 /// The `env` offset of `exclusive_high`.
 pub const EXCLUSIVE_HIGH: usize = env_off(offset_of!(CpuArmState, exclusive_high));
 
-/// The `env` offset of the low 64 bits of Vn.
+/// `ARM_MAX_VQ`: the largest SVE vector length this port supports, in quadwords.
+pub const ARM_MAX_VQ: usize = 16;
+
+/// The size in bytes of one Z register in `env`.
+pub const ZREG_SIZE: usize = 16 * ARM_MAX_VQ;
+
+/// The size in bytes of one predicate register in `env`.
+pub const PREG_SIZE: usize = ZREG_SIZE / 8;
+
+/// The index of FFR among the predicate registers.
+pub const FFR: usize = 16;
+
+/// The `env` offset of the low 64 bits of Vn, which is also the start of Zn.
 pub const fn vreg_off(n: usize) -> usize {
-    env_off(offset_of!(CpuArmState, zregs)) + 16 * n
+    env_off(offset_of!(CpuArmState, zregs)) + ZREG_SIZE * n
+}
+
+/// The `env` offset of predicate register `n` (16 is FFR).
+pub const fn preg_off(n: usize) -> usize {
+    env_off(offset_of!(CpuArmState, pregs)) + PREG_SIZE * n
 }
 /// The `env` offset of `fpcr`.
 pub const FPCR: usize = env_off(offset_of!(CpuArmState, fpcr));
@@ -819,6 +844,21 @@ pub struct ArmFeatures {
     pub tgran16: bool,
     /// The 64K translation granule (`aa64_tgran64`).
     pub tgran64: bool,
+    /// FEAT_SVE (`aa64_sve`).
+    pub sve: bool,
+    /// FEAT_SVE2 (`aa64_sve2`).
+    pub sve2: bool,
+    /// FEAT_SVE_AES with FEAT_SVE_PMULL128 (`aa64_sve2_aes` and `aa64_sve2_pmull128`).
+    pub sve_aes: bool,
+    /// FEAT_SVE_BitPerm (`aa64_sve2_bitperm`).
+    pub sve_bitperm: bool,
+    /// FEAT_SVE_SHA3 (`aa64_sve2_sha3`).
+    pub sve_sha3: bool,
+    /// FEAT_SVE_SM4 (`aa64_sve2_sm4`).
+    pub sve_sm4: bool,
+    /// The largest vector length in quadwords, QEMU's `sve-max-vq` (every length from 1 to
+    /// this is supported, as for TCG). Zero without SVE.
+    pub sve_max_vq: u32,
 }
 
 /// A CPU model: the identification registers and reset values of `aarch64_*_initfn()`.
@@ -846,6 +886,8 @@ pub struct ArmCpuModel {
     pub id_aa64pfr1: u64,
     /// ID_AA64DFR0_EL1.
     pub id_aa64dfr0: u64,
+    /// ID_AA64ZFR0_EL1.
+    pub id_aa64zfr0: u64,
     /// ID_AA64ISAR0_EL1.
     pub id_aa64isar0: u64,
     /// ID_AA64ISAR1_EL1.
@@ -889,6 +931,7 @@ impl ArmCpuModel {
             id_aa64pfr0: PFR0_EL01,
             id_aa64pfr1: 0,
             id_aa64dfr0: 0x6,
+            id_aa64zfr0: 0,
             // AES 2 (with PMULL), SHA1 1, SHA2 1 and CRC32 1, QEMU's 0x00011120.
             id_aa64isar0: 0x0001_1120,
             id_aa64isar1: 0,
@@ -924,6 +967,7 @@ impl ArmCpuModel {
             id_aa64pfr0: 0x1100_0000_0000_0000 | PFR0_FP16 | PFR0_EL01,
             id_aa64pfr1: 0,
             id_aa64dfr0: 0x6,
+            id_aa64zfr0: 0,
             // DP 1, RDM 1, Atomic 2, CRC32 1, SHA2 1, SHA1 1 and AES 2, QEMU's
             // 0x0000100010211120.
             id_aa64isar0: 0x0000_1000_1021_1120,
@@ -976,6 +1020,7 @@ impl ArmCpuModel {
             id_aa64pfr0: PFR0_EL01,
             id_aa64pfr1: 0,
             id_aa64dfr0: 0x1030_5106,
+            id_aa64zfr0: 0,
             id_aa64isar0: 0x0001_1120,
             id_aa64isar1: 0,
             // QEMU's 0x00001124 without BigEnd: PARange 4, 16 bit ASIDs, 4K and 64K
@@ -995,6 +1040,50 @@ impl ArmCpuModel {
         }
     }
 
+    /// `max` cut down to what this port implements: the `cortex-a76` feature set with QEMU's
+    /// `max` MIDR, CTR_EL0.IDC and DIC, and SVE2 with the BitPerm extension, at vector
+    /// lengths up to 2048 bits. The vector length limit is [`ArmCpuModel::with_sve_max_vq`],
+    /// `-cpu max,sve-max-vq=N`. QEMU's `max` has many more features (SVE AES and PMULL128,
+    /// SVE SHA3, SVE SM4, BF16, I8MM, F32MM, F64MM, SVE2p1, SME, MTE, PAuth and so on) that
+    /// this port does not; their ID register fields read as zero here.
+    pub fn max() -> ArmCpuModel {
+        let a76 = ArmCpuModel::cortex_a76();
+        ArmCpuModel {
+            name: "max",
+            midr: 0x000f_0510,
+            ctr: a76.ctr | (1 << 28) | (1 << 29),
+            // QEMU's 0x8200123 with LoUU and LoUIS cleared for FEAT_S2FWB.
+            clidr: 0x0000_0123,
+            // ID_AA64PFR0_EL1.SVE = 1.
+            id_aa64pfr0: a76.id_aa64pfr0 | (1 << 32),
+            // SVEver 1 (SVE2) and BitPerm 1. QEMU's `max` also sets AES 2 (with PMULL128),
+            // BF16 2, SHA3 1, SM4 1, I8MM 1, F32MM 1 and F64MM 1; those fields, and the
+            // matching feature flags below, come back when their instructions land.
+            id_aa64zfr0: 0x0000_0000_0001_0001,
+            features: ArmFeatures {
+                sve: true,
+                sve2: true,
+                sve_aes: false,
+                sve_bitperm: true,
+                sve_sha3: false,
+                sve_sm4: false,
+                sve_max_vq: ARM_MAX_VQ as u32,
+                ..a76.features
+            },
+            ..a76
+        }
+    }
+
+    /// The model with vector lengths limited to `vq` quadwords (1 to 16), QEMU's
+    /// `sve-max-vq` property. It has no effect on a model without SVE.
+    pub fn with_sve_max_vq(mut self, vq: u32) -> ArmCpuModel {
+        assert!((1..=ARM_MAX_VQ as u32).contains(&vq), "sve-max-vq must be from 1 to 16");
+        if self.features.sve {
+            self.features.sve_max_vq = vq;
+        }
+        self
+    }
+
     /// The model with EL2 implemented (AArch64 only), as the virt board's
     /// `virtualization=on` leaves `ARM_FEATURE_EL2` set. The models start without EL2 and
     /// EL3, as the virt board's defaults leave them.
@@ -1011,9 +1100,10 @@ impl ArmCpuModel {
         self
     }
 
-    /// The model called `name`, `cortex-a57`, `cortex-a72` or `cortex-a76`.
+    /// The model called `name`, `cortex-a57`, `cortex-a72`, `cortex-a76` or `max`.
     pub fn by_name(name: &str) -> Option<ArmCpuModel> {
         match name {
+            "max" => Some(ArmCpuModel::max()),
             "cortex-a57" => Some(ArmCpuModel::cortex_a57()),
             "cortex-a72" => Some(ArmCpuModel::cortex_a72()),
             "cortex-a76" => Some(ArmCpuModel::cortex_a76()),
