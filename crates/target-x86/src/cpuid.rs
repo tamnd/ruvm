@@ -626,7 +626,7 @@ impl X86Cpu {
         self.vendor == pack_vendor(s)
     }
 
-    fn is_intel(&self) -> bool {
+    pub(crate) fn is_intel(&self) -> bool {
         self.vendor_is(VENDOR_INTEL)
     }
 
@@ -1225,6 +1225,12 @@ impl X86Cpu {
     pub fn cpuid_for(&self, state: &X86CpuState, index: u32, count: u32) -> Regs {
         let regs = GuestRegs { cr4: state.cr4, hflags: state.hflags, xcr0: state.xcr0 };
         self.cpuid_regs(regs, index, count)
+    }
+
+    /// [`X86Cpu::cpuid_for`] given only the registers CPUID depends on, for the TCG helper,
+    /// which keeps them in the CPU state buffer rather than in an [`X86CpuState`].
+    pub fn cpuid_with(&self, cr4: u64, hflags: u32, xcr0: u64, index: u32, count: u32) -> Regs {
+        self.cpuid_regs(GuestRegs { cr4, hflags, xcr0 }, index, count)
     }
 
     fn feat(&self, w: usize) -> u32 {

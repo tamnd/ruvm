@@ -1066,6 +1066,9 @@ dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
  "ruvm-accel-kvm",
+ "ruvm-jit",
+ "ruvm-jit-core",
+ "ruvm-jit-interp",
  "ruvm-mem",
  "vmm-sys-util",
 ]

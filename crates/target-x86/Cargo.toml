@@ -14,6 +14,10 @@ publish = false
 unsafe-budget = 4
 
 [dependencies]
+ruvm-jit.workspace = true
+ruvm-jit-core.workspace = true
+ruvm-jit-interp.workspace = true
+ruvm-mem.workspace = true
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 ruvm-accel-kvm.workspace = true
