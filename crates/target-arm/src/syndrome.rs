@@ -29,6 +29,8 @@ pub const EC_INSNABORT: u32 = 0x20;
 pub const EC_PCALIGNMENT: u32 = 0x22;
 /// `EC_DATAABORT`; add one for an abort taken to the same EL.
 pub const EC_DATAABORT: u32 = 0x24;
+/// `EC_SERROR`.
+pub const EC_SERROR: u32 = 0x2f;
 /// `EC_AA64_BKPT`.
 pub const EC_AA64_BKPT: u32 = 0x3c;
 
@@ -121,6 +123,11 @@ pub const fn syn_wfx(cv: u32, cond: u32, ti: u32) -> u32 {
 /// `syn_illegalstate()`.
 pub const fn syn_illegalstate() -> u32 {
     (EC_ILLEGALSTATE << EC_SHIFT) | IL
+}
+
+/// `syn_serror()`.
+pub const fn syn_serror(extra: u32) -> u32 {
+    (EC_SERROR << EC_SHIFT) | IL | extra
 }
 
 /// `syn_pcalignment()`.

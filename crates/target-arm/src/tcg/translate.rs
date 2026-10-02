@@ -23,16 +23,18 @@ use ruvm_mem::Endian;
 use super::helpers::{self, Def};
 use super::sysreg::{self, Kind};
 use super::{
-    TB_ALIGN_MEM, TB_EL_MASK, TB_FPEXC_EL_SHIFT, TB_PAN, TB_PSTATE_IL, TB_TBID_SHIFT,
-    TB_TBII_SHIFT, TB_UNPRIV,
+    TB_ALIGN_MEM, TB_E2H, TB_EL_MASK, TB_FPEXC_EL_SHIFT, TB_MMUIDX_SHIFT, TB_PSTATE_IL,
+    TB_TBID_SHIFT, TB_TBII_SHIFT, TB_UNPRIV, regime_has_2_ranges,
 };
 use crate::cpu::{
-    ArmCpuModel, CF, EXCLUSIVE_ADDR, EXCLUSIVE_HIGH, EXCLUSIVE_VAL, EXCP_BKPT, EXCP_SWI, EXCP_UDEF,
-    MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN, NF, PC, PSTATE, PSTATE_PAN, PSTATE_SP,
-    PSTATE_UAO, VF, ZF, xreg_off,
+    ArmCpuModel, CF, EXCLUSIVE_ADDR, EXCLUSIVE_HIGH, EXCLUSIVE_VAL, EXCP_BKPT, EXCP_HVC, EXCP_SMC,
+    EXCP_SWI, EXCP_UDEF, MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN, MMU_IDX_E20_0,
+    MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NF, PC, PSTATE, PSTATE_PAN, PSTATE_SP, PSTATE_UAO, VF, ZF,
+    xreg_off,
 };
 use crate::syndrome::{
-    syn_aa64_bkpt, syn_aa64_svc, syn_aa64_sysregtrap, syn_illegalstate, syn_uncategorized,
+    syn_aa64_bkpt, syn_aa64_hvc, syn_aa64_smc, syn_aa64_svc, syn_aa64_sysregtrap, syn_illegalstate,
+    syn_uncategorized,
 };
 
 #[allow(missing_docs, unreachable_pub, clippy::pedantic, clippy::nursery)]
@@ -84,6 +86,8 @@ pub(crate) struct DisasContext {
     tbii: u32,
     tbid: u32,
     mmu_idx: u32,
+    /// HCR_EL2.E2H, for the VHE register redirections.
+    e2h: bool,
     /// The EL that FP and AdvSIMD instructions trap to, or 0 if they do not trap.
     fp_excp_el: u32,
 }
@@ -101,6 +105,7 @@ impl DisasContext {
             tbii: 0,
             tbid: 0,
             mmu_idx: 0,
+            e2h: false,
             fp_excp_el: 0,
         }
     }
@@ -165,7 +170,14 @@ impl S<'_, '_> {
 
     /// `get_a64_user_mem_index()`.
     fn user_mem_index(&self, unpriv: bool) -> u32 {
-        if unpriv && self.d.unpriv { MMU_IDX_E10_0 as u32 } else { self.d.mmu_idx }
+        if !(unpriv && self.d.unpriv) {
+            return self.d.mmu_idx;
+        }
+        match self.d.mmu_idx as usize {
+            MMU_IDX_E10_1 | MMU_IDX_E10_1_PAN => MMU_IDX_E10_0 as u32,
+            MMU_IDX_E20_2 | MMU_IDX_E20_2_PAN => MMU_IDX_E20_0 as u32,
+            idx => idx as u32,
+        }
     }
 
     // Registers and flags.
@@ -257,12 +269,17 @@ impl S<'_, '_> {
 
     /// `gen_top_byte_ignore()`.
     fn top_byte_ignore(&mut self, dst: TempI64, src: TempI64, tbi: u32) {
-        let f = self.f();
         if tbi == 0 {
             // Load unmodified address.
-            f.gen_mov_i64(dst, src);
+            self.f().gen_mov_i64(dst, src);
         } else {
-            // Sign-extend from bit 55. The EL1&0 regime always has two ranges.
+            if !regime_has_2_ranges(self.d.mmu_idx as usize) {
+                // Force tag byte to all zero.
+                self.f().gen_extract_i64(dst, src, 0, 56);
+                return;
+            }
+            let f = self.f();
+            // Sign-extend from bit 55.
             f.gen_sextract_i64(dst, src, 0, 56);
             match tbi {
                 1 => f.gen_and_i64(dst, dst, src),
@@ -298,12 +315,17 @@ impl S<'_, '_> {
 
     /// `gen_exception_insn()`: raise `excp` at `pc_curr + diff` to the default EL.
     fn gen_exception_insn(&mut self, diff: i64, excp: i32, syndrome: u32) {
+        // default_exception_el(): EL1 unless already higher.
+        self.gen_exception_insn_el(diff, excp, syndrome, self.d.current_el.max(1));
+    }
+
+    /// `gen_exception_insn_el()`: raise `excp` at `pc_curr + diff` to `target_el`.
+    fn gen_exception_insn_el(&mut self, diff: i64, excp: i32, syndrome: u32, target_el: u32) {
         self.update_pc(diff);
         let env = self.env();
         let e = self.c32(excp);
         let syn = self.c32(syndrome as i32);
-        // default_exception_el(): EL1 unless already higher.
-        let el = self.c32(self.d.current_el.max(1) as i32);
+        let el = self.c32(target_el as i32);
         self.call(
             &helpers::EXCEPTION_WITH_SYNDROME_EL,
             None,
@@ -1069,9 +1091,15 @@ impl S<'_, '_> {
         crm: u32,
         rt: i32,
     ) {
-        let key = sysreg::key(op0, op1, crn, crm, op2);
         let feat = self.feat();
         let el = self.d.current_el;
+        // The VHE redirections and the _EL12 and _EL02 aliases.
+        let Some(key) =
+            sysreg::resolve(sysreg::key(op0, op1, crn, crm, op2), el, self.d.e2h, &feat)
+        else {
+            self.unallocated_encoding();
+            return;
+        };
         let Some(ri) = sysreg::lookup(key, &feat) else {
             // Unknown register; this might be a guest error or a QEMU unimplemented feature.
             // Without FEAT_IDST this is an uncategorized UNDEF.
@@ -1753,8 +1781,35 @@ impl DisasA64 for S<'_, '_> {
         true
     }
 
-    // HVC and SMC are UNDEFINED without EL2 and EL3, and HLT without semihosting: they keep
-    // the default false.
+    fn trans_HVC(&mut self, a: &mut arg_i) -> bool {
+        let target_el = if self.d.current_el == 3 { 3 } else { 2 };
+        if self.d.current_el == 0 {
+            self.unallocated_encoding();
+            return true;
+        }
+        // The pre HVC helper handles cases when HVC gets trapped as an undefined insn by
+        // runtime configuration.
+        self.update_pc(0);
+        let env = self.env();
+        self.call(&helpers::PRE_HVC, None, &[env.into()]);
+        self.gen_exception_insn_el(4, EXCP_HVC, syn_aa64_hvc(a.imm as u32), target_el);
+        true
+    }
+
+    fn trans_SMC(&mut self, a: &mut arg_i) -> bool {
+        if self.d.current_el == 0 {
+            self.unallocated_encoding();
+            return true;
+        }
+        self.update_pc(0);
+        let env = self.env();
+        let syn = self.c32(syn_aa64_smc(a.imm as u32) as i32);
+        self.call(&helpers::PRE_SMC, None, &[env.into(), syn.into()]);
+        self.gen_exception_insn_el(4, EXCP_SMC, syn_aa64_smc(a.imm as u32), 3);
+        true
+    }
+
+    // HLT is UNDEFINED without semihosting: it keeps the default false.
 
     // Load/store exclusive
 
@@ -2407,11 +2462,8 @@ impl TranslatorOps for DisasContext {
         self.tbii = (flags >> TB_TBII_SHIFT) & 3;
         self.tbid = (flags >> TB_TBID_SHIFT) & 3;
         self.fp_excp_el = (flags >> TB_FPEXC_EL_SHIFT) & 3;
-        self.mmu_idx = match self.current_el {
-            0 => MMU_IDX_E10_0,
-            _ if flags & TB_PAN != 0 => MMU_IDX_E10_1_PAN,
-            _ => MMU_IDX_E10_1,
-        } as u32;
+        self.mmu_idx = (flags >> TB_MMUIDX_SHIFT) & 0xf;
+        self.e2h = flags & TB_E2H != 0;
 
         // Bound the number of insns to execute to those left on the page.
         let bound = (db.pc_first | !0xfff).wrapping_neg() / 4;

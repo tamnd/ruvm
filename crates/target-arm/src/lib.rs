@@ -3,13 +3,16 @@
 //! The Arm guest: a port of QEMU's `target/arm` TCG front end for AArch64.
 //!
 //! It covers the A64 base integer instruction set, scalar floating point and AdvSIMD (with AES,
-//! SHA1, SHA256 and PMULL) at EL0 and EL1: data processing, loads and stores in every
-//! addressing mode (pairs, exclusives and the LSE atomics included), branches, conditional select and compare, bitfield, extract and CRC32,
-//! with the system registers EL0 and EL1 need, the stage 1 VMSAv8-64 page walk for the 4K
-//! granule and 48 bit VAs, synchronous exceptions and IRQs taken to EL1, SVC, ERET and WFI.
+//! SHA1, SHA256 and PMULL) at EL0 to EL3: data processing, loads and stores in every addressing
+//! mode (pairs, exclusives and the LSE atomics included), branches, conditional select and
+//! compare, bitfield, extract and CRC32, with the system registers of EL0 to EL3 (HCR_EL2 and
+//! SCR_EL3 traps and routing, the VHE redirections), the stage 1 and stage 2 VMSAv8-64 page
+//! walks for the 4K, 16K and 64K granules and 48 bit addresses, exceptions and interrupts
+//! routed across the four ELs, ERET, WFI, HVC and SMC, PSCI over HVC or SMC behind a board
+//! hook, and the generic timers reported to the board through a callback.
 //!
-//! Not yet covered: SVE and SVE2, and EL2 and EL3 (HVC and SMC are UNDEFINED as on a CPU
-//! without those levels).
+//! Not yet covered: SVE and SVE2, AArch32, Secure EL2, 52 bit addresses, and the debug,
+//! PMU, pointer authentication and MTE extensions.
 //!
 //! - [`cpu`]: `CPUARMState` as a struct the generated code addresses by offset, and the CPU
 //!   models.
