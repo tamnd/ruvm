@@ -206,8 +206,9 @@ pub struct Q35MachineConfig {
     pub max_cpus: u32,
     /// Whether the accelerator is KVM.
     pub kvm: bool,
-    /// Whether the accelerator can run SMM. TCG always can; KVM says so through
-    /// `KVM_CAP_X86_SMM`.
+    /// Whether the accelerator can run SMM. KVM says so through `KVM_CAP_X86_SMM`. In QEMU
+    /// TCG always can; here it is [`crate::tcg_run::TCG_SMM_AVAILABLE`], since the x86 front
+    /// end has no SMM yet.
     pub smm_available: bool,
     /// `phys-bits` of the CPU model, for the address space check of `pc_memory_init()`.
     pub phys_bits: u32,
@@ -718,7 +719,7 @@ impl Q35 {
                 "q35: wdat=on (the ICH9 TCO watchdog table) is not supported yet".to_string()
             );
         }
-        let smm_enabled = props.smm_enabled(smm_available || !kvm)?;
+        let smm_enabled = props.smm_enabled(smm_available)?;
         // pc_basic_device_init(): resolve vmport.
         let vmport = match props.vmport {
             OnOffAuto::Auto => props.i8042,

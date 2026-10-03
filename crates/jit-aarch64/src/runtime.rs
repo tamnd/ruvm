@@ -149,6 +149,11 @@ impl CompiledTb {
         self.region.buf.addr() + self.offset as u64
     }
 
+    /// The size of the generated code in bytes.
+    pub fn size(&self) -> usize {
+        self.len
+    }
+
     /// The generated code, instructions and literal pool.
     pub fn code(&self) -> Vec<u8> {
         self.region.buf.read(self.offset, self.len).unwrap_or_default()

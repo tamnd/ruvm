@@ -1,0 +1,30 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+
+The guest kernels of QEMU 11.1's tests/tcg system tests for x86_64, used by
+tests/tcg_run.rs. They are QEMU's own sources (GPL-2.0-or-later), built
+unchanged and stripped:
+
+  hello.gz      tests/tcg/multiarch/system/hello.c
+  interrupt.gz  tests/tcg/multiarch/system/interrupt.c
+  memory.gz     tests/tcg/multiarch/system/memory.c, with -DCHECK_UNALIGNED=1
+
+each linked with tests/tcg/x86_64/system/boot.S, tests/tcg/minilib/printf.c
+and tests/tcg/x86_64/system/kernel.ld, built on x86_64 Ubuntu 24.04 with
+gcc 13.3.0 and GNU ld 2.42:
+
+  gcc -ffreestanding -fno-stack-protector -nostdlib -ggdb -O0 \
+      -isystem minilib -c boot.S printf.c
+  gcc -ffreestanding -fno-stack-protector -nostdlib -ggdb -O0 \
+      -isystem minilib TEST.c -Wl,-Tkernel.ld -Wl,-melf_x86_64 \
+      -static -nostdlib boot.o printf.o -lgcc -o TEST
+  strip TEST && gzip -9 -n TEST
+
+hello.out and memory.out.gz are what qemu-system-x86_64 11.1 (Homebrew)
+writes to the isa-debugcon chardev for them with
+
+  qemu-system-x86_64 -M q35 -accel tcg -monitor none -display none \
+      -chardev file,path=TEST.out,id=output \
+      -device isa-debugcon,chardev=output \
+      -device isa-debug-exit,iobase=0xf4,iosize=0x4 -kernel TEST
+
+which exits with status 0 for all three. interrupt writes nothing.

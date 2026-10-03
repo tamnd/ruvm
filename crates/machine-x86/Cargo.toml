@@ -14,6 +14,7 @@ publish = false
 unsafe-budget = 1
 
 [dependencies]
+ruvm-accel.workspace = true
 ruvm-base.workspace = true
 ruvm-firmware.workspace = true
 ruvm-hw-acpi.workspace = true
@@ -26,15 +27,21 @@ ruvm-hw-pci.workspace = true
 ruvm-hw-storage.workspace = true
 ruvm-hw-timer.workspace = true
 ruvm-hw-virtio.workspace = true
+ruvm-jit.workspace = true
+ruvm-jit-core.workspace = true
 ruvm-mem.workspace = true
+ruvm-target-x86.workspace = true
 ruvm-virtio-queue.workspace = true
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 kvm-bindings.workspace = true
 kvm-ioctls.workspace = true
 ruvm-accel-kvm.workspace = true
-ruvm-target-x86.workspace = true
 vmm-sys-util.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+ruvm-hw-misc.workspace = true
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
 ruvm-accel-kvm.workspace = true

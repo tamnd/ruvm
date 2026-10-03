@@ -78,30 +78,7 @@ thread_local! {
     static ON_VCPU_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Why the guest asked to stop.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ShutdownReason {
-    /// The guest powered off, `SHUTDOWN_CAUSE_GUEST_SHUTDOWN`.
-    GuestShutdown,
-    /// The guest reset with `-no-reboot` in effect, `SHUTDOWN_CAUSE_GUEST_RESET`.
-    GuestReset,
-}
-
-/// What a running machine tells its owner.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GuestEvent {
-    /// The guest wants the machine to stop.
-    Shutdown(ShutdownReason),
-    /// The guest reset the machine and it has been reset.
-    Reset,
-    /// KVM reported a guest crash, `KVM_SYSTEM_EVENT_CRASH`. The vCPU that saw it stops.
-    Panicked,
-    /// A vCPU failed. The message is QEMU's; the vCPU stops.
-    InternalError(String),
-}
-
-/// Receives the [`GuestEvent`]s, on whatever thread they happen.
-pub type EventHandler = Arc<dyn Fn(GuestEvent) + Send + Sync>;
+pub use crate::run_event::{EventHandler, GuestEvent, ShutdownReason};
 
 /// The lines QEMU prints when `kvm_init()` fails: the reason, then `failed to initialize kvm`
 /// with the error number's text.

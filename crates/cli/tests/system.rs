@@ -13,7 +13,13 @@ fn ruvm() -> PathBuf {
 
 /// Runs `qemu-system-x86_64` with `args`, returning the exit code, stdout and stderr.
 fn system(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(ruvm()).arg("qemu-system-x86_64").args(args).output().unwrap();
+    system_for("x86_64", args)
+}
+
+/// Runs `qemu-system-<target>` with `args`.
+fn system_for(target: &str, args: &[&str]) -> (i32, String, String) {
+    let out =
+        Command::new(ruvm()).arg(format!("qemu-system-{target}")).args(args).output().unwrap();
     let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
     (out.status.code().unwrap_or(-1), text(out.stdout), text(out.stderr))
 }
@@ -22,19 +28,39 @@ fn system(args: &[&str]) -> (i32, String, String) {
 fn startup_errors() {
     let p = "qemu-system-x86_64: ";
     let hint = "Use -machine help to list supported machines\n";
-    // With KVM built in, it is the default accelerator.
+    // The x86 targets have TCG, and KVM on Linux x86_64 hosts; a target without a front
+    // end has neither.
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let (code, _, err) = system(&["-machine", "none", "-accel", "kvm"]);
+        assert_eq!((code, err), (1, format!("{p}-accel kvm: invalid accelerator kvm\n")));
+    }
+    let (code, _, err) = system_for("alpha", &["-machine", "none"]);
+    assert_eq!(
+        (code, err.as_str()),
+        (1, "qemu-system-alpha: No accelerator selected and no default accelerator available\n")
+    );
+    let (code, _, err) = system_for("alpha", &["-machine", "none", "-accel", "tcg"]);
+    assert_eq!(
+        (code, err.as_str()),
+        (1, "qemu-system-alpha: -accel tcg: invalid accelerator tcg\n")
+    );
     for (args, want) in [
         (
-            &["-machine", "none"][..],
-            format!("{p}No accelerator selected and no default accelerator available\n"),
+            &["-accel", "tcg,thread=bogus"][..],
+            format!("{p}-accel tcg,thread=bogus: Invalid 'thread' setting bogus\n"),
         ),
         (
-            &["-machine", "none", "-accel", "kvm"],
-            format!("{p}-accel kvm: invalid accelerator kvm\n"),
+            &["-accel", "tcg,tb-size=x"],
+            format!("{p}-accel tcg,tb-size=x: Parameter 'tb-size' expects uint64\n"),
+        ),
+        (
+            &["-accel", "tcg,nope=1"],
+            format!("{p}-accel tcg,nope=1: Property 'tcg-accel.nope' not found\n"),
         ),
     ] {
-        let (code, _, err) = system(args);
+        let args: Vec<&str> = ["-machine", "none"].iter().chain(args).copied().collect();
+        let (code, _, err) = system(&args);
         assert_eq!((code, err), (1, want), "{args:?}");
     }
     for (args, want) in [
@@ -86,7 +112,7 @@ fn help_options() {
     );
     let (code, out, _) = system(&["-accel", "help"]);
     let kvm = if cfg!(all(target_os = "linux", target_arch = "x86_64")) { "kvm\n" } else { "" };
-    assert_eq!((code, out), (0, format!("Accelerators supported in QEMU binary:\n{kvm}")));
+    assert_eq!((code, out), (0, format!("Accelerators supported in QEMU binary:\n{kvm}tcg\n")));
     let (code, out, _) = system(&["-object", "help"]);
     assert_eq!(
         (code, out.as_str()),
@@ -109,7 +135,8 @@ fn help_options() {
 fn x86_board_errors() {
     let p = "qemu-system-x86_64: ";
     let q = ["-accel", "qtest"];
-    let only_kvm = format!("{p}this machine type is only supported with -accel kvm by ruvm yet\n");
+    let only_kvm =
+        format!("{p}this machine type is only supported with -accel kvm or tcg by ruvm yet\n");
     for (args, want) in [
         (&["-M", "microvm"][..], only_kvm.clone()),
         (&["-M", "q35", "-m", "256", "-smp", "2", "-nographic"], only_kvm.clone()),
@@ -145,6 +172,69 @@ fn x86_board_errors() {
         let (code, _, err) = system(&args);
         assert_eq!((code, err), (1, want), "{args:?}");
     }
+}
+
+/// A 64 KiB BIOS whose reset vector writes "ok" to `isa-debugcon` and 1 to
+/// `isa-debug-exit` at 0xf4, then halts.
+fn exit_bios() -> Vec<u8> {
+    let mut b = vec![0xf4u8; 0x10000];
+    let code = [
+        0xb0, b'o', 0xe6, 0xe9, // mov al, 'o'; out 0xe9, al
+        0xb0, b'k', 0xe6, 0xe9, // mov al, 'k'; out 0xe9, al
+        0xb0, 0x01, 0xe6, 0xf4, // mov al, 1; out 0xf4, al
+        0xf4, 0xeb, 0xfd, // hlt; jmp $-1
+    ];
+    b[0xfff0..0xfff0 + code.len()].copy_from_slice(&code);
+    b
+}
+
+/// Both x86 boards run guest code on TCG (on any host), with the debugcon output and the
+/// `isa-debug-exit` status, `(1 << 1) | 1`, that QEMU gives. `RUVM_TEST_FIRMWARE_DIR` is
+/// passed as `-L`.
+#[test]
+fn tcg_runs_guest_code() {
+    let dir = std::env::temp_dir().join(format!("ruvm-cli-tcg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bios = dir.join("exit.bin");
+    std::fs::write(&bios, exit_bios()).unwrap();
+    for (machine, accel) in [
+        ("q35", "tcg"),
+        ("microvm", "tcg"),
+        ("q35", "tcg,thread=single"),
+        ("microvm", "tcg,thread=multi"),
+    ] {
+        let out = dir.join(format!("{machine}.out"));
+        let chardev = format!("file,path={},id=out", out.display());
+        let fw = std::env::var("RUVM_TEST_FIRMWARE_DIR").ok();
+        let mut args: Vec<&str> = fw.iter().flat_map(|d| ["-L", d.as_str()]).collect();
+        args.extend([
+            "-M",
+            machine,
+            "-accel",
+            accel,
+            "-display",
+            "none",
+            "-nodefaults",
+            "-bios",
+            bios.to_str().unwrap(),
+            "-chardev",
+            &chardev,
+            "-device",
+            "isa-debugcon,chardev=out",
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=4",
+        ]);
+        let (code, _, err) = system(&args);
+        // Without firmware installed q35 warns that kvmvapic.bin is missing, as QEMU does.
+        let err: String = err
+            .lines()
+            .filter(|l| !l.starts_with("qemu-system-x86_64: warning: rom: file kvmvapic.bin "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!((code, err.as_str()), (3, ""), "{machine} {accel}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"ok", "{machine} {accel}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Boots Linux on KVM with the command line of the docs and waits for the kernel banner on

@@ -4,12 +4,15 @@
 //!
 //! So far these are the `q35` board ([`q35`]) with its ICH9 LPC bridge ([`ich9_lpc`]), the
 //! parts it shares with the other PC boards ([`pc`]) and the `microvm` board ([`microvm`]).
+//! They run on TCG ([`tcg_run`]) on any host and on KVM (`kvm_run`) on Linux x86 hosts; both
+//! report to the owner with the events of [`run_event`]. [`debugcon`] is `isa-debugcon`.
 //! The plan for this crate is in `spec/24-workspace-layout.md`.
 
 // The only unsafe code is the KVM_INTERRUPT ioctl in `kvm_run`, which kvm-ioctls does not wrap.
 #![deny(unsafe_code)]
 
 pub mod board;
+pub mod debugcon;
 pub mod file_backend;
 pub mod firmware;
 pub mod ich9_lpc;
@@ -19,6 +22,8 @@ pub mod microvm;
 pub mod pc;
 pub mod pflash;
 pub mod q35;
+pub mod run_event;
+pub mod tcg_run;
 
 pub use board::{BoardKind, BoardSpec, KernelFiles, X86_BOARDS, X86Board, build_board};
 pub use file_backend::FileBackend;
