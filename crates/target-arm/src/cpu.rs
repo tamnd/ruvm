@@ -378,6 +378,8 @@ pub const EXCP_HYP_TRAP: i32 = 12;
 pub const EXCP_VIRQ: i32 = 14;
 /// `EXCP_VFIQ`.
 pub const EXCP_VFIQ: i32 = 15;
+/// `EXCP_SEMIHOST`: a semihosting call, handled without taking an exception.
+pub const EXCP_SEMIHOST: i32 = 16;
 /// `EXCP_VSERR`.
 pub const EXCP_VSERR: i32 = 24;
 
@@ -870,6 +872,12 @@ pub struct ArmFeatures {
     /// The largest vector length in quadwords, QEMU's `sve-max-vq` (every length from 1 to
     /// this is supported, as for TCG). Zero without SVE.
     pub sve_max_vq: u32,
+    /// A GICv3 CPU interface is attached ([`Arm::with_gicv3`](crate::tcg::Arm::with_gicv3)),
+    /// so the ICC system registers exist, as `gicv3_init_cpuif()` defines them.
+    pub gicv3: bool,
+    /// The preemption bits of the attached GICv3 CPU interface (`cs->prebits`), which decide
+    /// whether ICC_AP0R1_EL1 to ICC_AP1R3_EL1 exist.
+    pub gic_prebits: u8,
 }
 
 /// A CPU model: the identification registers and reset values of `aarch64_*_initfn()`.
@@ -887,10 +895,18 @@ pub struct ArmCpuModel {
     pub dczid: u64,
     /// CLIDR_EL1.
     pub clidr: u64,
+    /// The CCSIDR_EL1 of each cache CSSELR_EL1 can select, indexed by CSSELR_EL1.{Level, InD}
+    /// as QEMU's `ccsidr[]` is. Zero for a cache that does not exist.
+    pub ccsidr: [u64; 8],
+    /// The `compatible` string of the CPU's device tree node, QEMU's `dtb_compatible`.
+    pub dtb_compatible: &'static str,
     /// SCTLR_EL1 out of reset.
     pub reset_sctlr: u64,
     /// CNTFRQ_EL0 out of reset, in Hz.
     pub cntfrq: u64,
+    /// The priority bits of the GICv3 CPU interface, QEMU's `gic_pribits` (5 on every
+    /// model here).
+    pub gic_pribits: u8,
     /// ID_AA64PFR0_EL1.
     pub id_aa64pfr0: u64,
     /// ID_AA64PFR1_EL1.
@@ -926,6 +942,18 @@ const PFR0_FP16: u64 = 0x0011_0000;
 /// mixed endian support.
 const MMFR0_4K_ONLY: u64 = 0x0f00_1020;
 
+/// `make_ccsidr(CCSIDR_FORMAT_LEGACY, assoc, linesize, cachesize, flags)`: a 32 bit CCSIDR
+/// for a cache of `size` bytes in lines of `line` bytes, `assoc` ways, with `flags` in the
+/// top bits (WT, WB, RA and WA, the bits QEMU still sets).
+pub const fn make_ccsidr(assoc: u64, line: u64, size: u64, flags: u64) -> u64 {
+    let sets = size / (assoc * line);
+    let lg_line = line.trailing_zeros() as u64;
+    (flags << 28) | ((sets - 1) << 13) | ((assoc - 1) << 3) | (lg_line - 4)
+}
+
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * 1024;
+
 impl ArmCpuModel {
     /// `cortex-a57`: ARMv8.0 with CRC32 and the AES, PMULL, SHA1 and SHA256 crypto
     /// extensions, and no LSE.
@@ -937,8 +965,21 @@ impl ArmCpuModel {
             ctr: 0x8444_c004,
             dczid: 4,
             clidr: 0x0a20_0023,
+            // 32 KiB L1 D, 48 KiB L1 I and 2 MiB L2, `aarch64_aa32_a57_init()`.
+            ccsidr: [
+                make_ccsidr(4, 64, 32 * KIB, 7),
+                make_ccsidr(3, 64, 48 * KIB, 2),
+                make_ccsidr(16, 64, 2 * MIB, 7),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            dtb_compatible: "arm,cortex-a57",
             reset_sctlr: 0x00c5_0838,
             cntfrq: 62_500_000,
+            gic_pribits: 5,
             id_aa64pfr0: PFR0_EL01,
             id_aa64pfr1: 0,
             id_aa64dfr0: 0x6,
@@ -972,8 +1013,21 @@ impl ArmCpuModel {
             ctr: 0x8444_c004,
             dczid: 4,
             clidr: 0x8200_0023,
+            // 64 KiB L1 D, 64 KiB L1 I and 512 KiB L2.
+            ccsidr: [
+                make_ccsidr(4, 64, 64 * KIB, 7),
+                make_ccsidr(4, 64, 64 * KIB, 2),
+                make_ccsidr(8, 64, 512 * KIB, 7),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            dtb_compatible: "arm,cortex-a76",
             reset_sctlr: 0x30c5_0838,
             cntfrq: 62_500_000,
+            gic_pribits: 5,
             // CSV2 and CSV3 as in QEMU; RAS is not modelled.
             id_aa64pfr0: 0x1100_0000_0000_0000 | PFR0_FP16 | PFR0_EL01,
             id_aa64pfr1: 0,
@@ -1026,8 +1080,21 @@ impl ArmCpuModel {
             ctr: 0x8444_c004,
             dczid: 4,
             clidr: 0x0a20_0023,
+            // 32 KiB L1 D, 48 KiB L1 I and 1 MiB L2.
+            ccsidr: [
+                make_ccsidr(4, 64, 32 * KIB, 7),
+                make_ccsidr(3, 64, 48 * KIB, 2),
+                make_ccsidr(16, 64, MIB, 7),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            dtb_compatible: "arm,cortex-a72",
             reset_sctlr: 0x00c5_0838,
             cntfrq: 62_500_000,
+            gic_pribits: 5,
             id_aa64pfr0: PFR0_EL01,
             id_aa64pfr1: 0,
             id_aa64dfr0: 0x1030_5106,
@@ -1065,6 +1132,19 @@ impl ArmCpuModel {
             ctr: a76.ctr | (1 << 28) | (1 << 29),
             // QEMU's 0x8200123 with LoUU and LoUIS cleared for FEAT_S2FWB.
             clidr: 0x0000_0123,
+            // 64 KiB L1 D, 64 KiB L1 I, 1 MiB L2 and 2 MiB L3. `max` starts from the A57, so
+            // its device tree node says it is one.
+            ccsidr: [
+                make_ccsidr(4, 64, 64 * KIB, 7),
+                make_ccsidr(4, 64, 64 * KIB, 2),
+                make_ccsidr(8, 64, MIB, 7),
+                0,
+                make_ccsidr(8, 64, 2 * MIB, 7),
+                0,
+                0,
+                0,
+            ],
+            dtb_compatible: "arm,cortex-a57",
             // ID_AA64PFR0_EL1.SVE = 1.
             id_aa64pfr0: a76.id_aa64pfr0 | (1 << 32),
             // SVEver 1 (SVE2), AES 2 (with PMULL128), BitPerm 1, BF16 1, SHA3 1, SM4 1,

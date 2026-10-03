@@ -63,6 +63,12 @@
 //! says. FP and SIMD accesses trap with EC 0x07 as CPACR_EL1.FPEN, CPTR_EL2 (in either format) and
 //! CPTR_EL3.TFP ask, as `fp_exception_el()` does.
 //!
+//! A board with a GICv3 attaches its CPU interface with [`Arm::with_gicv3`]: the ICC system
+//! registers then exist and are forwarded to the [`GicCpuInterface`], ID_AA64PFR0_EL1.GIC
+//! reads as 1, and exception entry, exception return and CPU_ON report the new EL to the
+//! interface as `arm_call_el_change_hook()` does (`gic.rs`). [`Arm::with_semihosting`] turns
+//! on Arm semihosting through `HLT #0xf000` (`semihost.rs`).
+//!
 //! SVE and SVE2 (`translate_sve.rs`, `sve_helper.rs`) cover the integer, predicate, permute,
 //! element count and memory groups, including first fault and non fault loads, gathers and
 //! scatters. The vector length comes from ZCR_EL1 to ZCR_EL3 and the model's `sve-max-vq`
@@ -120,19 +126,21 @@
 //!   authentication hints (PACIASP and friends) are no-ops because the models have no
 //!   FEAT_PAuth; QEMU does the same. BTI, MTE, FlagM, LRCPC2, CSSC, MOPS, SB, WFET and the
 //!   128-bit atomics are UNDEFINED because the models do not have them.
-//! - The ID registers in the ID space that this port does not model read as zero, and CCSIDR
-//!   reports a fixed cache geometry. FEAT_IDST is not implemented, so unknown registers are an
-//!   uncategorized UNDEF.
+//! - The ID registers in the ID space that this port does not model read as zero. CCSIDR
+//!   reports the model's cache geometry as QEMU's `ccsidr[]` does. FEAT_IDST is not
+//!   implemented, so unknown registers are an uncategorized UNDEF.
 //! - Every write to a system register ends the translation block, which QEMU also does unless
 //!   a register opts out.
 //! - QEMU logs accesses to unknown system registers with `LOG_UNIMP` and illegal exception
 //!   returns with `LOG_GUEST_ERROR`; this crate has no logging and stays silent.
 
 mod crypto;
+mod gic;
 mod gtimer;
 mod helpers;
 mod psci;
 mod ptw;
+mod semihost;
 mod sve2_int;
 mod sve_fp;
 mod sve_helper;
@@ -156,20 +164,22 @@ use ruvm_mem::{AddressSpace, MemTxAttrs, MemTxResult};
 
 use crate::cpu::{
     ArmCpuModel, ArmFeatures, CpuArmState, ENV_SIZE, EXCP_BKPT, EXCP_DATA_ABORT, EXCP_FIQ,
-    EXCP_HVC, EXCP_HYP_TRAP, EXCP_IRQ, EXCP_PREFETCH_ABORT, EXCP_SMC, EXCP_SWI, EXCP_UDEF,
-    EXCP_VFIQ, EXCP_VIRQ, EXCP_VSERR, HCR_AMO, HCR_E2H, HCR_FMO, HCR_IMO, HCR_TGE, HCR_VF, HCR_VI,
-    HCR_VSE, MMU_IDX_E2, MMU_IDX_E3, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN, MMU_IDX_E20_2,
-    MMU_IDX_E20_2_PAN, NB_MMU_MODES, PC, PSTATE_A, PSTATE_DAIF, PSTATE_F, PSTATE_I, PSTATE_IL,
-    PSTATE_PAN, PSTATE_SP, PSTATE_UAO, SCR_EA, SCR_FIQ, SCR_IRQ, SCTLR_A, SCTLR_SPAN,
+    EXCP_HVC, EXCP_HYP_TRAP, EXCP_IRQ, EXCP_PREFETCH_ABORT, EXCP_SEMIHOST, EXCP_SMC, EXCP_SWI,
+    EXCP_UDEF, EXCP_VFIQ, EXCP_VIRQ, EXCP_VSERR, HCR_AMO, HCR_E2H, HCR_FMO, HCR_IMO, HCR_TGE,
+    HCR_VF, HCR_VI, HCR_VSE, MMU_IDX_E2, MMU_IDX_E3, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN,
+    MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NB_MMU_MODES, PC, PSTATE_A, PSTATE_DAIF, PSTATE_F, PSTATE_I,
+    PSTATE_IL, PSTATE_PAN, PSTATE_SP, PSTATE_UAO, SCR_EA, SCR_FIQ, SCR_IRQ, SCTLR_A, SCTLR_SPAN,
 };
 use crate::syndrome::{EC_ADVSIMDFPACCESSTRAP, fsc, syn_get_ec, syn_serror};
 
+pub use gic::{GicAccess, GicCpuInterface, GicCpuState, IccEncoding};
 pub use gtimer::GTIMER_NAMES;
 pub use psci::{
     PSCI_OFF, PSCI_ON, PSCI_ON_PENDING, PSCI_RET_ALREADY_ON, PSCI_RET_DENIED,
     PSCI_RET_INTERNAL_FAILURE, PSCI_RET_INVALID_PARAMS, PSCI_RET_NOT_SUPPORTED,
     PSCI_RET_ON_PENDING, PSCI_RET_SUCCESS,
 };
+pub use semihost::{ADP_STOPPED_APPLICATION_EXIT, SemihostingHost};
 
 /// TB flags: the current EL in bits 0 and 1.
 pub const TB_EL_MASK: u32 = 3;
@@ -277,6 +287,8 @@ pub struct Arm {
     start: Instant,
     psci_conduit: PsciConduit,
     board: Option<Arc<dyn ArmBoard>>,
+    gic: Option<Arc<dyn GicCpuInterface>>,
+    semihost: Option<semihost::Semihosting>,
     lines: Mutex<Vec<CpuLines>>,
 }
 
@@ -285,6 +297,8 @@ impl fmt::Debug for Arm {
         f.debug_struct("Arm")
             .field("model", &self.model.name)
             .field("psci_conduit", &self.psci_conduit)
+            .field("gicv3", &self.gic.is_some())
+            .field("semihosting", &self.semihost.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -297,6 +311,8 @@ impl Arm {
             start: Instant::now(),
             psci_conduit: PsciConduit::Disabled,
             board: None,
+            gic: None,
+            semihost: None,
             lines: Mutex::new(Vec::new()),
         }
     }
@@ -326,6 +342,31 @@ impl Arm {
     /// The same CPU wired to `board`.
     pub fn with_board(mut self, board: Arc<dyn ArmBoard>) -> Arm {
         self.board = Some(board);
+        self
+    }
+
+    /// The same CPU wired to a GICv3 CPU interface, as `gicv3_init_cpuif()` does: the ICC
+    /// system registers exist and go to `gic`, ID_AA64PFR0_EL1.GIC reads as 1, and every
+    /// exception entry, exception return and PSCI CPU_ON tells `gic` the new EL.
+    pub fn with_gicv3(mut self, gic: Arc<dyn GicCpuInterface>) -> Arm {
+        let pribits = self.model.gic_pribits;
+        assert!((5..=8).contains(&pribits), "GICv3 priority bits must be 5 to 8");
+        let f = &mut self.model.features;
+        f.gicv3 = true;
+        // cs->prebits is the same as pribits, except that 8 bits of priority still only
+        // give 7 bits of preemption, because the low bit is the subpriority.
+        f.gic_prebits = if pribits == 8 { 7 } else { pribits };
+        // id_aa64pfr0_read(): the GIC field says the system register interface is there.
+        self.model.id_aa64pfr0 = (self.model.id_aa64pfr0 & !(0xf << 24)) | (1 << 24);
+        self.gic = Some(gic);
+        self
+    }
+
+    /// The same CPU with semihosting on, QEMU's `-semihosting`: `HLT #0xf000` makes a call
+    /// to `host`, from EL1 and up and also from EL0 when `userspace` is set
+    /// (`-semihosting-config userspace=on`).
+    pub fn with_semihosting(mut self, host: Arc<dyn SemihostingHost>, userspace: bool) -> Arm {
+        self.semihost = Some(semihost::Semihosting::new(host, userspace));
         self
     }
 
@@ -380,6 +421,14 @@ impl Arm {
         shared.halted.store(1, Ordering::Release);
     }
 
+    /// The power state part of `arm_cpu_reset_hold()` for the vCPU `shared`: off and halted
+    /// if `start_powered_off`, else on and running.
+    pub fn reset_power_state(&self, shared: &CpuShared, start_powered_off: bool) {
+        let (mut g, i) = self.lines(shared.cpu_index);
+        g[i].power = if start_powered_off { PSCI_OFF } else { PSCI_ON };
+        shared.halted.store(u32::from(start_powered_off), Ordering::Release);
+    }
+
     /// `arm_set_cpu_on()` for the vCPU `shared`: check its power state, then reset it into
     /// `target_el` at `entry` with `context_id` in X0, as `arm_set_cpu_on_async_work()`
     /// does on the vCPU's thread. Returns a PSCI return code.
@@ -417,6 +466,7 @@ impl Arm {
                 let (mut g, i) = arm.lines(index);
                 g[i].power = PSCI_ON;
             }
+            arm.gic_reset(index, &st);
             let shared = cpu.core.shared();
             shared.halted.store(0, Ordering::Release);
             shared.set_interrupt(interrupt::EXITTB);
@@ -879,13 +929,16 @@ impl Arm {
         st.restore_sp(new_el);
         st.pc = addr;
         st.store(cpu.env);
+        // arm_call_el_change_hook().
+        self.gic_el_change(cpu.core.shared().cpu_index, &st);
         cpu.core.shared().set_interrupt(interrupt::EXITTB);
     }
 }
 
 impl CpuOps for Arm {
     fn translate_code(&self, cpu: &mut Cpu<'_>, tb: &mut TbBuild) -> Result<(), CpuLoopExit> {
-        let mut dc = translate::DisasContext::new(&self.model);
+        let semihosting = self.semihost.as_ref().map(|s| s.userspace);
+        let mut dc = translate::DisasContext::new(&self.model, semihosting);
         translator_loop(cpu, tb, &mut dc)
     }
 
@@ -948,6 +1001,14 @@ impl CpuOps for Arm {
         // arm_cpu_do_interrupt(): PSCI calls are handled before the exception is taken.
         if psci::is_psci_call(self, cpu, cpu.core.exception_index) {
             psci::handle_psci_call(self, cpu);
+            return;
+        }
+        // Semihosting semantics depend on the register width of the code that caused the
+        // exception, not the target exception level, so must be handled here.
+        if cpu.core.exception_index == EXCP_SEMIHOST {
+            if let Some(sh) = &self.semihost {
+                semihost::handle(self, sh, cpu);
+            }
             return;
         }
         self.do_interrupt_aarch64(cpu);

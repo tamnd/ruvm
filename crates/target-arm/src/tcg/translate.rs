@@ -27,10 +27,10 @@ use super::{
     TB_SVEEXC_EL_SHIFT, TB_TBID_SHIFT, TB_TBII_SHIFT, TB_UNPRIV, TB_VL_SHIFT, regime_has_2_ranges,
 };
 use crate::cpu::{
-    ArmCpuModel, CF, EXCLUSIVE_ADDR, EXCLUSIVE_HIGH, EXCLUSIVE_VAL, EXCP_BKPT, EXCP_HVC, EXCP_SMC,
-    EXCP_SWI, EXCP_UDEF, MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN, MMU_IDX_E20_0,
-    MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NF, PC, PSTATE, PSTATE_PAN, PSTATE_SP, PSTATE_UAO, VF, ZF,
-    xreg_off,
+    ArmCpuModel, CF, EXCLUSIVE_ADDR, EXCLUSIVE_HIGH, EXCLUSIVE_VAL, EXCP_BKPT, EXCP_HVC,
+    EXCP_SEMIHOST, EXCP_SMC, EXCP_SWI, EXCP_UDEF, MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN,
+    MMU_IDX_E20_0, MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NF, PC, PSTATE, PSTATE_PAN, PSTATE_SP,
+    PSTATE_UAO, VF, ZF, xreg_off,
 };
 use crate::syndrome::{
     syn_aa64_bkpt, syn_aa64_hvc, syn_aa64_smc, syn_aa64_svc, syn_aa64_sysregtrap, syn_illegalstate,
@@ -97,11 +97,17 @@ pub(crate) struct DisasContext {
     sve_excp_el: u32,
     /// The SVE vector length in bytes.
     vl: u32,
+    /// Semihosting calls are on (`semihosting_enabled(false)`).
+    semihosting: bool,
+    /// Semihosting calls are also allowed from EL0 (`-semihosting-config userspace=on`).
+    semihosting_user: bool,
 }
 
 impl DisasContext {
-    /// A context for the CPU `model`; the rest is filled in from the TB flags.
-    pub(crate) fn new(model: &ArmCpuModel) -> DisasContext {
+    /// A context for the CPU `model`, with semihosting on for EL1 and up when `semihosting`
+    /// is `Some` and also for EL0 when it is `Some(true)`; the rest is filled in from the TB
+    /// flags.
+    pub(crate) fn new(model: &ArmCpuModel, semihosting: Option<bool>) -> DisasContext {
         DisasContext {
             model: model.clone(),
             pc_curr: 0,
@@ -116,6 +122,8 @@ impl DisasContext {
             fp_excp_el: 0,
             sve_excp_el: 0,
             vl: 16,
+            semihosting: semihosting.is_some(),
+            semihosting_user: semihosting == Some(true),
         }
     }
 }
@@ -1821,7 +1829,24 @@ impl DisasA64 for S<'_, '_> {
         true
     }
 
-    // HLT is UNDEFINED without semihosting: it keeps the default false.
+    fn trans_HLT(&mut self, a: &mut arg_i) -> bool {
+        // HLT. This has two purposes. Architecturally, it is an external halting debug
+        // instruction. Since QEMU doesn't implement external debug, we treat this as it is
+        // required for halting debug disabled: it will UNDEF. Secondly, "HLT 0xf000" is the
+        // A64 semihosting syscall instruction.
+        let user = self.d.current_el == 0;
+        let enabled = self.d.semihosting && (!user || self.d.semihosting_user);
+        if enabled && a.imm == 0xf000 {
+            // gen_exception_internal_insn().
+            self.update_pc(0);
+            let env = self.env();
+            let e = self.c32(EXCP_SEMIHOST);
+            self.call(&helpers::EXCEPTION_INTERNAL, None, &[env.into(), e.into()]);
+            self.b.is_jmp = DisasJumpType::NoReturn;
+            return true;
+        }
+        false
+    }
 
     // Load/store exclusive
 
