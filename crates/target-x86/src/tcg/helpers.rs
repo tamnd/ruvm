@@ -78,6 +78,7 @@ macro_rules! def {
     };
 }
 
+pub(crate) mod fpu;
 pub(crate) mod vec;
 
 /// Run `f` on the vCPU behind `h`, turning a guest exception into an [`Unwind`].
@@ -1254,7 +1255,7 @@ const ALL: &[&Def] = &[
 
 /// Register every x86 helper in `r`.
 pub(crate) fn register(r: &mut HelperRegistry) {
-    for d in ALL.iter().chain(vec::ALL) {
+    for d in ALL.iter().chain(vec::ALL).chain(fpu::ALL) {
         r.register_info(&d.info(), d.f);
     }
 }

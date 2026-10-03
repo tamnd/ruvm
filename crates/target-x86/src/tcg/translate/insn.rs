@@ -12,12 +12,9 @@ use super::super::env::{
     AC_MASK, CC_A, CR, DF, GDT, HF_UMIP_MASK, ID_MASK, IDT, IF_MASK, IOPL_MASK, KERNELGSBASE, LDT,
     NT_MASK, SEG_LIMIT, TR, cr,
 };
-use super::super::{EXCP00_DIVZ, EXCP03_INT3, EXCP07_PREX};
+use super::super::{EXCP00_DIVZ, EXCP03_INT3};
 use super::*;
-use crate::state::{
-    HF_EM_MASK, HF_MP_MASK, HF_TS_MASK, R_CS, R_DS, R_EAX, R_EBP, R_EBX, R_EDI, R_EDX, R_ES, R_ESI,
-    R_FS, R_GS,
-};
+use crate::state::{R_CS, R_DS, R_EAX, R_EBP, R_EBX, R_EDI, R_EDX, R_ES, R_ESI, R_FS, R_GS};
 
 const OP_ADD: u32 = 0;
 const OP_OR: u32 = 1;
@@ -443,11 +440,7 @@ impl S<'_, '_, '_> {
                 f.gen_movi_i64(g.t1, off as i64);
                 if b == 0x9a { self.do_lcall() } else { self.do_ljmp() }
             }
-            0x9b => {
-                if self.d.flags & (HF_MP_MASK | HF_TS_MASK) == HF_MP_MASK | HF_TS_MASK {
-                    self.gen_exception(EXCP07_PREX);
-                }
-            }
+            0x9b => self.fwait(),
             0x9c => {
                 if self.check_vm86_iopl() {
                     self.env_call(&helpers::READ_EFLAGS, Some(g.t0.into()), &[]);
@@ -662,14 +655,7 @@ impl S<'_, '_, '_> {
                 self.ld_v(OT8, g.t0, g.a0);
                 self.mov_reg_v(OT8, R_EAX, g.t0);
             }
-            0xd8..=0xdf => {
-                // x87 is not implemented.
-                if self.d.flags & (HF_EM_MASK | HF_TS_MASK) != 0 {
-                    self.gen_exception(EXCP07_PREX);
-                } else {
-                    self.gen_illegal_opcode();
-                }
-            }
+            0xd8..=0xdf => self.x87(b)?,
             0xe0..=0xe3 => {
                 self.near_branch_ot();
                 let diff = self.ldub()? as u8 as i8 as i64;
@@ -976,7 +962,7 @@ impl S<'_, '_, '_> {
                 let b = self.ldub()? as u32;
                 self.sse_insn(3, b)?;
             }
-            // Everything else: x87, UD0, UD1, UD2 and the instructions listed as missing in
+            // Everything else: UD0, UD1, UD2 and the instructions listed as missing in
             // the module documentation.
             _ => self.gen_illegal_opcode(),
         }
@@ -2661,6 +2647,9 @@ impl S<'_, '_, '_> {
         if md == 3 && op < 4 && rep == PREFIX_REPZ {
             self.fsgsbase(m);
             return Ok(());
+        }
+        if md != 3 && matches!(op, 0 | 1 | 4..=6) && rep == 0 {
+            return self.fxsave_xsave(m);
         }
         if md != 3 {
             if op == 7 && self.d.prefix & (PREFIX_REPZ | PREFIX_REPNZ) == 0 {
