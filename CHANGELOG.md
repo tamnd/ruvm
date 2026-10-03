@@ -6,6 +6,20 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.3.3
+
+This patch is the first one where machines run guest code on the JIT. Linux does not boot under TCG yet, but QEMU's own system tests do.
+
+`-accel tcg` now works (#131). The native aarch64 and x86-64 backends are wired into the runtime, vCPUs run on MTTCG or round robin threads, and q35 and microvm run on the x86 guest with `isa-debugcon` and `isa-debug-exit`. QEMU 11.1's tests/tcg x86_64 system tests (hello, interrupt and memory) print exactly what QEMU prints, both on an Apple M4 and on an EPYC without KVM.
+
+There is a first arm `virt` board (#132) with GICv3, PL011, PL031, A64 semihosting, virtio-mmio, fw_cfg, PSCI and kernel loading. Its device tree matches QEMU's for four setups, and the tests/tcg aarch64 hello test runs on it.
+
+The x86 guest now runs MMX, SSE through SSE4.2, AVX, AVX2, FMA and F16C through a table driven decoder generated from QEMU's sources, checked against 2107 native cases (#130). The aarch64 guest has the rest of SVE2 short of SVE2.1, plus BF16 and I8MM (#128).
+
+Two more pieces of M4 are done. Strong guests on Arm hosts can use the fence mappings from Risotto and Arancini, with a litmus test on an Apple M4 that sees no forbidden x86-TSO outcome (#127). Plugins built against QEMU 11.1's `qemu-plugin.h` load without changes, and QEMU's own example plugins give the expected counts (#129).
+
+M2 has not changed, since none of our machines has `/dev/kvm` right now.
+
 ## 0.3.2
 
 This patch fills in most of the AArch64 SVE and SVE2 instruction set and the x86 general purpose extensions. Nothing boots on the JIT yet.
