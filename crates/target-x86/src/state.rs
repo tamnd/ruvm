@@ -346,6 +346,23 @@ pub struct X86CpuState {
     pub xstate_bv: u64,
     /// PKRU.
     pub pkru: u32,
+    /// The x87 registers in physical order, `fpregs[]`: the 64-bit significand, which is
+    /// also the MMX register, then the sign and exponent in the low 16 bits of the second
+    /// word.
+    pub fpregs: [[u64; 2]; 8],
+    /// The last x87 opcode, `fpop`.
+    pub fpop: u16,
+    /// The last x87 instruction pointer, `fpip`.
+    pub fpip: u64,
+    /// The last x87 data pointer, `fpdp`.
+    pub fpdp: u64,
+    /// The last x87 code selector, `fpcs`.
+    pub fpcs: u16,
+    /// The last x87 data selector, `fpds`.
+    pub fpds: u16,
+    /// The vector registers ZMM0 to ZMM31, eight 64-bit lanes each, lowest first. XMMn is
+    /// lanes 0 and 1 and YMMn is lanes 0 to 3.
+    pub xmm_regs: [[u64; 8]; 32],
 
     /// Debug registers. DR4 and DR5 are unused.
     pub dr: [u64; 8],
@@ -525,6 +542,13 @@ impl Default for X86CpuState {
             mxcsr: 0,
             xstate_bv: 0,
             pkru: 0,
+            fpregs: [[0; 2]; 8],
+            fpop: 0,
+            fpip: 0,
+            fpdp: 0,
+            fpcs: 0,
+            fpds: 0,
+            xmm_regs: [[0; 8]; 32],
             dr: [0; 8],
             sysenter_cs: 0,
             sysenter_esp: 0,

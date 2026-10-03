@@ -12,6 +12,7 @@
 //! This file holds the shared state, the flags machinery, the address and stack helpers and
 //! the end of block code; [`insn`] holds the per opcode decoder and emitters.
 
+mod ext;
 mod insn;
 
 use ruvm_jit::{Cpu, CpuLoopExit, DisasContextBase, DisasJumpType, TranslatorOps, cf};
@@ -48,6 +49,7 @@ const PREFIX_LOCK: u32 = 0x04;
 const PREFIX_DATA: u32 = 0x08;
 const PREFIX_ADR: u32 = 0x10;
 const PREFIX_REX: u32 = 0x40;
+const PREFIX_VEX: u32 = 0x80;
 
 /// Stop after this instruction with EIP already set: `DISAS_EOB_ONLY`.
 const DISAS_EOB_ONLY: DisasJumpType = DisasJumpType::Target(0);
@@ -90,6 +92,17 @@ struct Feat {
     lahf_lm: bool,
     smap: bool,
     intel: bool,
+    sse: bool,
+    sse2: bool,
+    sse42: bool,
+    movbe: bool,
+    adx: bool,
+    bmi2: bool,
+    rdrand: bool,
+    rdseed: bool,
+    rdpid: bool,
+    xsave: bool,
+    fsgsbase: bool,
 }
 
 /// The TCG globals and the block wide temps.
@@ -156,6 +169,9 @@ pub(crate) struct DisasContext {
     rex_x: usize,
     rex_b: usize,
     rex_w: bool,
+    vex_l: bool,
+    vex_v: usize,
+    vex_w: bool,
     override_seg: i32,
     rip_offset: u64,
     popl_esp_hack: i64,
@@ -175,6 +191,17 @@ impl DisasContext {
             lahf_lm: model.has_feature("lahf-lm"),
             smap: model.has_feature("smap"),
             intel: model.is_intel(),
+            sse: model.has_feature("sse"),
+            sse2: model.has_feature("sse2"),
+            sse42: model.has_feature("sse4.2"),
+            movbe: model.has_feature("movbe"),
+            adx: model.has_feature("adx"),
+            bmi2: model.has_feature("bmi2"),
+            rdrand: model.has_feature("rdrand"),
+            rdseed: model.has_feature("rdseed"),
+            rdpid: model.has_feature("rdpid"),
+            xsave: model.has_feature("xsave"),
+            fsgsbase: model.has_feature("fsgsbase"),
         };
         DisasContext {
             feat,
@@ -204,6 +231,9 @@ impl DisasContext {
             rex_x: 0,
             rex_b: 0,
             rex_w: false,
+            vex_l: false,
+            vex_v: 0,
+            vex_w: false,
             override_seg: -1,
             rip_offset: 0,
             popl_esp_hack: 0,

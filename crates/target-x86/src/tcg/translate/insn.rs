@@ -89,7 +89,7 @@ impl S<'_, '_, '_> {
         }
     }
 
-    fn modrm(&mut self) -> R<(u32, u32, usize, usize)> {
+    pub(super) fn modrm(&mut self) -> R<(u32, u32, usize, usize)> {
         let m = self.ldub()? as u32;
         let (md, reg, rm) = self.split_modrm(m);
         Ok((m, md, reg, rm))
@@ -115,6 +115,9 @@ impl S<'_, '_, '_> {
         self.d.rex_x = 0;
         self.d.rex_b = 0;
         self.d.rex_w = false;
+        self.d.vex_l = false;
+        self.d.vex_v = 0;
+        self.d.vex_w = false;
         self.d.rip_offset = 0;
         self.d.popl_esp_hack = 0;
         let mut b;
@@ -149,6 +152,14 @@ impl S<'_, '_, '_> {
             self.d.rex_b = 0;
             self.d.rex_w = false;
         }
+        let mut vex_map = 0;
+        if b == 0xc4 || b == 0xc5 {
+            match self.vex_prefix(b)? {
+                ext::Vex::No => {}
+                ext::Vex::Map(m) => vex_map = m,
+                ext::Vex::Done => return Ok(()),
+            }
+        }
         if self.code64() {
             // ES, CS, SS and DS overrides are ignored in 64-bit mode.
             if self.d.override_seg >= 0 && self.d.override_seg < R_FS as i32 {
@@ -167,6 +178,9 @@ impl S<'_, '_, '_> {
             let adr = self.d.prefix & PREFIX_ADR != 0;
             self.d.dflag = if self.d.code32 ^ data { OT32 } else { OT16 };
             self.d.aflag = if self.d.code32 ^ adr { OT32 } else { OT16 };
+        }
+        if vex_map != 0 {
+            return self.vex_insn(vex_map);
         }
         if b == 0x0f {
             b = 0x100 | self.ldub()? as u32;
@@ -540,17 +554,11 @@ impl S<'_, '_, '_> {
                 self.b.is_jmp = DISAS_JUMP;
             }
             0xc4 | 0xc5 => {
-                if self.code64() {
-                    // VEX prefix.
-                    self.gen_illegal_opcode();
+                if self.inv64() {
                     return Ok(());
                 }
+                // A VEX prefix has been handled by disas_insn().
                 let m = self.ldub()? as u32;
-                if self.d.pe && !self.d.vm86 && m >> 6 == 3 {
-                    // VEX prefix.
-                    self.gen_illegal_opcode();
-                    return Ok(());
-                }
                 let s = if b == 0xc4 { R_ES } else { R_DS };
                 self.gen_lxs(s, m)?;
             }
@@ -947,6 +955,8 @@ impl S<'_, '_, '_> {
                 self.set_cc_op(CC_OP_ADDB + ot);
             }
             0x1c7 => self.grp9()?,
+            0x1c3 => self.movnti()?,
+            0x138 => self.op_0f38()?,
             0x1c8..=0x1cf => {
                 let r = (b & 7) as usize | self.d.rex_b;
                 let ot = self.d.dflag;
@@ -958,7 +968,7 @@ impl S<'_, '_, '_> {
                 }
                 self.mov_reg_v(ot, r, g.t0);
             }
-            // Everything else: x87, MMX, SSE, AVX, the 0F 38 and 0F 3A maps, UD0, UD1, UD2
+            // Everything else: x87, MMX, SSE, AVX, the 0F 3A map, UD0, UD1, UD2
             // and the instructions listed as missing in the module documentation.
             _ => self.gen_illegal_opcode(),
         }
@@ -1851,6 +1861,11 @@ impl S<'_, '_, '_> {
         let g = self.g;
         let (m, md, _, _) = self.modrm()?;
         let op = (m >> 3) & 7;
+        if op == 6 || op == 7 {
+            let rm = (m & 7) as usize | self.d.rex_b;
+            self.rdrand(md, op, rm);
+            return Ok(());
+        }
         let wide = self.code64() && self.d.rex_w;
         let ok = op == 1 && md != 3 && if wide { self.d.feat.cx16 } else { self.d.feat.cx8 };
         if !ok {
@@ -2490,6 +2505,10 @@ impl S<'_, '_, '_> {
         let (m, md, _, _) = self.modrm()?;
         let op = (m >> 3) & 7;
         match m {
+            0xd0 | 0xd1 => {
+                self.xgetbv_xsetbv(m);
+                return Ok(());
+            }
             0xca | 0xcb => {
                 // CLAC and STAC.
                 if !self.d.feat.smap || !self.check_cpl0() {
@@ -2627,6 +2646,14 @@ impl S<'_, '_, '_> {
     fn grp15(&mut self) -> R {
         let (m, md, _, _) = self.modrm()?;
         let op = (m >> 3) & 7;
+        let rep = self.d.prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA);
+        if md != 3 && (op == 2 || op == 3) && rep == 0 {
+            return self.ldst_mxcsr(m);
+        }
+        if md == 3 && op < 4 && rep == PREFIX_REPZ {
+            self.fsgsbase(m);
+            return Ok(());
+        }
         if md != 3 {
             if op == 7 && self.d.prefix & (PREFIX_REPZ | PREFIX_REPNZ) == 0 {
                 // CLFLUSH and CLFLUSHOPT: nothing is cached.
