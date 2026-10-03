@@ -11,9 +11,20 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 14
 
 [dependencies]
+ruvm-base.workspace = true
+ruvm-jit.workspace = true
+ruvm-mem.workspace = true
+ruvm-qapi.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+ruvm-jit-core.workspace = true
+ruvm-jit-interp.workspace = true
 
 [lints]
 workspace = true

@@ -204,7 +204,9 @@ pub(crate) fn helper_lookup_tb_ptr(cpu: &mut Cpu<'_>) -> Result<Option<Arc<Tb>>,
 /// `cpu_tb_exec()`: run `itb` and what it chains to.
 fn cpu_tb_exec(cpu: &mut Cpu<'_>, itb: &Arc<Tb>) -> Result<TbRet, CpuLoopExit> {
     let jit = cpu.jit();
-    let ret = jit.backend.exec(cpu, itb)?;
+    let ret = jit.backend.exec(cpu, itb);
+    crate::plugin::disable_mem_helpers();
+    let ret = ret?;
     cpu.set_can_do_io(true);
     if ret.exit > tb_exit::IDX1 {
         // We didn't start executing this TB (eg because the instruction counter hit zero); we

@@ -122,6 +122,7 @@ impl InterpBackend {
     /// target's helpers go here. `lookup_tb_ptr` is replaced by the runtime's.
     pub fn with_helpers(mut helpers: HelperRegistry) -> InterpBackend {
         helpers.register("lookup_tb_ptr", HelperType::Ptr, &[HelperType::Ptr], lookup_tb_ptr);
+        crate::plugin::register_helpers(&mut helpers);
         InterpBackend { helpers }
     }
 

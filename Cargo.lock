@@ -900,6 +900,15 @@ dependencies = [
 [[package]]
 name = "ruvm-plugin"
 version = "0.3.2"
+dependencies = [
+ "libc",
+ "ruvm-base",
+ "ruvm-jit",
+ "ruvm-jit-core",
+ "ruvm-jit-interp",
+ "ruvm-mem",
+ "ruvm-qapi",
+]
 
 [[package]]
 name = "ruvm-qapi"

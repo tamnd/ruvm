@@ -110,6 +110,7 @@ pub struct Jit {
     pub(crate) rr_halt: Arc<(Mutex<()>, Condvar)>,
     pub(crate) start: Instant,
     pub(crate) self_ref: Weak<Jit>,
+    pub(crate) plugin: crate::plugin::JitPlugin,
 }
 
 impl fmt::Debug for Jit {
@@ -155,6 +156,7 @@ impl Jit {
             rr_halt: Arc::new((Mutex::new(()), Condvar::new())),
             start: Instant::now(),
             self_ref: w.clone(),
+            plugin: crate::plugin::JitPlugin::default(),
         })
     }
 
@@ -188,6 +190,7 @@ impl Jit {
         let shared = Arc::new(CpuShared::new(cpu_index, self.self_ref.clone(), halt, tlb));
         cpus.push(shared.clone());
         drop(cpus);
+        self.plugin_vcpu_created(&shared);
         let tcg_cflags = if self.config.mttcg { cf::PARALLEL } else { 0 };
         let mut env = vec![0u8; ENV_TARGET_OFFSET + env_size];
         env[crate::ENV_CAN_DO_IO_OFFSET as usize] = 1;
