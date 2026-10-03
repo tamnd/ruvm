@@ -27,11 +27,11 @@ use ruvm_jit::{Jit, Vcpu, excp};
 use ruvm_mem::{AddressSpace, MemTxAttrs, MemorySystem};
 use ruvm_target_x86::cpuid::{Accel, X86Cpu};
 use ruvm_target_x86::state::{
-    CR0_EM_MASK, CR0_ET_MASK, CR0_NE_MASK, CR0_PE_MASK, CR0_PG_MASK, CR0_TS_MASK, CR0_WP_MASK,
-    CR4_FSGSBASE_MASK, CR4_OSFXSR_MASK, CR4_OSXSAVE_MASK, CR4_PAE_MASK, DESC_A_MASK, DESC_B_MASK,
-    DESC_CS_MASK, DESC_G_MASK, DESC_L_MASK, DESC_P_MASK, DESC_R_MASK, DESC_S_MASK, DESC_W_MASK,
-    HF_LMA_MASK, IrqchipMode, MSR_EFER_LME, R_CS, R_EAX, R_EBX, R_ECX, R_EDI, R_EDX, R_ESP, R_FS,
-    R_GS, ResetConfig, SegmentCache, X86CpuState,
+    CR0_EM_MASK, CR0_ET_MASK, CR0_MP_MASK, CR0_NE_MASK, CR0_PE_MASK, CR0_PG_MASK, CR0_TS_MASK,
+    CR0_WP_MASK, CR4_FSGSBASE_MASK, CR4_OSFXSR_MASK, CR4_OSXSAVE_MASK, CR4_PAE_MASK, DESC_A_MASK,
+    DESC_B_MASK, DESC_CS_MASK, DESC_G_MASK, DESC_L_MASK, DESC_P_MASK, DESC_R_MASK, DESC_S_MASK,
+    DESC_W_MASK, HF_LMA_MASK, IrqchipMode, MSR_EFER_LME, R_CS, R_EAX, R_EBX, R_ECX, R_EDI, R_EDX,
+    R_ESP, R_FS, R_GS, ResetConfig, SegmentCache, X86CpuState,
 };
 use ruvm_target_x86::tcg::{X86, create_vcpu, new_jit, save_vcpu};
 
@@ -728,4 +728,166 @@ fn rcp_and_rsqrt_are_exact() {
     assert_eq!(st.xmm_regs[0][..2], [0x4080_0000_3e80_0000, 0x3eaa_aaab_3d80_0000]);
     assert_eq!(st.xmm_regs[2][..2], [0x4000_0000_3f00_0000, 0x3f13_cd3a_3e80_0000]);
     assert_eq!(st.mxcsr, 0x1f80);
+}
+
+/// 1.0 as a floatx80 register: mantissa and sign plus exponent.
+const X80_ONE: [u64; 2] = [0x8000_0000_0000_0000, 0x3fff];
+
+#[test]
+fn x87_arith_and_stores() {
+    let w = World::new("EPYC");
+    w.w64(DATA, 0x3ff8_0000_0000_0000);
+    w.w64(DATA + 8, 3);
+    w.write(DATA + 16, &[0xff; 16]);
+    let mut st = World::long64(0);
+    st.regs[R_EDI] = DATA;
+    st.regs[R_EAX] = !0;
+    // fld qword [rdi]; fiadd dword [rdi + 8]; fstp qword [rdi + 16]; fild dword [rdi + 8];
+    // fsqrt; fstp dword [rdi + 24]; fnstsw ax.
+    let code = [
+        0xdd, 0x07, 0xda, 0x47, 0x08, 0xdd, 0x5f, 0x10, 0xdb, 0x47, 0x08, 0xd9, 0xfa, 0xd9, 0x5f,
+        0x18, 0xdf, 0xe0,
+    ];
+    let st = w.run(st, &code);
+    assert_eq!(vector(&st), None);
+    assert_eq!(chunk(&w.read(DATA, 32), 2), 0x4012_0000_0000_0000);
+    // sqrt(3) rounded to single precision; the precision exception sets FPUS.PE.
+    assert_eq!(w.read(DATA + 24, 8), [0xd7, 0xb3, 0xdd, 0x3f, 0xff, 0xff, 0xff, 0xff]);
+    assert_eq!((st.fpstt, st.fptags), (0, [1; 8]));
+    assert_eq!(st.regs[R_EAX], 0xffff_ffff_ffff_0020);
+}
+
+#[test]
+fn x87_fcomi_and_fcmov() {
+    // fld1; fldz; fcomi st0, st1; setc al; fcmovb st0, st1; fucomip st0, st1.
+    let code = [0xd9, 0xe8, 0xd9, 0xee, 0xdb, 0xf1, 0x0f, 0x92, 0xc0, 0xda, 0xc1, 0xdf, 0xe9];
+    let mut st = World::long64(0);
+    st.regs[R_EAX] = 0;
+    st.rflags = 2 | ARITH;
+    let st = World::new("EPYC").run(st, &code);
+    assert_eq!(vector(&st), None);
+    assert_eq!(st.regs[R_EAX], 1);
+    // QEMU's FCOMI and FUCOMI leave OF, SF and AF alone, where the hardware clears them.
+    assert_eq!(st.rflags & ARITH, ARITH & !(CF | 0x04));
+    assert_eq!(st.fpstt, 7);
+    assert_eq!(st.fpregs[6], X80_ONE);
+    assert_eq!(st.fpregs[7], X80_ONE);
+}
+
+#[test]
+fn x87_fbst_fbld_round_trip() {
+    let w = World::new("EPYC");
+    w.w64(DATA, (-1_234_567_890_123i64) as u64);
+    let mut st = World::long64(0);
+    st.regs[R_EDI] = DATA;
+    // fild qword [rdi]; fbstp [rdi + 16]; fbld [rdi + 16]; fistp qword [rdi + 32].
+    let code = [0xdf, 0x2f, 0xdf, 0x77, 0x10, 0xdf, 0x67, 0x10, 0xdf, 0x7f, 0x20];
+    let st = w.run(st, &code);
+    assert_eq!(vector(&st), None);
+    assert_eq!(w.read(DATA + 16, 10), [0x23, 0x01, 0x89, 0x67, 0x45, 0x23, 0x01, 0, 0, 0x80]);
+    assert_eq!(chunk(&w.read(DATA + 32, 8), 0), (-1_234_567_890_123i64) as u64);
+    assert_eq!(st.fpstt, 0);
+}
+
+#[test]
+fn x87_fnstenv_and_last_pointers() {
+    let w = World::new("EPYC");
+    w.w64(DATA + 64, 0x4000_0000_0000_0000);
+    let mut st = World::long64(0);
+    st.regs[R_EDI] = DATA;
+    // fld1; fld qword [rdi + 64]; fnstenv [rdi]; rex.w fnstenv [rdi + 32].
+    let code = [0xd9, 0xe8, 0xdd, 0x47, 0x40, 0xd9, 0x37, 0x48, 0xd9, 0x77, 0x20];
+    let st = w.run(st, &code);
+    assert_eq!(vector(&st), None);
+    let env = w.read(DATA, 28);
+    let l = |i: usize| u32::from_le_bytes(env[i..i + 4].try_into().unwrap());
+    assert_eq!((l(0), l(4), l(8)), (0x37f, 0x3000, 0x0fff));
+    assert_eq!((l(12), l(16), l(20), l(24)), (CODE as u32 + 2, 8, DATA as u32 + 64, 0x10));
+    // QEMU passes dflag - 1 = 2 with REX.W, which still writes the 32-bit layout.
+    assert_eq!(w.read(DATA + 32, 28), env);
+    assert_eq!((st.fpip, st.fpcs, st.fpdp, st.fpds), (CODE + 2, 8, DATA + 64, 0x10));
+    assert_eq!(st.fpuc, 0x37f);
+}
+
+#[test]
+fn x87_device_not_available() {
+    let nm = |cr0: u64, code: &[u8]| {
+        let mut st = World::long64(0);
+        st.update_cr0(st.cr0 | cr0);
+        vector(&World::new("EPYC").run(st, code))
+    };
+    // fld1 with CR0.TS or CR0.EM set.
+    assert_eq!(nm(CR0_TS_MASK, &[0xd9, 0xe8]), Some(7));
+    assert_eq!(nm(CR0_EM_MASK, &[0xd9, 0xe8]), Some(7));
+    // fwait only checks CR0.TS when CR0.MP is set.
+    assert_eq!(nm(CR0_TS_MASK, &[0x9b]), None);
+    assert_eq!(nm(CR0_TS_MASK | CR0_MP_MASK, &[0x9b]), Some(7));
+    // fnop is the one valid D9 /2 register form.
+    assert_eq!(nm(0, &[0xd9, 0xd0]), None);
+    assert_eq!(nm(0, &[0xd9, 0xd1]), Some(6));
+}
+
+#[test]
+fn fxsave_fxrstor() {
+    let w = World::new("EPYC");
+    w.write(DATA, &[0xff; 512]);
+    let mut st = World::long64(CR4_OSFXSR_MASK);
+    st.regs[R_EDI] = DATA;
+    st.xmm_regs[0][0] = 0x1122_3344_5566_7788;
+    // fld1; fxsave [rdi]; fninit; fxrstor [rdi].
+    let code = [0xd9, 0xe8, 0x0f, 0xae, 0x07, 0xdb, 0xe3, 0x0f, 0xae, 0x0f];
+    let st = w.run(st, &code);
+    assert_eq!(vector(&st), None);
+    let a = w.read(DATA, 512);
+    assert_eq!(a[..6], [0x7f, 0x03, 0x00, 0x38, 0x80, 0x00]);
+    assert_eq!(a[8..24], [0; 16]);
+    assert_eq!(u32::from_le_bytes(a[24..28].try_into().unwrap()), 0x1f80);
+    // ST0 is register 7.
+    assert_eq!((chunk(&a, 4), chunk(&a, 5) & 0xffff), (X80_ONE[0], X80_ONE[1]));
+    assert_eq!(chunk(&a, 20), 0x1122_3344_5566_7788);
+    assert_eq!((st.fpstt, st.fptags[7], st.fpregs[7]), (7, 0, X80_ONE));
+    // CR0.TS is #NM.
+    let mut st = World::long64(CR4_OSFXSR_MASK);
+    st.regs[R_EDI] = DATA;
+    st.update_cr0(st.cr0 | CR0_TS_MASK);
+    assert_eq!(vector(&World::new("EPYC").run(st, &[0x0f, 0xae, 0x07])), Some(7));
+}
+
+#[test]
+fn xsave_xrstor() {
+    let w = World::new("EPYC");
+    w.write(DATA, &[0; 1024]);
+    let mut st = long64_avx();
+    st.xcr0 = 3;
+    st.regs[R_EDI] = DATA;
+    st.regs[R_EAX] = 3;
+    st.regs[R_EDX] = 0;
+    st.xmm_regs[0][1] = 0x99aa_bbcc_ddee_ff00;
+    // fld1; xsave [rdi]; fninit; xrstor [rdi].
+    let code = [0xd9, 0xe8, 0x0f, 0xae, 0x27, 0xdb, 0xe3, 0x0f, 0xae, 0x2f];
+    let st = w.run(st, &code);
+    assert_eq!(vector(&st), None);
+    let a = w.read(DATA, 576);
+    assert_eq!(a[..2], [0x7f, 0x03]);
+    assert_eq!(chunk(&a, 21), 0x99aa_bbcc_ddee_ff00);
+    assert_eq!(chunk(&a, 64), 3);
+    assert_eq!((st.fpstt, st.fptags[7], st.fpregs[7]), (7, 0, X80_ONE));
+    // XSAVEOPT writes the same area.
+    if w.x86.model().has_feature("xsaveopt") {
+        let w2 = World::new("EPYC");
+        w2.write(DATA, &[0; 1024]);
+        let mut st = long64_avx();
+        st.xcr0 = 3;
+        st.regs[R_EDI] = DATA;
+        st.regs[R_EAX] = 3;
+        st.regs[R_EDX] = 0;
+        let st = w2.run(st, &[0xd9, 0xe8, 0x0f, 0xae, 0x37]);
+        assert_eq!(vector(&st), None);
+        assert_eq!(w2.read(DATA, 576)[..32], a[..32]);
+        assert_eq!(chunk(&w2.read(DATA, 576), 64), 3);
+    }
+    // Without CR4.OSXSAVE, XSAVE is #UD.
+    let mut st = World::long64(CR4_OSFXSR_MASK);
+    st.regs[R_EDI] = DATA;
+    assert_eq!(vector(&World::new("EPYC").run(st, &[0x0f, 0xae, 0x27])), Some(6));
 }

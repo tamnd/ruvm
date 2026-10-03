@@ -4,8 +4,8 @@
 //! guest code, run by `ruvm-jit`.
 //!
 //! [`X86`] is the [`CpuOps`] of an x86 vCPU. Its CPU state lives in the runtime's state
-//! buffer with the layout in [`env`], so generated code reaches every register by offset. The
-//! translator (`translate.rs`) decodes guest instructions and emits IR, keeping the
+//! buffer with the layout in [`env`](mod@env), so generated code reaches every register by
+//! offset. The translator (`translate.rs`) decodes guest instructions and emits IR, keeping the
 //! arithmetic flags lazy with the `cc_op` scheme of [`cc`]. Helpers called from generated code
 //! are in `helpers.rs` (arithmetic, CPUID, MSRs, control registers) and `seg.rs`
 //! (descriptors, far transfers, exceptions and interrupts through the IDT, SYSCALL and
@@ -24,19 +24,18 @@
 //! triple fault detection. The page walk handles 32-bit paging (with PSE), PAE paging, and 4 and 5
 //! level long mode paging, with NX, WP, SMEP and SMAP.
 //!
-//! **x87, MMX, SSE and AVX are not implemented yet.** Every x87 escape opcode (D8 to DF),
-//! every MMX and SSE opcode in the 0F, 0F 38 and 0F 3A maps (including the 66, F2 and F3
-//! forms), every vector instruction behind a VEX prefix, and the EVEX prefix raise #UD. FWAIT
-//! is a no-op. FXSAVE, FXRSTOR, XSAVE, XRSTOR and XSAVEOPT are #UD too. CPUID still reports
-//! what the model has, so a guest that checks CPUID and then uses SSE gets #UD. The VEX prefix
-//! itself is decoded (`translate/ext.rs`), and so are the general purpose register
-//! instructions that come with this part of the instruction set: ANDN, BEXTR, BLSI, BLSMSK,
-//! BLSR, BZHI, MULX, PDEP, PEXT, RORX, SARX, SHLX and SHRX (VEX class 13, VEX.L must be 0),
-//! ADCX and ADOX (with QEMU's `CC_OP_ADCX`, `CC_OP_ADOX` and `CC_OP_ADCOX` carry chaining),
-//! MOVBE, CRC32, RDRAND, RDSEED, RDPID, XGETBV, XSETBV, RDFSBASE, RDGSBASE, WRFSBASE,
-//! WRGSBASE (CR4.FSGSBASE is tested at run time, as in QEMU), MOVNTI, LDMXCSR and STMXCSR.
-//! `helpers/vec.rs` already holds the SSE to AVX2 arithmetic kernels (on `ruvm-softfloat`,
-//! with MXCSR rounding, DAZ, FZ and flags), but no decoder calls them yet.
+//! The x87 instructions (D8 to DF and FWAIT, `translate/x87.rs`) run on the 80-bit
+//! `floatx80` of `ruvm-softfloat`, with FPUC rounding and precision control and the FPUS
+//! exception flags, and FXSAVE, FXRSTOR, XSAVE, XRSTOR and XSAVEOPT save and restore the x87,
+//! SSE and AVX state (`helpers/fpu.rs`). MMX, SSE and AVX to AVX2 go through the table driven
+//! decoder of `translate/sse.rs` and the kernels of `helpers/vec.rs`. The EVEX prefix raises
+//! #UD, as do XSAVEC and XSAVES, which QEMU's TCG does not offer either. The VEX prefix is
+//! decoded in `translate/ext.rs`, along with the general purpose register instructions that
+//! come with this part of the instruction set: ANDN, BEXTR, BLSI, BLSMSK, BLSR, BZHI, MULX,
+//! PDEP, PEXT, RORX, SARX, SHLX and SHRX (VEX class 13, VEX.L must be 0), ADCX and ADOX (with
+//! QEMU's `CC_OP_ADCX`, `CC_OP_ADOX` and `CC_OP_ADCOX` carry chaining), MOVBE, CRC32, RDRAND,
+//! RDSEED, RDPID, XGETBV, XSETBV, RDFSBASE, RDGSBASE, WRFSBASE, WRGSBASE (CR4.FSGSBASE is
+//! tested at run time, as in QEMU), MOVNTI, LDMXCSR and STMXCSR.
 //!
 //! Deliberate differences from QEMU:
 //!

@@ -16,9 +16,9 @@
 //!   plain data work and builds everywhere.
 //! - `kvm` (Linux x86-64 only) is the port of `target/i386/kvm/kvm.c`:
 //!   vCPU setup and register sync over `ruvm-accel-kvm`.
-//! - [`tcg`] is the port of `target/i386/tcg`: the integer instruction set
-//!   translated by `ruvm-jit`, with the page walk, exceptions and
-//!   interrupts. x87, SSE and AVX raise #UD.
+//! - [`tcg`] is the port of `target/i386/tcg`: the integer, x87, MMX, SSE
+//!   and AVX to AVX2 instruction sets translated by `ruvm-jit`, with the
+//!   page walk, exceptions and interrupts.
 
 #![deny(unsafe_code)]
 

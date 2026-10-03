@@ -18,6 +18,7 @@ mod ext;
 mod insn;
 mod sse;
 mod sse_tab;
+mod x87;
 
 use ruvm_jit::{Cpu, CpuLoopExit, DisasContextBase, DisasJumpType, TranslatorOps, cf};
 use ruvm_jit_core::ir::{TempI32, TempI64, TempPtr};
@@ -120,6 +121,9 @@ struct Feat {
     pclmulqdq: bool,
     sha_ni: bool,
     cmpccxadd: bool,
+    fxsr: bool,
+    xsaveopt: bool,
+    cmov: bool,
 }
 
 /// The TCG globals and the block wide temps.
@@ -232,6 +236,9 @@ impl DisasContext {
             pclmulqdq: model.has_feature("pclmulqdq"),
             sha_ni: model.has_feature("sha-ni"),
             cmpccxadd: model.has_feature("cmpccxadd"),
+            fxsr: model.has_feature("fxsr"),
+            xsaveopt: model.has_feature("xsaveopt"),
+            cmov: model.has_feature("cmov"),
         };
         DisasContext {
             feat,

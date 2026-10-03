@@ -674,8 +674,9 @@ fn page_fault_error_code_and_cr2() {
 
 #[test]
 fn undefined_and_fpu_raise_ud() {
-    // fld1, addps xmm0, xmm0, vaddps and ud2 are #UD.
-    for code in [&[0xd9, 0xe8][..], &[0x0f, 0x58, 0xc0], &[0xc5, 0xf8, 0x58, 0xc0], &[0x0f, 0x0b]] {
+    // addps xmm0, xmm0 and vaddps without CR4.OSFXSR and CR4.OSXSAVE, the invalid x87 form
+    // D9 D1, and ud2 are #UD.
+    for code in [&[0x0f, 0x58, 0xc0][..], &[0xc5, 0xf8, 0x58, 0xc0], &[0xd9, 0xd1], &[0x0f, 0x0b]] {
         let st = run64(&[], code);
         assert_eq!(vector64(&st), 6, "{code:x?}");
         assert_eq!(st.rip, HANDLERS + 6 * 16 + 1);
