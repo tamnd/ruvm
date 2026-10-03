@@ -10,10 +10,14 @@
 //! loaded and stored by offset.
 //!
 //! This file holds the shared state, the flags machinery, the address and stack helpers and
-//! the end of block code; [`insn`] holds the per opcode decoder and emitters.
+//! the end of block code; [`insn`] holds the per opcode decoder and emitters, [`ext`] the
+//! later extensions with their own decoding and [`sse`] the table driven decoder of the vector
+//! instructions.
 
 mod ext;
 mod insn;
+mod sse;
+mod sse_tab;
 
 use ruvm_jit::{Cpu, CpuLoopExit, DisasContextBase, DisasJumpType, TranslatorOps, cf};
 use ruvm_jit_core::ir::{TempI32, TempI64, TempPtr};
@@ -103,6 +107,19 @@ struct Feat {
     rdpid: bool,
     xsave: bool,
     fsgsbase: bool,
+    sse3: bool,
+    ssse3: bool,
+    sse41: bool,
+    sse4a: bool,
+    avx: bool,
+    avx2: bool,
+    fma: bool,
+    f16c: bool,
+    aes: bool,
+    vaes: bool,
+    pclmulqdq: bool,
+    sha_ni: bool,
+    cmpccxadd: bool,
 }
 
 /// The TCG globals and the block wide temps.
@@ -202,6 +219,19 @@ impl DisasContext {
             rdpid: model.has_feature("rdpid"),
             xsave: model.has_feature("xsave"),
             fsgsbase: model.has_feature("fsgsbase"),
+            sse3: model.has_feature("pni"),
+            ssse3: model.has_feature("ssse3"),
+            sse41: model.has_feature("sse4.1"),
+            sse4a: model.has_feature("sse4a"),
+            avx: model.has_feature("avx"),
+            avx2: model.has_feature("avx2"),
+            fma: model.has_feature("fma"),
+            f16c: model.has_feature("f16c"),
+            aes: model.has_feature("aes"),
+            vaes: model.has_feature("vaes"),
+            pclmulqdq: model.has_feature("pclmulqdq"),
+            sha_ni: model.has_feature("sha-ni"),
+            cmpccxadd: model.has_feature("cmpccxadd"),
         };
         DisasContext {
             feat,

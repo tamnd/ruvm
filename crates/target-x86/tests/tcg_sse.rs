@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The x87, SSE and AVX slice of the translator: for now the general purpose register
-//! extensions that come with it (BMI1, BMI2, ADX, MOVBE, CRC32, RDRAND, RDSEED, RDPID,
-//! XGETBV, the FS and GS base instructions, LDMXCSR and STMXCSR) and the VEX prefix.
+//! The x87, SSE and AVX slice of the translator: MMX, SSE to SSE4.2, AVX, AVX2, FMA and F16C,
+//! the general purpose register extensions that come with them (BMI1, BMI2, ADX, MOVBE,
+//! CRC32, RDRAND, RDSEED, RDPID, XGETBV, the FS and GS base instructions, LDMXCSR and STMXCSR)
+//! and the VEX prefix.
 //!
 //! `data/tcg_bmi.txt` holds the results of the same instruction bytes run natively on an
 //! AMD EPYC host; each case runs in 64-bit mode with RDI pointing at 32 bytes of data. RSP,
 //! RDI and R15 are not compared (the native harness uses R15 as its base register).
-//! `data/native` holds the case generator and the C harness that produced the file.
+//!
+//! `data/tcg_vec.txt` does the same for the vector instructions. To keep the file small, it
+//! holds the kind and the seed of each case's input, which [`Rng`] expands as the generator
+//! does, and only the 8-byte chunks of the state that changed. The state is YMM0 to YMM3, MM0
+//! and MM1, RAX, RCX, RDX and the 32 bytes RDI points to, plus RFLAGS and MXCSR.
+//!
+//! `data/native` holds the case generators and the C harnesses that produced the files.
 //!
 //! The memory map follows `tcg.rs`: code at 0x1000, the GDT at 0x3000, the long mode IDT at
 //! 0x4000 with a HLT handler per vector at 0x5000 + 16 n, data at 0x8000, the stack below
@@ -20,7 +27,7 @@ use ruvm_jit::{Jit, Vcpu, excp};
 use ruvm_mem::{AddressSpace, MemTxAttrs, MemorySystem};
 use ruvm_target_x86::cpuid::{Accel, X86Cpu};
 use ruvm_target_x86::state::{
-    CR0_ET_MASK, CR0_NE_MASK, CR0_PE_MASK, CR0_PG_MASK, CR0_TS_MASK, CR0_WP_MASK,
+    CR0_EM_MASK, CR0_ET_MASK, CR0_NE_MASK, CR0_PE_MASK, CR0_PG_MASK, CR0_TS_MASK, CR0_WP_MASK,
     CR4_FSGSBASE_MASK, CR4_OSFXSR_MASK, CR4_OSXSAVE_MASK, CR4_PAE_MASK, DESC_A_MASK, DESC_B_MASK,
     DESC_CS_MASK, DESC_G_MASK, DESC_L_MASK, DESC_P_MASK, DESC_R_MASK, DESC_S_MASK, DESC_W_MASK,
     HF_LMA_MASK, IrqchipMode, MSR_EFER_LME, R_CS, R_EAX, R_EBX, R_ECX, R_EDI, R_EDX, R_ESP, R_FS,
@@ -223,7 +230,7 @@ fn vex_and_bmi_raise_ud() {
     ud("EPYC", &[0xf3, 0x0f, 0x38, 0xf0, 0x07]);
     // blsr with modrm.reg 0 has no instruction.
     ud("EPYC", &[0xc4, 0xe2, 0xb0, 0xf3, 0xc1]);
-    // Vector instructions are not implemented yet: vaddps.
+    // Without CR4.OSXSAVE and XCR0, VEX encoded vector instructions are #UD: vaddps.
     ud("EPYC", &[0xc5, 0xf8, 0x58, 0xc0]);
     // qemu64 has no BMI1, BMI2 or ADX.
     ud("qemu64", &[0xc4, 0xe2, 0xe0, 0xf2, 0xc1]);
@@ -338,4 +345,387 @@ fn movnti() {
     let st = w.run(st, &[0x48, 0x0f, 0xc3, 0x07, 0x0f, 0xc3, 0x4f, 0x08]);
     assert_eq!(vector(&st), None);
     assert_eq!(w.read(DATA, 16), hex("887766554433221100ffeedd00000000"));
+}
+
+/// splitmix64 and the input kinds of `data/native/gen_vec.py`; keep the two in sync.
+struct Rng(u64);
+
+const F32: [u32; 19] = [
+    0,
+    0x8000_0000,
+    0x3f80_0000,
+    0xbfc0_0000,
+    0x7f80_0000,
+    0xff80_0000,
+    0x7fc0_0000,
+    0xffc0_0000,
+    0x7fa0_0000,
+    0x0000_0001,
+    0x807f_ffff,
+    0x7f7f_ffff,
+    0x4f00_0000,
+    0xcf00_0000,
+    0x3f00_0000,
+    0x4020_0000,
+    0xc020_0000,
+    0x4040_0000,
+    0x3fc0_0000,
+];
+const F64: [u64; 19] = [
+    0,
+    0x8000_0000_0000_0000,
+    0x3ff0_0000_0000_0000,
+    0xbff8_0000_0000_0000,
+    0x7ff0_0000_0000_0000,
+    0xfff0_0000_0000_0000,
+    0x7ff8_0000_0000_0000,
+    0x7ff4_0000_0000_0000,
+    0x0000_0000_0000_0001,
+    0x800f_ffff_ffff_ffff,
+    0x7fef_ffff_ffff_ffff,
+    0x41e0_0000_0000_0000,
+    0xc1e0_0000_0000_0000,
+    0x3fe0_0000_0000_0000,
+    0x4004_0000_0000_0000,
+    0xc004_0000_0000_0000,
+    0x4008_0000_0000_0000,
+    0x43e0_0000_0000_0000,
+    0x3ff8_0000_0000_0000,
+];
+const H16: [u16; 10] = [0, 0x8000, 0x3c00, 0x7c00, 0xfc00, 0x7e00, 0x7d00, 0x0001, 0x03ff, 0x7bff];
+const W16: [u16; 6] = [0, 0x7fff, 0x8000, 0xffff, 0x80, 0x7f];
+const MXCSR: [u32; 6] = [0x1f80, 0x1f80, 0x3f80, 0x5f80, 0x7f80, 0x9fc0];
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn bits(&mut self, k: u32) -> u64 {
+        self.next() >> (64 - k)
+    }
+
+    fn f32(&mut self) -> u32 {
+        let k = self.below(10);
+        if k < 3 {
+            F32[self.below(F32.len() as u64) as usize]
+        } else if k < 5 {
+            ((self.below(600) as i64 - 300) as f32).to_bits()
+        } else {
+            (self.bits(1) << 31 | (100 + self.below(60)) << 23 | self.bits(23)) as u32
+        }
+    }
+
+    fn f64(&mut self) -> u64 {
+        let k = self.below(10);
+        if k < 3 {
+            F64[self.below(F64.len() as u64) as usize]
+        } else if k < 5 {
+            ((self.below(600) as i64 - 300) as f64).to_bits()
+        } else {
+            self.bits(1) << 63 | (990 + self.below(70)) << 52 | self.bits(52)
+        }
+    }
+
+    fn val(&mut self, kind: &str, n: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        while b.len() < n {
+            match kind {
+                "s" => {
+                    let v = self.f32();
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                "d" => {
+                    let v = self.f64();
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                "h" => {
+                    let k = self.below(12) as usize;
+                    let v = if k < 10 { H16[k] } else { self.bits(16) as u16 };
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                "w" => {
+                    let k = self.below(7) as usize;
+                    let v = if k < 6 { W16[k] } else { self.bits(16) as u16 };
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                "x" => {
+                    let v = if self.below(2) == 0 { self.below(70) } else { self.next() };
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                _ => {
+                    let v = self.next();
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        b
+    }
+
+    fn gpr(&mut self, kind: &str) -> u64 {
+        if kind != "s" {
+            return self.next();
+        }
+        match self.below(4) {
+            0 => self.next(),
+            1 => self.bits(31),
+            2 => self.bits(20).wrapping_neg(),
+            _ => 0,
+        }
+    }
+
+    /// The 200 bytes of state, RFLAGS and MXCSR of a case.
+    fn state(&mut self, kind: &str, mx: bool) -> (Vec<u8>, u64, u32) {
+        let mut st = Vec::new();
+        for _ in 0..4 {
+            st.extend(self.val(kind, 32));
+        }
+        st.extend(self.val("i", 16));
+        for _ in 0..3 {
+            let v = self.gpr(kind);
+            st.extend_from_slice(&v.to_le_bytes());
+        }
+        st.extend(self.val(kind, 32));
+        let fl = 0x202 | (self.bits(12) & ARITH);
+        let mxcsr = if mx { MXCSR[self.below(6) as usize] } else { 0x1f80 };
+        (st, fl, mxcsr)
+    }
+}
+
+fn chunk(b: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap())
+}
+
+/// The vector state of the native harness: YMM0 to YMM3, MM0 and MM1, RAX, RCX, RDX and the
+/// memory at DATA.
+fn vec_state(w: &World, st: &X86CpuState) -> Vec<u8> {
+    let mut b = Vec::new();
+    for r in &st.xmm_regs[..4] {
+        for q in &r[..4] {
+            b.extend_from_slice(&q.to_le_bytes());
+        }
+    }
+    for r in &st.fpregs[..2] {
+        b.extend_from_slice(&r[0].to_le_bytes());
+    }
+    for r in [R_EAX, R_ECX, R_EDX] {
+        b.extend_from_slice(&st.regs[r].to_le_bytes());
+    }
+    b.extend(w.read(DATA, 32));
+    b
+}
+
+/// 64-bit mode with SSE and AVX state enabled.
+fn long64_avx() -> X86CpuState {
+    let mut st = World::long64(CR4_OSFXSR_MASK | CR4_OSXSAVE_MASK);
+    st.xcr0 = 7;
+    st
+}
+
+/// Cases where QEMU and the hardware give different results, and ruvm follows QEMU.
+/// maxpd_0: with MXCSR.DAZ set, QEMU's FPU_MAX compares the flushed inputs but returns the
+/// unflushed denormal operand, while the hardware returns zero.
+const QEMU_RESULT_DIFFS: &[&str] = &["maxpd_0"];
+
+#[test]
+fn native_vector_results_match() {
+    let w0 = World::new("EPYC");
+    for f in ["avx", "avx2", "fma", "f16c", "pclmulqdq", "sse4.1", "ssse3"] {
+        assert!(w0.x86.model().has_feature(f), "{f}");
+    }
+    let data = include_str!("data/tcg_vec.txt");
+    let mut n = 0;
+    let mut bad = Vec::new();
+    for line in data.lines().filter(|l| !l.starts_with('#')) {
+        let p: Vec<&str> = line.split(';').collect();
+        assert_eq!(p.len(), 6, "{line}");
+        let (name, code) = (p[0], hex(p[1]));
+        let d: Vec<&str> = p[2].split(':').collect();
+        let (kind, seed, mx) = (d[0], d[1].parse().unwrap(), d[2] == "1");
+        let (input, fin, mxin) = Rng(seed).state(kind, mx);
+        let mut want = input.clone();
+        for c in p[3].split(',').filter(|c| !c.is_empty()) {
+            let (i, v) = c.split_once(':').unwrap();
+            let i: usize = i.parse().unwrap();
+            want[8 * i..8 * i + 8].copy_from_slice(&hex(v));
+        }
+        let (fout, mxout) = (u64::from_str_radix(p[4], 16).unwrap(), p[5]);
+        let mxout = u32::from_str_radix(mxout, 16).unwrap();
+
+        let w = World::new("EPYC");
+        let mut st = long64_avx();
+        for i in 0..4 {
+            for j in 0..4 {
+                st.xmm_regs[i][j] = chunk(&input, 4 * i + j);
+            }
+        }
+        for i in 0..2 {
+            st.fpregs[i][0] = chunk(&input, 16 + i);
+        }
+        for (i, r) in [R_EAX, R_ECX, R_EDX].into_iter().enumerate() {
+            st.regs[r] = chunk(&input, 18 + i);
+        }
+        st.regs[R_EDI] = DATA;
+        st.rflags = fin;
+        st.mxcsr = mxin;
+        w.write(DATA, &input[168..]);
+        let st = w.run(st, &code);
+        n += 1;
+        if vector(&st).is_some() {
+            bad.push(format!("{name}: exception {:?}", vector(&st)));
+            continue;
+        }
+        let got = vec_state(&w, &st);
+        for i in 0..25 {
+            if chunk(&got, i) != chunk(&want, i) && !QEMU_RESULT_DIFFS.contains(&name) {
+                bad.push(format!(
+                    "{name}: chunk {i}: {:016x} != {:016x} (input {:016x})",
+                    chunk(&got, i),
+                    chunk(&want, i),
+                    chunk(&input, i)
+                ));
+            }
+        }
+        if st.rflags & ARITH != fout & ARITH {
+            bad.push(format!("{name}: rflags {:#x} != {fout:#x}", st.rflags));
+        }
+        // QEMU raises DE when a half precision input is a denormal; AMD hardware does not.
+        let de = if name.starts_with("vcvtph2ps") { 2 } else { 0 };
+        if st.mxcsr & !de != mxout & !de {
+            bad.push(format!("{name}: mxcsr {:#x} != {mxout:#x} (input {mxin:#x})", st.mxcsr));
+        }
+    }
+    assert!(bad.is_empty(), "{} mismatches:\n{}", bad.len(), bad.join("\n"));
+    assert!(n > 2000);
+}
+
+#[test]
+fn vector_exceptions() {
+    let run = |st: X86CpuState, code: &[u8]| vector(&World::new("EPYC").run(st, code));
+    let with_cr0 = |cr4: u64, cr0: u64| {
+        let mut st = World::long64(cr4);
+        st.update_cr0(st.cr0 | cr0);
+        st.regs[R_EDI] = DATA;
+        st
+    };
+    // addps xmm0, xmm1 needs CR4.OSFXSR, which QEMU checks before CR0.TS and CR0.EM.
+    let addps = [0x0f, 0x58, 0xc1];
+    assert_eq!(run(with_cr0(CR4_OSFXSR_MASK, 0), &addps), None);
+    assert_eq!(run(with_cr0(0, 0), &addps), Some(6));
+    assert_eq!(run(with_cr0(0, CR0_TS_MASK), &addps), Some(6));
+    assert_eq!(run(with_cr0(CR4_OSFXSR_MASK, CR0_TS_MASK), &addps), Some(7));
+    assert_eq!(run(with_cr0(CR4_OSFXSR_MASK, CR0_EM_MASK), &addps), Some(6));
+    // paddb mm0, mm1 does not need CR4.OSFXSR, but the 66 form paddb xmm0, xmm1 does.
+    assert_eq!(run(with_cr0(0, 0), &[0x0f, 0xfc, 0xc1]), None);
+    assert_eq!(run(with_cr0(0, CR0_TS_MASK), &[0x0f, 0xfc, 0xc1]), Some(7));
+    assert_eq!(run(with_cr0(0, 0), &[0x66, 0x0f, 0xfc, 0xc1]), Some(6));
+    // A LOCK prefix is #UD.
+    assert_eq!(run(with_cr0(CR4_OSFXSR_MASK, 0), &[0xf0, 0x0f, 0x58, 0xc1]), Some(6));
+    // movaps and addps need an aligned memory operand, movups does not.
+    let mis = |code: &[u8]| run(with_cr0(CR4_OSFXSR_MASK, 0), code);
+    assert_eq!(mis(&[0x0f, 0x28, 0x47, 0x01]), Some(13));
+    assert_eq!(mis(&[0x0f, 0x58, 0x47, 0x01]), Some(13));
+    assert_eq!(mis(&[0x0f, 0x10, 0x47, 0x01]), None);
+    // The VEX forms: vmovaps still needs alignment, vaddps does not.
+    let mut st = long64_avx();
+    st.regs[R_EDI] = DATA;
+    assert_eq!(run(st.clone(), &[0xc5, 0xf8, 0x28, 0x47, 0x01]), Some(13));
+    assert_eq!(run(st.clone(), &[0xc5, 0xf8, 0x58, 0x47, 0x01]), None);
+    // XCR0 without the YMM state makes VEX #UD, as does a LOCK or 66 prefix before VEX.
+    let mut no_ymm = st.clone();
+    no_ymm.xcr0 = 3;
+    assert_eq!(run(no_ymm, &[0xc5, 0xf8, 0x58, 0xc1]), Some(6));
+    assert_eq!(run(st.clone(), &[0xf0, 0xc5, 0xf8, 0x58, 0xc1]), Some(6));
+    assert_eq!(run(st.clone(), &[0x66, 0xc5, 0xf8, 0x58, 0xc1]), Some(6));
+    // VEX.L = 1 is #UD for the 128-bit only vmovd.
+    assert_eq!(run(st.clone(), &[0xc5, 0xfd, 0x6e, 0xc0]), Some(6));
+    // With AVX2, integer ops take VEX.L = 1: vpaddb ymm0, ymm1, ymm2.
+    assert_eq!(run(st, &[0xc5, 0xf5, 0xfc, 0xc2]), None);
+}
+
+#[test]
+fn vzeroupper_and_vzeroall() {
+    let mut st = long64_avx();
+    for (i, r) in st.xmm_regs.iter_mut().enumerate() {
+        for (j, q) in r.iter_mut().take(4).enumerate() {
+            *q = (i * 4 + j + 1) as u64;
+        }
+    }
+    let up = World::new("EPYC").run(st.clone(), &[0xc5, 0xf8, 0x77]);
+    assert_eq!(vector(&up), None);
+    for (i, r) in up.xmm_regs.iter().take(16).enumerate() {
+        assert_eq!(r[..4], [(i * 4 + 1) as u64, (i * 4 + 2) as u64, 0, 0], "{i}");
+    }
+    let all = World::new("EPYC").run(st, &[0xc5, 0xfc, 0x77]);
+    assert_eq!(vector(&all), None);
+    for (i, r) in all.xmm_regs.iter().take(16).enumerate() {
+        assert_eq!(r[..4], [0; 4], "{i}");
+    }
+}
+
+#[test]
+fn mmx_tags_and_emms() {
+    // movq mm0, rax switches to MMX mode: TOP = 0 and every tag valid.
+    let mut st = World::long64(0);
+    st.regs[R_EAX] = 0x1122_3344_5566_7788;
+    st.fpstt = 3;
+    st.fptags = [1; 8];
+    let mmx = World::new("EPYC").run(st.clone(), &[0x48, 0x0f, 0x6e, 0xc0]);
+    assert_eq!(vector(&mmx), None);
+    assert_eq!((mmx.fpstt, mmx.fptags, mmx.fpregs[0][0]), (0, [0; 8], 0x1122_3344_5566_7788));
+    // emms then marks every register empty.
+    let emms = World::new("EPYC").run(st, &[0x48, 0x0f, 0x6e, 0xc0, 0x0f, 0x77]);
+    assert_eq!(vector(&emms), None);
+    assert_eq!((emms.fpstt, emms.fptags), (0, [1; 8]));
+}
+
+#[test]
+fn vldmxcsr_vstmxcsr() {
+    let w = World::new("EPYC");
+    w.w64(DATA, 0x3f80);
+    w.w64(DATA + 8, !0);
+    let mut st = long64_avx();
+    st.regs[R_EDI] = DATA;
+    // vldmxcsr [rdi]; vstmxcsr [rdi + 8].
+    let st = w.run(st, &[0xc5, 0xf8, 0xae, 0x17, 0xc5, 0xf8, 0xae, 0x5f, 0x08]);
+    assert_eq!(vector(&st), None);
+    assert_eq!(st.mxcsr, 0x3f80);
+    assert_eq!(w.read(DATA + 8, 8), [0x80, 0x3f, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+    // VEX.L = 1 is #UD.
+    let mut st = long64_avx();
+    st.regs[R_EDI] = DATA;
+    assert_eq!(vector(&World::new("EPYC").run(st, &[0xc5, 0xfc, 0xae, 0x17])), Some(6));
+}
+
+#[test]
+fn rip_relative_with_immediate() {
+    // pshufd xmm0, [rip + 7], 0x1b: the displacement is relative to the end of the
+    // instruction, after the immediate, so the operand is the aligned 16 bytes at 0x1010.
+    let w = World::new("EPYC");
+    w.write(CODE + 0x10, &hex("01000000020000000300000004000000"));
+    let st = w.run(World::long64(CR4_OSFXSR_MASK), &[0x66, 0x0f, 0x70, 0x05, 7, 0, 0, 0, 0x1b]);
+    assert_eq!(vector(&st), None);
+    assert_eq!(st.xmm_regs[0][..2], [0x0000_0003_0000_0004, 0x0000_0001_0000_0002]);
+}
+
+#[test]
+fn rcp_and_rsqrt_are_exact() {
+    // QEMU computes RCPPS and RSQRTPS exactly and leaves MXCSR alone, where hardware gives
+    // 12-bit approximations: rcpps xmm0, xmm1; rsqrtps xmm2, xmm1 on 4, 0.25, 16 and 3.
+    let mut st = World::long64(CR4_OSFXSR_MASK);
+    st.xmm_regs[1][0] = 0x3e80_0000_4080_0000;
+    st.xmm_regs[1][1] = 0x4040_0000_4180_0000;
+    let st = World::new("EPYC").run(st, &[0x0f, 0x53, 0xc1, 0x0f, 0x52, 0xd1]);
+    assert_eq!(vector(&st), None);
+    assert_eq!(st.xmm_regs[0][..2], [0x4080_0000_3e80_0000, 0x3eaa_aaab_3d80_0000]);
+    assert_eq!(st.xmm_regs[2][..2], [0x4000_0000_3f00_0000, 0x3f13_cd3a_3e80_0000]);
+    assert_eq!(st.mxcsr, 0x1f80);
 }

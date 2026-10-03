@@ -804,3 +804,12 @@ fn string_and_misc_16_bit() {
     // The upper half of EDX keeps the CPUID version loaded at reset.
     assert_eq!(st.regs[R_EDX] & 0xffff, 0x00ff);
 }
+
+/// x86 blocks carry the TSO order of QEMU's i386 `TCGCPUOps`: `TCG_MO_ALL & ~TCG_MO_ST_LD`,
+/// so only a store followed by a load may be reordered.
+#[test]
+fn guest_memory_order_is_tso() {
+    use ruvm_jit::CpuOps;
+    let x = X86::new(X86Cpu::new("qemu64", Accel::Tcg).unwrap());
+    assert_eq!(x.guest_default_memory_order(), 0x0d);
+}

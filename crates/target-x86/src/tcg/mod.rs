@@ -336,6 +336,12 @@ impl CpuOps for X86 {
         }
     }
 
+    /// x86 is TSO: everything is ordered except a store followed by a load, as QEMU's
+    /// `TCG_MO_ALL & ~TCG_MO_ST_LD` for i386.
+    fn guest_default_memory_order(&self) -> u32 {
+        ruvm_jit_core::types::mo::ALL & !ruvm_jit_core::types::mo::ST_LD
+    }
+
     fn set_pc(&self, cpu: &mut Cpu<'_>, pc: u64) {
         let base = ld64(cpu.env, seg(R_CS) + SEG_BASE);
         st64(cpu.env, EIP, pc.wrapping_sub(base));

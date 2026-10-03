@@ -113,7 +113,6 @@ impl K {
 }
 
 /// Pack the first argument of [`SSE`].
-#[allow(dead_code)] // Used by the vector decoder, which is not wired up yet.
 pub(crate) fn sse_op(k: K, var: u32, len: u32, imm: u32) -> i32 {
     let lenc = match len {
         8 => 0,
@@ -124,7 +123,6 @@ pub(crate) fn sse_op(k: K, var: u32, len: u32, imm: u32) -> i32 {
 }
 
 /// Pack the `env` offsets for [`SSE`]: destination, then up to three sources.
-#[allow(dead_code)] // Used by the vector decoder, which is not wired up yet.
 pub(crate) fn sse_offs(d: usize, a: usize, b: usize, c: usize) -> i64 {
     (d as u64 | (a as u64) << 16 | (b as u64) << 32 | (c as u64) << 48) as i64
 }
