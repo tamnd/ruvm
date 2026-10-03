@@ -12,7 +12,8 @@
 //! - A guest fault while fetching code is returned as a [`CpuLoopExit`] from the hook, instead
 //!   of a longjmp out of the translator.
 //! - The "host address" of a code page is its `ram_addr`, read through the runtime's RAM
-//!   registry. There is no plugin byte recording.
+//!   registry. Code bytes are recorded for plugins only while a block is instrumented, and
+//!   always, not only when the page is unreadable through the host address.
 
 use ruvm_jit_core::Opcode;
 use ruvm_jit_core::ir::OpId;
@@ -57,12 +58,24 @@ pub struct DisasContextBase<'a> {
     /// `ram_addr` of `pc_first`, and of the start of the second page once it is used.
     host_addr: [Option<u64>; 2],
     page_mask: u64,
+    /// The plugin state while the block is instrumented, `tcg_ctx->plugin_tb`.
+    pub(crate) plugin: Option<crate::plugin::PluginGen>,
 }
 
 impl DisasContextBase<'_> {
     /// `is_same_page()`: whether `addr` is on the page of the first instruction.
     pub fn is_same_page(&self, addr: u64) -> bool {
         (addr ^ self.pc_first) & self.page_mask == 0
+    }
+
+    /// `TARGET_PAGE_MASK`.
+    pub(crate) fn page_mask(&self) -> u64 {
+        self.page_mask
+    }
+
+    /// `host_addr[]`: the `ram_addr` of `pc_first` and of the second page.
+    pub(crate) fn host_addrs(&self) -> [Option<u64>; 2] {
+        self.host_addr
     }
 
     /// `translator_use_goto_tb()`: whether a direct jump to `dest` may be chained.
@@ -130,6 +143,20 @@ impl DisasContextBase<'_> {
     /// Fetch `buf.len()` code bytes at `pc` in memory order, `translator_ld()` with the
     /// `cpu_ld*_code_mmu()` fallback.
     pub fn translator_ld(
+        &mut self,
+        cpu: &mut Cpu<'_>,
+        pc: u64,
+        buf: &mut [u8],
+    ) -> Result<(), CpuLoopExit> {
+        self.translator_ld_bytes(cpu, pc, buf)?;
+        let pc_first = self.pc_first;
+        if let Some(p) = self.plugin.as_mut() {
+            p.record(pc, pc_first, buf);
+        }
+        Ok(())
+    }
+
+    fn translator_ld_bytes(
         &mut self,
         cpu: &mut Cpu<'_>,
         pc: u64,
@@ -262,6 +289,7 @@ pub fn translator_loop(
         insn_start: None,
         host_addr: [host0, None],
         page_mask,
+        plugin: None,
     };
     ops.init_disas_context(&mut db, cpu);
     // No early exit.
@@ -271,6 +299,7 @@ pub fn translator_loop(
     let exitreq_label = gen_tb_start(&mut db, cflags);
     ops.tb_start(&mut db, cpu);
     debug_assert_eq!(db.is_jmp, DisasJumpType::Next);
+    let plugin_enabled = crate::plugin::gen_tb_start(&mut db, cpu);
 
     let mut first_insn_start = None;
     loop {
@@ -282,11 +311,25 @@ pub fn translator_loop(
             first_insn_start = db.insn_start;
         }
         debug_assert_eq!(db.is_jmp, DisasJumpType::Next);
+        if plugin_enabled {
+            crate::plugin::gen_insn_start(&mut db);
+        }
 
         // Disassemble one instruction. The translate_insn hook should update db.pc_next and
         // db.is_jmp to indicate what should be done next: either exiting this loop or locate
         // the start of the next instruction.
         ops.translate_insn(&mut db, cpu)?;
+
+        // We can't instrument after instructions that change control flow although this only
+        // really affects post-load operations.
+        //
+        // Calling plugin_gen_insn_end() before we possibly stop translation is important. Even
+        // if this ends up as dead code, plugin generation needs to see a matching
+        // plugin_gen_insn_{start,end}() pair in order to accurately track instrumented helpers
+        // that might access memory.
+        if plugin_enabled {
+            crate::plugin::gen_insn_end(&mut db);
+        }
 
         // Stop translation if translate_insn so indicated.
         if db.is_jmp != DisasJumpType::Next {
@@ -324,6 +367,10 @@ pub fn translator_loop(
     // The disas_log hook may use these values rather than recompute.
     db.tb.size = db.pc_next.wrapping_sub(db.pc_first) as u32;
     db.tb.icount = db.num_insns as u16;
+
+    if plugin_enabled {
+        crate::plugin::gen_tb_end(&mut db, cpu);
+    }
     Ok(())
 }
 

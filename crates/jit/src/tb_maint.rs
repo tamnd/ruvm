@@ -357,6 +357,7 @@ impl Jit {
             r.tbs.clear();
         }
         self.tb_flush_count.fetch_add(1, Ordering::AcqRel);
+        self.plugin_flush();
     }
 
     /// `tb_add_jump()`: chain slot `n` of `tb` to `tb_next`.

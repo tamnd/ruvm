@@ -1094,6 +1094,7 @@ pub fn cpu_ld_mmu(cpu: &mut Cpu<'_>, addr: u64, oi: MemOpIdx, ra: Ra) -> Result<
         b[..n].reverse();
     }
     let v = u64::from_le_bytes(b);
+    crate::plugin::helper_mem_cb(cpu, addr, v, 0, oi, crate::plugin::MEM_R)?;
     if mop.is_signed() && n < 8 {
         let sh = 64 - 8 * n as u32;
         return Ok((((v << sh) as i64) >> sh) as u64);
@@ -1116,7 +1117,29 @@ pub fn cpu_st_mmu(
     if mop.is_bswap() {
         b[..n].reverse();
     }
-    do_st_bytes(cpu, addr, &b[..n], oi, ra)
+    do_st_bytes(cpu, addr, &b[..n], oi, ra)?;
+    let v = if n < 8 { val & ((1u64 << (8 * n)) - 1) } else { val };
+    crate::plugin::helper_mem_cb(cpu, addr, v, 0, oi, crate::plugin::MEM_W)
+}
+
+/// `tlb_plugin_lookup()`: the physical address of `addr` and whether it is IO, from the main
+/// table only, or `None` when the page is not there.
+pub fn tlb_plugin_lookup(
+    cpu: &Cpu<'_>,
+    addr: u64,
+    mmu_idx: usize,
+    is_store: bool,
+) -> Option<(u64, bool)> {
+    let jit = &cpu.core.jit;
+    let at = if is_store { MmuAccessType::DataStore } else { MmuAccessType::DataLoad };
+    let (tlb_addr, _, full) = tlb_read_entry(cpu, addr, at, mmu_idx);
+    if !tlb_hit(jit, tlb_addr, addr) {
+        return None;
+    }
+    let phys = full.phys_addr | (addr & !jit.page_mask());
+    let flags = tlb_addr | u64::from(full.slow_flags[at as usize]);
+    // We must have an iotlb entry for MMIO.
+    Some((phys, flags & u64::from(tlb::MMIO) != 0))
 }
 
 /// Fetch code bytes through the softmmu, `cpu_ld*_code_mmu()`, in memory order.

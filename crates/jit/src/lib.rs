@@ -66,7 +66,8 @@
 //!   `TLB_CHECK_ALIGNED` are therefore checked as plain alignment.
 //! - Guest atomics under `CF_PARALLEL` are made indivisible by one global lock around the
 //!   load and store pair, since the interpreter's atomic helpers are a load and a store.
-//! - No icount, no plugins, no `-d exec` style logging, no perf maps, and no user mode.
+//! - No icount, no `-d exec` style logging, no perf maps, and no user mode. TCG plugins are
+//!   supported through [`plugin`], with the differences listed there.
 
 #![forbid(unsafe_code)]
 
@@ -76,6 +77,7 @@ pub mod cpu;
 pub mod cpu_exec;
 pub mod cputlb;
 pub mod jit;
+pub mod plugin;
 pub mod tb;
 pub mod tb_maint;
 pub mod translate;

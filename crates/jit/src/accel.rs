@@ -76,11 +76,25 @@ fn qemu_wait_io_event_common(cpu: &mut Cpu<'_>) {
 /// `qemu_wait_io_event()`.
 fn qemu_wait_io_event(cpu: &mut Cpu<'_>) {
     let halt = cpu.core.shared.halt.clone();
+    let mut slept = false;
     {
         let mut g = lock(&halt.0);
         while cpu_thread_is_idle(cpu) {
+            if !slept {
+                slept = true;
+                if crate::plugin::enabled(cpu) {
+                    // The plugin runs without the lock; look again before waiting.
+                    drop(g);
+                    crate::plugin::vcpu_idle(cpu);
+                    g = lock(&halt.0);
+                    continue;
+                }
+            }
             g = halt.1.wait(g).unwrap_or_else(|e| e.into_inner());
         }
+    }
+    if slept {
+        crate::plugin::vcpu_resume(cpu);
     }
     qemu_wait_io_event_common(cpu);
 }
