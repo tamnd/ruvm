@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The SVE and SVE2 translator: QEMU's `target/arm/tcg/translate-sve.c` for the integer,
-//! predicate, permute, element count and memory groups.
+//! floating point, crypto, predicate, permute, element count and memory groups.
 //!
 //! The decoder is generated from QEMU's `sve.decode`. Every data processing instruction is
 //! one call of the `sve` helper ([`super::super::sve_helper`]) and every load and store one
@@ -10,30 +10,37 @@
 //! before `sve_access_check()` (the element sizes and the ID register features) are done in
 //! the same order, so the unallocated encodings and the traps are the same. The instructions
 //! that only move constants or general registers (RDVL, ADDVL, ADDPL, CNT, INC, DEC and the
-//! immediate DUPs) are expanded inline.
+//! immediate DUPs) are expanded inline. The floating point instructions use the status QEMU
+//! picks for each (`FPST_A64_F16` for most half precision forms, else `FPST_A64`), see
+//! [`super::super::sve_fp`].
 //!
 //! Differences from QEMU:
 //!
-//! - The floating point SVE instructions, the widening, narrowing, pairwise and long SVE2
-//!   integer groups, the indexed multiplies, the dot products, the complex integer
-//!   instructions, the SVE2 crypto instructions (AESE, AESD, AESMC, AESIMC, SM4E, SM4EKEY,
-//!   RAX1), DUP (indexed) of a quadword, the SVE2.1 and SME forms, BF16 and I8MM are not
-//!   implemented and raise an Undefined Instruction exception. To match, the `max` model
-//!   clears the ID_AA64ZFR0_EL1 AES, SHA3, SM4, BF16, I8MM, F32MM and F64MM fields that
-//!   QEMU's `max` sets (and the `sve_aes`, `sve_sha3` and `sve_sm4` feature flags); they
-//!   come back when the instructions land.
+//! - Not implemented yet, so an Undefined Instruction exception: the widening, narrowing,
+//!   pairwise and long SVE2 integer groups, the integer indexed multiplies, the dot products,
+//!   the complex integer instructions (CMLA, CDOT, SQRDCMLAH), FMLALB and its family, the
+//!   BF16 and I8MM instructions, DUPQ and the forms of later extensions (SVE2.1, SVE2.2, SME,
+//!   FP8, FEAT_FAMINMAX: the quadword reductions, the zeroing unary forms, FRINT32 and
+//!   FRINT64, FAMAX, FAMIN, FCLAMP and so on). To match, the `max` model clears the
+//!   ID_AA64ZFR0_EL1 BF16, B16B16 and I8MM fields and keeps SVEver at 1 (SVE2), where QEMU's
+//!   `max` sets them and SVEver 2; they come back when the instructions land.
+//! - The BFloat16 forms of the arithmetic, FMLA and indexed groups (FEAT_SVE_B16B16) are
+//!   unallocated as `max` does not have it. QEMU 11.1 runs BFMUL (indexed) without
+//!   checking FEAT_SVE_B16B16.
 //! - LDR and STR of a vector or predicate register do not check the alignment when
 //!   SCTLR_ELx.A asks for it.
 //! - The bits of a Z register above the vector length are zeroed by every write, as they are
 //!   in QEMU; the predicate registers likewise.
 
 use ruvm_jit_core::ir::TempI64;
+use ruvm_softfloat::RoundMode;
 
 use super::S;
 use crate::cpu::EXCP_UDEF;
 use crate::syndrome::syn_sve_access_trap;
-use crate::tcg::sve_helper::{Dsc, SVE, SVE_MEM, b, c, fam, mm, pl, pm, pr, pred_count, r, u};
-use crate::tcg::vfp::vfp_expand_imm;
+use crate::tcg::sve_fp::{data as fdata, f, sh};
+use crate::tcg::sve_helper::{Dsc, SVE, SVE_MEM, b, c, cr, fam, mm, pl, pm, pr, pred_count, r, u};
+use crate::tcg::vfp::{op as fop, vfp_expand_imm};
 
 #[allow(missing_docs, unreachable_pub, dead_code, clippy::pedantic, clippy::nursery)]
 mod decode {
@@ -43,12 +50,13 @@ mod decode {
 use decode::{
     arg_disas_sve30, arg_disas_sve31, arg_disas_sve32, arg_disas_sve33, arg_disas_sve34,
     arg_disas_sve35, arg_disas_sve36, arg_disas_sve37, arg_disas_sve39, arg_disas_sve40,
-    arg_disas_sve41, arg_disas_sve43, arg_disas_sve45, arg_disas_sve47, arg_disas_sve54,
-    arg_incdec_cnt, arg_incdec_pred, arg_incdec2_cnt, arg_incdec2_pred, arg_ptrue, arg_rpr_esz,
-    arg_rpr_s, arg_rpri_esz, arg_rpri_gather_load, arg_rpri_load, arg_rpri_scatter_store,
-    arg_rpri_store, arg_rprr_esz, arg_rprr_gather_load, arg_rprr_load, arg_rprr_s,
-    arg_rprr_scatter_store, arg_rprr_store, arg_rprrr_esz, arg_rr_dbm, arg_rr_esz, arg_rri,
-    arg_rri_esz, arg_rrr_esz, arg_rrri, arg_rrri_esz, arg_rrrr_esz, arg_while,
+    arg_disas_sve41, arg_disas_sve43, arg_disas_sve45, arg_disas_sve47, arg_disas_sve51,
+    arg_disas_sve52, arg_disas_sve53, arg_disas_sve54, arg_incdec_cnt, arg_incdec_pred,
+    arg_incdec2_cnt, arg_incdec2_pred, arg_ptrue, arg_rpr_esz, arg_rpr_s, arg_rpri_esz,
+    arg_rpri_gather_load, arg_rpri_load, arg_rpri_scatter_store, arg_rpri_store, arg_rprr_esz,
+    arg_rprr_gather_load, arg_rprr_load, arg_rprr_s, arg_rprr_scatter_store, arg_rprr_store,
+    arg_rprrr_esz, arg_rr_dbm, arg_rr_esz, arg_rri, arg_rri_esz, arg_rrr_esz, arg_rrri,
+    arg_rrri_esz, arg_rrrr_esz, arg_rrx_esz, arg_rrxr_esz, arg_while,
 };
 
 pub(super) fn disas(s: &mut S<'_, '_>, insn: u32) -> bool {
@@ -441,6 +449,130 @@ macro_rules! last {
         }
     )*};
 }
+
+/// The `data` of an FP call; the status is `FPST_A64_F16` for half precision elements.
+fn fpd(shape: u32, esz: i32, rmode: Option<RoundMode>, extra: u32) -> u32 {
+    fdata(shape, esz == 1, rmode, extra)
+}
+
+/// The predicated floating point instructions on Zd (or Pd), Zn, Zm and Pg.
+macro_rules! fp_rprr {
+    ($($name:ident: $feat:ident, $shape:expr, $op:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rprr_esz) -> bool {
+            let ok = self.feat().$feat && a.esz != 0;
+            self.sve_gen(ok, |s| {
+                let data = fpd($shape, a.esz, None, 0);
+                s.sv(fam::FP, $op, a.esz, [a.rd, a.rn, a.rm, 0, a.pg], data, None, None);
+            })
+        }
+    )*};
+}
+
+/// The unpredicated floating point instructions on Zd, Zn and Zm.
+macro_rules! fp_rrr {
+    ($($name:ident: $op:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rrr_esz) -> bool {
+            let ok = self.feat().sve && a.esz != 0;
+            self.sve_gen(ok, |s| {
+                let data = fpd(sh::ZZZ, a.esz, None, 0);
+                s.sv(fam::FP, $op, a.esz, [a.rd, a.rn, a.rm, 0, 0], data, None, None);
+            })
+        }
+    )*};
+}
+
+/// The floating point instructions on Zd (or Pd or Vd), Zn and Pg, with a rounding mode
+/// and extra bits.
+macro_rules! fp_rpr {
+    ($($name:ident: $feat:ident, $shape:expr, $op:expr, $rm:expr, $extra:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rpr_esz) -> bool {
+            let ok = self.feat().$feat && a.esz != 0;
+            self.sve_gen(ok, |s| {
+                let data = fpd($shape, a.esz, $rm, $extra);
+                s.sv(fam::FP, $op, a.esz, [a.rd, a.rn, 0, 0, a.pg], data, None, None);
+            })
+        }
+    )*};
+}
+
+/// The conversions: the container size, the source and result sizes, the status (true for
+/// `FPST_A64_F16`) and the rounding mode.
+macro_rules! fp_cvt {
+    ($($name:ident: $feat:ident, $op:expr, $c:expr, $from:expr, $to:expr, $h:expr, $rm:expr;)*)
+    => {$(
+        fn $name(&mut self, a: &mut arg_rpr_esz) -> bool {
+            let ok = self.feat().$feat;
+            self.sve_gen(ok, |s| {
+                let data = fdata(sh::UN, $h, $rm, $from | $to << 2);
+                s.sv(fam::FP, $op, $c, [a.rd, a.rn, 0, 0, a.pg], data, None, None);
+            })
+        }
+    )*};
+}
+
+/// The unpredicated unary floating point instructions.
+macro_rules! fp_rr {
+    ($($name:ident: $op:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rr_esz) -> bool {
+            let ok = self.feat().sve && a.esz != 0;
+            self.sve_gen(ok, |s| {
+                let data = fpd(sh::UNU, a.esz, None, 0);
+                s.sv(fam::FP, $op, a.esz, [a.rd, a.rn, 0, 0, 0], data, None, None);
+            })
+        }
+    )*};
+}
+
+/// The floating point instructions with an immediate that selects one of two constants,
+/// given for the half, single and double sizes.
+macro_rules! fp_zpzi {
+    ($($name:ident: $op:expr, $c0:expr, $c1:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rpri_esz) -> bool {
+            let ok = self.feat().sve && a.esz != 0;
+            self.sve_gen(ok, |s| {
+                let t: [u64; 3] = if a.imm != 0 { $c1 } else { $c0 };
+                let x = s.c64(t[(a.esz - 1) as usize] as i64);
+                let data = fpd(sh::ZPZS, a.esz, None, 0);
+                s.sv(fam::FP, $op, a.esz, [a.rd, a.rn, 0, 0, a.pg], data, Some(x), None);
+            })
+        }
+    )*};
+}
+
+/// The predicated multiply-adds; the extra bits say which operands are negated.
+macro_rules! fp_mla {
+    ($($name:ident: $extra:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rprrr_esz) -> bool {
+            let ok = self.feat().sve && a.esz != 0;
+            self.sve_gen(ok, |s| {
+                let data = fpd(sh::MLA, a.esz, None, $extra);
+                let r = [a.rd, a.rn, a.rm, a.ra, a.pg];
+                s.sv(fam::FP, fop::MLA, a.esz, r, data, None, None);
+            })
+        }
+    )*};
+}
+
+/// The SVE2 crypto instructions on Zd, Zn and Zm.
+macro_rules! sve_crypto {
+    ($($name:ident: $feat:ident, $op:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rrr_esz) -> bool {
+            let ok = self.feat().$feat;
+            self.sve_gen(ok, |s| {
+                s.sv(fam::CRYPTO, $op, 0, [a.rd, a.rn, a.rm, 0, 0], 0, None, None);
+            })
+        }
+    )*};
+}
+
+/// The constants of FADD, FSUB and FSUBR (immediate).
+const HALF_ONE: ([u64; 3], [u64; 3]) =
+    ([0x3800, 0x3f00_0000, 0x3fe0_0000_0000_0000], [0x3c00, 0x3f80_0000, 0x3ff0_0000_0000_0000]);
+/// The constants of FMUL (immediate).
+const HALF_TWO: ([u64; 3], [u64; 3]) =
+    ([0x3800, 0x3f00_0000, 0x3fe0_0000_0000_0000], [0x4000, 0x4000_0000, 0x4000_0000_0000_0000]);
+/// The constants of FMAX, FMIN, FMAXNM and FMINNM (immediate).
+const ZERO_ONE: ([u64; 3], [u64; 3]) = ([0; 3], [0x3c00, 0x3f80_0000, 0x3ff0_0000_0000_0000]);
 
 impl decode::DisasSve for S<'_, '_> {
     // The field functions of sve.decode.
@@ -1513,6 +1645,222 @@ impl decode::DisasSve for S<'_, '_> {
         let ok = a.rm != 31 && self.feat().sve;
         self.sve_gen(ok, |_| {})
     }
+
+    // Floating point arithmetic.
+
+    fp_rprr! {
+        trans_FADD_zpzz: sve, sh::ZPZZ, fop::ADD;
+        trans_FSUB_zpzz: sve, sh::ZPZZ, fop::SUB;
+        trans_FMUL_zpzz: sve, sh::ZPZZ, fop::MUL;
+        trans_FMAXNM_zpzz: sve, sh::ZPZZ, fop::MAXNM;
+        trans_FMINNM_zpzz: sve, sh::ZPZZ, fop::MINNM;
+        trans_FMAX_zpzz: sve, sh::ZPZZ, fop::MAX;
+        trans_FMIN_zpzz: sve, sh::ZPZZ, fop::MIN;
+        trans_FABD: sve, sh::ZPZZ, fop::ABD;
+        trans_FSCALE: sve, sh::ZPZZ, f::SCALE;
+        trans_FMULX: sve, sh::ZPZZ, fop::MULX;
+        trans_FDIV: sve, sh::ZPZZ, fop::DIV;
+        trans_FADDP: sve2, sh::PAIR, fop::ADDP;
+        trans_FMAXNMP: sve2, sh::PAIR, fop::MAXNMP;
+        trans_FMINNMP: sve2, sh::PAIR, fop::MINNMP;
+        trans_FMAXP: sve2, sh::PAIR, fop::MAXP;
+        trans_FMINP: sve2, sh::PAIR, fop::MINP;
+        trans_FCMGE_ppzz: sve, sh::CMP, fop::CGE;
+        trans_FCMGT_ppzz: sve, sh::CMP, fop::CGT;
+        trans_FCMEQ_ppzz: sve, sh::CMP, fop::CEQ;
+        trans_FCMNE_ppzz: sve, sh::CMP, f::CNE;
+        trans_FCMUO_ppzz: sve, sh::CMP, f::CUO;
+        trans_FACGE_ppzz: sve, sh::CMP, fop::ACGE;
+        trans_FACGT_ppzz: sve, sh::CMP, fop::ACGT;
+        trans_FADDA: sve, sh::RED, f::ADDA;
+    }
+
+    fp_rrr! {
+        trans_FADD_zzz: fop::ADD;
+        trans_FSUB_zzz: fop::SUB;
+        trans_FMUL_zzz: fop::MUL;
+        trans_FTSMUL: f::TSMUL;
+        trans_FRECPS: fop::RECPS;
+        trans_FRSQRTS: fop::RSQRTS;
+        trans_FTSSEL: f::TSSEL;
+    }
+
+    fp_rpr! {
+        trans_FCMGE_ppz0: sve, sh::CMP, fop::CGE, None, 1;
+        trans_FCMGT_ppz0: sve, sh::CMP, fop::CGT, None, 1;
+        trans_FCMLE_ppz0: sve, sh::CMP, fop::CGE, None, 3;
+        trans_FCMLT_ppz0: sve, sh::CMP, fop::CGT, None, 3;
+        trans_FCMEQ_ppz0: sve, sh::CMP, fop::CEQ, None, 1;
+        trans_FCMNE_ppz0: sve, sh::CMP, f::CNE, None, 1;
+        trans_FADDV: sve, sh::RED, fop::ADD, None, 0;
+        trans_FMAXNMV: sve, sh::RED, fop::MAXNM, None, 0;
+        trans_FMINNMV: sve, sh::RED, fop::MINNM, None, 0;
+        trans_FMAXV: sve, sh::RED, fop::MAX, None, 0;
+        trans_FMINV: sve, sh::RED, fop::MIN, None, 0;
+        trans_FRINTN_m: sve, sh::UN, fop::RINT, Some(RoundMode::NearestEven), 0;
+        trans_FRINTP_m: sve, sh::UN, fop::RINT, Some(RoundMode::Up), 0;
+        trans_FRINTM_m: sve, sh::UN, fop::RINT, Some(RoundMode::Down), 0;
+        trans_FRINTZ_m: sve, sh::UN, fop::RINT, Some(RoundMode::ToZero), 0;
+        trans_FRINTA_m: sve, sh::UN, fop::RINT, Some(RoundMode::TiesAway), 0;
+        trans_FRINTX_m: sve, sh::UN, fop::RINTX, None, 0;
+        trans_FRINTI_m: sve, sh::UN, fop::RINT, None, 0;
+        trans_FRECPX_m: sve, sh::UN, fop::RECPX, None, 0;
+        trans_FSQRT_m: sve, sh::UN, fop::SQRT, None, 0;
+        trans_FLOGB_m: sve2, sh::UN, f::LOGB, None, 0;
+    }
+
+    fp_rr! {
+        trans_FRECPE: fop::RECPE;
+        trans_FRSQRTE: fop::RSQRTE;
+        trans_FEXPA: f::EXPA;
+    }
+
+    fp_zpzi! {
+        trans_FADD_zpzi: fop::ADD, HALF_ONE.0, HALF_ONE.1;
+        trans_FSUB_zpzi: fop::SUB, HALF_ONE.0, HALF_ONE.1;
+        trans_FSUBR_zpzi: f::SUBR, HALF_ONE.0, HALF_ONE.1;
+        trans_FMUL_zpzi: fop::MUL, HALF_TWO.0, HALF_TWO.1;
+        trans_FMAXNM_zpzi: fop::MAXNM, ZERO_ONE.0, ZERO_ONE.1;
+        trans_FMINNM_zpzi: fop::MINNM, ZERO_ONE.0, ZERO_ONE.1;
+        trans_FMAX_zpzi: fop::MAX, ZERO_ONE.0, ZERO_ONE.1;
+        trans_FMIN_zpzi: fop::MIN, ZERO_ONE.0, ZERO_ONE.1;
+    }
+
+    fp_mla! {
+        trans_FMLA_zpzzz: 0;
+        trans_FMLS_zpzzz: 1;
+        trans_FNMLA_zpzzz: 3;
+        trans_FNMLS_zpzzz: 2;
+    }
+
+    fp_cvt! {
+        trans_FCVT_sh_m: sve, f::CVT, 2, 2, 1, false, None;
+        trans_FCVT_hs_m: sve, f::CVT, 2, 1, 2, true, None;
+        trans_FCVT_dh_m: sve, f::CVT, 3, 3, 1, false, None;
+        trans_FCVT_hd_m: sve, f::CVT, 3, 1, 3, true, None;
+        trans_FCVT_ds_m: sve, f::CVT, 3, 3, 2, false, None;
+        trans_FCVT_sd_m: sve, f::CVT, 3, 2, 3, false, None;
+        trans_FCVTZS_hh_m: sve, f::TOSINT, 1, 1, 1, true, None;
+        trans_FCVTZU_hh_m: sve, f::TOUINT, 1, 1, 1, true, None;
+        trans_FCVTZS_hs_m: sve, f::TOSINT, 2, 1, 2, true, None;
+        trans_FCVTZU_hs_m: sve, f::TOUINT, 2, 1, 2, true, None;
+        trans_FCVTZS_hd_m: sve, f::TOSINT, 3, 1, 3, true, None;
+        trans_FCVTZU_hd_m: sve, f::TOUINT, 3, 1, 3, true, None;
+        trans_FCVTZS_ss_m: sve, f::TOSINT, 2, 2, 2, false, None;
+        trans_FCVTZU_ss_m: sve, f::TOUINT, 2, 2, 2, false, None;
+        trans_FCVTZS_ds_m: sve, f::TOSINT, 3, 3, 2, false, None;
+        trans_FCVTZU_ds_m: sve, f::TOUINT, 3, 3, 2, false, None;
+        trans_FCVTZS_sd_m: sve, f::TOSINT, 3, 2, 3, false, None;
+        trans_FCVTZU_sd_m: sve, f::TOUINT, 3, 2, 3, false, None;
+        trans_FCVTZS_dd_m: sve, f::TOSINT, 3, 3, 3, false, None;
+        trans_FCVTZU_dd_m: sve, f::TOUINT, 3, 3, 3, false, None;
+        trans_SCVTF_hh_m: sve, f::SCVTF, 1, 1, 1, true, None;
+        trans_SCVTF_sh_m: sve, f::SCVTF, 2, 2, 1, true, None;
+        trans_SCVTF_dh_m: sve, f::SCVTF, 3, 3, 1, true, None;
+        trans_SCVTF_ss_m: sve, f::SCVTF, 2, 2, 2, false, None;
+        trans_SCVTF_sd_m: sve, f::SCVTF, 3, 2, 3, false, None;
+        trans_SCVTF_ds_m: sve, f::SCVTF, 3, 3, 2, false, None;
+        trans_SCVTF_dd_m: sve, f::SCVTF, 3, 3, 3, false, None;
+        trans_UCVTF_hh_m: sve, f::UCVTF, 1, 1, 1, true, None;
+        trans_UCVTF_sh_m: sve, f::UCVTF, 2, 2, 1, true, None;
+        trans_UCVTF_dh_m: sve, f::UCVTF, 3, 3, 1, true, None;
+        trans_UCVTF_ss_m: sve, f::UCVTF, 2, 2, 2, false, None;
+        trans_UCVTF_sd_m: sve, f::UCVTF, 3, 2, 3, false, None;
+        trans_UCVTF_ds_m: sve, f::UCVTF, 3, 3, 2, false, None;
+        trans_UCVTF_dd_m: sve, f::UCVTF, 3, 3, 3, false, None;
+        trans_FCVTNT_sh_m: sve2, f::CVTNT, 2, 2, 1, false, None;
+        trans_FCVTNT_ds_m: sve2, f::CVTNT, 3, 3, 2, false, None;
+        trans_FCVTLT_hs_m: sve2, f::CVTLT, 2, 1, 2, true, None;
+        trans_FCVTLT_sd_m: sve2, f::CVTLT, 3, 2, 3, false, None;
+        trans_FCVTX_ds_m: sve2, f::CVT, 3, 3, 2, false, Some(RoundMode::ToOdd);
+        trans_FCVTXNT_ds_m: sve2, f::CVTNT, 3, 3, 2, false, Some(RoundMode::ToOdd);
+    }
+
+    fn trans_FCADD(&mut self, a: &mut arg_disas_sve51) -> bool {
+        let ok = self.feat().sve && a.esz != 0;
+        self.sve_gen(ok, |s| {
+            let data = fpd(sh::CPLX, a.esz, None, a.rot as u32);
+            s.sv(fam::FP, f::CADD, a.esz, [a.rd, a.rn, a.rm, 0, a.pg], data, None, None);
+        })
+    }
+
+    fn trans_FCMLA_zpzzz(&mut self, a: &mut arg_disas_sve52) -> bool {
+        let ok = self.feat().sve && a.esz != 0;
+        self.sve_gen(ok, |s| {
+            let data = fpd(sh::CPLX, a.esz, None, a.rot as u32);
+            s.sv(fam::FP, f::CMLA, a.esz, [a.rd, a.rn, a.rm, a.ra, a.pg], data, None, None);
+        })
+    }
+
+    fn trans_FCMLA_zzxz(&mut self, a: &mut arg_disas_sve53) -> bool {
+        let ok = self.feat().sve;
+        self.sve_gen(ok, |s| {
+            let data = fpd(sh::IDX, a.esz, None, (a.index as u32) << 2 | a.rot as u32);
+            s.sv(fam::FP, f::CMLA, a.esz, [a.rd, a.rn, a.rm, a.ra, 0], data, None, None);
+        })
+    }
+
+    fn trans_FMLA_zzxz(&mut self, a: &mut arg_rrxr_esz) -> bool {
+        self.fp_idx(fop::MLA, a.esz, [a.rd, a.rn, a.rm, a.ra, 0], a.index)
+    }
+
+    fn trans_FMLS_zzxz(&mut self, a: &mut arg_rrxr_esz) -> bool {
+        self.fp_idx(fop::MLS, a.esz, [a.rd, a.rn, a.rm, a.ra, 0], a.index)
+    }
+
+    fn trans_FMUL_zzx(&mut self, a: &mut arg_rrx_esz) -> bool {
+        self.fp_idx(fop::MUL, a.esz, [a.rd, a.rn, a.rm, 0, 0], a.index)
+    }
+
+    fn trans_FTMAD(&mut self, a: &mut arg_rrri_esz) -> bool {
+        let ok = self.feat().sve && a.esz != 0;
+        self.sve_gen(ok, |s| {
+            let data = fpd(sh::MISC, a.esz, None, a.imm as u32);
+            s.sv(fam::FP, f::TMAD, a.esz, [a.rd, a.rn, a.rm, 0, 0], data, None, None);
+        })
+    }
+
+    fn trans_FMMLA_s(&mut self, a: &mut arg_rrrr_esz) -> bool {
+        let ok = self.feat().sve_f32mm;
+        self.fmmla(ok, 2, a)
+    }
+
+    fn trans_FMMLA_d(&mut self, a: &mut arg_rrrr_esz) -> bool {
+        let ok = self.feat().sve_f64mm;
+        self.fmmla(ok, 3, a)
+    }
+
+    // The SVE2 crypto instructions.
+
+    sve_crypto! {
+        trans_AESE: sve_aes, cr::AESE;
+        trans_AESD: sve_aes, cr::AESD;
+        trans_SM4E: sve_sm4, cr::SM4E;
+        trans_SM4EKEY: sve_sm4, cr::SM4EKEY;
+        trans_RAX1: sve_sha3, cr::RAX1;
+    }
+
+    fn trans_AESMC(&mut self, a: &mut arg_disas_sve39) -> bool {
+        let ok = self.feat().sve_aes;
+        self.sve_gen(ok, |s| {
+            s.sv(fam::CRYPTO, cr::AESMC, 0, [a.rd, a.rd, 0, 0, 0], 0, None, None);
+        })
+    }
+
+    fn trans_AESIMC(&mut self, a: &mut arg_disas_sve39) -> bool {
+        let ok = self.feat().sve_aes;
+        self.sve_gen(ok, |s| {
+            s.sv(fam::CRYPTO, cr::AESIMC, 0, [a.rd, a.rd, 0, 0, 0], 0, None, None);
+        })
+    }
+
+    fn trans_PMULLB(&mut self, a: &mut arg_rrr_esz) -> bool {
+        self.pmull(a, 0)
+    }
+
+    fn trans_PMULLT(&mut self, a: &mut arg_rrr_esz) -> bool {
+        self.pmull(a, 1)
+    }
 }
 
 /// The data of a gather or scatter descriptor.
@@ -1591,6 +1939,43 @@ impl S<'_, '_> {
         self.sve_gen(ok, |s| {
             let addr = s.cont_addr(a.rn, None, 0, i64::from(a.imm) * size);
             s.svm(op, 0, [a.rd, 0, 0, 0, 0], data, addr);
+        })
+    }
+}
+
+impl S<'_, '_> {
+    /// FMLA, FMLS and FMUL (indexed). The BFloat16 forms need FEAT_SVE_B16B16.
+    fn fp_idx(&mut self, op: u32, esz: i32, r: [i32; 5], index: i32) -> bool {
+        let ok = self.feat().sve && esz != 0;
+        self.sve_gen(ok, |s| {
+            let data = fpd(sh::IDX, esz, None, index as u32);
+            s.sv(fam::FP, op, esz, r, data, None, None);
+        })
+    }
+
+    /// `do_fmmla()`: the vector length must hold one matrix of the element size.
+    fn fmmla(&mut self, ok: bool, esz: i32, a: &arg_rrrr_esz) -> bool {
+        if !ok {
+            return false;
+        }
+        if self.sve_access_check() {
+            if (self.d.vl as usize) < 4 << esz {
+                self.unallocated_encoding();
+            } else {
+                let data = fdata(sh::MISC, false, None, 0);
+                let r = [a.rd, a.rn, a.rm, a.ra, 0];
+                self.sv(fam::FP, f::MMLA, esz, r, data, None, None);
+            }
+        }
+        true
+    }
+
+    /// `do_trans_pmull()`.
+    fn pmull(&mut self, a: &arg_rrr_esz, sel: u32) -> bool {
+        let f = self.feat();
+        let ok = f.sve2 && if a.esz == 0 { f.sve_aes } else { a.esz != 2 };
+        self.sve_gen(ok, |s| {
+            s.sv(fam::CRYPTO, cr::PMULL, a.esz, [a.rd, a.rn, a.rm, 0, 0], sel, None, None);
         })
     }
 }

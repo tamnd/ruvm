@@ -30,6 +30,10 @@ const CODE: u64 = 0x4020_0000;
 const MID: u64 = 0x4030_0000;
 const BUF: usize = 1024;
 const WFI: u32 = 0xd503_207f;
+/// The number of Z registers in the state.
+const NZ: usize = 14;
+/// `mrs x28, fpsr`, run after the instruction to read the flags it raised.
+const MRS_X28_FPSR: u32 = 0xd53b_443c;
 /// CPACR_EL1.FPEN = 3 and ZEN = 3: FP, AdvSIMD and SVE enabled at EL0 and EL1.
 const FPEN_ZEN: u64 = (3 << 20) | (3 << 16);
 
@@ -113,7 +117,7 @@ impl Rng {
 
 /// The state every case starts from, `init_state()` in `gen_sve.py`.
 struct Init {
-    /// Z0 to Z7, `vl / 8` words each.
+    /// Z0 to Z13, `vl / 8` words each.
     z: Vec<Vec<u64>>,
     /// P0 to P7, as `vl / 8` bits.
     p: Vec<u64>,
@@ -126,7 +130,8 @@ struct Init {
 /// byte offsets in its 64-bit lanes, Z5 small signed offsets in its 32-bit lanes, Z6 and Z7 64
 /// and 32-bit addresses into the buffer. P1 is all true and the rest random. X8 points to the
 /// middle of the 1 KiB buffer and X9 to X15 hold small and edge values, X14 16 bytes before the
-/// end of RAM.
+/// end of RAM. Z8 to Z13 hold half, single and double precision values from [`FP_H`],
+/// [`FP_S`] and [`FP_D`].
 fn init_state(vq: usize) -> Init {
     let vl = 16 * vq;
     let mut r = Rng(0x9E37_79B9_7F4A_7C15);
@@ -155,6 +160,11 @@ fn init_state(vq: usize) -> Init {
         };
         z.push(w);
     }
+    for (mul, add) in [(3, 0), (5, 1)] {
+        z.push(fp_reg(vl, &FP_H.map(u64::from), 2, mul, add));
+        z.push(fp_reg(vl, &FP_S.map(u64::from), 4, mul, add));
+        z.push(fp_reg(vl, &FP_D, 8, mul, add));
+    }
     let pmask = (1u64 << (vl / 8 * 8)) - 1;
     let p = (0..8).map(|n| if n == 1 { pmask } else { r.next() & pmask }).collect();
     let mut x = [0; 16];
@@ -173,6 +183,59 @@ fn init_state(vq: usize) -> Init {
     ]);
     let mem = (0..BUF).map(|j| (j * 37 + 11) as u8).collect();
     Init { z, p, x, nzcv: 0xa, mem }
+}
+
+/// The floating point values of Z8 to Z13, as in `gen_sve.py`: ones, twos, halves, pi,
+/// zeros of both signs, infinities, quiet and signaling NaNs, denormals, the largest finite
+/// values, a third and values out of the integer ranges.
+const FP_H: [u16; 16] = [
+    0x3c00, 0xc000, 0x3800, 0x4248, 0x0000, 0x8000, 0x7c00, 0x7e00, 0x0001, 0x7bff, 0xbe00, 0x5640,
+    0x7d00, 0xfc00, 0x3555, 0xd140,
+];
+const FP_S: [u32; 16] = [
+    0x3f80_0000,
+    0xc000_0000,
+    0x3f00_0000,
+    0x4049_0fdb,
+    0x0000_0000,
+    0x8000_0000,
+    0x7f80_0000,
+    0x7fc0_0000,
+    0x0000_0001,
+    0x7f7f_ffff,
+    0xbfc0_0000,
+    0x42c8_0000,
+    0x7fa0_0000,
+    0xcf00_0001,
+    0x3eaa_aaab,
+    0x4f80_0000,
+];
+const FP_D: [u64; 16] = [
+    0x3ff0_0000_0000_0000,
+    0xc000_0000_0000_0000,
+    0x3fe0_0000_0000_0000,
+    0x4009_21fb_5444_2d18,
+    0,
+    0x8000_0000_0000_0000,
+    0x7ff0_0000_0000_0000,
+    0x7ff8_0000_0000_0000,
+    1,
+    0x7fef_ffff_ffff_ffff,
+    0xbff8_0000_0000_0000,
+    0x4059_0000_0000_0000,
+    0x7ff4_0000_0000_0000,
+    0xc3e0_0000_0000_0001,
+    0x3fd5_5555_5555_5555,
+    0x43f0_0000_0000_0000,
+];
+
+/// `fp_reg()` of `gen_sve.py`: lane `i` (of `size` bytes) is `table[(i * mul + add) % 16]`.
+fn fp_reg(vl: usize, table: &[u64; 16], size: usize, mul: usize, add: usize) -> Vec<u64> {
+    let mut bytes = Vec::with_capacity(vl);
+    for i in 0..vl / size {
+        bytes.extend_from_slice(&table[(i * mul + add) % 16].to_le_bytes()[..size]);
+    }
+    bytes.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()
 }
 
 /// A hex number of any length as little endian 64-bit words, `n` of them.
@@ -204,6 +267,7 @@ fn run_vq(vq: usize, lines: &[&str]) -> Vec<String> {
         let mut want_x = init.x;
         let mut want_nzcv = init.nzcv;
         let mut want_esr = 0;
+        let mut want_fpsr = 0;
         let mut want_mem = init.mem.clone();
         for o in outs.split_whitespace() {
             let (name, v) = o.split_once('=').expect("name=value");
@@ -216,6 +280,8 @@ fn run_vq(vq: usize, lines: &[&str]) -> Vec<String> {
                 want_nzcv = hex(v) as u32;
             } else if name == "esr" {
                 want_esr = hex(v);
+            } else if name == "fpsr" {
+                want_fpsr = hex(v);
             } else {
                 let n: usize = name[1..].parse().unwrap();
                 match &name[..1] {
@@ -228,25 +294,28 @@ fn run_vq(vq: usize, lines: &[&str]) -> Vec<String> {
         }
 
         let mut st = w.state(vq as u32);
-        for n in 0..8 {
+        for n in 0..NZ {
             st.zregs[n][..vl / 8].copy_from_slice(&init.z[n]);
+        }
+        for n in 0..8 {
             st.pregs[n][0] = init.p[n];
         }
         st.pregs[16][0] = (1u64 << (pl * 8)) - 1;
         st.xregs[..16].copy_from_slice(&init.x);
         st.set_nzcv(init.nzcv << 28);
         w.write(MID - BUF as u64 / 2, &init.mem);
-        let pc = CODE + 8 * k as u64;
-        let st = w.run(st, pc, &[insn, WFI]);
+        let pc = CODE + 16 * k as u64;
+        let st = w.run(st, pc, &[insn, MRS_X28_FPSR, WFI]);
 
         let mut diffs = Vec::new();
-        for n in 0..8 {
-            if st.zregs[n][..vl / 8] != want_z[n][..]
-                || st.zregs[n][vl / 8..].iter().any(|&v| v != 0)
-            {
-                diffs.push(format!("z{n}={:x?}", &st.zregs[n][..vl / 8]));
+        for (n, want) in want_z.iter().enumerate() {
+            let z = &st.zregs[n];
+            if z[..vl / 8] != want[..] || z[vl / 8..].iter().any(|&v| v != 0) {
+                diffs.push(format!("z{n}={:x?}", &z[..vl / 8]));
             }
-            if st.pregs[n][0] != want_p[n] {
+        }
+        for (n, &want) in want_p.iter().enumerate() {
+            if st.pregs[n][0] != want {
                 diffs.push(format!("p{n}={:x}", st.pregs[n][0]));
             }
         }
@@ -266,6 +335,11 @@ fn run_vq(vq: usize, lines: &[&str]) -> Vec<String> {
         }
         if st.esr_el[1] != want_esr {
             diffs.push(format!("esr={:x}", st.esr_el[1]));
+        }
+        // FPSR as `mrs x28, fpsr` read it after the instruction; an exception skips the
+        // read, leaving the zero X28 starts with, as the flags QEMU dumps are then zero.
+        if st.xregs[28] != want_fpsr {
+            diffs.push(format!("fpsr={:x}", st.xregs[28]));
         }
         let mem = w.read(MID - BUF as u64 / 2, BUF);
         for j in (0..BUF).step_by(8) {
@@ -352,7 +426,7 @@ fn zcr_write_narrows_the_registers() {
 fn max_id_registers() {
     let w = World::max(4);
     let st = w.run(w.state(4), CODE, &[MRS_X3_ID_AA64ZFR0, MRS_X4_ID_AA64PFR0, WFI]);
-    assert_eq!(st.xregs[3], 0x0000_0000_0001_0001);
+    assert_eq!(st.xregs[3], 0x0110_0101_0001_0021);
     assert_eq!((st.xregs[4] >> 32) & 0xf, 1);
 }
 

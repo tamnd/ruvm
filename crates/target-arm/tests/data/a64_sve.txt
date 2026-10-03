@@ -7,7 +7,8 @@
 # the instruction word, then what it changed from the initial state of a64_sve.rs:
 # zN, pN and ffr as one hex number (element 0 lowest), xN, nzcv (the four flag
 # bits), esr (ESR_EL1 if the instruction raised an exception) and mOFF, the 64-bit
-# little endian word at byte offset OFF from X8. Then the assembly.
+# little endian word at byte offset OFF from X8, fpsr (FPSR if not zero). Then the
+# assembly.
 vq 1
 04000862 => z2=97ba1dce4e7b6b63c6bdf72477ad3cbb ; add z2.b, p2/m, z2.b, z3.b
 04400862 => z2=70ba1dce4e7b6c63c7bdf82478ad3dbb ; add z2.h, p2/m, z2.h, z3.h
@@ -1501,6 +1502,492 @@ e58009c3 =>  ; str p3, [x14, #2, mul vl]
 85c14903 =>  ; prfw pldl2strm, p2, [x8, #1, mul vl]
 c581e8c0 =>  ; prfd pldl1keep, p2, [z6.d, #8]
 84652908 =>  ; prfh pstl1keep, p2, [x8, z5.s, sxtw #1]
+65408968 => z8=00003800d1407f007bff7c007c00bc00 fpsr=11 ; fadd z8.h, p2/m, z8.h, z11.h
+65808989 => z9=7f7fffff7f8000007f800000bf800000 ; fadd z9.s, p2/m, z9.s, z12.s
+65c089aa => z10=7ff0000000000000bff0000000000000 ; fadd z10.d, p2/m, z10.d, z13.d
+65418968 => z8=80003800d1407f007bff7c00fc004200 fpsr=11 ; fsub z8.h, p2/m, z8.h, z11.h
+65818989 => z9=7f7fffff7f800000ff80000040400000 ; fsub z9.s, p2/m, z9.s, z12.s
+65c189aa => z10=fff00000000000004008000000000000 ; fsub z10.d, p2/m, z10.d, z13.d
+65428968 => z8=80003800d1407f007bff7c007c00c000 fpsr=1 ; fmul z8.h, p2/m, z8.h, z11.h
+65828989 => z9=7f7fffff7f8000007f800000c0000000 ; fmul z9.s, p2/m, z9.s, z12.s
+65c289aa => z10=7ff0000000000000c000000000000000 ; fmul z10.d, p2/m, z10.d, z13.d
+65448968 => z8=00003800d1407f007bff7c007c003c00 fpsr=1 ; fmaxnm z8.h, p2/m, z8.h, z11.h
+65848989 => z9=7f7fffff7f8000007f8000003f800000 ; fmaxnm z9.s, p2/m, z9.s, z12.s
+65c489aa => z10=7ff00000000000003ff0000000000000 ; fmaxnm z10.d, p2/m, z10.d, z13.d
+65458968 => z8=80003800d1407f003c0056404248c000 fpsr=1 ; fminnm z8.h, p2/m, z8.h, z11.h
+65858989 => z9=7f7fffff42c8000040490fdbc0000000 ; fminnm z9.s, p2/m, z9.s, z12.s
+65c589aa => z10=400921fb54442d18c000000000000000 ; fminnm z10.d, p2/m, z10.d, z13.d
+65468968 => z8=00003800d1407f007bff7c007c003c00 fpsr=1 ; fmax z8.h, p2/m, z8.h, z11.h
+65868989 => z9=7f7fffff7f8000007f8000003f800000 ; fmax z9.s, p2/m, z9.s, z12.s
+65c689aa => z10=7ff00000000000003ff0000000000000 ; fmax z10.d, p2/m, z10.d, z13.d
+65478968 => z8=80003800d1407f003c0056404248c000 fpsr=1 ; fmin z8.h, p2/m, z8.h, z11.h
+65878989 => z9=7f7fffff42c8000040490fdbc0000000 ; fmin z9.s, p2/m, z9.s, z12.s
+65c789aa => z10=400921fb54442d18c000000000000000 ; fmin z10.d, p2/m, z10.d, z13.d
+65488968 => z8=00003800d1407f007bff7c007c004200 fpsr=11 ; fabd z8.h, p2/m, z8.h, z11.h
+65888989 => z9=7f7fffff7f8000007f80000040400000 ; fabd z9.s, p2/m, z9.s, z12.s
+65c889aa => z10=7ff00000000000004008000000000000 ; fabd z10.d, p2/m, z10.d, z13.d
+65498968 => z8=80003800d1407f007c007c007c000000 fpsr=1d ; fscale z8.h, p2/m, z8.h, z11.h
+65898989 => z9=7f7fffff7f8000007f80000000000000 fpsr=1c ; fscale z9.s, p2/m, z9.s, z12.s
+65c989aa => z10=7ff00000000000000000000000000000 fpsr=1c ; fscale z10.d, p2/m, z10.d, z13.d
+654a8968 => z8=80003800d1407f007bff7c007c00c000 fpsr=1 ; fmulx z8.h, p2/m, z8.h, z11.h
+658a8989 => z9=7f7fffff7f8000007f800000c0000000 ; fmulx z9.s, p2/m, z9.s, z12.s
+65ca89aa => z10=7ff0000000000000c000000000000000 ; fmulx z10.d, p2/m, z10.d, z13.d
+654d8968 => z8=7e003800d1407f007bff7c000000b800 fpsr=1 ; fdiv z8.h, p2/m, z8.h, z11.h
+658d8989 => z9=7f7fffff7f80000000000000bf000000 ; fdiv z9.s, p2/m, z9.s, z12.s
+65cd89aa => z10=0000000000000000bfe0000000000000 ; fdiv z10.d, p2/m, z10.d, z13.d
+654c8968 => z8=7e003800d1407f00010000007c00c000 fpsr=19 ; fdivr z8.h, p2/m, z8.h, z11.h
+658c8989 => z9=7f7fffff000000007f800000c0000000 ; fdivr z9.s, p2/m, z9.s, z12.s
+65cc89aa => z10=7ff0000000000000c000000000000000 ; fdivr z10.d, p2/m, z10.d, z13.d
+65438968 => z8=00003800d1407f00fbfffc007c00c200 fpsr=11 ; fsubr z8.h, p2/m, z8.h, z11.h
+65838989 => z9=7f7fffffff8000007f800000c0400000 ; fsubr z9.s, p2/m, z9.s, z12.s
+65c389aa => z10=7ff0000000000000c008000000000000 ; fsubr z10.d, p2/m, z10.d, z13.d
+64508968 => z8=d1403800d1407f0056507c007c004424 fpsr=1 ; faddp z8.h, p2/m, z8.h, z11.h
+64908989 => z9=7f7fffff7f8000007f800000408487ee fpsr=10 ; faddp z9.s, p2/m, z9.s, z12.s
+64d089aa => z10=7ff0000000000000401090fdaa22168c ; faddp z10.d, p2/m, z10.d, z13.d
+64548968 => z8=00003800d1407f0056407c007c004248 fpsr=1 ; fmaxnmp z8.h, p2/m, z8.h, z11.h
+64948989 => z9=7f7fffff7f8000007f80000040490fdb ; fmaxnmp z9.s, p2/m, z9.s, z12.s
+64d489aa => z10=7ff0000000000000400921fb54442d18 ; fmaxnmp z10.d, p2/m, z10.d, z13.d
+64558968 => z8=d1403800d1407f003c007bffc0003c00 fpsr=1 ; fminnmp z8.h, p2/m, z8.h, z11.h
+64958989 => z9=7f7fffff7f7fffffc00000003f800000 ; fminnmp z9.s, p2/m, z9.s, z12.s
+64d589aa => z10=c0000000000000003ff0000000000000 ; fminnmp z10.d, p2/m, z10.d, z13.d
+64568968 => z8=00003800d1407f0056407c007c004248 fpsr=1 ; fmaxp z8.h, p2/m, z8.h, z11.h
+64968989 => z9=7f7fffff7f8000007f80000040490fdb ; fmaxp z9.s, p2/m, z9.s, z12.s
+64d689aa => z10=7ff0000000000000400921fb54442d18 ; fmaxp z10.d, p2/m, z10.d, z13.d
+64578968 => z8=d1403800d1407f003c007bffc0003c00 fpsr=1 ; fminp z8.h, p2/m, z8.h, z11.h
+64978989 => z9=7f7fffff7f7fffffc00000003f800000 ; fminp z9.s, p2/m, z9.s, z12.s
+64d789aa => z10=c0000000000000003ff0000000000000 ; fminp z10.d, p2/m, z10.d, z13.d
+65408862 => z2=d9aa1dce4e7bfa3e2cb4e144d6e8f2cd fpsr=10 ; fadd z2.h, p2/m, z2.h, z3.h
+65808862 => z2=97101dce4e7bfb792ceb16e0d6e8f2cf fpsr=10 ; fadd z2.s, p2/m, z2.s, z3.s
+65c08862 => z2=d9aa792e1af470ea2ceb16e0a1c54aec fpsr=10 ; fadd z2.d, p2/m, z2.d, z3.d
+65428862 => z2=35001dce4e7bfc008c31bc863cfbfc00 fpsr=14 ; fmul z2.h, p2/m, z2.h, z3.h
+65828862 => z2=97101dce29f09ad48841a7a139338706 fpsr=10 ; fmul z2.s, p2/m, z2.s, z3.s
+65c28862 => z2=30caaa7f1892cb6d87cff722f9f7ed83 fpsr=10 ; fmul z2.d, p2/m, z2.d, z3.d
+654d8862 => z2=00a01dce4e7bc615cdc5802a06af9411 fpsr=18 ; fdiv z2.h, p2/m, z2.h, z3.h
+658d8862 => z2=97101dce7303f2edd18eb1d40a58d0dc fpsr=10 ; fdiv z2.s, p2/m, z2.s, z3.s
+65cd8862 => z2=0000000000000138d206f5073e6194c9 fpsr=18 ; fdiv z2.d, p2/m, z2.d, z3.d
+64568862 => z2=792e1dce4e7b4e7b9ad22cebd6e84aec ; fmaxp z2.h, p2/m, z2.h, z3.h
+64968862 => z2=97101dce4e7bfb799ad2e1442ceb16e0 ; fmaxp z2.s, p2/m, z2.s, z3.s
+64d68862 => z2=9ad2e144d6e8f2cf2ceb16e0a1c54aec ; fmaxp z2.d, p2/m, z2.d, z3.d
+654b0102 => z2=0000d130d1707f007bff7c007c00bc00 fpsr=11 ; fadd z2.h, z8.h, z11.h
+658c0122 => z2=7f7fffff7f8000007f800000bf800000 fpsr=10 ; fadd z2.s, z9.s, z12.s
+65cd0142 => z2=7ff0000000000000bff0000000000000 ; fadd z2.d, z10.d, z13.d
+654b0502 => z2=80005150d1107f007bff7c00fc004200 fpsr=11 ; fsub z2.h, z8.h, z11.h
+658c0522 => z2=7f7fffff7f800000ff80000040400000 fpsr=10 ; fsub z2.s, z9.s, z12.s
+65cd0542 => z2=fff00000000000004008000000000000 ; fsub z2.d, z10.d, z13.d
+654b0902 => z2=8000cd4053e07f007bff7c007c00c000 fpsr=1 ; fmul z2.h, z8.h, z11.h
+658c0922 => z2=7f7fffff7f8000007f800000c0000000 ; fmul z2.s, z9.s, z12.s
+65cd0942 => z2=7ff0000000000000c000000000000000 ; fmul z2.d, z10.d, z13.d
+654b0d02 => z2=0000340066e47f007c007c0048ef3c00 fpsr=15 ; ftsmul z2.h, z8.h, z11.h
+658c0d22 => z2=7f8000007f800000411de9e73f800000 fpsr=14 ; ftsmul z2.s, z9.s, z12.s
+65cd0d42 => z2=4023bd3cc9be45de3ff0000000000000 fpsr=10 ; ftsmul z2.d, z10.d, z13.d
+654b1902 => z2=40004dc0d3a0ff00fbfffc00fc004400 fpsr=11 ; frecps z2.h, z8.h, z11.h
+658c1922 => z2=ff7fffffff800000ff80000040800000 fpsr=10 ; frecps z2.s, z9.s, z12.s
+65cd1942 => z2=fff00000000000004010000000000000 ; frecps z2.d, z10.d, z13.d
+654b1d02 => z2=3e004a00cf80ff00f7fffc00fc004100 fpsr=11 ; frsqrts z2.h, z8.h, z11.h
+658c1d22 => z2=feffffffff800000ff80000040200000 fpsr=10 ; frsqrts z2.s, z9.s, z12.s
+65cd1d42 => z2=fff00000000000004004000000000000 ; frsqrts z2.d, z10.d, z13.d
+046bb102 => z2=80003800d1407d007bff7c0042483c00 ; ftssel z2.h, z8.h, z11.h
+04acb122 => z2=7f7fffff7f80000040490fdb3f800000 ; ftssel z2.s, z9.s, z12.s
+04edb142 => z2=400921fb54442d183ff0000000000000 ; ftssel z2.d, z10.d, z13.d
+0463b102 => z2=0000b800d140fd00fbff7c004248bc00 ; ftssel z2.h, z8.h, z3.h
+04a3b122 => z2=ff7fffffff80000040490fdbbf800000 ; ftssel z2.s, z9.s, z3.s
+04e3b142 => z2=c00921fb54442d18bff0000000000000 ; ftssel z2.d, z10.d, z3.d
+654b4903 => p3=4051 fpsr=1 ; fcmge p3.h, p2/z, z8.h, z11.h
+658c4923 => p3=0101 ; fcmge p3.s, p2/z, z9.s, z12.s
+65cd4943 => p3=0001 ; fcmge p3.d, p2/z, z10.d, z13.d
+654b4913 => p3=0051 fpsr=1 ; fcmgt p3.h, p2/z, z8.h, z11.h
+658c4933 => p3=0101 ; fcmgt p3.s, p2/z, z9.s, z12.s
+65cd4953 => p3=0001 ; fcmgt p3.d, p2/z, z10.d, z13.d
+654b6903 => p3=4000 fpsr=1 ; fcmeq p3.h, p2/z, z8.h, z11.h
+658c6923 => p3=0000 ; fcmeq p3.s, p2/z, z9.s, z12.s
+65cd6943 => p3=0000 ; fcmeq p3.d, p2/z, z10.d, z13.d
+654b6913 => p3=0155 fpsr=1 ; fcmne p3.h, p2/z, z8.h, z11.h
+658c6933 => p3=0111 ; fcmne p3.s, p2/z, z9.s, z12.s
+65cd6953 => p3=0101 ; fcmne p3.d, p2/z, z10.d, z13.d
+654bc903 => p3=0100 fpsr=1 ; fcmuo p3.h, p2/z, z8.h, z11.h
+658cc923 => p3=0000 ; fcmuo p3.s, p2/z, z9.s, z12.s
+65cdc943 => p3=0000 ; fcmuo p3.d, p2/z, z10.d, z13.d
+654bc913 => p3=4050 fpsr=1 ; facge p3.h, p2/z, z8.h, z11.h
+658cc933 => p3=0100 ; facge p3.s, p2/z, z9.s, z12.s
+65cdc953 => p3=0000 ; facge p3.d, p2/z, z10.d, z13.d
+654be913 => p3=0050 fpsr=1 ; facgt p3.h, p2/z, z8.h, z11.h
+658ce933 => p3=0100 ; facgt p3.s, p2/z, z9.s, z12.s
+65cde953 => p3=0000 ; facgt p3.d, p2/z, z10.d, z13.d
+65484963 => p3=4004 fpsr=1 ; fcmle p3.h, p2/z, z8.h, z11.h
+65894983 => p3=0010 ; fcmle p3.s, p2/z, z9.s, z12.s
+65ca49a3 => p3=0100 ; fcmle p3.d, p2/z, z10.d, z13.d
+65502903 => p3=4055 fpsr=1 ; fcmge p3.h, p2/z, z8.h, #0.0
+65902923 => p3=0111 ; fcmge p3.s, p2/z, z9.s, #0.0
+65d02943 => p3=0101 ; fcmge p3.d, p2/z, z10.d, #0.0
+65502913 => p3=0055 fpsr=1 ; fcmgt p3.h, p2/z, z8.h, #0.0
+65902933 => p3=0111 ; fcmgt p3.s, p2/z, z9.s, #0.0
+65d02953 => p3=0101 ; fcmgt p3.d, p2/z, z10.d, #0.0
+65512913 => p3=4000 fpsr=1 ; fcmle p3.h, p2/z, z8.h, #0.0
+65912933 => p3=0000 ; fcmle p3.s, p2/z, z9.s, #0.0
+65d12953 => p3=0000 ; fcmle p3.d, p2/z, z10.d, #0.0
+65512903 => p3=0000 fpsr=1 ; fcmlt p3.h, p2/z, z8.h, #0.0
+65912923 => p3=0000 ; fcmlt p3.s, p2/z, z9.s, #0.0
+65d12943 => p3=0000 ; fcmlt p3.d, p2/z, z10.d, #0.0
+65522903 => p3=4000 fpsr=1 ; fcmeq p3.h, p2/z, z8.h, #0.0
+65922923 => p3=0000 ; fcmeq p3.s, p2/z, z9.s, #0.0
+65d22943 => p3=0000 ; fcmeq p3.d, p2/z, z10.d, #0.0
+65532903 => p3=0155 fpsr=1 ; fcmne p3.h, p2/z, z8.h, #0.0
+65932923 => p3=0111 ; fcmne p3.s, p2/z, z9.s, #0.0
+65d32943 => p3=0101 ; fcmne p3.d, p2/z, z10.d, #0.0
+65402902 => z2=00000000000000000000000000007f00 fpsr=1 ; faddv h2, p2, z8.h
+65802922 => z2=0000000000000000000000007f800000 fpsr=10 ; faddv s2, p2, z9.s
+65c02942 => z2=0000000000000000401090fdaa22168c ; faddv d2, p2, z10.d
+65402562 => z2=00000000000000000000000000007c00 ; faddv h2, p1, z11.h
+65802582 => z2=0000000000000000000000007f800000 ; faddv s2, p1, z12.s
+65c025a2 => z2=00000000000000007ff0000000000000 ; faddv d2, p1, z13.d
+65442902 => z2=00000000000000000000000000007c00 fpsr=1 ; fmaxnmv h2, p2, z8.h
+65842922 => z2=0000000000000000000000007f800000 ; fmaxnmv s2, p2, z9.s
+65c42942 => z2=0000000000000000400921fb54442d18 ; fmaxnmv d2, p2, z10.d
+65442562 => z2=00000000000000000000000000007c00 ; fmaxnmv h2, p1, z11.h
+65842582 => z2=0000000000000000000000007f800000 ; fmaxnmv s2, p1, z12.s
+65c425a2 => z2=00000000000000007ff0000000000000 ; fmaxnmv d2, p1, z13.d
+65452902 => z2=00000000000000000000000000008000 fpsr=1 ; fminnmv h2, p2, z8.h
+65852922 => z2=0000000000000000000000003f800000 ; fminnmv s2, p2, z9.s
+65c52942 => z2=00000000000000003ff0000000000000 ; fminnmv d2, p2, z10.d
+65452562 => z2=0000000000000000000000000000d140 ; fminnmv h2, p1, z11.h
+65852582 => z2=000000000000000000000000c0000000 ; fminnmv s2, p1, z12.s
+65c525a2 => z2=0000000000000000c000000000000000 ; fminnmv d2, p1, z13.d
+65462902 => z2=00000000000000000000000000007f00 fpsr=1 ; fmaxv h2, p2, z8.h
+65862922 => z2=0000000000000000000000007f800000 ; fmaxv s2, p2, z9.s
+65c62942 => z2=0000000000000000400921fb54442d18 ; fmaxv d2, p2, z10.d
+65462562 => z2=00000000000000000000000000007c00 ; fmaxv h2, p1, z11.h
+65862582 => z2=0000000000000000000000007f800000 ; fmaxv s2, p1, z12.s
+65c625a2 => z2=00000000000000007ff0000000000000 ; fmaxv d2, p1, z13.d
+65472902 => z2=00000000000000000000000000007f00 fpsr=1 ; fminv h2, p2, z8.h
+65872922 => z2=0000000000000000000000003f800000 ; fminv s2, p2, z9.s
+65c72942 => z2=00000000000000003ff0000000000000 ; fminv d2, p2, z10.d
+65472562 => z2=0000000000000000000000000000d140 ; fminv h2, p1, z11.h
+65872582 => z2=000000000000000000000000c0000000 ; fminv s2, p1, z12.s
+65c725a2 => z2=0000000000000000c000000000000000 ; fminv d2, p1, z13.d
+65582968 => z8=00000000000000000000000000007c00 ; fadda h8, p2, h8, z11.h
+65982989 => z9=0000000000000000000000007f800000 ; fadda s9, p2, s9, z12.s
+65d829aa => z10=00000000000000007ff0000000000000 ; fadda d10, p2, d10, z13.d
+65582462 => z2=00000000000000000000000000007897 fpsr=10 ; fadda h2, p1, h2, z3.h
+65982462 => z2=000000000000000000000000d9ae1cf9 fpsr=10 ; fadda s2, p1, s2, z3.s
+65d82462 => z2=0000000000000000d9aa792e1af470ea fpsr=10 ; fadda d2, p1, d2, z3.d
+6540a902 => z2=80001dce4e7b7f007bff7c0042003c00 fpsr=1 ; frintn z2.h, p2/m, z8.h
+6580a922 => z2=97101dce7f800000404000003f800000 ; frintn z2.s, p2/m, z9.s
+65c0a942 => z2=40080000000000003ff0000000000000 ; frintn z2.d, p2/m, z10.d
+6540a962 => z2=00001dce4e7b80003c0056407c00c000 ; frintn z2.h, p2/m, z11.h
+6580a982 => z2=97101dce42c800007f800000c0000000 ; frintn z2.s, p2/m, z12.s
+65c0a9a2 => z2=7ff0000000000000c000000000000000 ; frintn z2.d, p2/m, z13.d
+6541a902 => z2=80001dce4e7b7f007bff7c0044003c00 fpsr=1 ; frintp z2.h, p2/m, z8.h
+6581a922 => z2=97101dce7f800000408000003f800000 ; frintp z2.s, p2/m, z9.s
+65c1a942 => z2=40100000000000003ff0000000000000 ; frintp z2.d, p2/m, z10.d
+6541a962 => z2=00001dce4e7b80003c0056407c00c000 ; frintp z2.h, p2/m, z11.h
+6581a982 => z2=97101dce42c800007f800000c0000000 ; frintp z2.s, p2/m, z12.s
+65c1a9a2 => z2=7ff0000000000000c000000000000000 ; frintp z2.d, p2/m, z13.d
+6542a902 => z2=80001dce4e7b7f007bff7c0042003c00 fpsr=1 ; frintm z2.h, p2/m, z8.h
+6582a922 => z2=97101dce7f800000404000003f800000 ; frintm z2.s, p2/m, z9.s
+65c2a942 => z2=40080000000000003ff0000000000000 ; frintm z2.d, p2/m, z10.d
+6542a962 => z2=00001dce4e7b80003c0056407c00c000 ; frintm z2.h, p2/m, z11.h
+6582a982 => z2=97101dce42c800007f800000c0000000 ; frintm z2.s, p2/m, z12.s
+65c2a9a2 => z2=7ff0000000000000c000000000000000 ; frintm z2.d, p2/m, z13.d
+6543a902 => z2=80001dce4e7b7f007bff7c0042003c00 fpsr=1 ; frintz z2.h, p2/m, z8.h
+6583a922 => z2=97101dce7f800000404000003f800000 ; frintz z2.s, p2/m, z9.s
+65c3a942 => z2=40080000000000003ff0000000000000 ; frintz z2.d, p2/m, z10.d
+6543a962 => z2=00001dce4e7b80003c0056407c00c000 ; frintz z2.h, p2/m, z11.h
+6583a982 => z2=97101dce42c800007f800000c0000000 ; frintz z2.s, p2/m, z12.s
+65c3a9a2 => z2=7ff0000000000000c000000000000000 ; frintz z2.d, p2/m, z13.d
+6544a902 => z2=80001dce4e7b7f007bff7c0042003c00 fpsr=1 ; frinta z2.h, p2/m, z8.h
+6584a922 => z2=97101dce7f800000404000003f800000 ; frinta z2.s, p2/m, z9.s
+65c4a942 => z2=40080000000000003ff0000000000000 ; frinta z2.d, p2/m, z10.d
+6544a962 => z2=00001dce4e7b80003c0056407c00c000 ; frinta z2.h, p2/m, z11.h
+6584a982 => z2=97101dce42c800007f800000c0000000 ; frinta z2.s, p2/m, z12.s
+65c4a9a2 => z2=7ff0000000000000c000000000000000 ; frinta z2.d, p2/m, z13.d
+6546a902 => z2=80001dce4e7b7f007bff7c0042003c00 fpsr=11 ; frintx z2.h, p2/m, z8.h
+6586a922 => z2=97101dce7f800000404000003f800000 fpsr=10 ; frintx z2.s, p2/m, z9.s
+65c6a942 => z2=40080000000000003ff0000000000000 fpsr=10 ; frintx z2.d, p2/m, z10.d
+6546a962 => z2=00001dce4e7b80003c0056407c00c000 ; frintx z2.h, p2/m, z11.h
+6586a982 => z2=97101dce42c800007f800000c0000000 ; frintx z2.s, p2/m, z12.s
+65c6a9a2 => z2=7ff0000000000000c000000000000000 ; frintx z2.d, p2/m, z13.d
+6547a902 => z2=80001dce4e7b7f007bff7c0042003c00 fpsr=1 ; frinti z2.h, p2/m, z8.h
+6587a922 => z2=97101dce7f800000404000003f800000 ; frinti z2.s, p2/m, z9.s
+65c7a942 => z2=40080000000000003ff0000000000000 ; frinti z2.d, p2/m, z10.d
+6547a962 => z2=00001dce4e7b80003c0056407c00c000 ; frinti z2.h, p2/m, z11.h
+6587a982 => z2=97101dce42c800007f800000c0000000 ; frinti z2.s, p2/m, z12.s
+65c7a9a2 => z2=7ff0000000000000c000000000000000 ; frinti z2.d, p2/m, z13.d
+654ca902 => z2=f8001dce4e7b7f00040000003c004000 fpsr=1 ; frecpx z2.h, p2/m, z8.h
+658ca922 => z2=97101dce000000003f80000040000000 ; frecpx z2.s, p2/m, z9.s
+65cca942 => z2=3ff00000000000004000000000000000 ; frecpx z2.d, p2/m, z10.d
+654ca962 => z2=78001dce4e7bf800400028000000bc00 ; frecpx z2.h, p2/m, z11.h
+658ca982 => z2=97101dce3d00000000000000bf800000 ; frecpx z2.s, p2/m, z12.s
+65cca9a2 => z2=0000000000000000bff0000000000000 ; frecpx z2.d, p2/m, z13.d
+654da902 => z2=80001dce4e7b7f005bff7c003f173c00 fpsr=11 ; fsqrt z2.h, p2/m, z8.h
+658da922 => z2=97101dce7f8000003fe2dfc53f800000 fpsr=10 ; fsqrt z2.s, p2/m, z9.s
+65cda942 => z2=3ffc5bf891b4ef6a3ff0000000000000 fpsr=10 ; fsqrt z2.d, p2/m, z10.d
+654da962 => z2=00001dce4e7b80003c0049007c007e00 fpsr=1 ; fsqrt z2.h, p2/m, z11.h
+658da982 => z2=97101dce412000007f8000007fc00000 fpsr=1 ; fsqrt z2.s, p2/m, z12.s
+65cda9a2 => z2=7ff00000000000007ff8000000000000 fpsr=1 ; fsqrt z2.d, p2/m, z13.d
+651aa902 => z2=80001dce4e7b8000000f7fff00010000 fpsr=1 ; flogb z2.h, p2/m, z8.h
+651ca922 => z2=97101dce7fffffff0000000100000000 ; flogb z2.s, p2/m, z9.s
+651ea942 => z2=00000000000000010000000000000000 ; flogb z2.d, p2/m, z10.d
+651aa962 => z2=80001dce4e7b8000000000067fff0001 fpsr=1 ; flogb z2.h, p2/m, z11.h
+651ca982 => z2=97101dce000000067fffffff00000001 ; flogb z2.s, p2/m, z12.s
+651ea9a2 => z2=7fffffffffffffff0000000000000001 ; flogb z2.d, p2/m, z13.d
+6546a862 => z2=d9a81dce4e7b70ea8000e144d6e0f2cf fpsr=10 ; frintx z2.h, p2/m, z3.h
+6586a862 => z2=97101dce0000000080000000d6e8f2cf fpsr=10 ; frintx z2.s, p2/m, z3.s
+65c6a862 => z2=d9aa792e1af470ea8000000000000000 fpsr=10 ; frintx z2.d, p2/m, z3.d
+654e3102 => z2=fc003ffca6187f000100000035183bfc fpsr=3 ; frecpe z2.h, z8.h
+658e3122 => z2=00200000000000003ea300003f7f8000 ; frecpe z2.s, z9.s
+65ce3142 => z2=3fd46000000000003feff00000000000 ; frecpe z2.d, z10.d
+654e3062 => z2=9da8018b5c980684dcb09610a0a084b4 ; frecpe z2.h, z3.h
+658e3062 => z2=a540800064060000e41b8000a80d0000 ; frecpe z2.s, z3.s
+65ce3062 => z2=a633500000000000e50b100000000000 ; frecpe z2.d, z3.d
+654f3102 => z2=fc003da47e007f001c00000038843bfc fpsr=3 ; frsqrte z2.h, z8.h
+658f3122 => z2=1f800000000000003f1080003f7f8000 ; frsqrte z2.s, z9.s
+65cf3142 => z2=3fe21000000000003feff00000000000 ; frsqrte z2.d, z10.d
+654f3062 => z2=7e001cf84c4c21187e007e007e007e00 fpsr=1 ; frsqrte z2.h, z3.h
+658f3062 => z2=7fc0000051b900007fc000007fc00000 fpsr=1 ; frsqrte z2.s, z3.s
+65cf3062 => z2=7ff80000000000007ff8000000000000 fpsr=1 ; frsqrte z2.d, z3.d
+0460b862 => z2=34f8256b5e2b1cf859e8285d5cc25989 ; fexpa z2.h, z3.h
+04a0b862 => z2=7252a81e61c9b9be4285aac36596942d ; fexpa z2.s, z3.s
+04e0b862 => z2=1c393737b0cdc5e53cb2d285a6e4030b ; fexpa z2.d, z3.d
+65588808 => z8=38003800d1407f007bff7c0043483e00 fpsr=11 ; fadd z8.h, p2/m, z8.h, #0.5
+65988809 => z9=7f7fffff7f80000040690fdb3fc00000 ; fadd z9.s, p2/m, z9.s, #0.5
+65d8880a => z10=400d21fb54442d183ff8000000000000 ; fadd z10.d, p2/m, z10.d, #0.5
+65588828 => z8=3c003800d1407f007bff7c0044244000 fpsr=11 ; fadd z8.h, p2/m, z8.h, #1.0
+65988829 => z9=7f7fffff7f800000408487ee40000000 fpsr=10 ; fadd z9.s, p2/m, z9.s, #1.0
+65d8882a => z10=401090fdaa22168c4000000000000000 ; fadd z10.d, p2/m, z10.d, #1.0
+65598808 => z8=b8003800d1407f007bff7c0041483800 fpsr=11 ; fsub z8.h, p2/m, z8.h, #0.5
+65998809 => z9=7f7fffff7f80000040290fdb3f000000 ; fsub z9.s, p2/m, z9.s, #0.5
+65d9880a => z10=400521fb54442d183fe0000000000000 ; fsub z10.d, p2/m, z10.d, #0.5
+65598828 => z8=bc003800d1407f007bff7c0040480000 fpsr=11 ; fsub z8.h, p2/m, z8.h, #1.0
+65998829 => z9=7f7fffff7f80000040090fdb00000000 ; fsub z9.s, p2/m, z9.s, #1.0
+65d9882a => z10=400121fb54442d180000000000000000 ; fsub z10.d, p2/m, z10.d, #1.0
+655b8808 => z8=38003800d1407f00fbfffc00c148b800 fpsr=11 ; fsubr z8.h, p2/m, z8.h, #0.5
+659b8809 => z9=7f7fffffff800000c0290fdbbf000000 ; fsubr z9.s, p2/m, z9.s, #0.5
+65db880a => z10=c00521fb54442d18bfe0000000000000 ; fsubr z10.d, p2/m, z10.d, #0.5
+655b8828 => z8=3c003800d1407f00fbfffc00c0480000 fpsr=11 ; fsubr z8.h, p2/m, z8.h, #1.0
+659b8829 => z9=7f7fffffff800000c0090fdb00000000 ; fsubr z9.s, p2/m, z9.s, #1.0
+65db882a => z10=c00121fb54442d180000000000000000 ; fsubr z10.d, p2/m, z10.d, #1.0
+655a8808 => z8=80003800d1407f0077ff7c003e483800 fpsr=1 ; fmul z8.h, p2/m, z8.h, #0.5
+659a8809 => z9=7f7fffff7f8000003fc90fdb3f000000 ; fmul z9.s, p2/m, z9.s, #0.5
+65da880a => z10=3ff921fb54442d183fe0000000000000 ; fmul z10.d, p2/m, z10.d, #0.5
+655a8828 => z8=80003800d1407f007c007c0046484000 fpsr=15 ; fmul z8.h, p2/m, z8.h, #2.0
+659a8829 => z9=7f7fffff7f80000040c90fdb40000000 ; fmul z9.s, p2/m, z9.s, #2.0
+65da882a => z10=401921fb54442d184000000000000000 ; fmul z10.d, p2/m, z10.d, #2.0
+655c8808 => z8=00003800d1407f007bff7c0042483c00 fpsr=1 ; fmaxnm z8.h, p2/m, z8.h, #0.0
+659c8809 =>  ; fmaxnm z9.s, p2/m, z9.s, #0.0
+65dc880a =>  ; fmaxnm z10.d, p2/m, z10.d, #0.0
+655c8828 => z8=3c003800d1407f007bff7c0042483c00 fpsr=1 ; fmaxnm z8.h, p2/m, z8.h, #1.0
+659c8829 =>  ; fmaxnm z9.s, p2/m, z9.s, #1.0
+65dc882a =>  ; fmaxnm z10.d, p2/m, z10.d, #1.0
+655d8808 => z8=80003800d1407f000000000000000000 fpsr=1 ; fminnm z8.h, p2/m, z8.h, #0.0
+659d8809 => z9=7f7fffff000000000000000000000000 ; fminnm z9.s, p2/m, z9.s, #0.0
+65dd880a => z10=00000000000000000000000000000000 ; fminnm z10.d, p2/m, z10.d, #0.0
+655d8828 => z8=80003800d1407f003c003c003c003c00 fpsr=1 ; fminnm z8.h, p2/m, z8.h, #1.0
+659d8829 => z9=7f7fffff3f8000003f8000003f800000 ; fminnm z9.s, p2/m, z9.s, #1.0
+65dd882a => z10=3ff00000000000003ff0000000000000 ; fminnm z10.d, p2/m, z10.d, #1.0
+655e8808 => z8=00003800d1407f007bff7c0042483c00 fpsr=1 ; fmax z8.h, p2/m, z8.h, #0.0
+659e8809 =>  ; fmax z9.s, p2/m, z9.s, #0.0
+65de880a =>  ; fmax z10.d, p2/m, z10.d, #0.0
+655e8828 => z8=3c003800d1407f007bff7c0042483c00 fpsr=1 ; fmax z8.h, p2/m, z8.h, #1.0
+659e8829 =>  ; fmax z9.s, p2/m, z9.s, #1.0
+65de882a =>  ; fmax z10.d, p2/m, z10.d, #1.0
+655f8808 => z8=80003800d1407f000000000000000000 fpsr=1 ; fmin z8.h, p2/m, z8.h, #0.0
+659f8809 => z9=7f7fffff000000000000000000000000 ; fmin z9.s, p2/m, z9.s, #0.0
+65df880a => z10=00000000000000000000000000000000 ; fmin z10.d, p2/m, z10.d, #0.0
+655f8828 => z8=80003800d1407f003c003c003c003c00 fpsr=1 ; fmin z8.h, p2/m, z8.h, #1.0
+659f8829 => z9=7f7fffff3f8000003f8000003f800000 ; fmin z9.s, p2/m, z9.s, #1.0
+65df882a => z10=3ff00000000000003ff0000000000000 ; fmin z10.d, p2/m, z10.d, #1.0
+65680968 => z8=80003800d1407f007c007c007c00bc00 fpsr=15 ; fmla z8.h, p2/m, z11.h, z8.h
+65a90989 => z9=7f7fffff7f8000007f800000bf800000 ; fmla z9.s, p2/m, z12.s, z9.s
+65ea09aa => z10=7ff0000000000000bff0000000000000 ; fmla z10.d, p2/m, z13.d, z10.d
+65640862 => z2=2d3d1dce4e7bfb793d23f44b4c2c7c00 fpsr=14 ; fmla z2.h, p2/m, z3.h, z4.h
+65a40862 => z2=97101dce4e7bfb79390c4a464843891e fpsr=10 ; fmla z2.s, p2/m, z3.s, z4.s
+65e40862 => z2=29495e1a006706c3388f0ab7ce09fa27 fpsr=10 ; fmla z2.d, p2/m, z3.d, z4.d
+65682968 => z8=00003800d1407f0000007e00fc004200 fpsr=1 ; fmls z8.h, p2/m, z11.h, z8.h
+65a92989 => z9=7f7fffff7fc00000ff80000040400000 fpsr=1 ; fmls z9.s, p2/m, z12.s, z9.s
+65ea29aa => z10=fff00000000000004008000000000000 ; fmls z10.d, p2/m, z13.d, z10.d
+65642862 => z2=ad761dce4e7bfb79bc85744bcc2dfc00 fpsr=14 ; fmls z2.h, p2/m, z3.h, z4.h
+65a42862 => z2=97101dce4e7bfb79b90c4a45c843891e fpsr=10 ; fmls z2.s, p2/m, z3.s, z4.s
+65e42862 => z2=a9495e1a006706c3b88f0ab7ce09fa27 fpsr=10 ; fmls z2.d, p2/m, z3.d, z4.d
+65684968 => z8=00003800d140ff00fc00fc00fc003c00 fpsr=15 ; fnmla z8.h, p2/m, z11.h, z8.h
+65a94989 => z9=7f7fffffff800000ff8000003f800000 ; fnmla z9.s, p2/m, z12.s, z9.s
+65ea49aa => z10=fff00000000000003ff0000000000000 ; fnmla z10.d, p2/m, z13.d, z10.d
+65644862 => z2=ad3d1dce4e7b7b79bd23744bcc2cfc00 fpsr=14 ; fnmla z2.h, p2/m, z3.h, z4.h
+65a44862 => z2=97101dcece7bfb79b90c4a46c843891e fpsr=10 ; fnmla z2.s, p2/m, z3.s, z4.s
+65e44862 => z2=a9495e1a006706c3b88f0ab7ce09fa27 fpsr=10 ; fnmla z2.d, p2/m, z3.d, z4.d
+65686968 => z8=00003800d140ff0000007e007c00c200 fpsr=1 ; fnmls z8.h, p2/m, z11.h, z8.h
+65a96989 => z9=7f7fffff7fc000007f800000c0400000 fpsr=1 ; fnmls z9.s, p2/m, z12.s, z9.s
+65ea69aa => z10=7ff0000000000000c008000000000000 ; fnmls z10.d, p2/m, z13.d, z10.d
+65646862 => z2=2d761dce4e7b7b793c85f44b4c2d7c00 fpsr=14 ; fnmls z2.h, p2/m, z3.h, z4.h
+65a46862 => z2=97101dcece7bfb79390c4a454843891e fpsr=10 ; fnmls z2.s, p2/m, z3.s, z4.s
+65e46862 => z2=29495e1a006706c3388f0ab7ce09fa27 fpsr=10 ; fnmls z2.d, p2/m, z3.d, z4.d
+65688968 => z8=80003800d1407f007c007c007c00bc00 fpsr=15 ; fmad z8.h, p2/m, z11.h, z8.h
+65a98989 => z9=7f7fffff7f8000007f800000bf800000 ; fmad z9.s, p2/m, z12.s, z9.s
+65ea89aa => z10=7ff0000000000000bff0000000000000 ; fmad z10.d, p2/m, z13.d, z10.d
+65648862 => z2=34fe1dce4e7bfc00ddaa4e3d3c60fc00 fpsr=14 ; fmad z2.h, p2/m, z3.h, z4.h
+65a48862 => z2=97101dce49428d8eddaa4e853933869b fpsr=10 ; fmad z2.s, p2/m, z3.s, z4.s
+65e48862 => z2=30caaa7f1892cb6dddaa4e85b0d6e28b fpsr=10 ; fmad z2.d, p2/m, z3.d, z4.d
+6568a968 => z8=00003800d1407f0000007e00fc004200 fpsr=1 ; fmsb z8.h, p2/m, z11.h, z8.h
+65a9a989 => z9=7f7fffff7fc00000ff80000040400000 fpsr=1 ; fmsb z9.s, p2/m, z12.s, z9.s
+65eaa9aa => z10=fff00000000000004008000000000000 ; fmsb z10.d, p2/m, z13.d, z10.d
+6564a862 => z2=b5021dce4e7b7c00ddaa4ecdbd967c00 fpsr=14 ; fmsb z2.h, p2/m, z3.h, z4.h
+65a4a862 => z2=97101dce49428d8eddaa4e85b9338772 fpsr=10 ; fmsb z2.s, p2/m, z3.s, z4.s
+65e4a862 => z2=b0caaa7f1892cb6dddaa4e85b0d6e28b fpsr=10 ; fmsb z2.d, p2/m, z3.d, z4.d
+6568c968 => z8=00003800d140ff00fc00fc00fc003c00 fpsr=15 ; fnmad z8.h, p2/m, z11.h, z8.h
+65a9c989 => z9=7f7fffffff800000ff8000003f800000 ; fnmad z9.s, p2/m, z12.s, z9.s
+65eac9aa => z10=fff00000000000003ff0000000000000 ; fnmad z10.d, p2/m, z13.d, z10.d
+6564c862 => z2=b4fe1dce4e7b7c005daace3dbc607c00 fpsr=14 ; fnmad z2.h, p2/m, z3.h, z4.h
+65a4c862 => z2=97101dcec9428d8e5daa4e85b933869b fpsr=10 ; fnmad z2.s, p2/m, z3.s, z4.s
+65e4c862 => z2=b0caaa7f1892cb6d5daa4e85b0d6e28b fpsr=10 ; fnmad z2.d, p2/m, z3.d, z4.d
+6568e968 => z8=00003800d140ff0000007e007c00c200 fpsr=1 ; fnmsb z8.h, p2/m, z11.h, z8.h
+65a9e989 => z9=7f7fffff7fc000007f800000c0400000 fpsr=1 ; fnmsb z9.s, p2/m, z12.s, z9.s
+65eae9aa => z10=7ff0000000000000c008000000000000 ; fnmsb z10.d, p2/m, z13.d, z10.d
+6564e862 => z2=35021dce4e7bfc005daacecd3d96fc00 fpsr=14 ; fnmsb z2.h, p2/m, z3.h, z4.h
+65a4e862 => z2=97101dcec9428d8e5daa4e8539338772 fpsr=10 ; fnmsb z2.s, p2/m, z3.s, z4.s
+65e4e862 => z2=30caaa7f1892cb6d5daa4e85b0d6e28b fpsr=10 ; fnmsb z2.d, p2/m, z3.d, z4.d
+64408968 => z8=d1403800d1407f007c007c003c90fc00 fpsr=15 ; fcadd z8.h, p2/m, z8.h, z11.h, #90
+64808989 => z9=7f7fffff7f8000003f921fb6ff800000 ; fcadd z9.s, p2/m, z9.s, z12.s, #90
+64c089aa => z10=3ff243f6a8885a30fff0000000000000 ; fcadd z10.d, p2/m, z10.d, z13.d, #90
+64418968 => z8=51403800d1407f007bfc7c0045247c00 fpsr=11 ; fcadd z8.h, p2/m, z8.h, z11.h, #270
+64818989 => z9=7f7fffff7f80000040a487ee7f800000 fpsr=10 ; fcadd z9.s, p2/m, z9.s, z12.s, #270
+64c189aa => z10=401490fdaa22168c7ff0000000000000 ; fcadd z10.d, p2/m, z10.d, z13.d, #270
+64480968 => z8=00003800d1407f007c007c00c248bc00 fpsr=15 ; fcmla z8.h, p2/m, z11.h, z8.h, #0
+64890989 => z9=7f7fffff7f800000c0490fdbbf800000 ; fcmla z9.s, p2/m, z12.s, z9.s, #0
+64ca09aa => z10=c00921fb54442d18bff0000000000000 ; fcmla z10.d, p2/m, z13.d, z10.d, #0
+64482968 => z8=00003800d1407f007c007c007c00fc00 fpsr=1 ; fcmla z8.h, p2/m, z11.h, z8.h, #90
+64892989 => z9=7f7fffff7f8000007f800000ff800000 ; fcmla z9.s, p2/m, z12.s, z9.s, #90
+64ca29aa => z10=7ff0000000000000fff0000000000000 ; fcmla z10.d, p2/m, z13.d, z10.d, #90
+64484968 => z8=80003800d1407f00fc007e0048b64200 fpsr=15 ; fcmla z8.h, p2/m, z11.h, z8.h, #180
+64894989 => z9=7f7fffff7fc000004116cbe440400000 fpsr=11 ; fcmla z9.s, p2/m, z12.s, z9.s, #180
+64ca49aa => z10=4022d97c7f3321d24008000000000000 ; fcmla z10.d, p2/m, z13.d, z10.d, #180
+64486968 => z8=80003800d1407f00fc007c00fc007c00 fpsr=1 ; fcmla z8.h, p2/m, z11.h, z8.h, #270
+64896989 => z9=7f7fffff7f800000ff8000007f800000 ; fcmla z9.s, p2/m, z12.s, z9.s, #270
+64ca69aa => z10=fff00000000000007ff0000000000000 ; fcmla z10.d, p2/m, z13.d, z10.d, #270
+64a31168 => z8=6c887c00d1407f007aa67c005b0176cf fpsr=15 ; fcmla z8.h, z11.h, z3.h[0], #0
+64e91189 => z9=7f7fffff7f800000c0490fdbbf800000 fpsr=10 ; fcmla z9.s, z12.s, z9.s[0], #0
+64bb1568 => z8=00003800fbc67f007c007c007c007c00 fpsr=15 ; fcmla z8.h, z11.h, z3.h[3], #90
+64f91589 => z9=7f8000007f8000007f800000ff800000 ; fcmla z9.s, z12.s, z9.s[1], #90
+64ab1968 => z8=b07af6e9d1407f007bff7c004245e543 fpsr=11 ; fcmla z8.h, z11.h, z3.h[1], #180
+64f91989 => z9=ff8000007fc000007f8000007f800000 fpsr=15 ; fcmla z9.s, z12.s, z9.s[1], #180
+64b31d68 => z8=80003800735a7f007ac47c00fc007c00 fpsr=11 ; fcmla z8.h, z11.h, z3.h[2], #270
+64e91d89 => z9=7f7fffff7f800000ff8000007f800000 fpsr=10 ; fcmla z9.s, z12.s, z9.s[0], #270
+646b0168 => z8=000035b8d1407f007bff7c007c003bf2 fpsr=11 ; fmla z8.h, z11.h, z3.h[5]
+64b40189 => z9=7f7fffff7f8000007f800000c9c28d86 fpsr=10 ; fmla z9.s, z12.s, z4.s[2]
+64fd01aa => z10=7ff0000000000000fff0000000000000 ; fmla z10.d, z13.d, z13.d[1]
+64a40062 => z2=4b0f18284e7bfb792ceb16e04843891e fpsr=10 ; fmla z2.s, z3.s, z4.s[0]
+646b0568 => z8=80003924d1407f007bff7c00fc003c07 fpsr=11 ; fmls z8.h, z11.h, z3.h[5]
+64b40589 => z9=7f7fffff7f800000ff80000049c28d96 fpsr=10 ; fmls z9.s, z12.s, z4.s[2]
+64fd05aa => z10=fff00000000000007ff0000000000000 ; fmls z10.d, z13.d, z13.d[1]
+64a40462 => z2=cb0f18284e7bfb792ceb16e0c843891e fpsr=10 ; fmls z2.s, z3.s, z4.s[0]
+647b2102 => z2=0000d5aa6f6f7f00fc00fc00e072d9aa fpsr=15 ; fmul z2.h, z8.h, z3.h[7]
+64bc2122 => z2=cf8ea9d2ff800000906018598f8ea9d3 fpsr=10 ; fmul z2.s, z9.s, z4.s[3]
+64ed2142 => z2=c01921fb54442d18c000000000000000 ; fmul z2.d, z10.d, z13.d[0]
+64f42062 => z2=29495e1a006706c30000000000000000 fpsr=18 ; fmul z2.d, z3.d, z4.d[1]
+65508168 => z8=3c004d80d3c07f007bff7c007c004200 fpsr=11 ; ftmad z8.h, z8.h, z11.h, #0
+65908189 => z9=7f7fffff7f8000007f80000040400000 fpsr=10 ; ftmad z9.s, z9.s, z12.s, #0
+65d081aa => z10=7ff00000000000004008000000000000 ; ftmad z10.d, z10.d, z13.d, #0
+65538168 => z8=00004d40d3e07f007bff7c007c004000 fpsr=1 ; ftmad z8.h, z8.h, z11.h, #3
+65938189 => z9=7f7fffff7f8000007f8000003fffd27e fpsr=10 ; ftmad z9.s, z9.s, z12.s, #3
+65d381aa => z10=7ff00000000000003ffffa4fa4fa4fb1 fpsr=10 ; ftmad z10.d, z10.d, z13.d, #3
+65558168 => z8=00004d40d3e07f007bff7c007c004000 fpsr=1 ; ftmad z8.h, z8.h, z11.h, #5
+65958189 => z9=7f7fffff7f8000007f80000040000000 ; ftmad z9.s, z9.s, z12.s, #5
+65d581aa => z10=7ff00000000000003fffffffb606c236 fpsr=10 ; ftmad z10.d, z10.d, z13.d, #5
+65578168 => z8=00004d40d3e07f007bff7c007c004000 fpsr=1 ; ftmad z8.h, z8.h, z11.h, #7
+65978189 => z9=7f7fffff7f8000007f80000040000000 ; ftmad z9.s, z9.s, z12.s, #7
+65d781aa => z10=7ff00000000000003fffffffffff3845 fpsr=10 ; ftmad z10.d, z10.d, z13.d, #7
+6588a922 => z2=97101dce00007c000000424800003c00 fpsr=10 ; fcvt z2.h, p2/m, z9.s
+6588a862 => z2=97101dce00000000000080000000fc00 fpsr=1c ; fcvt z2.h, p2/m, z3.s
+6589a902 => z2=97101dce7fe000007f8000003f800000 fpsr=1 ; fcvt z2.s, p2/m, z8.h
+6589a862 => z2=97101dce461d4000c4288000c659e000 ; fcvt z2.s, p2/m, z3.h
+65c8a942 => z2=00000000000042480000000000003c00 fpsr=10 ; fcvt z2.h, p2/m, z10.d
+65c8a862 => z2=000000000000fc000000000000008000 fpsr=1c ; fcvt z2.h, p2/m, z3.d
+65c9a902 => z2=7ffc0000000000003ff0000000000000 fpsr=1 ; fcvt z2.d, p2/m, z8.h
+65c9a862 => z2=40c3a80000000000c0cb3c0000000000 ; fcvt z2.d, p2/m, z3.h
+65caa942 => z2=0000000040490fdb000000003f800000 fpsr=10 ; fcvt z2.s, p2/m, z10.d
+65caa862 => z2=00000000ff8000000000000080000000 fpsr=1c ; fcvt z2.s, p2/m, z3.d
+65cba922 => z2=7ff00000000000003ff0000000000000 ; fcvt z2.d, p2/m, z9.s
+65cba862 => z2=3b5e8e1d40000000c2dd1e59e0000000 ; fcvt z2.d, p2/m, z3.s
+655aa902 => z2=00001dce4e7b00007fff7fff00030001 fpsr=11 ; fcvtzs z2.h, p2/m, z8.h
+655aa962 => z2=00001dce4e7b0000000100647ffffffe fpsr=1 ; fcvtzs z2.h, p2/m, z11.h
+655ca902 => z2=97101dce000000007fffffff00000001 fpsr=1 ; fcvtzs z2.s, p2/m, z8.h
+655ca962 => z2=97101dce0000000000000064fffffffe ; fcvtzs z2.s, p2/m, z11.h
+655ea902 => z2=00000000000000000000000000000001 fpsr=1 ; fcvtzs z2.d, p2/m, z8.h
+655ea962 => z2=0000000000000000fffffffffffffffe ; fcvtzs z2.d, p2/m, z11.h
+659ca922 => z2=97101dce7fffffff0000000300000001 fpsr=11 ; fcvtzs z2.s, p2/m, z9.s
+659ca982 => z2=97101dce000000647ffffffffffffffe fpsr=1 ; fcvtzs z2.s, p2/m, z12.s
+65d8a942 => z2=00000000000000030000000000000001 fpsr=10 ; fcvtzs z2.s, p2/m, z10.d
+65d8a9a2 => z2=000000007ffffffffffffffffffffffe fpsr=1 ; fcvtzs z2.s, p2/m, z13.d
+65dca922 => z2=7fffffffffffffff0000000000000001 fpsr=1 ; fcvtzs z2.d, p2/m, z9.s
+65dca982 => z2=0000000000000064fffffffffffffffe ; fcvtzs z2.d, p2/m, z12.s
+65dea942 => z2=00000000000000030000000000000001 fpsr=10 ; fcvtzs z2.d, p2/m, z10.d
+65dea9a2 => z2=7ffffffffffffffffffffffffffffffe fpsr=1 ; fcvtzs z2.d, p2/m, z13.d
+655ba902 => z2=00001dce4e7b0000ffe0ffff00030001 fpsr=11 ; fcvtzu z2.h, p2/m, z8.h
+655ba962 => z2=00001dce4e7b000000010064ffff0000 fpsr=1 ; fcvtzu z2.h, p2/m, z11.h
+655da902 => z2=97101dce00000000ffffffff00000001 fpsr=1 ; fcvtzu z2.s, p2/m, z8.h
+655da962 => z2=97101dce000000000000006400000000 fpsr=1 ; fcvtzu z2.s, p2/m, z11.h
+655fa902 => z2=00000000000000000000000000000001 fpsr=1 ; fcvtzu z2.d, p2/m, z8.h
+655fa962 => z2=00000000000000000000000000000000 fpsr=1 ; fcvtzu z2.d, p2/m, z11.h
+659da922 => z2=97101dceffffffff0000000300000001 fpsr=11 ; fcvtzu z2.s, p2/m, z9.s
+659da982 => z2=97101dce00000064ffffffff00000000 fpsr=1 ; fcvtzu z2.s, p2/m, z12.s
+65d9a942 => z2=00000000000000030000000000000001 fpsr=10 ; fcvtzu z2.s, p2/m, z10.d
+65d9a9a2 => z2=00000000ffffffff0000000000000000 fpsr=1 ; fcvtzu z2.s, p2/m, z13.d
+65dda922 => z2=ffffffffffffffff0000000000000001 fpsr=1 ; fcvtzu z2.d, p2/m, z9.s
+65dda982 => z2=00000000000000640000000000000000 fpsr=1 ; fcvtzu z2.d, p2/m, z12.s
+65dfa942 => z2=00000000000000030000000000000001 fpsr=10 ; fcvtzu z2.d, p2/m, z10.d
+65dfa9a2 => z2=ffffffffffffffff0000000000000000 fpsr=1 ; fcvtzu z2.d, p2/m, z13.d
+6552a8a2 => z2=00001dce4e7b52000000480000000000 ; scvtf z2.h, p2/m, z5.h
+6552a862 => z2=f0cb1dce4e7b770ff653efaff123ea98 fpsr=10 ; scvtf z2.h, p2/m, z3.h
+6554a8a2 => z2=97101dce000052000000480000000000 ; scvtf z2.h, p2/m, z5.s
+6554a862 => z2=97101dce00007c000000fc000000fc00 fpsr=14 ; scvtf z2.h, p2/m, z3.s
+6556a8a2 => z2=0000000000007c000000000000007c00 fpsr=14 ; scvtf z2.h, p2/m, z5.d
+6556a862 => z2=000000000000fc00000000000000fc00 fpsr=14 ; scvtf z2.h, p2/m, z3.d
+6594a8a2 => z2=97101dce424000004100000000000000 ; scvtf z2.s, p2/m, z5.s
+6594a862 => z2=97101dce4dd7a387ceca5a3dce245c35 fpsr=10 ; scvtf z2.s, p2/m, z3.s
+65d0a8a2 => z2=40480000000000000000000000000000 ; scvtf z2.d, p2/m, z5.s
+65d0a862 => z2=41baf470ea000000c1c48b8698800000 ; scvtf z2.d, p2/m, z3.s
+65d4a8a2 => z2=00000000524000000000000051000000 fpsr=10 ; scvtf z2.s, p2/m, z5.d
+65d4a862 => z2=00000000de19561b00000000deca5a3d fpsr=10 ; scvtf z2.s, p2/m, z3.d
+65d6a8a2 => z2=42480000001800004220000000000000 ; scvtf z2.d, p2/m, z5.d
+65d6a862 => z2=c3c32ac368f285c8c3d94b47aeca45c3 fpsr=10 ; scvtf z2.d, p2/m, z3.d
+6553a8a2 => z2=00001dce4e7b52000000480000000000 ; ucvtf z2.h, p2/m, z5.h
+6553a862 => z2=7acd1dce4e7b770f78d77b0a7ab77b96 fpsr=10 ; ucvtf z2.h, p2/m, z3.h
+6555a8a2 => z2=97101dce000052000000480000000000 ; ucvtf z2.h, p2/m, z5.s
+6555a862 => z2=97101dce00007c0000007c0000007c00 fpsr=14 ; ucvtf z2.h, p2/m, z3.s
+6557a8a2 => z2=0000000000007c000000000000007c00 fpsr=14 ; ucvtf z2.h, p2/m, z5.d
+6557a862 => z2=0000000000007c000000000000007c00 fpsr=14 ; ucvtf z2.h, p2/m, z3.d
+6595a8a2 => z2=97101dce424000004100000000000000 ; ucvtf z2.s, p2/m, z5.s
+6595a862 => z2=97101dce4dd7a3874f1ad2e14f56e8f3 fpsr=10 ; ucvtf z2.s, p2/m, z3.s
+65d1a8a2 => z2=40480000000000000000000000000000 ; ucvtf z2.d, p2/m, z5.s
+65d1a862 => z2=41baf470ea00000041eadd1e59e00000 ; ucvtf z2.d, p2/m, z3.s
+65d5a8a2 => z2=00000000524000000000000051000000 fpsr=10 ; ucvtf z2.s, p2/m, z5.d
+65d5a862 => z2=000000005f59aa79000000005f1ad2e1 fpsr=10 ; ucvtf z2.s, p2/m, z3.d
+65d7a8a2 => z2=42480000001800004220000000000000 ; ucvtf z2.d, p2/m, z5.d
+65d7a862 => z2=43eb354f25c35e8e43e35a5c289add1e fpsr=10 ; ucvtf z2.d, p2/m, z3.d
+6488a922 => z2=97101dce7c00fb79424816e03c004aec fpsr=10 ; fcvtnt z2.h, p2/m, z9.s
+64caa942 => z2=40490fdb4e7bfb793f800000a1c54aec fpsr=10 ; fcvtnt z2.s, p2/m, z10.d
+6489a902 => z2=97101dcec2280000477fe00040490000 ; fcvtlt z2.s, p2/m, z8.h
+64cba922 => z2=47efffffe0000000400921fb60000000 ; fcvtlt z2.d, p2/m, z9.s
+650aa942 => z2=0000000040490fdb000000003f800000 fpsr=10 ; fcvtx z2.s, p2/m, z10.d
+640aa942 => z2=40490fdb4e7bfb793f800000a1c54aec fpsr=10 ; fcvtxnt z2.s, p2/m, z10.d
+6488a862 => z2=97101dce0000fb79800016e0fc004aec fpsr=1c ; fcvtnt z2.h, p2/m, z3.s
+650aa862 => z2=00000000ff7fffff0000000080000001 fpsr=1c ; fcvtx z2.s, p2/m, z3.d
+6489a862 => z2=97101dce3b5e8000bb5a4000c2dd0000 ; fcvtlt z2.s, p2/m, z3.h
+64a9e589 => z9=7f8000007f8000007fc000007f800000 fpsr=11 ; fmmla z9.s, z12.s, z9.s
+64a4e462 => z2=29be2f0d77e2d184e0b108d04843891e fpsr=18 ; fmmla z2.s, z3.s, z4.s
+64eae5aa => esr=2000000 ; fmmla z10.d, z13.d, z10.d
+64e4e462 => esr=2000000 ; fmmla z2.d, z3.d, z4.d
+4522e062 => z2=20126ce14ed843dcf5f43d492f736826 ; aese z2.b, z2.b, z3.b
+4522e462 => z2=025bcea0b6fa2622fdc09a1d79738c32 ; aesd z2.b, z2.b, z3.b
+4520e002 => z2=7151532797a657d19e4fc626f9cf8d79 ; aesmc z2.b, z2.b
+4520e402 => z2=f992dbe4ba617a16e5f0bd9932214697 ; aesimc z2.b, z2.b
+4523e062 => z2=b616dbc4b9547616a6189d9019924758 ; sm4e z2.s, z2.s, z3.s
+4524f062 => z2=25ee9a62343e2fa0785ef00dec2336a6 ; sm4ekey z2.s, z3.s, z4.s
+4524f462 => z2=c6b72a8888716bf721867c4fb74537d8 ; rax1 z2.d, z3.d, z4.d
+45046862 => z2=640c19e42ece6f0dbb783ce7747dd8a9 ; pmullb z2.q, z3.d, z4.d
+45046c62 => z2=687c84010ac0270d70374a62acb7c22c ; pmullt z2.q, z3.d, z4.d
+45446862 => z2=53ac1e123ce8702c7474235442f060a9 ; pmullb z2.h, z3.b, z4.b
+45446c62 => z2=68473011064a3a3064023d0e7ca05a24 ; pmullt z2.h, z3.b, z4.b
+45c46862 => z2=0676cee8acb7c22c7c96fb78747dd8a9 ; pmullb z2.d, z3.s, z4.s
+45c46c62 => z2=687c8401376d5b12640c19e42fdd7e54 ; pmullt z2.d, z3.s, z4.s
 vq 2
 04000862 => z2=f3ad85c052d71f0308150de7f742ab349d8ea9d3497d8d2cdd66c77d5d7de288 ; add z2.b, p2/m, z2.b, z3.b
 04400862 => z2=2eadd5c056d71f03c2150ee7f842bb348f8ea9d31f7d0e2c3366c87d5e7df488 ; add z2.h, p2/m, z2.h, z3.h
@@ -2994,6 +3481,492 @@ e58009c3 =>  ; str p3, [x14, #2, mul vl]
 85c14903 =>  ; prfw pldl2strm, p2, [x8, #1, mul vl]
 c581e8c0 =>  ; prfd pldl1keep, p2, [z6.d, #8]
 84652908 =>  ; prfh pstl1keep, p2, [x8, z5.s, sxtw #1]
+65408968 => z8=fc007e007e000000c00042f356457bff80003800d1707f007bff7c007c00bc00 fpsr=11 ; fadd z8.h, p2/m, z8.h, z11.h
+65808989 => z9=000000003f0000004f8000007fe000007f7fffff7f8000007f800000bf800000 fpsr=11 ; fadd z9.s, p2/m, z9.s, z12.s
+65c089aa => z10=7fefffffffffffff7ff00000000000007ff0000000000000bff0000000000000 ; fadd z10.d, p2/m, z10.d, z13.d
+65418968 => z8=fc007e007e000000c000c19d563bfbff80003800d1107f007bff7c00fc004200 fpsr=11 ; fsub z8.h, p2/m, z8.h, z11.h
+65818989 => z9=800000003f0000004f8000007fe000007f7fffff7f800000ff80000040400000 fpsr=11 ; fsub z9.s, p2/m, z9.s, z12.s
+65c189aa => z10=7fefffffffffffff7ff0000000000000fff00000000000004008000000000000 ; fsub z10.d, p2/m, z10.d, z13.d
+65428968 => z8=fc007e007e00000080023c30502a1bff8000380053e07f007bff7c007c00c000 fpsr=11 ; fmul z8.h, p2/m, z8.h, z11.h
+65828989 => z9=800000003f000000cfc000007fe000007f7fffff7f8000007f800000c0000000 fpsr=1 ; fmul z9.s, p2/m, z9.s, z12.s
+65c289aa => z10=7fefffffffffffff7ff00000000000007ff0000000000000c000000000000000 ; fmul z10.d, p2/m, z10.d, z13.d
+65448968 => z8=fc00be007e0000000001424856407bff80003800be007f007bff7c007c003c00 fpsr=1 ; fmaxnm z8.h, p2/m, z8.h, z11.h
+65848989 => z9=000000003f0000004f8000007fe000007f7fffff7f8000007f8000003f800000 fpsr=1 ; fmaxnm z9.s, p2/m, z9.s, z12.s
+65c489aa => z10=7fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fmaxnm z10.d, p2/m, z10.d, z13.d
+65458968 => z8=fc00be007e000000c00035553555000180003800d1407f003c0056404248c000 fpsr=1 ; fminnm z8.h, p2/m, z8.h, z11.h
+65858989 => z9=800000003f000000bfc000007fe000007f7fffff42c8000040490fdbc0000000 fpsr=1 ; fminnm z9.s, p2/m, z9.s, z12.s
+65c589aa => z10=7fefffffffffffff4059000000000000400921fb54442d18c000000000000000 ; fminnm z10.d, p2/m, z10.d, z13.d
+65468968 => z8=fc007e007e0000000001424856407bff80003800be007f007bff7c007c003c00 fpsr=1 ; fmax z8.h, p2/m, z8.h, z11.h
+65868989 => z9=000000003f0000004f8000007fe000007f7fffff7f8000007f8000003f800000 fpsr=1 ; fmax z9.s, p2/m, z9.s, z12.s
+65c689aa => z10=7fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fmax z10.d, p2/m, z10.d, z13.d
+65478968 => z8=fc007e007e000000c00035553555000180003800d1407f003c0056404248c000 fpsr=1 ; fmin z8.h, p2/m, z8.h, z11.h
+65878989 => z9=800000003f000000bfc000007fe000007f7fffff42c8000040490fdbc0000000 fpsr=1 ; fmin z9.s, p2/m, z9.s, z12.s
+65c789aa => z10=7fefffffffffffff4059000000000000400921fb54442d18c000000000000000 ; fmin z10.d, p2/m, z10.d, z13.d
+65488968 => z8=fc007e007e0000004000419d563b7bff8000380051107f007bff7c007c004200 fpsr=11 ; fabd z8.h, p2/m, z8.h, z11.h
+65888989 => z9=000000003f0000004f8000007fe000007f7fffff7f8000007f80000040400000 fpsr=11 ; fabd z9.s, p2/m, z9.s, z12.s
+65c889aa => z10=7fefffffffffffff7ff00000000000007ff00000000000004008000000000000 ; fabd z10.d, p2/m, z10.d, z13.d
+65498968 => z8=fc00fc007e000000c4007c007c007c008000380080007f007c007c007c000000 fpsr=1d ; fscale z8.h, p2/m, z8.h, z11.h
+65898989 => z9=800000003f000000000000007fe000007f7fffff7f8000007f80000000000000 fpsr=1d ; fscale z9.s, p2/m, z9.s, z12.s
+65c989aa => z10=7fefffffffffffff7ff00000000000007ff00000000000000000000000000000 fpsr=1c ; fscale z10.d, p2/m, z10.d, z13.d
+654a8968 => z8=fc007e007e00000080023c30502a1bff8000380053e07f007bff7c007c00c000 fpsr=11 ; fmulx z8.h, p2/m, z8.h, z11.h
+658a8989 => z9=800000003f000000cfc000007fe000007f7fffff7f8000007f800000c0000000 fpsr=1 ; fmulx z9.s, p2/m, z9.s, z12.s
+65ca89aa => z10=7fefffffffffffff7ff00000000000007ff0000000000000c000000000000000 ; fmulx z10.d, p2/m, z10.d, z13.d
+654d8968 => z8=fc007e007e000000fc002ecb5cb00000800038004f007f007bff7c000000b800 fpsr=1d ; fdiv z8.h, p2/m, z8.h, z11.h
+658d8989 => z9=7fc000003f000000cf2aaaab7fe000007f7fffff7f80000000000000bf000000 fpsr=11 ; fdiv z9.s, p2/m, z9.s, z12.s
+65cd89aa => z10=7fefffffffffffff7ff00000000000000000000000000000bfe0000000000000 ; fdiv z10.d, p2/m, z10.d, z13.d
+654c8968 => z8=fc007e007e000000800048b61ad37c008000380028927f00010000007c00c000 fpsr=1d ; fdivr z8.h, p2/m, z8.h, z11.h
+658c8989 => z9=7fc000003f000000afc000007fe000007f7fffff000000007f800000c0000000 fpsr=1 ; fdivr z9.s, p2/m, z9.s, z12.s
+65cc89aa => z10=7fefffffffffffff00000000000000007ff0000000000000c000000000000000 ; fdivr z10.d, p2/m, z10.d, z13.d
+65438968 => z8=fc007e007e0000004000419dd63b7bff8000380051107f00fbfffc007c00c200 fpsr=11 ; fsubr z8.h, p2/m, z8.h, z11.h
+65838989 => z9=000000003f000000cf8000007fe000007f7fffffff8000007f800000c0400000 fpsr=11 ; fsubr z9.s, p2/m, z9.s, z12.s
+65c389aa => z10=7feffffffffffffffff00000000000007ff0000000000000c008000000000000 ; fsubr z10.d, p2/m, z10.d, z13.d
+64508968 => z8=fc00fc007e0000004248beab7bff564080003800be007f0056507c007c004424 fpsr=11 ; faddp z8.h, p2/m, z8.h, z11.h
+64908989 => z9=4f8000003f000000bfc000007fe000007f7fffff7f8000007f800000408487ee fpsr=11 ; faddp z9.s, p2/m, z9.s, z12.s
+64d089aa => z10=7fefffffffffffff7ff00000000000007ff0000000000000401090fdaa22168c ; faddp z10.d, p2/m, z10.d, z13.d
+64548968 => z8=fc00be007e000000424835557bff56408000380080007f0056407c007c004248 fpsr=1 ; fmaxnmp z8.h, p2/m, z8.h, z11.h
+64948989 => z9=4f8000003f000000800000007fe000007f7fffff7f8000007f80000040490fdb fpsr=1 ; fmaxnmp z9.s, p2/m, z9.s, z12.s
+64d489aa => z10=7fefffffffffffff7ff00000000000007ff0000000000000400921fb54442d18 ; fmaxnmp z10.d, p2/m, z10.d, z13.d
+64558968 => z8=fc00fc007e0000000001c0003555000180003800be007f003c007bffc0003c00 fpsr=1 ; fminnmp z8.h, p2/m, z8.h, z11.h
+64958989 => z9=000000003f000000bfc000007fe000007f7fffff7f7fffffc00000003f800000 fpsr=1 ; fminnmp z9.s, p2/m, z9.s, z12.s
+64d589aa => z10=7fefffffffffffff7fefffffffffffffc0000000000000003ff0000000000000 ; fminnmp z10.d, p2/m, z10.d, z13.d
+64568968 => z8=fc00be007e000000424835557bff56408000380080007f0056407c007c004248 fpsr=1 ; fmaxp z8.h, p2/m, z8.h, z11.h
+64968989 => z9=4f8000003f000000800000007fe000007f7fffff7f8000007f80000040490fdb fpsr=1 ; fmaxp z9.s, p2/m, z9.s, z12.s
+64d689aa => z10=7fefffffffffffff7ff00000000000007ff0000000000000400921fb54442d18 ; fmaxp z10.d, p2/m, z10.d, z13.d
+64578968 => z8=fc00fc007e0000000001c0003555000180003800be007f003c007bffc0003c00 fpsr=1 ; fminp z8.h, p2/m, z8.h, z11.h
+64978989 => z9=000000003f000000bfc000007fe000007f7fffff7f7fffffc00000003f800000 fpsr=1 ; fminp z9.s, p2/m, z9.s, z12.s
+64d789aa => z10=7fefffffffffffff7fefffffffffffffc0000000000000003ff0000000000000 ; fminp z10.d, p2/m, z10.d, z13.d
+65408862 => z2=2ead507956d71f03b92174ff3ce6ab058f8ea9d3d5938db6dc3b79f9b3aae28b fpsr=10 ; fadd z2.h, p2/m, z2.h, z3.h
+65808862 => z2=c576507956d71f03b92199e83f5a08da8f8ea9d3d63b809eddaa4dc9b0d97ed3 fpsr=10 ; fadd z2.s, p2/m, z2.s, z3.s
+65c08862 => z2=2ead854756d71f03b92199e83f5a101f8f8ea9d309b955e2ddaa4e85b0d6e28b fpsr=10 ; fadd z2.d, p2/m, z2.d, z3.d
+65428862 => z2=2ead99e756d71f03865ad361bc8281d38f8ea9d3e4180000f80f7c0022d5b8e6 fpsr=1c ; fmul z2.h, p2/m, z2.h, z3.h
+65828862 => z2=b4a6f49e56d71f03829a508cb8c630578f8ea9d3e00e7f26f3fac59c1f0c3ce2 fpsr=10 ; fmul z2.s, p2/m, z2.s, z3.s
+65c28862 => z2=2ead854756d71f0382268117734b357b8000000000000000f37768fa538ea89b fpsr=18 ; fmul z2.d, p2/m, z2.d, z3.d
+654d8862 => z2=2ead802656d71f038bbafc00b557d6e08f8ea9d3aec05080c3e7105e3ed8fc00 fpsr=1c ; fdiv z2.h, p2/m, z2.h, z3.h
+658d8862 => z2=a8b4580756d71f038f41a0bdb90892b88f8ea9d3b284d028c767521f42a4a209 fpsr=10 ; fdiv z2.s, p2/m, z2.s, z3.s
+65cd8862 => z2=2ead854756d71f038fc2989560618006c15ee326c6eb30bfc7dd8fd270172ab6 fpsr=10 ; fdiv z2.d, p2/m, z2.d, z3.d
+64568862 => z2=2ead2ead56d71f0399e874ff3f5aab158f8ea9d3809e494279f84e8511fdb0d6 ; fmaxp z2.h, p2/m, z2.h, z3.h
+64968862 => z2=c576507956d71f033f5a101f08f474ff8f8ea9d349428d8e55bc79f8b0d6e28b ; fmaxp z2.s, p2/m, z2.s, z3.s
+64d68862 => z2=2ead854756d71f032ead854756d71f0355bc79f8ada711fd8f8ea9d349428d8e ; fmaxp z2.d, p2/m, z2.d, z3.d
+654b0102 => z2=7f007e007e00fc00c00042f356457bff0000d130d1707f007bff7c007c00bc00 fpsr=11 ; fadd z2.h, z8.h, z11.h
+658c0122 => z2=000000004f8000004f8000007fe000007f7fffff7f8000007f800000bf800000 fpsr=11 ; fadd z2.s, z9.s, z12.s
+65cd0142 => z2=7fefffffffffffff7ff00000000000007ff0000000000000bff0000000000000 fpsr=10 ; fadd z2.d, z10.d, z13.d
+654b0502 => z2=7f007e007e007c00c000c19d563bfbff80005150d1107f007bff7c00fc004200 fpsr=11 ; fsub z2.h, z8.h, z11.h
+658c0522 => z2=80000000cf8000004f8000007fe000007f7fffff7f800000ff80000040400000 fpsr=11 ; fsub z2.s, z9.s, z12.s
+65cd0542 => z2=7fefffffffffffff7ff0000000000000fff00000000000004008000000000000 fpsr=10 ; fsub z2.d, z10.d, z13.d
+654b0902 => z2=7f007e007e007e0080023c30502a1bff8000cd4053e07f007bff7c007c00c000 fpsr=11 ; fmul z2.h, z8.h, z11.h
+658c0922 => z2=800000004f000000cfc000007fe000007f7fffff7f8000007f800000c0000000 fpsr=1 ; fmul z2.s, z9.s, z12.s
+65cd0942 => z2=7fefffffffffffff7ff00000000000007ff0000000000000c000000000000000 ; fmul z2.d, z10.d, z13.d
+654b0d02 => z2=7c0040807e000000c4002f1cf0e280000000340066e47f007c007c0048ef3c00 fpsr=1d ; ftsmul z2.h, z8.h, z11.h
+658c0d22 => z2=000000003e8000005f8000007fe000007f8000007f800000411de9e73f800000 fpsr=15 ; ftsmul z2.s, z9.s, z12.s
+65cd0d42 => z2=7ff00000000000007ff00000000000004023bd3cc9be45de3ff0000000000000 fpsr=14 ; ftsmul z2.d, z10.d, z13.d
+654b1902 => z2=7f007e00fe00400040003ba1cfd53ffc40004dc0d3a0ff00fbfffc00fc004400 fpsr=11 ; frecps z2.h, z8.h, z11.h
+658c1922 => z2=40000000cf0000004fc00000ffe00000ff7fffffff800000ff80000040800000 fpsr=11 ; frecps z2.s, z9.s, z12.s
+65cd1942 => z2=ffeffffffffffffffff0000000000000fff00000000000004010000000000000 fpsr=10 ; frecps z2.d, z10.d, z13.d
+654b1d02 => z2=7f007e00fe003e003e003bd0cb953dfe3e004a00cf80ff00f7fffc00fc004100 fpsr=11 ; frsqrts z2.h, z8.h, z11.h
+658c1d22 => z2=3fc00000ce8000004f400000ffe00000feffffffff800000ff80000040200000 fpsr=11 ; frsqrts z2.s, z9.s, z12.s
+65cd1d42 => z2=ffdffffffffffffffff0000000000000fff00000000000004004000000000000 fpsr=10 ; frsqrts z2.d, z10.d, z13.d
+046bb102 => z2=fc00be007e0000003c0035553c00bc0080003800d1407d007bff7c0042483c00 ; ftssel z2.h, z8.h, z11.h
+04acb122 => z2=800000003f0000004f8000007fa000007f7fffff7f80000040490fdb3f800000 ; ftssel z2.s, z9.s, z12.s
+04edb142 => z2=7fefffffffffffff7ff0000000000000400921fb54442d183ff0000000000000 ; ftssel z2.d, z10.d, z13.d
+0463b102 => z2=7c003c003c00bc003c003555d640bc00bc00bc00bc00fd007bff7c00bc003c00 ; ftssel z2.h, z8.h, z3.h
+04a3b122 => z2=3f800000bf8000004f800000bf800000bf800000ff80000040490fdb3f800000 ; ftssel z2.s, z9.s, z3.s
+04e3b142 => z2=bff0000000000000bff0000000000000c00921fb54442d183ff0000000000000 ; ftssel z2.d, z10.d, z3.d
+654b4903 => p3=00040051 fpsr=1 ; fcmge p3.h, p2/z, z8.h, z11.h
+658c4923 => p3=10100101 fpsr=1 ; fcmge p3.s, p2/z, z9.s, z12.s
+65cd4943 => p3=00010001 ; fcmge p3.d, p2/z, z10.d, z13.d
+654b4913 => p3=00040051 fpsr=1 ; fcmgt p3.h, p2/z, z8.h, z11.h
+658c4933 => p3=00100101 fpsr=1 ; fcmgt p3.s, p2/z, z9.s, z12.s
+65cd4953 => p3=00010001 ; fcmgt p3.d, p2/z, z10.d, z13.d
+654b6903 => p3=00000000 fpsr=1 ; fcmeq p3.h, p2/z, z8.h, z11.h
+658c6923 => p3=10000000 fpsr=1 ; fcmeq p3.s, p2/z, z9.s, z12.s
+65cd6943 => p3=00000000 ; fcmeq p3.d, p2/z, z10.d, z13.d
+654b6913 => p3=10550555 fpsr=1 ; fcmne p3.h, p2/z, z8.h, z11.h
+658c6933 => p3=00110111 fpsr=1 ; fcmne p3.s, p2/z, z9.s, z12.s
+65cd6953 => p3=00010101 ; fcmne p3.d, p2/z, z10.d, z13.d
+654bc903 => p3=10000100 fpsr=1 ; fcmuo p3.h, p2/z, z8.h, z11.h
+658cc923 => p3=00010000 fpsr=1 ; fcmuo p3.s, p2/z, z9.s, z12.s
+65cdc943 => p3=00000000 ; fcmuo p3.d, p2/z, z10.d, z13.d
+654bc913 => p3=00440450 fpsr=1 ; facge p3.h, p2/z, z8.h, z11.h
+658cc933 => p3=10100100 fpsr=1 ; facge p3.s, p2/z, z9.s, z12.s
+65cdc953 => p3=00010000 ; facge p3.d, p2/z, z10.d, z13.d
+654be913 => p3=00440450 fpsr=1 ; facgt p3.h, p2/z, z8.h, z11.h
+658ce933 => p3=00100100 fpsr=1 ; facgt p3.s, p2/z, z9.s, z12.s
+65cde953 => p3=00010000 ; facgt p3.d, p2/z, z10.d, z13.d
+65484963 => p3=00510404 fpsr=1 ; fcmle p3.h, p2/z, z8.h, z11.h
+65894983 => p3=10000010 fpsr=1 ; fcmle p3.s, p2/z, z9.s, z12.s
+65ca49a3 => p3=00000100 ; fcmle p3.d, p2/z, z10.d, z13.d
+65502903 => p3=00150055 fpsr=1 ; fcmge p3.h, p2/z, z8.h, #0.0
+65902923 => p3=10100111 fpsr=1 ; fcmge p3.s, p2/z, z9.s, #0.0
+65d02943 => p3=00010101 ; fcmge p3.d, p2/z, z10.d, #0.0
+65502913 => p3=00150055 fpsr=1 ; fcmgt p3.h, p2/z, z8.h, #0.0
+65902933 => p3=00100111 fpsr=1 ; fcmgt p3.s, p2/z, z9.s, #0.0
+65d02953 => p3=00010101 ; fcmgt p3.d, p2/z, z10.d, #0.0
+65512913 => p3=10400400 fpsr=1 ; fcmle p3.h, p2/z, z8.h, #0.0
+65912933 => p3=10000000 fpsr=1 ; fcmle p3.s, p2/z, z9.s, #0.0
+65d12953 => p3=00000000 ; fcmle p3.d, p2/z, z10.d, #0.0
+65512903 => p3=10400400 fpsr=1 ; fcmlt p3.h, p2/z, z8.h, #0.0
+65912923 => p3=00000000 fpsr=1 ; fcmlt p3.s, p2/z, z9.s, #0.0
+65d12943 => p3=00000000 ; fcmlt p3.d, p2/z, z10.d, #0.0
+65522903 => p3=00000000 fpsr=1 ; fcmeq p3.h, p2/z, z8.h, #0.0
+65922923 => p3=10000000 fpsr=1 ; fcmeq p3.s, p2/z, z9.s, #0.0
+65d22943 => p3=00000000 ; fcmeq p3.d, p2/z, z10.d, #0.0
+65532903 => p3=10550555 fpsr=1 ; fcmne p3.h, p2/z, z8.h, #0.0
+65932923 => p3=00110111 fpsr=1 ; fcmne p3.s, p2/z, z9.s, #0.0
+65d32943 => p3=00010101 ; fcmne p3.d, p2/z, z10.d, #0.0
+65402902 => z2=0000000000000000000000000000000000000000000000000000000000007f00 fpsr=11 ; faddv h2, p2, z8.h
+65802922 => z2=000000000000000000000000000000000000000000000000000000007fe00000 fpsr=11 ; faddv s2, p2, z9.s
+65c02942 => z2=0000000000000000000000000000000000000000000000007ff0000000000000 ; faddv d2, p2, z10.d
+65402562 => z2=0000000000000000000000000000000000000000000000000000000000007f00 fpsr=11 ; faddv h2, p1, z11.h
+65802582 => z2=000000000000000000000000000000000000000000000000000000007f800000 fpsr=10 ; faddv s2, p1, z12.s
+65c025a2 => z2=0000000000000000000000000000000000000000000000007ff0000000000000 ; faddv d2, p1, z13.d
+65442902 => z2=0000000000000000000000000000000000000000000000000000000000007c00 fpsr=1 ; fmaxnmv h2, p2, z8.h
+65842922 => z2=000000000000000000000000000000000000000000000000000000007f800000 fpsr=1 ; fmaxnmv s2, p2, z9.s
+65c42942 => z2=0000000000000000000000000000000000000000000000007ff0000000000000 ; fmaxnmv d2, p2, z10.d
+65442562 => z2=0000000000000000000000000000000000000000000000000000000000007c00 fpsr=1 ; fmaxnmv h2, p1, z11.h
+65842582 => z2=000000000000000000000000000000000000000000000000000000007f800000 ; fmaxnmv s2, p1, z12.s
+65c425a2 => z2=0000000000000000000000000000000000000000000000007ff0000000000000 ; fmaxnmv d2, p1, z13.d
+65452902 => z2=000000000000000000000000000000000000000000000000000000000000c000 fpsr=1 ; fminnmv h2, p2, z8.h
+65852922 => z2=0000000000000000000000000000000000000000000000000000000080000000 fpsr=1 ; fminnmv s2, p2, z9.s
+65c52942 => z2=0000000000000000000000000000000000000000000000003ff0000000000000 ; fminnmv d2, p2, z10.d
+65452562 => z2=000000000000000000000000000000000000000000000000000000000000fc00 fpsr=1 ; fminnmv h2, p1, z11.h
+65852582 => z2=00000000000000000000000000000000000000000000000000000000c0000000 ; fminnmv s2, p1, z12.s
+65c525a2 => z2=000000000000000000000000000000000000000000000000c000000000000000 ; fminnmv d2, p1, z13.d
+65462902 => z2=0000000000000000000000000000000000000000000000000000000000007f00 fpsr=1 ; fmaxv h2, p2, z8.h
+65862922 => z2=000000000000000000000000000000000000000000000000000000007fe00000 fpsr=1 ; fmaxv s2, p2, z9.s
+65c62942 => z2=0000000000000000000000000000000000000000000000007ff0000000000000 ; fmaxv d2, p2, z10.d
+65462562 => z2=0000000000000000000000000000000000000000000000000000000000007f00 fpsr=1 ; fmaxv h2, p1, z11.h
+65862582 => z2=000000000000000000000000000000000000000000000000000000007f800000 ; fmaxv s2, p1, z12.s
+65c625a2 => z2=0000000000000000000000000000000000000000000000007ff0000000000000 ; fmaxv d2, p1, z13.d
+65472902 => z2=0000000000000000000000000000000000000000000000000000000000007f00 fpsr=1 ; fminv h2, p2, z8.h
+65872922 => z2=000000000000000000000000000000000000000000000000000000007fe00000 fpsr=1 ; fminv s2, p2, z9.s
+65c72942 => z2=0000000000000000000000000000000000000000000000003ff0000000000000 ; fminv d2, p2, z10.d
+65472562 => z2=0000000000000000000000000000000000000000000000000000000000007f00 fpsr=1 ; fminv h2, p1, z11.h
+65872582 => z2=00000000000000000000000000000000000000000000000000000000c0000000 ; fminv s2, p1, z12.s
+65c725a2 => z2=000000000000000000000000000000000000000000000000c000000000000000 ; fminv d2, p1, z13.d
+65582968 => z8=0000000000000000000000000000000000000000000000000000000000007e00 ; fadda h8, p2, h8, z11.h
+65982989 => z9=000000000000000000000000000000000000000000000000000000007f800000 ; fadda s9, p2, s9, z12.s
+65d829aa => z10=0000000000000000000000000000000000000000000000007ff0000000000000 ; fadda d10, p2, d10, z13.d
+65582462 => z2=000000000000000000000000000000000000000000000000000000000000fe5d fpsr=11 ; fadda h2, p1, h2, z3.h
+65982462 => z2=00000000000000000000000000000000000000000000000000000000fc5d43ff fpsr=10 ; fadda s2, p1, s2, z3.s
+65d82462 => z2=000000000000000000000000000000000000000000000000ddaa4e85b0d6e28b fpsr=10 ; fadda d2, p1, d2, z3.d
+6540a902 => z2=2eadc00056d71f03c0000000564000008f8ea9d3d1407f007bff7c0042003c00 fpsr=1 ; frintn z2.h, p2/m, z8.h
+6580a922 => z2=8000000056d71f034f8000007fe000008f8ea9d37f800000404000003f800000 fpsr=1 ; frintn z2.s, p2/m, z9.s
+65c0a942 => z2=2ead854756d71f037ff000000000000040080000000000003ff0000000000000 ; frintn z2.d, p2/m, z10.d
+6540a962 => z2=2ead7e0056d71f030000420000007bff8f8ea9d3c00080003c0056407c00c000 ; frintn z2.h, p2/m, z11.h
+6580a982 => z2=0000000056d71f03c0000000800000008f8ea9d342c800007f800000c0000000 ; frintn z2.s, p2/m, z12.s
+65c0a9a2 => z2=2ead854756d71f0340590000000000007ff0000000000000c000000000000000 ; frintn z2.d, p2/m, z13.d
+6541a902 => z2=2eadbc0056d71f03c0003c0056403c008f8ea9d3d1407f007bff7c0044003c00 fpsr=1 ; frintp z2.h, p2/m, z8.h
+6581a922 => z2=8000000056d71f034f8000007fe000008f8ea9d37f800000408000003f800000 fpsr=1 ; frintp z2.s, p2/m, z9.s
+65c1a942 => z2=2ead854756d71f037ff000000000000040100000000000003ff0000000000000 ; frintp z2.d, p2/m, z10.d
+6541a962 => z2=2ead7e0056d71f033c0044003c007bff8f8ea9d3bc0080003c0056407c00c000 ; frintp z2.h, p2/m, z11.h
+6581a982 => z2=0000000056d71f03bf800000800000008f8ea9d342c800007f800000c0000000 ; frintp z2.s, p2/m, z12.s
+65c1a9a2 => z2=2ead854756d71f0340590000000000007ff0000000000000c000000000000000 ; frintp z2.d, p2/m, z13.d
+6542a902 => z2=2eadc00056d71f03c0000000564000008f8ea9d3d1407f007bff7c0042003c00 fpsr=1 ; frintm z2.h, p2/m, z8.h
+6582a922 => z2=8000000056d71f034f8000007fe000008f8ea9d37f800000404000003f800000 fpsr=1 ; frintm z2.s, p2/m, z9.s
+65c2a942 => z2=2ead854756d71f037ff000000000000040080000000000003ff0000000000000 ; frintm z2.d, p2/m, z10.d
+6542a962 => z2=2ead7e0056d71f030000420000007bff8f8ea9d3c00080003c0056407c00c000 ; frintm z2.h, p2/m, z11.h
+6582a982 => z2=0000000056d71f03c0000000800000008f8ea9d342c800007f800000c0000000 ; frintm z2.s, p2/m, z12.s
+65c2a9a2 => z2=2ead854756d71f0340590000000000007ff0000000000000c000000000000000 ; frintm z2.d, p2/m, z13.d
+6543a902 => z2=2eadbc0056d71f03c0000000564000008f8ea9d3d1407f007bff7c0042003c00 fpsr=1 ; frintz z2.h, p2/m, z8.h
+6583a922 => z2=8000000056d71f034f8000007fe000008f8ea9d37f800000404000003f800000 fpsr=1 ; frintz z2.s, p2/m, z9.s
+65c3a942 => z2=2ead854756d71f037ff000000000000040080000000000003ff0000000000000 ; frintz z2.d, p2/m, z10.d
+6543a962 => z2=2ead7e0056d71f030000420000007bff8f8ea9d3bc0080003c0056407c00c000 ; frintz z2.h, p2/m, z11.h
+6583a982 => z2=0000000056d71f03bf800000800000008f8ea9d342c800007f800000c0000000 ; frintz z2.s, p2/m, z12.s
+65c3a9a2 => z2=2ead854756d71f0340590000000000007ff0000000000000c000000000000000 ; frintz z2.d, p2/m, z13.d
+6544a902 => z2=2eadc00056d71f03c0000000564000008f8ea9d3d1407f007bff7c0042003c00 fpsr=1 ; frinta z2.h, p2/m, z8.h
+6584a922 => z2=8000000056d71f034f8000007fe000008f8ea9d37f800000404000003f800000 fpsr=1 ; frinta z2.s, p2/m, z9.s
+65c4a942 => z2=2ead854756d71f037ff000000000000040080000000000003ff0000000000000 ; frinta z2.d, p2/m, z10.d
+6544a962 => z2=2ead7e0056d71f030000420000007bff8f8ea9d3c00080003c0056407c00c000 ; frinta z2.h, p2/m, z11.h
+6584a982 => z2=0000000056d71f03c0000000800000008f8ea9d342c800007f800000c0000000 ; frinta z2.s, p2/m, z12.s
+65c4a9a2 => z2=2ead854756d71f0340590000000000007ff0000000000000c000000000000000 ; frinta z2.d, p2/m, z13.d
+6546a902 => z2=2eadc00056d71f03c0000000564000008f8ea9d3d1407f007bff7c0042003c00 fpsr=11 ; frintx z2.h, p2/m, z8.h
+6586a922 => z2=8000000056d71f034f8000007fe000008f8ea9d37f800000404000003f800000 fpsr=11 ; frintx z2.s, p2/m, z9.s
+65c6a942 => z2=2ead854756d71f037ff000000000000040080000000000003ff0000000000000 fpsr=10 ; frintx z2.d, p2/m, z10.d
+6546a962 => z2=2ead7e0056d71f030000420000007bff8f8ea9d3c00080003c0056407c00c000 fpsr=10 ; frintx z2.h, p2/m, z11.h
+6586a982 => z2=0000000056d71f03c0000000800000008f8ea9d342c800007f800000c0000000 fpsr=10 ; frintx z2.s, p2/m, z12.s
+65c6a9a2 => z2=2ead854756d71f0340590000000000007ff0000000000000c000000000000000 ; frintx z2.d, p2/m, z13.d
+6547a902 => z2=2eadc00056d71f03c0000000564000008f8ea9d3d1407f007bff7c0042003c00 fpsr=1 ; frinti z2.h, p2/m, z8.h
+6587a922 => z2=8000000056d71f034f8000007fe000008f8ea9d37f800000404000003f800000 fpsr=1 ; frinti z2.s, p2/m, z9.s
+65c7a942 => z2=2ead854756d71f037ff000000000000040080000000000003ff0000000000000 ; frinti z2.d, p2/m, z10.d
+6547a962 => z2=2ead7e0056d71f030000420000007bff8f8ea9d3c00080003c0056407c00c000 ; frinti z2.h, p2/m, z11.h
+6587a982 => z2=0000000056d71f03c0000000800000008f8ea9d342c800007f800000c0000000 ; frinti z2.s, p2/m, z12.s
+65c7a9a2 => z2=2ead854756d71f0340590000000000007ff0000000000000c000000000000000 ; frinti z2.d, p2/m, z13.d
+654ca902 => z2=2eadc00056d71f03bc004800280078008f8ea9d3ac007f00040000003c004000 fpsr=1 ; frecpx z2.h, p2/m, z8.h
+658ca922 => z2=ff00000056d71f03300000007fe000008f8ea9d3000000003f80000040000000 fpsr=1 ; frecpx z2.s, p2/m, z9.s
+65cca942 => z2=2ead854756d71f0300000000000000003ff00000000000004000000000000000 ; frecpx z2.d, p2/m, z10.d
+654ca962 => z2=2ead7e0056d71f0378003c00480004008f8ea9d3c000f800400028000000bc00 ; frecpx z2.h, p2/m, z11.h
+658ca982 => z2=7f00000056d71f03c0000000ff0000008f8ea9d33d00000000000000bf800000 ; frecpx z2.s, p2/m, z12.s
+65cca9a2 => z2=2ead854756d71f033fa00000000000000000000000000000bff0000000000000 ; frecpx z2.d, p2/m, z13.d
+654da902 => z2=2ead7e0056d71f037e00389e49000c008f8ea9d37e007f005bff7c003f173c00 fpsr=11 ; fsqrt z2.h, p2/m, z8.h
+658da922 => z2=8000000056d71f03478000007fe000008f8ea9d37f8000003fe2dfc53f800000 fpsr=11 ; fsqrt z2.s, p2/m, z9.s
+65cda942 => z2=2ead854756d71f037ff00000000000003ffc5bf891b4ef6a3ff0000000000000 fpsr=10 ; fsqrt z2.d, p2/m, z10.d
+654da962 => z2=2ead7e0056d71f030c003f17389e5bff8f8ea9d37e0080003c0049007c007e00 fpsr=11 ; fsqrt z2.h, p2/m, z11.h
+658da982 => z2=0000000056d71f037fc00000800000008f8ea9d3412000007f8000007fc00000 fpsr=1 ; fsqrt z2.s, p2/m, z12.s
+65cda9a2 => z2=2ead854756d71f0340240000000000007ff00000000000007ff8000000000000 fpsr=1 ; fsqrt z2.d, p2/m, z13.d
+651aa902 => z2=2ead000056d71f030001fffe0006ffe88f8ea9d300058000000f7fff00010000 fpsr=1 ; flogb z2.h, p2/m, z8.h
+651ca922 => z2=8000000056d71f0300000020800000008f8ea9d37fffffff0000000100000000 fpsr=1 ; flogb z2.s, p2/m, z9.s
+651ea942 => z2=2ead854756d71f037fffffffffffffff00000000000000010000000000000000 ; flogb z2.d, p2/m, z10.d
+651aa962 => z2=2ead800056d71f03ffe80001fffe000f8f8ea9d300008000000000067fff0001 fpsr=1 ; flogb z2.h, p2/m, z11.h
+651ca982 => z2=8000000056d71f0300000000800000008f8ea9d3000000067fffffff00000001 fpsr=1 ; flogb z2.s, p2/m, z12.s
+651ea9a2 => z2=2ead854756d71f0300000000000000067fffffffffffffff0000000000000001 ; flogb z2.d, p2/m, z13.d
+6546a862 => z2=2ead508056d71f03bc008000400000008f8ea9d3d640800055c079f880000000 fpsr=10 ; frintx z2.h, p2/m, z3.h
+6586a862 => z2=c576500056d71f03800000003f8000008f8ea9d3d63b809e55bc79f880000000 fpsr=10 ; frintx z2.s, p2/m, z3.s
+65c6a862 => z2=2ead854756d71f038000000000000000000000000000000055bc79f8ada711fd fpsr=10 ; frintx z2.d, p2/m, z3.d
+654e3102 => z2=8000b9547e007c00b7fc4200211c7c00fc003ffca6187f000100000035183bfc fpsr=17 ; frecpe z2.h, z8.h
+658e3122 => z2=ff8000003fff80002f7f80007fe0000000200000000000003ea300003f7f8000 fpsr=3 ; frecpe z2.s, z9.s
+65ce3142 => z2=000400000000000000000000000000003fd46000000000003feff00000000000 ; frecpe z2.d, z10.d
+654e3062 => z2=b1dc2724fe5d3400be3cdd68385c67c4693cb2f4a124fc0021940157c9ac6558 fpsr=15 ; frecpe z2.h, z3.h
+658e3062 => z2=b985000082940000c5ca80003f96000070cd0000a8ae8000292e0000d1440000 ; frecpe z2.s, z3.s
+65ce3062 => z2=ba66f00000000000c6bd20000000000071c02000000000002a22000000000000 ; frecpe z2.d, z3.d
+654f3102 => z2=7e007e007e007c007e003ef02e646bfcfc003da47e007f001c00000038843bfc fpsr=3 ; frsqrte z2.h, z8.h
+658f3122 => z2=ff8000003fb48000377f80007fe000001f800000000000003f1080003f7f8000 fpsr=3 ; frsqrte z2.s, z9.s
+65cf3142 => z2=1ff000000000000000000000000000003fe21000000000003feff00000000000 ; frsqrte z2.d, z10.d
+654f3062 => z2=7e003158fe5d38007e007e0039e4519452787e007e007e002eb01ca07e0050a0 fpsr=1 ; frsqrte z2.h, z3.h
+658f3062 => z2=7fc000007fc000007fc000003f8a8000582200007fc00000345300007fc00000 fpsr=1 ; frsqrte z2.s, z3.s
+65cf3062 => z2=7ff80000000000007ff800000000000058d6b000000000003508000000000000 fpsr=1 ; frsqrte z2.d, z3.d
+0460b862 => z2=2e710ee00b7f7fd424163cc26b0603d443d4132e472e13a937563eba34a83f7f ; fexpa z2.h, z3.h
+04a0b862 => z2=20ed4f3007fd3e0c33c5672a203311c4092b7a3a013123f673eac0c723f7d0df ; fexpa z2.s, z3.s
+04e0b862 => z2=50ffa7c1819e90d804066238825522256026247eb03a5585447efa1bee615a27 ; fexpa z2.d, z3.d
+65588808 => z8=fc00bc007e000000be003aaa5648380080003800d1307f007bff7c0043483e00 fpsr=11 ; fadd z8.h, p2/m, z8.h, #0.5
+65988809 => z9=3f0000003f0000004f8000007fe000007f7fffff7f80000040690fdb3fc00000 fpsr=11 ; fadd z9.s, p2/m, z9.s, #0.5
+65d8880a => z10=7fefffffffffffff7ff0000000000000400d21fb54442d183ff8000000000000 ; fadd z10.d, p2/m, z10.d, #0.5
+65588828 => z8=fc00b8007e000000bc003d5556503c0080003800d1207f007bff7c0044244000 fpsr=11 ; fadd z8.h, p2/m, z8.h, #1.0
+65988829 => z9=3f8000003f0000004f8000007fe000007f7fffff7f800000408487ee40000000 fpsr=11 ; fadd z9.s, p2/m, z9.s, #1.0
+65d8882a => z10=7fefffffffffffff7ff0000000000000401090fdaa22168c4000000000000000 ; fadd z10.d, p2/m, z10.d, #1.0
+65598808 => z8=fc00c0007e000000c100b1565638b80080003800d1507f007bff7c0041483800 fpsr=11 ; fsub z8.h, p2/m, z8.h, #0.5
+65998809 => z9=bf0000003f0000004f8000007fe000007f7fffff7f80000040290fdb3f000000 fpsr=11 ; fsub z9.s, p2/m, z9.s, #0.5
+65d9880a => z10=7fefffffffffffff7ff0000000000000400521fb54442d183fe0000000000000 ; fsub z10.d, p2/m, z10.d, #0.5
+65598828 => z8=fc00c1007e000000c200b9565630bc0080003800d1607f007bff7c0040480000 fpsr=11 ; fsub z8.h, p2/m, z8.h, #1.0
+65998829 => z9=bf8000003f0000004f8000007fe000007f7fffff7f80000040090fdb00000000 fpsr=11 ; fsub z9.s, p2/m, z9.s, #1.0
+65d9882a => z10=7fefffffffffffff7ff0000000000000400121fb54442d180000000000000000 ; fsub z10.d, p2/m, z10.d, #1.0
+655b8808 => z8=fc0040007e00000041003156d63838008000380051507f00fbfffc00c148b800 fpsr=11 ; fsubr z8.h, p2/m, z8.h, #0.5
+659b8809 => z9=3f0000003f000000cf8000007fe000007f7fffffff800000c0290fdbbf000000 fpsr=11 ; fsubr z9.s, p2/m, z9.s, #0.5
+65db880a => z10=7feffffffffffffffff0000000000000c00521fb54442d18bfe0000000000000 ; fsubr z10.d, p2/m, z10.d, #0.5
+655b8828 => z8=fc0041007e00000042003956d6303c008000380051607f00fbfffc00c0480000 fpsr=11 ; fsubr z8.h, p2/m, z8.h, #1.0
+659b8829 => z9=3f8000003f000000cf8000007fe000007f7fffffff800000c0090fdb00000000 fpsr=11 ; fsubr z9.s, p2/m, z9.s, #1.0
+65db882a => z10=7feffffffffffffffff0000000000000c00121fb54442d180000000000000000 ; fsubr z10.d, p2/m, z10.d, #1.0
+655a8808 => z8=fc00ba007e000000bc0031555240000080003800cd407f0077ff7c003e483800 fpsr=19 ; fmul z8.h, p2/m, z8.h, #0.5
+659a8809 => z9=800000003f0000004f0000007fe000007f7fffff7f8000003fc90fdb3f000000 fpsr=1 ; fmul z9.s, p2/m, z9.s, #0.5
+65da880a => z10=7fefffffffffffff7ff00000000000003ff921fb54442d183fe0000000000000 ; fmul z10.d, p2/m, z10.d, #0.5
+655a8828 => z8=fc00c2007e000000c40039555a40000280003800d5407f007c007c0046484000 fpsr=15 ; fmul z8.h, p2/m, z8.h, #2.0
+659a8829 => z9=800000003f000000500000007fe000007f7fffff7f80000040c90fdb40000000 fpsr=1 ; fmul z9.s, p2/m, z9.s, #2.0
+65da882a => z10=7fefffffffffffff7ff0000000000000401921fb54442d184000000000000000 ; fmul z10.d, p2/m, z10.d, #2.0
+655c8808 => z8=fc0000007e00000000003555564000018000380000007f007bff7c0042483c00 fpsr=1 ; fmaxnm z8.h, p2/m, z8.h, #0.0
+659c8809 => z9=000000003f0000004f8000007fe000007f7fffff7f80000040490fdb3f800000 fpsr=1 ; fmaxnm z9.s, p2/m, z9.s, #0.0
+65dc880a =>  ; fmaxnm z10.d, p2/m, z10.d, #0.0
+655c8828 => z8=fc003c007e0000003c003c0056403c00800038003c007f007bff7c0042483c00 fpsr=1 ; fmaxnm z8.h, p2/m, z8.h, #1.0
+659c8829 => z9=3f8000003f0000004f8000007fe000007f7fffff7f80000040490fdb3f800000 fpsr=1 ; fmaxnm z9.s, p2/m, z9.s, #1.0
+65dc882a =>  ; fmaxnm z10.d, p2/m, z10.d, #1.0
+655d8808 => z8=fc00be007e000000c00000000000000080003800d1407f000000000000000000 fpsr=1 ; fminnm z8.h, p2/m, z8.h, #0.0
+659d8809 => z9=800000003f000000000000007fe000007f7fffff000000000000000000000000 fpsr=1 ; fminnm z9.s, p2/m, z9.s, #0.0
+65dd880a => z10=7fefffffffffffff000000000000000000000000000000000000000000000000 ; fminnm z10.d, p2/m, z10.d, #0.0
+655d8828 => z8=fc00be007e000000c00035553c00000180003800d1407f003c003c003c003c00 fpsr=1 ; fminnm z8.h, p2/m, z8.h, #1.0
+659d8829 => z9=800000003f0000003f8000007fe000007f7fffff3f8000003f8000003f800000 fpsr=1 ; fminnm z9.s, p2/m, z9.s, #1.0
+65dd882a => z10=7fefffffffffffff3ff00000000000003ff00000000000003ff0000000000000 ; fminnm z10.d, p2/m, z10.d, #1.0
+655e8808 => z8=fc0000007e00000000003555564000018000380000007f007bff7c0042483c00 fpsr=1 ; fmax z8.h, p2/m, z8.h, #0.0
+659e8809 => z9=000000003f0000004f8000007fe000007f7fffff7f80000040490fdb3f800000 fpsr=1 ; fmax z9.s, p2/m, z9.s, #0.0
+65de880a =>  ; fmax z10.d, p2/m, z10.d, #0.0
+655e8828 => z8=fc003c007e0000003c003c0056403c00800038003c007f007bff7c0042483c00 fpsr=1 ; fmax z8.h, p2/m, z8.h, #1.0
+659e8829 => z9=3f8000003f0000004f8000007fe000007f7fffff7f80000040490fdb3f800000 fpsr=1 ; fmax z9.s, p2/m, z9.s, #1.0
+65de882a =>  ; fmax z10.d, p2/m, z10.d, #1.0
+655f8808 => z8=fc00be007e000000c00000000000000080003800d1407f000000000000000000 fpsr=1 ; fmin z8.h, p2/m, z8.h, #0.0
+659f8809 => z9=800000003f000000000000007fe000007f7fffff000000000000000000000000 fpsr=1 ; fmin z9.s, p2/m, z9.s, #0.0
+65df880a => z10=7fefffffffffffff000000000000000000000000000000000000000000000000 ; fmin z10.d, p2/m, z10.d, #0.0
+655f8828 => z8=fc00be007e000000c00035553c00000180003800d1407f003c003c003c003c00 fpsr=1 ; fmin z8.h, p2/m, z8.h, #1.0
+659f8829 => z9=800000003f0000003f8000007fe000007f7fffff3f8000003f8000003f800000 fpsr=1 ; fmin z9.s, p2/m, z9.s, #1.0
+65df882a => z10=7fefffffffffffff3ff00000000000003ff00000000000003ff0000000000000 ; fmin z10.d, p2/m, z10.d, #1.0
+65680968 => z8=fc007e007e000000c0003d85582b1bff800038004d407f007c007c007c00bc00 fpsr=15 ; fmla z8.h, p2/m, z11.h, z8.h
+65a90989 => z9=800000003f000000cf0000007fe000007f7fffff7f8000007f800000bf800000 fpsr=1 ; fmla z9.s, p2/m, z12.s, z9.s
+65ea09aa => z10=7fefffffffffffff7ff00000000000007ff0000000000000bff0000000000000 ; fmla z10.d, p2/m, z13.d, z10.d
+65640862 => z2=2ead427f56d71f03fe5674ff6ed6aa248f8ea9d3f04b8d58dd32fe387ffae28e fpsr=11 ; fmla z2.h, p2/m, z3.h, z4.h
+65a40862 => z2=2ead854756d71f0376073b136b4d89538f8ea9d3ec43e92bddaa4e85ec23be23 fpsr=10 ; fmla z2.s, p2/m, z3.s, z4.s
+65e40862 => z2=2ead854756d71f0375887316cf48a6d18f8ea9d349428d8eddaa4e85b0d6e28b fpsr=10 ; fmla z2.d, p2/m, z3.d, z4.d
+65682968 => z8=fc00fe007e000000c000b9b5542b9bff80003800d6907f0000007e00fc004200 fpsr=11 ; fmls z8.h, p2/m, z11.h, z8.h
+65a92989 => z9=000000003f000000502000007fe000007f7fffff7fc00000ff80000040400000 fpsr=1 ; fmls z9.s, p2/m, z12.s, z9.s
+65ea29aa => z10=7fefffffffffffff7ff8000000000000fff00000000000004008000000000000 fpsr=1 ; fmls z10.d, p2/m, z13.d, z10.d
+65642862 => z2=2eadc27f56d71f03fe5674ffeed7ac038f8ea9d3704e8dc4de22fe387ffae288 fpsr=11 ; fmls z2.h, p2/m, z3.h, z4.h
+65a42862 => z2=2ead854756d71f03f6073b13eb4d89538f8ea9d36c43e92bddaa4e856c23be23 fpsr=10 ; fmls z2.s, p2/m, z3.s, z4.s
+65e42862 => z2=2ead854756d71f03f5887316cf48a6d18f8ea9d349428d8eddaa4e85b0d6e28b fpsr=10 ; fmls z2.d, p2/m, z3.d, z4.d
+65684968 => z8=fc00fe007e0000004000bd85d82b9bff80003800cd40ff00fc00fc00fc003c00 fpsr=15 ; fnmla z8.h, p2/m, z11.h, z8.h
+65a94989 => z9=000000003f0000004f000000ffe000007f7fffffff800000ff8000003f800000 fpsr=1 ; fnmla z9.s, p2/m, z12.s, z9.s
+65ea49aa => z10=7feffffffffffffffff0000000000000fff00000000000003ff0000000000000 ; fnmla z10.d, p2/m, z13.d, z10.d
+65644862 => z2=2eadc27f56d71f03fe56f4ffeed62a248f8ea9d3704b0d585d32fe387ffa628e fpsr=11 ; fnmla z2.h, p2/m, z3.h, z4.h
+65a44862 => z2=aead854756d71f03f6073b13eb4d89538f8ea9d36c43e92b5daa4e856c23be23 fpsr=10 ; fnmla z2.s, p2/m, z3.s, z4.s
+65e44862 => z2=2ead854756d71f03f5887316cf48a6d10f8ea9d349428d8e5daa4e85b0d6e28b fpsr=10 ; fnmla z2.d, p2/m, z3.d, z4.d
+65686968 => z8=fc007e007e000000400039b5d42b1bff800038005690ff0000007e007c00c200 fpsr=11 ; fnmls z8.h, p2/m, z11.h, z8.h
+65a96989 => z9=000000003f000000d0200000ffe000007f7fffff7fc000007f800000c0400000 fpsr=1 ; fnmls z9.s, p2/m, z12.s, z9.s
+65ea69aa => z10=7fefffffffffffff7ff80000000000007ff0000000000000c008000000000000 fpsr=1 ; fnmls z10.d, p2/m, z13.d, z10.d
+65646862 => z2=2ead427f56d71f03fe56f4ff6ed72c038f8ea9d3f04e0dc45e22fe387ffa6288 fpsr=11 ; fnmls z2.h, p2/m, z3.h, z4.h
+65a46862 => z2=aead854756d71f0376073b136b4d89538f8ea9d3ec43e92b5daa4e85ec23be23 fpsr=10 ; fnmls z2.s, p2/m, z3.s, z4.s
+65e46862 => z2=2ead854756d71f0375887316cf48a6d10f8ea9d349428d8e5daa4e85b0d6e28b fpsr=10 ; fnmls z2.d, p2/m, z3.d, z4.d
+65688968 => z8=fc007e007e000000c0003d85582b1bff800038004d407f007c007c007c00bc00 fpsr=15 ; fmad z8.h, p2/m, z11.h, z8.h
+65a98989 => z9=800000003f000000cf0000007fe000007f7fffff7f8000007f800000bf800000 fpsr=1 ; fmad z9.s, p2/m, z12.s, z9.s
+65ea89aa => z10=7fefffffffffffff7ff00000000000007ff0000000000000bff0000000000000 ; fmad z10.d, p2/m, z13.d, z10.d
+65648862 => z2=2ead2da056d71f03fe56d34a6b704b4f8f8ea9d3e380bd75f80ffe387ffae6b9 fpsr=11 ; fmad z2.h, p2/m, z3.h, z4.h
+65a48862 => z2=b4a6f49e56d71f03fc5639b16b714b4f8f8ea9d3e00e7f21f3fac59c7dfae6b8 fpsr=10 ; fmad z2.s, p2/m, z3.s, z4.s
+65e48862 => z2=2ead854756d71f03fc5639b16b714b4fa32edabf5585bd75f37768fa538ea89b fpsr=10 ; fmad z2.d, p2/m, z3.d, z4.d
+6568a968 => z8=fc007e007e000000c000b9b5542b9bff80003800d6907f0000007e00fc004200 fpsr=11 ; fmsb z8.h, p2/m, z11.h, z8.h
+65a9a989 => z9=000000003f000000502000007fe000007f7fffff7fc00000ff80000040400000 fpsr=1 ; fmsb z9.s, p2/m, z12.s, z9.s
+65eaa9aa => z10=7fefffffffffffff7ff8000000000000fff00000000000004008000000000000 fpsr=1 ; fmsb z10.d, p2/m, z13.d, z10.d
+6564a862 => z2=2ead2dfe56d71f03fe5653776b724b4f8f8ea9d36471bd75780ffe387ffae6b7 fpsr=11 ; fmsb z2.h, p2/m, z3.h, z4.h
+65a4a862 => z2=34a6f49e56d71f03fc5639b16b714b4f8f8ea9d3600e7f2a73fac59c7dfae6b8 fpsr=10 ; fmsb z2.s, p2/m, z3.s, z4.s
+65e4a862 => z2=2ead854756d71f03fc5639b16b714b4fa32edabf5585bd75737768fa538ea89b fpsr=10 ; fmsb z2.d, p2/m, z3.d, z4.d
+6568c968 => z8=fc007e007e0000004000bd85d82b9bff80003800cd40ff00fc00fc00fc003c00 fpsr=15 ; fnmad z8.h, p2/m, z11.h, z8.h
+65a9c989 => z9=000000003f0000004f000000ffe000007f7fffffff800000ff8000003f800000 fpsr=1 ; fnmad z9.s, p2/m, z12.s, z9.s
+65eac9aa => z10=7feffffffffffffffff0000000000000fff00000000000003ff0000000000000 ; fnmad z10.d, p2/m, z13.d, z10.d
+6564c862 => z2=2eadada056d71f037e56534aeb70cb4f8f8ea9d363803d75780f7e38fffa66b9 fpsr=11 ; fnmad z2.h, p2/m, z3.h, z4.h
+65a4c862 => z2=34a6f49e56d71f037c5639b1eb714b4f8f8ea9d3600e7f2173fac59cfdfae6b8 fpsr=10 ; fnmad z2.s, p2/m, z3.s, z4.s
+65e4c862 => z2=2ead854756d71f037c5639b16b714b4f232edabf5585bd75737768fa538ea89b fpsr=10 ; fnmad z2.d, p2/m, z3.d, z4.d
+6568e968 => z8=fc007e007e000000400039b5d42b1bff800038005690ff0000007e007c00c200 fpsr=11 ; fnmsb z8.h, p2/m, z11.h, z8.h
+65a9e989 => z9=000000003f000000d0200000ffe000007f7fffff7fc000007f800000c0400000 fpsr=1 ; fnmsb z9.s, p2/m, z12.s, z9.s
+65eae9aa => z10=7fefffffffffffff7ff80000000000007ff0000000000000c008000000000000 fpsr=1 ; fnmsb z10.d, p2/m, z13.d, z10.d
+6564e862 => z2=2eadadfe56d71f037e56d377eb72cb4f8f8ea9d3e4713d75f80f7e38fffa66b7 fpsr=11 ; fnmsb z2.h, p2/m, z3.h, z4.h
+65a4e862 => z2=b4a6f49e56d71f037c5639b1eb714b4f8f8ea9d3e00e7f2af3fac59cfdfae6b8 fpsr=10 ; fnmsb z2.s, p2/m, z3.s, z4.s
+65e4e862 => z2=2ead854756d71f037c5639b16b714b4f232edabf5585bd75f37768fa538ea89b fpsr=10 ; fnmsb z2.d, p2/m, z3.d, z4.d
+64408968 => z8=fc00ff007e0000003c9035557c00b55580003800d1407f007c007c003c90fc00 fpsr=15 ; fcadd z8.h, p2/m, z8.h, z11.h, #90
+64808989 => z9=4f8000003f0000004f8000007fe000007f7fffff7f8000003f921fb6ff800000 fpsr=1 ; fcadd z9.s, p2/m, z9.s, z12.s, #90
+64c089aa => z10=7fefffffffffffff7ff00000000000003ff243f6a8885a30fff0000000000000 ; fcadd z10.d, p2/m, z10.d, z13.d, #90
+64418968 => z8=fc007f007e000000c5243555fbfc355580003800d1407f007bfc7c0045247c00 fpsr=11 ; fcadd z8.h, p2/m, z8.h, z11.h, #270
+64818989 => z9=cf8000003f0000004f8000007fe000007f7fffff7f80000040a487ee7f800000 fpsr=11 ; fcadd z9.s, p2/m, z9.s, z12.s, #270
+64c189aa => z10=7fefffffffffffff7ff0000000000000401490fdaa22168c7ff0000000000000 ; fcadd z10.d, p2/m, z10.d, z13.d, #270
+64480968 => z8=fc007e007e000000c8243d857c001bff80003800d1407f007c007c00c248bc00 fpsr=15 ; fcmla z8.h, p2/m, z11.h, z8.h, #0
+64890989 => z9=800000003f0000004f8000007fe000007f7fffff7f800000c0490fdbbf800000 fpsr=1 ; fcmla z9.s, p2/m, z12.s, z9.s, #0
+64ca09aa => z10=7fefffffffffffff7ff0000000000000c00921fb54442d18bff0000000000000 ; fcmla z10.d, p2/m, z13.d, z10.d, #0
+64482968 => z8=fc007f007e000000c00035555640d02a800038007f007f007c007c007c00fc00 fpsr=11 ; fcmla z8.h, p2/m, z11.h, z8.h, #90
+64892989 => z9=000000003f0000007fe000007fe000007f7fffff7f8000007f800000ff800000 fpsr=1 ; fcmla z9.s, p2/m, z12.s, z9.s, #90
+64ca29aa => z10=7fefffffffffffff7ff00000000000007ff0000000000000fff0000000000000 ; fcmla z10.d, p2/m, z13.d, z10.d, #90
+64484968 => z8=fc007e007e0000004448b9b5fc009bff80003800d1407f00fc007e0048b64200 fpsr=15 ; fcmla z8.h, p2/m, z11.h, z8.h, #180
+64894989 => z9=000000003f0000004f8000007fe000007f7fffff7fc000004116cbe440400000 fpsr=11 ; fcmla z9.s, p2/m, z12.s, z9.s, #180
+64ca49aa => z10=7fefffffffffffff7ff80000000000004022d97c7f3321d24008000000000000 fpsr=1 ; fcmla z10.d, p2/m, z13.d, z10.d, #180
+64486968 => z8=fc007f007e000000c00035555640502a80003800ff007f00fc007c00fc007c00 fpsr=11 ; fcmla z8.h, p2/m, z11.h, z8.h, #270
+64896989 => z9=800000003f000000ffe000007fe000007f7fffff7f800000ff8000007f800000 fpsr=1 ; fcmla z9.s, p2/m, z12.s, z9.s, #270
+64ca69aa => z10=7fefffffffffffff7ff0000000000000fff00000000000007ff0000000000000 ; fcmla z10.d, p2/m, z13.d, z10.d, #270
+64a31168 => z8=7e007e007e00fc00438b355b7c00501e436b3782d1407f007bff7c0042a23bfd fpsr=15 ; fcmla z8.h, z11.h, z3.h[0], #0
+64e91189 => z9=5f8000007fe000004f8000007fe000007f7fffff7f800000c0490fdbbf800000 fpsr=11 ; fcmla z9.s, z12.s, z9.s[0], #0
+64bb1568 => z8=7f007f007e004176c000355556ff3f4880003800d0637f007bff7c00fc00fc00 fpsr=11 ; fcmla z8.h, z11.h, z3.h[3], #90
+64f91589 => z9=000000003f0000004f8000007fe000007f8000007f8000007f800000ff800000 fpsr=11 ; fcmla z9.s, z12.s, z9.s[1], #90
+64ab1968 => z8=7e007e007e00fc0022e9357a792359e76b877c00d1407f007ae07c0059d57c00 fpsr=15 ; fcmla z8.h, z11.h, z3.h[1], #180
+64f91989 => z9=00000000cf0000004f8000007fe00000ff8000007fc000007f8000007f800000 fpsr=15 ; fcmla z9.s, z12.s, z9.s[1], #180
+64b31d68 => z8=7f007f007e00fe5dc000fe5d562bfe5d00003800d1407f007bff7c007c00fc00 fpsr=11 ; fcmla z8.h, z11.h, z3.h[2], #270
+64e91d89 => z9=ffe000003f000000ffe000007fe000007f7fffff7f800000ff8000007f800000 fpsr=11 ; fcmla z9.s, z12.s, z9.s[0], #270
+646b0168 => z8=7f00fe5dfe5dfe5dfe5dfe5dfe5dfe5d80006c1756b87f007bfc7c00fc005a43 fpsr=11 ; fmla z8.h, z11.h, z3.h[5]
+64b40189 => z9=80000000d8ae9a194f8004187fe000007f7fffff7f8000007f800000d605bd75 fpsr=11 ; fmla z9.s, z12.s, z4.s[2]
+64fd01aa => z10=7fefffffffffffff7ff00000000000007ff0000000000000fff0000000000000 fpsr=10 ; fmla z10.d, z13.d, z13.d[1]
+64a40062 => z2=f1682a37ff800000e518516d6b4d89534c9c95fdff8000007f800000ec23be23 fpsr=14 ; fmla z2.s, z3.s, z4.s[0]
+646b0568 => z8=ff00fe5dfe5dfe5dfe5dfe5dfe5dfe5d0000ec17d9fc7f007c007c007c00da33 fpsr=15 ; fmls z8.h, z11.h, z3.h[5]
+64b40589 => z9=0000000058ae9a194f7ff7d17fe000007f7fffff7f800000ff8000005605bd75 fpsr=11 ; fmls z9.s, z12.s, z4.s[2]
+64fd05aa => z10=7fefffffffffffff7ff0000000000000fff00000000000007ff0000000000000 fpsr=10 ; fmls z10.d, z13.d, z13.d[1]
+64a40462 => z2=71682a377f8000006518516deb4d8953cc9c95fd7f800000ff8000006c23be23 fpsr=14 ; fmls z2.s, z3.s, z4.s[0]
+647b2102 => z2=7c0048187e0080004976bf48e044800580000a1fa4047f004e1e7c0014ce0e1f fpsr=19 ; fmul z2.h, z8.h, z3.h[7]
+64bc2122 => z2=00000000927b2dcfa2fb2dcf7fe00000e32edabeff800000a4095494a32edabf fpsr=11 ; fmul z2.s, z9.s, z4.s[3]
+64ed2142 => z2=7ff00000000000007ff0000000000000c01921fb54442d18c000000000000000 fpsr=14 ; fmul z2.d, z10.d, z13.d[0]
+64f42062 => z2=1882f3d8fcff68770c2de61d5c0ac6798000000000000000b8fb7502550aef9c fpsr=18 ; fmul z2.d, z3.d, z4.d[1]
+65508168 => z8=7f007e007e007e003c004018504a3c043c004d80d3c07f007bff7c007c004200 fpsr=11 ; ftmad z8.h, z8.h, z11.h, #0
+65908189 => z9=3f8000004f0000004fc000007fe000007f7fffff7f8000007f80000040400000 fpsr=11 ; ftmad z9.s, z9.s, z12.s, #0
+65d081aa => z10=7fefffffffffffff7ff00000000000007ff00000000000004008000000000000 fpsr=10 ; ftmad z10.d, z10.d, z13.d, #0
+65538168 => z8=7f007e007e007e0080023c30502a1bff00004d40d3e07f007bff7c007c004000 fpsr=11 ; ftmad z8.h, z8.h, z11.h, #3
+65938189 => z9=b95008b94f0000004fc000007fe000007f7fffff7f8000007f8000003fffd27e fpsr=11 ; ftmad z9.s, z9.s, z12.s, #3
+65d381aa => z10=7fefffffffffffff7ff00000000000007ff00000000000003ffffa4fa4fa4fb1 fpsr=10 ; ftmad z10.d, z10.d, z13.d, #3
+65558168 => z8=7f007e007e007e0080023c30502a1bff00004d40d3e07f007bff7c007c004000 fpsr=11 ; ftmad z8.h, z8.h, z11.h, #5
+65958189 => z9=000000004f0000004fc000007fe000007f7fffff7f8000007f80000040000000 fpsr=1 ; ftmad z9.s, z9.s, z12.s, #5
+65d581aa => z10=7fefffffffffffff7ff00000000000007ff00000000000003fffffffb606c236 fpsr=10 ; ftmad z10.d, z10.d, z13.d, #5
+65578168 => z8=7f007e007e007e0080023c30502a1bff00004d40d3e07f007bff7c007c004000 fpsr=11 ; ftmad z8.h, z8.h, z11.h, #7
+65978189 => z9=000000004f0000004fc000007fe000007f7fffff7f8000007f80000040000000 fpsr=1 ; ftmad z9.s, z9.s, z12.s, #7
+65d781aa => z10=7fefffffffffffff7ff00000000000007ff00000000000003fffffffffff3845 fpsr=10 ; ftmad z10.d, z10.d, z13.d, #7
+6588a922 => z2=0000800056d71f0300007c0000007f008f8ea9d300007c000000424800003c00 fpsr=15 ; fcvt z2.h, p2/m, z9.s
+6588a862 => z2=0000ebb356d71f030000890d00003ad18f8ea9d30000fc0000007c0000008000 fpsr=1c ; fcvt z2.h, p2/m, z3.s
+6589a902 => z2=bfc0000056d71f033eaaa000338000008f8ea9d37fe000007f8000003f800000 fpsr=1 ; fcvt z2.s, p2/m, z8.h
+6589a862 => z2=420f200056d71f03bb3d00003a03e0008f8ea9d3b71e0000473f00003a3fa000 ; fcvt z2.s, p2/m, z3.h
+65c8a942 => z2=2ead854756d71f030000000000007c0000000000000042480000000000003c00 fpsr=10 ; fcvt z2.h, p2/m, z10.d
+65c8a862 => z2=2ead854756d71f03000000000000800000000000000000000000000000007c00 fpsr=1c ; fcvt z2.h, p2/m, z3.d
+65c9a902 => z2=2ead854756d71f033e700000000000007ffc0000000000003ff0000000000000 fpsr=1 ; fcvt z2.d, p2/m, z8.h
+65c9a862 => z2=2ead854756d71f033f407c0000000000bee3c000000000003f47f40000000000 ; fcvt z2.d, p2/m, z3.h
+65caa942 => z2=2ead854756d71f03000000007f8000000000000040490fdb000000003f800000 fpsr=10 ; fcvt z2.s, p2/m, z10.d
+65caa862 => z2=2ead854756d71f0300000000890ccf420000000000000000000000007f800000 fpsr=1c ; fcvt z2.s, p2/m, z3.d
+65cba922 => z2=2ead854756d71f037ffc0000000000007ff00000000000003ff0000000000000 fpsr=1 ; fcvt z2.d, p2/m, z9.s
+65cba862 => z2=2ead854756d71f033feb4203e0000000c2c77013c0000000bdb4e23fa0000000 ; fcvt z2.d, p2/m, z3.s
+655aa902 => z2=2eadffff56d71f03fffe0000006400008f8ea9d3ffd600007fff7fff00030001 fpsr=11 ; fcvtzs z2.h, p2/m, z8.h
+655aa962 => z2=2ead000056d71f030000000300007fff8f8ea9d3ffff0000000100647ffffffe fpsr=11 ; fcvtzs z2.h, p2/m, z11.h
+655ca902 => z2=ffffffff56d71f0300000000000000008f8ea9d3000000007fffffff00000001 fpsr=11 ; fcvtzs z2.s, p2/m, z8.h
+655ca962 => z2=0000000056d71f03000000030000ffe08f8ea9d30000000000000064fffffffe fpsr=11 ; fcvtzs z2.s, p2/m, z11.h
+655ea902 => z2=2ead854756d71f03000000000000000000000000000000000000000000000001 fpsr=11 ; fcvtzs z2.d, p2/m, z8.h
+655ea962 => z2=2ead854756d71f03000000000000ffe00000000000000000fffffffffffffffe ; fcvtzs z2.d, p2/m, z11.h
+659ca922 => z2=0000000056d71f037fffffff000000008f8ea9d37fffffff0000000300000001 fpsr=11 ; fcvtzs z2.s, p2/m, z9.s
+659ca982 => z2=0000000056d71f03ffffffff000000008f8ea9d3000000647ffffffffffffffe fpsr=11 ; fcvtzs z2.s, p2/m, z12.s
+65d8a942 => z2=2ead854756d71f03000000007fffffff00000000000000030000000000000001 fpsr=11 ; fcvtzs z2.s, p2/m, z10.d
+65d8a9a2 => z2=2ead854756d71f030000000000000064000000007ffffffffffffffffffffffe fpsr=1 ; fcvtzs z2.s, p2/m, z13.d
+65dca922 => z2=2ead854756d71f0300000000000000007fffffffffffffff0000000000000001 fpsr=1 ; fcvtzs z2.d, p2/m, z9.s
+65dca982 => z2=2ead854756d71f0300000000000000000000000000000064fffffffffffffffe ; fcvtzs z2.d, p2/m, z12.s
+65dea942 => z2=2ead854756d71f037fffffffffffffff00000000000000030000000000000001 fpsr=11 ; fcvtzs z2.d, p2/m, z10.d
+65dea9a2 => z2=2ead854756d71f0300000000000000647ffffffffffffffffffffffffffffffe fpsr=1 ; fcvtzs z2.d, p2/m, z13.d
+655ba902 => z2=2ead000056d71f0300000000006400008f8ea9d300000000ffe0ffff00030001 fpsr=11 ; fcvtzu z2.h, p2/m, z8.h
+655ba962 => z2=2ead000056d71f03000000030000ffe08f8ea9d30000000000010064ffff0000 fpsr=11 ; fcvtzu z2.h, p2/m, z11.h
+655da902 => z2=0000000056d71f0300000000000000008f8ea9d300000000ffffffff00000001 fpsr=11 ; fcvtzu z2.s, p2/m, z8.h
+655da962 => z2=0000000056d71f03000000030000ffe08f8ea9d3000000000000006400000000 fpsr=11 ; fcvtzu z2.s, p2/m, z11.h
+655fa902 => z2=2ead854756d71f03000000000000000000000000000000000000000000000001 fpsr=11 ; fcvtzu z2.d, p2/m, z8.h
+655fa962 => z2=2ead854756d71f03000000000000ffe000000000000000000000000000000000 fpsr=1 ; fcvtzu z2.d, p2/m, z11.h
+659da922 => z2=0000000056d71f03ffffffff000000008f8ea9d3ffffffff0000000300000001 fpsr=11 ; fcvtzu z2.s, p2/m, z9.s
+659da982 => z2=0000000056d71f0300000000000000008f8ea9d300000064ffffffff00000000 fpsr=1 ; fcvtzu z2.s, p2/m, z12.s
+65d9a942 => z2=2ead854756d71f0300000000ffffffff00000000000000030000000000000001 fpsr=11 ; fcvtzu z2.s, p2/m, z10.d
+65d9a9a2 => z2=2ead854756d71f03000000000000006400000000ffffffff0000000000000000 fpsr=1 ; fcvtzu z2.s, p2/m, z13.d
+65dda922 => z2=2ead854756d71f030000000000000000ffffffffffffffff0000000000000001 fpsr=1 ; fcvtzu z2.d, p2/m, z9.s
+65dda982 => z2=2ead854756d71f03000000000000000000000000000000640000000000000000 fpsr=1 ; fcvtzu z2.d, p2/m, z12.s
+65dfa942 => z2=2ead854756d71f03ffffffffffffffff00000000000000030000000000000001 fpsr=11 ; fcvtzu z2.d, p2/m, z10.d
+65dfa9a2 => z2=2ead854756d71f030000000000000064ffffffffffffffff0000000000000000 fpsr=1 ; fcvtzu z2.d, p2/m, z13.d
+6552a8a2 => z2=2eadcc0056d71f030000500000004e008f8ea9d30000500000004c0000005000 ; scvtf z2.h, p2/m, z5.h
+6552a862 => z2=2ead750856d71f03f46ef66273eb6c088f8ea9d3f139f7f6755c77a0f5266c7f fpsr=10 ; scvtf z2.h, p2/m, z3.h
+6554a8a2 => z2=0000cc0056d71f030000500000004e008f8ea9d30000500000004c0000005000 ; scvtf z2.h, p2/m, z5.s
+6554a862 => z2=0000fc0056d71f030000fc0000007c008f8ea9d30000fc0000007c000000fc00 fpsr=14 ; scvtf z2.h, p2/m, z3.s
+6556a8a2 => z2=2ead854756d71f030000000000007c000000000000007c000000000000007c00 fpsr=14 ; scvtf z2.h, p2/m, z5.d
+6556a862 => z2=2ead854756d71f03000000000000fc000000000000007c000000000000007c00 fpsr=14 ; scvtf z2.h, p2/m, z3.d
+6594a8a2 => z2=c180000056d71f034200000041c000008f8ea9d3420000004180000042000000 ; scvtf z2.s, p2/m, z5.s
+6594a862 => z2=ce6a26be56d71f03ce8dbccc4e7d68408f8ea9d3ce2711fe4eab78f4cea4b1dc fpsr=10 ; scvtf z2.s, p2/m, z3.s
+65d0a8a2 => z2=2ead854756d71f03403800000000000040400000000000004040000000000000 ; scvtf z2.d, p2/m, z5.s
+65d0a862 => z2=2ead854756d71f0341cfad080f800000c1c4e23fb1000000c1d4963b80c00000 ; scvtf z2.d, p2/m, z3.s
+65d4a8a2 => z2=2ead854756d71f03000000005200000000000000518000000000000051800000 fpsr=10 ; scvtf z2.s, p2/m, z5.d
+65d4a862 => z2=2ead854756d71f0300000000de8dbccc000000005d61fc4a000000005eab78f4 fpsr=10 ; scvtf z2.s, p2/m, z3.d
+65d6a8a2 => z2=2ead854756d71f0342400000000c000042300000002000004230000000200000 ; scvtf z2.d, p2/m, z5.d
+65d6a862 => z2=2ead854756d71f03c3d1b79985f0297c43ac3f8937ac770143d56f1e7e2b69c4 fpsr=10 ; scvtf z2.d, p2/m, z3.d
+6553a8a2 => z2=2ead7c0056d71f030000500000004e008f8ea9d30000500000004c0000005000 fpsr=14 ; ucvtf z2.h, p2/m, z5.h
+6553a862 => z2=2ead750856d71f0379c978cf73eb6c088f8ea9d37ab27805755c77a0796d6c7f fpsr=10 ; ucvtf z2.h, p2/m, z3.h
+6555a8a2 => z2=00007c0056d71f030000500000004e008f8ea9d30000500000004c0000005000 fpsr=14 ; ucvtf z2.h, p2/m, z5.s
+6555a862 => z2=00007c0056d71f0300007c0000007c008f8ea9d300007c0000007c0000007c00 fpsr=14 ; ucvtf z2.h, p2/m, z3.s
+6557a8a2 => z2=2ead854756d71f030000000000007c000000000000007c000000000000007c00 fpsr=14 ; ucvtf z2.h, p2/m, z5.d
+6557a862 => z2=2ead854756d71f030000000000007c000000000000007c000000000000007c00 fpsr=14 ; ucvtf z2.h, p2/m, z3.d
+6595a8a2 => z2=4f80000056d71f034200000041c000008f8ea9d3420000004180000042000000 fpsr=10 ; ucvtf z2.s, p2/m, z5.s
+6595a862 => z2=4f45765056d71f034f39219a4e7d68408f8ea9d34f563b814eab78f44f2da712 fpsr=10 ; ucvtf z2.s, p2/m, z3.s
+65d1a8a2 => z2=2ead854756d71f03403800000000000040400000000000004040000000000000 ; ucvtf z2.d, p2/m, z5.s
+65d1a862 => z2=2ead854756d71f0341cfad080f80000041eac77013c0000041e5b4e23fa00000 ; ucvtf z2.d, p2/m, z3.s
+65d5a8a2 => z2=2ead854756d71f03000000005200000000000000518000000000000051800000 fpsr=10 ; ucvtf z2.s, p2/m, z5.d
+65d5a862 => z2=2ead854756d71f03000000005f39219a000000005d61fc4a000000005eab78f4 fpsr=10 ; ucvtf z2.s, p2/m, z3.d
+65d7a8a2 => z2=2ead854756d71f0342400000000c000042300000002000004230000000200000 ; ucvtf z2.d, p2/m, z5.d
+65d7a862 => z2=2ead854756d71f0343e724333d07eb4243ac3f8937ac770143d56f1e7e2b69c4 fpsr=10 ; ucvtf z2.d, p2/m, z3.d
+6488a922 => z2=8000854756d71f037c0074ff7f00ab158f8ea9d37c008d8e42484e853c00e28b fpsr=15 ; fcvtnt z2.h, p2/m, z9.s
+64caa942 => z2=2ead854756d71f037f800000b8e8ab1540490fdb49428d8e3f800000b0d6e28b fpsr=10 ; fcvtnt z2.s, p2/m, z10.d
+6489a902 => z2=ff80000056d71f03c000000042c800008f8ea9d3c2280000477fe00040490000 ; fcvtlt z2.s, p2/m, z8.h
+64cba922 => z2=2ead854756d71f0341f000000000000047efffffe0000000400921fb60000000 ; fcvtlt z2.d, p2/m, z9.s
+650aa942 => z2=2ead854756d71f03000000007f8000000000000040490fdb000000003f800000 fpsr=10 ; fcvtx z2.s, p2/m, z10.d
+640aa942 => z2=2ead854756d71f037f800000b8e8ab1540490fdb49428d8e3f800000b0d6e28b fpsr=10 ; fcvtxnt z2.s, p2/m, z10.d
+6488a862 => z2=ebb3854756d71f03890d74ff3ad1ab158f8ea9d3fc008d8e7c004e858000e28b fpsr=1c ; fcvtnt z2.h, p2/m, z3.s
+650aa862 => z2=2ead854756d71f0300000000890ccf410000000000000001000000007f7fffff fpsr=1c ; fcvtx z2.s, p2/m, z3.d
+6489a862 => z2=c0aec00056d71f03bf2420003feb40008f8ea9d3c2c7600042b78000bdb4e000 ; fcvtlt z2.s, p2/m, z3.h
+64a9e589 => z9=4f0000007fe000004f8000007fe000007f8000007f8000007fc000007f800000 fpsr=11 ; fmmla z9.s, z12.s, z9.s
+64a4e462 => z2=7f8000007fc00000c894ba3876073b16ec43e92bff800000ddaa4e85ec23be23 fpsr=1d ; fmmla z2.s, z3.s, z4.s
+64eae5aa => z10=7ff00000000000007ff00000000000007ff80000000000007ff0000000000000 fpsr=11 ; fmmla z10.d, z13.d, z10.d
+64e4e462 => z2=75887316cf48a6d1ae6fe2cc9e06ad7afff0000000000000ddaa4e85b0d6e28b fpsr=1c ; fmmla z2.d, z3.d, z4.d
+4522e062 => z2=ac03eab2c83703b017b94af0e97e5567db470d52c4a33ccaa481d7ff0cb69a38 ; aese z2.b, z2.b, z3.b
+4522e462 => z2=eab5a7d13c3e5355629ffe8756cfb5a3defff3d4912cb27c6eac7e1397afb30f ; aesd z2.b, z2.b, z3.b
+4520e002 => z2=bdf19499615309a68a60188517a6c39c4cf79c5cd45c0080d1f821b4c9158556 ; aesmc z2.b, z2.b
+4520e402 => z2=194a3022daaab25ff4d9663c6a4ebe74216df1c6a9017ddd3cd3cc9fe202ae41 ; aesimc z2.b, z2.b
+4523e062 => z2=7d6711c4a3d8e290579d7787429d799232ca532b62d683f413d012ea190d076a ; sm4e z2.s, z2.s, z3.s
+4524f062 => z2=750feaf7cc7f703bdfc3e04974d1b9ec66fd51b6735d1e26b4f2a7984e6b6786 ; sm4ekey z2.s, z3.s, z4.s
+4524f462 => z2=e0800be66d0077cc418dea8ae9b88680484271e57d30fa753fc581885652dc8d ; rax1 z2.d, z3.d, z4.d
+45046862 => z2=69655fb960f0c2b6c025ebbdc6aaee650ee321cf2d7320b627375d58705b3f18 ; pmullb z2.q, z3.d, z4.d
+45046c62 => z2=6f26c7a2de14e603e47413ae51a115f706dfa9d64bc38a66a3ea4cf3eec88946 ; pmullt z2.q, z3.d, z4.d
+45446862 => z2=2c0a2067260608f70a966768183a0765035a50491d573f461b50174060a66918 ; pmullb z2.h, z3.b, z4.b
+45446c62 => z2=6f5a099046e0272e695c1ee1099904b006d258e83b6e5e800ef1285c33410e86 ; pmullt z2.h, z3.b, z4.b
+45c46862 => z2=46bf22ca51a115f7098d01eac6aaee653b0b671eeec889463317dd80705b3f18 ; pmullb z2.d, z3.s, z4.s
+45c46c62 => z2=6f26c7a2fbe3656769655fb948c2e66806dfa9d6382af2490ee321cf2901cf40 ; pmullt z2.d, z3.s, z4.s
 vq 3
 04000862 => z2=23dcfbbfd7eabd75443cfc3819fae6b88131eb79fc5d43ff0d6c99afac5a711f0e1fc49b9e3b1ab751bcb2f8181811fd ; add z2.b, p2/m, z2.b, z3.b
 04400862 => z2=23dcdabfd7eabd75353cfc387dfae6b882315079fc5d43ff0d6ca8af3f5a101f0e1fc49bd63b1ab755bc79f8191811fd ; add z2.h, p2/m, z2.h, z3.h
@@ -4487,3 +5460,489 @@ e58009c3 => esr=96000050 ; str p3, [x14, #2, mul vl]
 85c14903 =>  ; prfw pldl2strm, p2, [x8, #1, mul vl]
 c581e8c0 =>  ; prfd pldl1keep, p2, [z6.d, #8]
 84652908 =>  ; prfh pstl1keep, p2, [x8, z5.s, sxtw #1]
+65408968 => z8=00003800d1707d007bff7c0042483c007f00be007e000000c00042f35640000180003800d1407f007bff7c007c003c00 fpsr=11 ; fadd z8.h, p2/m, z8.h, z11.h
+65808989 => fpsr=10 ; fadd z9.s, p2/m, z9.s, z12.s
+65c089aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fadd z10.d, p2/m, z10.d, z13.d
+65418968 => z8=80003800d1107d007bff7c0042483c007f00be007e000000c000c19d5640000180003800d1407f007bff7c00fc003c00 fpsr=11 ; fsub z8.h, p2/m, z8.h, z11.h
+65818989 => fpsr=10 ; fsub z9.s, p2/m, z9.s, z12.s
+65c189aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000fff00000000000003ff0000000000000 ; fsub z10.d, p2/m, z10.d, z13.d
+65428968 => z8=8000380053e07d007bff7c0042483c007f00be007e00000080023c305640000180003800d1407f007bff7c007c003c00 fpsr=11 ; fmul z8.h, p2/m, z8.h, z11.h
+65828989 => z9=c00000003eaaaaab42c8000000000001800000003f000000cfc000007fa000007f7fffff7f80000040490fdb3f800000 ; fmul z9.s, p2/m, z9.s, z12.s
+65c289aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fmul z10.d, p2/m, z10.d, z13.d
+65448968 => z8=00003800be007d007bff7c0042483c007f00be007e000000000142485640000180003800d1407f007bff7c007c003c00 fpsr=1 ; fmaxnm z8.h, p2/m, z8.h, z11.h
+65848989 =>  ; fmaxnm z9.s, p2/m, z9.s, z12.s
+65c489aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fmaxnm z10.d, p2/m, z10.d, z13.d
+65458968 => z8=80003800d1407d007bff7c0042483c007f00be007e000000c00035555640000180003800d1407f007bff7c0042483c00 fpsr=1 ; fminnm z8.h, p2/m, z8.h, z11.h
+65858989 => z9=c00000003eaaaaab42c8000000000001800000003f000000bfc000007fa000007f7fffff42c8000040490fdb3f800000 ; fminnm z9.s, p2/m, z9.s, z12.s
+65c589aa =>  ; fminnm z10.d, p2/m, z10.d, z13.d
+65468968 => z8=00003800be007d007bff7c0042483c007f00be007e000000000142485640000180003800d1407f007bff7c007c003c00 fpsr=1 ; fmax z8.h, p2/m, z8.h, z11.h
+65868989 =>  ; fmax z9.s, p2/m, z9.s, z12.s
+65c689aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fmax z10.d, p2/m, z10.d, z13.d
+65478968 => z8=80003800d1407d007bff7c0042483c007f00be007e000000c00035555640000180003800d1407f007bff7c0042483c00 fpsr=1 ; fmin z8.h, p2/m, z8.h, z11.h
+65878989 => z9=c00000003eaaaaab42c8000000000001800000003f000000bfc000007fa000007f7fffff42c8000040490fdb3f800000 ; fmin z9.s, p2/m, z9.s, z12.s
+65c789aa =>  ; fmin z10.d, p2/m, z10.d, z13.d
+65488968 => z8=0000380051107d007bff7c0042483c007f00be007e0000004000419d5640000180003800d1407f007bff7c007c003c00 fpsr=11 ; fabd z8.h, p2/m, z8.h, z11.h
+65888989 => fpsr=10 ; fabd z9.s, p2/m, z9.s, z12.s
+65c889aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fabd z10.d, p2/m, z10.d, z13.d
+65498968 => z8=8000380080007d007bff7c0042483c00fc00be007e000000c4007c005640000180003800d1407f007bff7c007c003c00 fpsr=1d ; fscale z8.h, p2/m, z8.h, z11.h
+65898989 => z9=c00000003eaaaaab42c8000000000001800000003f000000000000007fa000007f7fffff7f80000040490fdb3f800000 fpsr=18 ; fscale z9.s, p2/m, z9.s, z12.s
+65c989aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 fpsr=14 ; fscale z10.d, p2/m, z10.d, z13.d
+654a8968 => z8=8000380053e07d007bff7c0042483c007f00be007e00000080023c305640000180003800d1407f007bff7c007c003c00 fpsr=11 ; fmulx z8.h, p2/m, z8.h, z11.h
+658a8989 => z9=c00000003eaaaaab42c8000000000001800000003f000000cfc000007fa000007f7fffff7f80000040490fdb3f800000 ; fmulx z9.s, p2/m, z9.s, z12.s
+65ca89aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fmulx z10.d, p2/m, z10.d, z13.d
+654d8968 => z8=7e0038004f007d007bff7c0042483c007f00be007e000000fc002ecb5640000180003800d1407f007bff7c0000003c00 fpsr=15 ; fdiv z8.h, p2/m, z8.h, z11.h
+658d8989 => z9=c00000003eaaaaab42c8000000000001800000003f000000cf2aaaab7fa000007f7fffff7f80000040490fdb3f800000 fpsr=10 ; fdiv z9.s, p2/m, z9.s, z12.s
+65cd89aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff000000000000000000000000000003ff0000000000000 ; fdiv z10.d, p2/m, z10.d, z13.d
+654c8968 => z8=7e00380028927d007bff7c0042483c007f00be007e000000800048b65640000180003800d1407f007bff7c007c003c00 fpsr=19 ; fdivr z8.h, p2/m, z8.h, z11.h
+658c8989 => z9=c00000003eaaaaab42c8000000000001800000003f000000afc000007fa000007f7fffff0000000040490fdb3f800000 ; fdivr z9.s, p2/m, z9.s, z12.s
+65cc89aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fdivr z10.d, p2/m, z10.d, z13.d
+65438968 => z8=0000380051107d007bff7c0042483c007f00be007e0000004000419d5640000180003800d1407f007bff7c007c003c00 fpsr=11 ; fsubr z8.h, p2/m, z8.h, z11.h
+65838989 => z9=c00000003eaaaaab42c8000000000001800000003f000000cf8000007fa000007f7fffffff80000040490fdb3f800000 fpsr=10 ; fsubr z9.s, p2/m, z9.s, z12.s
+65c389aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fsubr z10.d, p2/m, z10.d, z13.d
+64508968 => z8=d1403800be007d007bff7c0042483c007f00be007e0000004248beab5640000180003800d1407f007bff7c007c003c00 fpsr=11 ; faddp z8.h, p2/m, z8.h, z11.h
+64908989 => z9=c00000003eaaaaab42c8000000000001800000003f000000bfc000007fa000007f7fffff7f80000040490fdb3f800000 ; faddp z9.s, p2/m, z9.s, z12.s
+64d089aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; faddp z10.d, p2/m, z10.d, z13.d
+64548968 => z8=0000380080007d007bff7c0042483c007f00be007e000000424835555640000180003800d1407f007bff7c007c003c00 fpsr=1 ; fmaxnmp z8.h, p2/m, z8.h, z11.h
+64948989 => z9=c00000003eaaaaab42c8000000000001800000003f000000800000007fa000007f7fffff7f80000040490fdb3f800000 ; fmaxnmp z9.s, p2/m, z9.s, z12.s
+64d489aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fmaxnmp z10.d, p2/m, z10.d, z13.d
+64558968 => z8=d1403800be007d007bff7c0042483c007f00be007e0000000001c0005640000180003800d1407f007bff7c00c0003c00 fpsr=1 ; fminnmp z8.h, p2/m, z8.h, z11.h
+64958989 => z9=c00000003eaaaaab42c8000000000001800000003f000000bfc000007fa000007f7fffff7f7fffff40490fdb3f800000 ; fminnmp z9.s, p2/m, z9.s, z12.s
+64d589aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000c0000000000000003ff0000000000000 ; fminnmp z10.d, p2/m, z10.d, z13.d
+64568968 => z8=0000380080007d007bff7c0042483c007f00be007e000000424835555640000180003800d1407f007bff7c007c003c00 fpsr=1 ; fmaxp z8.h, p2/m, z8.h, z11.h
+64968989 => z9=c00000003eaaaaab42c8000000000001800000003f000000800000007fa000007f7fffff7f80000040490fdb3f800000 ; fmaxp z9.s, p2/m, z9.s, z12.s
+64d689aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fmaxp z10.d, p2/m, z10.d, z13.d
+64578968 => z8=d1403800be007d007bff7c0042483c007f00be007e0000000001c0005640000180003800d1407f007bff7c00c0003c00 fpsr=1 ; fminp z8.h, p2/m, z8.h, z11.h
+64978989 => z9=c00000003eaaaaab42c8000000000001800000003f000000bfc000007fa000007f7fffff7f7fffff40490fdb3f800000 ; fminp z9.s, p2/m, z9.s, z12.s
+64d789aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000c0000000000000003ff0000000000000 ; fminp z10.d, p2/m, z10.d, z13.d
+65408862 => z2=a32fdabf5585bd75353cfc387dfae6b8c6a55079fc5d43ff5441990f3f5a101f0e1fc49bd63b9a1e55bc79f86b7111fd fpsr=10 ; fadd z2.h, p2/m, z2.h, z3.h
+65808862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff544b0ec73f5a101f0e1fc49bd63b809e55bc79f8ada711fd fpsr=10 ; fadd z2.s, p2/m, z2.s, z3.s
+65c08862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f92fb2dcfc8ae9a1955bc79f8ada711fd fpsr=10 ; fadd z2.d, p2/m, z2.d, z3.d
+65428862 => z2=0002dabf9a9cbd75353cfc387dfae6b846755079fc5d43ffd18180143f5a101f0e1fc49bd63b000055bc79f8dd4211fd fpsr=18 ; fmul z2.h, p2/m, z2.h, z3.h
+65828862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffce002e5f3f5a101f0e1fc49b5f7fc49255bc79f8ada711fd fpsr=10 ; fmul z2.s, p2/m, z2.s, z3.s
+65c28862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f800000000000000055bc79f8ada711fd fpsr=18 ; fmul z2.d, p2/m, z2.d, z3.d
+654d8862 => z2=6548dabffc00bd75353cfc387dfae6b8449e5079fc5d43ffa0c7c6f93f5a101f0e1fc49bd63b1a7a55bc79f8818511fd fpsr=1c ; fdiv z2.h, p2/m, z2.h, z3.h
+658d8862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffa44bbc163f5a101f0e1fc49b4d09751055bc79f8ada711fd fpsr=10 ; fdiv z2.s, p2/m, z2.s, z3.s
+65cd8862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101fbb12b3979fd9a83e55bc79f8ada711fd fpsr=10 ; fdiv z2.d, p2/m, z2.d, z3.d
+64568862 => z2=2120dabf71debd75353cfc387dfae6b89b7e5079fc5d43ff544b99e83f5a101f0e1fc49bd63b809e55bc79f86b7111fd ; fmaxp z2.h, p2/m, z2.h, z3.h
+64968862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff6d00616d3f5a101f0e1fc49b0e1fc49b55bc79f8ada711fd ; fmaxp z2.s, p2/m, z2.s, z3.s
+64d68862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f92fb2dcfc8ae9a1955bc79f8ada711fd ; fmaxp z2.d, p2/m, z2.d, z3.d
+654b0102 => z2=0000d130d1707f007bff7c007c00bc007f007e007e00fc00c00042f356457bff0000d130d1707f007bff7c007c00bc00 fpsr=11 ; fadd z2.h, z8.h, z11.h
+658c0122 => z2=c0000000405e653042c8aaab7f7fffff000000004f8000004f8000007fe000007f7fffff7f8000007f800000bf800000 fpsr=11 ; fadd z2.s, z9.s, z12.s
+65cd0142 => z2=43f00000000000007ffc0000000000007fefffffffffffff7ff00000000000007ff0000000000000bff0000000000000 fpsr=11 ; fadd z2.d, z10.d, z13.d
+654b0502 => z2=80005150d1107f007bff7c00fc0042007f007e007e007c00c000c19d563bfbff80005150d1107f007bff7c00fc004200 fpsr=11 ; fsub z2.h, z8.h, z11.h
+658c0522 => z2=c0000000c033ba8642c75555ff7fffff80000000cf8000004f8000007fe000007f7fffff7f800000ff80000040400000 fpsr=11 ; fsub z2.s, z9.s, z12.s
+65cd0542 => z2=43f00000000000007ffc0000000000007fefffffffffffff7ff0000000000000fff00000000000004008000000000000 fpsr=11 ; fsub z2.d, z10.d, z13.d
+654b0902 => z2=8000cd4053e07f007bff7c007c00c0007f007e007e007e0080023c30502a1bff8000cd4053e07f007bff7c007c00c000 fpsr=11 ; fmul z2.h, z8.h, z11.h
+658c0922 => z2=800000023f860a924205555634ffffff800000004f000000cfc000007fe000007f7fffff7f8000007f800000c0000000 fpsr=11 ; fmul z2.s, z9.s, z12.s
+65cd0942 => z2=c3f80000000000007ffc0000000000007fefffffffffffff7ff00000000000007ff0000000000000c000000000000000 fpsr=1 ; fmul z2.d, z10.d, z13.d
+654b0d02 => z2=0000340066e47f007c007c0048ef3c007c0040807e000000c4002f1cf0e280000000340066e47f007c007c0048ef3c00 fpsr=1d ; ftsmul z2.h, z8.h, z11.h
+658c0d22 => z2=c0800000bde38e3ac61c400080000000000000003e8000005f8000007fe000007f8000007f800000411de9e73f800000 fpsr=1d ; ftsmul z2.s, z9.s, z12.s
+65cd0d42 => z2=47f00000000000007ffc0000000000007ff00000000000007ff00000000000004023bd3cc9be45de3ff0000000000000 fpsr=15 ; ftsmul z2.d, z10.d, z13.d
+654b1902 => z2=40004dc0d3a0ff00fbfffc00fc0044007f007e00fe00400040003ba1cfd53ffc40004dc0d3a0ff00fbfffc00fc004400 fpsr=11 ; frecps z2.h, z8.h, z11.h
+658c1922 => z2=400000003f73eadbc1faaaab3ffffffc40000000cf0000004fc00000ffe00000ff7fffffff800000ff80000040800000 fpsr=11 ; frecps z2.s, z9.s, z12.s
+65cd1942 => z2=43f8000000000000fffc000000000000ffeffffffffffffffff0000000000000fff00000000000004010000000000000 fpsr=11 ; frecps z2.d, z10.d, z13.d
+654b1d02 => z2=3e004a00cf80ff00f7fffc00fc0041007f007e00fe003e003e003bd0cb953dfe3e004a00cf80ff00f7fffc00fc004100 fpsr=11 ; frsqrts z2.h, z8.h, z11.h
+658c1d22 => z2=3fc000003f79f56ec172aaab3fbffffe3fc00000ce8000004f400000ffe00000feffffffff800000ff80000040200000 fpsr=11 ; frsqrts z2.s, z9.s, z12.s
+65cd1d42 => z2=43e8000000000000fffc000000000000ffdffffffffffffffff0000000000000fff00000000000004004000000000000 fpsr=11 ; frsqrts z2.d, z10.d, z13.d
+046bb102 => z2=80003800d1407d007bff7c0042483c00fc00be007e0000003c0035553c00bc0080003800d1407d007bff7c0042483c00 ; ftssel z2.h, z8.h, z11.h
+04acb122 => z2=3f800000bf800000bf800000bf800000800000003f0000004f8000007fa000007f7fffff7f80000040490fdb3f800000 ; ftssel z2.s, z9.s, z12.s
+04edb142 => z2=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000400921fb54442d183ff0000000000000 ; ftssel z2.d, z10.d, z13.d
+0463b102 => z2=000038003c00fd00fbff3c00c248bc00bc003e003c00bc00bc00bc0056403c00bc00bc0051403c00fbff3c003c00bc00 ; ftssel z2.h, z8.h, z3.h
+04a3b122 => z2=c0000000beaaaaab3f8000008000000100000000bf800000bf8000003f800000bf8000003f8000003f800000bf800000 ; ftssel z2.s, z9.s, z3.s
+04e3b142 => z2=c3f0000000000000fff4000000000000bff00000000000003ff00000000000003ff0000000000000bff0000000000000 ; ftssel z2.d, z10.d, z3.d
+654b4903 => p3=400000000000 fpsr=1 ; fcmge p3.h, p2/z, z8.h, z11.h
+658c4923 => p3=000000100100 ; fcmge p3.s, p2/z, z9.s, z12.s
+65cd4943 => p3=000000000000 ; fcmge p3.d, p2/z, z10.d, z13.d
+654b4913 => p3=000000000000 fpsr=1 ; fcmgt p3.h, p2/z, z8.h, z11.h
+658c4933 => p3=000000100100 ; fcmgt p3.s, p2/z, z9.s, z12.s
+65cd4953 => p3=000000000000 ; fcmgt p3.d, p2/z, z10.d, z13.d
+654b6903 => p3=400000000000 fpsr=1 ; fcmeq p3.h, p2/z, z8.h, z11.h
+658c6923 => p3=000000000000 ; fcmeq p3.s, p2/z, z9.s, z12.s
+65cd6943 => p3=000000000000 ; fcmeq p3.d, p2/z, z10.d, z13.d
+654b6913 => p3=040040500104 fpsr=1 ; fcmne p3.h, p2/z, z8.h, z11.h
+658c6933 => p3=000000100100 ; fcmne p3.s, p2/z, z9.s, z12.s
+65cd6953 => p3=000000000100 ; fcmne p3.d, p2/z, z10.d, z13.d
+654bc903 => p3=000040000100 fpsr=1 ; fcmuo p3.h, p2/z, z8.h, z11.h
+658cc923 => p3=000000000000 ; fcmuo p3.s, p2/z, z9.s, z12.s
+65cdc943 => p3=000000000000 ; fcmuo p3.d, p2/z, z10.d, z13.d
+654bc913 => p3=440000400000 fpsr=1 ; facge p3.h, p2/z, z8.h, z11.h
+658cc933 => p3=000000100100 ; facge p3.s, p2/z, z9.s, z12.s
+65cdc953 => p3=000000000000 ; facge p3.d, p2/z, z10.d, z13.d
+654be913 => p3=040000400000 fpsr=1 ; facgt p3.h, p2/z, z8.h, z11.h
+658ce933 => p3=000000100100 ; facgt p3.s, p2/z, z9.s, z12.s
+65cde953 => p3=000000000000 ; facgt p3.d, p2/z, z10.d, z13.d
+65484963 => p3=440000500004 fpsr=1 ; fcmle p3.h, p2/z, z8.h, z11.h
+65894983 => p3=000000000000 ; fcmle p3.s, p2/z, z9.s, z12.s
+65ca49a3 => p3=000000000100 ; fcmle p3.d, p2/z, z10.d, z13.d
+65502903 => p3=400000100004 fpsr=1 ; fcmge p3.h, p2/z, z8.h, #0.0
+65902923 => p3=000000100100 ; fcmge p3.s, p2/z, z9.s, #0.0
+65d02943 => p3=000000000100 ; fcmge p3.d, p2/z, z10.d, #0.0
+65502913 => p3=000000100004 fpsr=1 ; fcmgt p3.h, p2/z, z8.h, #0.0
+65902933 => p3=000000100100 ; fcmgt p3.s, p2/z, z9.s, #0.0
+65d02953 => p3=000000000100 ; fcmgt p3.d, p2/z, z10.d, #0.0
+65512913 => p3=440040400000 fpsr=1 ; fcmle p3.h, p2/z, z8.h, #0.0
+65912933 => p3=000000000000 ; fcmle p3.s, p2/z, z9.s, #0.0
+65d12953 => p3=000000000000 ; fcmle p3.d, p2/z, z10.d, #0.0
+65512903 => p3=040040400000 fpsr=1 ; fcmlt p3.h, p2/z, z8.h, #0.0
+65912923 => p3=000000000000 ; fcmlt p3.s, p2/z, z9.s, #0.0
+65d12943 => p3=000000000000 ; fcmlt p3.d, p2/z, z10.d, #0.0
+65522903 => p3=400000000000 fpsr=1 ; fcmeq p3.h, p2/z, z8.h, #0.0
+65922923 => p3=000000000000 ; fcmeq p3.s, p2/z, z9.s, #0.0
+65d22943 => p3=000000000000 ; fcmeq p3.d, p2/z, z10.d, #0.0
+65532903 => p3=040040500104 fpsr=1 ; fcmne p3.h, p2/z, z8.h, #0.0
+65932923 => p3=000000100100 ; fcmne p3.s, p2/z, z9.s, #0.0
+65d32943 => p3=000000000100 ; fcmne p3.d, p2/z, z10.d, #0.0
+65402902 => z2=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f00 fpsr=11 ; faddv h2, p2, z8.h
+65802922 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f800000 ; faddv s2, p2, z9.s
+65c02942 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000400921fb54442d18 ; faddv d2, p2, z10.d
+65402562 => z2=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f00 fpsr=11 ; faddv h2, p1, z11.h
+65802582 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f800000 fpsr=10 ; faddv s2, p1, z12.s
+65c025a2 => z2=000000000000000000000000000000000000000000000000000000000000000000000000000000007ff0000000000000 ; faddv d2, p1, z13.d
+65442902 => z2=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004248 fpsr=1 ; fmaxnmv h2, p2, z8.h
+65842922 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f800000 ; fmaxnmv s2, p2, z9.s
+65c42942 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000400921fb54442d18 ; fmaxnmv d2, p2, z10.d
+65442562 => z2=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007c00 fpsr=1 ; fmaxnmv h2, p1, z11.h
+65842582 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f800000 ; fmaxnmv s2, p1, z12.s
+65c425a2 => z2=000000000000000000000000000000000000000000000000000000000000000000000000000000007ff0000000000000 ; fmaxnmv d2, p1, z13.d
+65452902 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000fc00 fpsr=1 ; fminnmv h2, p2, z8.h
+65852922 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000004f800000 ; fminnmv s2, p2, z9.s
+65c52942 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000400921fb54442d18 ; fminnmv d2, p2, z10.d
+65452562 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000fc00 fpsr=1 ; fminnmv h2, p1, z11.h
+65852582 => z2=0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0000000 ; fminnmv s2, p1, z12.s
+65c525a2 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000c000000000000000 ; fminnmv d2, p1, z13.d
+65462902 => z2=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f00 fpsr=1 ; fmaxv h2, p2, z8.h
+65862922 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f800000 ; fmaxv s2, p2, z9.s
+65c62942 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000400921fb54442d18 ; fmaxv d2, p2, z10.d
+65462562 => z2=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f00 fpsr=1 ; fmaxv h2, p1, z11.h
+65862582 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f800000 ; fmaxv s2, p1, z12.s
+65c625a2 => z2=000000000000000000000000000000000000000000000000000000000000000000000000000000007ff0000000000000 ; fmaxv d2, p1, z13.d
+65472902 => z2=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f00 fpsr=1 ; fminv h2, p2, z8.h
+65872922 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000004f800000 ; fminv s2, p2, z9.s
+65c72942 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000400921fb54442d18 ; fminv d2, p2, z10.d
+65472562 => z2=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f00 fpsr=1 ; fminv h2, p1, z11.h
+65872582 => z2=0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0000000 ; fminv s2, p1, z12.s
+65c725a2 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000c000000000000000 ; fminv d2, p1, z13.d
+65582968 => z8=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007f00 fpsr=1 ; fadda h8, p2, h8, z11.h
+65982989 => z9=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000042c70000 ; fadda s9, p2, s9, z12.s
+65d829aa => z10=000000000000000000000000000000000000000000000000000000000000000000000000000000007ff0000000000000 ; fadda d10, p2, d10, z13.d
+65582462 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000fe56 fpsr=11 ; fadda h2, p1, h2, z3.h
+65982462 => z2=0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000fc5639b1 fpsr=10 ; fadda s2, p1, s2, z3.s
+65d82462 => z2=00000000000000000000000000000000000000000000000000000000000000000000000000000000fc5639b16b714b4f fpsr=10 ; fadda d2, p1, d2, z3.d
+6540a902 => z2=8000dabfd140bd75353cfc387dfae6b8fc005079fc5d43ffc00000003f5a101f0e1fc49bd63b7f0055bc79f8420011fd fpsr=1 ; frintn z2.h, p2/m, z8.h
+6580a922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff4f8000003f5a101f0e1fc49b7f80000055bc79f8ada711fd ; frintn z2.s, p2/m, z9.s
+65c0a942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f400800000000000055bc79f8ada711fd ; frintn z2.d, p2/m, z10.d
+6540a962 => z2=0000dabfc000bd75353cfc387dfae6b87f005079fc5d43ff000042003f5a101f0e1fc49bd63b800055bc79f87c0011fd fpsr=1 ; frintn z2.h, p2/m, z11.h
+6580a982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffc00000003f5a101f0e1fc49b42c8000055bc79f8ada711fd ; frintn z2.s, p2/m, z12.s
+65c0a9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7ff000000000000055bc79f8ada711fd ; frintn z2.d, p2/m, z13.d
+6541a902 => z2=8000dabfd140bd75353cfc387dfae6b8fc005079fc5d43ffc0003c003f5a101f0e1fc49bd63b7f0055bc79f8440011fd fpsr=1 ; frintp z2.h, p2/m, z8.h
+6581a922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff4f8000003f5a101f0e1fc49b7f80000055bc79f8ada711fd ; frintp z2.s, p2/m, z9.s
+65c1a942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f401000000000000055bc79f8ada711fd ; frintp z2.d, p2/m, z10.d
+6541a962 => z2=0000dabfbc00bd75353cfc387dfae6b87f005079fc5d43ff3c0044003f5a101f0e1fc49bd63b800055bc79f87c0011fd fpsr=1 ; frintp z2.h, p2/m, z11.h
+6581a982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffbf8000003f5a101f0e1fc49b42c8000055bc79f8ada711fd ; frintp z2.s, p2/m, z12.s
+65c1a9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7ff000000000000055bc79f8ada711fd ; frintp z2.d, p2/m, z13.d
+6542a902 => z2=8000dabfd140bd75353cfc387dfae6b8fc005079fc5d43ffc00000003f5a101f0e1fc49bd63b7f0055bc79f8420011fd fpsr=1 ; frintm z2.h, p2/m, z8.h
+6582a922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff4f8000003f5a101f0e1fc49b7f80000055bc79f8ada711fd ; frintm z2.s, p2/m, z9.s
+65c2a942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f400800000000000055bc79f8ada711fd ; frintm z2.d, p2/m, z10.d
+6542a962 => z2=0000dabfc000bd75353cfc387dfae6b87f005079fc5d43ff000042003f5a101f0e1fc49bd63b800055bc79f87c0011fd fpsr=1 ; frintm z2.h, p2/m, z11.h
+6582a982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffc00000003f5a101f0e1fc49b42c8000055bc79f8ada711fd ; frintm z2.s, p2/m, z12.s
+65c2a9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7ff000000000000055bc79f8ada711fd ; frintm z2.d, p2/m, z13.d
+6543a902 => z2=8000dabfd140bd75353cfc387dfae6b8fc005079fc5d43ffc00000003f5a101f0e1fc49bd63b7f0055bc79f8420011fd fpsr=1 ; frintz z2.h, p2/m, z8.h
+6583a922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff4f8000003f5a101f0e1fc49b7f80000055bc79f8ada711fd ; frintz z2.s, p2/m, z9.s
+65c3a942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f400800000000000055bc79f8ada711fd ; frintz z2.d, p2/m, z10.d
+6543a962 => z2=0000dabfbc00bd75353cfc387dfae6b87f005079fc5d43ff000042003f5a101f0e1fc49bd63b800055bc79f87c0011fd fpsr=1 ; frintz z2.h, p2/m, z11.h
+6583a982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffbf8000003f5a101f0e1fc49b42c8000055bc79f8ada711fd ; frintz z2.s, p2/m, z12.s
+65c3a9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7ff000000000000055bc79f8ada711fd ; frintz z2.d, p2/m, z13.d
+6544a902 => z2=8000dabfd140bd75353cfc387dfae6b8fc005079fc5d43ffc00000003f5a101f0e1fc49bd63b7f0055bc79f8420011fd fpsr=1 ; frinta z2.h, p2/m, z8.h
+6584a922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff4f8000003f5a101f0e1fc49b7f80000055bc79f8ada711fd ; frinta z2.s, p2/m, z9.s
+65c4a942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f400800000000000055bc79f8ada711fd ; frinta z2.d, p2/m, z10.d
+6544a962 => z2=0000dabfc000bd75353cfc387dfae6b87f005079fc5d43ff000042003f5a101f0e1fc49bd63b800055bc79f87c0011fd fpsr=1 ; frinta z2.h, p2/m, z11.h
+6584a982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffc00000003f5a101f0e1fc49b42c8000055bc79f8ada711fd ; frinta z2.s, p2/m, z12.s
+65c4a9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7ff000000000000055bc79f8ada711fd ; frinta z2.d, p2/m, z13.d
+6546a902 => z2=8000dabfd140bd75353cfc387dfae6b8fc005079fc5d43ffc00000003f5a101f0e1fc49bd63b7f0055bc79f8420011fd fpsr=11 ; frintx z2.h, p2/m, z8.h
+6586a922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff4f8000003f5a101f0e1fc49b7f80000055bc79f8ada711fd ; frintx z2.s, p2/m, z9.s
+65c6a942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f400800000000000055bc79f8ada711fd fpsr=10 ; frintx z2.d, p2/m, z10.d
+6546a962 => z2=0000dabfc000bd75353cfc387dfae6b87f005079fc5d43ff000042003f5a101f0e1fc49bd63b800055bc79f87c0011fd fpsr=11 ; frintx z2.h, p2/m, z11.h
+6586a982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffc00000003f5a101f0e1fc49b42c8000055bc79f8ada711fd fpsr=10 ; frintx z2.s, p2/m, z12.s
+65c6a9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7ff000000000000055bc79f8ada711fd ; frintx z2.d, p2/m, z13.d
+6547a902 => z2=8000dabfd140bd75353cfc387dfae6b8fc005079fc5d43ffc00000003f5a101f0e1fc49bd63b7f0055bc79f8420011fd fpsr=1 ; frinti z2.h, p2/m, z8.h
+6587a922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff4f8000003f5a101f0e1fc49b7f80000055bc79f8ada711fd ; frinti z2.s, p2/m, z9.s
+65c7a942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f400800000000000055bc79f8ada711fd ; frinti z2.d, p2/m, z10.d
+6547a962 => z2=0000dabfc000bd75353cfc387dfae6b87f005079fc5d43ff000042003f5a101f0e1fc49bd63b800055bc79f87c0011fd fpsr=1 ; frinti z2.h, p2/m, z11.h
+6587a982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffc00000003f5a101f0e1fc49b42c8000055bc79f8ada711fd ; frinti z2.s, p2/m, z12.s
+65c7a9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7ff000000000000055bc79f8ada711fd ; frinti z2.d, p2/m, z13.d
+654ca902 => z2=f800dabfac00bd75353cfc387dfae6b880005079fc5d43ffbc0048003f5a101f0e1fc49bd63b7f0055bc79f83c0011fd fpsr=1 ; frecpx z2.h, p2/m, z8.h
+658ca922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff300000003f5a101f0e1fc49b0000000055bc79f8ada711fd ; frecpx z2.s, p2/m, z9.s
+65cca942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f3ff000000000000055bc79f8ada711fd ; frecpx z2.d, p2/m, z10.d
+654ca962 => z2=7800dabfc000bd75353cfc387dfae6b87f005079fc5d43ff78003c003f5a101f0e1fc49bd63bf80055bc79f8000011fd fpsr=1 ; frecpx z2.h, p2/m, z11.h
+658ca982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffc00000003f5a101f0e1fc49b3d00000055bc79f8ada711fd ; frecpx z2.s, p2/m, z12.s
+65cca9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000000055bc79f8ada711fd ; frecpx z2.d, p2/m, z13.d
+654da902 => z2=8000dabf7e00bd75353cfc387dfae6b87e005079fc5d43ff7e00389e3f5a101f0e1fc49bd63b7f0055bc79f83f1711fd fpsr=11 ; fsqrt z2.h, p2/m, z8.h
+658da922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff478000003f5a101f0e1fc49b7f80000055bc79f8ada711fd ; fsqrt z2.s, p2/m, z9.s
+65cda942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f3ffc5bf891b4ef6a55bc79f8ada711fd fpsr=10 ; fsqrt z2.d, p2/m, z10.d
+654da962 => z2=0000dabf7e00bd75353cfc387dfae6b87f005079fc5d43ff0c003f173f5a101f0e1fc49bd63b800055bc79f87c0011fd fpsr=11 ; fsqrt z2.h, p2/m, z11.h
+658da982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff7fc000003f5a101f0e1fc49b4120000055bc79f8ada711fd fpsr=1 ; fsqrt z2.s, p2/m, z12.s
+65cda9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7ff000000000000055bc79f8ada711fd ; fsqrt z2.d, p2/m, z13.d
+651aa902 => z2=8000dabf0005bd75353cfc387dfae6b87fff5079fc5d43ff0001fffe3f5a101f0e1fc49bd63b800055bc79f8000111fd fpsr=1 ; flogb z2.h, p2/m, z8.h
+651ca922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff000000203f5a101f0e1fc49b7fffffff55bc79f8ada711fd ; flogb z2.s, p2/m, z9.s
+651ea942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000000155bc79f8ada711fd ; flogb z2.d, p2/m, z10.d
+651aa962 => z2=8000dabf0000bd75353cfc387dfae6b880005079fc5d43ffffe800013f5a101f0e1fc49bd63b800055bc79f87fff11fd fpsr=1 ; flogb z2.h, p2/m, z11.h
+651ca982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff000000003f5a101f0e1fc49b0000000655bc79f8ada711fd ; flogb z2.s, p2/m, z12.s
+651ea9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7fffffffffffffff55bc79f8ada711fd ; flogb z2.d, p2/m, z13.d
+6546a862 => z2=8000dabf8000bd75353cfc387dfae6b8bc005079fc5d43ff545000003f5a101f0e1fc49bd63b800055bc79f86b7111fd fpsr=10 ; frintx z2.h, p2/m, z3.h
+6586a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff544b0ec73f5a101f0e1fc49bc8ae9a2055bc79f8ada711fd fpsr=10 ; frintx z2.s, p2/m, z3.s
+65c6a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f800000000000000055bc79f8ada711fd fpsr=10 ; frintx z2.d, p2/m, z3.d
+654e3102 => z2=fc003ffca6187f000100000035183bfc8000b9547e007c00b7fc4200211c7c00fc003ffca6187f000100000035183bfc fpsr=17 ; frecpe z2.h, z8.h
+658e3122 => z2=beff8000404000003c2380007f800000ff8000003fff80002f7f80007fe0000000200000000000003ea300003f7f8000 fpsr=17 ; frecpe z2.s, z9.s
+65ce3142 => z2=3beff000000000007ffc000000000000000400000000000000000000000000003fd46000000000003feff00000000000 fpsr=1 ; frecpe z2.d, z10.d
+654e3062 => z2=fc00563cf6b005746880269cdbecd540bac4dc44dd2cdca0237468b80a6415e4e4984984aed8dd40fe563da00c4c2c60 fpsr=15 ; frecpe z2.h, z3.h
+658e3062 => z2=fe3c0000fc8f00006fd48000e2ec0000c22e8000e4b880002aa1000011ff8000ec028000b63b80008299000013880000 ; frecpe z2.s, z3.s
+65ce3062 => z2=ff3100000000000070c3700000000000c3229000000000002b92f00000000000ece2e000000000008387100000000000 ; frecpe z2.d, z3.d
+654f3102 => z2=fc003da47e007f001c00000038843bfc7e007e007e007c007e003ef02e646bfcfc003da47e007f001c00000038843bfc fpsr=3 ; frsqrte z2.h, z8.h
+658f3122 => z2=7fc000003fde00003dcc800064b48000ff8000003fb48000377f80007fe000001f800000000000003f1080003f7f8000 fpsr=3 ; frsqrte z2.s, z9.s
+65cf3142 => z2=3deff000000000007ffc0000000000001ff000000000000000000000000000003fe21000000000003feff00000000000 fpsr=1 ; frsqrte z2.d, z10.d
+654f3062 => z2=7e0048fc7e0020ac520031287e007e007e007e007e007e002fb85228232428dc7e0042a47e007e00fe563cbc24243430 fpsr=1 ; frsqrte z2.h, z3.h
+658f3062 => z2=7fc000007fc0000057a500007fc000007fc000007fc00000350f800028b480007fc000007fc000007fc0000029840000 fpsr=1 ; frsqrte z2.s, z3.s
+65cf3062 => z2=7ff80000000000005858f000000000007ff800000000000035c16000000000007ff80000000000007ff8000000000000 fpsr=1 ; frsqrte z2.d, z3.d
+0460b862 => z2=156b24004c753ba963061a4e00f84306172e6fa945c85d89091458a820002d4d5f2e3989156b42e00a7135c86dc86989 ; fexpa z2.h, z3.h
+04a0b862 => z2=423504f363b123f621a0b0514429a15b36fa83b335d4f35b1d8a14d542d063345b96942d3427cd9473599d161696942d ; fexpa z2.s, z3.s
+04e0b862 => z2=5c76247eb03a55852885342b569d4f8266ba9e6b5579fdbf185a0c667b5de5652684f9b2769d2ca752d2d285a6e4030b ; fexpa z2.d, z3.d
+65588808 => z8=38003800d1307d007bff7c0042483c00fc00be007e000000be003aaa5640000180003800d1407f007bff7c0043483c00 fpsr=11 ; fadd z8.h, p2/m, z8.h, #0.5
+65988809 => fpsr=10 ; fadd z9.s, p2/m, z9.s, #0.5
+65d8880a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000400d21fb54442d183ff0000000000000 ; fadd z10.d, p2/m, z10.d, #0.5
+65588828 => z8=3c003800d1207d007bff7c0042483c00fc00be007e000000bc003d555640000180003800d1407f007bff7c0044243c00 fpsr=11 ; fadd z8.h, p2/m, z8.h, #1.0
+65988829 => fpsr=10 ; fadd z9.s, p2/m, z9.s, #1.0
+65d8882a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000401090fdaa22168c3ff0000000000000 ; fadd z10.d, p2/m, z10.d, #1.0
+65598808 => z8=b8003800d1507d007bff7c0042483c00fc00be007e000000c100b1565640000180003800d1407f007bff7c0041483c00 fpsr=1 ; fsub z8.h, p2/m, z8.h, #0.5
+65998809 => fpsr=10 ; fsub z9.s, p2/m, z9.s, #0.5
+65d9880a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000400521fb54442d183ff0000000000000 ; fsub z10.d, p2/m, z10.d, #0.5
+65598828 => z8=bc003800d1607d007bff7c0042483c00fc00be007e000000c200b9565640000180003800d1407f007bff7c0040483c00 fpsr=11 ; fsub z8.h, p2/m, z8.h, #1.0
+65998829 => fpsr=10 ; fsub z9.s, p2/m, z9.s, #1.0
+65d9882a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000400121fb54442d183ff0000000000000 ; fsub z10.d, p2/m, z10.d, #1.0
+655b8808 => z8=3800380051507d007bff7c0042483c007c00be007e000000410031565640000180003800d1407f007bff7c00c1483c00 fpsr=1 ; fsubr z8.h, p2/m, z8.h, #0.5
+659b8809 => z9=c00000003eaaaaab42c8000000000001800000003f000000cf8000007fa000007f7fffffff80000040490fdb3f800000 fpsr=10 ; fsubr z9.s, p2/m, z9.s, #0.5
+65db880a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000c00521fb54442d183ff0000000000000 ; fsubr z10.d, p2/m, z10.d, #0.5
+655b8828 => z8=3c00380051607d007bff7c0042483c007c00be007e000000420039565640000180003800d1407f007bff7c00c0483c00 fpsr=11 ; fsubr z8.h, p2/m, z8.h, #1.0
+659b8829 => z9=c00000003eaaaaab42c8000000000001800000003f000000cf8000007fa000007f7fffffff80000040490fdb3f800000 fpsr=10 ; fsubr z9.s, p2/m, z9.s, #1.0
+65db882a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000c00121fb54442d183ff0000000000000 ; fsubr z10.d, p2/m, z10.d, #1.0
+655a8808 => z8=80003800cd407d007bff7c0042483c00fc00be007e000000bc0031555640000180003800d1407f007bff7c003e483c00 fpsr=1 ; fmul z8.h, p2/m, z8.h, #0.5
+659a8809 => z9=c00000003eaaaaab42c8000000000001800000003f0000004f0000007fa000007f7fffff7f80000040490fdb3f800000 ; fmul z9.s, p2/m, z9.s, #0.5
+65da880a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000003ff921fb54442d183ff0000000000000 ; fmul z10.d, p2/m, z10.d, #0.5
+655a8828 => z8=80003800d5407d007bff7c0042483c00fc00be007e000000c40039555640000180003800d1407f007bff7c0046483c00 fpsr=1 ; fmul z8.h, p2/m, z8.h, #2.0
+659a8829 => z9=c00000003eaaaaab42c8000000000001800000003f000000500000007fa000007f7fffff7f80000040490fdb3f800000 ; fmul z9.s, p2/m, z9.s, #2.0
+65da882a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000401921fb54442d183ff0000000000000 ; fmul z10.d, p2/m, z10.d, #2.0
+655c8808 => z8=0000380000007d007bff7c0042483c000000be007e000000000035555640000180003800d1407f007bff7c0042483c00 fpsr=1 ; fmaxnm z8.h, p2/m, z8.h, #0.0
+659c8809 =>  ; fmaxnm z9.s, p2/m, z9.s, #0.0
+65dc880a =>  ; fmaxnm z10.d, p2/m, z10.d, #0.0
+655c8828 => z8=3c0038003c007d007bff7c0042483c003c00be007e0000003c003c005640000180003800d1407f007bff7c0042483c00 fpsr=1 ; fmaxnm z8.h, p2/m, z8.h, #1.0
+659c8829 =>  ; fmaxnm z9.s, p2/m, z9.s, #1.0
+65dc882a =>  ; fmaxnm z10.d, p2/m, z10.d, #1.0
+655d8808 => z8=80003800d1407d007bff7c0042483c00fc00be007e000000c00000005640000180003800d1407f007bff7c0000003c00 fpsr=1 ; fminnm z8.h, p2/m, z8.h, #0.0
+659d8809 => z9=c00000003eaaaaab42c8000000000001800000003f000000000000007fa000007f7fffff0000000040490fdb3f800000 ; fminnm z9.s, p2/m, z9.s, #0.0
+65dd880a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff000000000000000000000000000003ff0000000000000 ; fminnm z10.d, p2/m, z10.d, #0.0
+655d8828 => z8=80003800d1407d007bff7c0042483c00fc00be007e000000c00035555640000180003800d1407f007bff7c003c003c00 fpsr=1 ; fminnm z8.h, p2/m, z8.h, #1.0
+659d8829 => z9=c00000003eaaaaab42c8000000000001800000003f0000003f8000007fa000007f7fffff3f80000040490fdb3f800000 ; fminnm z9.s, p2/m, z9.s, #1.0
+65dd882a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000003ff00000000000003ff0000000000000 ; fminnm z10.d, p2/m, z10.d, #1.0
+655e8808 => z8=0000380000007d007bff7c0042483c000000be007e000000000035555640000180003800d1407f007bff7c0042483c00 fpsr=1 ; fmax z8.h, p2/m, z8.h, #0.0
+659e8809 =>  ; fmax z9.s, p2/m, z9.s, #0.0
+65de880a =>  ; fmax z10.d, p2/m, z10.d, #0.0
+655e8828 => z8=3c0038003c007d007bff7c0042483c003c00be007e0000003c003c005640000180003800d1407f007bff7c0042483c00 fpsr=1 ; fmax z8.h, p2/m, z8.h, #1.0
+659e8829 =>  ; fmax z9.s, p2/m, z9.s, #1.0
+65de882a =>  ; fmax z10.d, p2/m, z10.d, #1.0
+655f8808 => z8=80003800d1407d007bff7c0042483c00fc00be007e000000c00000005640000180003800d1407f007bff7c0000003c00 fpsr=1 ; fmin z8.h, p2/m, z8.h, #0.0
+659f8809 => z9=c00000003eaaaaab42c8000000000001800000003f000000000000007fa000007f7fffff0000000040490fdb3f800000 ; fmin z9.s, p2/m, z9.s, #0.0
+65df880a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff000000000000000000000000000003ff0000000000000 ; fmin z10.d, p2/m, z10.d, #0.0
+655f8828 => z8=80003800d1407d007bff7c0042483c00fc00be007e000000c00035555640000180003800d1407f007bff7c003c003c00 fpsr=1 ; fmin z8.h, p2/m, z8.h, #1.0
+659f8829 => z9=c00000003eaaaaab42c8000000000001800000003f0000003f8000007fa000007f7fffff3f80000040490fdb3f800000 ; fmin z9.s, p2/m, z9.s, #1.0
+65df882a => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000003ff00000000000003ff0000000000000 ; fmin z10.d, p2/m, z10.d, #1.0
+65680968 => z8=800038004d407d007bff7c0042483c007f00be007e000000c0003d855640000180003800d1407f007bff7c007c003c00 fpsr=11 ; fmla z8.h, p2/m, z11.h, z8.h
+65a90989 => z9=c00000003eaaaaab42c8000000000001800000003f000000cf0000007fa000007f7fffff7f80000040490fdb3f800000 ; fmla z9.s, p2/m, z12.s, z9.s
+65ea09aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fmla z10.d, p2/m, z13.d, z10.d
+65640862 => z2=a43cdabf5585bd75353cfc387dfae6b8edf55079fc5d43fff4db9a1d3f5a101f0e1fc49bd63bda0455bc79f8fc0011fd fpsr=14 ; fmla z2.h, p2/m, z3.h, z4.h
+65a40862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43fff155b0be3f5a101f0e1fc49bd63b809b55bc79f8ada711fd fpsr=10 ; fmla z2.s, p2/m, z3.s, z4.s
+65e40862 => fpsr=10 ; fmla z2.d, p2/m, z3.d, z4.d
+65682968 => z8=00003800d6907d007bff7c0042483c00ff00be007e000000c000b9b55640000180003800d1407f007bff7c00fc003c00 fpsr=11 ; fmls z8.h, p2/m, z11.h, z8.h
+65a92989 => z9=c00000003eaaaaab42c8000000000001800000003f000000502000007fa000007f7fffff7fc0000040490fdb3f800000 fpsr=1 ; fmls z9.s, p2/m, z12.s, z9.s
+65ea29aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000fff00000000000003ff0000000000000 ; fmls z10.d, p2/m, z13.d, z10.d
+65642862 => z2=a1e5dabf5585bd75353cfc387dfae6b86df25079fc5d43ff74db99b33f5a101f0e1fc49bd63b5a0455bc79f87c0011fd fpsr=14 ; fmls z2.h, p2/m, z3.h, z4.h
+65a42862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff7155b0be3f5a101f0e1fc49bd63b80a155bc79f8ada711fd fpsr=10 ; fmls z2.s, p2/m, z3.s, z4.s
+65e42862 => fpsr=10 ; fmls z2.d, p2/m, z3.d, z4.d
+65684968 => z8=00003800cd407d007bff7c0042483c00ff00be007e0000004000bd855640000180003800d140ff007bff7c00fc003c00 fpsr=11 ; fnmla z8.h, p2/m, z11.h, z8.h
+65a94989 => z9=c00000003eaaaaab42c8000000000001800000003f0000004f0000007fa000007f7fffffff80000040490fdb3f800000 ; fnmla z9.s, p2/m, z12.s, z9.s
+65ea49aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000fff00000000000003ff0000000000000 ; fnmla z10.d, p2/m, z13.d, z10.d
+65644862 => z2=243cdabfd585bd75353cfc387dfae6b86df55079fc5d43ff74db1a1d3f5a101f0e1fc49bd63b5a0455bc79f87c0011fd fpsr=14 ; fnmla z2.h, p2/m, z3.h, z4.h
+65a44862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff7155b0be3f5a101f0e1fc49b563b809b55bc79f8ada711fd fpsr=10 ; fnmla z2.s, p2/m, z3.s, z4.s
+65e44862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f8e1fc49bd63b809e55bc79f8ada711fd fpsr=10 ; fnmla z2.d, p2/m, z3.d, z4.d
+65686968 => z8=0000380056907d007bff7c0042483c007f00be007e000000400039b55640000180003800d140ff007bff7c007c003c00 fpsr=11 ; fnmls z8.h, p2/m, z11.h, z8.h
+65a96989 => z9=c00000003eaaaaab42c8000000000001800000003f000000d02000007fa000007f7fffff7fc0000040490fdb3f800000 fpsr=1 ; fnmls z9.s, p2/m, z12.s, z9.s
+65ea69aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fnmls z10.d, p2/m, z13.d, z10.d
+65646862 => z2=21e5dabfd585bd75353cfc387dfae6b8edf25079fc5d43fff4db19b33f5a101f0e1fc49bd63bda0455bc79f8fc0011fd fpsr=14 ; fnmls z2.h, p2/m, z3.h, z4.h
+65a46862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43fff155b0be3f5a101f0e1fc49b563b80a155bc79f8ada711fd fpsr=10 ; fnmls z2.s, p2/m, z3.s, z4.s
+65e46862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f8e1fc49bd63b809e55bc79f8ada711fd fpsr=10 ; fnmls z2.d, p2/m, z3.d, z4.d
+65688968 => z8=800038004d407d007bff7c0042483c007f00be007e000000c0003d855640000180003800d1407f007bff7c007c003c00 fpsr=11 ; fmad z8.h, p2/m, z11.h, z8.h
+65a98989 => z9=c00000003eaaaaab42c8000000000001800000003f000000cf0000007fa000007f7fffff7f80000040490fdb3f800000 ; fmad z9.s, p2/m, z12.s, z9.s
+65ea89aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fmad z10.d, p2/m, z13.d, z10.d
+65648862 => z2=5b92dabf9d8cbd75353cfc387dfae6b86d0a5079fc5d43ffdd36b3d33f5a101f0e1fc49bd63b7be455bc79f8edd011fd fpsr=10 ; fmad z2.h, p2/m, z3.h, z4.h
+65a48862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffdc86b3d33f5a101f0e1fc49b5f7fc49255bc79f8ada711fd fpsr=10 ; fmad z2.s, p2/m, z3.s, z4.s
+65e48862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f0d0981e8c1fa7be455bc79f8ada711fd fpsr=10 ; fmad z2.d, p2/m, z3.d, z4.d
+6568a968 => z8=00003800d6907d007bff7c0042483c007f00be007e000000c000b9b55640000180003800d1407f007bff7c00fc003c00 fpsr=11 ; fmsb z8.h, p2/m, z11.h, z8.h
+65a9a989 => z9=c00000003eaaaaab42c8000000000001800000003f000000502000007fa000007f7fffff7fc0000040490fdb3f800000 fpsr=1 ; fmsb z9.s, p2/m, z12.s, z9.s
+65eaa9aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000fff00000000000003ff0000000000000 ; fmsb z10.d, p2/m, z13.d, z10.d
+6564a862 => z2=5b92dabf143dbd75353cfc387dfae6b86d065079fc5d43ffdbacb3d33f5a101f0e1fc49bd63b7be455bc79f8ed2811fd fpsr=10 ; fmsb z2.h, p2/m, z3.h, z4.h
+65a4a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffdc86b3d33f5a101f0e1fc49bdf7fc49255bc79f8ada711fd fpsr=10 ; fmsb z2.s, p2/m, z3.s, z4.s
+65e4a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f0d0981e8c1fa7be455bc79f8ada711fd fpsr=10 ; fmsb z2.d, p2/m, z3.d, z4.d
+6568c968 => z8=00003800cd407d007bff7c0042483c007f00be007e0000004000bd855640000180003800d140ff007bff7c00fc003c00 fpsr=11 ; fnmad z8.h, p2/m, z11.h, z8.h
+65a9c989 => z9=c00000003eaaaaab42c8000000000001800000003f0000004f0000007fa000007f7fffffff80000040490fdb3f800000 ; fnmad z9.s, p2/m, z12.s, z9.s
+65eac9aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000fff00000000000003ff0000000000000 ; fnmad z10.d, p2/m, z13.d, z10.d
+6564c862 => z2=db92dabf1d8cbd75353cfc387dfae6b8ed0a5079fc5d43ff5d3633d33f5a101f0e1fc49bd63bfbe455bc79f86dd011fd fpsr=10 ; fnmad z2.h, p2/m, z3.h, z4.h
+65a4c862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff5c86b3d33f5a101f0e1fc49bdf7fc49255bc79f8ada711fd fpsr=10 ; fnmad z2.s, p2/m, z3.s, z4.s
+65e4c862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f8d0981e8c1fa7be455bc79f8ada711fd fpsr=10 ; fnmad z2.d, p2/m, z3.d, z4.d
+6568e968 => z8=0000380056907d007bff7c0042483c007f00be007e000000400039b55640000180003800d140ff007bff7c007c003c00 fpsr=11 ; fnmsb z8.h, p2/m, z11.h, z8.h
+65a9e989 => z9=c00000003eaaaaab42c8000000000001800000003f000000d02000007fa000007f7fffff7fc0000040490fdb3f800000 fpsr=1 ; fnmsb z9.s, p2/m, z12.s, z9.s
+65eae9aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fnmsb z10.d, p2/m, z13.d, z10.d
+6564e862 => z2=db92dabf943dbd75353cfc387dfae6b8ed065079fc5d43ff5bac33d33f5a101f0e1fc49bd63bfbe455bc79f86d2811fd fpsr=10 ; fnmsb z2.h, p2/m, z3.h, z4.h
+65a4e862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff5c86b3d33f5a101f0e1fc49b5f7fc49255bc79f8ada711fd fpsr=10 ; fnmsb z2.s, p2/m, z3.s, z4.s
+65e4e862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f8d0981e8c1fa7be455bc79f8ada711fd fpsr=10 ; fnmsb z2.d, p2/m, z3.d, z4.d
+64408968 => z8=d1403800d1407d007bff7c0042483c007e00be007e0000003c9035555640000180003800d1407f007bff7c003c903c00 fpsr=11 ; fcadd z8.h, p2/m, z8.h, z11.h, #90
+64808989 =>  ; fcadd z9.s, p2/m, z9.s, z12.s, #90
+64c089aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000003ff243f6a8885a303ff0000000000000 ; fcadd z10.d, p2/m, z10.d, z13.d, #90
+64418968 => z8=51403800d1407d007bff7c0042483c00fe00be007e000000c52435555640000180003800d1407f007bff7c0045243c00 fpsr=11 ; fcadd z8.h, p2/m, z8.h, z11.h, #270
+64818989 =>  ; fcadd z9.s, p2/m, z9.s, z12.s, #270
+64c189aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000401490fdaa22168c3ff0000000000000 ; fcadd z10.d, p2/m, z10.d, z13.d, #270
+64480968 => z8=00003800d1407d007bff7c0042483c007e00be007e000000c8243d855640000180003800d1407f007bff7c00c2483c00 fpsr=11 ; fcmla z8.h, p2/m, z11.h, z8.h, #0
+64890989 =>  ; fcmla z9.s, p2/m, z12.s, z9.s, #0
+64ca09aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000c00921fb54442d183ff0000000000000 ; fcmla z10.d, p2/m, z13.d, z10.d, #0
+64482968 => z8=000038007f007d007bff7c0042483c007f00be007e000000c00035555640000180003800d1407f007bff7c007c003c00 fpsr=11 ; fcmla z8.h, p2/m, z11.h, z8.h, #90
+64892989 => z9=c00000003eaaaaab42c8000000000001800000003f0000007fe000007fa000007f7fffff7f80000040490fdb3f800000 fpsr=1 ; fcmla z9.s, p2/m, z12.s, z9.s, #90
+64ca29aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000007ff00000000000003ff0000000000000 ; fcmla z10.d, p2/m, z13.d, z10.d, #90
+64484968 => z8=80003800d1407d007bff7c0042483c007e00be007e0000004448b9b55640000180003800d1407f007bff7c0048b63c00 fpsr=11 ; fcmla z8.h, p2/m, z11.h, z8.h, #180
+64894989 => z9=c00000003eaaaaab42c8000000000001800000003f0000004f8000007fa000007f7fffff7fc0000040490fdb3f800000 fpsr=1 ; fcmla z9.s, p2/m, z12.s, z9.s, #180
+64ca49aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff00000000000004022d97c7f3321d23ff0000000000000 ; fcmla z10.d, p2/m, z13.d, z10.d, #180
+64486968 => z8=80003800ff007d007bff7c0042483c007f00be007e000000c00035555640000180003800d1407f007bff7c00fc003c00 fpsr=11 ; fcmla z8.h, p2/m, z11.h, z8.h, #270
+64896989 => z9=c00000003eaaaaab42c8000000000001800000003f000000ffe000007fa000007f7fffff7f80000040490fdb3f800000 fpsr=1 ; fcmla z9.s, p2/m, z12.s, z9.s, #270
+64ca69aa => z10=43f00000000000007ff40000000000007fefffffffffffff7ff0000000000000fff00000000000003ff0000000000000 ; fcmla z10.d, p2/m, z13.d, z10.d, #270
+64a31168 => z8=314d3c01d1407f007bff7c00424c3c187e007e007e00fc0073da68437c007c00fc00e0cbd1407f007c007c00ef70cf0f fpsr=15 ; fcmla z8.h, z11.h, z3.h[0], #0
+64e91189 => z9=439c14633eaaaaab7f80000034ffffff5f8000007fe000004f8000007fe000007f7fffff7f800000c0490fdbbf800000 fpsr=15 ; fcmla z9.s, z12.s, z9.s[0], #0
+64bb1568 => z8=00003800d1407f007bff7c007c007c007f007f007e0038bbc00035555640364e00003800d1447f007bff7c007c007c00 fpsr=11 ; fcmla z8.h, z11.h, z3.h[3], #90
+64f91589 => z9=c00000003eaaaaab42c838e43f2aaaab000000003f0000004f8000007fe000007f8000007f8000007f800000ff800000 fpsr=11 ; fcmla z9.s, z12.s, z9.s[1], #90
+64ab1968 => z8=24a96658d1407f007bff7c00424854e57e007e007e007c00dace3550fc00cec67e564f987e567f007e567c007e5640d8 fpsr=15 ; fcmla z8.h, z11.h, z3.h[1], #180
+64f91989 => z9=40890fdbbf36bfcf7f800000feaaaaaa00000000cf0000004f8000007fe00000ff8000007fc000007f8000007f800000 fpsr=15 ; fcmla z9.s, z12.s, z9.s[1], #180
+64b31d68 => z8=8000380074647f007a887c00fc00fc007f007f007e009631c00035555640942000003800d1407f007bff7c007c00fc00 fpsr=11 ; fcmla z8.h, z11.h, z3.h[2], #270
+64e91d89 => z9=c00000003eaaaaab42c8000042055556ffe000003f000000ffe000007fe000007f7fffff7f800000ff8000007f800000 fpsr=11 ; fcmla z9.s, z12.s, z9.s[0], #270
+646b0168 => z8=80003803d1407f007bff7c00fc003c007f007e007e007c00c000352e5640da3080005e26cefe7f007bff7c00fc004cee fpsr=11 ; fmla z8.h, z11.h, z3.h[5]
+64b40189 => z9=c00000003eaaaaab42c80000d87d857c0000000079e7693fea2d8eef7fe000007f7fffff7f800000ff800000427e7be4 fpsr=11 ; fmla z9.s, z12.s, z4.s[2]
+64fd01aa => z10=43f00000000000007ffc0000000000007fefffffffffffff7ff00000000000007ff0000000000000fff0000000000000 fpsr=11 ; fmla z10.d, z13.d, z13.d[1]
+64a40062 => z2=aac806885585bd753931ffac7dfae6b84b0b26bcfc5d43ffe296ad18fb3e86a940f74d9776abe8617f800000ff800000 fpsr=14 ; fmla z2.s, z3.s, z4.s[0]
+646b0568 => z8=000037fad1407f007bff7c007c003c00ff00fe007e00fc00c000357c56405a300000de22d3017f007bff7c007c00cc6e fpsr=11 ; fmls z8.h, z11.h, z3.h[5]
+64b40589 => z9=c00000003eaaaaab42c80000587d857c80000000f9e7693f6a2d8eef7fe000007f7fffff7f8000007f800000c2767be4 fpsr=11 ; fmls z9.s, z12.s, z4.s[2]
+64fd05aa => z10=43f00000000000007ffc0000000000007fefffffffffffff7ff0000000000000fff00000000000007ff0000000000000 fpsr=11 ; fmls z10.d, z13.d, z13.d[1]
+64a40462 => z2=2ac803cc5585bd75b93085b47dfae6b8cb0b4586fc5d43ff6296ad187b3e86a9c0f74d97f6abe861ff8000007f800000 fpsr=14 ; fmls z2.s, z3.s, z4.s[0]
+647b2102 => z2=000080570f237f00b96ffc00822280ae7c003f187e00800040bbb64ed764800100008efb28957f00d2fafc00997b92fb fpsr=19 ; fmul z2.h, z8.h, z3.h[7]
+64bc2122 => z2=dc128e2c5ac3683b5ee4fe2511128e2c800000006c8844c27d0844c27fe000004d0981e77f8000000dd7ff070d0981e8 fpsr=11 ; fmul z2.s, z9.s, z4.s[3]
+64ed2142 => z2=80000000000000007ffc0000000000007ff00000000000007ff0000000000000c01921fb54442d18c000000000000000 fpsr=15 ; fmul z2.d, z10.d, z13.d[0]
+64f42062 => z2=9c51787f46bbef032abe84c7106ea236e9d4eff11aba411a7ff00000000000008000000000000000c971b74cd829dd59 fpsr=1c ; fmul z2.d, z3.d, z4.d[1]
+65508168 => z8=3c004d80d3c07f007bff7c007c0042007f007e007e007e003c004018504a3c043c004d80d3c07f007bff7c007c004200 fpsr=11 ; ftmad z8.h, z8.h, z11.h, #0
+65908189 => z9=3f80000040030549420955563f8000043f8000004f0000004fc000007fe000007f7fffff7f8000007f80000040400000 fpsr=11 ; ftmad z9.s, z9.s, z12.s, #0
+65d081aa => z10=43f80000000000007ffc0000000000007fefffffffffffff7ff00000000000007ff00000000000004008000000000000 fpsr=11 ; ftmad z10.d, z10.d, z13.d, #0
+65538168 => z8=00004d40d3e07f007bff7c007c0040007f007e007e007e0080023c30502a1bff00004d40d3e07f007bff7c007c004000 fpsr=11 ; ftmad z8.h, z8.h, z11.h, #3
+65938189 => z9=b95008b93f86041242055522b94f88b9b95008b94f0000004fc000007fe000007f7fffff7f8000007f8000003fffd27e fpsr=11 ; ftmad z9.s, z9.s, z12.s, #3
+65d381aa => z10=43f80000000000007ffc0000000000007fefffffffffffff7ff00000000000007ff00000000000003ffffa4fa4fa4fb1 fpsr=11 ; ftmad z10.d, z10.d, z13.d, #3
+65558168 => z8=00004d40d3e07f007bff7c007c0040007f007e007e007e0080023c30502a1bff00004d40d3e07f007bff7c007c004000 fpsr=11 ; ftmad z8.h, z8.h, z11.h, #5
+65958189 => z9=800000023f860a924205555634ffffff000000004f0000004fc000007fe000007f7fffff7f8000007f80000040000000 fpsr=11 ; ftmad z9.s, z9.s, z12.s, #5
+65d581aa => z10=43f80000000000007ffc0000000000007fefffffffffffff7ff00000000000007ff00000000000003fffffffb606c236 fpsr=11 ; ftmad z10.d, z10.d, z13.d, #5
+65578168 => z8=00004d40d3e07f007bff7c007c0040007f007e007e007e0080023c30502a1bff00004d40d3e07f007bff7c007c004000 fpsr=11 ; ftmad z8.h, z8.h, z11.h, #7
+65978189 => z9=800000023f860a924205555634ffffff000000004f0000004fc000007fe000007f7fffff7f8000007f80000040000000 fpsr=11 ; ftmad z9.s, z9.s, z12.s, #7
+65d781aa => z10=43f80000000000007ffc0000000000007fefffffffffffff7ff00000000000007ff00000000000003fffffffffff3845 fpsr=11 ; ftmad z10.d, z10.d, z13.d, #7
+6588a922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff00007c003f5a101f0e1fc49b00007c0055bc79f8ada711fd fpsr=14 ; fcvt z2.h, p2/m, z9.s
+6588a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff00007c003f5a101f0e1fc49b0000fc0055bc79f8ada711fd fpsr=14 ; fcvt z2.h, p2/m, z3.s
+6589a902 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff3eaaa0003f5a101f0e1fc49b7fe0000055bc79f8ada711fd fpsr=1 ; fcvt z2.s, p2/m, z8.h
+6589a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff39d8e0003f5a101f0e1fc49bbb43200055bc79f8ada711fd ; fcvt z2.s, p2/m, z3.h
+65c8a942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000424855bc79f8ada711fd fpsr=10 ; fcvt z2.h, p2/m, z10.d
+65c8a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000800055bc79f8ada711fd fpsr=18 ; fcvt z2.h, p2/m, z3.d
+65c9a902 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7ffc00000000000055bc79f8ada711fd fpsr=1 ; fcvt z2.d, p2/m, z8.h
+65c9a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101fbf6864000000000055bc79f8ada711fd ; fcvt z2.d, p2/m, z3.h
+65caa942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f0000000040490fdb55bc79f8ada711fd fpsr=10 ; fcvt z2.s, p2/m, z10.d
+65caa862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000008000000055bc79f8ada711fd fpsr=18 ; fcvt z2.s, p2/m, z3.d
+65cba922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7ff000000000000055bc79f8ada711fd ; fcvt z2.d, p2/m, z9.s
+65cba862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101fc115d3432000000055bc79f8ada711fd ; fcvt z2.d, p2/m, z3.s
+655aa902 => z2=0000dabfffd6bd75353cfc387dfae6b880005079fc5d43fffffe00003f5a101f0e1fc49bd63b000055bc79f8000311fd fpsr=11 ; fcvtzs z2.h, p2/m, z8.h
+655aa962 => z2=0000dabfffffbd75353cfc387dfae6b800005079fc5d43ff000000033f5a101f0e1fc49bd63b000055bc79f87fff11fd fpsr=11 ; fcvtzs z2.h, p2/m, z11.h
+655ca902 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff000000003f5a101f0e1fc49b0000000055bc79f8ada711fd fpsr=11 ; fcvtzs z2.s, p2/m, z8.h
+655ca962 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff000000033f5a101f0e1fc49b0000000055bc79f8ada711fd fpsr=10 ; fcvtzs z2.s, p2/m, z11.h
+655ea902 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000000055bc79f8ada711fd fpsr=1 ; fcvtzs z2.d, p2/m, z8.h
+655ea962 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000000055bc79f8ada711fd ; fcvtzs z2.d, p2/m, z11.h
+659ca922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff7fffffff3f5a101f0e1fc49b7fffffff55bc79f8ada711fd fpsr=1 ; fcvtzs z2.s, p2/m, z9.s
+659ca982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffffffffff3f5a101f0e1fc49b0000006455bc79f8ada711fd fpsr=10 ; fcvtzs z2.s, p2/m, z12.s
+65d8a942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000000355bc79f8ada711fd fpsr=10 ; fcvtzs z2.s, p2/m, z10.d
+65d8a9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000007fffffff55bc79f8ada711fd fpsr=1 ; fcvtzs z2.s, p2/m, z13.d
+65dca922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7fffffffffffffff55bc79f8ada711fd fpsr=1 ; fcvtzs z2.d, p2/m, z9.s
+65dca982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000006455bc79f8ada711fd ; fcvtzs z2.d, p2/m, z12.s
+65dea942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000000355bc79f8ada711fd fpsr=10 ; fcvtzs z2.d, p2/m, z10.d
+65dea9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f7fffffffffffffff55bc79f8ada711fd fpsr=1 ; fcvtzs z2.d, p2/m, z13.d
+655ba902 => z2=0000dabf0000bd75353cfc387dfae6b800005079fc5d43ff000000003f5a101f0e1fc49bd63b000055bc79f8000311fd fpsr=11 ; fcvtzu z2.h, p2/m, z8.h
+655ba962 => z2=0000dabf0000bd75353cfc387dfae6b800005079fc5d43ff000000033f5a101f0e1fc49bd63b000055bc79f8ffff11fd fpsr=11 ; fcvtzu z2.h, p2/m, z11.h
+655da902 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff000000003f5a101f0e1fc49b0000000055bc79f8ada711fd fpsr=11 ; fcvtzu z2.s, p2/m, z8.h
+655da962 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff000000033f5a101f0e1fc49b0000000055bc79f8ada711fd fpsr=10 ; fcvtzu z2.s, p2/m, z11.h
+655fa902 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000000055bc79f8ada711fd fpsr=1 ; fcvtzu z2.d, p2/m, z8.h
+655fa962 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000000055bc79f8ada711fd ; fcvtzu z2.d, p2/m, z11.h
+659da922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffffffffff3f5a101f0e1fc49bffffffff55bc79f8ada711fd fpsr=1 ; fcvtzu z2.s, p2/m, z9.s
+659da982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff000000003f5a101f0e1fc49b0000006455bc79f8ada711fd fpsr=1 ; fcvtzu z2.s, p2/m, z12.s
+65d9a942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000000355bc79f8ada711fd fpsr=10 ; fcvtzu z2.s, p2/m, z10.d
+65d9a9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f00000000ffffffff55bc79f8ada711fd fpsr=1 ; fcvtzu z2.s, p2/m, z13.d
+65dda922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101fffffffffffffffff55bc79f8ada711fd fpsr=1 ; fcvtzu z2.d, p2/m, z9.s
+65dda982 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000006455bc79f8ada711fd ; fcvtzu z2.d, p2/m, z12.s
+65dfa942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000000355bc79f8ada711fd fpsr=10 ; fcvtzu z2.d, p2/m, z10.d
+65dfa9a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101fffffffffffffffff55bc79f8ada711fd fpsr=1 ; fcvtzu z2.d, p2/m, z13.d
+6552a8a2 => z2=0000dabf0000bd75353cfc387dfae6b8bc005079fc5d43ff000051003f5a101f0e1fc49bd63bcc0055bc79f8bc0011fd ; scvtf z2.h, p2/m, z5.h
+6552a862 => z2=f7f5dabff7dabd75353cfc387dfae6b8f4345079fc5d43ff75456b643f5a101f0e1fc49bd63bf65e55bc79f876b711fd fpsr=10 ; scvtf z2.h, p2/m, z3.h
+6554a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff000051003f5a101f0e1fc49b0000cc0055bc79f8ada711fd ; scvtf z2.h, p2/m, z5.s
+6554a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff00007c003f5a101f0e1fc49b0000fc0055bc79f8ada711fd fpsr=14 ; scvtf z2.h, p2/m, z3.s
+6556a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000fc0055bc79f8ada711fd fpsr=14 ; scvtf z2.h, p2/m, z5.d
+6556a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000000000fc0055bc79f8ada711fd fpsr=14 ; scvtf z2.h, p2/m, z3.d
+6594a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff422000003f5a101f0e1fc49bc180000055bc79f8ada711fd ; scvtf z2.s, p2/m, z5.s
+6594a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff4ea8961e3f5a101f0e1fc49bce5d459855bc79f8ada711fd fpsr=10 ; scvtf z2.s, p2/m, z3.s
+65d0a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101fc03000000000000055bc79f8ada711fd ; scvtf z2.d, p2/m, z5.s
+65d0a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101fc1cba8b2f380000055bc79f8ada711fd ; scvtf z2.d, p2/m, z3.s
+65d4a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f00000000d170000055bc79f8ada711fd fpsr=10 ; scvtf z2.s, p2/m, z5.d
+65d4a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f00000000deda09a455bc79f8ada711fd fpsr=10 ; scvtf z2.s, p2/m, z3.d
+65d6a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101fc22e00000020000055bc79f8ada711fd ; scvtf z2.d, p2/m, z5.d
+65d6a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101fc3db41348c0dd45955bc79f8ada711fd fpsr=10 ; scvtf z2.d, p2/m, z3.d
+6553a8a2 => z2=0000dabf0000bd75353cfc387dfae6b87c005079fc5d43ff000051003f5a101f0e1fc49bd63b7c0055bc79f87c0011fd fpsr=14 ; ucvtf z2.h, p2/m, z5.h
+6553a862 => z2=7805dabf7813bd75353cfc387dfae6b879e65079fc5d43ff75456b643f5a101f0e1fc49bd63b78d155bc79f876b711fd fpsr=10 ; ucvtf z2.h, p2/m, z3.h
+6555a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff000051003f5a101f0e1fc49b00007c0055bc79f8ada711fd fpsr=14 ; ucvtf z2.h, p2/m, z5.s
+6555a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff00007c003f5a101f0e1fc49b00007c0055bc79f8ada711fd fpsr=14 ; ucvtf z2.h, p2/m, z3.s
+6557a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f0000000000007c0055bc79f8ada711fd fpsr=14 ; ucvtf z2.h, p2/m, z5.d
+6557a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f0000000000007c0055bc79f8ada711fd fpsr=14 ; ucvtf z2.h, p2/m, z3.d
+6595a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff422000003f5a101f0e1fc49b4f80000055bc79f8ada711fd fpsr=10 ; ucvtf z2.s, p2/m, z5.s
+6595a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff4ea8961e3f5a101f0e1fc49b4f48ae9a55bc79f8ada711fd fpsr=10 ; ucvtf z2.s, p2/m, z3.s
+65d1a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f41effffffe00000055bc79f8ada711fd ; ucvtf z2.d, p2/m, z5.s
+65d1a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f41e915d34320000055bc79f8ada711fd ; ucvtf z2.d, p2/m, z3.s
+65d5a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000005f80000055bc79f8ada711fd fpsr=10 ; ucvtf z2.s, p2/m, z5.d
+65d5a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000005f12fb2e55bc79f8ada711fd fpsr=10 ; ucvtf z2.s, p2/m, z3.d
+65d7a8a2 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f43effffffe20000055bc79f8ada711fd fpsr=10 ; ucvtf z2.d, p2/m, z5.d
+65d7a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f43e25f65b9f915d355bc79f8ada711fd fpsr=10 ; ucvtf z2.d, p2/m, z3.d
+6488a922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff7c0099e83f5a101f0e1fc49b7c00809e55bc79f8ada711fd fpsr=14 ; fcvtnt z2.h, p2/m, z9.s
+64caa942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f40490fdbd63b809e55bc79f8ada711fd fpsr=10 ; fcvtnt z2.s, p2/m, z10.d
+6489a902 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffc00000003f5a101f0e1fc49bc228000055bc79f8ada711fd ; fcvtlt z2.s, p2/m, z8.h
+64cba922 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f47efffffe000000055bc79f8ada711fd ; fcvtlt z2.d, p2/m, z9.s
+650aa942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f0000000040490fdb55bc79f8ada711fd fpsr=10 ; fcvtx z2.s, p2/m, z10.d
+640aa942 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f40490fdbd63b809e55bc79f8ada711fd fpsr=10 ; fcvtxnt z2.s, p2/m, z10.d
+6488a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff7c0099e83f5a101f0e1fc49bfc00809e55bc79f8ada711fd fpsr=14 ; fcvtnt z2.h, p2/m, z3.s
+650aa862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ffb92199e83f5a101f000000008000000155bc79f8ada711fd fpsr=18 ; fcvtx z2.s, p2/m, z3.d
+6489a862 => z2=a32edabf5585bd75353cfc387dfae6b8c5765079fc5d43ff428960003f5a101f0e1fc49bc115c00055bc79f8ada711fd ; fcvtlt z2.s, p2/m, z3.h
+64a9e589 => z9=bf73eadc3eaaaaab7eaaaaaa420555564f0000007fe000004f8000007fe000007f8000007f8000007fc000007f800000 fpsr=19 ; fmmla z9.s, z12.s, z9.s
+64a4e462 => z2=a32ee0fa5585bd75353cfc437dfae6b8ea47b9fdfc5d43ff7f800000fb3e86b64b2ad6fc76abe861edec1851ff800000 fpsr=1c ; fmmla z2.s, z3.s, z4.s
+64eae5aa => z10=43f00000000000007ff40000000000007ff00000000000007ff00000000000007ff80000000000007ff0000000000000 fpsr=11 ; fmmla z10.d, z13.d, z10.d
+64e4e462 => z2=a32edabf5585bd75353cfc387dfae6b8f0e33236dde440c4b92199e83f5a101f7ff000000000000055bc79f8ada711fd fpsr=1c ; fmmla z2.d, z3.d, z4.d
+4522e062 => z2=0ef71bdb808c0f62f8cd4b5526e1913a3302a3c555be1fca00bd3515b65088407287be20d3f61e17b469a23bde2a0937 ; aese z2.b, z2.b, z3.b
+4522e462 => z2=e023276e3217aa0e0d3a8653a2a0631a4858e538af46857cd3802c4e53b8591ec7bb43fd1c4a72eae9ae46a4b7adeb3e ; aesd z2.b, z2.b, z3.b
+4520e002 => z2=73c7c19d0d26d5e6e2e3aa66353607dd3c9186b1e7196281f2e31be315faee6b7173276bb5091e517c1d8089eb5580d8 ; aesmc z2.b, z2.b
+4520e402 => z2=8db43fee400b98cbd9c19144fdb7cf5ce2115831c54f40d77be392e3d4882f193213640b2f72842aa17b5def5c5737da ; aesimc z2.b, z2.b
+4523e062 => z2=d8da40292e07e7c537938c07b5998a738009c7a11d6ed6fd587b9a4660ae6bf9b9e5f01d13ea92037de7f59d4bcc100a ; sm4e z2.s, z2.s, z3.s
+4524f062 => z2=92c5de9df0dbe1baaf83f28803dbcbd80b085b6a8ce8737c996f27ef18c6355d0a6eb8f8d6eb07bbf28b29f8cbb90de9 ; sm4ekey z2.s, z3.s, z4.s
+4524f462 => z2=378b3d79b29e7b246219e42b4f2cb24066ab12fa49ff4891ed466960f67b8d4a88e82e1e4b5a6dd1e06ba3b4b1895235 ; rax1 z2.d, z3.d, z4.d
+45046862 => z2=0137341951dcc2c036a9bf1918bfa9e239ab796040328eafaffeee7c57d66b6705e12eae6060fee92514e7186145029b ; pmullb z2.q, z3.d, z4.d
+45046c62 => z2=2decf2d95616c240536cd86d5ad1cff63f17d4ede176e9ce9064450ff8b457e5064a8242c61718793297b1b80512b284 ; pmullt z2.q, z3.d, z4.d
+45446862 => z2=5cbc0580116924f60d1a263305be03e205d8207c127716e5243a5f790000066707234bd8678c098406240162173c299b ; pmullb z2.h, z3.b, z4.b
+45446c62 => z2=2d80114e4d30393501323b2030fc05103f2c24ac318a318a39b006322f7123b6064a16ad56c8391e05e813d520bf0374 ; pmullt z2.h, z3.b, z4.b
+45c46862 => z2=4d39ec855ad1cff630b9c66618bfa9e231facd3bf8b457e52f4e4ce257d66b6756f0520c0512b284208411cb6145029b ; pmullb z2.d, z3.s, z4.s
+45c46c62 => z2=2decf2d937126980013734194ace84333f17d4edef1e2e7c39ab7960557f7479064a8242ae9c0cd805e12eae38344e62 ; pmullt z2.d, z3.s, z4.s
