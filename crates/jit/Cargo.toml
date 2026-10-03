@@ -13,10 +13,22 @@ publish = false
 [package.metadata.ruvm]
 unsafe-budget = 0
 
+[features]
+# Run every runtime made with the interpreter backend on the host's native backend instead,
+# the test mode for front end suites: `cargo test -p <crate> --features ruvm-jit/force-native`.
+# `RUVM_JIT_BACKEND=interp` still wins.
+force-native = []
+
 [dependencies]
 ruvm-jit-core.workspace = true
 ruvm-jit-interp.workspace = true
 ruvm-mem.workspace = true
+
+[target.'cfg(all(unix, target_arch = "aarch64"))'.dependencies]
+ruvm-jit-aarch64.workspace = true
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+ruvm-jit-x86_64.workspace = true
 
 [lints]
 workspace = true

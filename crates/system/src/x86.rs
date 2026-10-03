@@ -1,37 +1,66 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The x86 boards, microvm and q35, from the command line: what `-machine`, `-m`, `-smp`,
-//! `-kernel`, `-drive`, `-device` and `-serial` turn into, and, on Linux x86 hosts, the
-//! board running on KVM.
+//! `-kernel`, `-drive`, `-device` and `-serial` turn into, and the board running on TCG (any
+//! host) or KVM (Linux x86 hosts).
 //!
 //! The mapping is plain data and works on any host, so it is tested everywhere. Only the part
 //! that opens `/dev/kvm` is built for Linux x86_64.
+//!
+//! `-device` knows the virtio devices, `isa-debugcon` and `isa-debug-exit`. One deliberate
+//! difference from QEMU: `isa-debugcon` reads and drops what its chardev receives, where
+//! QEMU never reads it.
 //!
 //! Firmware and option ROMs are looked up in the `-L` directories in command line order, then
 //! in `/usr/share/qemu`, `/usr/share/seabios` and `/usr/local/share/qemu`, and last in the
 //! `share/qemu` directory next to a `qemu-system-x86_64` found on `PATH`. `-L help` prints
 //! that list.
 
-// Without KVM nothing builds a board, so the device plan is only used by the tests.
-#![cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
-
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use ruvm_base::report::{Location, push_location, report_error};
-use ruvm_base::{Error, Result};
+use ruvm_accel::tcg::TcgOptions;
+use ruvm_base::report::{Location, push_location, report_error, warn_report};
+use ruvm_base::{ClockType, Error, Result};
 use ruvm_chardev::opts::{NographicDefaults, nographic_defaults};
+use ruvm_chardev::{Attachment, Chardev, Connection, Frontend};
 use ruvm_firmware::smbios::{SmbiosOptions, SmbiosTopology, parse_uuid};
-use ruvm_machine_x86::board::X86_BOARDS;
-use ruvm_machine_x86::pflash::raw_block_length;
-use ruvm_machine_x86::q35::PflashDrive;
-use ruvm_machine_x86::{
-    BoardKind, FileBackend, FirmwareSearch, KernelFiles, MicrovmProps, PflashBacking, Q35Props,
+use ruvm_hw_char::serial::{Serial, SerialBackend};
+use ruvm_hw_core::Clock;
+use ruvm_hw_core::timer::TimeSource;
+use ruvm_hw_misc::debugexit::{
+    DEBUG_EXIT_DEFAULT_IOBASE, DEBUG_EXIT_DEFAULT_IOSIZE, IsaDebugExit, IsaDebugExitConfig,
 };
+use ruvm_hw_storage::{BlockBackend, DriveConfig};
+use ruvm_hw_virtio::{
+    RandomFile, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass, VirtioRng,
+    VirtioRngConf,
+};
+use ruvm_machine_x86::board::X86_BOARDS;
+use ruvm_machine_x86::debugcon::{
+    DEBUGCON_DEFAULT_IOBASE, DEBUGCON_DEFAULT_READBACK, DebugconConfig, IsaDebugcon,
+    TYPE_ISA_DEBUGCON,
+};
+use ruvm_machine_x86::pflash::raw_block_length;
+use ruvm_machine_x86::q35::{CpuIdent, PflashDrive};
+use ruvm_machine_x86::run_event::{EventHandler, GuestEvent, ShutdownReason};
+use ruvm_machine_x86::tcg_run::{TCG_SMM_AVAILABLE, TcgCpuModel, TcgMachine, TcgRunConfig};
+use ruvm_machine_x86::{
+    BoardKind, BoardSpec, FileBackend, FirmwareSearch, KernelFiles, MicrovmProps, PflashBacking,
+    Q35Props, X86Board, build_board,
+};
+use ruvm_qapi::events::{event_guest_panicked, event_reset};
 use ruvm_qapi::opts::{QemuOptsList, is_help_option};
-use ruvm_qapi::types::{MemorySizeConfiguration, SMPConfiguration};
-use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor};
+use ruvm_qapi::types::{
+    GuestPanicAction, GuestPanickedArg, MemorySizeConfiguration, ResetArg, RunState,
+    SMPConfiguration, ShutdownCause,
+};
+use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
+
+use crate::vl::Vm;
 
 /// Whether `target` is one the x86 boards exist for.
 pub(crate) fn is_x86(target: &str) -> bool {
@@ -662,6 +691,25 @@ pub(crate) struct Plug {
     pub loc: Option<Location>,
 }
 
+/// The ISA devices `-device` knows, with their properties.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IsaModel {
+    /// `isa-debugcon`, with the id of its chardev.
+    Debugcon { chardev: Option<String>, iobase: u32, readback: u32 },
+    /// `isa-debug-exit`.
+    DebugExit { iobase: u32, iosize: u32 },
+}
+
+/// `TYPE_ISA_DEBUG_EXIT`.
+const TYPE_ISA_DEBUG_EXIT: &str = "isa-debug-exit";
+
+/// An ISA device to plug.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IsaPlug {
+    pub model: IsaModel,
+    pub loc: Option<Location>,
+}
+
 /// What the board gets from `-drive` and `-device`, in the order QEMU plugs it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
@@ -671,6 +719,14 @@ pub(crate) struct Plan {
     pub default_cdrom: Option<u32>,
     /// The virtio devices, `-device` first and then the ones `-drive if=virtio` adds.
     pub virtio: Vec<Plug>,
+    /// The ISA devices of `-device`, in order.
+    pub isa: Vec<IsaPlug>,
+}
+
+/// One `-device`, planned.
+enum Planned {
+    Virtio(Plug),
+    Isa(IsaPlug),
 }
 
 /// The drives of the q35 system flashes: `-machine pflashN=` names a drive by id, and
@@ -756,8 +812,10 @@ pub(crate) fn plan(
         queue.push((format!("virtio-blk,drive={}", d.id), d.loc.clone()));
     }
     for (arg, loc) in &queue {
-        let plug = plan_device(kind, drives, &mut used, arg, loc).map_err(|e| vec![e])?;
-        p.virtio.push(plug);
+        match plan_device(kind, drives, &mut used, arg, loc).map_err(|e| vec![e])? {
+            Planned::Virtio(plug) => p.virtio.push(plug),
+            Planned::Isa(plug) => p.isa.push(plug),
+        }
     }
 
     let orphans: Vec<Located> = drives
@@ -790,7 +848,7 @@ fn plan_device(
     used: &mut HashSet<usize>,
     arg: &str,
     loc: &Option<Location>,
-) -> std::result::Result<Plug, Located> {
+) -> std::result::Result<Planned, Located> {
     let mut list = QemuOptsList::new("device", &[]).with_implied_opt_name("driver");
     let opts = list.parse(arg, true).map_err(|e| Located(loc.clone(), e))?;
     let Some(driver) = opts.get("driver") else {
@@ -798,6 +856,9 @@ fn plan_device(
     };
     if is_help_option(driver) || opts.has_help_opt() {
         return Err(Located::new(loc, "-device help is not supported by ruvm yet"));
+    }
+    if driver == TYPE_ISA_DEBUGCON || driver == TYPE_ISA_DEBUG_EXIT {
+        return plan_isa_device(kind, driver, opts, loc).map(Planned::Isa);
     }
     let alias = DEVICE_ALIASES.iter().find(|(a, _)| *a == driver).map(|(_, t)| *t);
     let name = alias.unwrap_or(driver);
@@ -869,7 +930,65 @@ fn plan_device(
             return Err(Located::new(loc, "Device needs media, but drive is empty"));
         }
     }
-    Ok(Plug { typename, model, transport, drive, serial, loc: loc.clone() })
+    Ok(Planned::Virtio(Plug { typename, model, transport, drive, serial, loc: loc.clone() }))
+}
+
+/// A `uint32` qdev property from its command line string, with QEMU's errors.
+fn prop_u32(name: &str, value: &str) -> Result<u32> {
+    let mut d = QDict::new();
+    d.put(name, QValue::Str(value.to_string()));
+    let mut v = QObjectInputVisitor::new_keyval(QValue::Dict(d));
+    v.start_struct(None)?;
+    let mut out = 0u32;
+    v.type_uint32(Some(name), &mut out)?;
+    v.end_struct();
+    Ok(out)
+}
+
+/// `qdev_device_add()` for `isa-debugcon` and `isa-debug-exit`: the bus first, then the
+/// properties. Whether the chardev exists is checked when the device is realized.
+fn plan_isa_device(
+    kind: Option<BoardKind>,
+    typename: &str,
+    opts: &ruvm_qapi::opts::QemuOpts,
+    loc: &Option<Location>,
+) -> std::result::Result<IsaPlug, Located> {
+    // Both boards have an ISA bus, `isa.0`; q35 also has `pcie.0`.
+    if let Some(b) = opts.get("bus") {
+        if b == "pcie.0" && kind == Some(BoardKind::Q35) {
+            return Err(Located::new(loc, format!("Device '{typename}' can't go on PCIE bus")));
+        }
+        if b != "isa.0" || kind.is_none() {
+            return Err(Located::new(loc, format!("Bus '{b}' not found")));
+        }
+    }
+    if kind.is_none() {
+        return Err(Located::new(loc, format!("No 'ISA' bus found for device '{typename}'")));
+    }
+    let mut model = if typename == TYPE_ISA_DEBUGCON {
+        IsaModel::Debugcon {
+            chardev: None,
+            iobase: DEBUGCON_DEFAULT_IOBASE,
+            readback: DEBUGCON_DEFAULT_READBACK,
+        }
+    } else {
+        IsaModel::DebugExit { iobase: DEBUG_EXIT_DEFAULT_IOBASE, iosize: DEBUG_EXIT_DEFAULT_IOSIZE }
+    };
+    let num = |k: &str, v: &str| prop_u32(k, v).map_err(|e| Located(loc.clone(), e));
+    for (k, v) in opts.iter() {
+        match (k, &mut model) {
+            ("driver" | "bus", _) => {}
+            ("chardev", IsaModel::Debugcon { chardev, .. }) => *chardev = Some(v.to_string()),
+            ("iobase", IsaModel::Debugcon { iobase, .. })
+            | ("iobase", IsaModel::DebugExit { iobase, .. }) => *iobase = num(k, v)?,
+            ("readback", IsaModel::Debugcon { readback, .. }) => *readback = num(k, v)?,
+            ("iosize", IsaModel::DebugExit { iosize, .. }) => *iosize = num(k, v)?,
+            _ => {
+                return Err(Located::new(loc, format!("Property '{typename}.{k}' not found")));
+            }
+        }
+    }
+    Ok(IsaPlug { model, loc: loc.clone() })
 }
 
 /// QEMU's warning for a drive without `format=`, which it would probe and find raw.
@@ -880,12 +999,13 @@ pub(crate) fn probe_warning(file: &str) -> String {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) use kvm::{Running, kvm_init, start_board};
+pub(crate) use kvm::{kvm_init, start_board};
 
 /// The accelerator `configure_accelerators()` picked.
 #[derive(Debug)]
 pub(crate) enum Accel {
     Qtest,
+    Tcg(TcgOptions),
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     Kvm(Box<ruvm_accel_kvm::KvmAccel>),
 }
@@ -900,34 +1020,411 @@ pub(crate) enum AccelInitError {
     Failed([String; 2]),
 }
 
+/// `do_configure_accelerator()` for tcg: the `-accel tcg` properties, set in order. The
+/// code buffer is made by `tcg_init_machine()`, which is where QEMU fails a `split-wx=on` it
+/// cannot do, with `error_fatal`.
+pub(crate) fn tcg_init(
+    props: &[(String, String)],
+) -> std::result::Result<TcgOptions, AccelInitError> {
+    let fatal = |e: String| AccelInitError::Fatal(Error::generic(e));
+    let opts = TcgOptions::from_props(props.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .map_err(fatal)?;
+    if opts.split_wx {
+        return Err(fatal("jit split-wx not supported".to_string()));
+    }
+    Ok(opts)
+}
+
+/// The machine the vCPUs run, on either accelerator.
+#[derive(Debug)]
+enum RunningMachine {
+    Tcg(Arc<TcgMachine>),
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    Kvm(Arc<ruvm_machine_x86::kvm_run::KvmMachine>),
+}
+
+/// The x86 board running on its vCPUs, and the chardevs its devices are attached to.
+#[derive(Debug)]
+pub(crate) struct Running {
+    machine: RunningMachine,
+    _attachments: Vec<Attachment>,
+}
+
+impl Running {
+    /// Stops the vCPU and timer threads.
+    pub(crate) fn quit(&self) {
+        match &self.machine {
+            RunningMachine::Tcg(m) => m.quit(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            RunningMachine::Kvm(m) => m.quit(),
+        }
+    }
+}
+
+/// Feeds `input` to `serial`, as much at a time as the port has room for.
+fn feed(serial: &Serial, mut input: &[u8]) {
+    while !input.is_empty() {
+        let room = serial.can_receive();
+        if room == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        let k = room.min(input.len());
+        serial.receive(&input[..k]);
+        input = &input[k..];
+    }
+}
+
+/// A serial port on its chardev, the `chardev` property of `isa-serial`: what the guest
+/// writes goes to the chardev, what the chardev reads goes to the port.
+struct ChardevSerial {
+    serial: Arc<Serial>,
+    chr: Arc<Chardev>,
+}
+
+impl SerialBackend for ChardevSerial {
+    fn write(&self, bytes: &[u8]) -> usize {
+        // Output nobody can take is dropped, as serial_xmit() does after an error.
+        let _ = self.chr.write_all(bytes);
+        bytes.len()
+    }
+}
+
+impl Frontend for ChardevSerial {
+    fn serve(&self, conn: &mut Connection) -> std::io::Result<()> {
+        let mut buf = [0u8; 256];
+        loop {
+            match conn.recv(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => feed(&self.serial, &buf[..n]),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// The chardev side of `isa-debugcon`. QEMU installs no read handler, so input is never
+/// taken from the chardev; here it is read and dropped.
+struct DebugconFrontend;
+
+impl Frontend for DebugconFrontend {
+    fn serve(&self, conn: &mut Connection) -> std::io::Result<()> {
+        let mut buf = [0u8; 256];
+        loop {
+            if conn.recv(&mut buf)? == 0 {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn virtio_class(
+    plug_model: VirtioModel,
+    drive: Option<&Drive>,
+    serial: Option<String>,
+) -> std::result::Result<Box<dyn VirtioDeviceClass>, String> {
+    Ok(match plug_model {
+        VirtioModel::Blk => {
+            let d = drive.expect("planned with a drive");
+            let file = d.file.as_deref().expect("planned with media");
+            let backend = FileBackend::open(file, d.read_only)?;
+            if d.probed && !d.read_only {
+                eprint!("{}", probe_warning(file));
+            }
+            let conf = VirtioBlkConf { serial, ..VirtioBlkConf::default() };
+            Box::new(VirtioBlk::new(Box::new(backend), conf))
+        }
+        VirtioModel::Rng => {
+            Box::new(VirtioRng::new(Box::<RandomFile>::default(), VirtioRngConf::default()))
+        }
+        VirtioModel::Serial => Box::new(VirtioConsole::new(None)),
+    })
+}
+
+fn attach_ide(
+    board: &X86Board,
+    port: u32,
+    config: DriveConfig,
+    blk: Option<Arc<dyn BlockBackend>>,
+) -> std::result::Result<(), String> {
+    match board {
+        X86Board::Q35(m, _) => m.attach_drive(port as usize, config, blk),
+        X86Board::Microvm(_) => {
+            Err(format!("machine type does not support if=ide,bus={port},unit=0"))
+        }
+    }
+}
+
+/// What the accelerator tells the board about itself.
+struct BoardAccel {
+    kvm: bool,
+    pit_in_kernel: bool,
+    smm_available: bool,
+    phys_bits: u32,
+    cpu: CpuIdent,
+}
+
+/// A board with its devices plugged and its chardevs attached, not yet on vCPUs.
+struct Built {
+    board: X86Board,
+    clocks: Vec<Arc<Clock>>,
+    attachments: Vec<Attachment>,
+}
+
+/// `qemu_init_board()` and `qemu_create_cli_devices()` for an x86 board: builds the board,
+/// plugs the devices and connects the serial ports to `serial_hds` (`serial_hd(i)` by
+/// index).
+#[allow(clippy::too_many_arguments)]
+fn build(
+    vm: &Arc<Vm>,
+    accel: BoardAccel,
+    kind: BoardKind,
+    opts: BoardOptions,
+    cmd: &Cmdline,
+    drives: &[Drive],
+    serial_hds: &[Option<Arc<Chardev>>],
+) -> std::result::Result<Built, Vec<Located>> {
+    let one = |e: Located| vec![e];
+    let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
+    let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
+    let pflash = pflash_drives(kind, &opts, drives).map_err(one)?;
+    let spec = BoardSpec {
+        kind,
+        props: opts.props,
+        ram_size: opts.ram_size,
+        cpus: opts.cpus,
+        max_cpus: opts.max_cpus,
+        kvm: accel.kvm,
+        pit_in_kernel: accel.pit_in_kernel,
+        smm_available: accel.smm_available,
+        phys_bits: accel.phys_bits,
+        cpu: accel.cpu,
+        bios: opts.bios,
+        pflash,
+        uuid: cmd.uuid,
+        smbios: cmd.smbios.clone(),
+        topology: opts.topology,
+        kernel: opts.kernel,
+        firmware: cmd.firmware(),
+        serial_hds: serial_hds.iter().map(Option::is_some).collect(),
+        clock: Arc::clone(&clock),
+        rtc_clock: Arc::clone(&rtc_clock),
+    };
+    let (mut board, warnings) = build_board(spec).map_err(|e| one(Located::bare(e)))?;
+    for w in warnings.iter().chain(board.warnings()) {
+        warn_report(w);
+    }
+
+    let p = plan(Some(kind), drives, &cmd.devices, cmd.has_defaults)?;
+    for &(port, i) in &p.ide {
+        let d = &drives[i];
+        let blk: Option<Arc<dyn BlockBackend>> = match &d.file {
+            Some(f) => {
+                let b =
+                    FileBackend::open(f, d.read_only).map_err(|e| one(Located::new(&d.loc, e)))?;
+                if d.probed && !d.read_only {
+                    eprint!("{}", probe_warning(f));
+                }
+                Some(Arc::new(b))
+            }
+            None => None,
+        };
+        let config = if d.cdrom { DriveConfig::cdrom() } else { DriveConfig::hd() };
+        if !d.cdrom && blk.is_none() {
+            return Err(one(Located::new(&d.loc, "Device needs media, but drive is empty")));
+        }
+        attach_ide(&board, port, config, blk).map_err(|e| one(Located::new(&d.loc, e)))?;
+    }
+    if let Some(port) = p.default_cdrom {
+        attach_ide(&board, port, DriveConfig::cdrom(), None).map_err(|e| one(Located::bare(e)))?;
+    }
+    for plug in p.virtio {
+        let drive = plug.drive.map(|i| &drives[i]);
+        let class = virtio_class(plug.model, drive, plug.serial)
+            .map_err(|e| one(Located::new(drive.map_or(&plug.loc, |d| &d.loc), e)))?;
+        board.attach_virtio(class).map_err(|e| {
+            let msg = if e.starts_with("No 'virtio-bus' bus found for device") {
+                format!("No 'virtio-bus' bus found for device '{}'", plug.typename)
+            } else {
+                e
+            };
+            one(Located::new(&plug.loc, msg))
+        })?;
+    }
+    let mut attachments = Vec::new();
+    for plug in &p.isa {
+        realize_isa(vm, &board, plug, &mut attachments).map_err(one)?;
+    }
+
+    // The ports the board made take their chardevs; a microvm leaves the ones after the
+    // first unconnected, as QEMU does.
+    for (index, chr) in serial_hds.iter().enumerate() {
+        let (Some(chr), Some(port)) = (chr, board.serial(index)) else { continue };
+        let fe = Arc::new(ChardevSerial { serial: Arc::clone(port), chr: Arc::clone(chr) });
+        board.set_serial_backend(index, Some(fe.clone()));
+        attachments.push(chr.attach(fe).map_err(|e| vec![Located(None, e)])?);
+    }
+    Ok(Built { board, clocks: vec![clock, rtc_clock], attachments })
+}
+
+/// Realizes one ISA device of `-device` on `board`.
+fn realize_isa(
+    vm: &Arc<Vm>,
+    board: &X86Board,
+    plug: &IsaPlug,
+    attachments: &mut Vec<Attachment>,
+) -> std::result::Result<(), Located> {
+    let mem = board.memory_system();
+    let io = board.io_as().root();
+    match &plug.model {
+        IsaModel::Debugcon { chardev, iobase, readback } => {
+            let Some(id) = chardev else {
+                return Err(Located::new(
+                    &plug.loc,
+                    "Can't create debugcon device, empty char device",
+                ));
+            };
+            let Some(chr) = vm.chardevs.find(id) else {
+                return Err(Located::new(
+                    &plug.loc,
+                    format!("Property '{TYPE_ISA_DEBUGCON}.chardev' can't find value '{id}'"),
+                ));
+            };
+            if chr.is_busy() && !chr.is_mux() {
+                return Err(Located::new(
+                    &plug.loc,
+                    format!(
+                        "Property '{TYPE_ISA_DEBUGCON}.chardev' can't take value '{id}', it's in use"
+                    ),
+                ));
+            }
+            attachments.push(
+                chr.attach(Arc::new(DebugconFrontend)).map_err(|e| Located(plug.loc.clone(), e))?,
+            );
+            let config = DebugconConfig { iobase: *iobase, readback: *readback };
+            let sink = Arc::new(move |b: &[u8]| {
+                // qemu_chr_fe_write_all(); errors are ignored.
+                let _ = chr.write_all(b);
+            });
+            IsaDebugcon::realize(mem, io, config, sink).map_err(|e| Located::new(&plug.loc, e))?;
+        }
+        IsaModel::DebugExit { iobase, iosize } => {
+            let rs = Arc::clone(&vm.runstate);
+            let handler = Arc::new(move |code: u64| {
+                rs.shutdown_request_with_code(ShutdownCause::GuestShutdown, code as i32);
+            });
+            let config = IsaDebugExitConfig { iobase: *iobase, iosize: *iosize };
+            IsaDebugExit::realize(mem, io, config, handler)
+                .map_err(|e| Located(plug.loc.clone(), e))?;
+        }
+    }
+    Ok(())
+}
+
+/// What the run loops report, turned into runstate changes and QMP events.
+fn event_handler(vm: &Arc<Vm>) -> EventHandler {
+    let rs = Arc::clone(&vm.runstate);
+    let qmp = Arc::clone(&vm.qmp);
+    Arc::new(move |e: GuestEvent| match e {
+        GuestEvent::Shutdown(r) => rs.shutdown_request(match r {
+            ShutdownReason::GuestShutdown => ShutdownCause::GuestShutdown,
+            ShutdownReason::GuestReset => ShutdownCause::GuestReset,
+        }),
+        GuestEvent::Reset => {
+            let arg = ResetArg { guest: true, reason: ShutdownCause::GuestReset };
+            if let Some(ev) = event_reset(&qmp.policy(), arg) {
+                qmp.emit_event(ev);
+            }
+        }
+        GuestEvent::Panicked => {
+            // The default panic action is shutdown: say so, stop and quit.
+            let arg = GuestPanickedArg { action: GuestPanicAction::Poweroff, info: None };
+            if let Some(ev) = event_guest_panicked(&qmp.policy(), arg) {
+                qmp.emit_event(ev);
+            }
+            rs.vm_stop(RunState::GuestPanicked);
+            rs.shutdown_request(ShutdownCause::GuestPanic);
+        }
+        GuestEvent::InternalError(msg) => {
+            // kvm_cpu_exec() prints these with fprintf(), without the program name.
+            eprintln!("{msg}");
+            rs.vm_stop(RunState::InternalError);
+        }
+    })
+}
+
+/// Lets the runstate start and stop the vCPUs, through `start` and `pause` on `machine`.
+fn set_cpu_hook<M: Send + Sync + 'static>(
+    vm: &Arc<Vm>,
+    machine: &Arc<M>,
+    start: fn(&M),
+    pause: fn(&M),
+) {
+    let weak = Arc::downgrade(machine);
+    vm.runstate.set_cpu_hook(Some(Arc::new(move |run| {
+        if let Some(m) = weak.upgrade() {
+            if run {
+                start(&m);
+            } else {
+                pause(&m);
+            }
+        }
+    })));
+}
+
+/// `qemu_init_board()`, `qemu_create_cli_devices()` and `qemu_machine_creation_done()`
+/// for an x86 board on TCG: builds the board, plugs the devices and puts it all on the
+/// vCPU threads, stopped until `vm_start()`.
+pub(crate) fn start_board_tcg(
+    vm: &Arc<Vm>,
+    tcg: TcgOptions,
+    kind: BoardKind,
+    opts: BoardOptions,
+    cmd: &Cmdline,
+    drives: &[Drive],
+    serial_hds: &[Option<Arc<Chardev>>],
+) -> std::result::Result<Running, Vec<Located>> {
+    let one = |e: String| vec![Located::bare(e)];
+    let cpu = TcgCpuModel::new(cmd.cpu.as_deref()).map_err(one)?;
+    for w in cpu.warnings() {
+        warn_report(w);
+    }
+    let accel = BoardAccel {
+        kvm: false,
+        pit_in_kernel: false,
+        smm_available: TCG_SMM_AVAILABLE,
+        phys_bits: cpu.phys_bits(),
+        cpu: cpu.ident(),
+    };
+    let built = build(vm, accel, kind, opts, cmd, drives, serial_hds)?;
+    let cfg = TcgRunConfig { no_reboot: cmd.no_reboot, tcg, backend: None };
+    let (machine, warnings) =
+        TcgMachine::new(built.board, &cpu, built.clocks, &cfg, event_handler(vm)).map_err(one)?;
+    for w in &warnings {
+        warn_report(w);
+    }
+    let machine = Arc::new(machine);
+    set_cpu_hook(vm, &machine, TcgMachine::start, TcgMachine::pause);
+    Ok(Running { machine: RunningMachine::Tcg(machine), _attachments: built.attachments })
+}
+
 /// The KVM side, Linux on x86_64 only.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod kvm {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
     use ruvm_accel_kvm::{KernelIrqchip, KvmAccel, KvmOptions};
+    use ruvm_base::Error;
     use ruvm_base::report::warn_report;
-    use ruvm_base::{ClockType, Error};
-    use ruvm_chardev::{Attachment, Chardev, Connection, Frontend};
-    use ruvm_hw_char::serial::{Serial, SerialBackend};
-    use ruvm_hw_core::Clock;
-    use ruvm_hw_core::timer::TimeSource;
-    use ruvm_hw_storage::DriveConfig;
-    use ruvm_hw_virtio::{
-        RandomFile, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass, VirtioRng,
-        VirtioRngConf,
-    };
+    use ruvm_chardev::Chardev;
+    use ruvm_machine_x86::BoardKind;
     use ruvm_machine_x86::kvm_run::{
-        CpuModel, GuestEvent, KvmMachine, KvmRunConfig, ShutdownReason, open_accel, pit_in_kernel,
+        CpuModel, KvmMachine, KvmRunConfig, open_accel, pit_in_kernel,
     };
-    use ruvm_machine_x86::{BoardKind, BoardSpec, FileBackend, build_board};
-    use ruvm_qapi::events::{event_guest_panicked, event_reset};
-    use ruvm_qapi::types::{GuestPanicAction, GuestPanickedArg, ResetArg, RunState, ShutdownCause};
 
     use super::{
-        AccelInitError, BoardOptions, Cmdline, Drive, Located, VirtioModel, pflash_drives, plan,
-        probe_warning,
+        AccelInitError, BoardAccel, BoardOptions, Cmdline, Drive, Located, Running, RunningMachine,
+        build, event_handler, set_cpu_hook,
     };
     use crate::vl::Vm;
 
@@ -958,89 +1455,9 @@ mod kvm {
         open_accel(&opts, default_split).map_err(AccelInitError::Failed)
     }
 
-    /// The x86 board running on KVM, and the chardevs its serial ports are attached to.
-    #[derive(Debug)]
-    pub(crate) struct Running {
-        machine: Arc<KvmMachine>,
-        _serials: Vec<Attachment>,
-    }
-
-    impl Running {
-        /// Stops the vCPU and timer threads.
-        pub(crate) fn quit(&self) {
-            self.machine.quit();
-        }
-    }
-
-    /// Feeds `input` to `serial`, as much at a time as the port has room for.
-    fn feed(serial: &Serial, mut input: &[u8]) {
-        while !input.is_empty() {
-            let room = serial.can_receive();
-            if room == 0 {
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-            let k = room.min(input.len());
-            serial.receive(&input[..k]);
-            input = &input[k..];
-        }
-    }
-
-    /// A serial port on its chardev, the `chardev` property of `isa-serial`: what the guest
-    /// writes goes to the chardev, what the chardev reads goes to the port.
-    struct ChardevSerial {
-        serial: Arc<Serial>,
-        chr: Arc<Chardev>,
-    }
-
-    impl SerialBackend for ChardevSerial {
-        fn write(&self, bytes: &[u8]) -> usize {
-            // Output nobody can take is dropped, as serial_xmit() does after an error.
-            let _ = self.chr.write_all(bytes);
-            bytes.len()
-        }
-    }
-
-    impl Frontend for ChardevSerial {
-        fn serve(&self, conn: &mut Connection) -> std::io::Result<()> {
-            let mut buf = [0u8; 256];
-            loop {
-                match conn.recv(&mut buf) {
-                    Ok(0) => return Ok(()),
-                    Ok(n) => feed(&self.serial, &buf[..n]),
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-    }
-
-    fn virtio_class(
-        plug_model: VirtioModel,
-        drive: Option<&Drive>,
-        serial: Option<String>,
-    ) -> Result<Box<dyn VirtioDeviceClass>, String> {
-        Ok(match plug_model {
-            VirtioModel::Blk => {
-                let d = drive.expect("planned with a drive");
-                let file = d.file.as_deref().expect("planned with media");
-                let backend = FileBackend::open(file, d.read_only)?;
-                if d.probed && !d.read_only {
-                    eprint!("{}", probe_warning(file));
-                }
-                let conf = VirtioBlkConf { serial, ..VirtioBlkConf::default() };
-                Box::new(VirtioBlk::new(Box::new(backend), conf))
-            }
-            VirtioModel::Rng => {
-                Box::new(VirtioRng::new(Box::<RandomFile>::default(), VirtioRngConf::default()))
-            }
-            VirtioModel::Serial => Box::new(VirtioConsole::new(None)),
-        })
-    }
-
     /// `qemu_init_board()`, `qemu_create_cli_devices()` and `qemu_machine_creation_done()`
-    /// for an x86 board on KVM: builds the board, plugs the devices, connects the serial ports
-    /// to `serial_hds` (`serial_hd(i)` by index) and puts it all on the vCPUs, stopped until
-    /// `vm_start()`.
+    /// for an x86 board on KVM: builds the board, plugs the devices and puts it all on the
+    /// vCPUs, stopped until `vm_start()`.
     pub(crate) fn start_board(
         vm: &Arc<Vm>,
         accel: KvmAccel,
@@ -1050,146 +1467,26 @@ mod kvm {
         drives: &[Drive],
         serial_hds: &[Option<Arc<Chardev>>],
     ) -> Result<Running, Vec<Located>> {
-        let one = |e: Located| vec![e];
-        let cpu = CpuModel::new(&accel, cmd.cpu.as_deref()).map_err(|e| one(Located::bare(e)))?;
+        let one = |e: String| vec![Located::bare(e)];
+        let cpu = CpuModel::new(&accel, cmd.cpu.as_deref()).map_err(one)?;
         for w in cpu.warnings() {
             warn_report(w);
         }
-        let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
-        let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
-        let pflash = pflash_drives(kind, &opts, drives).map_err(one)?;
-        let spec = BoardSpec {
-            kind,
-            props: opts.props,
-            ram_size: opts.ram_size,
-            cpus: opts.cpus,
-            max_cpus: opts.max_cpus,
+        let board_accel = BoardAccel {
             kvm: true,
             pit_in_kernel: pit_in_kernel(&accel),
             smm_available: false,
             phys_bits: cpu.phys_bits(),
             cpu: cpu.ident(),
-            bios: opts.bios,
-            pflash,
-            uuid: cmd.uuid,
-            smbios: cmd.smbios.clone(),
-            topology: opts.topology,
-            kernel: opts.kernel,
-            firmware: cmd.firmware(),
-            serial_hds: serial_hds.iter().map(Option::is_some).collect(),
-            clock: Arc::clone(&clock),
-            rtc_clock: Arc::clone(&rtc_clock),
         };
-        let (mut board, warnings) = build_board(spec).map_err(|e| one(Located::bare(e)))?;
-        for w in warnings.iter().chain(board.warnings()) {
-            warn_report(w);
-        }
-
-        let p = plan(Some(kind), drives, &cmd.devices, cmd.has_defaults)?;
-        for &(port, i) in &p.ide {
-            let d = &drives[i];
-            let blk: Option<Arc<dyn ruvm_hw_storage::BlockBackend>> = match &d.file {
-                Some(f) => {
-                    let b = FileBackend::open(f, d.read_only)
-                        .map_err(|e| one(Located::new(&d.loc, e)))?;
-                    if d.probed && !d.read_only {
-                        eprint!("{}", probe_warning(f));
-                    }
-                    Some(Arc::new(b))
-                }
-                None => None,
-            };
-            let config = if d.cdrom { DriveConfig::cdrom() } else { DriveConfig::hd() };
-            if !d.cdrom && blk.is_none() {
-                return Err(one(Located::new(&d.loc, "Device needs media, but drive is empty")));
-            }
-            attach_ide(&board, port, config, blk).map_err(|e| one(Located::new(&d.loc, e)))?;
-        }
-        if let Some(port) = p.default_cdrom {
-            attach_ide(&board, port, DriveConfig::cdrom(), None)
-                .map_err(|e| one(Located::bare(e)))?;
-        }
-        for plug in p.virtio {
-            let drive = plug.drive.map(|i| &drives[i]);
-            let class = virtio_class(plug.model, drive, plug.serial)
-                .map_err(|e| one(Located::new(drive.map_or(&plug.loc, |d| &d.loc), e)))?;
-            board.attach_virtio(class).map_err(|e| {
-                let msg = if e.starts_with("No 'virtio-bus' bus found for device") {
-                    format!("No 'virtio-bus' bus found for device '{}'", plug.typename)
-                } else {
-                    e
-                };
-                one(Located::new(&plug.loc, msg))
-            })?;
-        }
-
-        // The ports the board made take their chardevs; a microvm leaves the ones after the
-        // first unconnected, as QEMU does.
-        let mut attachments = Vec::new();
-        for (index, chr) in serial_hds.iter().enumerate() {
-            let (Some(chr), Some(port)) = (chr, board.serial(index)) else { continue };
-            let fe = Arc::new(ChardevSerial { serial: Arc::clone(port), chr: Arc::clone(chr) });
-            board.set_serial_backend(index, Some(fe.clone()));
-            attachments.push(chr.attach(fe).map_err(|e| vec![Located(None, e)])?);
-        }
-
-        let rs = Arc::clone(&vm.runstate);
-        let qmp = Arc::clone(&vm.qmp);
-        let handler = Arc::new(move |e: GuestEvent| match e {
-            GuestEvent::Shutdown(r) => rs.shutdown_request(match r {
-                ShutdownReason::GuestShutdown => ShutdownCause::GuestShutdown,
-                ShutdownReason::GuestReset => ShutdownCause::GuestReset,
-            }),
-            GuestEvent::Reset => {
-                let arg = ResetArg { guest: true, reason: ShutdownCause::GuestReset };
-                if let Some(ev) = event_reset(&qmp.policy(), arg) {
-                    qmp.emit_event(ev);
-                }
-            }
-            GuestEvent::Panicked => {
-                // The default panic action is shutdown: say so, stop and quit.
-                let arg = GuestPanickedArg { action: GuestPanicAction::Poweroff, info: None };
-                if let Some(ev) = event_guest_panicked(&qmp.policy(), arg) {
-                    qmp.emit_event(ev);
-                }
-                rs.vm_stop(RunState::GuestPanicked);
-                rs.shutdown_request(ShutdownCause::GuestPanic);
-            }
-            GuestEvent::InternalError(msg) => {
-                // kvm_cpu_exec() prints these with fprintf(), without the program name.
-                eprintln!("{msg}");
-                rs.vm_stop(RunState::InternalError);
-            }
-        });
+        let built = build(vm, board_accel, kind, opts, cmd, drives, serial_hds)?;
         let cfg = KvmRunConfig { no_reboot: cmd.no_reboot };
-        let machine = KvmMachine::new(accel, board, &cpu, vec![clock, rtc_clock], &cfg, handler)
-            .map_err(|e| one(Located::bare(e)))?;
+        let machine =
+            KvmMachine::new(accel, built.board, &cpu, built.clocks, &cfg, event_handler(vm))
+                .map_err(one)?;
         let machine = Arc::new(machine);
-        let weak = Arc::downgrade(&machine);
-        vm.runstate.set_cpu_hook(Some(Arc::new(move |run| {
-            if let Some(m) = weak.upgrade() {
-                if run {
-                    m.start();
-                } else {
-                    m.pause();
-                }
-            }
-        })));
-        Ok(Running { machine, _serials: attachments })
-    }
-
-    fn attach_ide(
-        board: &ruvm_machine_x86::X86Board,
-        port: u32,
-        config: DriveConfig,
-        blk: Option<Arc<dyn ruvm_hw_storage::BlockBackend>>,
-    ) -> Result<(), String> {
-        match board {
-            ruvm_machine_x86::X86Board::Q35(m, _) => m.attach_drive(port as usize, config, blk),
-            ruvm_machine_x86::X86Board::Microvm(_) => {
-                Err(format!("machine type does not support if=ide,bus={port},unit=0"))
-            }
-        }
+        set_cpu_hook(vm, &machine, KvmMachine::start, KvmMachine::pause);
+        Ok(Running { machine: RunningMachine::Kvm(machine), _attachments: built.attachments })
     }
 }
 
@@ -1431,6 +1728,55 @@ mod tests {
             ]
         );
         assert_eq!(p.virtio[0].serial.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn isa_debug_devices_are_planned_like_qdev() {
+        for k in [BoardKind::Microvm, BoardKind::Q35] {
+            let p = plan(
+                Some(k),
+                &[],
+                &devices(&[
+                    "isa-debugcon,chardev=c",
+                    "isa-debugcon,iobase=0x402,readback=0x1,chardev=d,bus=isa.0",
+                    "isa-debug-exit,iobase=0xf4,iosize=0x4",
+                    "isa-debug-exit",
+                ]),
+                true,
+            )
+            .unwrap();
+            let got: Vec<_> = p.isa.iter().map(|i| i.model.clone()).collect();
+            assert_eq!(
+                got,
+                vec![
+                    IsaModel::Debugcon { chardev: Some("c".into()), iobase: 0xe9, readback: 0xe9 },
+                    IsaModel::Debugcon { chardev: Some("d".into()), iobase: 0x402, readback: 1 },
+                    IsaModel::DebugExit { iobase: 0xf4, iosize: 4 },
+                    IsaModel::DebugExit { iobase: 0x501, iosize: 2 },
+                ]
+            );
+        }
+        let err = |k: Option<BoardKind>, arg: &str| {
+            plan(k, &[], &devices(&[arg]), true).unwrap_err()[0].1.message().to_string()
+        };
+        let q = Some(BoardKind::Q35);
+        assert_eq!(err(q, "isa-debugcon,iobase=foo"), "Parameter 'iobase' expects integer");
+        assert_eq!(
+            err(q, "isa-debugcon,iobase=0x1ffffffff"),
+            "Parameter 'iobase' expects uint32_t"
+        );
+        assert_eq!(err(q, "isa-debug-exit,iosize=x"), "Parameter 'iosize' expects integer");
+        assert_eq!(
+            err(q, "isa-debug-exit,chardev=c"),
+            "Property 'isa-debug-exit.chardev' not found"
+        );
+        assert_eq!(err(q, "isa-debugcon,bus=pcie.0"), "Device 'isa-debugcon' can't go on PCIE bus");
+        assert_eq!(err(q, "isa-debugcon,bus=nope"), "Bus 'nope' not found");
+        assert_eq!(
+            err(Some(BoardKind::Microvm), "isa-debugcon,bus=pcie.0"),
+            "Bus 'pcie.0' not found"
+        );
+        assert_eq!(err(None, "isa-debug-exit"), "No 'ISA' bus found for device 'isa-debug-exit'");
     }
 
     #[test]

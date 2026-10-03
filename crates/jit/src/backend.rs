@@ -73,6 +73,18 @@ pub trait Backend: Send + Sync + fmt::Debug {
         let _ = guest_mo;
         ruvm_jit_core::FenceMapping::Qemu
     }
+
+    /// The helpers of an interpreter backend, so that the runtime can make a native backend
+    /// with the same ones; `None` for other backends.
+    fn interp_helpers(&self) -> Option<&HelperRegistry> {
+        None
+    }
+
+    /// For a native backend, how many blocks were compiled to host code and how many fell
+    /// back to the interpreter; `None` for other backends.
+    fn native_stats(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// The code of a block for [`InterpBackend`].
@@ -99,7 +111,7 @@ impl Default for InterpBackend {
 }
 
 /// The runtime's `helper_lookup_tb_ptr()`.
-fn lookup_tb_ptr(h: &mut HelperEnv<'_>, _args: &[u64]) -> Result<u128, Unwind> {
+pub(crate) fn lookup_tb_ptr(h: &mut HelperEnv<'_>, _args: &[u64]) -> Result<u128, Unwind> {
     let Some(mut cpu) = Cpu::from_helper_env(h) else { return Ok(0) };
     match cpu_exec::helper_lookup_tb_ptr(&mut cpu) {
         Ok(Some(tb)) => {
@@ -127,22 +139,40 @@ impl InterpBackend {
     }
 
     fn unwind(&self, cpu: &mut Cpu<'_>, u: Unwind) -> CpuLoopExit {
-        if let Some(e) = cpu.core.unwinding.take() {
-            return e;
-        }
-        match u {
-            Unwind::Mem(f) if f.kind == FaultKind::Unaligned => {
-                let ops = cpu.ops();
-                let at = if f.write { MmuAccessType::DataStore } else { MmuAccessType::DataLoad };
-                ops.do_unaligned_access(cpu, f.addr, at, f.oi.mmu_idx() as usize, Ra::Tb)
-            }
-            Unwind::Mem(f) => {
-                panic!("guest memory fault at {:#x} did not leave through the softmmu", f.addr)
-            }
-            Unwind::Exception(code) => cpu.raise_exception(code as i32, Ra::Tb),
-            Unwind::ExitAtomic => cpu.cpu_loop_exit_atomic(Ra::Tb),
-        }
+        unwind(cpu, u)
     }
+}
+
+/// Turn the reason generated code left with into the `cpu_loop_exit()` it stands for.
+pub(crate) fn unwind(cpu: &mut Cpu<'_>, u: Unwind) -> CpuLoopExit {
+    if let Some(e) = cpu.core.unwinding.take() {
+        return e;
+    }
+    match u {
+        Unwind::Mem(f) if f.kind == FaultKind::Unaligned => {
+            let ops = cpu.ops();
+            let at = if f.write { MmuAccessType::DataStore } else { MmuAccessType::DataLoad };
+            ops.do_unaligned_access(cpu, f.addr, at, f.oi.mmu_idx() as usize, Ra::Tb)
+        }
+        Unwind::Mem(f) => {
+            panic!("guest memory fault at {:#x} did not leave through the softmmu", f.addr)
+        }
+        Unwind::Exception(code) => cpu.raise_exception(code as i32, Ra::Tb),
+        Unwind::ExitAtomic => cpu.cpu_loop_exit_atomic(Ra::Tb),
+    }
+}
+
+/// Copy the shared `icount_decr` into `env`, where generated code reads it.
+pub(crate) fn copy_icount_decr(cpu: &mut Cpu<'_>) {
+    let decr = cpu.core.shared.icount_decr.load(Ordering::Acquire);
+    let off = ENV_ICOUNT_DECR_OFFSET as usize;
+    cpu.env[off..off + 4].copy_from_slice(&decr.to_le_bytes());
+}
+
+/// The `goto_tb` targets of a block that are still alive.
+pub(crate) fn live_targets(targets: &Mutex<[Option<Weak<Tb>>; 2]>) -> [Option<Arc<Tb>>; 2] {
+    let t = lock(targets);
+    [t[0].as_ref().and_then(Weak::upgrade), t[1].as_ref().and_then(Weak::upgrade)]
 }
 
 fn interp_code(tb: &Tb) -> &InterpCode {
@@ -165,6 +195,10 @@ impl Backend for InterpBackend {
 
     fn set_jmp_target(&self, tb: &Arc<Tb>, n: usize, dest: Option<&Arc<Tb>>) {
         lock(&interp_code(tb).targets)[n] = dest.map(Arc::downgrade);
+    }
+
+    fn interp_helpers(&self) -> Option<&HelperRegistry> {
+        Some(&self.helpers)
     }
 
     fn exec(&self, cpu: &mut Cpu<'_>, tb: &Arc<Tb>) -> Result<TbRet, CpuLoopExit> {

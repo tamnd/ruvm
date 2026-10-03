@@ -77,6 +77,7 @@ pub mod cpu;
 pub mod cpu_exec;
 pub mod cputlb;
 pub mod jit;
+pub mod native;
 pub mod plugin;
 pub mod tb;
 pub mod tb_maint;
@@ -89,6 +90,7 @@ pub use cpu::{
 };
 pub use cputlb::{TlbEntryFull, TlbSection};
 pub use jit::{Jit, JitConfig};
+pub use native::{BackendKind, NativeBackend, host_backend};
 pub use tb::{Tb, TbCpuState};
 pub use translator::{DisasContextBase, DisasJumpType, TranslatorOps, translator_loop};
 

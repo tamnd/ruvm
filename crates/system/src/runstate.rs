@@ -129,6 +129,8 @@ struct Inner {
     state: RunState,
     vm_was_suspended: bool,
     shutdown_requested: ShutdownCause,
+    /// `shutdown_exit_code`.
+    shutdown_exit_code: i32,
     killed: Option<Killed>,
 }
 
@@ -157,6 +159,7 @@ impl Runstate {
                 state: RunState::Prelaunch,
                 vm_was_suspended: false,
                 shutdown_requested: ShutdownCause::None,
+                shutdown_exit_code: 0,
                 killed: None,
             }),
             qmp,
@@ -299,6 +302,19 @@ impl Runstate {
         self.qmp.shutdown();
     }
 
+    /// `qemu_system_shutdown_request_with_code()`: a shutdown request that also sets the
+    /// exit status of the process, as `isa-debug-exit` makes.
+    pub fn shutdown_request_with_code(&self, cause: ShutdownCause, code: i32) {
+        lock(&self.inner).shutdown_exit_code = code;
+        self.shutdown_request(cause);
+    }
+
+    /// The exit status `qemu_main_loop()` returns: the code of the last
+    /// [`Runstate::shutdown_request_with_code`], 0 without one.
+    pub fn exit_code(&self) -> i32 {
+        lock(&self.inner).shutdown_exit_code
+    }
+
     /// `qemu_system_killed()`, called from the thread that watches for signals.
     pub fn killed(&self, killed: Killed) {
         let mut inner = lock(&self.inner);
@@ -356,6 +372,10 @@ mod tests {
         assert_eq!(rs.take_killed(), Some(Killed { signo: 15, pid: 42 }));
         assert!(!caused_by_guest(ShutdownCause::HostQmpQuit));
         assert!(caused_by_guest(ShutdownCause::GuestShutdown));
+        assert_eq!(rs.exit_code(), 0);
+        rs.shutdown_request_with_code(ShutdownCause::GuestShutdown, 3);
+        assert_eq!(rs.take_shutdown_request(), ShutdownCause::GuestShutdown);
+        assert_eq!(rs.exit_code(), 3);
     }
 
     #[test]

@@ -409,6 +409,13 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "ruvm-accel"
 version = "0.3.2"
+dependencies = [
+ "ruvm-jit",
+ "ruvm-jit-core",
+ "ruvm-jit-interp",
+ "ruvm-mem",
+ "ruvm-qapi",
+]
 
 [[package]]
 name = "ruvm-accel-hvf"
@@ -736,8 +743,10 @@ dependencies = [
 name = "ruvm-jit"
 version = "0.3.2"
 dependencies = [
+ "ruvm-jit-aarch64",
  "ruvm-jit-core",
  "ruvm-jit-interp",
+ "ruvm-jit-x86_64",
  "ruvm-mem",
 ]
 
@@ -822,8 +831,10 @@ version = "0.3.2"
 name = "ruvm-machine-x86"
 version = "0.3.2"
 dependencies = [
+ "flate2",
  "kvm-bindings",
  "kvm-ioctls",
+ "ruvm-accel",
  "ruvm-accel-kvm",
  "ruvm-base",
  "ruvm-firmware",
@@ -833,10 +844,13 @@ dependencies = [
  "ruvm-hw-i2c",
  "ruvm-hw-input",
  "ruvm-hw-intc",
+ "ruvm-hw-misc",
  "ruvm-hw-pci",
  "ruvm-hw-storage",
  "ruvm-hw-timer",
  "ruvm-hw-virtio",
+ "ruvm-jit",
+ "ruvm-jit-core",
  "ruvm-mem",
  "ruvm-target-x86",
  "ruvm-virtio-queue",
@@ -972,6 +986,7 @@ dependencies = [
 name = "ruvm-system"
 version = "0.3.2"
 dependencies = [
+ "ruvm-accel",
  "ruvm-accel-kvm",
  "ruvm-accel-qtest",
  "ruvm-base",
@@ -981,6 +996,7 @@ dependencies = [
  "ruvm-hostmem",
  "ruvm-hw-char",
  "ruvm-hw-core",
+ "ruvm-hw-misc",
  "ruvm-hw-storage",
  "ruvm-hw-virtio",
  "ruvm-machine-x86",

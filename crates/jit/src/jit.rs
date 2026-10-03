@@ -133,6 +133,7 @@ impl Jit {
         assert!(config.page_bits < 32);
         assert!((1..=16).contains(&config.nb_mmu_modes), "NB_MMU_MODES must be 1 to 16");
         assert!(matches!(config.target_long_bits, 32 | 64));
+        let backend = crate::native::env_override(backend, config.code_gen_buffer_size);
         Arc::new_cyclic(|w| Jit {
             config,
             backend,

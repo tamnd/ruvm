@@ -5,8 +5,16 @@
 //! shutdown request.
 //!
 //! ruvm behaves like a QEMU build with the `qtest` accelerator, the `none` machine and no
-//! displays, plus, for the x86 targets, the `microvm` and `q35` boards on `kvm` (Linux x86_64
-//! hosts only). Options for things that build would leave out fail with QEMU's own messages.
+//! displays, plus, for the x86 targets, the `microvm` and `q35` boards on `tcg` and, on Linux
+//! x86_64 hosts, `kvm`. Options for things that build would leave out fail with QEMU's own
+//! messages.
+//!
+//! Deliberate differences from QEMU:
+//!
+//! - Without `-accel` or `-machine accel=`, a build with both KVM and TCG tries `kvm:tcg`, so
+//!   KVM is used where it works and TCG otherwise (after QEMU's "falling back to tcg"). QEMU
+//!   picks `tcg:kvm` unless its program name ends in `kvm`.
+//! - The x86 boards do not run under qtest yet.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,10 +54,19 @@ fn have_kvm(target: &str) -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64")) && x86::is_x86(target)
 }
 
+/// Whether TCG is built in for `target`: the x86 targets, whose front end exists.
+fn have_tcg(target: &str) -> bool {
+    x86::is_x86(target)
+}
+
 /// The accelerators this build has for `target`. qtest is left out of `-accel help`, as in
 /// QEMU.
 fn accels(target: &str) -> &'static [&'static str] {
-    if have_kvm(target) { &["kvm", "qtest"] } else { &["qtest"] }
+    match (have_kvm(target), have_tcg(target)) {
+        (true, _) => &["kvm", "tcg", "qtest"],
+        (false, true) => &["tcg", "qtest"],
+        (false, false) => &["qtest"],
+    }
 }
 
 /// The running machine and everything QMP commands reach.
@@ -264,12 +281,12 @@ impl Drop for TermGuard {
 pub fn qemu_main(p: &Personality<'_>, args: &[String]) -> u8 {
     let _term = TermGuard;
     match run(p, args) {
-        Ok(()) => 0,
+        Ok(code) => code,
         Err(Exit(code)) => code,
     }
 }
 
-fn run(p: &Personality<'_>, args: &[String]) -> Flow<()> {
+fn run(p: &Personality<'_>, args: &[String]) -> Flow<u8> {
     // qemu_init_subsystems() registers every type before the option loop, so -object help
     // sees them.
     let registry = Registry::new();
@@ -287,9 +304,9 @@ fn run(p: &Personality<'_>, args: &[String]) -> Flow<()> {
     let mut cfg = Config::new();
     parse_options(p, &registry, args, &mut cfg)?;
     let vm = start(p, Backends { registry, qmp, chardevs, regions }, cfg)?;
-    main_loop(&vm.0, &vm.1);
+    let status = main_loop(&vm.0, &vm.1);
     drop(vm.1);
-    Ok(())
+    Ok(status)
 }
 
 /// What exists before the option loop runs.
@@ -305,8 +322,7 @@ struct Keep {
     _qtest: Option<ruvm_chardev::Attachment>,
     /// The accelerator, when no board took it over.
     _accel: Option<Accel>,
-    /// The x86 board on KVM.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    /// The x86 board on its accelerator.
     board: Option<x86::Running>,
 }
 
@@ -748,7 +764,9 @@ fn configure_accelerators(target: &str, kind: Option<BoardKind>, cfg: &mut Confi
     if cfg.accel.is_empty() {
         let accelerators = match cfg.accelerators.clone() {
             Some(a) => a,
+            None if have_kvm(target) && have_tcg(target) => "kvm:tcg".to_string(),
             None if have_kvm(target) => "kvm".to_string(),
+            None if have_tcg(target) => "tcg".to_string(),
             None => {
                 return Err(fail_msg(
                     "No accelerator selected and no default accelerator available",
@@ -828,6 +846,9 @@ fn init_accel(
             .map(|a| Accel::Kvm(Box::new(a)));
     }
     let _ = (kernel_irqchip, default_split);
+    if acc == "tcg" {
+        return x86::tcg_init(props).map(Accel::Tcg);
+    }
     match props.first() {
         Some((name, _)) => Err(AccelInitError::Fatal(Error::generic(format!(
             "Property '{acc}-accel.{name}' not found"
@@ -934,7 +955,9 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     };
     let accel = configure_accelerators(p.target, kind, &mut cfg)?;
     if kind.is_some() && (matches!(accel, Accel::Qtest) || cfg.qtest.is_some()) {
-        return Err(fail_msg("this machine type is only supported with -accel kvm by ruvm yet"));
+        return Err(fail_msg(
+            "this machine type is only supported with -accel kvm or tcg by ruvm yet",
+        ));
     }
     let clock = VirtualClock::manual(ruvm_base::ClockType::Virtual);
     if cfg.qtest.is_some() {
@@ -972,12 +995,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         resolve_machine_memdev(&vm, machine, &cfg, id)?;
     }
 
-    let mut keep = Keep {
-        _qtest: qtest,
-        _accel: None,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        board: None,
-    };
+    let mut keep = Keep { _qtest: qtest, _accel: None, board: None };
     match (kind, board_opts) {
         (Some(kind), Some(opts)) => {
             if cfg.preconfig {
@@ -1016,7 +1034,6 @@ fn parse_drives(
 
 /// Builds the x86 board and puts it on its vCPUs: `qemu_init_board()` and
 /// `qemu_create_cli_devices()`. `serial_hds` are the chardevs of the `-serial` options.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 fn start_x86(
     vm: &Arc<Vm>,
@@ -1028,32 +1045,20 @@ fn start_x86(
     serial_hds: &[Option<Arc<Chardev>>],
     mut keep: Keep,
 ) -> Flow<Keep> {
-    let Accel::Kvm(accel) = accel else { unreachable!("checked by the caller") };
-    let running = x86::start_board(vm, *accel, kind, opts, &cfg.x86, drives, serial_hds).map_err(
-        |errors| {
-            for e in &errors {
-                e.report();
-            }
-            Exit(1)
-        },
-    )?;
+    let running = match accel {
+        Accel::Tcg(tcg) => x86::start_board_tcg(vm, tcg, kind, opts, &cfg.x86, drives, serial_hds),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        Accel::Kvm(accel) => x86::start_board(vm, *accel, kind, opts, &cfg.x86, drives, serial_hds),
+        Accel::Qtest => unreachable!("checked by the caller"),
+    };
+    let running = running.map_err(|errors| {
+        for e in &errors {
+            e.report();
+        }
+        Exit(1)
+    })?;
     keep.board = Some(running);
     Ok(keep)
-}
-
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-#[allow(clippy::too_many_arguments)]
-fn start_x86(
-    _vm: &Arc<Vm>,
-    _cfg: &Config,
-    _accel: Accel,
-    _kind: BoardKind,
-    _opts: x86::BoardOptions,
-    _drives: &[x86::Drive],
-    _serial_hds: &[Option<Arc<Chardev>>],
-    _keep: Keep,
-) -> Flow<Keep> {
-    unreachable!("only kvm runs the x86 boards, and this host has no kvm")
 }
 
 /// `qemu_create_default_devices()` for the serial port and the monitor. `no_serial` is set
@@ -1137,7 +1142,8 @@ fn mux_quit_hook(runstate: &Arc<Runstate>) -> ruvm_chardev::Hook {
 }
 
 /// `qemu_main_loop()` and `qemu_cleanup()`: serve QMP until something asks for a shutdown.
-fn main_loop(vm: &Arc<Vm>, keep: &Keep) {
+/// Gives the exit status.
+fn main_loop(vm: &Arc<Vm>, keep: &Keep) -> u8 {
     vm.qmp.run_dispatcher();
     let cause = vm.runstate.take_shutdown_request();
     // qemu_kill_report()
@@ -1148,13 +1154,13 @@ fn main_loop(vm: &Arc<Vm>, keep: &Keep) {
     }
     vm.runstate.send_shutdown_event(cause);
     vm.runstate.vm_shutdown();
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if let Some(board) = &keep.board {
         vm.runstate.set_cpu_hook(None);
         board.quit();
     }
-    let _ = keep;
     vm.registry.user_creatable_cleanup();
+    // exit() keeps the low eight bits of the status.
+    vm.runstate.exit_code() as u8
 }
 
 fn kill_report(k: Killed) {

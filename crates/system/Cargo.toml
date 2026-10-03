@@ -14,6 +14,7 @@ publish = false
 unsafe-budget = 0
 
 [dependencies]
+ruvm-accel.workspace = true
 ruvm-accel-qtest.workspace = true
 ruvm-base.workspace = true
 ruvm-block.workspace = true
@@ -22,6 +23,7 @@ ruvm-firmware.workspace = true
 ruvm-hostmem.workspace = true
 ruvm-hw-char.workspace = true
 ruvm-hw-core.workspace = true
+ruvm-hw-misc.workspace = true
 ruvm-hw-storage.workspace = true
 ruvm-hw-virtio.workspace = true
 ruvm-machine-x86.workspace = true
