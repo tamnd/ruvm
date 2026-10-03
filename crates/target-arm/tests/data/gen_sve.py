@@ -24,13 +24,35 @@ from concurrent.futures import ThreadPoolExecutor
 
 LLVM = "/opt/homebrew/opt/llvm/bin"
 QEMU = "/opt/homebrew/bin/qemu-system-aarch64"
-MARCH = "+sve2,+sve2-aes,+sve2-sha3,+sve2-sm4,+sve2-bitperm"
+MARCH = "+sve2,+sve2-aes,+sve2-sha3,+sve2-sm4,+sve2-bitperm,+f32mm,+f64mm"
 LOAD = 0x4020_0000
 MID = 0x4030_0000
 RAM_END = 0x4100_0000
 BUF = 1024
 M64 = (1 << 64) - 1
 VQS = [1, 2, 3]
+# The number of Z registers in the state: Z8 to Z13 hold floating point values.
+NZ = 14
+
+# Floating point values for Z8 to Z13: ones, twos, halves, pi, zeros of both signs,
+# infinities, quiet and signaling NaNs, denormals, the largest finite values, a third and
+# values out of the integer ranges.
+FP_H = [0x3C00, 0xC000, 0x3800, 0x4248, 0x0000, 0x8000, 0x7C00, 0x7E00, 0x0001, 0x7BFF,
+        0xBE00, 0x5640, 0x7D00, 0xFC00, 0x3555, 0xD140]
+FP_S = [0x3F80_0000, 0xC000_0000, 0x3F00_0000, 0x4049_0FDB, 0x0000_0000, 0x8000_0000,
+        0x7F80_0000, 0x7FC0_0000, 0x0000_0001, 0x7F7F_FFFF, 0xBFC0_0000, 0x42C8_0000,
+        0x7FA0_0000, 0xCF00_0001, 0x3EAA_AAAB, 0x4F80_0000]
+FP_D = [0x3FF0_0000_0000_0000, 0xC000_0000_0000_0000, 0x3FE0_0000_0000_0000,
+        0x4009_21FB_5444_2D18, 0, 0x8000_0000_0000_0000, 0x7FF0_0000_0000_0000,
+        0x7FF8_0000_0000_0000, 1, 0x7FEF_FFFF_FFFF_FFFF, 0xBFF8_0000_0000_0000,
+        0x4059_0000_0000_0000, 0x7FF4_0000_0000_0000, 0xC3E0_0000_0000_0001,
+        0x3FD5_5555_5555_5555, 0x43F0_0000_0000_0000]
+
+
+def fp_reg(vl, table, size, mul, add):
+    """Lane i of the register is table[(i * mul + add) % 16]."""
+    n = vl // size
+    return b"".join(table[(i * mul + add) % 16].to_bytes(size, "little") for i in range(n))
 
 
 class Rng:
@@ -67,6 +89,9 @@ def init_state(vq):
             if n == 0:
                 w[0] = 8
         z.append(b"".join(v.to_bytes(8, "little") for v in w))
+    for mul, add in [(3, 0), (5, 1)]:
+        z += [fp_reg(vl, FP_H, 2, mul, add), fp_reg(vl, FP_S, 4, mul, add),
+              fp_reg(vl, FP_D, 8, mul, add)]
     pmask = (1 << (vl // 8 * 8)) - 1
     p = []
     for n in range(8):
@@ -336,6 +361,95 @@ def cases():
         "prfb pldl1keep, p2, [x8, x9]", "prfw pldl2strm, p2, [x8, #1, mul vl]",
         "prfd pldl1keep, p2, [z6.d, #8]", "prfh pstl1keep, p2, [x8, z5.s, sxtw #1]",
     ]
+    out += fp_cases()
+    return out
+
+
+def fp_cases():
+    """The floating point and crypto cases. Z8 to Z10 (A) and Z11 to Z13 (B) hold half,
+    single and double values from the FP_ tables."""
+    out = []
+    A = {"h": 8, "s": 9, "d": 10}
+    B = {"h": 11, "s": 12, "d": 13}
+    F = ["h", "s", "d"]
+
+    def each(tmpl, sizes=F):
+        for t in sizes:
+            out.append(tmpl.format(t=t, a=A[t], b=B[t]))
+
+    for op in ["fadd", "fsub", "fmul", "fmaxnm", "fminnm", "fmax", "fmin", "fabd", "fscale",
+               "fmulx", "fdiv", "fdivr", "fsubr", "faddp", "fmaxnmp", "fminnmp", "fmaxp",
+               "fminp"]:
+        each(op + " z{a}.{t}, p2/m, z{a}.{t}, z{b}.{t}")
+    for op in ["fadd", "fmul", "fdiv", "fmaxp"]:
+        each(op + " z2.{t}, p2/m, z2.{t}, z3.{t}")
+    for op in ["fadd", "fsub", "fmul", "ftsmul", "frecps", "frsqrts", "ftssel"]:
+        each(op + " z2.{t}, z{a}.{t}, z{b}.{t}")
+    each("ftssel z2.{t}, z{a}.{t}, z3.{t}")
+    for op in ["fcmge", "fcmgt", "fcmeq", "fcmne", "fcmuo", "facge", "facgt", "fcmle"]:
+        each(op + " p3.{t}, p2/z, z{a}.{t}, z{b}.{t}")
+    for op in ["fcmge", "fcmgt", "fcmle", "fcmlt", "fcmeq", "fcmne"]:
+        each(op + " p3.{t}, p2/z, z{a}.{t}, #0.0")
+    for op in ["faddv", "fmaxnmv", "fminnmv", "fmaxv", "fminv"]:
+        each(op + " {t}2, p2, z{a}.{t}")
+        each(op + " {t}2, p1, z{b}.{t}")
+    each("fadda {t}{a}, p2, {t}{a}, z{b}.{t}")
+    each("fadda {t}2, p1, {t}2, z3.{t}")
+    for op in ["frintn", "frintp", "frintm", "frintz", "frinta", "frintx", "frinti", "frecpx",
+               "fsqrt", "flogb"]:
+        each(op + " z2.{t}, p2/m, z{a}.{t}")
+        each(op + " z2.{t}, p2/m, z{b}.{t}")
+    each("frintx z2.{t}, p2/m, z3.{t}")
+    for op in ["frecpe", "frsqrte"]:
+        each(op + " z2.{t}, z{a}.{t}")
+        each(op + " z2.{t}, z3.{t}")
+    each("fexpa z2.{t}, z3.{t}")
+    for op, imms in [("fadd", ["0.5", "1.0"]), ("fsub", ["0.5", "1.0"]),
+                     ("fsubr", ["0.5", "1.0"]), ("fmul", ["0.5", "2.0"]),
+                     ("fmaxnm", ["0.0", "1.0"]), ("fminnm", ["0.0", "1.0"]),
+                     ("fmax", ["0.0", "1.0"]), ("fmin", ["0.0", "1.0"])]:
+        for imm in imms:
+            each(op + " z{a}.{t}, p2/m, z{a}.{t}, #" + imm)
+    for op in ["fmla", "fmls", "fnmla", "fnmls", "fmad", "fmsb", "fnmad", "fnmsb"]:
+        each(op + " z{a}.{t}, p2/m, z{b}.{t}, z{a}.{t}")
+        each(op + " z2.{t}, p2/m, z3.{t}, z4.{t}")
+    for rot in [90, 270]:
+        each("fcadd z{a}.{t}, p2/m, z{a}.{t}, z{b}.{t}, #" + str(rot))
+    for rot in [0, 90, 180, 270]:
+        each("fcmla z{a}.{t}, p2/m, z{b}.{t}, z{a}.{t}, #" + str(rot))
+    for rot, i in [(0, 0), (90, 3), (180, 1), (270, 2)]:
+        out.append(f"fcmla z8.h, z11.h, z3.h[{i}], #{rot}")
+        out.append(f"fcmla z9.s, z12.s, z9.s[{i % 2}], #{rot}")
+    for op in ["fmla", "fmls"]:
+        out += [f"{op} z8.h, z11.h, z3.h[5]", f"{op} z9.s, z12.s, z4.s[2]",
+                f"{op} z10.d, z13.d, z13.d[1]", f"{op} z2.s, z3.s, z4.s[0]"]
+    out += ["fmul z2.h, z8.h, z3.h[7]", "fmul z2.s, z9.s, z4.s[3]",
+            "fmul z2.d, z10.d, z13.d[0]", "fmul z2.d, z3.d, z4.d[1]"]
+    for imm in [0, 3, 5, 7]:
+        each("ftmad z{a}.{t}, z{a}.{t}, z{b}.{t}, #" + str(imm))
+    for d, n in [("h", "s"), ("s", "h"), ("h", "d"), ("d", "h"), ("s", "d"), ("d", "s")]:
+        for src in [A[n], 3]:
+            out.append(f"fcvt z2.{d}, p2/m, z{src}.{n}")
+    for op in ["fcvtzs", "fcvtzu"]:
+        for d, n in [("h", "h"), ("s", "h"), ("d", "h"), ("s", "s"), ("s", "d"), ("d", "s"),
+                     ("d", "d")]:
+            out.append(f"{op} z2.{d}, p2/m, z{A[n]}.{n}")
+            out.append(f"{op} z2.{d}, p2/m, z{B[n]}.{n}")
+    for op in ["scvtf", "ucvtf"]:
+        for d, n in [("h", "h"), ("h", "s"), ("h", "d"), ("s", "s"), ("d", "s"), ("s", "d"),
+                     ("d", "d")]:
+            out.append(f"{op} z2.{d}, p2/m, z5.{n}")
+            out.append(f"{op} z2.{d}, p2/m, z3.{n}")
+    out += ["fcvtnt z2.h, p2/m, z9.s", "fcvtnt z2.s, p2/m, z10.d", "fcvtlt z2.s, p2/m, z8.h",
+            "fcvtlt z2.d, p2/m, z9.s", "fcvtx z2.s, p2/m, z10.d", "fcvtxnt z2.s, p2/m, z10.d",
+            "fcvtnt z2.h, p2/m, z3.s", "fcvtx z2.s, p2/m, z3.d", "fcvtlt z2.s, p2/m, z3.h"]
+    out += ["fmmla z9.s, z12.s, z9.s", "fmmla z2.s, z3.s, z4.s", "fmmla z10.d, z13.d, z10.d",
+            "fmmla z2.d, z3.d, z4.d"]
+    out += ["aese z2.b, z2.b, z3.b", "aesd z2.b, z2.b, z3.b", "aesmc z2.b, z2.b",
+            "aesimc z2.b, z2.b", "sm4e z2.s, z2.s, z3.s", "sm4ekey z2.s, z3.s, z4.s",
+            "rax1 z2.d, z3.d, z4.d"]
+    for d, n in [("q", "d"), ("h", "b"), ("d", "s")]:
+        out += [f"pmullb z2.{d}, z3.{n}, z4.{n}", f"pmullt z2.{d}, z3.{n}, z4.{n}"]
     return out
 
 
@@ -389,22 +503,22 @@ def program(vq, words):
           "adr x29, pristine", "adr x28, buf", f"mov x25, #{BUF // 16}",
           "1: ldp x0, x1, [x29], #16", "stp x0, x1, [x28], #16", "subs x25, x25, #1",
           "b.ne 1b", "adr x29, zinit"]
-    a += [f"ldr z{n}, [x29, #{n}, mul vl]" for n in range(8)]
+    a += [f"ldr z{n}, [x29, #{n}, mul vl]" for n in range(NZ)]
     a += ["adr x29, pinit"] + [f"ldr p{n}, [x29, #{n}, mul vl]" for n in range(8)]
-    a += ["setffr", "adr x29, esr_slot", "str xzr, [x29]", "adr x29, xinit",
+    a += ["setffr", "msr fpsr, xzr", "adr x29, esr_slot", "str xzr, [x29]", "adr x29, xinit",
           "ldr x28, [x29, #128]", "msr nzcv, x28"]
     a += [f"ldp x{2 * k}, x{2 * k + 1}, [x29, #{16 * k}]" for k in range(8)]
     a += ["ret"]
     a += ["dump:", "mov x26, x30", "adr x29, out"]
-    a += [f"str z{n}, [x29, #{n}, mul vl]" for n in range(8)]
-    a += [f"add x29, x29, #{8 * vl}"]
+    a += [f"str z{n}, [x29, #{n}, mul vl]" for n in range(NZ)]
+    a += [f"add x29, x29, #{NZ * vl}"]
     a += [f"str p{n}, [x29, #{n}, mul vl]" for n in range(8)]
     a += ["rdffr p0.b", "str p0, [x29, #8, mul vl]", f"add x29, x29, #{ppad(pl)}"]
     a += [f"stp x{2 * k}, x{2 * k + 1}, [x29], #16" for k in range(8)]
     a += ["mrs x28, nzcv", "str x28, [x29], #8", "adr x28, esr_slot", "ldr x28, [x28]",
-          "str x28, [x29], #8",
+          "str x28, [x29], #8", "mrs x28, fpsr", "str x28, [x29], #8",
           "mov w2, #82", "strb w2, [x27]", "mov w2, #32", "strb w2, [x27]",
-          "adr x0, out", f"mov x1, #{8 * vl + ppad(pl) + 128 + 16}", "bl hexdump",
+          "adr x0, out", f"mov x1, #{NZ * vl + ppad(pl) + 128 + 24}", "bl hexdump",
           "adr x0, buf", f"mov x1, #{BUF}", "bl hexdump",
           "mov w2, #10", "strb w2, [x27]", "ret x26"]
     a += ["hexdump:",
@@ -429,7 +543,7 @@ def program(vq, words):
     xb = b"".join(v.to_bytes(8, "little") for v in x) + (nzcv << 28).to_bytes(8, "little")
     a += data("xinit", xb)
     a += data("pristine", mem)
-    a += [".balign 16", "out:", f".skip {8 * vl + ppad(pl) + 160}", ".balign 16",
+    a += [".balign 16", "out:", f".skip {NZ * vl + ppad(pl) + 160}", ".balign 16",
           "stack:", ".skip 4096", "stack_top:"]
     # The buffer sits at a fixed address, MID - 512, well past the end of the program.
     text = "\n".join(a) + "\n"
@@ -474,7 +588,8 @@ def main():
     print("# the instruction word, then what it changed from the initial state of a64_sve.rs:")
     print("# zN, pN and ffr as one hex number (element 0 lowest), xN, nzcv (the four flag")
     print("# bits), esr (ESR_EL1 if the instruction raised an exception) and mOFF, the 64-bit")
-    print("# little endian word at byte offset OFF from X8. Then the assembly.")
+    print("# little endian word at byte offset OFF from X8, fpsr (FPSR if not zero). Then the")
+    print("# assembly.")
     for vq in VQS:
         vl = 16 * vq
         pl = vl // 8
@@ -483,7 +598,7 @@ def main():
         for (w, asm), row in zip(cs, build_and_run(vq, words)):
             ch = []
             o = 0
-            for n in range(8):
+            for n in range(NZ):
                 if row[o:o + vl] != z[n]:
                     ch.append(f"z{n}={le_hex(row[o:o + vl])}")
                 o += vl
@@ -506,6 +621,10 @@ def main():
             esr = int.from_bytes(row[o:o + 8], "little")
             if esr:
                 ch.append(f"esr={esr:x}")
+            o += 8
+            fpsr = int.from_bytes(row[o:o + 8], "little")
+            if fpsr:
+                ch.append(f"fpsr={fpsr:x}")
             o += 8
             m = row[o:o + BUF]
             for j in range(0, BUF, 8):

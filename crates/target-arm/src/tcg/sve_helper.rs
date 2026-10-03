@@ -11,7 +11,10 @@
 //! read the registers out of `env`, compute the whole result and write it back, so a source
 //! that is also the destination is read before it is written, as QEMU's helpers arrange. The
 //! instructions that set NZCV write the flags into `env` themselves. The value returned is
-//! the scalar result of the instructions that write a general register.
+//! the scalar result of the instructions that write a general register. The floating point
+//! family is in [`super::sve_fp`]; the SVE2 crypto family (AESE, AESD, AESMC, AESIMC, SM4E,
+//! SM4EKEY, RAX1 and PMULLB/PMULLT) uses the AdvSIMD ones of [`super::crypto`] per 128-bit
+//! segment.
 //!
 //! The results are those of the QEMU helpers bit for bit. Saturating SVE operations do not
 //! set FPSR.QC, as in QEMU (the architecture has no QC for SVE).
@@ -127,6 +130,25 @@ pub(crate) mod fam {
     pub(crate) const PERM: u32 = 8;
     /// Predicate operations ([`super::pr`]).
     pub(crate) const PRED: u32 = 9;
+    /// Floating point ([`super::super::sve_fp`]).
+    pub(crate) const FP: u32 = 10;
+    /// The SVE2 crypto instructions and PMULLB and PMULLT ([`super::cr`]).
+    pub(crate) const CRYPTO: u32 = 11;
+}
+
+/// The operations of the CRYPTO family. They work on each 128-bit segment (AES and SM4), on
+/// 64-bit elements (RAX1) or on the element size (PMULL, with data bit 0 selecting the odd
+/// source elements).
+#[allow(missing_docs)]
+pub(crate) mod cr {
+    pub(crate) const AESE: u32 = 1;
+    pub(crate) const AESD: u32 = 2;
+    pub(crate) const AESMC: u32 = 3;
+    pub(crate) const AESIMC: u32 = 4;
+    pub(crate) const SM4E: u32 = 5;
+    pub(crate) const SM4EKEY: u32 = 6;
+    pub(crate) const RAX1: u32 = 7;
+    pub(crate) const PMULL: u32 = 8;
 }
 
 /// The element-wise binary operations of the ZZZ, ZPZZ, ZPZI and ZZI families. The
@@ -856,9 +878,73 @@ fn h_sve(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
         }
         fam::PERM => perm(env, &d, a[2], a[3]),
         fam::PRED => pred(env, &d, a[2], a[3]),
+        fam::FP => {
+            super::sve_fp::fp(env, &d, a[2]);
+            0
+        }
+        fam::CRYPTO => {
+            crypto(env, &d);
+            0
+        }
         _ => unreachable!("bad sve family {}", d.fam),
     };
     Ok(u128::from(r))
+}
+
+/// The CRYPTO family.
+fn crypto(env: &mut [u8], d: &Dsc) {
+    let n = zload(env, d.n);
+    let m = zload(env, d.m);
+    let mut out = zload(env, d.d);
+    let seg = |z: &Z, s: usize| -> [u8; 16] { z[16 * s..16 * s + 16].try_into().unwrap() };
+    let zero = [0u8; 16];
+    match d.op {
+        cr::PMULL => {
+            let sel = (d.data & 1) as usize;
+            match d.esz {
+                0 => {
+                    for s in 0..d.vl / 16 {
+                        let r = clmul(get(&n, 3, 2 * s + sel), get(&m, 3, 2 * s + sel), 64);
+                        set(&mut out, 3, 2 * s, r as u64);
+                        set(&mut out, 3, 2 * s + 1, (r >> 64) as u64);
+                    }
+                }
+                1 => {
+                    for i in 0..d.vl / 2 {
+                        let r = clmul(get(&n, 0, 2 * i + sel), get(&m, 0, 2 * i + sel), 8);
+                        set(&mut out, 1, i, r as u64);
+                    }
+                }
+                _ => {
+                    for i in 0..d.vl / 8 {
+                        let r = clmul(get(&n, 2, 2 * i + sel), get(&m, 2, 2 * i + sel), 32);
+                        set(&mut out, 3, i, r as u64);
+                    }
+                }
+            }
+        }
+        cr::RAX1 => {
+            for i in 0..d.vl / 8 {
+                set(&mut out, 3, i, get(&n, 3, i) ^ get(&m, 3, i).rotate_left(1));
+            }
+        }
+        op => {
+            for s in 0..d.vl / 16 {
+                let (sn, sm) = (seg(&n, s), seg(&m, s));
+                let r = match op {
+                    cr::AESE => super::crypto::crypto(super::crypto::op::AESE, &sn, &sm, &zero),
+                    cr::AESD => super::crypto::crypto(super::crypto::op::AESD, &sn, &sm, &zero),
+                    cr::AESMC => super::crypto::crypto(super::crypto::op::AESMC, &zero, &sn, &zero),
+                    cr::AESIMC => {
+                        super::crypto::crypto(super::crypto::op::AESIMC, &zero, &sn, &zero)
+                    }
+                    _ => super::crypto::sm4(op == cr::SM4EKEY, &sn, &sm),
+                };
+                out[16 * s..16 * s + 16].copy_from_slice(&r);
+            }
+        }
+    }
+    zstore(env, d.d, &out, d.vl);
 }
 
 /// The ZZZ, ZPZZ, ZPZI and ZZI families.

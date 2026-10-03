@@ -78,12 +78,12 @@ pub(crate) fn pack_status(s: &FloatStatus) -> u64 {
         | u64::from(s.exception_flags) << 16
 }
 
-fn load_status(env: &[u8], idx: usize) -> FloatStatus {
+pub(crate) fn load_status(env: &[u8], idx: usize) -> FloatStatus {
     let o = FPST_A64 + 8 * idx;
     unpack_status(u64::from_le_bytes(env[o..o + 8].try_into().unwrap()))
 }
 
-fn store_status(env: &mut [u8], idx: usize, s: &FloatStatus) {
+pub(crate) fn store_status(env: &mut [u8], idx: usize, s: &FloatStatus) {
     let o = FPST_A64 + 8 * idx;
     env[o..o + 8].copy_from_slice(&pack_status(s).to_le_bytes());
 }
@@ -217,6 +217,7 @@ pub(crate) trait Fp: Copy {
     fn muladd(self, b: Self, c: Self, fl: u32, s: &mut FloatStatus) -> Self;
     fn muladd_scalbn(self, b: Self, c: Self, sc: i32, fl: u32, s: &mut FloatStatus) -> Self;
     fn sqrt(self, s: &mut FloatStatus) -> Self;
+    fn scalbn(self, n: i32, s: &mut FloatStatus) -> Self;
     fn round_to_int(self, s: &mut FloatStatus) -> Self;
     fn compare(self, b: Self, s: &mut FloatStatus) -> FloatRelation;
     fn compare_quiet(self, b: Self, s: &mut FloatStatus) -> FloatRelation;
@@ -331,6 +332,9 @@ macro_rules! impl_fp {
             }
             fn sqrt(self, s: &mut FloatStatus) -> Self {
                 $t::sqrt(self, s)
+            }
+            fn scalbn(self, n: i32, s: &mut FloatStatus) -> Self {
+                $t::scalbn(self, n, s)
             }
             fn round_to_int(self, s: &mut FloatStatus) -> Self {
                 $t::round_to_int(self, s)
@@ -525,7 +529,7 @@ fn mask_of(b: bool, esz: u32) -> u64 {
 }
 
 /// `float*_ceq`, `_cge`, `_cgt`, `_acge` and `_acgt` from `neon_helper.c`.
-fn fcmp<F: Fp>(op: u32, a: F, b: F, s: &mut FloatStatus) -> bool {
+pub(crate) fn fcmp<F: Fp>(op: u32, a: F, b: F, s: &mut FloatStatus) -> bool {
     let rel = |x: F, y: F, s: &mut FloatStatus| x.compare(y, s);
     match op {
         op::CEQ => a.compare_quiet(b, s) == FloatRelation::Equal,
@@ -539,7 +543,7 @@ fn fcmp<F: Fp>(op: u32, a: F, b: F, s: &mut FloatStatus) -> bool {
 }
 
 /// One two-operand element operation; `d` is the accumulator of FMLA and FMLS.
-fn binop<F: Fp>(op: u32, a: F, b: F, d: F, s: &mut FloatStatus) -> u64 {
+pub(crate) fn binop<F: Fp>(op: u32, a: F, b: F, d: F, s: &mut FloatStatus) -> u64 {
     let r = match op {
         op::ADD | op::ADDP => a.add(b, s),
         op::SUB => a.sub(b, s),
@@ -641,7 +645,7 @@ fn call_recip_estimate(exp: &mut i32, exp_off: i32, frac: u64) -> u64 {
 }
 
 /// `HELPER(recpe_f16)`, `do_recpe_f32()` without FEAT_RPRES and `HELPER(recpe_f64)`.
-fn recpe<F: Fp>(input: F, s: &mut FloatStatus) -> F {
+pub(crate) fn recpe<F: Fp>(input: F, s: &mut FloatStatus) -> F {
     let f = input.squash_input_denormal(s);
     let v = f.bits();
     let sign = f.is_neg();
@@ -710,7 +714,7 @@ fn recip_sqrt_estimate(exp: &mut i32, exp_off: i32, frac: u64) -> u64 {
 }
 
 /// `HELPER(rsqrte_f16)`, `do_rsqrte_f32()` without FEAT_RPRES and `HELPER(rsqrte_f64)`.
-fn rsqrte<F: Fp>(input: F, s: &mut FloatStatus) -> F {
+pub(crate) fn rsqrte<F: Fp>(input: F, s: &mut FloatStatus) -> F {
     let f = input.squash_input_denormal(s);
     let v = f.bits();
     let mut exp = ((v >> F::FRAC) & F::exp_mask()) as i32;
@@ -735,7 +739,7 @@ fn rsqrte<F: Fp>(input: F, s: &mut FloatStatus) -> F {
 }
 
 /// `HELPER(frecpx_f16)`, `_f32` and `_f64`.
-fn recpx<F: Fp>(a: F, s: &mut FloatStatus) -> F {
+pub(crate) fn recpx<F: Fp>(a: F, s: &mut FloatStatus) -> F {
     if a.is_any_nan() {
         return estimate_nan(a, s);
     }
@@ -762,7 +766,7 @@ pub(crate) fn rsqrte_u32(a: u32) -> u32 {
 }
 
 /// `HELPER(rints)`: round in the status rounding mode, without raising inexact.
-fn rint<F: Fp>(a: F, exact: bool, s: &mut FloatStatus) -> F {
+pub(crate) fn rint<F: Fp>(a: F, exact: bool, s: &mut FloatStatus) -> F {
     let old = s.exception_flags;
     let r = a.round_to_int(s);
     if !exact && old & flags::INEXACT == 0 {
@@ -945,7 +949,7 @@ fn fcvt(env: &mut [u8], r: Regs, desc: &Desc) -> V {
 /// One precision conversion as QEMU's helpers do it: the half precision conversions turn
 /// flushing off for the duration, on the input side when widening and the output side
 /// when narrowing.
-fn cvt(x: u64, from: u32, to: u32, ieee: bool, s: &mut FloatStatus) -> u64 {
+pub(crate) fn cvt(x: u64, from: u32, to: u32, ieee: bool, s: &mut FloatStatus) -> u64 {
     match (from, to) {
         (2, 3) => Float32(x as u32).to_float64(s).0,
         (3, 2) => u64::from(Float64(x).to_float32(s).0),
