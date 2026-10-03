@@ -38,6 +38,8 @@
 //! - The optimizer keeps its env memory copies in a vector instead of an interval tree; the
 //!   lookup order, and therefore the result, is the same.
 //! - There is no single verifier in QEMU; [`verify`] gathers its debug assertions in one pass.
+//! - [`memory_model`] adds two fence mappings beside QEMU's `tcg_gen_req_mo` for guests such as
+//!   x86 on weaker hosts. QEMU's mapping stays the default.
 
 #![forbid(unsafe_code)]
 
@@ -45,6 +47,7 @@ pub mod dump;
 pub mod helpers;
 pub mod ir;
 pub mod liveness;
+pub mod memory_model;
 pub mod opcode;
 pub mod optimize;
 pub mod regalloc;
@@ -55,5 +58,6 @@ pub mod types;
 pub mod verify;
 
 pub use ir::{Func, FuncConfig, HelperId, HelperInfo, HelperType, Label, Op, OpId, Temp};
+pub use memory_model::FenceMapping;
 pub use opcode::Opcode;
 pub use types::{Cond, MemOp, MemOpIdx, TempKind, Type};

@@ -5,9 +5,16 @@
 //! The host is assumed to swap bytes as part of a memory access and to have 128-bit loads and
 //! stores, so no `bswap` ops are added around accesses and `qemu_ld2`/`qemu_st2` are always used
 //! for 128-bit values. Plugin memory callbacks are not emitted.
+//!
+//! Barriers follow [`FuncConfig::fence_mapping`](crate::ir::FuncConfig). With
+//! [`FenceMapping::Qemu`], the default, they are exactly `tcg_gen_req_mo`'s. The other mappings
+//! and the ways they differ from QEMU are described in [`crate::memory_model`]: barriers after
+//! loads and before stores, or ordering flags on the access ops, and full barriers around the
+//! atomic read-modify-write and compare and swap entry points.
 
 use crate::helpers;
 use crate::ir::{Func, Temp, TempI32, TempI64, TempI128};
+use crate::memory_model::{FenceMapping, ldst_flags, needed_mo};
 use crate::opcode::Opcode;
 use crate::types::{Cond, MemOp, MemOpIdx, Type, mo};
 
@@ -224,38 +231,124 @@ impl Func {
         }
     }
 
-    fn gen_ldst1(&mut self, opc: Opcode, ty: Type, v: Temp, addr: Temp, oi: MemOpIdx) {
-        let op = self.emit_op(opc, ty, &[v.arg(), addr.arg(), oi.0 as u64]);
-        self.op_mut(op).flags = oi.memop().size() as u8;
+    /// The mapping this block uses, after [`FenceMapping::effective`], and the orders it must
+    /// enforce.
+    fn fence_mapping(&self) -> (FenceMapping, u32) {
+        let (g, h) = (self.config.guest_mo, self.config.target_default_mo);
+        (self.config.fence_mapping.effective(g, h), needed_mo(g, h))
     }
 
-    fn gen_ldst2(&mut self, opc: Opcode, ty: Type, vl: Temp, vh: Temp, addr: Temp, oi: MemOpIdx) {
+    /// True when `gen_mb` emits barriers, so other vCPUs can observe the order of accesses.
+    fn orders_visible(&self) -> bool {
+        if self.config.user_only { self.config.parallel } else { true }
+    }
+
+    /// What goes before a load: `tcg_gen_req_mo(ty)` for QEMU's mapping. Returns the ordering
+    /// flags for the op.
+    fn order_before_ld(&mut self, ty: u32) -> u8 {
+        match self.fence_mapping() {
+            (FenceMapping::Qemu, _) => {
+                self.req_mo(ty);
+                0
+            }
+            (FenceMapping::Risotto, _) => 0,
+            (FenceMapping::AranciniRcpc, needed) => {
+                if needed & (mo::LD_LD | mo::LD_ST) != 0 && self.orders_visible() {
+                    ldst_flags::ACQUIRE_PC
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// What goes after a load: Risotto's barrier ordering it before later accesses.
+    fn order_after_ld(&mut self) {
+        if let (FenceMapping::Risotto, needed) = self.fence_mapping() {
+            let bar = needed & (mo::LD_LD | mo::LD_ST);
+            if bar != 0 {
+                self.gen_mb(bar | mo::BAR_SC);
+            }
+        }
+    }
+
+    /// What goes before a store: `tcg_gen_req_mo(ty)` for QEMU's mapping, Risotto's store
+    /// barrier, or the release flag. Returns the ordering flags for the op.
+    fn order_before_st(&mut self, ty: u32) -> u8 {
+        match self.fence_mapping() {
+            (FenceMapping::Qemu, _) => {
+                self.req_mo(ty);
+                0
+            }
+            (FenceMapping::Risotto, needed) => {
+                let bar = needed & mo::ST_ST;
+                if bar != 0 {
+                    self.gen_mb(bar | mo::BAR_SC);
+                }
+                0
+            }
+            (FenceMapping::AranciniRcpc, needed) => {
+                if needed & (mo::ST_ST | mo::LD_ST) != 0 && self.orders_visible() {
+                    ldst_flags::RELEASE
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// The full barrier the alternative mappings put before and after an atomic
+    /// read-modify-write or compare and swap. Nothing for QEMU's mapping.
+    fn atomic_fence(&mut self) {
+        if self.fence_mapping().0 != FenceMapping::Qemu {
+            self.gen_mb(mo::ALL | mo::BAR_SC);
+        }
+    }
+
+    fn gen_ldst1(&mut self, opc: Opcode, ty: Type, v: Temp, addr: Temp, oi: MemOpIdx, fl: u8) {
+        let op = self.emit_op(opc, ty, &[v.arg(), addr.arg(), oi.0 as u64]);
+        self.op_mut(op).flags = oi.memop().size() as u8 | fl;
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "the operands of a qemu_ld2 or qemu_st2")]
+    fn gen_ldst2(
+        &mut self,
+        opc: Opcode,
+        ty: Type,
+        vl: Temp,
+        vh: Temp,
+        addr: Temp,
+        oi: MemOpIdx,
+        fl: u8,
+    ) {
         let op = self.emit_op(opc, ty, &[vl.arg(), vh.arg(), addr.arg(), oi.0 as u64]);
-        self.op_mut(op).flags = oi.memop().size() as u8;
+        self.op_mut(op).flags = oi.memop().size() as u8 | fl;
     }
 
     fn qemu_ld_i32_int(&mut self, val: TempI32, addr: Temp, idx: u32, memop: MemOp) {
-        self.req_mo(mo::LD_LD | mo::ST_LD);
+        let fl = self.order_before_ld(mo::LD_LD | mo::ST_LD);
         let memop = self.canonicalize_memop(memop, false, false);
-        self.gen_ldst1(Opcode::QemuLd, Type::I32, val.0, addr, MemOpIdx::new(memop, idx));
+        self.gen_ldst1(Opcode::QemuLd, Type::I32, val.0, addr, MemOpIdx::new(memop, idx), fl);
+        self.order_after_ld();
     }
 
     fn qemu_st_i32_int(&mut self, val: TempI32, addr: Temp, idx: u32, memop: MemOp) {
-        self.req_mo(mo::LD_ST | mo::ST_ST);
+        let fl = self.order_before_st(mo::LD_ST | mo::ST_ST);
         let memop = self.canonicalize_memop(memop, false, true);
-        self.gen_ldst1(Opcode::QemuSt, Type::I32, val.0, addr, MemOpIdx::new(memop, idx));
+        self.gen_ldst1(Opcode::QemuSt, Type::I32, val.0, addr, MemOpIdx::new(memop, idx), fl);
     }
 
     fn qemu_ld_i64_int(&mut self, val: TempI64, addr: Temp, idx: u32, memop: MemOp) {
-        self.req_mo(mo::LD_LD | mo::ST_LD);
+        let fl = self.order_before_ld(mo::LD_LD | mo::ST_LD);
         let memop = self.canonicalize_memop(memop, true, false);
-        self.gen_ldst1(Opcode::QemuLd, Type::I64, val.0, addr, MemOpIdx::new(memop, idx));
+        self.gen_ldst1(Opcode::QemuLd, Type::I64, val.0, addr, MemOpIdx::new(memop, idx), fl);
+        self.order_after_ld();
     }
 
     fn qemu_st_i64_int(&mut self, val: TempI64, addr: Temp, idx: u32, memop: MemOp) {
-        self.req_mo(mo::LD_ST | mo::ST_ST);
+        let fl = self.order_before_st(mo::LD_ST | mo::ST_ST);
         let memop = self.canonicalize_memop(memop, true, true);
-        self.gen_ldst1(Opcode::QemuSt, Type::I64, val.0, addr, MemOpIdx::new(memop, idx));
+        self.gen_ldst1(Opcode::QemuSt, Type::I64, val.0, addr, MemOpIdx::new(memop, idx), fl);
     }
 
     fn reduce_atom(&self, memop: MemOp) -> MemOp {
@@ -267,17 +360,19 @@ impl Func {
     }
 
     fn qemu_ld_i128_int(&mut self, val: TempI128, addr: Temp, idx: u32, memop: MemOp) {
-        self.req_mo(mo::LD_LD | mo::ST_LD);
+        let fl = self.order_before_ld(mo::LD_LD | mo::ST_LD);
         let memop = self.reduce_atom(memop);
         let oi = MemOpIdx::new(memop, idx);
-        self.gen_ldst2(Opcode::QemuLd2, Type::I128, val.low().0, val.high().0, addr, oi);
+        self.gen_ldst2(Opcode::QemuLd2, Type::I128, val.low().0, val.high().0, addr, oi, fl);
+        self.order_after_ld();
     }
 
     fn qemu_st_i128_int(&mut self, val: TempI128, addr: Temp, idx: u32, memop: MemOp) {
-        self.req_mo(mo::ST_LD | mo::ST_ST);
+        // QEMU asks for ST_LD | ST_ST here rather than LD_ST | ST_ST; kept as it is.
+        let fl = self.order_before_st(mo::ST_LD | mo::ST_ST);
         let memop = self.reduce_atom(memop);
         let oi = MemOpIdx::new(memop, idx);
-        self.gen_ldst2(Opcode::QemuSt2, Type::I128, val.low().0, val.high().0, addr, oi);
+        self.gen_ldst2(Opcode::QemuSt2, Type::I128, val.low().0, val.high().0, addr, oi, fl);
     }
 
     /// `tcg_gen_qemu_ld_i32`: load from guest memory through MMU index `idx`.
@@ -544,11 +639,27 @@ impl Func {
         let addr = addr.into();
         self.check_addr(addr);
         assert!(memop.size() <= 2);
+        self.atomic_fence();
         self.atomic_cmpxchg_i32_int(retv, addr, cmpv, newv, idx, memop);
+        self.atomic_fence();
     }
 
     /// `tcg_gen_atomic_cmpxchg_i64`.
     pub fn gen_atomic_cmpxchg_i64(
+        &mut self,
+        retv: TempI64,
+        addr: impl Into<Temp>,
+        cmpv: TempI64,
+        newv: TempI64,
+        idx: u32,
+        memop: MemOp,
+    ) {
+        self.atomic_fence();
+        self.atomic_cmpxchg_i64_body(retv, addr, cmpv, newv, idx, memop);
+        self.atomic_fence();
+    }
+
+    fn atomic_cmpxchg_i64_body(
         &mut self,
         retv: TempI64,
         addr: impl Into<Temp>,
@@ -591,6 +702,20 @@ impl Func {
 
     /// `tcg_gen_atomic_cmpxchg_i128`.
     pub fn gen_atomic_cmpxchg_i128(
+        &mut self,
+        retv: TempI128,
+        addr: impl Into<Temp>,
+        cmpv: TempI128,
+        newv: TempI128,
+        idx: u32,
+        memop: MemOp,
+    ) {
+        self.atomic_fence();
+        self.atomic_cmpxchg_i128_body(retv, addr, cmpv, newv, idx, memop);
+        self.atomic_fence();
+    }
+
+    fn atomic_cmpxchg_i128_body(
         &mut self,
         retv: TempI128,
         addr: impl Into<Temp>,
@@ -679,6 +804,20 @@ impl Func {
         idx: u32,
         memop: MemOp,
     ) {
+        self.atomic_fence();
+        self.atomic_op_i32_body(op, ret, addr, val, idx, memop);
+        self.atomic_fence();
+    }
+
+    fn atomic_op_i32_body(
+        &mut self,
+        op: AtomicOp,
+        ret: TempI32,
+        addr: impl Into<Temp>,
+        val: TempI32,
+        idx: u32,
+        memop: MemOp,
+    ) {
         let addr = addr.into();
         self.check_addr(addr);
         assert!(memop.size() <= 2);
@@ -699,6 +838,20 @@ impl Func {
 
     /// `tcg_gen_atomic_<op>_i64`, for any [`AtomicOp`].
     pub fn gen_atomic_op_i64(
+        &mut self,
+        op: AtomicOp,
+        ret: TempI64,
+        addr: impl Into<Temp>,
+        val: TempI64,
+        idx: u32,
+        memop: MemOp,
+    ) {
+        self.atomic_fence();
+        self.atomic_op_i64_body(op, ret, addr, val, idx, memop);
+        self.atomic_fence();
+    }
+
+    fn atomic_op_i64_body(
         &mut self,
         op: AtomicOp,
         ret: TempI64,
@@ -748,6 +901,20 @@ impl Func {
 
     /// `tcg_gen_atomic_<op>_i128`. Only `fetch_and`, `fetch_or` and `xchg` exist in 128 bits.
     pub fn gen_atomic_op_i128(
+        &mut self,
+        op: AtomicOp,
+        ret: TempI128,
+        addr: impl Into<Temp>,
+        val: TempI128,
+        idx: u32,
+        memop: MemOp,
+    ) {
+        self.atomic_fence();
+        self.atomic_op_i128_body(op, ret, addr, val, idx, memop);
+        self.atomic_fence();
+    }
+
+    fn atomic_op_i128_body(
         &mut self,
         op: AtomicOp,
         ret: TempI128,

@@ -277,6 +277,23 @@ pub(crate) mod i {
     pub(crate) const DMB_ISH: u32 = 0xd50338bf;
     pub(crate) const DMB_LD: u32 = 0x00000100;
     pub(crate) const DMB_ST: u32 = 0x00000200;
+
+    // Load-acquire and store-release, with the size in bits 30 and 31. Not in QEMU's table;
+    // used for the acquire and release guest accesses of `crate::memory_order`.
+    /// LDAPR, load-acquire RCpc (FEAT_LRCPC).
+    pub(crate) const LDAPR: u32 = 0x38bfc000;
+    /// LDAR, load-acquire RCsc.
+    pub(crate) const LDAR: u32 = 0x08dffc00;
+    /// STLR, store-release.
+    pub(crate) const STLR: u32 = 0x089ffc00;
+    /// LDAPUR, load-acquire RCpc with an unscaled offset (FEAT_LRCPC2).
+    pub(crate) const LDAPUR: u32 = 0x19400000;
+    /// LDAPURS with a 64-bit destination, sign extending (FEAT_LRCPC2).
+    pub(crate) const LDAPURS_X: u32 = 0x19800000;
+    /// LDAPURS with a 32-bit destination, sign extending (FEAT_LRCPC2).
+    pub(crate) const LDAPURS_W: u32 = 0x19c00000;
+    /// STLUR, store-release with an unscaled offset (FEAT_LRCPC2).
+    pub(crate) const STLUR: u32 = 0x19000000;
 }
 
 /// Is `val` usable as an add or subtract immediate, `is_aimm`.
@@ -751,6 +768,17 @@ impl Asm {
         self.emit(w | (base as u32) << 5 | (rd as u32 & 0x1f));
     }
 
+    /// LDAPR, LDAR or STLR of `1 << size` bytes at `[rn]`.
+    pub(crate) fn ldst_ordered(&mut self, insn: u32, size: u32, rt: Reg, rn: Reg) {
+        self.emit(insn | size << 30 | (rn as u32) << 5 | (rt as u32 & 0x1f));
+    }
+
+    /// LDAPUR, LDAPURS or STLUR of `1 << size` bytes at `[rn, #imm9]`.
+    pub(crate) fn ldst_rcpc_imm(&mut self, insn: u32, size: u32, rt: Reg, rn: Reg, imm9: i32) {
+        let w = insn | size << 30 | ((imm9 as u32) & 0x1ff) << 12;
+        self.emit(w | (rn as u32) << 5 | (rt as u32 & 0x1f));
+    }
+
     pub(crate) fn ldst_imm(&mut self, insn: u32, rd: Reg, rn: Reg, offset: i64) {
         self.emit(insn | ((offset as u32) & 0x1ff) << 12 | (rn as u32) << 5 | (rd as u32 & 0x1f));
     }
@@ -1081,5 +1109,31 @@ mod tests {
         assert_eq!(w1, i::LDR_LIT | (3 << 5));
         let v = u64::from_le_bytes(out.bytes[16..24].try_into().unwrap());
         assert_eq!(v, 0x1234_5678_9abc_def0);
+    }
+
+    #[test]
+    fn acquire_release_encodings() {
+        // Reference words from Apple clang with `.arch armv8.4-a+rcpc`.
+        assert_eq!(one(|a| a.ldst_ordered(i::LDAPR, 3, 0, X16)), [0xf8bfc200]);
+        assert_eq!(one(|a| a.ldst_ordered(i::LDAPR, 2, 3, X16)), [0xb8bfc203]);
+        assert_eq!(one(|a| a.ldst_ordered(i::LDAPR, 1, 5, X16)), [0x78bfc205]);
+        assert_eq!(one(|a| a.ldst_ordered(i::LDAPR, 0, 7, X16)), [0x38bfc207]);
+        assert_eq!(one(|a| a.ldst_ordered(i::LDAR, 3, 0, X16)), [0xc8dffe00]);
+        assert_eq!(one(|a| a.ldst_ordered(i::LDAR, 0, 1, X16)), [0x08dffe01]);
+        assert_eq!(one(|a| a.ldst_ordered(i::STLR, 3, 0, X16)), [0xc89ffe00]);
+        assert_eq!(one(|a| a.ldst_ordered(i::STLR, 2, 2, X16)), [0x889ffe02]);
+        assert_eq!(one(|a| a.ldst_ordered(i::STLR, 1, 2, X16)), [0x489ffe02]);
+        assert_eq!(one(|a| a.ldst_ordered(i::STLR, 0, XZR, X16)), [0x089ffe1f]);
+        assert_eq!(one(|a| a.ldst_ordered(i::STLR, 3, XZR, X16)), [0xc89ffe1f]);
+        assert_eq!(one(|a| a.ldst_rcpc_imm(i::LDAPUR, 3, 0, X16, 0)), [0xd9400200]);
+        assert_eq!(one(|a| a.ldst_rcpc_imm(i::LDAPURS_X, 0, 1, X16, 0)), [0x19800201]);
+        assert_eq!(one(|a| a.ldst_rcpc_imm(i::LDAPURS_W, 0, 1, X16, 0)), [0x19c00201]);
+        assert_eq!(one(|a| a.ldst_rcpc_imm(i::LDAPURS_X, 1, 2, X16, 0)), [0x59800202]);
+        assert_eq!(one(|a| a.ldst_rcpc_imm(i::LDAPURS_W, 1, 2, X16, 0)), [0x59c00202]);
+        assert_eq!(one(|a| a.ldst_rcpc_imm(i::LDAPURS_X, 2, 3, X16, 0)), [0x99800203]);
+        assert_eq!(one(|a| a.ldst_rcpc_imm(i::STLUR, 3, 4, X16, -8)), [0xd91f8204]);
+        assert_eq!(one(|a| a.emit(i::DMB_ISH | i::DMB_LD)), [0xd50339bf]);
+        assert_eq!(one(|a| a.emit(i::DMB_ISH | i::DMB_ST)), [0xd5033abf]);
+        assert_eq!(one(|a| a.emit(i::DMB_ISH | i::DMB_LD | i::DMB_ST)), [0xd5033bbf]);
     }
 }

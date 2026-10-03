@@ -48,15 +48,22 @@
 //!   used; such constants are loaded into a register.
 //! - The add and subtract with carry ops keep the carry in a word of the slot array, and only
 //!   pass it in the flags between two adjacent ops of the same family.
+//! - With [`CodegenOptions::guest_window`], `qemu_ld` and `qemu_st` of up to 64 bits first try
+//!   a host window of guest memory the run context describes, and use the service routine only
+//!   when the address is outside it, misaligned or byte swapped. This stands in for QEMU's
+//!   softmmu fast path. Accesses flagged by a fence mapping use `ldapr` and `stlr` there; see
+//!   [`crate::memory_order`] for those and for the barriers around helper calls.
 
 use ruvm_jit_core::ir::{Func, HelperType, Op, OpId, Temp};
+use ruvm_jit_core::memory_model::{FenceMapping, ldst_flags};
 use ruvm_jit_core::opcode::Opcode;
 use ruvm_jit_core::regalloc::{self, Letter, RegSet, Target};
 use ruvm_jit_core::types::{
-    Cond, INSN_START_WORDS, MemOpIdx, TempKind, Type, bswap, dup_const, opf,
+    Cond, INSN_START_WORDS, MemOp, MemOpIdx, TempKind, Type, bswap, call_flags, dup_const, opf,
 };
 
 use crate::asm::{self, Asm, AsmError, LR, Reg, TMP0, TMP1, VTMP0, VTMP1, XZR, cc, i};
+use crate::memory_order::{DMB_ISH_FULL, DMB_ISHLD, DMB_ISHST, HostFeatures, dmb_for};
 
 /// Base of the CPU state buffer.
 pub(crate) const ENV: Reg = asm::AREG0;
@@ -80,6 +87,30 @@ pub(crate) const NARGS: usize = 32;
 pub(crate) const RET_OFFSET: i64 = 8 * NARGS as i64;
 /// Byte offset of the word holding one more than the index of the last `insn_start` request.
 pub(crate) const INSN_OFFSET: i64 = RET_OFFSET + 8;
+/// Byte offset of the guest address the host window starts at.
+pub(crate) const WIN_BASE_OFFSET: i64 = INSN_OFFSET + 8;
+/// Byte offset of the window length less 7: an offset below it has 8 bytes in the window.
+pub(crate) const WIN_LIMIT_OFFSET: i64 = INSN_OFFSET + 16;
+/// Byte offset of the host address of the window.
+pub(crate) const WIN_HOST_OFFSET: i64 = INSN_OFFSET + 24;
+
+/// Choices for code generation beyond the block itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CodegenOptions {
+    /// Make guest loads and stores of up to 64 bits go straight to the host window that
+    /// [`crate::CompiledTb::run_with_window`] passes, when they fall inside it. Off by default:
+    /// every guest access then goes through [`ruvm_jit_interp::GuestMemory`].
+    pub guest_window: bool,
+    /// The optional instructions the code may use. [`HostFeatures::BASELINE`] by default.
+    pub features: HostFeatures,
+}
+
+impl CodegenOptions {
+    /// The options for code that runs on this host: the window on, and the detected features.
+    pub fn host() -> CodegenOptions {
+        CodegenOptions { guest_window: true, features: HostFeatures::detect() }
+    }
+}
 
 /// How generated code left, in x0 at the epilogue.
 pub(crate) mod kind {
@@ -244,10 +275,15 @@ fn static_offset(f: &Func, base: Temp, off: i64) -> Option<i64> {
 
 /// Compile `f` for code that will live at `base`. `service` is the address of the service
 /// routine.
-pub(crate) fn generate(f: &Func, base: u64, service: u64) -> R<Generated> {
+pub(crate) fn generate(f: &Func, base: u64, service: u64, opts: &CodegenOptions) -> R<Generated> {
     check_types(f)?;
     let f = regalloc::prepare(f, &extra_flags);
+    let c = &f.config;
     let mut g = Gen {
+        opts: *opts,
+        mapping: c.fence_mapping.effective(c.guest_mo, c.target_default_mo),
+        addr32: c.addr_type == Type::I32,
+        after_full_dmb: false,
         a: Asm::new(base),
         labels: vec![None; f.nb_labels()],
         requests: Vec::new(),
@@ -394,6 +430,14 @@ enum Addr {
 }
 
 struct Gen {
+    opts: CodegenOptions,
+    /// The fence mapping the block was built with, after `FenceMapping::effective`.
+    mapping: FenceMapping,
+    /// Guest addresses are 32 bits wide.
+    addr32: bool,
+    /// A full barrier from an `mb` op has run since the last guest access, helper call or
+    /// label.
+    after_full_dmb: bool,
     a: Asm,
     labels: Vec<Option<usize>>,
     requests: Vec<Request>,
@@ -539,12 +583,21 @@ impl Gen {
 
     /// Call the service routine for `req`. Leaves the block if it reports an unwind or error.
     fn service(&mut self, req: Request) {
+        self.service_then(req, None);
+    }
+
+    /// [`Self::service`], with `after` emitted right after the call returns, before the check
+    /// for leaving.
+    fn service_then(&mut self, req: Request, after: Option<u32>) {
         let idx = self.requests.len();
         self.requests.push(req);
         self.a.movr(true, X0, CTX);
         self.a.movi(Type::I64, X1, idx as u64);
         self.a.movi(Type::I64, TMP0, self.service);
         self.a.breg(i::BLR, TMP0);
+        if let Some(w) = after {
+            self.a.emit(w);
+        }
         let ok = self.a.new_label();
         self.a.reloc_here(asm::Reloc::Condbr19, ok);
         self.a.cbz(i::CBZ, true, X0, 0);
@@ -924,25 +977,55 @@ impl Gen {
             Opcode::QemuLd | Opcode::QemuLd2 => {
                 let two = op.opc == Opcode::QemuLd2;
                 let ai = if two { 2 } else { 1 };
+                let oi = MemOpIdx(op.args[ai + 1] as u32);
+                let acquire = op.flags & ldst_flags::ACQUIRE_PC != 0;
+                let done = self.a.new_label();
+                self.after_full_dmb = false;
+                if !two && self.window_fits(oi.memop()) {
+                    let slow = self.a.new_label();
+                    self.window_addr(r(ai), oi.memop(), acquire, slow);
+                    self.window_load(ty, r(0), oi.memop(), acquire);
+                    self.a.b_label(done);
+                    self.a.bind(slow);
+                }
                 self.put_args(&args[ai..ai + 1]);
-                self.service(Request::Load(MemOpIdx(op.args[ai + 1] as u32)));
+                self.service(Request::Load(oi));
                 if two {
                     self.a.ld(Type::I64, r(0), CTX, 0);
                     self.a.ld(Type::I64, r(1), CTX, 8);
                 } else {
                     self.a.ld(ty, r(0), CTX, 0);
                 }
+                if acquire {
+                    self.a.emit(DMB_ISHLD);
+                }
+                self.a.bind(done);
             }
             Opcode::QemuSt | Opcode::QemuSt2 => {
                 let two = op.opc == Opcode::QemuSt2;
                 let ai = if two { 2 } else { 1 };
+                let oi = MemOpIdx(op.args[ai + 1] as u32);
+                let release = op.flags & ldst_flags::RELEASE != 0;
+                let done = self.a.new_label();
+                self.after_full_dmb = false;
+                if !two && self.window_fits(oi.memop()) {
+                    let slow = self.a.new_label();
+                    self.window_addr(r(ai), oi.memop(), release, slow);
+                    self.window_store(r(0), oi.memop(), release);
+                    self.a.b_label(done);
+                    self.a.bind(slow);
+                }
+                if release {
+                    self.a.emit(DMB_ISH_FULL);
+                }
                 if two {
                     self.put_args(&args[..2]);
                 } else {
                     self.put_args(&[args[0], XZR as u64]);
                 }
                 self.a.st(Type::I64, r(ai), CTX, 16);
-                self.service(Request::Store(MemOpIdx(op.args[ai + 1] as u32)));
+                self.service(Request::Store(oi));
+                self.a.bind(done);
             }
             Opcode::GotoPtr => {
                 self.a.movr(true, X1, r(0));
@@ -951,6 +1034,90 @@ impl Gen {
             other => return Err(GenCodeError::Unsupported(other.name().to_string())),
         }
         Ok(())
+    }
+
+    /// True if a guest access with `memop` can be tried against the host window: the window is
+    /// on, and the access is at most 64 bits, needs no byte swap and needs no more than 8 byte
+    /// alignment (the window starts 8 byte aligned).
+    fn window_fits(&self, memop: MemOp) -> bool {
+        self.opts.guest_window
+            && memop.0 & MemOp::BSWAP.0 == 0
+            && memop.size() <= 3
+            && memop.alignment_bits() <= 3
+    }
+
+    /// Put the offset into the host window of the guest access at `addr` in x16 and the host
+    /// address of the window in x17, or branch to `slow` if the access is not entirely inside
+    /// the window or is not aligned as `memop` asks. An `ordered` access must also be
+    /// naturally aligned, as `ldapr` and `stlr` require.
+    fn window_addr(&mut self, addr: Reg, memop: MemOp, ordered: bool, slow: usize) {
+        let src = if self.addr32 {
+            self.a.movr(false, TMP0, addr);
+            TMP0
+        } else {
+            addr
+        };
+        self.a.ld(Type::I64, TMP1, CTX, WIN_BASE_OFFSET);
+        self.a.rrr(i::SUB, true, TMP0, src, TMP1);
+        self.a.ld(Type::I64, TMP1, CTX, WIN_LIMIT_OFFSET);
+        self.a.rrr(i::SUBS, true, XZR, TMP0, TMP1);
+        self.a.bcond_label(cc::HS, slow);
+        let bits =
+            if ordered { memop.alignment_bits().max(memop.size()) } else { memop.alignment_bits() };
+        if bits > 0 {
+            self.a.logicali(i::ANDSI, true, XZR, TMP0, (1u64 << bits) - 1);
+            self.a.bcond_label(cc::NE, slow);
+        }
+        self.a.ld(Type::I64, TMP1, CTX, WIN_HOST_OFFSET);
+    }
+
+    /// Load `rt` from the window, at the offset in x16 from the address in x17. An `acquire`
+    /// load is `ldapr` (or `ldar` without FEAT_LRCPC), sign extended by `ldapurs*` with
+    /// FEAT_LRCPC2 or by `sbfm` without.
+    fn window_load(&mut self, ty: Type, rt: Reg, memop: MemOp, acquire: bool) {
+        let size = memop.size();
+        let ext = ty == Type::I64;
+        let signed = memop.is_signed() && size < 3 && (ext || size < 2);
+        if !acquire {
+            let insn = match (size, signed, ext) {
+                (0, true, true) => i::LDRSBX,
+                (0, true, false) => i::LDRSBW,
+                (0, false, _) => i::LDRB,
+                (1, true, true) => i::LDRSHX,
+                (1, true, false) => i::LDRSHW,
+                (1, false, _) => i::LDRH,
+                (2, true, _) => i::LDRSWX,
+                (2, false, _) => i::LDRW,
+                _ => i::LDRX,
+            };
+            self.a.ldst_reg(insn, rt, TMP1, true, TMP0);
+            return;
+        }
+        self.a.rrr(i::ADD, true, TMP0, TMP0, TMP1);
+        let f = self.opts.features;
+        if signed && f.lrcpc2 {
+            let insn = if ext { i::LDAPURS_X } else { i::LDAPURS_W };
+            self.a.ldst_rcpc_imm(insn, size, rt, TMP0, 0);
+        } else {
+            let insn = if f.lrcpc { i::LDAPR } else { i::LDAR };
+            self.a.ldst_ordered(insn, size, rt, TMP0);
+            if signed {
+                self.a.bitfield(i::SBFM, ext, rt, rt, ext as u32, 0, (8 << size) - 1);
+            }
+        }
+    }
+
+    /// Store `rt` to the window, at the offset in x16 from the address in x17; `stlr` for a
+    /// `release` store.
+    fn window_store(&mut self, rt: Reg, memop: MemOp, release: bool) {
+        let size = memop.size();
+        if release {
+            self.a.rrr(i::ADD, true, TMP0, TMP0, TMP1);
+            self.a.ldst_ordered(i::STLR, size, rt, TMP0);
+            return;
+        }
+        let insn = [i::STRB, i::STRH, i::STRW, i::STRX][size as usize];
+        self.a.ldst_reg(insn, rt, TMP1, true, TMP0);
     }
 
     /// [`Self::host_addr`] for a store, whose base is argument 1.
@@ -1499,12 +1666,17 @@ impl Target for Gen {
             Opcode::SetLabel => {
                 let l = self.label(op, 0)?;
                 self.a.bind(l);
+                self.after_full_dmb = false;
             }
             Opcode::Br => {
                 let l = self.label(op, 0)?;
                 self.a.b_label(l);
             }
-            Opcode::Mb => self.a.emit(i::DMB_ISH | i::DMB_LD | i::DMB_ST),
+            Opcode::Mb => {
+                let w = dmb_for(op.args[0] as u32);
+                self.a.emit(w);
+                self.after_full_dmb |= w == DMB_ISH_FULL;
+            }
             Opcode::InsnStart => {
                 let mut words = [0u64; INSN_START_WORDS];
                 words.copy_from_slice(&op.args[..INSN_START_WORDS]);
@@ -1542,7 +1714,15 @@ impl Target for Gen {
     fn out_call(&mut self, f: &Func, op: &Op) -> R<()> {
         let info = f.helper_info(op.call_helper()).clone();
         let ni = op.calli as usize;
-        self.service(Request::Call { name: info.name, ret: info.ret, args: info.args, nin: ni });
+        // A helper that may have side effects may access guest memory; see memory_order.
+        let fence =
+            self.mapping != FenceMapping::Qemu && info.flags & call_flags::NO_SIDE_EFFECTS == 0;
+        if fence && !self.after_full_dmb {
+            self.a.emit(DMB_ISHST);
+        }
+        self.after_full_dmb = false;
+        let req = Request::Call { name: info.name, ret: info.ret, args: info.args, nin: ni };
+        self.service_then(req, if fence { Some(DMB_ISHLD) } else { None });
         Ok(())
     }
 }
