@@ -10,9 +10,15 @@
 //! a run context and a slot array. Anything it cannot do itself goes through [`service`], a
 //! C-ABI Rust function whose address is built into the code. The context is the only channel
 //! between the two: argument words in, results and the reason for leaving out.
+//!
+//! [`CompiledTb::run_with_window`] also hands the code a [`HostWindow`], a run of guest memory
+//! held as host atomics that code compiled with [`CodegenOptions::guest_window`] loads and
+//! stores directly. Several threads can run blocks against the same window at once, which is
+//! what the memory ordering litmus tests do.
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use ruvm_jit_core::ir::{Func, HelperType};
@@ -24,7 +30,10 @@ use ruvm_jit_interp::{
 
 use crate::asm::i;
 use crate::buffer::{BufferError, CodeBuffer};
-use crate::codegen::{self, GenCodeError, INSN_OFFSET, NARGS, RET_OFFSET, Request, kind};
+use crate::codegen::{
+    self, CodegenOptions, GenCodeError, INSN_OFFSET, NARGS, RET_OFFSET, Request, WIN_BASE_OFFSET,
+    WIN_HOST_OFFSET, WIN_LIMIT_OFFSET, kind,
+};
 
 /// One executable buffer that blocks are compiled into, front to back.
 #[derive(Debug)]
@@ -52,11 +61,20 @@ impl CodeRegion {
     /// Compile `f` into the region, `tcg_gen_code`. A block with temps wider than 128 bits is
     /// refused with [`GenCodeError::Unsupported`]; it can be run with the interpreter instead.
     pub fn compile(self: &Arc<Self>, f: &Func) -> Result<CompiledTb, GenCodeError> {
+        self.compile_with(f, &CodegenOptions::default())
+    }
+
+    /// [`CodeRegion::compile`] with `opts`.
+    pub fn compile_with(
+        self: &Arc<Self>,
+        f: &Func,
+        opts: &CodegenOptions,
+    ) -> Result<CompiledTb, GenCodeError> {
         let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let offset = next.next_multiple_of(16);
         let base = self.buf.addr() + offset as u64;
         let service_fn: extern "C" fn(&mut RunCtx<'_>, u64) -> u64 = service;
-        let g = codegen::generate(f, base, service_fn as usize as u64)?;
+        let g = codegen::generate(f, base, service_fn as usize as u64, opts)?;
         let end = offset.checked_add(g.bytes.len()).ok_or(GenCodeError::TooLarge)?;
         if end > self.buf.size() {
             return Err(GenCodeError::TooLarge);
@@ -71,6 +89,46 @@ impl CodeRegion {
             slot_words: g.slot_words,
             goto_tb: g.goto_tb,
         })
+    }
+}
+
+/// Guest memory that generated code accesses directly: guest address `guest_base + k` is byte
+/// `k % 8` of `words[k / 8]`, in host (little endian) order.
+///
+/// Rust code must only touch the words through the atomics. Generated code uses plain,
+/// load-acquire and store-release instructions on them, which the hardware makes single-copy
+/// atomic for aligned accesses.
+#[derive(Clone, Copy, Debug)]
+pub struct HostWindow<'a> {
+    words: &'a [AtomicU64],
+    guest_base: u64,
+}
+
+impl<'a> HostWindow<'a> {
+    /// The window of `words` at guest address `guest_base`, which must be 8 byte aligned.
+    pub fn new(words: &'a [AtomicU64], guest_base: u64) -> HostWindow<'a> {
+        assert!(guest_base % 8 == 0, "the window must start 8 byte aligned");
+        assert!(
+            guest_base.checked_add(8 * words.len() as u64).is_some(),
+            "the window wraps the guest address space"
+        );
+        HostWindow { words, guest_base }
+    }
+
+    /// The guest address of the first byte.
+    pub fn guest_base(&self) -> u64 {
+        self.guest_base
+    }
+
+    /// The words.
+    pub fn words(&self) -> &'a [AtomicU64] {
+        self.words
+    }
+
+    /// The window fields of the run context: base, limit and host address.
+    fn ctx_fields(&self) -> (u64, u64, u64) {
+        let len = 8 * self.words.len() as u64;
+        (self.guest_base, len.saturating_sub(7), self.words.as_ptr() as u64)
     }
 }
 
@@ -135,12 +193,42 @@ impl CompiledTb {
         helpers: &HelperRegistry,
         last_insn_start: &mut Option<[u64; INSN_START_WORDS]>,
     ) -> Result<Exit, InterpError> {
+        self.run_inner(env, None, mem, helpers, last_insn_start)
+    }
+
+    /// [`CompiledTb::run`] with guest memory `window` that code compiled with
+    /// [`CodegenOptions::guest_window`] accesses directly. Accesses the code cannot make there
+    /// (outside the window, misaligned, byte swapped or 128 bits wide) go to `mem`, which
+    /// should therefore show the same bytes for the window's addresses.
+    pub fn run_with_window(
+        &self,
+        env: &mut [u8],
+        window: &HostWindow<'_>,
+        mem: &mut dyn GuestMemory,
+        helpers: &HelperRegistry,
+    ) -> Result<Exit, InterpError> {
+        let mut last = None;
+        self.run_inner(env, Some(window), mem, helpers, &mut last)
+    }
+
+    fn run_inner(
+        &self,
+        env: &mut [u8],
+        window: Option<&HostWindow<'_>>,
+        mem: &mut dyn GuestMemory,
+        helpers: &HelperRegistry,
+        last_insn_start: &mut Option<[u64; INSN_START_WORDS]>,
+    ) -> Result<Exit, InterpError> {
         let mut slots = vec![0u64; self.slot_words];
         let env_len = env.len();
+        let (win_base, win_limit, win_host) = window.map_or((0, 0, 0), HostWindow::ctx_fields);
         let mut ctx = RunCtx {
             args: [0; NARGS],
             ret: 0,
             insn: 0,
+            win_base,
+            win_limit,
+            win_host,
             insn_delivered: 0,
             requests: &self.requests,
             env: env.as_mut_ptr(),
@@ -180,13 +268,21 @@ impl CompiledTb {
 }
 
 /// The state shared by generated code and [`service`] during one run. Generated code only
-/// touches `args`, `ret` and `insn`, at the offsets [`codegen`] uses.
+/// writes `args`, `ret` and `insn` and reads `args` and the window fields, at the offsets
+/// [`codegen`] uses.
 #[repr(C)]
 pub(crate) struct RunCtx<'a> {
     args: [u64; NARGS],
     ret: u64,
     /// One more than the index of the request of the last `insn_start` executed, or 0.
     insn: u64,
+    /// The guest address of the host window.
+    win_base: u64,
+    /// The window length less 7, or 0 when there is no window: an offset below it has 8 bytes
+    /// in the window.
+    win_limit: u64,
+    /// The host address of the window.
+    win_host: u64,
     /// The value of `insn` last reported to the guest memory.
     insn_delivered: u64,
     requests: &'a [Request],
@@ -203,6 +299,10 @@ pub(crate) struct RunCtx<'a> {
 
 const _: () = assert!(std::mem::offset_of!(RunCtx<'static>, ret) == RET_OFFSET as usize);
 const _: () = assert!(std::mem::offset_of!(RunCtx<'static>, insn) == INSN_OFFSET as usize);
+const _: () = assert!(std::mem::offset_of!(RunCtx<'static>, win_base) == WIN_BASE_OFFSET as usize);
+const _: () =
+    assert!(std::mem::offset_of!(RunCtx<'static>, win_limit) == WIN_LIMIT_OFFSET as usize);
+const _: () = assert!(std::mem::offset_of!(RunCtx<'static>, win_host) == WIN_HOST_OFFSET as usize);
 
 /// Report the last `insn_start` generated code stored, if it is new, to the context and the
 /// guest memory, as the interpreter does when it executes one.
@@ -233,9 +333,12 @@ fn enter(
     // calling convention: it saves and restores every callee-saved register it uses and keeps
     // the stack 16-byte aligned. It reads and writes only `env_len` bytes at `env` (every
     // access is bounds checked against that length), the `slot_words` words at `slots` that
-    // the caller allocated, and the argument and return words at the start of `ctx`; it calls
-    // only `service`, with `ctx`. `env` comes from a `&mut [u8]` the caller holds for the whole
-    // call, and nothing else uses these pointers until the block returns.
+    // the caller allocated, the argument and return words at the start of `ctx`, and the host
+    // window `ctx` describes, if any; it calls only `service`, with `ctx`. `env` comes from a
+    // `&mut [u8]` the caller holds for the whole call, and nothing else uses these pointers
+    // until the block returns. The window comes from a `&[AtomicU64]` that outlives the call;
+    // its accesses are checked against its length, and atomics allow shared mutation, so other
+    // threads may use it at the same time.
     let k = unsafe {
         let f = std::mem::transmute::<usize, Entry>(addr as usize);
         f(env, env_len as u64, ctx, slots)

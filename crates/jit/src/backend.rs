@@ -66,6 +66,13 @@ pub trait Backend: Send + Sync + fmt::Debug {
     fn target_default_mo(&self) -> u32 {
         0
     }
+
+    /// How blocks of a guest whose memory order is `guest_mo` keep it on this host; see
+    /// [`ruvm_jit_core::memory_model`]. QEMU's mapping by default.
+    fn fence_mapping(&self, guest_mo: u32) -> ruvm_jit_core::FenceMapping {
+        let _ = guest_mo;
+        ruvm_jit_core::FenceMapping::Qemu
+    }
 }
 
 /// The code of a block for [`InterpBackend`].

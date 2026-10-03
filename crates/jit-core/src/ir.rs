@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::memory_model::FenceMapping;
 use crate::opcode::Opcode;
 use crate::types::{INSN_START_WORDS, TempKind, Type};
 
@@ -404,6 +405,9 @@ pub struct FuncConfig {
     pub addr_type: Type,
     /// `CF_NO_GOTO_PTR`.
     pub no_goto_ptr: bool,
+    /// How the orders in `guest_mo` that the host lacks are enforced; see
+    /// [`crate::memory_model`]. [`FenceMapping::Qemu`] by default.
+    pub fence_mapping: FenceMapping,
 }
 
 impl Default for FuncConfig {
@@ -415,6 +419,7 @@ impl Default for FuncConfig {
             target_default_mo: 0,
             addr_type: Type::I64,
             no_goto_ptr: false,
+            fence_mapping: FenceMapping::Qemu,
         }
     }
 }

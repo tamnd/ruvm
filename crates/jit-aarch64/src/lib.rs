@@ -14,6 +14,10 @@
 //! caller can fall back to the interpreter for those.
 //! Code can be generated on any host, but only run on an AArch64 one.
 //!
+//! [`memory_order`] lowers the fence mappings of [`ruvm_jit_core::memory_model`] (QEMU's,
+//! Risotto's and the RCpc one after Arancini) to `dmb`, `ldapr` and `stlr`, detects FEAT_LRCPC
+//! and picks the mapping for a guest on this host.
+//!
 //! All unsafe code is in the code buffer (mapping, writing and flushing executable memory) and
 //! in the two places the runtime crosses into and back out of generated code.
 
@@ -25,8 +29,10 @@
 mod asm;
 mod buffer;
 mod codegen;
+pub mod memory_order;
 mod runtime;
 
 pub use buffer::{BufferError, CodeBuffer};
-pub use codegen::GenCodeError;
-pub use runtime::{CodeRegion, CompiledTb};
+pub use codegen::{CodegenOptions, GenCodeError};
+pub use memory_order::{HostFeatures, TARGET_DEFAULT_MO, select_fence_mapping};
+pub use runtime::{CodeRegion, CompiledTb, HostWindow};
