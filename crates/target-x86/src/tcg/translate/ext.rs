@@ -45,7 +45,7 @@ enum Bmi {
 
 impl S<'_, '_, '_> {
     /// `decode_by_prefix()`: the column of a four entry row.
-    fn prefix_col(&self) -> usize {
+    pub(super) fn prefix_col(&self) -> usize {
         let p = self.d.prefix;
         if p & PREFIX_REPNZ != 0 {
             3
@@ -59,7 +59,7 @@ impl S<'_, '_, '_> {
     }
 
     /// The `y` operand size: 32 or 64 bits.
-    fn ot_y(&self) -> u32 {
+    pub(super) fn ot_y(&self) -> u32 {
         if self.d.dflag == OT16 { OT32 } else { self.d.dflag }
     }
 
@@ -109,10 +109,16 @@ impl S<'_, '_, '_> {
         Ok(Vex::Map(map))
     }
 
-    /// Decode an instruction after a VEX prefix. Only the general purpose register
-    /// instructions (VEX class 13) are implemented; vector instructions raise #UD.
+    /// Decode an instruction after a VEX prefix: the general purpose register instructions
+    /// (VEX class 13) are handled here, VLDMXCSR and VSTMXCSR and the vector instructions by
+    /// [`super::sse`].
     pub(super) fn vex_insn(&mut self, map: u32) -> R {
         let b = self.ldub()? as u32;
+        match (map, b) {
+            (1, 0xae) => return self.vldst_mxcsr(),
+            (2, 0xf0..) | (3, 0xf0) => {}
+            _ => return self.sse_insn(map, b),
+        }
         let col = self.prefix_col();
         let op = match (map, b) {
             (2, 0xf2) if col == 0 => Some((Bmi::Andn, self.d.feat.bmi1)),
@@ -353,7 +359,7 @@ impl S<'_, '_, '_> {
                 self.gen_adcox(ot, if col == 1 { CC_OP_ADCX } else { CC_OP_ADOX });
                 self.mov_reg_v(ot, reg, g.t0);
             }
-            // The vector instructions of the 0F 38 map are not implemented.
+            (0..0xf0, _) => return self.sse_insn(2, b),
             _ => self.gen_illegal_opcode(),
         }
         Ok(())

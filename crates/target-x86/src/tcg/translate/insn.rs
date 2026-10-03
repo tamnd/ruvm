@@ -968,8 +968,16 @@ impl S<'_, '_, '_> {
                 }
                 self.mov_reg_v(ot, r, g.t0);
             }
-            // Everything else: x87, MMX, SSE, AVX, the 0F 3A map, UD0, UD1, UD2
-            // and the instructions listed as missing in the module documentation.
+            0x110..=0x117 | 0x128..=0x12f | 0x150..=0x17f | 0x1c2 | 0x1c4..=0x1c6 => {
+                self.sse_insn(1, b & 0xff)?;
+            }
+            0x1d0..=0x1fe => self.sse_insn(1, b & 0xff)?,
+            0x13a => {
+                let b = self.ldub()? as u32;
+                self.sse_insn(3, b)?;
+            }
+            // Everything else: x87, UD0, UD1, UD2 and the instructions listed as missing in
+            // the module documentation.
             _ => self.gen_illegal_opcode(),
         }
         Ok(())
