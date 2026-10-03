@@ -37,7 +37,7 @@ use ruvm_jit::cputlb::{
 };
 use ruvm_jit::{Cpu, MmuAccessType};
 
-use super::{Arm, PsciConduit, arm_of, gtimer, ptw, regime_has_2_ranges, vfp};
+use super::{Arm, PsciConduit, arm_of, gic, gtimer, ptw, regime_has_2_ranges, vfp};
 use crate::cpu::{
     ArmCpuModel, ArmFeatures, CpuArmState, GTIMER_HYP, GTIMER_HYPVIRT, GTIMER_PHYS, GTIMER_SEC,
     GTIMER_VIRT, HCR_DC, HCR_E2H, HCR_FWB, HCR_NV, HCR_NV1, HCR_PTW, HCR_TACR, HCR_TDZ, HCR_TGE,
@@ -138,6 +138,9 @@ pub(crate) enum Trap {
     Cpacr,
     /// `cptr_access()`: CPTR_EL3.TCPAC for CPTR_EL2.
     Cptr,
+    /// The `accessfn` of a GICv3 CPU interface register (`gicv3_irqfiq_access()` and
+    /// friends), which the interface decides: see `gic.rs`.
+    Gic,
 }
 
 /// What a run time access check decides, `CPAccessResult`.
@@ -279,6 +282,8 @@ impl Trap {
                     Access::Ok
                 }
             }
+            // The interface is asked by the access check helper, which knows the vCPU.
+            Trap::Gic => Access::Ok,
         }
     }
 }
@@ -810,6 +815,11 @@ pub(crate) fn lookup(key_: u32, feat: &ArmFeatures) -> Option<Reg> {
             return Some(*r);
         }
     }
+    if feat.gicv3 {
+        if let Some(r) = icc_lookup(key_, feat) {
+            return Some(r);
+        }
+    }
     let op0 = key_ >> 14;
     let op1 = key_op1(key_);
     let crn = (key_ >> 7) & 0xf;
@@ -827,15 +837,30 @@ pub(crate) fn lookup(key_: u32, feat: &ArmFeatures) -> Option<Reg> {
     None
 }
 
-/// The cache geometry CCSIDR_EL1 reports for the cache CSSELR_EL1 selects: a 32 KiB L1 data
-/// cache, a 48 KiB L1 instruction cache and a 2 MiB L2, with 64 byte lines.
-fn ccsidr(csselr: u64) -> u64 {
-    match csselr {
-        0 => 0x701f_e00a,
-        1 => 0x201f_e012,
-        2 => 0x70ff_e07a,
-        _ => 0,
+/// The GICv3 CPU interface register with encoding `key_`, as `gicv3_init_cpuif()` defines
+/// them for a CPU whose interface has `feat.gic_prebits` preemption bits.
+fn icc_lookup(key_: u32, feat: &ArmFeatures) -> Option<Reg> {
+    // We don't support IRQ/FIQ bypass and system registers are always enabled, so all the
+    // SRE bits are RAZ/WI or RAO/WI.
+    let sre = |name: &'static str, access: u8, kind: Kind| Reg {
+        name,
+        key: key_,
+        access,
+        trap: Trap::None,
+        kind,
+        feat: always,
+    };
+    match gic::encoding(key_) {
+        (3, 0, 12, 12, 5) => return Some(sre("ICC_SRE_EL1", PL1_RW, Kind::Model(|_| 0x7))),
+        (3, 4, 12, 9, 5) => return Some(sre("ICC_SRE_EL2", PL2_RW, Kind::Model(|_| 0xf))),
+        (3, 6, 12, 12, 5) => return Some(sre("ICC_SRE_EL3", PL3_RW, Kind::Model(|_| 0xf))),
+        _ => {}
     }
+    let enc = gic::encoding(key_);
+    let r = gic::ICC_REGS.iter().find(|r| r.enc == enc && r.prebits <= feat.gic_prebits)?;
+    // The EL3 registers have no accessfn.
+    let trap = if r.access == PL3_RW { Trap::None } else { Trap::Gic };
+    Some(Reg { name: r.name, key: key_, access: r.access, trap, kind: Kind::Special, feat: always })
 }
 
 const fn bit(idx: usize) -> u32 {
@@ -893,6 +918,9 @@ pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
             _ => st.gt_cval[timer],
         };
     }
+    if let Some(v) = arm.gic_read(cpu.core.shared().cpu_index, key_, &st) {
+        return v;
+    }
     let el1_with_el2 = st.current_el() == 1 && st.is_el2_enabled(f);
     match key_ {
         MIDR_EL1 => {
@@ -910,7 +938,9 @@ pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
                 (1 << 31) | arm.mp_affinity(cpu.core.shared().cpu_index)
             }
         }
-        CCSIDR_EL1 => ccsidr(st.csselr_el1),
+        // ccsidr_read(): QEMU's array has 16 entries and the index is masked to fit; the
+        // entries past the 8 a model gives are all zero.
+        CCSIDR_EL1 => model.ccsidr.get((st.csselr_el1 & 15) as usize).copied().unwrap_or(0),
         CTR_EL0 => model.ctr,
         DCZID_EL0 => {
             // aa64_dczid_read(): DZP is set when DC ZVA is not allowed.
@@ -956,6 +986,9 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
             _ => gtimer::cval_write(arm, cpu, &mut st, timer, value),
         }
         st.store(cpu.env);
+        return;
+    }
+    if arm.gic_write(cpu.core.shared().cpu_index, key_, &st, value) {
         return;
     }
     match key_ {

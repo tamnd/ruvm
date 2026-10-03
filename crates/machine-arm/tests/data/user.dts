@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/dts-v1/;
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "linux,dummy-virt";
+	interrupt-parent = <&gic>;
+
+	chosen {
+		bootargs = "from the dtb";
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0 0x40000000 0 0x1000000>;
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0 0x80000000 0 0x1000000>;
+	};
+
+	psci {
+		compatible = "arm,psci";
+		method = "smc";
+		cpu_on = <0x1>;
+	};
+
+	gic: intc@8000000 {
+		compatible = "arm,gic-v3";
+		#interrupt-cells = <3>;
+		interrupt-controller;
+		reg = <0 0x8000000 0 0x10000 0 0x80a0000 0 0xf60000>;
+	};
+
+	pl011@9000000 {
+		compatible = "arm,pl011", "arm,primecell";
+		reg = <0 0x9000000 0 0x1000>;
+		interrupts = <0 1 4>;
+	};
+};

@@ -2,4 +2,10 @@
 
 //! Arm machines: virt, sbsa-ref and every Arm board.
 //!
-//! Empty for now. The plan for this crate is in `spec/24-workspace-layout.md`.
+//! So far this is the `virt` board ([`virt`]) with GICv3, and the device tree writer it uses
+//! ([`fdt`]).
+
+#![forbid(unsafe_code)]
+
+pub mod fdt;
+pub mod virt;

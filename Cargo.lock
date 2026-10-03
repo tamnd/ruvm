@@ -802,6 +802,19 @@ version = "0.3.2"
 [[package]]
 name = "ruvm-machine-arm"
 version = "0.3.2"
+dependencies = [
+ "flate2",
+ "ruvm-base",
+ "ruvm-hw-char",
+ "ruvm-hw-core",
+ "ruvm-hw-intc",
+ "ruvm-hw-timer",
+ "ruvm-hw-virtio",
+ "ruvm-jit",
+ "ruvm-mem",
+ "ruvm-target-arm",
+ "ruvm-virtio-queue",
+]
 
 [[package]]
 name = "ruvm-machine-loongarch"

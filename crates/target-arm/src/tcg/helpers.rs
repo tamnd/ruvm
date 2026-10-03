@@ -18,7 +18,7 @@ use ruvm_jit_core::types::call_flags::NO_RWG_SE;
 use ruvm_jit_core::{HelperInfo, HelperType, MemOp, MemOpIdx};
 use ruvm_jit_interp::{HelperEnv, HelperRegistry, Unwind};
 
-use super::{arm_of, exception_target_el, psci, sysreg};
+use super::{GicAccess, arm_of, exception_target_el, psci, sysreg};
 use crate::cpu::{
     CpuArmState, EXCP_HVC, EXCP_HYP_TRAP, EXCP_PREFETCH_ABORT, EXCP_SMC, EXCP_UDEF, HCR_HCD,
     HCR_NV, HCR_TGE, HCR_TSC, HCR_TWI, PSTATE_DAIF, PSTATE_IL, PSTATE_NRW, PSTATE_NZCV, PSTATE_PAN,
@@ -107,6 +107,7 @@ def!(
     [Ptr, I32, I32, I32],
     h_exception_with_syndrome_el
 );
+def!(EXCEPTION_INTERNAL, "exception_internal", 0, Void, [Ptr, I32], h_exception_internal);
 def!(
     EXCEPTION_PC_ALIGNMENT,
     "exception_pc_alignment",
@@ -142,6 +143,7 @@ def!(UDIV64, "udiv64", NO_RWG_SE, I64, [I64, I64], h_udiv64);
 /// Every AArch64 helper.
 pub(crate) const ALL: &[Def] = &[
     EXCEPTION_WITH_SYNDROME_EL,
+    EXCEPTION_INTERNAL,
     EXCEPTION_PC_ALIGNMENT,
     WFI,
     EXCEPTION_RETURN,
@@ -173,6 +175,12 @@ pub(crate) fn register(r: &mut HelperRegistry) {
 /// `HELPER(exception_with_syndrome_el)`.
 fn h_exception_with_syndrome_el(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| Err(raise_exception(cpu, a[1] as i32, a[2] as u32, a[3] as u32, Ra::None)))
+}
+
+/// `HELPER(exception_internal)`: raise an exception that QEMU handles itself, such as
+/// `EXCP_SEMIHOST`, without a syndrome or target EL.
+fn h_exception_internal(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    run(h, |cpu| Err(cpu.raise_exception(a[1] as i32, Ra::None)))
 }
 
 /// `HELPER(exception_pc_alignment)`.
@@ -285,7 +293,8 @@ fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> 
                 && !(el == 2 && !st.is_el2_enabled(&feat))
                 && !(el == 1 && hcr & HCR_TGE != 0)
         };
-        match el_from_spsr(spsr).filter(|&el| legal(el)) {
+        let target = el_from_spsr(spsr).filter(|&el| legal(el));
+        match target {
             Some(new_el) => {
                 let spsr = spsr as u32 & pstate_valid_mask(feat.pan, feat.uao);
                 st.pstate_write(spsr);
@@ -321,6 +330,10 @@ fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> 
             }
         }
         st.store(cpu.env);
+        if target.is_some() {
+            // arm_call_el_change_hook().
+            arm_of(&ops).gic_el_change(cpu.core.shared().cpu_index, &st);
+        }
         Ok(0)
     })
 }
@@ -381,7 +394,19 @@ fn h_access_check_cp_reg(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwin
         let isread = a[3] != 0;
         let ri = sysreg::lookup(key, feat).expect("the translator checked the register");
         let st = CpuArmState::load(cpu.env);
-        let (syn, target_el) = match ri.trap.check(feat, &st, isread) {
+        let access = if ri.trap == sysreg::Trap::Gic {
+            let index = cpu.core.shared().cpu_index;
+            match arm_of(&ops).gic_access(index, key, &st, isread) {
+                GicAccess::Ok => sysreg::Access::Ok,
+                GicAccess::TrapEl1 => sysreg::Access::TrapEl1,
+                GicAccess::TrapEl2 => sysreg::Access::TrapEl2,
+                GicAccess::TrapEl3 => sysreg::Access::TrapEl3,
+                GicAccess::Undefined => sysreg::Access::Undefined,
+            }
+        } else {
+            ri.trap.check(feat, &st, isread)
+        };
+        let (syn, target_el) = match access {
             sysreg::Access::Ok => return Ok(0),
             sysreg::Access::TrapEl1 => (syndrome, 1),
             sysreg::Access::TrapEl2 => (syndrome, 2),
