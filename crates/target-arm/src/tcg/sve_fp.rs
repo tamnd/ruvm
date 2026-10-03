@@ -2,7 +2,9 @@
 
 //! The SVE and SVE2 floating point helpers: the floating point parts of QEMU's
 //! `sve_helper.c` and the SVE users of `vec_helper.c` (the indexed multiplies, FCMLA by
-//! element, FTSMUL, FRECPS and FRSQRTS).
+//! element, FTSMUL, FRECPS and FRSQRTS), with the FEAT_BF16 operations (BFCVT, BFCVTNT,
+//! BFDOT, BFMMLA, BFMLALB and BFMLALT, which follow `is_ebf()` with FPCR.EBF clear as
+//! FEAT_EBF16 is not implemented) and FMLALB, FMLALT, FMLSLB and FMLSLT.
 //!
 //! They are one family of the `sve` helper ([`super::sve_helper::fam::FP`]). The descriptor
 //! names the operation ([`f`] or a [`super::vfp::op`] number), the element size (the
@@ -89,6 +91,17 @@ pub(crate) mod f {
     pub(crate) const CVTNT: u32 = 118;
     /// Widen the top half of each container.
     pub(crate) const CVTLT: u32 = 119;
+    /// BFCVT and BFCVTNT (extra bit 0) on 32-bit containers.
+    pub(crate) const BFCVT: u32 = 120;
+    /// FMLALB, FMLALT, FMLSLB and FMLSLT: extra bit 0 subtracts, bit 1 picks the top
+    /// halves, bit 2 asks for the indexed form and bits 3 to 5 hold the index.
+    pub(crate) const FMLAL: u32 = 121;
+    /// BFDOT: extra bit 0 asks for the indexed form, bits 1 and 2 hold the index.
+    pub(crate) const BFDOT: u32 = 122;
+    pub(crate) const BFMMLA: u32 = 123;
+    /// BFMLALB and BFMLALT: extra bit 0 picks the top halves, bit 1 asks for the indexed
+    /// form and bits 2 to 4 hold the index.
+    pub(crate) const BFMLAL: u32 = 124;
 }
 
 /// The data field of a call: shape, status (from the element size, as QEMU picks it for
@@ -111,6 +124,8 @@ pub(crate) fn fp(env: &mut [u8], d: &Dsc, x: u64) {
         matches!(d.op, f::CVT | f::TOSINT | f::TOUINT | f::SCVTF | f::UCVTF | f::CVTNT | f::CVTLT);
     if conv_op {
         conv(env, d, &mut s);
+    } else if d.op >= f::BFCVT {
+        widen(env, d, &mut s);
     } else {
         match d.esz {
             1 => run::<Float16>(env, d, x, &mut s),
@@ -459,6 +474,119 @@ fn run<F: Fp>(env: &mut [u8], d: &Dsc, x: u64, s: &mut FloatStatus) {
                         let p1 = el::<F>(&n, b + 2 * r + 1).mul(el(&m, b + 2 * c + 1), s);
                         let sum = p0.add(p1, s);
                         set(&mut out, e, b + k, el::<F>(&za, b + k).add(sum, s).bits());
+                    }
+                }
+            }
+        }
+    }
+    zstore(env, d.d, &out, d.vl);
+}
+
+/// `float16_to_float32_by_bits()`: the exact widening FMLAL uses, which raises nothing and
+/// flushes denormal inputs to zero when `fz16` is set.
+fn f16_to_f32_by_bits(x: u16, fz16: bool) -> Float32 {
+    let x = u32::from(x);
+    let sign = x >> 15;
+    let mut exp = (x >> 10) & 0x1f;
+    let mut frac = x & 0x3ff;
+    if exp == 0x1f {
+        exp = 0xff;
+    } else if exp == 0 {
+        if frac != 0 {
+            if fz16 {
+                frac = 0;
+            } else {
+                // Normalize the denormal.
+                let shift = frac.leading_zeros() - 21;
+                frac = (frac << shift) & 0x3ff;
+                exp = 127 - 15 - shift + 1;
+            }
+        }
+    } else {
+        exp += 127 - 15;
+    }
+    Float32(sign << 31 | exp << 23 | frac << 13)
+}
+
+/// `bfdotadd()`: `sum + (e1.lo * e2.lo + e1.hi * e2.hi)` on the BFloat16 pairs of `e1` and
+/// `e2`, in the status `is_ebf()` makes with FPCR.EBF clear.
+fn bfdotadd(sum: u32, e1: u32, e2: u32, s: &mut FloatStatus) -> u32 {
+    let t1 = Float32(e1 << 16).mul(Float32(e2 << 16), s);
+    let t2 = Float32(e1 & 0xffff_0000).mul(Float32(e2 & 0xffff_0000), s);
+    Float32(sum).add(t1.add(t2, s), s).0
+}
+
+/// The widening operations of FEAT_BF16 and SVE2's FMLAL group, in `FPST_A64`.
+fn widen(env: &mut [u8], d: &Dsc, s: &mut FloatStatus) {
+    let extra = d.data >> 8;
+    let n = zload(env, d.n);
+    let m = zload(env, d.m);
+    let a = zload(env, d.a);
+    let mut out = zload(env, d.d);
+    let words = d.vl / 4;
+    let h = |z: &Z, i: usize| get(z, 1, i) as u16;
+    let wd = |z: &Z, i: usize| get(z, 2, i) as u32;
+    match d.op {
+        f::BFCVT => {
+            let g = pload(env, d.g);
+            for i in 0..words {
+                if act(&g, 2, i) {
+                    let r = u64::from(Float32(wd(&n, i)).to_bfloat16(s).0);
+                    if extra & 1 != 0 {
+                        set(&mut out, 1, 2 * i + 1, r);
+                    } else {
+                        set(&mut out, 2, i, r);
+                    }
+                }
+            }
+        }
+        f::FMLAL => {
+            let fz16 = load_status(env, 1).flush_inputs_to_zero;
+            let negx = if extra & 1 != 0 { 0x8000 } else { 0 };
+            let sel = ((extra >> 1) & 1) as usize;
+            let idx = ((extra >> 3) & 7) as usize;
+            for i in 0..words {
+                let nn = f16_to_f32_by_bits(h(&n, 2 * i + sel) ^ negx, fz16);
+                let mi = if extra & 4 != 0 { (i / 4) * 8 + idx } else { 2 * i + sel };
+                let mm = f16_to_f32_by_bits(h(&m, mi), fz16);
+                set(&mut out, 2, i, u64::from(nn.muladd(mm, Float32(wd(&a, i)), 0, s).0));
+            }
+        }
+        f::BFMLAL => {
+            let sel = (extra & 1) as usize;
+            let idx = ((extra >> 2) & 7) as usize;
+            for i in 0..words {
+                let nn = Float32(u32::from(h(&n, 2 * i + sel)) << 16);
+                let mi = if extra & 2 != 0 { 2 * (i / 4) * 4 + idx } else { 2 * i + sel };
+                let mm = Float32(u32::from(h(&m, mi)) << 16);
+                set(&mut out, 2, i, u64::from(nn.muladd(mm, Float32(wd(&a, i)), 0, s).0));
+            }
+        }
+        _ => {
+            // BFDOT and BFMMLA ignore the cumulative flags and use round to odd with
+            // denormals flushed, as `is_ebf()` sets them up with FPCR.EBF clear.
+            let mut st = *s;
+            st.default_nan_mode = true;
+            st.flush_to_zero = true;
+            st.flush_inputs_to_zero = true;
+            st.rounding_mode = RoundMode::ToOddInf;
+            let st = &mut st;
+            if d.op == f::BFDOT {
+                let idx = ((extra >> 1) & 3) as usize;
+                for i in 0..words {
+                    let mi = if extra & 1 != 0 { (i / 4) * 4 + idx } else { i };
+                    let r = bfdotadd(wd(&a, i), wd(&n, i), wd(&m, mi), st);
+                    set(&mut out, 2, i, u64::from(r));
+                }
+            } else {
+                for b in (0..words).step_by(4) {
+                    let nw = |k: usize| wd(&n, b + k);
+                    let mw = |k: usize| wd(&m, b + k);
+                    for k in 0..4 {
+                        let (r, c) = (k / 2, k % 2);
+                        let t = bfdotadd(wd(&a, b + k), nw(2 * r), mw(2 * c), st);
+                        let t = bfdotadd(t, nw(2 * r + 1), mw(2 * c + 1), st);
+                        set(&mut out, 2, b + k, u64::from(t));
                     }
                 }
             }

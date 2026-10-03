@@ -12,23 +12,24 @@
 //! that only move constants or general registers (RDVL, ADDVL, ADDPL, CNT, INC, DEC and the
 //! immediate DUPs) are expanded inline. The floating point instructions use the status QEMU
 //! picks for each (`FPST_A64_F16` for most half precision forms, else `FPST_A64`), see
-//! [`super::super::sve_fp`].
+//! [`super::super::sve_fp`]. The SVE2 widening, narrowing, pairwise and complex integer
+//! groups, the integer multiplies by element, the dot products and the integer matrix
+//! multiplies use [`super::super::sve2_int`].
 //!
 //! Differences from QEMU:
 //!
-//! - Not implemented yet, so an Undefined Instruction exception: the widening, narrowing,
-//!   pairwise and long SVE2 integer groups, the integer indexed multiplies, the dot products,
-//!   the complex integer instructions (CMLA, CDOT, SQRDCMLAH), FMLALB and its family, the
-//!   BF16 and I8MM instructions, DUPQ and the forms of later extensions (SVE2.1, SVE2.2, SME,
-//!   FP8, FEAT_FAMINMAX: the quadword reductions, the zeroing unary forms, FRINT32 and
-//!   FRINT64, FAMAX, FAMIN, FCLAMP and so on). To match, the `max` model clears the
-//!   ID_AA64ZFR0_EL1 BF16, B16B16 and I8MM fields and keeps SVEver at 1 (SVE2), where QEMU's
-//!   `max` sets them and SVEver 2; they come back when the instructions land.
+//! - Not implemented yet, so an Undefined Instruction exception: the forms of later
+//!   extensions (SVE2.1, SVE2.2, SME, FP8, FEAT_FAMINMAX: the quadword reductions, the
+//!   zeroing unary forms, FRINT32 and FRINT64, FAMAX, FAMIN, FCLAMP, BFMLSLB, BFMLSLT, FDOT,
+//!   the two-way dot products and so on). To match, the `max` model clears the
+//!   ID_AA64ZFR0_EL1 B16B16 field and keeps SVEver at 1 (SVE2), where QEMU's `max` sets
+//!   B16B16 and SVEver 2. DUPQ (SVE2.1) is implemented but needs
+//!   [`crate::cpu::ArmFeatures::sve2p1`], which no model sets.
+//! - ID_AA64ZFR0_EL1.BF16 is 1, not QEMU's 2: FEAT_EBF16 (FPCR.EBF) is not implemented, so
+//!   BFDOT and BFMMLA always take the FPCR.EBF clear path (round to odd, no flags).
 //! - The BFloat16 forms of the arithmetic, FMLA and indexed groups (FEAT_SVE_B16B16) are
 //!   unallocated as `max` does not have it. QEMU 11.1 runs BFMUL (indexed) without
 //!   checking FEAT_SVE_B16B16.
-//! - LDR and STR of a vector or predicate register do not check the alignment when
-//!   SCTLR_ELx.A asks for it.
 //! - The bits of a Z register above the vector length are zeroed by every write, as they are
 //!   in QEMU; the predicate registers likewise.
 
@@ -40,6 +41,7 @@ use crate::cpu::EXCP_UDEF;
 use crate::syndrome::syn_sve_access_trap;
 use crate::tcg::sve_fp::{data as fdata, f, sh};
 use crate::tcg::sve_helper::{Dsc, SVE, SVE_MEM, b, c, cr, fam, mm, pl, pm, pr, pred_count, r, u};
+use crate::tcg::sve2_int::w;
 use crate::tcg::vfp::{op as fop, vfp_expand_imm};
 
 #[allow(missing_docs, unreachable_pub, dead_code, clippy::pedantic, clippy::nursery)]
@@ -50,13 +52,14 @@ mod decode {
 use decode::{
     arg_disas_sve30, arg_disas_sve31, arg_disas_sve32, arg_disas_sve33, arg_disas_sve34,
     arg_disas_sve35, arg_disas_sve36, arg_disas_sve37, arg_disas_sve39, arg_disas_sve40,
-    arg_disas_sve41, arg_disas_sve43, arg_disas_sve45, arg_disas_sve47, arg_disas_sve51,
-    arg_disas_sve52, arg_disas_sve53, arg_disas_sve54, arg_incdec_cnt, arg_incdec_pred,
-    arg_incdec2_cnt, arg_incdec2_pred, arg_ptrue, arg_rpr_esz, arg_rpr_s, arg_rpri_esz,
-    arg_rpri_gather_load, arg_rpri_load, arg_rpri_scatter_store, arg_rpri_store, arg_rprr_esz,
-    arg_rprr_gather_load, arg_rprr_load, arg_rprr_s, arg_rprr_scatter_store, arg_rprr_store,
-    arg_rprrr_esz, arg_rr_dbm, arg_rr_esz, arg_rri, arg_rri_esz, arg_rrr_esz, arg_rrri,
-    arg_rrri_esz, arg_rrrr_esz, arg_rrx_esz, arg_rrxr_esz, arg_while,
+    arg_disas_sve41, arg_disas_sve43, arg_disas_sve45, arg_disas_sve47, arg_disas_sve48,
+    arg_disas_sve49, arg_disas_sve50, arg_disas_sve51, arg_disas_sve52, arg_disas_sve53,
+    arg_disas_sve54, arg_incdec_cnt, arg_incdec_pred, arg_incdec2_cnt, arg_incdec2_pred, arg_ptrue,
+    arg_rpr_esz, arg_rpr_s, arg_rpri_esz, arg_rpri_gather_load, arg_rpri_load,
+    arg_rpri_scatter_store, arg_rpri_store, arg_rprr_esz, arg_rprr_gather_load, arg_rprr_load,
+    arg_rprr_s, arg_rprr_scatter_store, arg_rprr_store, arg_rprrr_esz, arg_rr_dbm, arg_rr_esz,
+    arg_rri, arg_rri_esz, arg_rrr_esz, arg_rrri, arg_rrri_esz, arg_rrrr_esz, arg_rrx_esz,
+    arg_rrxr_esz, arg_while,
 };
 
 pub(super) fn disas(s: &mut S<'_, '_>, insn: u32) -> bool {
@@ -561,6 +564,118 @@ macro_rules! sve_crypto {
             self.sve_gen(ok, |s| {
                 s.sv(fam::CRYPTO, $op, 0, [a.rd, a.rn, a.rm, 0, 0], 0, None, None);
             })
+        }
+    )*};
+}
+
+/// The SVE2 integer instructions on Zd, Zn and Zm of one helper each
+/// (`gen_gvec_ool_arg_zzz()`): the operation, the element size check and the data.
+macro_rules! i2_zzz {
+    ($($name:ident: $op:expr, $chk:expr, $data:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rrr_esz) -> bool {
+            let ok = self.feat().sve2 && $chk(a.esz);
+            self.int2(ok, $op, a.esz, [a.rd, a.rn, a.rm, 0, 0], $data)
+        }
+    )*};
+}
+
+/// The SVE2 integer instructions on Zd, Zn, Zm and Za (`gen_gvec_ool_arg_zzzz()`).
+macro_rules! i2_zzzz {
+    ($($name:ident: $feat:ident, $op:expr, $chk:expr, $data:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rrrr_esz) -> bool {
+            let ok = self.feat().$feat && $chk(a.esz);
+            self.int2(ok, $op, a.esz, [a.rd, a.rn, a.rm, a.ra, 0], $data)
+        }
+    )*};
+}
+
+/// The shift left long, extract narrow and shift right narrow instructions, on the narrow
+/// element size of the encoding: `do_shll_tb()`, `do_narrow_extract()` (`xtn`, where the
+/// immediate must be zero) and `do_shr_narrow()`. The helper takes the wide size.
+macro_rules! i2_zzi {
+    ($($name:ident: $op:expr, $top:expr, $xtn:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rri_esz) -> bool {
+            let ok = self.feat().sve2 && (0..=2).contains(&a.esz) && !($xtn && a.imm != 0);
+            let data = $top | (a.imm as u32) << 1;
+            self.int2(ok, $op, a.esz + 1, [a.rd, a.rn, 0, 0, 0], data)
+        }
+    )*};
+}
+
+/// The multiplies by element on Zd, Zn and Zm[index] (`DO_SVE2_RRX` and `DO_SVE2_RRX_TB`):
+/// the operation, the element size and the data from the index.
+macro_rules! i2_zzx {
+    ($($name:ident: $op:expr, $esz:expr, $data:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rrx_esz) -> bool {
+            let ok = self.feat().sve2;
+            self.int2(ok, $op, $esz, [a.rd, a.rn, a.rm, 0, 0], $data(a.index as u32))
+        }
+    )*};
+}
+
+/// The multiply-adds and dot products by element on Zd, Zn, Zm[index] and Za.
+macro_rules! i2_zzxz {
+    ($($name:ident: $feat:ident, $op:expr, $esz:expr, $data:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rrxr_esz) -> bool {
+            let ok = self.feat().$feat;
+            self.int2(ok, $op, $esz, [a.rd, a.rn, a.rm, a.ra, 0], $data(a.index as u32))
+        }
+    )*};
+}
+
+/// The data of a same-size multiply by element.
+fn ix(i: u32) -> u32 {
+    i
+}
+
+/// The data of a long multiply by element of the bottom halves.
+fn ixb(i: u32) -> u32 {
+    4 | i << 3
+}
+
+/// The data of a long multiply by element of the top halves.
+fn ixt(i: u32) -> u32 {
+    3 | 4 | i << 3
+}
+
+/// The data of SDOT, UDOT, USDOT and SUDOT by element.
+fn sdot_x(i: u32) -> u32 {
+    3 | 4 | i << 3
+}
+
+fn udot_x(i: u32) -> u32 {
+    4 | i << 3
+}
+
+fn usdot_x(i: u32) -> u32 {
+    2 | 4 | i << 3
+}
+
+fn sudot_x(i: u32) -> u32 {
+    1 | 4 | i << 3
+}
+
+/// Not 8-bit elements, as the long, wide and narrow groups.
+fn wide(e: i32) -> bool {
+    e != 0
+}
+
+/// The FEAT_BF16 and FMLAL instructions on Zd, Zn, Zm and Za: the feature, the operation
+/// and the extra data bits of [`f`], from the index for the indexed forms.
+macro_rules! fp_w {
+    ($($name:ident: $feat:ident, $op:expr, $extra:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rrrr_esz) -> bool {
+            let ok = self.feat().$feat;
+            self.fp_w(ok, $op, [a.rd, a.rn, a.rm, a.ra, 0], $extra)
+        }
+    )*};
+}
+
+macro_rules! fp_wx {
+    ($($name:ident: $feat:ident, $op:expr, $extra:expr;)*) => {$(
+        fn $name(&mut self, a: &mut arg_rrxr_esz) -> bool {
+            let ok = self.feat().$feat;
+            self.fp_w(ok, $op, [a.rd, a.rn, a.rm, a.ra, 0], $extra(a.index as u32))
         }
     )*};
 }
@@ -1861,6 +1976,336 @@ impl decode::DisasSve for S<'_, '_> {
     fn trans_PMULLT(&mut self, a: &mut arg_rrr_esz) -> bool {
         self.pmull(a, 1)
     }
+
+    // SVE2 Widening Integer Arithmetic and the other long, wide and narrow groups.
+
+    i2_zzz! {
+        trans_SADDLB: w::SADDL, wide, 0;
+        trans_SADDLT: w::SADDL, wide, 3;
+        trans_SADDLBT: w::SADDL, wide, 2;
+        trans_SSUBLB: w::SSUBL, wide, 0;
+        trans_SSUBLT: w::SSUBL, wide, 3;
+        trans_SSUBLBT: w::SSUBL, wide, 2;
+        trans_SSUBLTB: w::SSUBL, wide, 1;
+        trans_SABDLB: w::SABDL, wide, 0;
+        trans_SABDLT: w::SABDL, wide, 3;
+        trans_UADDLB: w::UADDL, wide, 0;
+        trans_UADDLT: w::UADDL, wide, 3;
+        trans_USUBLB: w::USUBL, wide, 0;
+        trans_USUBLT: w::USUBL, wide, 3;
+        trans_UABDLB: w::UABDL, wide, 0;
+        trans_UABDLT: w::UABDL, wide, 3;
+        trans_SQDMULLB_zzz: w::SQDMULL, wide, 0;
+        trans_SQDMULLT_zzz: w::SQDMULL, wide, 3;
+        trans_SMULLB_zzz: w::SMULL, wide, 0;
+        trans_SMULLT_zzz: w::SMULL, wide, 3;
+        trans_UMULLB_zzz: w::UMULL, wide, 0;
+        trans_UMULLT_zzz: w::UMULL, wide, 3;
+        trans_SADDWB: w::SADDW, wide, 0;
+        trans_SADDWT: w::SADDW, wide, 1;
+        trans_SSUBWB: w::SSUBW, wide, 0;
+        trans_SSUBWT: w::SSUBW, wide, 1;
+        trans_UADDWB: w::UADDW, wide, 0;
+        trans_UADDWT: w::UADDW, wide, 1;
+        trans_USUBWB: w::USUBW, wide, 0;
+        trans_USUBWT: w::USUBW, wide, 1;
+        trans_EORBT: w::EORBT, any, 2;
+        trans_EORTB: w::EORBT, any, 1;
+        trans_CADD_rot90: w::CADD, any, 0;
+        trans_CADD_rot270: w::CADD, any, 1;
+        trans_SQCADD_rot90: w::SQCADD, any, 0;
+        trans_SQCADD_rot270: w::SQCADD, any, 1;
+        trans_ADDHNB: w::ADDHN, wide, 0;
+        trans_ADDHNT: w::ADDHN, wide, 1;
+        trans_RADDHNB: w::RADDHN, wide, 0;
+        trans_RADDHNT: w::RADDHN, wide, 1;
+        trans_SUBHNB: w::SUBHN, wide, 0;
+        trans_SUBHNT: w::SUBHN, wide, 1;
+        trans_RSUBHNB: w::RSUBHN, wide, 0;
+        trans_RSUBHNT: w::RSUBHN, wide, 1;
+    }
+
+    // The accumulating forms with one selector pass it as both.
+    i2_zzzz! {
+        trans_SABALB: sve2, w::SABAL, wide, 0;
+        trans_SABALT: sve2, w::SABAL, wide, 3;
+        trans_UABALB: sve2, w::UABAL, wide, 0;
+        trans_UABALT: sve2, w::UABAL, wide, 3;
+        trans_SMLALB_zzzw: sve2, w::SMLAL, wide, 0;
+        trans_SMLALT_zzzw: sve2, w::SMLAL, wide, 3;
+        trans_UMLALB_zzzw: sve2, w::UMLAL, wide, 0;
+        trans_UMLALT_zzzw: sve2, w::UMLAL, wide, 3;
+        trans_SMLSLB_zzzw: sve2, w::SMLSL, wide, 0;
+        trans_SMLSLT_zzzw: sve2, w::SMLSL, wide, 3;
+        trans_UMLSLB_zzzw: sve2, w::UMLSL, wide, 0;
+        trans_UMLSLT_zzzw: sve2, w::UMLSL, wide, 3;
+        trans_SQDMLALB_zzzw: sve2, w::SQDMLAL, wide, 0;
+        trans_SQDMLALT_zzzw: sve2, w::SQDMLAL, wide, 3;
+        trans_SQDMLALBT: sve2, w::SQDMLAL, wide, 2;
+        trans_SQDMLSLB_zzzw: sve2, w::SQDMLSL, wide, 0;
+        trans_SQDMLSLT_zzzw: sve2, w::SQDMLSL, wide, 3;
+        trans_SQDMLSLBT: sve2, w::SQDMLSL, wide, 2;
+        trans_USDOT_zzzz_4s: sve_i8mm, w::DOT, any, 2;
+    }
+
+    fn trans_ADCLB(&mut self, a: &mut arg_rrrr_esz) -> bool {
+        self.adcl(a, 0)
+    }
+
+    fn trans_ADCLT(&mut self, a: &mut arg_rrrr_esz) -> bool {
+        self.adcl(a, 1)
+    }
+
+    i2_zzi! {
+        trans_SSHLLB: w::SSHLL, 0, false;
+        trans_SSHLLT: w::SSHLL, 1, false;
+        trans_USHLLB: w::USHLL, 0, false;
+        trans_USHLLT: w::USHLL, 1, false;
+        trans_SQXTNB: w::SQXTN, 0, true;
+        trans_SQXTNT: w::SQXTN, 1, true;
+        trans_UQXTNB: w::UQXTN, 0, true;
+        trans_UQXTNT: w::UQXTN, 1, true;
+        trans_SQXTUNB: w::SQXTUN, 0, true;
+        trans_SQXTUNT: w::SQXTUN, 1, true;
+        trans_SHRNB: w::SHRN, 0, false;
+        trans_SHRNT: w::SHRN, 1, false;
+        trans_RSHRNB: w::RSHRN, 0, false;
+        trans_RSHRNT: w::RSHRN, 1, false;
+        trans_SQSHRUNB: w::SQSHRUN, 0, false;
+        trans_SQSHRUNT: w::SQSHRUN, 1, false;
+        trans_SQRSHRUNB: w::SQRSHRUN, 0, false;
+        trans_SQRSHRUNT: w::SQRSHRUN, 1, false;
+        trans_SQSHRNB: w::SQSHRN, 0, false;
+        trans_SQSHRNT: w::SQSHRN, 1, false;
+        trans_SQRSHRNB: w::SQRSHRN, 0, false;
+        trans_SQRSHRNT: w::SQRSHRN, 1, false;
+        trans_UQSHRNB: w::UQSHRN, 0, false;
+        trans_UQSHRNT: w::UQSHRN, 1, false;
+        trans_UQRSHRNB: w::UQRSHRN, 0, false;
+        trans_UQRSHRNT: w::UQRSHRN, 1, false;
+    }
+
+    fn trans_ADDP(&mut self, a: &mut arg_rprr_esz) -> bool {
+        self.pairwise(a, w::ADDP)
+    }
+
+    fn trans_SMAXP(&mut self, a: &mut arg_rprr_esz) -> bool {
+        self.pairwise(a, w::SMAXP)
+    }
+
+    fn trans_UMAXP(&mut self, a: &mut arg_rprr_esz) -> bool {
+        self.pairwise(a, w::UMAXP)
+    }
+
+    fn trans_SMINP(&mut self, a: &mut arg_rprr_esz) -> bool {
+        self.pairwise(a, w::SMINP)
+    }
+
+    fn trans_UMINP(&mut self, a: &mut arg_rprr_esz) -> bool {
+        self.pairwise(a, w::UMINP)
+    }
+
+    // The complex integer instructions.
+
+    fn trans_CMLA_zzzz(&mut self, a: &mut arg_disas_sve49) -> bool {
+        let ok = self.feat().sve2;
+        self.int2(ok, w::CMLA, a.esz, [a.rd, a.rn, a.rm, a.ra, 0], a.rot as u32)
+    }
+
+    fn trans_SQRDCMLAH_zzzz(&mut self, a: &mut arg_disas_sve49) -> bool {
+        let ok = self.feat().sve2;
+        self.int2(ok, w::SQRDCMLAH, a.esz, [a.rd, a.rn, a.rm, a.ra, 0], a.rot as u32)
+    }
+
+    fn trans_CDOT_zzzz(&mut self, a: &mut arg_disas_sve49) -> bool {
+        let ok = self.feat().sve2 && sd(a.esz);
+        self.int2(ok, w::CDOT, a.esz, [a.rd, a.rn, a.rm, a.ra, 0], a.rot as u32)
+    }
+
+    fn trans_CMLA_zzxz_h(&mut self, a: &mut arg_disas_sve50) -> bool {
+        self.cplx_x(a, w::CMLA, 1)
+    }
+
+    fn trans_CMLA_zzxz_s(&mut self, a: &mut arg_disas_sve50) -> bool {
+        self.cplx_x(a, w::CMLA, 2)
+    }
+
+    fn trans_SQRDCMLAH_zzxz_h(&mut self, a: &mut arg_disas_sve50) -> bool {
+        self.cplx_x(a, w::SQRDCMLAH, 1)
+    }
+
+    fn trans_SQRDCMLAH_zzxz_s(&mut self, a: &mut arg_disas_sve50) -> bool {
+        self.cplx_x(a, w::SQRDCMLAH, 2)
+    }
+
+    fn trans_CDOT_zzxw_s(&mut self, a: &mut arg_disas_sve50) -> bool {
+        self.cplx_x(a, w::CDOT, 2)
+    }
+
+    fn trans_CDOT_zzxw_d(&mut self, a: &mut arg_disas_sve50) -> bool {
+        self.cplx_x(a, w::CDOT, 3)
+    }
+
+    // SVE Multiply - Indexed and the dot products.
+
+    i2_zzx! {
+        trans_MUL_zzx_h: w::MUL_X, 1, ix;
+        trans_MUL_zzx_s: w::MUL_X, 2, ix;
+        trans_MUL_zzx_d: w::MUL_X, 3, ix;
+        trans_SQDMULH_zzx_h: w::SQDMULH_X, 1, ix;
+        trans_SQDMULH_zzx_s: w::SQDMULH_X, 2, ix;
+        trans_SQDMULH_zzx_d: w::SQDMULH_X, 3, ix;
+        trans_SQRDMULH_zzx_h: w::SQRDMULH_X, 1, ix;
+        trans_SQRDMULH_zzx_s: w::SQRDMULH_X, 2, ix;
+        trans_SQRDMULH_zzx_d: w::SQRDMULH_X, 3, ix;
+        trans_SQDMULLB_zzx_s: w::SQDMULL, 2, ixb;
+        trans_SQDMULLB_zzx_d: w::SQDMULL, 3, ixb;
+        trans_SQDMULLT_zzx_s: w::SQDMULL, 2, ixt;
+        trans_SQDMULLT_zzx_d: w::SQDMULL, 3, ixt;
+        trans_SMULLB_zzx_s: w::SMULL, 2, ixb;
+        trans_SMULLB_zzx_d: w::SMULL, 3, ixb;
+        trans_SMULLT_zzx_s: w::SMULL, 2, ixt;
+        trans_SMULLT_zzx_d: w::SMULL, 3, ixt;
+        trans_UMULLB_zzx_s: w::UMULL, 2, ixb;
+        trans_UMULLB_zzx_d: w::UMULL, 3, ixb;
+        trans_UMULLT_zzx_s: w::UMULL, 2, ixt;
+        trans_UMULLT_zzx_d: w::UMULL, 3, ixt;
+    }
+
+    i2_zzxz! {
+        trans_MLA_zzxz_h: sve2, w::MLA_X, 1, ix;
+        trans_MLA_zzxz_s: sve2, w::MLA_X, 2, ix;
+        trans_MLA_zzxz_d: sve2, w::MLA_X, 3, ix;
+        trans_MLS_zzxz_h: sve2, w::MLS_X, 1, ix;
+        trans_MLS_zzxz_s: sve2, w::MLS_X, 2, ix;
+        trans_MLS_zzxz_d: sve2, w::MLS_X, 3, ix;
+        trans_SQRDMLAH_zzxz_h: sve2, w::SQRDMLAH_X, 1, ix;
+        trans_SQRDMLAH_zzxz_s: sve2, w::SQRDMLAH_X, 2, ix;
+        trans_SQRDMLAH_zzxz_d: sve2, w::SQRDMLAH_X, 3, ix;
+        trans_SQRDMLSH_zzxz_h: sve2, w::SQRDMLSH_X, 1, ix;
+        trans_SQRDMLSH_zzxz_s: sve2, w::SQRDMLSH_X, 2, ix;
+        trans_SQRDMLSH_zzxz_d: sve2, w::SQRDMLSH_X, 3, ix;
+        trans_SQDMLALB_zzxw_s: sve2, w::SQDMLAL, 2, ixb;
+        trans_SQDMLALB_zzxw_d: sve2, w::SQDMLAL, 3, ixb;
+        trans_SQDMLALT_zzxw_s: sve2, w::SQDMLAL, 2, ixt;
+        trans_SQDMLALT_zzxw_d: sve2, w::SQDMLAL, 3, ixt;
+        trans_SQDMLSLB_zzxw_s: sve2, w::SQDMLSL, 2, ixb;
+        trans_SQDMLSLB_zzxw_d: sve2, w::SQDMLSL, 3, ixb;
+        trans_SQDMLSLT_zzxw_s: sve2, w::SQDMLSL, 2, ixt;
+        trans_SQDMLSLT_zzxw_d: sve2, w::SQDMLSL, 3, ixt;
+        trans_SMLALB_zzxw_s: sve2, w::SMLAL, 2, ixb;
+        trans_SMLALB_zzxw_d: sve2, w::SMLAL, 3, ixb;
+        trans_SMLALT_zzxw_s: sve2, w::SMLAL, 2, ixt;
+        trans_SMLALT_zzxw_d: sve2, w::SMLAL, 3, ixt;
+        trans_UMLALB_zzxw_s: sve2, w::UMLAL, 2, ixb;
+        trans_UMLALB_zzxw_d: sve2, w::UMLAL, 3, ixb;
+        trans_UMLALT_zzxw_s: sve2, w::UMLAL, 2, ixt;
+        trans_UMLALT_zzxw_d: sve2, w::UMLAL, 3, ixt;
+        trans_SMLSLB_zzxw_s: sve2, w::SMLSL, 2, ixb;
+        trans_SMLSLB_zzxw_d: sve2, w::SMLSL, 3, ixb;
+        trans_SMLSLT_zzxw_s: sve2, w::SMLSL, 2, ixt;
+        trans_SMLSLT_zzxw_d: sve2, w::SMLSL, 3, ixt;
+        trans_UMLSLB_zzxw_s: sve2, w::UMLSL, 2, ixb;
+        trans_UMLSLB_zzxw_d: sve2, w::UMLSL, 3, ixb;
+        trans_UMLSLT_zzxw_s: sve2, w::UMLSL, 2, ixt;
+        trans_UMLSLT_zzxw_d: sve2, w::UMLSL, 3, ixt;
+        trans_SDOT_zzxw_4s: sve, w::DOT, 2, sdot_x;
+        trans_SDOT_zzxw_4d: sve, w::DOT, 3, sdot_x;
+        trans_UDOT_zzxw_4s: sve, w::DOT, 2, udot_x;
+        trans_UDOT_zzxw_4d: sve, w::DOT, 3, udot_x;
+        trans_USDOT_zzxw_4s: sve_i8mm, w::DOT, 2, usdot_x;
+        trans_SUDOT_zzxw_4s: sve_i8mm, w::DOT, 2, sudot_x;
+    }
+
+    fn trans_DOT_zzzz(&mut self, a: &mut arg_disas_sve48) -> bool {
+        let ok = self.feat().sve;
+        let data = if a.u != 0 { 0 } else { 3 };
+        self.int2(ok, w::DOT, 2 + a.sz, [a.rd, a.rn, a.rm, a.ra, 0], data)
+    }
+
+    // The integer matrix multiplies, with FEAT_I8MM.
+
+    i2_zzzz! {
+        trans_SMMLA: sve_i8mm, w::MMLA, any, 3;
+        trans_USMMLA: sve_i8mm, w::MMLA, any, 2;
+        trans_UMMLA: sve_i8mm, w::MMLA, any, 0;
+    }
+
+    // FMLALB and its family, and the FEAT_BF16 instructions.
+
+    fp_w! {
+        trans_FMLALB_zzzw: sve2, f::FMLAL, 0;
+        trans_FMLALT_zzzw: sve2, f::FMLAL, 2;
+        trans_FMLSLB_zzzw: sve2, f::FMLAL, 1;
+        trans_FMLSLT_zzzw: sve2, f::FMLAL, 3;
+        trans_BFDOT_zzzz: sve_bf16, f::BFDOT, 0;
+        trans_BFMMLA: sve_bf16, f::BFMMLA, 0;
+        trans_BFMLALB_zzzw: sve_bf16, f::BFMLAL, 0;
+        trans_BFMLALT_zzzw: sve_bf16, f::BFMLAL, 1;
+    }
+
+    fp_wx! {
+        trans_FMLALB_zzxw: sve2, f::FMLAL, |i: u32| 4 | i << 3;
+        trans_FMLALT_zzxw: sve2, f::FMLAL, |i: u32| 2 | 4 | i << 3;
+        trans_FMLSLB_zzxw: sve2, f::FMLAL, |i: u32| 1 | 4 | i << 3;
+        trans_FMLSLT_zzxw: sve2, f::FMLAL, |i: u32| 3 | 4 | i << 3;
+        trans_BFDOT_zzxz: sve_bf16, f::BFDOT, |i: u32| 1 | i << 1;
+        trans_BFMLALB_zzxw: sve_bf16, f::BFMLAL, |i: u32| 2 | i << 2;
+        trans_BFMLALT_zzxw: sve_bf16, f::BFMLAL, |i: u32| 3 | i << 2;
+    }
+
+    fn trans_BFCVT_m(&mut self, a: &mut arg_rpr_esz) -> bool {
+        let ok = self.feat().sve_bf16;
+        self.fp_w(ok, f::BFCVT, [a.rd, a.rn, 0, 0, a.pg], 0)
+    }
+
+    fn trans_BFCVTNT_m(&mut self, a: &mut arg_rpr_esz) -> bool {
+        let ok = self.feat().sve_bf16;
+        self.fp_w(ok, f::BFCVT, [a.rd, a.rn, 0, 0, a.pg], 1)
+    }
+
+    // The quadword permutes of FEAT_F64MM, LD1RO and DUPQ.
+
+    fn trans_ZIP1_q(&mut self, a: &mut arg_rrr_esz) -> bool {
+        self.perm_q(a, w::ZIPQ, 0)
+    }
+
+    fn trans_ZIP2_q(&mut self, a: &mut arg_rrr_esz) -> bool {
+        let data = (self.d.vl & !31) / 2;
+        self.perm_q(a, w::ZIPQ, data)
+    }
+
+    fn trans_UZP1_q(&mut self, a: &mut arg_rrr_esz) -> bool {
+        self.perm_q(a, w::UZPQ, 0)
+    }
+
+    fn trans_UZP2_q(&mut self, a: &mut arg_rrr_esz) -> bool {
+        self.perm_q(a, w::UZPQ, 16)
+    }
+
+    fn trans_TRN1_q(&mut self, a: &mut arg_rrr_esz) -> bool {
+        self.perm_q(a, w::TRNQ, 0)
+    }
+
+    fn trans_TRN2_q(&mut self, a: &mut arg_rrr_esz) -> bool {
+        self.perm_q(a, w::TRNQ, 16)
+    }
+
+    fn trans_LD1RO_zprr(&mut self, a: &mut arg_rprr_load) -> bool {
+        if a.rm == 31 {
+            return false;
+        }
+        self.ld1ro(a.rd, a.pg, a.rn, Some(a.rm), 0, a.dtype)
+    }
+
+    fn trans_LD1RO_zpri(&mut self, a: &mut arg_rpri_load) -> bool {
+        self.ld1ro(a.rd, a.pg, a.rn, None, i64::from(a.imm) * 32, a.dtype)
+    }
+
+    fn trans_DUPQ(&mut self, a: &mut arg_rri_esz) -> bool {
+        let ok = self.feat().sve2p1;
+        self.int2(ok, w::DUPQ, a.esz, [a.rd, a.rn, 0, 0, 0], a.imm as u32)
+    }
 }
 
 /// The data of a gather or scatter descriptor.
@@ -1938,6 +2383,8 @@ impl S<'_, '_> {
         let ok = self.feat().sve;
         self.sve_gen(ok, |s| {
             let addr = s.cont_addr(a.rn, None, 0, i64::from(a.imm) * size);
+            // QEMU asks for alignment (MO_ALIGN_16 or MO_ALIGN_2) when SCTLR_ELx.A is set.
+            let data = data | if s.d.align_mem { 16 } else { 0 };
             s.svm(op, 0, [a.rd, 0, 0, 0, 0], data, addr);
         })
     }
@@ -1977,5 +2424,76 @@ impl S<'_, '_> {
         self.sve_gen(ok, |s| {
             s.sv(fam::CRYPTO, cr::PMULL, a.esz, [a.rd, a.rn, a.rm, 0, 0], sel, None, None);
         })
+    }
+
+    /// Call the SVE2 integer helpers ([`super::super::sve2_int`]).
+    fn int2(&mut self, ok: bool, op: u32, esz: i32, r: [i32; 5], data: u32) -> bool {
+        self.sve_gen(ok, |s| {
+            s.sv(fam::INT2, op, esz, r, data, None, None);
+        })
+    }
+
+    /// `do_adcl()`: the element size field holds the size in bit 0 and the subtraction in
+    /// bit 1.
+    fn adcl(&mut self, a: &arg_rrrr_esz, sel: u32) -> bool {
+        let ok = self.feat().sve2;
+        let data = (a.esz as u32 & 2) | sel;
+        self.int2(ok, w::ADCL, 2 + (a.esz & 1), [a.rd, a.rn, a.rm, a.ra, 0], data)
+    }
+
+    /// The SVE2 integer pairwise instructions.
+    fn pairwise(&mut self, a: &arg_rprr_esz, op: u32) -> bool {
+        let ok = self.feat().sve2;
+        self.int2(ok, op, a.esz, [a.rd, a.rn, a.rm, 0, a.pg], 0)
+    }
+
+    /// CMLA, SQRDCMLAH and CDOT by element (`DO_SVE2_RRXR_ROT`).
+    fn cplx_x(&mut self, a: &arg_disas_sve50, op: u32, esz: i32) -> bool {
+        let ok = self.feat().sve2;
+        let data = a.rot as u32 | 4 | (a.index as u32) << 3;
+        self.int2(ok, op, esz, [a.rd, a.rn, a.rm, a.ra, 0], data)
+    }
+
+    /// The FEAT_BF16 and FMLAL instructions, all on 32-bit elements in `FPST_A64`.
+    fn fp_w(&mut self, ok: bool, op: u32, r: [i32; 5], extra: u32) -> bool {
+        self.sve_gen(ok, |s| {
+            let data = fdata(sh::MISC, false, None, extra);
+            s.sv(fam::FP, op, 2, r, data, None, None);
+        })
+    }
+
+    /// `do_interleave_q()`: the vector length must hold two quadwords, which is checked
+    /// after the access check.
+    fn perm_q(&mut self, a: &arg_rrr_esz, op: u32, data: u32) -> bool {
+        if !self.feat().sve_f64mm {
+            return false;
+        }
+        if self.sve_access_check() {
+            if self.d.vl < 32 {
+                self.unallocated_encoding();
+            } else {
+                self.sv(fam::INT2, op, 0, [a.rd, a.rn, a.rm, 0, 0], data, None, None);
+            }
+        }
+        true
+    }
+
+    /// LD1RO (`do_ldro()`): the vector length must hold an octaword, which is checked after
+    /// the access check.
+    fn ld1ro(&mut self, rd: i32, pg: i32, rn: i32, rm: Option<i32>, imm: i64, dtype: i32) -> bool {
+        if !self.feat().sve_f64mm {
+            return false;
+        }
+        if self.sve_access_check() {
+            if self.d.vl < 32 {
+                self.unallocated_encoding();
+            } else {
+                let (msz, sign) = dtype_mop(dtype);
+                let addr = self.cont_addr(rn, rm, msz, imm);
+                let data = msz | u32::from(sign) << 2;
+                self.svm(mm::LD1RO, dtype_esz(dtype), [rd, 0, 0, 0, pg], data, addr);
+            }
+        }
+        true
     }
 }

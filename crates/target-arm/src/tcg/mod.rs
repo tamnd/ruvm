@@ -133,6 +133,7 @@ mod gtimer;
 mod helpers;
 mod psci;
 mod ptw;
+mod sve2_int;
 mod sve_fp;
 mod sve_helper;
 mod sysreg;

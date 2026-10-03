@@ -134,6 +134,10 @@ pub(crate) mod fam {
     pub(crate) const FP: u32 = 10;
     /// The SVE2 crypto instructions and PMULLB and PMULLT ([`super::cr`]).
     pub(crate) const CRYPTO: u32 = 11;
+    /// The SVE2 widening, narrowing, pairwise, complex and indexed integer operations, the
+    /// integer dot products and matrix multiplies and the quadword permutes
+    /// ([`super::super::sve2_int::w`]).
+    pub(crate) const INT2: u32 = 12;
 }
 
 /// The operations of the CRYPTO family. They work on each 128-bit segment (AES and SM4), on
@@ -421,11 +425,11 @@ pub(crate) const ALL: &[Def] = &[SVE, SVE_MEM];
 
 // Element and register access.
 
-fn mask(esz: u32) -> u64 {
+pub(crate) fn mask(esz: u32) -> u64 {
     if esz >= 3 { u64::MAX } else { (1u64 << (8 << esz)) - 1 }
 }
 
-fn sext(x: u64, esz: u32) -> i64 {
+pub(crate) fn sext(x: u64, esz: u32) -> i64 {
     let sh = 64 - (8 << esz);
     ((x << sh) as i64) >> sh
 }
@@ -440,7 +444,7 @@ pub(crate) fn get(z: &[u8], esz: u32, i: usize) -> u64 {
 }
 
 /// Element `i` of `z`, sign extended.
-fn gets(z: &[u8], esz: u32, i: usize) -> i64 {
+pub(crate) fn gets(z: &[u8], esz: u32, i: usize) -> i64 {
     sext(get(z, esz, i), esz)
 }
 
@@ -570,11 +574,11 @@ fn smin_of(esz: u32) -> i128 {
     -smax_of(esz) - 1
 }
 
-fn ssat(x: i128, esz: u32) -> u64 {
+pub(crate) fn ssat(x: i128, esz: u32) -> u64 {
     x.clamp(smin_of(esz), smax_of(esz)) as u64 & mask(esz)
 }
 
-fn usat(x: i128, esz: u32) -> u64 {
+pub(crate) fn usat(x: i128, esz: u32) -> u64 {
     x.clamp(0, i128::from(mask(esz))) as u64
 }
 
@@ -884,6 +888,10 @@ fn h_sve(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
         }
         fam::CRYPTO => {
             crypto(env, &d);
+            0
+        }
+        fam::INT2 => {
+            super::sve2_int::int2(env, &d);
             0
         }
         _ => unreachable!("bad sve family {}", d.fam),
@@ -1671,7 +1679,8 @@ pub(crate) mod mm {
     pub(crate) const LD1R: u32 = 3;
     /// LD1RQ: a contiguous load of 16 bytes, replicated.
     pub(crate) const LD1RQ: u32 = 4;
-    /// LDR and STR of a Z register (data bit 3: predicate register).
+    /// LDR and STR of a Z register (data bit 3: predicate register, bit 4: SCTLR_ELx.A
+    /// asks for the alignment check).
     pub(crate) const LDR: u32 = 5;
     pub(crate) const STR: u32 = 6;
     /// Gather loads; data bit 3: first fault, bits 4 and 5 the addressing kind ([`OFF_UXTW`]
@@ -1679,6 +1688,8 @@ pub(crate) mod mm {
     pub(crate) const GATHER: u32 = 7;
     /// Scatter stores, data as for GATHER.
     pub(crate) const SCATTER: u32 = 8;
+    /// LD1RO: a contiguous load of 32 bytes, replicated.
+    pub(crate) const LD1RO: u32 = 9;
     /// The fault kinds of LD.
     pub(crate) const FF: u32 = 1;
     pub(crate) const NF: u32 = 2;
@@ -1768,7 +1779,7 @@ fn h_sve_mem(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     let x = a[2];
     run(h, |cpu| {
         match d.op {
-            mm::LD | mm::LD1RQ => cont_ld(cpu, &d, x)?,
+            mm::LD | mm::LD1RQ | mm::LD1RO => cont_ld(cpu, &d, x)?,
             mm::ST => cont_st(cpu, &d, x)?,
             mm::LD1R => ld1r(cpu, &d, x)?,
             mm::LDR | mm::STR => ldr_str(cpu, &d, x)?,
@@ -1800,13 +1811,17 @@ fn cont_probe(
     Ok(())
 }
 
-/// The contiguous loads, `sve_ldN_r()` and `sve_ldnfff1_r()`, and LD1RQ.
+/// The contiguous loads, `sve_ldN_r()` and `sve_ldnfff1_r()`, LD1RQ and LD1RO (`do_ldro()`).
 fn cont_ld(cpu: &mut Cpu<'_>, d: &Dsc, addr: u64) -> R<()> {
     let mem = Mem::new(d);
     let nreg = if d.op == mm::LD { ((d.data >> 3) & 3) as usize + 1 } else { 1 };
     let fault = (d.data >> 5) & 3;
-    // LD1RQ loads one quadword under the low bits of the predicate.
-    let vl = if d.op == mm::LD1RQ { 16 } else { d.vl };
+    // LD1RQ loads one quadword under the low bits of the predicate, LD1RO one octaword.
+    let vl = match d.op {
+        mm::LD1RQ => 16,
+        mm::LD1RO => 32,
+        _ => d.vl,
+    };
     let esz = d.esz;
     let elems = vl >> esz;
     let g = pload(cpu.env, d.g);
@@ -1826,6 +1841,13 @@ fn cont_ld(cpu: &mut Cpu<'_>, d: &Dsc, addr: u64) -> R<()> {
             if d.op == mm::LD1RQ {
                 for b in 16..d.vl {
                     z[b] = z[b % 16];
+                }
+            }
+            if d.op == mm::LD1RO {
+                // Replicated in units of 32 bytes; a tail of 16 is zeroed.
+                let r32 = d.vl & !31;
+                for b in 32..d.vl {
+                    z[b] = if b < r32 { z[b % 32] } else { 0 };
                 }
             }
             zstore(env, (d.d + k) & 31, &z, d.vl);
@@ -1944,10 +1966,20 @@ fn ld1r(cpu: &mut Cpu<'_>, d: &Dsc, addr: u64) -> R<()> {
 /// `gen_sve_ldr()` and `gen_sve_str()`: the register goes to or from memory 8 bytes at a
 /// time, then 4, 2 and 2 for the tail of a predicate register, updating the register as it
 /// goes as QEMU's inline code does.
+///
+/// With SCTLR_ELx.A set QEMU asks for 16-byte alignment of a Z register and 2-byte alignment
+/// of a predicate register. Every access after the first is a multiple of 16 bytes further
+/// on, so only the first can fail the check, and it does before any memory is touched.
 fn ldr_str(cpu: &mut Cpu<'_>, d: &Dsc, addr: u64) -> R<()> {
     let mmu_idx = (d.data >> 16) & 15;
-    let (base, len) =
-        if d.data & 8 != 0 { (preg_off(d.d), d.vl / 8) } else { (vreg_off(d.d), d.vl) };
+    let pred = d.data & 8 != 0;
+    let (base, len) = if pred { (preg_off(d.d), d.vl / 8) } else { (vreg_off(d.d), d.vl) };
+    let align = if pred { 2 } else { 16 };
+    if d.data & 16 != 0 && addr & (align - 1) != 0 {
+        let at = if d.op == mm::LDR { MmuAccessType::DataLoad } else { MmuAccessType::DataStore };
+        let ops = cpu.ops();
+        return Err(ops.do_unaligned_access(cpu, addr, at, mmu_idx as usize, Ra::Tb));
+    }
     let mut off = 0;
     while off < len {
         let rem = len - off;

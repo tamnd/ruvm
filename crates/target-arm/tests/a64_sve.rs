@@ -8,7 +8,9 @@
 //! program under `qemu-system-aarch64 -M virt -cpu max,sve-max-vq=N -accel tcg` at EL1 and
 //! records what it changed. Each case starts from the state [`init_state`] builds (the same
 //! one `gen_sve.py` builds), and the test checks every register the instruction may touch and
-//! the whole data buffer, so a write QEMU does not do is caught as well as a wrong value.
+//! the whole data buffer, so a write QEMU does not do is caught as well as a wrong value. A
+//! case marked "{A}" runs with SCTLR_EL1.A set and X16 and X17 pointing 8 and 9 bytes past
+//! [`MID`]; one marked "{P1}" runs on a `max` with FEAT_SVE2p1, which QEMU's `max` has.
 //!
 //! The memory map follows the virt board where it matters: RAM at 0x4000_0000, the data
 //! buffer around [`MID`], so that the addresses held in vector registers are the same as in
@@ -254,12 +256,19 @@ fn run_vq(vq: usize, lines: &[&str]) -> Vec<String> {
     let vl = 16 * vq;
     let pl = vl / 8;
     let w = World::max(vq as u32);
+    // QEMU's max has FEAT_SVE2p1 and this port's does not: the "{P1}" cases run on a max
+    // with it turned on.
+    let mut m = ArmCpuModel::max().with_sve_max_vq(vq as u32);
+    m.features.sve2p1 = true;
+    let w_p1 = World::new(m);
     let init = init_state(vq);
     let mut bad = Vec::new();
     for (k, line) in lines.iter().enumerate() {
         let (fields, asm) = line.split_once(" ; ").expect("case line");
         let (insn, outs) = fields.split_once(" =>").expect("case line");
         let insn = hex(insn) as u32;
+        let align = asm.starts_with("{A} ");
+        let w = if asm.starts_with("{P1} ") { &w_p1 } else { &w };
 
         let mut want_z = init.z.clone();
         let mut want_p = init.p.clone();
@@ -302,6 +311,11 @@ fn run_vq(vq: usize, lines: &[&str]) -> Vec<String> {
         }
         st.pregs[16][0] = (1u64 << (pl * 8)) - 1;
         st.xregs[..16].copy_from_slice(&init.x);
+        if align {
+            st.sctlr_el[1] |= 2;
+            st.xregs[16] = MID + 8;
+            st.xregs[17] = MID + 9;
+        }
         st.set_nzcv(init.nzcv << 28);
         w.write(MID - BUF as u64 / 2, &init.mem);
         let pc = CODE + 16 * k as u64;
@@ -426,7 +440,7 @@ fn zcr_write_narrows_the_registers() {
 fn max_id_registers() {
     let w = World::max(4);
     let st = w.run(w.state(4), CODE, &[MRS_X3_ID_AA64ZFR0, MRS_X4_ID_AA64PFR0, WFI]);
-    assert_eq!(st.xregs[3], 0x0110_0101_0001_0021);
+    assert_eq!(st.xregs[3], 0x0110_1101_0011_0021);
     assert_eq!((st.xregs[4] >> 32) & 0xf, 1);
 }
 

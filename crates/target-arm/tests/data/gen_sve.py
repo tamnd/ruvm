@@ -24,7 +24,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 LLVM = "/opt/homebrew/opt/llvm/bin"
 QEMU = "/opt/homebrew/bin/qemu-system-aarch64"
-MARCH = "+sve2,+sve2-aes,+sve2-sha3,+sve2-sm4,+sve2-bitperm,+f32mm,+f64mm"
+MARCH = ("+sve2,+sve2-aes,+sve2-sha3,+sve2-sm4,+sve2-bitperm,+f32mm,+f64mm,+bf16,+i8mm,"
+         "+sve2p1")
 LOAD = 0x4020_0000
 MID = 0x4030_0000
 RAM_END = 0x4100_0000
@@ -362,6 +363,120 @@ def cases():
         "prfd pldl1keep, p2, [z6.d, #8]", "prfh pstl1keep, p2, [x8, z5.s, sxtw #1]",
     ]
     out += fp_cases()
+    out += sve2_cases()
+    return out
+
+
+def sve2_cases():
+    """The SVE2 integer widening, narrowing, long, pairwise, complex, indexed and dot product
+    groups, I8MM, BF16, FMLAL, the quadword permutes, LD1RO, DUPQ and the LDR and STR
+    alignment checks. A "{A} " prefix runs the case with SCTLR_EL1.A set and X16 and X17
+    holding X8 + 8 and X8 + 9; "{P1} " marks an SVE2p1 instruction, which the test runs on a
+    model with FEAT_SVE2p1 (QEMU's max has it)."""
+    out = []
+    W = [("h", "b"), ("s", "h"), ("d", "s")]
+
+    def wide(tmpl, pairs=W):
+        for t, n in pairs:
+            out.append(tmpl.format(t=t, n=n))
+
+    for op in ["saddlb", "saddlt", "uaddlb", "uaddlt", "ssublb", "ssublt", "usublb", "usublt",
+               "sabdlb", "sabdlt", "uabdlb", "uabdlt", "smullb", "smullt", "umullb", "umullt",
+               "sqdmullb", "sqdmullt", "saddlbt", "ssublbt", "ssubltb"]:
+        wide(op + " z2.{t}, z3.{n}, z4.{n}")
+    for op in ["sabalb", "sabalt", "uabalb", "uabalt", "smlalb", "smlalt", "umlalb", "umlalt",
+               "smlslb", "smlslt", "umlslb", "umlslt", "sqdmlalb", "sqdmlalt", "sqdmlslb",
+               "sqdmlslt", "sqdmlalbt", "sqdmlslbt"]:
+        wide(op + " z2.{t}, z3.{n}, z4.{n}")
+    for op in ["saddwb", "saddwt", "uaddwb", "uaddwt", "ssubwb", "ssubwt", "usubwb", "usubwt"]:
+        wide(op + " z2.{t}, z3.{t}, z4.{n}")
+    for op in ["eorbt", "eortb"]:
+        for t in "bhsd":
+            out.append(f"{op} z2.{t}, z3.{t}, z4.{t}")
+    for op in ["adclb", "adclt", "sbclb", "sbclt"]:
+        for t in "sd":
+            out += [f"{op} z2.{t}, z3.{t}, z4.{t}", f"{op} z2.{t}, z0.{t}, z1.{t}"]
+    for op in ["cadd", "sqcadd"]:
+        for t in "bhsd":
+            for rot in [90, 270]:
+                out.append(f"{op} z2.{t}, z2.{t}, z3.{t}, #{rot}")
+    for op in ["sshllb", "sshllt", "ushllb", "ushllt"]:
+        for t, n, i in [("h", "b", 0), ("h", "b", 7), ("s", "h", 5), ("d", "s", 31),
+                        ("d", "s", 0)]:
+            out.append(f"{op} z2.{t}, z3.{n}, #{i}")
+    for op in ["sqxtnb", "sqxtnt", "uqxtnb", "uqxtnt", "sqxtunb", "sqxtunt"]:
+        wide(op + " z2.{n}, z3.{t}")
+        wide(op + " z2.{n}, z0.{t}")
+    for op in ["shrnb", "shrnt", "rshrnb", "rshrnt", "sqshrnb", "sqshrnt", "sqrshrnb",
+               "sqrshrnt", "uqshrnb", "uqshrnt", "uqrshrnb", "uqrshrnt", "sqshrunb",
+               "sqshrunt", "sqrshrunb", "sqrshrunt"]:
+        for t, n, i in [("h", "b", 1), ("h", "b", 8), ("s", "h", 5), ("s", "h", 16),
+                        ("d", "s", 32), ("d", "s", 17)]:
+            out.append(f"{op} z2.{n}, z3.{t}, #{i}")
+        out.append(f"{op} z2.b, z0.h, #3")
+    for op in ["addhnb", "addhnt", "raddhnb", "raddhnt", "subhnb", "subhnt", "rsubhnb",
+               "rsubhnt"]:
+        wide(op + " z2.{n}, z3.{t}, z4.{t}")
+    for op in ["addp", "smaxp", "umaxp", "sminp", "uminp"]:
+        for t in "bhsd":
+            out.append(f"{op} z2.{t}, p2/m, z2.{t}, z3.{t}")
+    for op in ["cmla", "sqrdcmlah"]:
+        for t in "bhsd":
+            for rot in [0, 90, 180, 270]:
+                out.append(f"{op} z2.{t}, z3.{t}, z4.{t}, #{rot}")
+        for rot, i in [(0, 0), (90, 3), (180, 1), (270, 2)]:
+            out.append(f"{op} z2.h, z3.h, z4.h[{i}], #{rot}")
+            out.append(f"{op} z2.s, z3.s, z12.s[{i % 2}], #{rot}")
+    for rot in [0, 90, 180, 270]:
+        out += [f"cdot z2.s, z3.b, z4.b, #{rot}", f"cdot z2.d, z3.h, z4.h, #{rot}",
+                f"cdot z2.s, z3.b, z4.b[{rot // 90}], #{rot}",
+                f"cdot z2.d, z3.h, z13.h[{rot // 180}], #{rot}"]
+    for op in ["mul", "mla", "mls", "sqdmulh", "sqrdmulh", "sqrdmlah", "sqrdmlsh"]:
+        out += [f"{op} z2.h, z3.h, z4.h[7]", f"{op} z2.h, z3.h, z1.h[2]",
+                f"{op} z2.s, z3.s, z4.s[3]", f"{op} z2.s, z3.s, z7.s[0]",
+                f"{op} z2.d, z3.d, z12.d[1]", f"{op} z2.d, z3.d, z4.d[0]"]
+    for op in ["smullb", "smullt", "umullb", "umullt", "sqdmullb", "sqdmullt", "smlalb",
+               "smlalt", "umlalb", "umlalt", "smlslb", "smlslt", "umlslb", "umlslt",
+               "sqdmlalb", "sqdmlalt", "sqdmlslb", "sqdmlslt"]:
+        out += [f"{op} z2.s, z3.h, z4.h[7]", f"{op} z2.s, z3.h, z1.h[2]",
+                f"{op} z2.d, z3.s, z12.s[3]", f"{op} z2.d, z3.s, z4.s[0]"]
+    for op in ["sdot", "udot"]:
+        out += [f"{op} z2.s, z3.b, z4.b", f"{op} z2.d, z3.h, z4.h",
+                f"{op} z2.s, z3.b, z4.b[3]", f"{op} z2.s, z3.b, z1.b[0]",
+                f"{op} z2.d, z3.h, z12.h[1]", f"{op} z2.d, z3.h, z4.h[0]"]
+    out += ["usdot z2.s, z3.b, z4.b", "usdot z2.s, z3.b, z4.b[2]", "sudot z2.s, z3.b, z4.b[1]",
+            "usdot z2.s, z3.b, z1.b[3]", "sudot z2.s, z3.b, z7.b[0]"]
+    for op in ["smmla", "ummla", "usmmla"]:
+        out += [f"{op} z2.s, z3.b, z4.b", f"{op} z2.s, z1.b, z5.b"]
+    for op in ["fmlalb", "fmlalt", "fmlslb", "fmlslt"]:
+        out += [f"{op} z9.s, z8.h, z11.h", f"{op} z12.s, z11.h, z8.h",
+                f"{op} z2.s, z3.h, z4.h", f"{op} z9.s, z8.h, z3.h[7]",
+                f"{op} z12.s, z11.h, z4.h[2]", f"{op} z2.s, z3.h, z4.h[0]"]
+    out += ["bfdot z9.s, z12.h, z9.h", "bfdot z12.s, z9.h, z12.h", "bfdot z2.s, z3.h, z4.h",
+            "bfdot z9.s, z12.h, z3.h[3]", "bfdot z2.s, z3.h, z4.h[0]",
+            "bfdot z12.s, z9.h, z4.h[1]",
+            "bfmmla z9.s, z12.h, z9.h", "bfmmla z12.s, z9.h, z12.h",
+            "bfmmla z2.s, z3.h, z4.h"]
+    for op in ["bfmlalb", "bfmlalt"]:
+        out += [f"{op} z9.s, z12.h, z9.h", f"{op} z12.s, z9.h, z12.h",
+                f"{op} z2.s, z3.h, z4.h", f"{op} z9.s, z12.h, z4.h[7]",
+                f"{op} z12.s, z9.h, z3.h[2]"]
+    for src in [9, 12, 3]:
+        out += [f"bfcvt z2.h, p2/m, z{src}.s", f"bfcvtnt z2.h, p2/m, z{src}.s"]
+    for op in ["zip1", "zip2", "uzp1", "uzp2", "trn1", "trn2"]:
+        out.append(f"{op} z2.q, z3.q, z4.q")
+    for m, sz in [("b", 0), ("h", 1), ("w", 2), ("d", 3)]:
+        t = "bhsd"[sz]
+        sh = f", lsl #{sz}" if sz else ""
+        out += [f"ld1ro{m} {{z2.{t}}}, p2/z, [x8, #-64]", f"ld1ro{m} {{z2.{t}}}, p2/z, [x8, #32]",
+                f"ld1ro{m} {{z2.{t}}}, p2/z, [x8, x9{sh}]",
+                f"ld1ro{m} {{z2.{t}}}, p1/z, [x14, x9{sh}]"]
+    for t, i in [("b", 0), ("b", 13), ("h", 5), ("s", 3), ("d", 1), ("d", 0)]:
+        out.append(f"{{P1}} dupq z2.{t}, z3.{t}[{i}]")
+    out += ["{A} ldr z2, [x16]", "{A} ldr z2, [x8, #1, mul vl]", "{A} ldr p3, [x16]",
+            "{A} ldr p3, [x17]", "{A} ldr p3, [x8, #1, mul vl]", "{A} str z2, [x16]",
+            "{A} str z2, [x8, #-1, mul vl]", "{A} str p3, [x17, #1, mul vl]",
+            "{A} str p3, [x16, #3, mul vl]", "ldr z2, [x8, #1, mul vl]"]
     return out
 
 
@@ -459,7 +574,8 @@ def assemble(lines):
 
     def one(asm):
         r = subprocess.run([f"{LLVM}/llvm-mc", "-triple=aarch64", f"-mattr={MARCH}",
-                            "-show-encoding"], input=asm + "\n", capture_output=True, text=True)
+                            "-show-encoding"], input=strip(asm) + "\n", capture_output=True,
+                           text=True)
         m = re.search(r"encoding: \[(0x..),(0x..),(0x..),(0x..)\]", r.stdout)
         if r.returncode != 0 or not m:
             print(f"dropped: {asm}", file=sys.stderr)
@@ -469,6 +585,18 @@ def assemble(lines):
 
     with ThreadPoolExecutor(8) as ex:
         return [r for r in ex.map(one, lines) if r]
+
+
+def strip(asm):
+    """The assembly without its "{A} " or "{P1} " prefix."""
+    return re.sub(r"^\{\w+\} ", "", asm)
+
+
+# The code around an "{A} " case: X16 = X8 + 8, X17 = X8 + 9 and SCTLR_EL1.A set before the
+# instruction, cleared after it. X16, X17 and X28 are not in the dump.
+ALIGN_ON = ["add x16, x8, #8", "add x17, x8, #9", "mrs x28, sctlr_el1", "orr x28, x28, #2",
+            "msr sctlr_el1, x28", "isb"]
+ALIGN_OFF = ["mrs x28, sctlr_el1", "bic x28, x28, #2", "msr sctlr_el1, x28", "isb"]
 
 
 def ppad(pl):
@@ -486,7 +614,7 @@ def movx(reg, v):
     return s
 
 
-def program(vq, words):
+def program(vq, cs):
     vl = 16 * vq
     pl = vl // 8
     z, p, x, nzcv, mem = init_state(vq)
@@ -496,8 +624,10 @@ def program(vq, words):
           "adr x0, vectors", "msr vbar_el1, x0", "adr x0, stack_top", "mov sp, x0"]
     a += movx("x27", 0x0900_0000)
     a += ["mov w0, #0x301", "str w0, [x27, #0x30]", "isb"]
-    for w in words:
-        a += ["bl init", f".inst 0x{w:08x}", "bl dump"]
+    for w, asm in cs:
+        al = asm.startswith("{A} ")
+        a += ["bl init"] + (ALIGN_ON if al else []) + [f".inst 0x{w:08x}"]
+        a += (ALIGN_OFF if al else []) + ["bl dump"]
     a += ["mov x0, #0x18", "adr x1, exit_block", "hlt #0xf000", "b ."]
     a += ["init:",
           "adr x29, pristine", "adr x28, buf", f"mov x25, #{BUF // 16}",
@@ -550,9 +680,9 @@ def program(vq, words):
     return text
 
 
-def build_and_run(vq, words):
+def build_and_run(vq, cs):
     with tempfile.TemporaryDirectory() as d:
-        src = program(vq, words)
+        src = program(vq, cs)
         # The buffer is not in the image: place it with an absolute symbol.
         src = src.replace("adr x28, buf", "\n".join(movx("x28", MID - BUF // 2)))
         src = src.replace("adr x0, buf", "\n".join(movx("x0", MID - BUF // 2)))
@@ -567,8 +697,8 @@ def build_and_run(vq, words):
                             f"loader,file={d}/h.bin,addr={LOAD:#x},cpu-num=0"],
                            capture_output=True, text=True, timeout=600)
     rows = [l[2:].strip() for l in r.stdout.splitlines() if l.startswith("R ")]
-    if len(rows) != len(words):
-        sys.exit(f"vq {vq}: {len(rows)} rows for {len(words)} cases\n{r.stderr}")
+    if len(rows) != len(cs):
+        sys.exit(f"vq {vq}: {len(rows)} rows for {len(cs)} cases\n{r.stderr}")
     return [bytes.fromhex(row) for row in rows]
 
 
@@ -578,7 +708,6 @@ def le_hex(bs):
 
 def main():
     cs = assemble(cases())
-    words = [w for w, _ in cs]
     print("# SPDX-License-Identifier: GPL-2.0-or-later")
     print("#")
     print("# SVE and SVE2 cases for tests/a64_sve.rs, generated by gen_sve.py from QEMU 11.1")
@@ -589,13 +718,14 @@ def main():
     print("# zN, pN and ffr as one hex number (element 0 lowest), xN, nzcv (the four flag")
     print("# bits), esr (ESR_EL1 if the instruction raised an exception) and mOFF, the 64-bit")
     print("# little endian word at byte offset OFF from X8, fpsr (FPSR if not zero). Then the")
-    print("# assembly.")
+    print("# assembly, after \"{A} \" for a case run with SCTLR_EL1.A set, X16 = X8 + 8 and")
+    print("# X17 = X8 + 9, or \"{P1} \" for an SVE2p1 instruction.")
     for vq in VQS:
         vl = 16 * vq
         pl = vl // 8
         z, p, x, nzcv, mem = init_state(vq)
         print(f"vq {vq}")
-        for (w, asm), row in zip(cs, build_and_run(vq, words)):
+        for (w, asm), row in zip(cs, build_and_run(vq, cs)):
             ch = []
             o = 0
             for n in range(NZ):

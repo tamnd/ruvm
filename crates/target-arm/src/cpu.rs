@@ -860,6 +860,13 @@ pub struct ArmFeatures {
     pub sve_f32mm: bool,
     /// FEAT_F64MM (`aa64_sve_f64mm`).
     pub sve_f64mm: bool,
+    /// FEAT_BF16 for SVE (`aa64_sve_bf16`): BFCVT, BFCVTNT, BFDOT, BFMMLA and BFMLAL.
+    pub sve_bf16: bool,
+    /// FEAT_I8MM for SVE (`aa64_sve_i8mm`): SMMLA, UMMLA, USMMLA, USDOT and SUDOT.
+    pub sve_i8mm: bool,
+    /// FEAT_SVE2p1 (`aa64_sve2p1`). Only DUPQ looks at it; no model sets it, as the rest of
+    /// SVE2.1 is not implemented, so it exists for testing DUPQ.
+    pub sve2p1: bool,
     /// The largest vector length in quadwords, QEMU's `sve-max-vq` (every length from 1 to
     /// this is supported, as for TCG). Zero without SVE.
     pub sve_max_vq: u32,
@@ -1046,10 +1053,10 @@ impl ArmCpuModel {
 
     /// `max` cut down to what this port implements: the `cortex-a76` feature set with QEMU's
     /// `max` MIDR, CTR_EL0.IDC and DIC, and SVE2 with the AES, PMULL128, BitPerm, SHA3 and
-    /// SM4 extensions, F32MM and F64MM, at vector lengths up to 2048 bits. The vector length
-    /// limit is [`ArmCpuModel::with_sve_max_vq`], `-cpu max,sve-max-vq=N`. QEMU's `max` has
-    /// many more features (BF16, I8MM, SVE2p1, SME, MTE, PAuth and so on) that this port does
-    /// not; their ID register fields read as zero here.
+    /// SM4 extensions, F32MM, F64MM, BF16 and I8MM, at vector lengths up to 2048 bits. The
+    /// vector length limit is [`ArmCpuModel::with_sve_max_vq`], `-cpu max,sve-max-vq=N`.
+    /// QEMU's `max` has many more features (SVE2p1, EBF16, SVE_B16B16, SME, MTE, PAuth and so
+    /// on) that this port does not; their ID register fields read as zero here.
     pub fn max() -> ArmCpuModel {
         let a76 = ArmCpuModel::cortex_a76();
         ArmCpuModel {
@@ -1060,10 +1067,10 @@ impl ArmCpuModel {
             clidr: 0x0000_0123,
             // ID_AA64PFR0_EL1.SVE = 1.
             id_aa64pfr0: a76.id_aa64pfr0 | (1 << 32),
-            // SVEver 1 (SVE2), AES 2 (with PMULL128), BitPerm 1, SHA3 1, SM4 1, F32MM 1 and
-            // F64MM 1, as in QEMU's `max`. QEMU also sets SVEver 2 (SVE2p1), BF16 2, B16B16 1
-            // and I8MM 1; those fields come back when their instructions land.
-            id_aa64zfr0: 0x0110_0101_0001_0021,
+            // SVEver 1 (SVE2), AES 2 (with PMULL128), BitPerm 1, BF16 1, SHA3 1, SM4 1,
+            // I8MM 1, F32MM 1 and F64MM 1. QEMU's `max` sets SVEver 2 (SVE2p1), BF16 2
+            // (FEAT_EBF16) and B16B16 1; those fields come up when their instructions land.
+            id_aa64zfr0: 0x0110_1101_0011_0021,
             features: ArmFeatures {
                 sve: true,
                 sve2: true,
@@ -1073,6 +1080,8 @@ impl ArmCpuModel {
                 sve_sm4: true,
                 sve_f32mm: true,
                 sve_f64mm: true,
+                sve_bf16: true,
+                sve_i8mm: true,
                 sve_max_vq: ARM_MAX_VQ as u32,
                 ..a76.features
             },
