@@ -21,10 +21,10 @@ use ruvm_mem::{Endian, MemTxAttrs};
 use super::cc::{CC_OP_EFLAGS, cc_op_has_eflags, cc_op_size, compute_all, compute_c, parity};
 use super::env::{
     APIC_BASE, CC_A, CC_C, CC_O, CC_OP, CC_SRC, CC_Z, CR8, CSTAR, EFER, EFLAGS, EIP, FMASK,
-    HF_INHIBIT_IRQ_MASK, HF_OSFXSR_MASK, HF_SMAP_MASK, HF_UMIP_MASK, HFLAGS, KERNELGSBASE, LSTAR,
-    MISC_ENABLE, PAT, RF_MASK, SEG_BASE, STAR, SYSENTER_CS, SYSENTER_EIP, SYSENTER_ESP, TF_MASK,
-    TSC_AUX, TSC_OFFSET, XCR0, cc_compute_all, compute_eflags, cr, dr, ld32, ld64, load_eflags,
-    reg, seg, st32, st64,
+    HF_AVX_EN_MASK, HF_INHIBIT_IRQ_MASK, HF_OSFXSR_MASK, HF_SMAP_MASK, HF_UMIP_MASK, HFLAGS,
+    KERNELGSBASE, LSTAR, MISC_ENABLE, PAT, RF_MASK, SEG_BASE, STAR, SYSENTER_CS, SYSENTER_EIP,
+    SYSENTER_ESP, TF_MASK, TSC_AUX, TSC_OFFSET, XCR0, avx_enabled, cc_compute_all, compute_eflags,
+    cr, dr, ld32, ld64, load_eflags, reg, seg, st32, st64,
 };
 use super::seg::{self as sh, raise_exception_err_ra, raise_exception_ra, raise_interrupt2};
 use super::{
@@ -77,6 +77,8 @@ macro_rules! def {
             Def { name: $name, flags: $flags, ret: $ret, args: &[$($a),*], f: $f };
     };
 }
+
+pub(crate) mod vec;
 
 /// Run `f` on the vCPU behind `h`, turning a guest exception into an [`Unwind`].
 fn run(h: &mut HelperEnv<'_>, f: impl FnOnce(&mut Cpu<'_>) -> R<u64>) -> Result<u128, Unwind> {
@@ -898,7 +900,7 @@ fn update_cr4(cpu: &mut Cpu<'_>, new_cr4: u64) {
     let ops = cpu.ops();
     let m = x86_of(&ops).model();
     let mut v = new_cr4;
-    let mut hf = hflags(cpu) & !(HF_OSFXSR_MASK | HF_SMAP_MASK | HF_UMIP_MASK);
+    let mut hf = hflags(cpu) & !(HF_OSFXSR_MASK | HF_SMAP_MASK | HF_UMIP_MASK | HF_AVX_EN_MASK);
     if !m.has_feature("sse") {
         v &= !CR4_OSFXSR_MASK;
     }
@@ -925,6 +927,9 @@ fn update_cr4(cpu: &mut Cpu<'_>, new_cr4: u64) {
     }
     if !m.has_feature("lam") {
         v &= !CR4_LAM_SUP_MASK;
+    }
+    if avx_enabled(v, ld64(cpu.env, XCR0)) {
+        hf |= HF_AVX_EN_MASK;
     }
     st64(cpu.env, cr(4), v);
     set_hflags(cpu, hf);
@@ -1249,7 +1254,7 @@ const ALL: &[&Def] = &[
 
 /// Register every x86 helper in `r`.
 pub(crate) fn register(r: &mut HelperRegistry) {
-    for d in ALL {
+    for d in ALL.iter().chain(vec::ALL) {
         r.register_info(&d.info(), d.f);
     }
 }

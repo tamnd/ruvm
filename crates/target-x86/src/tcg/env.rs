@@ -100,8 +100,45 @@ pub const TSC_AUX: usize = APIC_BASE + 8;
 pub const MISC_ENABLE: usize = TSC_AUX + 8;
 /// `xcr0`.
 pub const XCR0: usize = MISC_ENABLE + 8;
+/// `fpstt`, 32 bits: the x87 top of stack.
+pub const FPSTT: usize = XCR0 + 8;
+/// `fpus`, 32 bits: the x87 status word. TOP lives in [`FPSTT`].
+pub const FPUS: usize = FPSTT + 4;
+/// `fpuc`, 32 bits: the x87 control word.
+pub const FPUC: usize = FPUS + 4;
+/// `fpop`, 32 bits: the last x87 opcode.
+pub const FPOP: usize = FPUC + 4;
+/// `fptags[8]`, one byte each, 1 meaning empty.
+pub const FPTAGS: usize = FPOP + 4;
+/// `fpip`: the last x87 instruction pointer.
+pub const FPIP: usize = FPTAGS + 8;
+/// `fpdp`: the last x87 data pointer.
+pub const FPDP: usize = FPIP + 8;
+/// `fpcs`, 32 bits.
+pub const FPCS: usize = FPDP + 8;
+/// `fpds`, 32 bits.
+pub const FPDS: usize = FPCS + 4;
+/// `fpregs[8]`, [`FPREG_SIZE`] bytes each: the significand (also the MMX register), then
+/// the sign and exponent.
+pub const FPREGS: usize = FPDS + 4;
+/// The size of one x87 register slot.
+pub const FPREG_SIZE: usize = 16;
+/// `ft0`, the x87 temporary, laid out like an x87 register.
+pub const FT0: usize = FPREGS + 8 * FPREG_SIZE;
+/// `mxcsr`, 32 bits.
+pub const MXCSR: usize = FT0 + FPREG_SIZE;
+/// `pkru`, 32 bits.
+pub const PKRU: usize = MXCSR + 4;
+/// `xmm_regs[32]`, [`ZMM_SIZE`] bytes each.
+pub const XMM_REGS: usize = PKRU + 4;
+/// The size of one vector register.
+pub const ZMM_SIZE: usize = 64;
+/// `xmm_t0`, the vector operand loaded from memory.
+pub const XMM_T0: usize = XMM_REGS + 32 * ZMM_SIZE;
+/// `mmx_t0`, the MMX operand loaded from memory.
+pub const MMX_T0: usize = XMM_T0 + ZMM_SIZE;
 /// The size of the whole buffer.
-pub const ENV_SIZE: usize = XCR0 + 8;
+pub const ENV_SIZE: usize = MMX_T0 + 8;
 
 /// The offset of general purpose register `r`.
 pub const fn reg(r: usize) -> usize {
@@ -111,6 +148,16 @@ pub const fn reg(r: usize) -> usize {
 /// The offset of the segment cache of segment register `s`.
 pub const fn seg(s: usize) -> usize {
     SEGS + SEG_SIZE * s
+}
+
+/// The offset of physical x87 register `n`.
+pub const fn fpreg(n: usize) -> usize {
+    FPREGS + FPREG_SIZE * n
+}
+
+/// The offset of vector register `n`.
+pub const fn zmm(n: usize) -> usize {
+    XMM_REGS + ZMM_SIZE * n
 }
 
 /// The offset of control register `n` (0, 2, 3 or 4).
@@ -183,7 +230,9 @@ pub const HF_OSFXSR_MASK: u32 = 1 << 22;
 /// `HF_SMAP_MASK`.
 pub const HF_SMAP_MASK: u32 = 1 << 23;
 /// `HF_UMIP_MASK`.
-pub const HF_UMIP_MASK: u32 = 1 << 25;
+pub const HF_UMIP_MASK: u32 = 1 << 27;
+/// `HF_AVX_EN_MASK`: CR4.OSXSAVE is set and XCR0 enables SSE and AVX state.
+pub const HF_AVX_EN_MASK: u32 = 1 << 28;
 /// `HF2_HIF_MASK`.
 pub const HF2_HIF_MASK: u32 = 1 << 1;
 
@@ -277,6 +326,38 @@ pub fn load_state(env: &mut [u8], s: &X86CpuState) {
     st64(env, TSC_AUX, s.tsc_aux);
     st64(env, MISC_ENABLE, s.msr_ia32_misc_enable);
     st64(env, XCR0, s.xcr0);
+    st32(env, FPSTT, s.fpstt & 7);
+    st32(env, FPUS, u32::from(s.fpus));
+    st32(env, FPUC, u32::from(s.fpuc));
+    st32(env, FPOP, u32::from(s.fpop));
+    env[FPTAGS..FPTAGS + 8].copy_from_slice(&s.fptags);
+    st64(env, FPIP, s.fpip);
+    st64(env, FPDP, s.fpdp);
+    st32(env, FPCS, u32::from(s.fpcs));
+    st32(env, FPDS, u32::from(s.fpds));
+    for i in 0..8 {
+        st64(env, fpreg(i), s.fpregs[i][0]);
+        st64(env, fpreg(i) + 8, s.fpregs[i][1] & 0xffff);
+    }
+    st32(env, MXCSR, s.mxcsr);
+    st32(env, PKRU, s.pkru);
+    for i in 0..32 {
+        for j in 0..8 {
+            st64(env, zmm(i) + 8 * j, s.xmm_regs[i][j]);
+        }
+    }
+    // HF_AVX_EN_MASK is derived state, recomputed as cpu_sync_avx_hflag() does.
+    let mut hf = s.hflags & !HF_AVX_EN_MASK;
+    if avx_enabled(s.cr4, s.xcr0) {
+        hf |= HF_AVX_EN_MASK;
+    }
+    st32(env, HFLAGS, hf);
+}
+
+/// The condition of `cpu_sync_avx_hflag()`.
+pub fn avx_enabled(cr4: u64, xcr0: u64) -> bool {
+    // CR4.OSXSAVE, and XCR0 enables both SSE and YMM state.
+    cr4 & (1 << 18) != 0 && xcr0 & 6 == 6
 }
 
 /// Copy the buffer back into `s`, folding the lazy flags into `rflags` as
@@ -321,6 +402,25 @@ pub fn save_state(env: &[u8], s: &mut X86CpuState) {
     s.tsc_aux = ld64(env, TSC_AUX);
     s.msr_ia32_misc_enable = ld64(env, MISC_ENABLE);
     s.xcr0 = ld64(env, XCR0);
+    s.fpstt = ld32(env, FPSTT) & 7;
+    s.fpus = ld32(env, FPUS) as u16;
+    s.fpuc = ld32(env, FPUC) as u16;
+    s.fpop = ld32(env, FPOP) as u16;
+    s.fptags.copy_from_slice(&env[FPTAGS..FPTAGS + 8]);
+    s.fpip = ld64(env, FPIP);
+    s.fpdp = ld64(env, FPDP);
+    s.fpcs = ld32(env, FPCS) as u16;
+    s.fpds = ld32(env, FPDS) as u16;
+    for i in 0..8 {
+        s.fpregs[i] = [ld64(env, fpreg(i)), ld64(env, fpreg(i) + 8) & 0xffff];
+    }
+    s.mxcsr = ld32(env, MXCSR);
+    s.pkru = ld32(env, PKRU);
+    for i in 0..32 {
+        for j in 0..8 {
+            s.xmm_regs[i][j] = ld64(env, zmm(i) + 8 * j);
+        }
+    }
 }
 
 /// `cpu_cc_compute_all()`: the arithmetic flags.

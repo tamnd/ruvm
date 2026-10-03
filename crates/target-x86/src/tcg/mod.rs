@@ -24,11 +24,19 @@
 //! triple fault detection. The page walk handles 32-bit paging (with PSE), PAE paging, and 4 and 5
 //! level long mode paging, with NX, WP, SMEP and SMAP.
 //!
-//! **x87, MMX, SSE and AVX are not implemented.** Every x87 escape opcode (D8 to DF), every
-//! MMX and SSE opcode in the 0F map (including the 66, F2 and F3 forms), and the VEX and EVEX
-//! prefixes raise #UD, as do the BMI, ADX and other instructions that only exist in VEX form or
-//! need SSE state. FWAIT is a no-op. LDMXCSR, FXSAVE and the like are #UD too. CPUID still
-//! reports what the model has, so a guest that checks CPUID and then uses SSE gets #UD.
+//! **x87, MMX, SSE and AVX are not implemented yet.** Every x87 escape opcode (D8 to DF),
+//! every MMX and SSE opcode in the 0F, 0F 38 and 0F 3A maps (including the 66, F2 and F3
+//! forms), every vector instruction behind a VEX prefix, and the EVEX prefix raise #UD. FWAIT
+//! is a no-op. FXSAVE, FXRSTOR, XSAVE, XRSTOR and XSAVEOPT are #UD too. CPUID still reports
+//! what the model has, so a guest that checks CPUID and then uses SSE gets #UD. The VEX prefix
+//! itself is decoded (`translate/ext.rs`), and so are the general purpose register
+//! instructions that come with this part of the instruction set: ANDN, BEXTR, BLSI, BLSMSK,
+//! BLSR, BZHI, MULX, PDEP, PEXT, RORX, SARX, SHLX and SHRX (VEX class 13, VEX.L must be 0),
+//! ADCX and ADOX (with QEMU's `CC_OP_ADCX`, `CC_OP_ADOX` and `CC_OP_ADCOX` carry chaining),
+//! MOVBE, CRC32, RDRAND, RDSEED, RDPID, XGETBV, XSETBV, RDFSBASE, RDGSBASE, WRFSBASE,
+//! WRGSBASE (CR4.FSGSBASE is tested at run time, as in QEMU), MOVNTI, LDMXCSR and STMXCSR.
+//! `helpers/vec.rs` already holds the SSE to AVX2 arithmetic kernels (on `ruvm-softfloat`,
+//! with MXCSR rounding, DAZ, FZ and flags), but no decoder calls them yet.
 //!
 //! Deliberate differences from QEMU:
 //!
@@ -60,15 +68,17 @@
 //! - RCL and RCR are computed inline in generated code instead of calling `helper_rcl*` and
 //!   `helper_rcr*`; the results and flags are the same. ROL and ROR with an immediate count
 //!   go through the same code as a count in CL.
+//! - VEX.X and VEX.B are ignored outside 64-bit mode, as on hardware; QEMU copies them into
+//!   `rex_x` and `rex_b` in every mode.
+//! - RDRAND and RDSEED return values from the host's `RandomState` hasher instead of
+//!   `qemu_guest_getrandom()`; like QEMU they always succeed (CF = 1, the other flags 0).
+//! - LDMXCSR does not raise #GP for reserved MXCSR bits, as in QEMU.
 //! - BSF and BSR with a zero source leave the destination unchanged, as QEMU and real
 //!   hardware do; LZCNT needs ABM and TZCNT needs BMI1 in the model (`qemu64` has neither,
 //!   so there they decode as BSR and BSF, as on hardware without them).
 //!
-//! Not translated yet (they raise #UD, and are left for a follow up): ADCX and ADOX, the BMI1
-//! and BMI2 instructions other than TZCNT and LZCNT (ANDN, BEXTR, BLSI, BLSMSK, BLSR, BZHI,
-//! MULX, PDEP, PEXT, RORX, SARX, SHLX, SHRX, which are VEX encoded anyway), RDFSBASE,
-//! RDGSBASE, WRFSBASE and WRGSBASE, MOVBE, CRC32, RDRAND, RDSEED, RDPID, RSM, MONITOR and
-//! MWAIT, XSAVE, XRSTOR, XGETBV and XSETBV, the SVM and VMX instructions, CMPccXADD, the MPX
+//! Not translated yet (they raise #UD, and are left for a follow up): RSM, MONITOR and
+//! MWAIT, the SVM and VMX instructions, CMPccXADD, the MPX
 //! instructions, RDPKRU and WRPKRU, the AMD `lock mov cr0` alias for CR8, and the PCREL
 //! translation mode. I/O breakpoints (`bpt_io`) are not checked. Virtual 8086 mode decodes
 //! like real mode with the IOPL checks, but nothing enters it (see above).
