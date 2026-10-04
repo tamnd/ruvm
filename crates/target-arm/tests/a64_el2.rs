@@ -125,6 +125,8 @@ enum Event {
 #[derive(Default)]
 struct Board {
     log: Mutex<Vec<Event>>,
+    /// Whether each timer has a deadline armed, by `GTIMER_*` index.
+    armed: Mutex<[bool; 5]>,
     arm: OnceLock<Weak<Arm>>,
 }
 
@@ -140,8 +142,13 @@ impl ArmBoard for Board {
         shared: &CpuShared,
         timer: usize,
         level: bool,
-        _deadline: Option<Instant>,
+        deadline: Option<Instant>,
     ) {
+        self.armed.lock().unwrap()[timer] = deadline.is_some();
+        self.gt_timer_set_level(shared, timer, level);
+    }
+
+    fn gt_timer_set_level(&self, shared: &CpuShared, timer: usize, level: bool) {
         self.log.lock().unwrap().push(Event::Timer(timer, level));
         if let Some(arm) = self.arm.get().and_then(Weak::upgrade) {
             arm.set_irq(shared, level);
@@ -702,6 +709,36 @@ fn timer_interrupt_reaches_the_cpu() {
         0x6200_0000 | (3 << 20) | (1 << 17) | (3 << 14) | (14 << 10) | (4 << 5) | (2 << 1)
     );
     assert!(w.board.events().is_empty());
+}
+
+/// Unmasking a timer that is waiting for its compare value keeps it waiting. Linux masks the
+/// timer in its interrupt handler and then writes CVAL and a CTL that only clears IMASK; if
+/// that dropped the deadline, an idle CPU would never see the next timer interrupt.
+#[test]
+fn unmasking_keeps_the_timer_deadline() {
+    let w = World::new(ArmCpuModel::cortex_a57(), PsciConduit::Disabled);
+    let mut st = w.state();
+    st.xregs[1] = 3;
+    st.xregs[2] = 1;
+    st.xregs[3] = 1 << 50;
+    w.run(
+        &st,
+        &[
+            msr(CNTP_CTL_EL0, 1),  // enabled and masked
+            msr(CNTP_CVAL_EL0, 3), // far in the future
+            msr(CNTP_CTL_EL0, 2),  // unmask
+            WFI,
+        ],
+    );
+    assert_eq!(
+        w.board.events(),
+        [
+            Event::Timer(GTIMER_PHYS, false),
+            Event::Timer(GTIMER_PHYS, false),
+            Event::Timer(GTIMER_PHYS, false)
+        ]
+    );
+    assert!(w.board.armed.lock().unwrap()[GTIMER_PHYS], "the deadline is still armed");
 }
 
 #[test]

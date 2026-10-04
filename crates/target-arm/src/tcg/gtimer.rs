@@ -5,9 +5,11 @@
 //! `target/arm/helper.c`.
 //!
 //! The five timers are indexed by `GTIMER_*`. Their outputs and the deadlines at which
-//! they need recalculating go to the board through [`ArmBoard::gt_timer_update`]; the board
-//! wires the outputs to its interrupt controller (the virt board's GIC PPIs) and calls
-//! [`Arm::gt_timer_expired`] at the deadline, as QEMU's `gt_timer[]` QEMU timers do.
+//! they need recalculating go to the board through [`ArmBoard::gt_timer_update`], and an
+//! output change that leaves the deadline alone (a CTL write that only toggles IMASK) through
+//! [`ArmBoard::gt_timer_set_level`]; the board wires the outputs to its interrupt controller
+//! (the virt board's GIC PPIs) and calls [`Arm::gt_timer_expired`] at the deadline, as QEMU's
+//! `gt_timer[]` QEMU timers do.
 //!
 //! Differences from QEMU: there is no FEAT_ECV (CNTPOFF_EL2, the CNTHCTL_EL2 mask bits) and
 //! no event stream. The counter is host time since the [`Arm`] was made, scaled to
@@ -15,6 +17,7 @@
 //! EL02 aliases use the offset of the EL1 view of the timer.
 //!
 //! [`ArmBoard::gt_timer_update`]: super::ArmBoard::gt_timer_update
+//! [`ArmBoard::gt_timer_set_level`]: super::ArmBoard::gt_timer_set_level
 
 use ruvm_jit::Cpu;
 
@@ -105,20 +108,20 @@ pub(crate) fn recalc(arm: &Arm, cpu: &Cpu<'_>, st: &mut CpuArmState, timer: usiz
         // Timer disabled: ISTATUS and timer output always clear.
         st.gt_ctl[timer] = ctl & !4;
     }
-    update_irq(arm, cpu, st, timer, deadline);
+    if let Some(board) = &arm.board {
+        board.gt_timer_update(cpu.core.shared(), timer, level(st, timer), deadline);
+    }
 }
 
-/// `gt_update_irq()`: the output is ISTATUS and ENABLE with IMASK clear.
-fn update_irq(
-    arm: &Arm,
-    cpu: &Cpu<'_>,
-    st: &CpuArmState,
-    timer: usize,
-    deadline: Option<std::time::Instant>,
-) {
-    let level = st.gt_ctl[timer] & 7 == 5;
+/// The timer output: ISTATUS and ENABLE with IMASK clear.
+fn level(st: &CpuArmState, timer: usize) -> bool {
+    st.gt_ctl[timer] & 7 == 5
+}
+
+/// `gt_update_irq()`: drive the output and leave the timer's deadline alone.
+fn update_irq(arm: &Arm, cpu: &Cpu<'_>, st: &CpuArmState, timer: usize) {
     if let Some(board) = &arm.board {
-        board.gt_timer_update(cpu.core.shared(), timer, level, deadline);
+        board.gt_timer_set_level(cpu.core.shared(), timer, level(st, timer));
     }
 }
 
@@ -133,7 +136,7 @@ pub(crate) fn ctl_write(arm: &Arm, cpu: &Cpu<'_>, st: &mut CpuArmState, timer: u
     } else if (oldval ^ v) & 2 != 0 {
         // IMASK toggled, don't need to recalculate, just set the interrupt line based on
         // ISTATUS.
-        update_irq(arm, cpu, st, timer, None);
+        update_irq(arm, cpu, st, timer);
     }
 }
 

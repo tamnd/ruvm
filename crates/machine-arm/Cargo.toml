@@ -15,6 +15,7 @@ unsafe-budget = 0
 
 [dependencies]
 flate2.workspace = true
+ruvm-accel.workspace = true
 ruvm-base.workspace = true
 ruvm-hw-char.workspace = true
 ruvm-hw-core.workspace = true

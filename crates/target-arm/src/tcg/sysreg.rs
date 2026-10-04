@@ -28,6 +28,11 @@
 //! - The TLB has no VMID or ASID tags, so a change of VTTBR_EL2 flushes the EL1&0 regime
 //!   and the by-ASID TLBIs flush the whole regime, as QEMU does.
 //! - A change of SCR_EL3.NS flushes the whole TLB; there is no Secure address space.
+//! - TCR2_EL1 and TCR2_EL2 keep only the FEAT_ASID2 bits (A2, FNG0 and FNG1), which change
+//!   nothing in translation as the TLB has no ASIDs; there is no HCRX_EL2, so EL1 accesses
+//!   never trap on HCRX_EL2.TCR2En.
+//! - The TLBI nXS forms (CRn 9) do what their plain forms do, and the TLBI OS forms are
+//!   broadcast like the IS ones. There are no FEAT_TLBIRANGE operations.
 
 use std::mem::offset_of;
 
@@ -44,7 +49,7 @@ use crate::cpu::{
     HCR_TID1, HCR_TID2, HCR_TID3, HCR_TPCP, HCR_TPU, HCR_TRVM, HCR_TSW, HCR_TTLB, HCR_TVM, HCR_VM,
     MMU_IDX_E2, MMU_IDX_E3, MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN, MMU_IDX_E20_0,
     MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, PSTATE_DAIF, PSTATE_PAN, PSTATE_SP, PSTATE_UAO, SCR_NS,
-    SCTLR_DZE, SCTLR_UCI, SCTLR_UCT, SCTLR_UMA, env_off,
+    SCR_TCR2EN, SCTLR_DZE, SCTLR_UCI, SCTLR_UCT, SCTLR_UMA, env_off,
 };
 
 /// `PL3_R`.
@@ -132,8 +137,13 @@ pub(crate) enum Trap {
     Tid3,
     /// `access_tacr()`.
     Tacr,
-    /// `access_ttlb()`.
+    /// `access_ttlb()`, also `access_ttlbis()` and `access_ttlbos()`: HCR_EL2.TTLBIS and
+    /// TTLBOS are RES0 here.
     Ttlb,
+    /// `tcr2_el1_access()` and `tcr2_el2_access()`: the TVM and TRVM checks at EL1 and
+    /// SCR_EL3.TCR2En below EL3. There is no HCRX_EL2, so HCRX_EL2.TCR2En reads as one,
+    /// as it does when EL2 is disabled.
+    Tcr2,
     /// `cpacr_access()`: CPTR_EL2.TCPAC and CPTR_EL3.TCPAC.
     Cpacr,
     /// `cptr_access()`: CPTR_EL3.TCPAC for CPTR_EL2.
@@ -264,6 +274,16 @@ impl Trap {
             Trap::Tid3 => el1_hcr(HCR_TID3),
             Trap::Tacr => el1_hcr(HCR_TACR),
             Trap::Ttlb => el1_hcr(HCR_TTLB),
+            Trap::Tcr2 => {
+                let tvm = el1_hcr(if isread { HCR_TRVM } else { HCR_TVM });
+                if tvm != Access::Ok {
+                    tvm
+                } else if el < 3 && f.el3 && st.scr_el3 & SCR_TCR2EN == 0 {
+                    Access::TrapEl3
+                } else {
+                    Access::Ok
+                }
+            }
             Trap::Cpacr => {
                 // Check if CPACR accesses are to be trapped to EL2, then EL3 (TCPAC is bit
                 // 31 of both CPTR registers).
@@ -358,6 +378,14 @@ fn has_sve(f: &ArmFeatures) -> bool {
     f.sve
 }
 
+fn has_tlbios(f: &ArmFeatures) -> bool {
+    f.tlbios
+}
+
+fn has_tcr2(f: &ArmFeatures) -> bool {
+    f.tcr2
+}
+
 /// The `env` offset of element `i` of an array field.
 macro_rules! off {
     ($f:ident) => {
@@ -404,6 +432,8 @@ pub(crate) const TTBR0_EL1: u32 = key(3, 0, 2, 0, 0);
 pub(crate) const TTBR1_EL1: u32 = key(3, 0, 2, 0, 1);
 /// TCR_EL1.
 pub(crate) const TCR_EL1: u32 = key(3, 0, 2, 0, 2);
+/// TCR2_EL1.
+pub(crate) const TCR2_EL1: u32 = key(3, 0, 2, 0, 3);
 /// NZCV.
 pub(crate) const NZCV: u32 = key(3, 3, 4, 2, 0);
 /// DAIF.
@@ -450,6 +480,8 @@ pub(crate) const TTBR0_EL2: u32 = key(3, 4, 2, 0, 0);
 pub(crate) const TTBR1_EL2: u32 = key(3, 4, 2, 0, 1);
 /// TCR_EL2.
 pub(crate) const TCR_EL2: u32 = key(3, 4, 2, 0, 2);
+/// TCR2_EL2.
+pub(crate) const TCR2_EL2: u32 = key(3, 4, 2, 0, 3);
 /// VTTBR_EL2.
 pub(crate) const VTTBR_EL2: u32 = key(3, 4, 2, 1, 0);
 /// VTCR_EL2.
@@ -499,6 +531,9 @@ macro_rules! tlbi {
     ($name:literal, $op1:expr, $crm:expr, $op2:expr, $access:expr, $trap:ident) => {
         r!($name, (1, $op1, 8, $crm, $op2), $access, $trap, Kind::Special)
     };
+    ($name:literal, $op1:expr, $crm:expr, $op2:expr, $access:expr, $trap:ident, $feat:expr) => {
+        r!($name, (1, $op1, 8, $crm, $op2), $access, $trap, Kind::Special, $feat)
+    };
 }
 
 macro_rules! at {
@@ -522,6 +557,8 @@ static REGS: &[Reg] = &[
     r!("ID_AA64MMFR0_EL1", (3, 0, 0, 7, 0), PL1_R, Tid3, Kind::Model(|m| m.id_aa64mmfr0)),
     r!("ID_AA64MMFR1_EL1", (3, 0, 0, 7, 1), PL1_R, Tid3, Kind::Model(|m| m.id_aa64mmfr1)),
     r!("ID_AA64MMFR2_EL1", (3, 0, 0, 7, 2), PL1_R, Tid3, Kind::Model(|m| m.id_aa64mmfr2)),
+    r!("ID_AA64MMFR3_EL1", (3, 0, 0, 7, 3), PL1_R, Tid3, Kind::Model(|m| m.id_aa64mmfr3)),
+    r!("ID_AA64MMFR4_EL1", (3, 0, 0, 7, 4), PL1_R, Tid3, Kind::Model(|m| m.id_aa64mmfr4)),
     r!("CCSIDR_EL1", (3, 1, 0, 0, 0), PL1_R, Tid2, Kind::Special),
     r!("CLIDR_EL1", (3, 1, 0, 0, 1), PL1_R, Tid2, Kind::Model(|m| m.clidr)),
     r!("AIDR_EL1", (3, 1, 0, 0, 7), PL1_R, Tid1, Kind::Zero),
@@ -547,6 +584,7 @@ static REGS: &[Reg] = &[
     r!("TTBR0_EL1", (3, 0, 2, 0, 0), PL1_RW, Tvm, Kind::Special),
     r!("TTBR1_EL1", (3, 0, 2, 0, 1), PL1_RW, Tvm, Kind::Special),
     r!("TCR_EL1", (3, 0, 2, 0, 2), PL1_RW, Tvm, Kind::Special),
+    r!("TCR2_EL1", (3, 0, 2, 0, 3), PL1_RW, Tcr2, Kind::Special, has_tcr2),
     // Exception handling.
     r!("SPSR_EL1", (3, 0, 4, 0, 0), PL1_RW, None, field(off!(spsr_el[1]))),
     r!("ELR_EL1", (3, 0, 4, 0, 1), PL1_RW, None, field(off!(elr_el[1]))),
@@ -635,6 +673,13 @@ static REGS: &[Reg] = &[
     tlbi!("TLBI_VAAE1", 0, 7, 3, PL1_W, Ttlb),
     tlbi!("TLBI_VALE1", 0, 7, 5, PL1_W, Ttlb),
     tlbi!("TLBI_VAALE1", 0, 7, 7, PL1_W, Ttlb),
+    // tlbios_reginfo.
+    tlbi!("TLBI_VMALLE1OS", 0, 1, 0, PL1_W, Ttlb, has_tlbios),
+    tlbi!("TLBI_VAE1OS", 0, 1, 1, PL1_W, Ttlb, has_tlbios),
+    tlbi!("TLBI_ASIDE1OS", 0, 1, 2, PL1_W, Ttlb, has_tlbios),
+    tlbi!("TLBI_VAAE1OS", 0, 1, 3, PL1_W, Ttlb, has_tlbios),
+    tlbi!("TLBI_VALE1OS", 0, 1, 5, PL1_W, Ttlb, has_tlbios),
+    tlbi!("TLBI_VAALE1OS", 0, 1, 7, PL1_W, Ttlb, has_tlbios),
 ];
 
 /// The EL2 registers, `el2_cp_reginfo` and the VHE additions.
@@ -651,6 +696,7 @@ static EL2_REGS: &[Reg] = &[
     r!("TTBR0_EL2", (3, 4, 2, 0, 0), PL2_RW, None, Kind::Special),
     r!("TTBR1_EL2", (3, 4, 2, 0, 1), PL2_RW, None, Kind::Special, has_vh),
     r!("TCR_EL2", (3, 4, 2, 0, 2), PL2_RW, None, Kind::Special),
+    r!("TCR2_EL2", (3, 4, 2, 0, 3), PL2_RW, Tcr2, Kind::Special, has_tcr2),
     r!("VTTBR_EL2", (3, 4, 2, 1, 0), PL2_RW, None, Kind::Special),
     r!("VTCR_EL2", (3, 4, 2, 1, 2), PL2_RW, None, Kind::Special),
     r!("SPSR_EL2", (3, 4, 4, 0, 0), PL2_RW, None, field(off!(spsr_el[2]))),
@@ -708,6 +754,16 @@ static EL2_REGS: &[Reg] = &[
     tlbi!("TLBI_ALLE1", 4, 7, 4, PL2_W, None),
     tlbi!("TLBI_VALE2", 4, 7, 5, PL2_W, None),
     tlbi!("TLBI_VMALLS12E1", 4, 7, 6, PL2_W, None),
+    tlbi!("TLBI_ALLE2OS", 4, 1, 0, PL2_W, None, has_tlbios),
+    tlbi!("TLBI_VAE2OS", 4, 1, 1, PL2_W, None, has_tlbios),
+    tlbi!("TLBI_ALLE1OS", 4, 1, 4, PL2_W, None, has_tlbios),
+    tlbi!("TLBI_VALE2OS", 4, 1, 5, PL2_W, None, has_tlbios),
+    tlbi!("TLBI_VMALLS12E1OS", 4, 1, 6, PL2_W, None, has_tlbios),
+    // There is no separate stage 2 TLB, so these are ARM_CP_NOP as in QEMU.
+    r!("TLBI_IPAS2E1OS", (1, 4, 8, 4, 0), PL2_W, None, Kind::Nop, has_tlbios),
+    r!("TLBI_RIPAS2E1OS", (1, 4, 8, 4, 3), PL2_W, None, Kind::Nop, has_tlbios),
+    r!("TLBI_IPAS2LE1OS", (1, 4, 8, 4, 4), PL2_W, None, Kind::Nop, has_tlbios),
+    r!("TLBI_RIPAS2LE1OS", (1, 4, 8, 4, 7), PL2_W, None, Kind::Nop, has_tlbios),
 ];
 
 /// The EL3 registers, `el3_cp_reginfo` and the Secure timer.
@@ -747,6 +803,9 @@ static EL3_REGS: &[Reg] = &[
     tlbi!("TLBI_ALLE3", 6, 7, 0, PL3_W, None),
     tlbi!("TLBI_VAE3", 6, 7, 1, PL3_W, None),
     tlbi!("TLBI_VALE3", 6, 7, 5, PL3_W, None),
+    tlbi!("TLBI_ALLE3OS", 6, 1, 0, PL3_W, None, has_tlbios),
+    tlbi!("TLBI_VAE3OS", 6, 1, 1, PL3_W, None, has_tlbios),
+    tlbi!("TLBI_VALE3OS", 6, 1, 5, PL3_W, None, has_tlbios),
 ];
 
 /// The EL1 registers that VHE redirects, and the EL2 register each one names at EL2 with
@@ -758,6 +817,7 @@ static E2H_REDIRECTS: &[(u32, u32)] = &[
     (key(3, 0, 2, 0, 0), key(3, 4, 2, 0, 0)),   // TTBR0
     (key(3, 0, 2, 0, 1), key(3, 4, 2, 0, 1)),   // TTBR1
     (key(3, 0, 2, 0, 2), key(3, 4, 2, 0, 2)),   // TCR
+    (key(3, 0, 2, 0, 3), key(3, 4, 2, 0, 3)),   // TCR2
     (key(3, 0, 4, 0, 0), key(3, 4, 4, 0, 0)),   // SPSR
     (key(3, 0, 4, 0, 1), key(3, 4, 4, 0, 1)),   // ELR
     (key(3, 0, 5, 1, 0), key(3, 4, 5, 1, 0)),   // AFSR0
@@ -798,6 +858,15 @@ pub(crate) fn resolve(k: u32, el: u32, e2h: bool, feat: &ArmFeatures) -> Option<
 /// The register with encoding `key` on a CPU with `feat`, as `get_arm_cp_reginfo()` finds
 /// it. The ID register space that is not listed reads as zero at EL1.
 pub(crate) fn lookup(key_: u32, feat: &ArmFeatures) -> Option<Reg> {
+    if key_ >> 14 == 1 && (key_ >> 7) & 0xf == 9 {
+        // ARM_CP_ADD_TLBI_NXS: with FEAT_XS every TLBI operation has an nXS form, encoded
+        // with CRn 9 instead of 8, that does the same here.
+        if !feat.xs {
+            return None;
+        }
+        let r = lookup((key_ & !(0xf << 7)) | (8 << 7), feat)?;
+        return Some(Reg { key: key_, ..r });
+    }
     if let Some(r) = REGS.iter().find(|r| r.key == key_ && (r.feat)(feat)) {
         return Some(*r);
     }
@@ -951,6 +1020,7 @@ pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
         TTBR0_EL1 | TTBR0_EL2 | TTBR0_EL3 => st.ttbr0_el[el_of(key_)],
         TTBR1_EL1 | TTBR1_EL2 => st.ttbr1_el[el_of(key_)],
         TCR_EL1 | TCR_EL2 | TCR_EL3 => st.tcr_el[el_of(key_)],
+        TCR2_EL1 | TCR2_EL2 => st.tcr2_el[el_of(key_)],
         HCR_EL2 => st.hcr_el2,
         SCR_EL3 => st.scr_el3,
         VTTBR_EL2 => st.vttbr_el2,
@@ -1003,6 +1073,20 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
             tlb_flush(cpu);
             st.tcr_el[el_of(key_)] = value;
             st.store(cpu.env);
+        }
+        TCR2_EL1 | TCR2_EL2 => {
+            // tcr2_el1_write() and tcr2_el2_write(): of the fields only ASID2's are
+            // implemented, and they change nothing but the TLB flush on a change of A2, as
+            // this TLB has no ASIDs.
+            const TCR2_A2: u64 = 1 << 16;
+            let el = el_of(key_);
+            let valid = if f.asid2 { 0x7 << 16 } else { 0 };
+            let old = st.tcr2_el[el];
+            st.tcr2_el[el] = value & valid;
+            st.store(cpu.env);
+            if f.asid2 && (old ^ value) & TCR2_A2 != 0 {
+                tlb_flush_by_mmuidx(cpu, if el == 1 { E10_MASK } else { ALLE2_MASK });
+            }
         }
         TTBR0_EL1 | TTBR1_EL1 | TTBR0_EL2 | TTBR1_EL2 | TTBR0_EL3 => {
             let el = el_of(key_);
@@ -1113,7 +1197,10 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
             st.store(cpu.env);
         }
         _ if key_ >> 14 == 1 && (key_ >> 7) & 0xf == 7 => at(arm, cpu, &st, key_, value),
-        _ if key_ >> 14 == 1 && (key_ >> 7) & 0xf == 8 => tlbi(cpu, f, &st, key_, value),
+        // CRn 9 is the nXS forms.
+        _ if key_ >> 14 == 1 && matches!((key_ >> 7) & 0xf, 8 | 9) => {
+            tlbi(cpu, f, &st, key_, value);
+        }
         _ => panic!("no write for system register key 0x{key_:x}"),
     }
 }
@@ -1182,8 +1269,9 @@ fn tlbi(cpu: &mut Cpu<'_>, f: &ArmFeatures, st: &CpuArmState, key_: u32, value: 
     let op1 = key_op1(key_);
     let crm = (key_ >> 3) & 0xf;
     let op2 = key_ & 7;
-    // CRm 3 and 0 are the Inner Shareable forms, which are broadcast.
-    let shareable = crm == 3 || crm == 0;
+    // CRm 3 and 0 are the Inner Shareable forms and CRm 1 the Outer Shareable ones, which
+    // are broadcast.
+    let shareable = matches!(crm, 0 | 1 | 3);
     let (mask, va_idx) = match (op1, op2) {
         // VMALLE1, ASIDE1, VAE1 and friends.
         (0, _) => vae1_tlbmask(f, st),
@@ -1222,7 +1310,27 @@ fn tlbi(cpu: &mut Cpu<'_>, f: &ArmFeatures, st: &CpuArmState, key_: u32, value: 
 
 #[cfg(test)]
 mod tests {
-    use super::{EL2_REGS, EL3_REGS, REGS};
+    use super::{EL2_REGS, EL3_REGS, REGS, TCR2_EL1, TCR2_EL2, key, lookup};
+    use crate::cpu::ArmCpuModel;
+
+    #[test]
+    fn feature_gated_registers() {
+        let max = ArmCpuModel::max().with_el2().features;
+        let a76 = ArmCpuModel::cortex_a76().with_el2().features;
+        // TLBI VMALLE1NXS, VMALLE1OSNXS, ALLE2OSNXS and IPAS2E1OSNXS.
+        for k in [key(1, 0, 9, 7, 0), key(1, 0, 9, 1, 0), key(1, 4, 9, 1, 0), key(1, 4, 9, 4, 0)] {
+            assert_eq!(lookup(k, &max).map(|r| r.key), Some(k), "0x{k:x}");
+            assert!(lookup(k, &a76).is_none(), "0x{k:x}");
+        }
+        // TLBI VMALLE1OS and VAE3OS (no EL3 on either).
+        assert!(lookup(key(1, 0, 8, 1, 0), &max).is_some());
+        assert!(lookup(key(1, 0, 8, 1, 0), &a76).is_none());
+        assert!(lookup(key(1, 6, 8, 1, 1), &max).is_none());
+        for k in [TCR2_EL1, TCR2_EL2] {
+            assert!(lookup(k, &max).is_some());
+            assert!(lookup(k, &a76).is_none());
+        }
+    }
 
     #[test]
     fn keys_and_names_are_unique() {

@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod arm;
 pub mod options;
 mod qmp_cmds;
 pub mod qtest;

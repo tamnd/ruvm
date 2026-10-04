@@ -508,13 +508,16 @@ dependencies = [
 name = "ruvm-cli"
 version = "0.3.3"
 dependencies = [
+ "flate2",
  "ruvm-base",
  "ruvm-img",
  "ruvm-io",
+ "ruvm-machine-arm",
  "ruvm-nbd",
  "ruvm-qapi",
  "ruvm-storage-daemon",
  "ruvm-system",
+ "ruvm-target-arm",
 ]
 
 [[package]]
@@ -804,6 +807,7 @@ name = "ruvm-machine-arm"
 version = "0.3.3"
 dependencies = [
  "flate2",
+ "ruvm-accel",
  "ruvm-base",
  "ruvm-hw-char",
  "ruvm-hw-core",
@@ -1012,6 +1016,7 @@ dependencies = [
  "ruvm-hw-misc",
  "ruvm-hw-storage",
  "ruvm-hw-virtio",
+ "ruvm-machine-arm",
  "ruvm-machine-x86",
  "ruvm-mem",
  "ruvm-monitor",
@@ -1019,6 +1024,7 @@ dependencies = [
  "ruvm-qapi-gen",
  "ruvm-qom",
  "ruvm-sys",
+ "ruvm-target-arm",
 ]
 
 [[package]]

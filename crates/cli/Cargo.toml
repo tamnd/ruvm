@@ -26,7 +26,10 @@ ruvm-storage-daemon.workspace = true
 ruvm-system.workspace = true
 
 [dev-dependencies]
+flate2.workspace = true
+ruvm-machine-arm.workspace = true
 ruvm-qapi.workspace = true
+ruvm-target-arm.workspace = true
 
 [lints]
 workspace = true

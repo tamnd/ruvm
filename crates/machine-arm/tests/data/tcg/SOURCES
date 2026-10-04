@@ -1,0 +1,37 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+
+The guest kernels of QEMU 11.1's tests/tcg system tests for aarch64, used by
+tests/tcg_run.rs and by the ruvm-cli tests. They are QEMU's own sources
+(GPL-2.0-or-later), built unchanged and stripped:
+
+  hello.gz      tests/tcg/multiarch/system/hello.c
+  interrupt.gz  tests/tcg/multiarch/system/interrupt.c
+  memory.gz     tests/tcg/multiarch/system/memory.c, with -DCHECK_UNALIGNED=1
+  asid2.gz      tests/tcg/aarch64/system/asid2.c
+  feat-xs.gz    tests/tcg/aarch64/system/feat-xs.c
+  semiheap.gz   tests/tcg/aarch64/system/semiheap.c
+
+each linked with tests/tcg/aarch64/system/boot.S, tests/tcg/minilib/printf.c
+and tests/tcg/aarch64/system/kernel.ld, built on x86_64 Ubuntu 24.04 with
+aarch64-linux-gnu-gcc 13.3.0 and GNU ld 2.42, the flags of
+tests/tcg/aarch64/Makefile.softmmu-target (memory.c without -Werror, which
+gcc 13 trips over):
+
+  CFLAGS="-Wall -Werror -O0 -g -fno-strict-aliasing -nostdlib -ggdb \
+      -isystem minilib -ffreestanding -fno-stack-protector"
+  gcc -nostdlib -fno-stack-protector -ggdb -O0 -ffreestanding \
+      -c printf.c -o printf.o
+  gcc $CFLAGS -x assembler-with-cpp -Wa,--noexecstack -c boot.S -o boot.o
+  gcc $CFLAGS TEST.c -o TEST -Wl,-Tkernel.ld -static -nostdlib printf.o \
+      -lgcc boot.o
+  strip TEST && gzip -9 -n TEST
+
+asid2.out, semiheap.out and memory.out.gz are what qemu-system-aarch64 11.1
+(Homebrew) writes to the semihosting chardev for them with
+
+  qemu-system-aarch64 -monitor none -display none \
+      -chardev file,path=TEST.out,id=output -M virt -cpu max -display none \
+      -semihosting-config enable=on,target=native,chardev=output -kernel TEST
+
+which exits with status 0 for all six. hello writes "Hello World\n";
+interrupt and feat-xs write nothing.

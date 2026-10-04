@@ -245,6 +245,14 @@ pub trait ArmBoard: Send + Sync {
         let _ = (shared, timer, level, deadline);
     }
 
+    /// The output of generic timer `timer` of the vCPU `shared` is now `level`, and when the
+    /// timer next needs recalculating has not changed: `gt_update_irq()` on its own, as a
+    /// write that only toggles CTL.IMASK does it. The board must keep the deadline it was
+    /// given last.
+    fn gt_timer_set_level(&self, shared: &CpuShared, timer: usize, level: bool) {
+        let _ = (shared, timer, level);
+    }
+
     /// PSCI CPU_ON, `arm_set_cpu_on()`: start the CPU whose MPIDR is `mpidr` at `entry` in
     /// `target_el` with `context_id` in X0. A board finds the vCPU and calls
     /// [`Arm::cpu_on`], returning its result. The default says no such CPU.
@@ -943,7 +951,7 @@ impl CpuOps for Arm {
     }
 
     fn get_tb_cpu_state(&self, cpu: &Cpu<'_>) -> TbCpuState {
-        let st = CpuArmState::load(cpu.env);
+        let st = CpuArmState::load_system(cpu.env);
         TbCpuState { pc: st.pc, flags: tb_flags(self.features(), &st), cflags: 0, cs_base: 0 }
     }
 
@@ -1077,7 +1085,7 @@ impl CpuOps for Arm {
     }
 
     fn mmu_index(&self, cpu: &Cpu<'_>, _ifetch: bool) -> usize {
-        CpuArmState::load(cpu.env).mmu_idx(self.features())
+        CpuArmState::load_system(cpu.env).mmu_idx(self.features())
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {

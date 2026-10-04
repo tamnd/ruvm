@@ -611,7 +611,7 @@ pub(crate) fn get_phys_addr(
     stage1_only: bool,
     is_at: bool,
 ) -> Result<Translation, Fault> {
-    let st = CpuArmState::load(cpu.env);
+    let st = CpuArmState::load_system(cpu.env);
     let as_ = cpu.core.address_space().clone();
     let w = Walker { arm, st: &st, as_: &as_ };
     w.get_phys_addr(address, access, mmu_idx, stage1_only, is_at)

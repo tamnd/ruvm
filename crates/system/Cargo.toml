@@ -26,11 +26,13 @@ ruvm-hw-core.workspace = true
 ruvm-hw-misc.workspace = true
 ruvm-hw-storage.workspace = true
 ruvm-hw-virtio.workspace = true
+ruvm-machine-arm.workspace = true
 ruvm-machine-x86.workspace = true
 ruvm-mem.workspace = true
 ruvm-monitor.workspace = true
 ruvm-qapi.workspace = true
 ruvm-qom.workspace = true
+ruvm-target-arm.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 ruvm-sys.workspace = true

@@ -1724,6 +1724,14 @@ impl DisasA64 for S<'_, '_> {
         true
     }
 
+    fn trans_DSB_nXS(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if !self.feat().xs {
+            return false;
+        }
+        self.f().gen_mb(mo::BAR_SC | mo::ALL);
+        true
+    }
+
     fn trans_ISB(&mut self, _a: &mut arg_disas_a6432) -> bool {
         // We need to break the TB after this insn to execute self-modifying code correctly
         // and also to take any pending interrupts immediately.
