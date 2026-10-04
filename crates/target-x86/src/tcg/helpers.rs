@@ -33,8 +33,10 @@ use super::{
 };
 use crate::msr::{
     MSR_CSTAR, MSR_EFER, MSR_FMASK, MSR_FSBASE, MSR_GSBASE, MSR_IA32_APICBASE,
-    MSR_IA32_MISC_ENABLE, MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_EIP, MSR_IA32_SYSENTER_ESP,
-    MSR_IA32_TSC, MSR_KERNELGSBASE, MSR_LSTAR, MSR_PAT, MSR_STAR, MSR_TSC_AUX,
+    MSR_IA32_APICBASE_BASE, MSR_IA32_APICBASE_BSP, MSR_IA32_APICBASE_ENABLE,
+    MSR_IA32_APICBASE_EXTD, MSR_IA32_MISC_ENABLE, MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_EIP,
+    MSR_IA32_SYSENTER_ESP, MSR_IA32_TSC, MSR_KERNELGSBASE, MSR_LSTAR, MSR_PAT, MSR_STAR,
+    MSR_TSC_AUX,
 };
 use crate::state::{
     CR0_ET_MASK, CR0_PE_MASK, CR0_PG_MASK, CR0_TS_MASK, CR0_WP_MASK, CR4_CET_MASK, CR4_DE_MASK,
@@ -48,6 +50,17 @@ use crate::state::{
 };
 
 type R<T> = Result<T, CpuLoopExit>;
+
+/// `MSR_IA32_APICBASE_RESERVED`.
+const MSR_IA32_APICBASE_RESERVED: u64 = !(MSR_IA32_APICBASE_BSP
+    | MSR_IA32_APICBASE_ENABLE
+    | MSR_IA32_APICBASE_EXTD
+    | MSR_IA32_APICBASE_BASE);
+/// `MSR_APIC_START` and `MSR_APIC_END`, the x2APIC registers.
+const MSR_APIC_START: u32 = 0x800;
+const MSR_APIC_END: u32 = 0x8ff;
+/// `CPUID_APIC`, bit 9 of CPUID leaf 1 EDX.
+const CPUID_APIC: u32 = 1 << 9;
 
 /// A helper's declaration and implementation.
 pub(crate) struct Def {
@@ -556,10 +569,15 @@ fn h_cpuid(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
             regv(cpu, R_EAX) as u32,
             regv(cpu, R_ECX) as u32,
         );
+        let mut edx = r[3];
+        // cpu_clear_apic_feature() takes CPUID_APIC out of features[FEAT_1_EDX].
+        if regv(cpu, R_EAX) as u32 == 1 && !x.apic_feature() {
+            edx &= !CPUID_APIC;
+        }
         set_reg(cpu, R_EAX, u64::from(r[0]));
         set_reg(cpu, R_EBX, u64::from(r[1]));
         set_reg(cpu, R_ECX, u64::from(r[2]));
-        set_reg(cpu, R_EDX, u64::from(r[3]));
+        set_reg(cpu, R_EDX, u64::from(edx));
         Ok(0)
     })
 }
@@ -693,8 +711,18 @@ fn load_efer(cpu: &mut Cpu<'_>, val: u64) {
 
 fn h_rdmsr(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
+        let ops = cpu.ops();
+        let platform = x86_of(&ops).platform();
+        let ecx = regv(cpu, R_ECX) as u32;
         let env = &*cpu.env;
-        let val = match regv(cpu, R_ECX) as u32 {
+        let val = match ecx {
+            MSR_IA32_APICBASE if platform.is_some() => platform.map_or(0, |p| p.apic_base()),
+            MSR_APIC_START..=MSR_APIC_END => {
+                match platform.and_then(|p| p.apic_msr_read(ecx - MSR_APIC_START)) {
+                    Some(v) => v,
+                    None => return Err(raise_exception_err_ra(cpu, EXCP0D_GPF, 0, TB)),
+                }
+            }
             MSR_IA32_SYSENTER_CS => ld64(env, SYSENTER_CS),
             MSR_IA32_SYSENTER_ESP => ld64(env, SYSENTER_ESP),
             MSR_IA32_SYSENTER_EIP => ld64(env, SYSENTER_EIP),
@@ -723,7 +751,22 @@ fn h_rdmsr(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
 fn h_wrmsr(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
         let val = (regv(cpu, R_EAX) & 0xffff_ffff) | (regv(cpu, R_EDX) << 32);
-        match regv(cpu, R_ECX) as u32 {
+        let ops = cpu.ops();
+        let platform = x86_of(&ops).platform();
+        let ecx = regv(cpu, R_ECX) as u32;
+        match ecx {
+            MSR_IA32_APICBASE if platform.is_some() => {
+                let ok = val & MSR_IA32_APICBASE_RESERVED == 0
+                    && platform.is_some_and(|p| p.set_apic_base(val));
+                if !ok {
+                    return Err(raise_exception_err_ra(cpu, EXCP0D_GPF, 0, TB));
+                }
+            }
+            MSR_APIC_START..=MSR_APIC_END => {
+                if !platform.is_some_and(|p| p.apic_msr_write(ecx - MSR_APIC_START, val)) {
+                    return Err(raise_exception_err_ra(cpu, EXCP0D_GPF, 0, TB));
+                }
+            }
             MSR_IA32_SYSENTER_CS => st64(cpu.env, SYSENTER_CS, val & 0xffff),
             MSR_IA32_SYSENTER_ESP => st64(cpu.env, SYSENTER_ESP, val),
             MSR_IA32_SYSENTER_EIP => st64(cpu.env, SYSENTER_EIP, val),
@@ -785,7 +828,14 @@ def!(CLTS, "x86_clts", 0, Void, [Ptr], h_clts);
 fn h_read_crn(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
         Ok(match a32(a, 1) {
-            8 => ld64(cpu.env, CR8),
+            // helper_read_cr8(): the TPR of the APIC.
+            8 => {
+                let ops = cpu.ops();
+                match x86_of(&ops).platform() {
+                    Some(p) => u64::from(p.apic_tpr()),
+                    None => ld64(cpu.env, CR8),
+                }
+            }
             n => ld64(cpu.env, cr(n as usize)),
         })
     })
@@ -957,7 +1007,13 @@ fn h_write_crn(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
                 }
                 update_cr4(cpu, t0);
             }
-            8 => st64(cpu.env, CR8, t0 & 0xf),
+            8 => {
+                let ops = cpu.ops();
+                if let Some(p) = x86_of(&ops).platform() {
+                    p.set_apic_tpr(t0 as u8);
+                }
+                st64(cpu.env, CR8, t0 & 0xf);
+            }
             2 => st64(cpu.env, cr(2), t0),
             _ => {}
         }

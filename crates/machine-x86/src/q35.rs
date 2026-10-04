@@ -87,7 +87,7 @@ use crate::pc::{
     GsiHookSlot, GsiState, HdGeometry, ISA_BIOS_MAX, IoportF0, MIB, PC_FW_DATA, PC_ROM_MIN_VGA,
     PC_ROM_SIZE, PCSPK_IO_BASE, PORT92_IO_BASE, PcSpeaker, Port92, REG_EQUIPMENT_BYTE,
     UnassignedIo, WeakDma, boot_order_nibbles, cmos_init_disks, cmos_set_memory, err,
-    hd_geometry_guess, pci_hole64_start, rtc_set_cpus_count, set_boot_dev,
+    hd_geometry_guess, pci_hole64_start, rtc_ref_date, rtc_set_cpus_count, set_boot_dev,
 };
 use crate::pflash::{FlashDrive, Pflash, PflashBacking, pc_system_flash_map};
 
@@ -190,7 +190,8 @@ pub type A20Handler = Arc<dyn Fn(bool) + Send + Sync>;
 pub struct PflashDrive {
     /// The block backend name QEMU prints in errors, "pflash0" or "pflash1".
     pub name: String,
-    /// The image size as the block layer reports it, see [`raw_block_length`](crate::pflash::raw_block_length).
+    /// The image size as the block layer reports it, see
+    /// [`raw_block_length`](crate::pflash::raw_block_length).
     pub size: u64,
     /// The image.
     pub backing: PflashBacking,
@@ -1030,11 +1031,11 @@ impl Q35 {
             .map_err(err)?;
         }
 
-        // The RTC inside the LPC bridge.
+        // The RTC inside the LPC bridge, which ich9_lpc_realize() gives base_year 2000.
         let rtc = {
-            let s = Arc::new(
-                Mc146818Rtc::new(Mc146818Props::default(), rtc_clock, rtc_date).map_err(err)?,
-            );
+            let date = rtc_ref_date(rtc_date, &rtc_clock);
+            let props = Mc146818Props { base_year: 2000, ..Mc146818Props::default() };
+            let s = Arc::new(Mc146818Rtc::new(props, rtc_clock, date).map_err(err)?);
             let r = mem.new_io("rtc", 2, s.clone()).map_err(err)?;
             mem.add_subregion(io, RTC_IO_BASE, r).map_err(err)?;
             s

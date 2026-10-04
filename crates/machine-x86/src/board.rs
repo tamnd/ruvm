@@ -21,7 +21,7 @@ use ruvm_hw_virtio::{
     AddressSpaceMemory, SharedGuestMemory, VirtioBackend, VirtioDeviceClass, VirtioPci,
     VirtioPciProps,
 };
-use ruvm_mem::{AddressSpace, MemorySystem};
+use ruvm_mem::{AddressSpace, MemorySystem, RegionId};
 
 use crate::firmware::FirmwareSearch;
 use crate::microvm::{
@@ -151,6 +151,14 @@ impl X86Board {
         match self {
             X86Board::Microvm(m) => m.memory_system(),
             X86Board::Q35(m, _) => m.memory_system(),
+        }
+    }
+
+    /// `get_system_memory()`, the root region of `address_space_memory`.
+    pub fn system_memory(&self) -> RegionId {
+        match self {
+            X86Board::Microvm(m) => m.system_memory(),
+            X86Board::Q35(m, _) => m.system_memory(),
         }
     }
 
