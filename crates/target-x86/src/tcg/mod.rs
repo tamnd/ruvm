@@ -48,8 +48,9 @@
 //!   is not supported: IRET to a frame with VM set raises #GP(0).
 //! - When the TSS is not present or has the wrong type on a stack switch, QEMU aborts with
 //!   "invalid tss"; this port raises #TS with the TR selector instead.
-//! - A triple fault halts the vCPU (counted by [`X86::triple_faults`]) instead of requesting
-//!   a system reset, since this crate has no machine to reset.
+//! - A triple fault halts the vCPU (counted by [`X86::triple_faults`]) and asks the
+//!   [`X86Platform`] for a system reset; QEMU leaves the vCPU running until the reset comes.
+//!   Without a platform the vCPU just stays halted.
 //! - The accessed and dirty bits of page table entries are set with a plain read and write of
 //!   physical memory, not with a compare and swap, so another vCPU changing the same entry at
 //!   the same moment can lose an update.
@@ -60,9 +61,17 @@
 //! - Debug registers are stored but hardware breakpoints and watchpoints are not armed.
 //!   Single stepping with TF works.
 //! - SVM, VMX, SMM, protection keys, MPX, CET, FRED, LAM and nested paging are not modelled.
-//! - Hardware interrupts come from a small vector queue fed by [`X86::raise_irq`], standing
-//!   in for the PIC and APIC that QEMU asks with `cpu_get_pic_interrupt()`. NMIs are not
-//!   modelled.
+//! - The local APIC, the PIC and system reset are reached through the [`X86Platform`] the
+//!   machine installs with [`X86::set_platform`], standing in for `cpu->apic_state`,
+//!   `isa_pic` and `qemu_system_reset_request()`. Without one, hardware interrupts come from
+//!   a small vector queue fed by [`X86::raise_irq`], the APIC base MSR and CR8 are plain
+//!   registers and the x2APIC MSRs raise #GP, as QEMU does without an APIC.
+//! - `x86_cpu_exec_interrupt()` follows QEMU's priority (POLL, SIPI, SMI, NMI, MCE, HARD), but
+//!   an SMI is dropped since there is no SMM, and a hardware interrupt for which the PIC and
+//!   APIC have no vector (-1) is not delivered, where QEMU would deliver vector -1.
+//! - `x86_cpu_exec_halt()` clears `CPU_INTERRUPT_POLL` before polling the APIC rather than
+//!   after, since there is no big lock here to keep another thread from raising it in
+//!   between.
 //! - PAUSE ends the block like any other instruction rather than leaving the execution loop.
 //! - RCL and RCR are computed inline in generated code instead of calling `helper_rcl*` and
 //!   `helper_rcr*`; the results and flags are the same. ROL and ROR with an immediate count
@@ -91,23 +100,28 @@ mod translate;
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+use ruvm_jit::cputlb::tlb_flush;
 use ruvm_jit::translate::TbBuild;
 use ruvm_jit::{
     Cpu, CpuLoopExit, CpuOps, CpuShared, InterpBackend, Jit, JitConfig, MmuAccessType, Ra, Tb,
-    TbCpuState, Vcpu, interrupt, translator_loop,
+    TbCpuState, Vcpu, excp, interrupt, translator_loop,
 };
 use ruvm_jit_interp::HelperRegistry;
 use ruvm_mem::AddressSpace;
 
 use crate::cpuid::X86Cpu;
-use crate::state::{HF_CPL_MASK, HF_CS64_MASK, HF_LMA_MASK, HF2_GIF_MASK, R_CS, X86CpuState};
+use crate::state::{
+    HF_CPL_MASK, HF_CS64_MASK, HF_LMA_MASK, HF_SMM_MASK, HF2_GIF_MASK, HF2_NMI_MASK, R_CS,
+    X86CpuState,
+};
 use env::{
-    AC_MASK, CC_OP, EFLAGS, EIP, HF_INHIBIT_IRQ_MASK, HF_SMAP_MASK, HFLAGS, HFLAGS2, IF_MASK,
-    IOPL_MASK, RF_MASK, SEG_BASE, TF_MASK, VM_MASK, ld32, ld64, seg, st32, st64,
+    AC_MASK, CC_OP, DR, EFLAGS, EIP, ENV_SIZE, HF_INHIBIT_IRQ_MASK, HF_SMAP_MASK, HFLAGS, HFLAGS2,
+    IF_MASK, IOPL_MASK, RF_MASK, SEG_BASE, SEG_SELECTOR, STAR, TF_MASK, TSC_OFFSET, VM_MASK, dr,
+    ld32, ld64, seg, st32, st64,
 };
 
 /// Divide error.
@@ -147,6 +161,55 @@ pub const EXCP11_ALGN: i32 = 17;
 /// Machine check.
 pub const EXCP12_MCHK: i32 = 18;
 
+/// `CPU_INTERRUPT_POLL`: the local APIC asks its vCPU to look at it again.
+pub const CPU_INTERRUPT_POLL: u32 = 0x0010;
+/// `CPU_INTERRUPT_SMI`.
+pub const CPU_INTERRUPT_SMI: u32 = 0x0040;
+/// `CPU_INTERRUPT_NMI`.
+pub const CPU_INTERRUPT_NMI: u32 = 0x0200;
+/// `CPU_INTERRUPT_MCE`.
+pub const CPU_INTERRUPT_MCE: u32 = 0x1000;
+/// `CPU_INTERRUPT_VIRQ`, the SVM virtual interrupt (not used without SVM).
+pub const CPU_INTERRUPT_VIRQ: u32 = 0x0100;
+/// `CPU_INTERRUPT_SIPI`.
+pub const CPU_INTERRUPT_SIPI: u32 = 0x0800;
+/// `CPU_INTERRUPT_TPR`.
+pub const CPU_INTERRUPT_TPR: u32 = 0x2000;
+/// `CPU_INTERRUPT_INIT`, which x86 puts in the place of `CPU_INTERRUPT_RESET`.
+pub const CPU_INTERRUPT_INIT: u32 = interrupt::RESET;
+
+/// `DR6_BS`: the single step bit of DR6.
+const DR6_BS: u64 = 1 << 14;
+
+/// What an x86 vCPU needs from the machine around it: its local APIC (`cpu->apic_state`),
+/// the 8259 (`isa_pic`) and system reset. Every method runs on the vCPU's own thread.
+pub trait X86Platform: Send + Sync {
+    /// `cpu_get_pic_interrupt()`: acknowledge and return the vector of the interrupt to
+    /// take, from the APIC or else the PIC, or `None` when there is none.
+    fn get_pic_interrupt(&self) -> Option<u8>;
+    /// `apic_poll_irq()`.
+    fn apic_poll_irq(&self);
+    /// `apic_sipi()`: the startup vector when the APIC was waiting for a SIPI, which it then
+    /// stops doing.
+    fn apic_sipi(&self) -> Option<u8>;
+    /// `apic_init_reset()`.
+    fn apic_init_reset(&self);
+    /// `cpu_get_apic_base()`.
+    fn apic_base(&self) -> u64;
+    /// `cpu_set_apic_base()`: false when the new value is refused, which raises #GP.
+    fn set_apic_base(&self, val: u64) -> bool;
+    /// `cpu_get_apic_tpr()`, the value CR8 reads.
+    fn apic_tpr(&self) -> u8;
+    /// `cpu_set_apic_tpr()`, for a CR8 write.
+    fn set_apic_tpr(&self, val: u8);
+    /// `apic_msr_read()` of x2APIC register `index`, `None` when it raises #GP.
+    fn apic_msr_read(&self, index: u32) -> Option<u64>;
+    /// `apic_msr_write()` of x2APIC register `index`: false when it raises #GP.
+    fn apic_msr_write(&self, index: u32, val: u64) -> bool;
+    /// `qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET)`, after a triple fault.
+    fn system_reset_request(&self);
+}
+
 /// Supervisor access with SMAP enforced, 64-bit addresses.
 pub const MMU_KSMAP64_IDX: usize = 0;
 /// Supervisor access with SMAP enforced, 32-bit addresses.
@@ -173,6 +236,9 @@ pub struct X86 {
     tsc_base: Instant,
     irqs: Mutex<VecDeque<u8>>,
     triple_faults: AtomicU64,
+    platform: OnceLock<Arc<dyn X86Platform>>,
+    /// `CPUID_APIC` in `features[FEAT_1_EDX]`, cleared while the APIC is disabled.
+    apic_feature: AtomicBool,
 }
 
 impl fmt::Debug for X86 {
@@ -181,6 +247,7 @@ impl fmt::Debug for X86 {
             .field("model", &self.model.typename())
             .field("io", &self.io.is_some())
             .field("triple_faults", &self.triple_faults.load(Ordering::Relaxed))
+            .field("platform", &self.platform.get().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -194,6 +261,8 @@ impl X86 {
             tsc_base: Instant::now(),
             irqs: Mutex::new(VecDeque::new()),
             triple_faults: AtomicU64::new(0),
+            platform: OnceLock::new(),
+            apic_feature: AtomicBool::new(true),
         }
     }
 
@@ -209,6 +278,38 @@ impl X86 {
     pub fn with_io(mut self, io: Arc<AddressSpace>) -> X86 {
         self.io = Some(io);
         self
+    }
+
+    /// Count the TSC from `base` instead of from when this [`X86`] was made, so that the
+    /// vCPUs of one machine share a time base, as `cpu_get_ticks()` does in QEMU.
+    pub fn with_tsc_base(mut self, base: Instant) -> X86 {
+        self.tsc_base = base;
+        self
+    }
+
+    /// Connect the machine: the local APIC, the PIC and system reset. Only the first call
+    /// counts; it returns false if a platform was already set.
+    pub fn set_platform(&self, platform: Arc<dyn X86Platform>) -> bool {
+        self.platform.set(platform).is_ok()
+    }
+
+    pub(crate) fn platform(&self) -> Option<&Arc<dyn X86Platform>> {
+        self.platform.get()
+    }
+
+    /// `cpu_set_apic_feature()` and `cpu_clear_apic_feature()`: whether CPUID leaf 1 shows
+    /// the APIC, which the APIC turns off while it is disabled.
+    pub fn set_apic_feature(&self, on: bool) {
+        self.apic_feature.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn apic_feature(&self) -> bool {
+        self.apic_feature.load(Ordering::Relaxed)
+    }
+
+    /// Drop the vectors queued by [`X86::raise_irq`], for a reset.
+    pub fn clear_irqs(&self) {
+        self.irqs.lock().expect("irq queue").clear();
     }
 
     /// The CPU model.
@@ -237,22 +338,67 @@ impl X86 {
         self.io.as_ref()
     }
 
+    /// Count a triple fault and ask the platform for a reset.
     pub(crate) fn note_triple_fault(&self) {
         self.triple_faults.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = self.platform() {
+            p.system_reset_request();
+        }
     }
 
-    /// `x86_cpu_pending_interrupt()` for the interrupts this port models.
+    /// `x86_cpu_pending_interrupt()`, without SVM's virtual interrupts.
     fn pending_interrupt(&self, cpu: &Cpu<'_>, request: u32) -> u32 {
+        if request & CPU_INTERRUPT_POLL != 0 {
+            return CPU_INTERRUPT_POLL;
+        }
+        if request & CPU_INTERRUPT_SIPI != 0 {
+            return CPU_INTERRUPT_SIPI;
+        }
         let fl = ld64(cpu.env, EFLAGS) as u32;
         let hf = ld32(cpu.env, HFLAGS);
         let hf2 = ld32(cpu.env, HFLAGS2);
         if hf2 & HF2_GIF_MASK == 0 {
             return 0;
         }
-        if request & interrupt::HARD != 0 && fl & IF_MASK != 0 && hf & HF_INHIBIT_IRQ_MASK == 0 {
-            return interrupt::HARD;
+        if request & CPU_INTERRUPT_SMI != 0 && hf & HF_SMM_MASK == 0 {
+            CPU_INTERRUPT_SMI
+        } else if request & CPU_INTERRUPT_NMI != 0 && hf2 & HF2_NMI_MASK == 0 {
+            CPU_INTERRUPT_NMI
+        } else if request & CPU_INTERRUPT_MCE != 0 {
+            CPU_INTERRUPT_MCE
+        } else if request & interrupt::HARD != 0
+            && fl & IF_MASK != 0
+            && hf & HF_INHIBIT_IRQ_MASK == 0
+        {
+            interrupt::HARD
+        } else {
+            0
         }
-        0
+    }
+
+    /// `cpu_get_pic_interrupt()` through the platform, or the next queued vector.
+    fn get_pic_interrupt(&self, shared: &CpuShared) -> Option<u8> {
+        if let Some(p) = self.platform() {
+            return p.get_pic_interrupt();
+        }
+        let mut q = self.irqs.lock().expect("irq queue");
+        let v = q.pop_front();
+        if !q.is_empty() {
+            shared.set_interrupt(interrupt::HARD);
+        }
+        v
+    }
+
+    /// `do_cpu_sipi()` with `apic_sipi()` and `cpu_x86_load_seg_cache_sipi()`.
+    fn do_cpu_sipi(&self, cpu: &mut Cpu<'_>) {
+        if ld32(cpu.env, HFLAGS) & HF_SMM_MASK != 0 {
+            return;
+        }
+        let Some(vector) = self.platform().and_then(|p| p.apic_sipi()) else { return };
+        st64(cpu.env, EIP, 0);
+        st32(cpu.env, seg(R_CS) + SEG_SELECTOR, u32::from(vector) << 8);
+        st64(cpu.env, seg(R_CS) + SEG_BASE, u64::from(vector) << 12);
+        cpu.shared().halted.store(0, Ordering::Release);
     }
 }
 
@@ -350,25 +496,90 @@ impl CpuOps for X86 {
         linear_pc(cpu.env)
     }
 
+    /// `x86_cpu_exec_interrupt()`: take one interrupt request, in priority order.
     fn cpu_exec_interrupt(&self, cpu: &mut Cpu<'_>, interrupt_request: u32) -> bool {
         let pending = self.pending_interrupt(cpu, interrupt_request);
         if pending == 0 {
             return false;
         }
         let shared = cpu.shared();
-        let vector = {
-            let mut q = self.irqs.lock().expect("irq queue");
-            let v = q.pop_front();
-            if q.is_empty() {
-                shared.reset_interrupt(interrupt::HARD);
+        match pending {
+            CPU_INTERRUPT_POLL => {
+                shared.reset_interrupt(CPU_INTERRUPT_POLL);
+                if let Some(p) = self.platform() {
+                    p.apic_poll_irq();
+                }
             }
-            v
-        };
-        let Some(vector) = vector else {
-            return false;
-        };
-        seg::do_interrupt_x86_hardirq(cpu, self, i32::from(vector));
+            CPU_INTERRUPT_SIPI => {
+                shared.reset_interrupt(CPU_INTERRUPT_SIPI);
+                self.do_cpu_sipi(cpu);
+            }
+            CPU_INTERRUPT_SMI => {
+                // There is no SMM to enter.
+                shared.reset_interrupt(CPU_INTERRUPT_SMI);
+            }
+            CPU_INTERRUPT_NMI => {
+                shared.reset_interrupt(CPU_INTERRUPT_NMI);
+                let hf2 = ld32(cpu.env, HFLAGS2);
+                st32(cpu.env, HFLAGS2, hf2 | HF2_NMI_MASK);
+                seg::do_interrupt_x86_hardirq(cpu, self, EXCP02_NMI, true);
+            }
+            CPU_INTERRUPT_MCE => {
+                shared.reset_interrupt(CPU_INTERRUPT_MCE);
+                seg::do_interrupt_x86_hardirq(cpu, self, EXCP12_MCHK, false);
+            }
+            _ => {
+                shared.reset_interrupt(interrupt::HARD | CPU_INTERRUPT_VIRQ);
+                if let Some(intno) = self.get_pic_interrupt(&shared) {
+                    seg::do_interrupt_x86_hardirq(cpu, self, i32::from(intno), true);
+                }
+            }
+        }
         true
+    }
+
+    /// `x86_cpu_exec_halt()`.
+    fn cpu_exec_halt(&self, cpu: &mut Cpu<'_>) -> bool {
+        let shared = cpu.shared();
+        if shared.test_interrupt(CPU_INTERRUPT_POLL) {
+            shared.reset_interrupt(CPU_INTERRUPT_POLL);
+            if let Some(p) = self.platform() {
+                p.apic_poll_irq();
+            }
+        }
+        if !self.has_work(cpu) {
+            return false;
+        }
+        // Complete the HLT instruction.
+        if ld64(cpu.env, EFLAGS) as u32 & TF_MASK != 0 {
+            let d6 = ld64(cpu.env, dr(6)) | DR6_BS;
+            st64(cpu.env, dr(6), d6);
+            seg::hlt_single_step(cpu, self);
+        }
+        true
+    }
+
+    /// `CPU_INTERRUPT_INIT` in `cpu_handle_interrupt()`: `do_cpu_init()`, then leave the loop
+    /// with `EXCP_HALTED`.
+    fn cpu_exec_reset(&self, cpu: &mut Cpu<'_>) {
+        let shared = cpu.shared();
+        let sipi = shared.interrupt_request() & CPU_INTERRUPT_SIPI;
+        let save = cpu.env[..ENV_SIZE].to_vec();
+        // x86_cpu_reset_hold(): the BSP is hard-wired to the first CPU.
+        let is_bsp = shared.cpu_index == 0;
+        let state = self.model.new_state(is_bsp);
+        env::load_state(cpu.env, &state);
+        // The registers between start_init_save and end_init_save survive INIT.
+        cpu.env[STAR..DR].copy_from_slice(&save[STAR..DR]);
+        cpu.env[TSC_OFFSET..ENV_SIZE].copy_from_slice(&save[TSC_OFFSET..ENV_SIZE]);
+        shared.reset_interrupt(!sipi);
+        shared.halted.store(u32::from(!is_bsp), Ordering::Release);
+        self.clear_irqs();
+        tlb_flush(cpu);
+        if let Some(p) = self.platform() {
+            p.apic_init_reset();
+        }
+        cpu.core.exception_index = excp::HALTED;
     }
 
     fn do_interrupt(&self, cpu: &mut Cpu<'_>) {
@@ -450,7 +661,7 @@ pub fn create_vcpu(
     as_: Arc<AddressSpace>,
     state: &X86CpuState,
 ) -> Vcpu {
-    let mut v = jit.create_vcpu(ops, as_, env::ENV_SIZE);
+    let mut v = jit.create_vcpu(ops, as_, ENV_SIZE);
     env::load_state(&mut v.env, state);
     v
 }

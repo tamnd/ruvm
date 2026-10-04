@@ -9,7 +9,9 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ruvm_hw_core::Clock;
 use ruvm_hw_core::IrqLine;
 use ruvm_hw_core::IrqPin;
 use ruvm_hw_core::fw_cfg::{DmaMemory, FW_CFG_ARCH_LOCAL};
@@ -143,6 +145,23 @@ impl GsiState {
                 l.set(level);
             }
         }
+    }
+}
+
+/// The date `rtc_clock` reads zero at, which `Mc146818Rtc::new()` takes, for an RTC that is
+/// to show `date` (`-rtc base=`) now. `qemu_ref_timedate()` reads the host clock as the date
+/// itself and counts the other clocks from the start date, so the clock's reading so far comes
+/// off `date`: with the host clock that gives the epoch, with the virtual clock `date`.
+pub fn rtc_ref_date(date: SystemTime, rtc_clock: &Clock) -> SystemTime {
+    let secs = match date.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    let start = secs - rtc_clock.get_ms() / 1000;
+    if start >= 0 {
+        UNIX_EPOCH + Duration::from_secs(start as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_secs(start.unsigned_abs())
     }
 }
 

@@ -67,6 +67,7 @@ pub use props::{MicrovmProps, OnOffAuto};
 
 use crate::pc::{
     GsiHook, GsiHookSlot, GsiState, ISA_BIOS_MAX, MIB, UnassignedIo, WeakDma, cmos_set_memory, err,
+    rtc_ref_date,
 };
 
 /// `mc->desc`.
@@ -656,7 +657,8 @@ impl Microvm {
                 irq: RTC_IRQ as u8,
                 ..Mc146818Props::default()
             };
-            let s = Arc::new(Mc146818Rtc::new(rtc_props, rtc_clock, rtc_date).map_err(err)?);
+            let date = rtc_ref_date(rtc_date, &rtc_clock);
+            let s = Arc::new(Mc146818Rtc::new(rtc_props, rtc_clock, date).map_err(err)?);
             s.connect_irq(gsi[RTC_IRQ as usize].clone());
             let r = mem.new_io("rtc", 2, s.clone()).map_err(err)?;
             mem.add_subregion(io, RTC_IO_BASE, r).map_err(err)?;

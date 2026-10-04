@@ -102,7 +102,7 @@ fn check_exception(cpu: &mut Cpu<'_>, intno: i32, error_code: &mut u32) -> i32 {
     let first_contributory = old == 0 || (10..=13).contains(&old);
     let second_contributory = intno == 0 || (10..=13).contains(&intno);
     if old == EXCP08_DBLE {
-        // "Triple fault": QEMU asks for a system reset; there is no machine here, so halt.
+        // "Triple fault": ask the platform for a system reset and halt until it comes.
         let ops = cpu.ops();
         x86_of(&ops).note_triple_fault();
         cpu.shared().halted.store(1, std::sync::atomic::Ordering::Release);
@@ -777,8 +777,18 @@ pub(crate) fn x86_cpu_do_interrupt(cpu: &mut Cpu<'_>, _x: &X86) {
 }
 
 /// `do_interrupt_x86_hardirq()`.
-pub(crate) fn do_interrupt_x86_hardirq(cpu: &mut Cpu<'_>, _x: &X86, intno: i32) {
-    if do_interrupt_all(cpu, intno, false, 0, 0, true).is_err() {
+pub(crate) fn do_interrupt_x86_hardirq(cpu: &mut Cpu<'_>, _x: &X86, intno: i32, is_hw: bool) {
+    if do_interrupt_all(cpu, intno, false, 0, 0, is_hw).is_err() {
+        deliver_pending(cpu);
+    }
+    cpu.core.exception_index = -1;
+}
+
+/// The #DB that completes a HLT run with TF set, `do_interrupt_all(cpu, EXCP01_DB, 0, 0,
+/// env->eip, 0)` in `x86_cpu_exec_halt()`.
+pub(crate) fn hlt_single_step(cpu: &mut Cpu<'_>, _x: &X86) {
+    let eip = ld64(cpu.env, EIP);
+    if do_interrupt_all(cpu, EXCP01_DB, false, 0, eip, false).is_err() {
         deliver_pending(cpu);
     }
     cpu.core.exception_index = -1;

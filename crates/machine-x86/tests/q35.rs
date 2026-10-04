@@ -6,7 +6,9 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ruvm_base::ClockType;
 use ruvm_firmware::acpi::devices::IsaDevice;
 use ruvm_firmware::acpi::pci::CrsRange;
 use ruvm_firmware::acpi::q35::{self as acpi_q35, PciDevice, PciDeviceAml, Q35Acpi};
@@ -17,8 +19,12 @@ use ruvm_firmware::x86_linux::{
     LINUXBOOT_DMA_ROM,
 };
 use ruvm_hw_acpi::SystemRequest;
+use ruvm_hw_core::Clock;
+use ruvm_hw_core::timer::TimeSource;
 use ruvm_hw_storage::{BlockBackend, DriveConfig, VecBackend};
+use ruvm_hw_timer::mc146818::gmtime;
 use ruvm_machine_x86::microvm::KernelConfig;
+use ruvm_machine_x86::pc::rtc_ref_date;
 use ruvm_machine_x86::q35::{KVMVAPIC_ROM, PflashDrive, q35_ram_split};
 use ruvm_machine_x86::{PflashBacking, Q35, Q35MachineConfig, Q35Props};
 use ruvm_mem::{Endian, MemTxAttrs};
@@ -258,6 +264,37 @@ fn cmos_memory_and_boot_bytes() {
     assert_eq!(cmos(&m, 0x3d), 0x34);
     assert_eq!(cmos(&m, 0x38), 0x01);
     assert_eq!(cmos(&m, 0x5f), 2);
+}
+
+/// Reads the CMOS date as (century, year, month, day), all BCD as after reset.
+fn cmos_date(m: &Q35) -> (u8, u8, u8, u8) {
+    (cmos(m, 0x32), cmos(m, 0x09), cmos(m, 0x08), cmos(m, 0x07))
+}
+
+fn bcd(v: i32) -> u8 {
+    (v / 10 * 16 + v % 10) as u8
+}
+
+#[test]
+fn cmos_date_follows_rtc_clock() {
+    // The host clock reads the date itself, so the RTC shows today and not twice today's
+    // distance from the epoch, with the century in 0x32 as ich9_lpc_realize() sets
+    // base_year 2000.
+    let now = SystemTime::now();
+    let host = Clock::new(ClockType::Host, TimeSource::Wall);
+    let m = machine(Q35MachineConfig { rtc_clock: host, rtc_date: now, ..config("") });
+    let secs = now.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let tm = gmtime(secs);
+    let (century, year, _, _) = cmos_date(&m);
+    assert_eq!((century, year), (bcd((1900 + tm.year) / 100), bcd(tm.year % 100)));
+
+    // Other clocks count from `-rtc base=`, whatever they read when the board is built.
+    let date = UNIX_EPOCH + Duration::from_secs(1_150_502_400); // 2006-06-17
+    let virt = Clock::manual(ClockType::Virtual);
+    virt.advance_to(5_000_000_000_000);
+    assert_eq!(rtc_ref_date(date, &virt), date - Duration::from_secs(5000));
+    let m = machine(Q35MachineConfig { rtc_clock: virt, rtc_date: date, ..config("") });
+    assert_eq!(cmos_date(&m), (0x20, 0x06, 0x06, 0x17));
 }
 
 #[test]
