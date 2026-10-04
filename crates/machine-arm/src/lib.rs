@@ -2,10 +2,11 @@
 
 //! Arm machines: virt, sbsa-ref and every Arm board.
 //!
-//! So far this is the `virt` board ([`virt`]) with GICv3, and the device tree writer it uses
-//! ([`fdt`]).
+//! So far this is the `virt` board ([`virt`]) with GICv3, the device tree writer it uses
+//! ([`fdt`]) and the loop that runs it on TCG ([`tcg_run`]).
 
 #![forbid(unsafe_code)]
 
 pub mod fdt;
+pub mod tcg_run;
 pub mod virt;

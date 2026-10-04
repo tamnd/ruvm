@@ -74,6 +74,17 @@ macro_rules! arm_state {
                 s
             }
 
+            /// Read the state without the SVE registers `zregs` and `pregs`, which are left
+            /// zero, for the hot paths that only look at the system state (the TB flags,
+            /// the MMU index and the page table walk). The result must not be stored back.
+            pub fn load_system(env: &[u8]) -> $name {
+                let mut s = $name::default();
+                $(if !matches!(stringify!($f), "zregs" | "pregs") {
+                    s.$f.get(&env[ENV_TARGET_OFFSET + offset_of!($name, $f)..]);
+                })*
+                s
+            }
+
             /// Write the state into a vCPU's `env` buffer.
             pub fn store(&self, env: &mut [u8]) {
                 $(self.$f.put(&mut env[ENV_TARGET_OFFSET + offset_of!($name, $f)..]);)*
@@ -117,6 +128,8 @@ arm_state! {
         pub sctlr_el: [u64; 4],
         /// TCR_ELx.
         pub tcr_el: [u64; 4],
+        /// TCR2_EL1 (index 1) and TCR2_EL2 (index 2).
+        pub tcr2_el: [u64; 4],
         /// TTBR0_ELx.
         pub ttbr0_el: [u64; 4],
         /// TTBR1_ELx.
@@ -422,6 +435,8 @@ pub const SCR_TWI: u64 = 1 << 12;
 pub const SCR_TWE: u64 = 1 << 13;
 /// `SCR_TLOR`.
 pub const SCR_TLOR: u64 = 1 << 14;
+/// `SCR_TCR2EN`.
+pub const SCR_TCR2EN: u64 = 1 << 43;
 
 /// `HCR_VM`.
 pub const HCR_VM: u64 = 1 << 0;
@@ -716,6 +731,9 @@ impl CpuArmState {
         if f.lor {
             valid |= SCR_TLOR;
         }
+        if f.tcr2 {
+            valid |= SCR_TCR2EN;
+        }
         if !f.el2 {
             valid &= !SCR_HCE;
         }
@@ -872,6 +890,14 @@ pub struct ArmFeatures {
     /// The largest vector length in quadwords, QEMU's `sve-max-vq` (every length from 1 to
     /// this is supported, as for TCG). Zero without SVE.
     pub sve_max_vq: u32,
+    /// FEAT_TLBIOS: the Outer Shareable TLBI operations (`aa64_tlbios`).
+    pub tlbios: bool,
+    /// FEAT_XS: the TLBI nXS operations and DSB nXS (`aa64_xs`).
+    pub xs: bool,
+    /// FEAT_TCR2: TCR2_EL1 and TCR2_EL2 (`aa64_tcr2`).
+    pub tcr2: bool,
+    /// FEAT_ASID2: TCR2_ELx.A2, FNG0 and FNG1 (`aa64_asid2`).
+    pub asid2: bool,
     /// A GICv3 CPU interface is attached ([`Arm::with_gicv3`](crate::tcg::Arm::with_gicv3)),
     /// so the ICC system registers exist, as `gicv3_init_cpuif()` defines them.
     pub gicv3: bool,
@@ -925,6 +951,10 @@ pub struct ArmCpuModel {
     pub id_aa64mmfr1: u64,
     /// ID_AA64MMFR2_EL1.
     pub id_aa64mmfr2: u64,
+    /// ID_AA64MMFR3_EL1.
+    pub id_aa64mmfr3: u64,
+    /// ID_AA64MMFR4_EL1.
+    pub id_aa64mmfr4: u64,
     /// The features, derived from the ID registers.
     pub features: ArmFeatures,
 }
@@ -991,6 +1021,8 @@ impl ArmCpuModel {
             id_aa64mmfr0: MMFR0_4K_ONLY | 4,
             id_aa64mmfr1: 0,
             id_aa64mmfr2: 0,
+            id_aa64mmfr3: 0,
+            id_aa64mmfr4: 0,
             features: ArmFeatures {
                 crc32: true,
                 aes: true,
@@ -1045,6 +1077,8 @@ impl ArmCpuModel {
             id_aa64mmfr1: 0x0011_1102,
             // UAO 1, CnP 1.
             id_aa64mmfr2: 0x11,
+            id_aa64mmfr3: 0,
+            id_aa64mmfr4: 0,
             features: ArmFeatures {
                 lse: true,
                 crc32: true,
@@ -1106,6 +1140,8 @@ impl ArmCpuModel {
             id_aa64mmfr0: 0x0000_1024,
             id_aa64mmfr1: 0,
             id_aa64mmfr2: 0,
+            id_aa64mmfr3: 0,
+            id_aa64mmfr4: 0,
             features: ArmFeatures {
                 crc32: true,
                 aes: true,
@@ -1122,8 +1158,10 @@ impl ArmCpuModel {
     /// `max` MIDR, CTR_EL0.IDC and DIC, and SVE2 with the AES, PMULL128, BitPerm, SHA3 and
     /// SM4 extensions, F32MM, F64MM, BF16 and I8MM, at vector lengths up to 2048 bits. The
     /// vector length limit is [`ArmCpuModel::with_sve_max_vq`], `-cpu max,sve-max-vq=N`.
-    /// QEMU's `max` has many more features (SVE2p1, EBF16, SVE_B16B16, SME, MTE, PAuth and so
-    /// on) that this port does not; their ID register fields read as zero here.
+    /// It also has FEAT_TLBIOS, FEAT_XS, FEAT_TCR2 and FEAT_ASID2, which are only maintenance
+    /// operations and register bits here. QEMU's `max` has many more features (SVE2p1, EBF16,
+    /// SVE_B16B16, SME, MTE, PAuth and so on) that this port does not; their ID register
+    /// fields read as zero here.
     pub fn max() -> ArmCpuModel {
         let a76 = ArmCpuModel::cortex_a76();
         ArmCpuModel {
@@ -1151,7 +1189,19 @@ impl ArmCpuModel {
             // I8MM 1, F32MM 1 and F64MM 1. QEMU's `max` sets SVEver 2 (SVE2p1), BF16 2
             // (FEAT_EBF16) and B16B16 1; those fields come up when their instructions land.
             id_aa64zfr0: 0x0110_1101_0011_0021,
+            // ID_AA64ISAR0_EL1.TLB = 1 (FEAT_TLBIOS). QEMU's `max` has 2, FEAT_TLBIRANGE.
+            id_aa64isar0: a76.id_aa64isar0 | (1 << 56),
+            // ID_AA64ISAR1_EL1.XS = 1.
+            id_aa64isar1: a76.id_aa64isar1 | (1 << 56),
+            // ID_AA64MMFR3_EL1.TCRX = 1.
+            id_aa64mmfr3: 1,
+            // ID_AA64MMFR4_EL1.ASID2 = 1.
+            id_aa64mmfr4: 1 << 8,
             features: ArmFeatures {
+                tlbios: true,
+                xs: true,
+                tcr2: true,
+                asid2: true,
                 sve: true,
                 sve2: true,
                 sve_aes: true,

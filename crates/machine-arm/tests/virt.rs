@@ -293,6 +293,9 @@ fn memory_map() {
     // The PrimeCell IDs of the PL011 and the PL031.
     assert_eq!(r32(&m, VIRT_UART + 0xfe0), 0x11);
     assert_eq!(r32(&m, VIRT_RTC + 0xfe0), 0x31);
+    // RTCDR counts the seconds since the epoch: the host date, not twice it.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    assert!(u64::from(r32(&m, VIRT_RTC)).abs_diff(now.as_secs()) < 60, "RTCDR is the date");
     // Every virtio-mmio transport says "virt".
     for i in 0..32 {
         assert_eq!(r32(&m, VIRT_MMIO + i * 0x200), 0x7472_6976);

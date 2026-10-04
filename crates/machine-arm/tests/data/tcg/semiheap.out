@@ -1,0 +1,5 @@
+Semihosting Heap Info Test
+heap: 402b1000 -> 48000000
+stack: 402b1000 <- 48000000
+r/w to heap up to 402b1800
+Passed HeapInfo checks

@@ -6,15 +6,15 @@
 //!
 //! ruvm behaves like a QEMU build with the `qtest` accelerator, the `none` machine and no
 //! displays, plus, for the x86 targets, the `microvm` and `q35` boards on `tcg` and, on Linux
-//! x86_64 hosts, `kvm`. Options for things that build would leave out fail with QEMU's own
-//! messages.
+//! x86_64 hosts, `kvm`, and for aarch64 the `virt` board on `tcg`. Options for things that
+//! build would leave out fail with QEMU's own messages.
 //!
 //! Deliberate differences from QEMU:
 //!
 //! - Without `-accel` or `-machine accel=`, a build with both KVM and TCG tries `kvm:tcg`, so
 //!   KVM is used where it works and TCG otherwise (after QEMU's "falling back to tcg"). QEMU
 //!   picks `tcg:kvm` unless its program name ends in `kvm`.
-//! - The x86 boards do not run under qtest yet.
+//! - The x86 boards and virt do not run under qtest yet.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +43,7 @@ use ruvm_qapi::visit::{QObjectInputVisitor, Visit};
 use ruvm_qapi::{QDict, QValue, json};
 use ruvm_qom::{Registry, type_print_class_properties, user_creatable_print_types};
 
+use crate::arm;
 use crate::options::{Opt, arch_available, help_text, lookup_opt};
 use crate::qmp_cmds::{self, object_options_dict};
 use crate::qtest::{self, VirtualClock};
@@ -54,9 +55,9 @@ fn have_kvm(target: &str) -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64")) && x86::is_x86(target)
 }
 
-/// Whether TCG is built in for `target`: the x86 targets, whose front end exists.
+/// Whether TCG is built in for `target`: the x86 targets and aarch64, whose front ends exist.
 fn have_tcg(target: &str) -> bool {
-    x86::is_x86(target)
+    x86::is_x86(target) || arm::is_arm(target)
 }
 
 /// The accelerators this build has for `target`. qtest is left out of `-accel help`, as in
@@ -219,6 +220,8 @@ struct Config {
     memory: QemuOptsList,
     /// The x86 board options: `-L`, `-cpu`, `-serial`, `-drive`, `-device` and friends.
     x86: x86::Cmdline,
+    /// `-semihosting` and `-semihosting-config`.
+    semihosting: arm::Semihosting,
     /// `-machine kernel-irqchip=`, the sugar for the kvm property.
     kernel_irqchip: Option<String>,
 }
@@ -243,6 +246,7 @@ impl Config {
             mon_deprecation_warned: false,
             memory: memory_opts(),
             x86: x86::Cmdline::default(),
+            semihosting: arm::Semihosting::default(),
             kernel_irqchip: None,
         }
     }
@@ -324,6 +328,8 @@ struct Keep {
     _accel: Option<Accel>,
     /// The x86 board on its accelerator.
     board: Option<x86::Running>,
+    /// The virt board on TCG.
+    arm_board: Option<arm::Running>,
 }
 
 /// The option loop of `qemu_init()`.
@@ -419,6 +425,11 @@ fn parse_options(
             Opt::Kernel => cfg.machine.put("kernel", arg),
             Opt::Initrd => cfg.machine.put("initrd", arg),
             Opt::Append => cfg.machine.put("append", arg),
+            Opt::Dtb => cfg.machine.put("dtb", arg),
+            Opt::Semihosting => cfg.semihosting.enable(),
+            Opt::SemihostingConfig => {
+                cfg.semihosting.config_options(arg).map_err(|e| fail_msg(&e))?;
+            }
             Opt::Bios => cfg.machine.put("firmware", arg),
             Opt::Cpu => {
                 if is_help_option(arg) {
@@ -607,6 +618,9 @@ fn machine_help(target: &str) -> String {
     if x86::is_x86(target) {
         lines.extend(x86::machine_help_lines());
     }
+    if arm::is_arm(target) {
+        lines.extend(arm::machine_help_lines());
+    }
     lines.sort();
     let mut out = String::from("Supported machines are:\n");
     for (_, text) in lines {
@@ -697,6 +711,8 @@ enum MachineChoice {
     Qom(String),
     /// One of the x86 boards.
     X86(BoardKind),
+    /// The Arm virt board.
+    ArmVirt,
 }
 
 /// `select_machine()`: no target has a default machine.
@@ -714,6 +730,9 @@ fn select_machine(target: &str, cfg: &mut Config) -> Flow<MachineChoice> {
         if let Some(kind) = BoardKind::from_name(&ty) {
             return Ok(MachineChoice::X86(kind));
         }
+    }
+    if arm::is_arm(target) && arm::is_virt(&ty) {
+        return Ok(MachineChoice::ArmVirt);
     }
     if !MACHINES.iter().any(|m| m.name == ty) {
         let e = Error::generic(format!("unsupported machine type: \"{ty}\"")).hint(hint);
@@ -910,8 +929,11 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         }
     }
 
-    let (kind, machine) = match select_machine(p.target, &mut cfg)? {
+    let choice = select_machine(p.target, &mut cfg)?;
+    let virt = matches!(choice, MachineChoice::ArmVirt);
+    let (kind, machine) = match choice {
         MachineChoice::X86(kind) => (Some(kind), None),
+        MachineChoice::ArmVirt => (None, None),
         MachineChoice::Qom(typename) => {
             let machine =
                 create_machine(&vm.registry, &typename, &vm.regions).map_err(|e| fail(&e))?;
@@ -921,7 +943,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
 
     // C-a x on a mux.
     chardevs.set_mux_quit_handler(mux_quit_hook(&runstate));
-    create_default_devices(&mut cfg, kind.is_none())?;
+    create_default_devices(&mut cfg, kind.is_none() && !virt)?;
 
     // qemu_create_early_backends()
     create_objects(&vm, &mut cfg, object_create_early)?;
@@ -936,11 +958,25 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         }
     }
     // configure_blockdev(): the -drive options, which need to know the machine.
+    if virt && !cfg.x86.drives.is_empty() {
+        return Err(fail_msg("-drive is not supported with this machine by ruvm yet"));
+    }
+    if virt && !cfg.x86.devices.is_empty() {
+        return Err(fail_msg("-device is not supported with this machine by ruvm yet"));
+    }
     let drives = parse_drives(kind, &cfg.x86.drives)?;
 
     // qemu_apply_legacy_machine_options() and qemu_apply_machine_options()
     let memdev = apply_legacy_machine_options(&mut cfg)?;
+    let mut virt_opts = None;
     let board_opts = match (kind, machine) {
+        (None, None) if virt => {
+            if memdev.is_some() {
+                return Err(fail_msg("memory-backend is not supported by ruvm yet"));
+            }
+            virt_opts = Some(arm::take_board_options(&cfg.machine).map_err(|e| fail(&e))?);
+            None
+        }
         (Some(kind), _) => {
             if memdev.is_some() {
                 return Err(fail_msg("memory-backend is not supported by ruvm yet"));
@@ -954,7 +990,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         (None, None) => unreachable!("a QOM machine was created"),
     };
     let accel = configure_accelerators(p.target, kind, &mut cfg)?;
-    if kind.is_some() && (matches!(accel, Accel::Qtest) || cfg.qtest.is_some()) {
+    if (kind.is_some() || virt) && (matches!(accel, Accel::Qtest) || cfg.qtest.is_some()) {
         return Err(fail_msg(
             "this machine type is only supported with -accel kvm or tcg by ruvm yet",
         ));
@@ -995,15 +1031,37 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         resolve_machine_memdev(&vm, machine, &cfg, id)?;
     }
 
-    let mut keep = Keep { _qtest: qtest, _accel: None, board: None };
-    match (kind, board_opts) {
-        (Some(kind), Some(opts)) => {
-            if cfg.preconfig {
-                return Err(fail_msg("-preconfig is not supported with this machine by ruvm yet"));
-            }
-            keep = start_x86(&vm, &cfg, accel, kind, opts, &drives, &serial_hds, keep)?;
+    let mut keep = Keep { _qtest: qtest, _accel: None, board: None, arm_board: None };
+    if let Some(opts) = virt_opts {
+        if cfg.preconfig {
+            return Err(fail_msg("-preconfig is not supported with this machine by ruvm yet"));
         }
-        _ => keep._accel = Some(accel),
+        let Accel::Tcg(tcg) = accel else { unreachable!("checked above") };
+        let args = arm::ArmArgs {
+            cpu: cfg.x86.cpu.as_deref(),
+            no_reboot: cfg.x86.no_reboot,
+            semihosting: &cfg.semihosting,
+        };
+        let running =
+            arm::start_board_tcg(&vm, tcg, opts, &args, &serial_hds).map_err(|errors| {
+                for e in &errors {
+                    e.report();
+                }
+                Exit(1)
+            })?;
+        keep.arm_board = Some(running);
+    } else {
+        match (kind, board_opts) {
+            (Some(kind), Some(opts)) => {
+                if cfg.preconfig {
+                    return Err(fail_msg(
+                        "-preconfig is not supported with this machine by ruvm yet",
+                    ));
+                }
+                keep = start_x86(&vm, &cfg, accel, kind, opts, &drives, &serial_hds, keep)?;
+            }
+            _ => keep._accel = Some(accel),
+        }
     }
 
     if cfg.preconfig {
@@ -1153,8 +1211,16 @@ fn main_loop(vm: &Arc<Vm>, keep: &Keep) -> u8 {
         }
     }
     vm.runstate.send_shutdown_event(cause);
+    if let Some(board) = &keep.arm_board {
+        // A vCPU waiting for semihosting console input would never stop otherwise.
+        board.wake_console();
+    }
     vm.runstate.vm_shutdown();
     if let Some(board) = &keep.board {
+        vm.runstate.set_cpu_hook(None);
+        board.quit();
+    }
+    if let Some(board) = &keep.arm_board {
         vm.runstate.set_cpu_hook(None);
         board.quit();
     }

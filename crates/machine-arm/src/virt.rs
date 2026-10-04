@@ -67,7 +67,7 @@ mod dt;
 
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
-use std::time::{Instant, SystemTime};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ruvm_base::ClockType;
 use ruvm_hw_char::pl011::{PL011_MMIO_SIZE, Pl011};
@@ -103,6 +103,9 @@ pub const VIRT_GIC_DIST: u64 = 0x0800_0000;
 pub const VIRT_GIC_REDIST: u64 = 0x080a_0000;
 /// The size of the `VIRT_GIC_REDIST` window.
 pub const VIRT_GIC_REDIST_SIZE: u64 = 0x00f6_0000;
+/// The most CPUs the GICv3 redistributor window has room for, `virt_max_cpus` in
+/// `machvirt_init()`.
+pub const VIRT_GICV3_MAX_CPUS: usize = (VIRT_GIC_REDIST_SIZE / GICV3_REDIST_SIZE) as usize;
 /// `VIRT_UART0`.
 pub const VIRT_UART: u64 = 0x0900_0000;
 /// The size of the UART window.
@@ -226,6 +229,9 @@ pub enum VirtRequest {
     /// SYSTEM_RESET.
     Reset,
 }
+
+/// Receives the [`VirtRequest`]s on the thread of the vCPU that made them.
+pub type VirtRequestHandler = Arc<dyn Fn(VirtRequest) + Send + Sync>;
 
 fn err<E: fmt::Display>(e: E) -> String {
     e.to_string()
@@ -369,7 +375,7 @@ impl VirtMachine {
                 memtop - (1u64 << pa_bits)
             ));
         }
-        let max_cpus = (VIRT_GIC_REDIST_SIZE / GICV3_REDIST_SIZE) as usize;
+        let max_cpus = VIRT_GICV3_MAX_CPUS;
         if smp > max_cpus {
             return Err(format!(
                 "Number of SMP CPUs requested ({smp}) exceeds max CPUs supported by machine \
@@ -447,7 +453,11 @@ impl VirtMachine {
         // create_rtc().
         let rtc_clock =
             cfg.rtc_clock.unwrap_or_else(|| Clock::new(ClockType::Host, TimeSource::Wall));
-        let rtc = Pl031::new(rtc_clock, SystemTime::now());
+        // qemu_ref_timedate(): the host clock reads the date itself; the others count from
+        // the date the machine started.
+        let rtc_date =
+            if rtc_clock.kind() == ClockType::Host { UNIX_EPOCH } else { SystemTime::now() };
+        let rtc = Pl031::new(rtc_clock, rtc_date);
         let r = mem.new_io("pl031", PL031_MMIO_SIZE.into(), rtc.clone()).map_err(err)?;
         mem.add_subregion(system, VIRT_RTC, r).map_err(err)?;
         rtc.irq().connect(gic.spi(VIRT_RTC_IRQ));
@@ -708,9 +718,16 @@ impl VirtMachine {
         self.arm.gic_reset(idx, &st);
     }
 
-    /// The pending PSCI shutdown or reset request, taken.
+    /// The pending PSCI shutdown or reset request, taken. Requests made while a handler is
+    /// set ([`VirtMachine::set_request_handler`]) go to the handler instead.
     pub fn take_request(&self) -> Option<VirtRequest> {
         self.hub.take_request()
+    }
+
+    /// Send the PSCI shutdown and reset requests to `handler`, on the thread of the vCPU
+    /// that made them, rather than keeping them for [`VirtMachine::take_request`].
+    pub fn set_request_handler(&self, handler: Option<VirtRequestHandler>) {
+        self.hub.set_request_handler(handler);
     }
 
     /// The CPU operations every vCPU runs.

@@ -16,7 +16,7 @@ use ruvm_target_arm::tcg::{
     SemihostingHost,
 };
 
-use super::VirtRequest;
+use super::{VirtRequest, VirtRequestHandler};
 
 /// The number of generic timers, `NUM_GTIMERS`.
 pub(crate) const NUM_GTIMERS: usize = 5;
@@ -48,6 +48,8 @@ pub(crate) struct CpuHub {
     arm: OnceLock<Weak<Arm>>,
     slots: Mutex<Vec<CpuSlot>>,
     request: Mutex<Option<VirtRequest>>,
+    /// Where requests go instead of [`CpuHub::request`], once a run loop has set it.
+    handler: Mutex<Option<VirtRequestHandler>>,
 }
 
 impl fmt::Debug for CpuHub {
@@ -72,6 +74,7 @@ impl CpuHub {
             arm: OnceLock::new(),
             slots: Mutex::new(slots),
             request: Mutex::new(None),
+            handler: Mutex::new(None),
         }
     }
 
@@ -114,8 +117,20 @@ impl CpuHub {
         lock(&self.request).take()
     }
 
-    /// `qemu_system_*_request()`: record `req` and kick every vCPU out of its loop.
+    /// Send the requests to `handler` from now on, or keep them for
+    /// [`CpuHub::take_request`] again with `None`.
+    pub(crate) fn set_request_handler(&self, handler: Option<VirtRequestHandler>) {
+        *lock(&self.handler) = handler;
+    }
+
+    /// `qemu_system_*_request()`: hand `req` to the handler if there is one, otherwise record
+    /// it and kick every vCPU out of its loop.
     fn request(&self, req: VirtRequest) {
+        let handler = lock(&self.handler).clone();
+        if let Some(h) = handler {
+            h(req);
+            return;
+        }
         *lock(&self.request) = Some(req);
         let all: Vec<_> = lock(&self.slots).iter().filter_map(|s| s.shared.upgrade()).collect();
         for s in all {
@@ -163,6 +178,12 @@ impl ArmBoard for CpuHub {
                     t.del();
                 }
             }
+        }
+    }
+
+    fn gt_timer_set_level(&self, shared: &CpuShared, timer: usize, level: bool) {
+        if let Some(line) = self.ppis.get(shared.cpu_index).and_then(|l| l.get(timer)) {
+            line.set_bool(level);
         }
     }
 
