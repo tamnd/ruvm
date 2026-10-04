@@ -6,6 +6,18 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.3.4
+
+This patch is the first one where Linux boots under TCG, on both q35 and the arm virt board.
+
+On q35, Linux boots to a busybox shell with one or two vCPUs (#136). That needed a local APIC ported from QEMU, with IPIs, MSIs, INIT and SIPI and the APIC timer, plus QEMU's interrupt order and triple fault reset in the x86 guest. The RTC on q35 and microvm no longer reports a date decades ahead, and q35 now stores the right century in CMOS.
+
+On arm, `-M virt` is wired into the system emulator (#135), and the Debian bookworm 6.1 kernel boots to a busybox shell on two vCPUs. QEMU's tests/tcg aarch64 system tests hello, memory, memory-sve, interrupt, asid2, feat-xs and semiheap print what QEMU prints. The guest gained FEAT_TLBIOS, FEAT_XS, FEAT_TCR2 and FEAT_ASID2.
+
+The x86 guest now runs x87, FXSAVE and XSAVE (#134).
+
+Both boards run vCPUs round robin by default for now, because the atomic helpers are not yet safe against plain stores from other vCPUs. `thread=multi` still gives MTTCG. Boots are slow, about 15 to 20 minutes on a loaded server, since the native backends still return to Rust after every block. Both are being worked on next.
+
 ## 0.3.3
 
 This patch is the first one where machines run guest code on the JIT. Linux does not boot under TCG yet, but QEMU's own system tests do.
