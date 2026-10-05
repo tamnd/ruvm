@@ -87,7 +87,7 @@ const SEG_NAMES: [&str; 6] = ["es_base", "cs_base", "ss_base", "ds_base", "fs_ba
 
 /// The CPUID features the decoder looks at.
 #[derive(Clone, Copy, Debug, Default)]
-struct Feat {
+pub(crate) struct Feat {
     popcnt: bool,
     abm: bool,
     bmi1: bool,
@@ -200,9 +200,10 @@ pub(crate) struct DisasContext {
     prev_insn_end: Option<OpId>,
 }
 
-impl DisasContext {
-    pub(crate) fn new(model: &X86Cpu) -> DisasContext {
-        let feat = Feat {
+impl Feat {
+    /// The features of `model`, looked up by name once per CPU rather than per block.
+    pub(crate) fn of(model: &X86Cpu) -> Feat {
+        Feat {
             popcnt: model.has_feature("popcnt"),
             abm: model.has_feature("abm"),
             bmi1: model.has_feature("bmi1"),
@@ -239,7 +240,13 @@ impl DisasContext {
             fxsr: model.has_feature("fxsr"),
             xsaveopt: model.has_feature("xsaveopt"),
             cmov: model.has_feature("cmov"),
-        };
+        }
+    }
+}
+
+impl DisasContext {
+    /// A context for a block decoded with the features `feat`, see [`Feat::of`].
+    pub(crate) fn new(feat: Feat) -> DisasContext {
         DisasContext {
             feat,
             g: None,

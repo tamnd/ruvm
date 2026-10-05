@@ -232,6 +232,8 @@ pub const NB_MMU_MODES: usize = 8;
 /// The x86 CPU: the [`CpuOps`] of x86 vCPUs translated by the TCG front end.
 pub struct X86 {
     model: X86Cpu,
+    /// The decoder's view of the model's features.
+    feat: translate::Feat,
     io: Option<Arc<AddressSpace>>,
     tsc_base: Instant,
     irqs: Mutex<VecDeque<u8>>,
@@ -256,6 +258,7 @@ impl X86 {
     /// An x86 CPU of the given model.
     pub fn new(model: X86Cpu) -> X86 {
         X86 {
+            feat: translate::Feat::of(&model),
             model,
             io: None,
             tsc_base: Instant::now(),
@@ -449,7 +452,7 @@ pub(crate) fn linear_pc(env: &[u8]) -> u64 {
 
 impl CpuOps for X86 {
     fn translate_code(&self, cpu: &mut Cpu<'_>, tb: &mut TbBuild) -> Result<(), CpuLoopExit> {
-        let mut dc = translate::DisasContext::new(&self.model);
+        let mut dc = translate::DisasContext::new(self.feat);
         translator_loop(cpu, tb, &mut dc)
     }
 

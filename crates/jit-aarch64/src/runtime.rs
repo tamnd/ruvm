@@ -55,6 +55,13 @@
 //!   the run context, not at a fixed offset from `env`. A run whose guest memory has no TLB of
 //!   the chain's page size gives them a descriptor that never matches, so every access takes
 //!   the slow path through the service routine.
+//! - `lookup_and_goto_ptr` calls its own lookup routine, which finds the block through a
+//!   per-CPU cache that also keeps the address to jump to, so a hit costs no reference count
+//!   and no chain check; QEMU's `helper_lookup_tb_ptr` reads `tb->tc.ptr` from its jump cache.
+//! - A call to a helper with `TCG_CALL_NO_SE` does not tell the guest memory which block and
+//!   instruction it is in, since such a helper cannot raise an exception; the next request
+//!   that may raise one, or the end of the run, does. QEMU needs no such step because it
+//!   finds the instruction from the host return address only when it unwinds.
 
 use std::any::Any;
 use std::cell::Cell;
@@ -83,7 +90,7 @@ use crate::codegen::{
 pub const MAX_SLOT_WORDS: usize = 1 << 16;
 
 /// The name of the helper whose result `goto_ptr` jumps to.
-const LOOKUP_TB_PTR: &str = "lookup_tb_ptr";
+pub(crate) const LOOKUP_TB_PTR: &str = "lookup_tb_ptr";
 
 /// The blocks a run may chain to and how to find them, for [`CompiledTb::run_chained`]. This
 /// is the runtime side of `lookup_and_goto_ptr`.
@@ -100,14 +107,19 @@ pub trait Chain {
 
     /// [`Chain::lookup_tb_ptr`] and [`Chain::code`] in one, which is what the service routine
     /// calls. `jump` is given the code of the block found and returns the address generated
-    /// code may jump to, or `None` if it may not jump there. The default calls the other two
-    /// methods; an implementation can override it so as not to take a reference to the block
-    /// when the code jumps.
+    /// code may jump to, or `None` if it may not jump there. What it returns only depends on
+    /// that code and `key`, so an implementation may remember an address `jump` gave for a
+    /// block and `key` and use it again for the same block and key without calling `jump`;
+    /// a key of `[0, 0]` must not be remembered. The default calls the other two methods; an
+    /// implementation can override it so as not to take a reference to the block when the
+    /// code jumps.
     fn lookup_code(
         &self,
         he: &mut HelperEnv<'_>,
+        key: [u64; 2],
         jump: &mut dyn FnMut(&CompiledTb) -> Option<u64>,
     ) -> Result<Found, Unwind> {
+        let _ = key;
         let Some(block) = self.lookup_tb_ptr(he)? else { return Ok(Found::Leave(None)) };
         match self.code(&*block).and_then(jump) {
             Some(entry) => Ok(Found::Jump(entry)),
@@ -161,8 +173,9 @@ pub(crate) struct BlockMeta {
 #[derive(Clone, Copy, Debug)]
 enum Fast {
     /// A call to this helper, found in the registry with the right signature, with `nin`
-    /// argument words; `ret` says whether it returns a value.
-    Helper { f: HelperFn, nin: usize, ret: bool },
+    /// argument words; `ret` says whether it returns a value and `pure` whether the helper is
+    /// `TCG_CALL_NO_SE`.
+    Helper { f: HelperFn, nin: usize, ret: bool, pure: bool },
     /// A call to `lookup_tb_ptr`.
     Lookup,
     /// Anything else.
@@ -293,6 +306,11 @@ impl CodeRegion {
             meta: Arc::as_ptr(&meta) as usize as u64,
             icount_decr: opts.icount_decr_offset,
             tlb_page_bits: opts.tlb_page_bits,
+            lookup: {
+                let f: extern "C" fn(&mut RunCtx<'_>, u64, *const BlockMeta) -> u64 =
+                    lookup_service;
+                f as usize as u64
+            },
         };
         let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let offset = next.next_multiple_of(16);
@@ -312,12 +330,15 @@ impl CodeRegion {
             .iter()
             .map(|r| match (r, opts.helpers) {
                 (Request::Call { name, .. }, _) if name == LOOKUP_TB_PTR => Fast::Lookup,
-                (Request::Call { name, ret, args, nin }, Some(reg)) => {
-                    reg.get(name).filter(|e| e.ret == *ret && e.args == *args).map_or(
-                        Fast::Other,
-                        |e| Fast::Helper { f: e.f, nin: *nin, ret: *ret != HelperType::Void },
-                    )
-                }
+                (Request::Call { name, ret, args, nin, pure }, Some(reg)) => reg
+                    .get(name)
+                    .filter(|e| e.ret == *ret && e.args == *args)
+                    .map_or(Fast::Other, |e| Fast::Helper {
+                        f: e.f,
+                        nin: *nin,
+                        ret: *ret != HelperType::Void,
+                        pure: *pure,
+                    }),
                 _ => Fast::Other,
             })
             .collect();
@@ -587,6 +608,7 @@ impl CompiledTb {
             decr: decr.as_ptr(),
             goto_ptr_ok: 0,
             tlb,
+            jump_key: jump_key(&self.region, env_len as u64),
             meta_seen: meta,
             insn_delivered: 0,
             region: &self.region,
@@ -661,6 +683,8 @@ pub(crate) struct RunCtx<'a> {
     goto_ptr_ok: u64,
     /// The TLB descriptor inlined lookups read.
     tlb: *const AtomicU64,
+    /// The key [`Chain::lookup_code`] is given, see [`jump_key`].
+    jump_key: [u64; 2],
     /// The block the service routine last told the guest memory about.
     meta_seen: *const BlockMeta,
     /// The value of `insn` last reported to the guest memory.
@@ -814,25 +838,25 @@ enum Leave {
 }
 
 fn serve(ctx: &mut RunCtx<'_>, req: u64) -> Result<(), Leave> {
-    let i = req as usize;
+    // The request index is in the lower half and its `insn_of` in the upper half, so that
+    // the service routine need not look it up.
+    let i = (req & u64::from(u32::MAX)) as usize;
     let m = meta_of(ctx.meta);
     let fast = m.fast.get(i).copied().unwrap_or(Fast::Other);
-    ctx.insn = m.insn_of.get(i).copied().unwrap_or(0);
+    ctx.insn = req >> 32;
+    debug_assert_eq!(m.insn_of.get(i).copied().unwrap_or(0), ctx.insn);
     // SAFETY: `env` and `env_len` come from the `&mut [u8]` that `run_in` holds for the whole
     // run. Generated code is suspended in this call and touches the buffer again only after it
     // returns, and this slice does not outlive the call, so it is the only live access to the
     // buffer.
     let env = unsafe { std::slice::from_raw_parts_mut(ctx.env, ctx.env_len) };
-    // `helper_lookup_tb_ptr()` runs at the end of a block and does not restore the state of an
-    // instruction, so the guest memory is not told about the block or instruction.
-    if matches!(fast, Fast::Lookup) && ctx.chain.is_some() {
-        let v = serve_lookup(ctx, env).map_err(Leave::Unwind)?;
-        ctx.args[0] = v;
-        ctx.args[1] = 0;
-        return Ok(());
+    // A helper without side effects cannot raise an exception, so it needs neither the block
+    // nor the instruction to restore the guest state from; the next request that may raise one,
+    // or the end of the run, tells the guest memory.
+    if !matches!(fast, Fast::Helper { pure: true, .. }) {
+        deliver_insn_start(ctx);
     }
-    deliver_insn_start(ctx);
-    if let Fast::Helper { f, nin, ret } = fast {
+    if let Fast::Helper { f, nin, ret, .. } = fast {
         let mut he = HelperEnv { env, mem: &mut *ctx.mem };
         let v = f(&mut he, &ctx.args[..nin]).map_err(Leave::Unwind)?;
         if ret {
@@ -850,7 +874,7 @@ fn serve(ctx: &mut RunCtx<'_>, req: u64) -> Result<(), Leave> {
             ctx.insn_start = Some(*words);
             ctx.mem.insn_start(words);
         }
-        Request::Call { name, ret, args, nin } => {
+        Request::Call { name, ret, args, nin, .. } => {
             // Not found when the block was compiled: look it up by name now.
             let entry = ctx
                 .helpers
@@ -887,15 +911,56 @@ fn serve(ctx: &mut RunCtx<'_>, req: u64) -> Result<(), Leave> {
     Ok(())
 }
 
+/// What the entry [`serve_lookup`] finds for a block depends on besides the block's code: the
+/// chain of `region`, the region of the run, and its place in it, and the length of the CPU
+/// state. `[0, 0]`, which [`Chain::lookup_code`] does not remember, when they do not fit.
+fn jump_key(region: &CodeRegion, env_len: u64) -> [u64; 2] {
+    if region.seq > u64::from(u32::MAX) || env_len > u64::from(u32::MAX) {
+        return [0, 0];
+    }
+    // Chains are numbered from 1, so a real key is never `[0, 0]`.
+    [region.chain, region.seq << 32 | env_len]
+}
+
+/// The routine generated code calls for `lookup_tb_ptr` instead of [`service`], see
+/// [`ChainGen::lookup`]. In a chained run it serves the call with [`serve_lookup`];
+/// otherwise the call is served like any other.
+extern "C" fn lookup_service(ctx: &mut RunCtx<'_>, req: u64, meta: *const BlockMeta) -> u64 {
+    let Some(chain) = ctx.chain else { return service(ctx, req, meta) };
+    ctx.meta = meta;
+    // `helper_lookup_tb_ptr()` runs at the end of a block and does not restore the state of an
+    // instruction, so the guest memory is not told about the block or instruction.
+    ctx.insn = req >> 32;
+    match catch_unwind(AssertUnwindSafe(|| serve_lookup(ctx, chain))) {
+        Ok(Ok(v)) => {
+            ctx.args[0] = v;
+            ctx.args[1] = 0;
+            0
+        }
+        Ok(Err(u)) => {
+            ctx.unwind = Some(u);
+            kind::UNWIND
+        }
+        // A panic must not unwind into generated code; it is resumed once the block returns.
+        Err(p) => {
+            ctx.panic = Some(p);
+            kind::ERROR
+        }
+    }
+}
+
 /// `lookup_tb_ptr` in a chained run: the entry of the next block when generated code may jump
 /// there, which `goto_ptr` then does, or 0 to leave.
-fn serve_lookup(ctx: &mut RunCtx<'_>, env: &mut [u8]) -> Result<u64, Unwind> {
-    let Some(chain) = ctx.chain else { return Ok(0) };
+fn serve_lookup(ctx: &mut RunCtx<'_>, chain: &dyn Chain) -> Result<u64, Unwind> {
+    // SAFETY: as in `serve`: `env` and `env_len` come from the `&mut [u8]` that `run_in` holds
+    // for the whole run, generated code is suspended in this call, and the slice does not
+    // outlive it.
+    let env = unsafe { std::slice::from_raw_parts_mut(ctx.env, ctx.env_len) };
     let region = ctx.region;
     let env_len = env.len() as u64;
     let mut he = HelperEnv { env, mem: &mut *ctx.mem };
     let mut jump = |c: &CompiledTb| region.reaches(&c.region).then(|| c.chain_entry(env_len));
-    match chain.lookup_code(&mut he, &mut jump)? {
+    match chain.lookup_code(&mut he, ctx.jump_key, &mut jump)? {
         Found::Jump(entry) => {
             ctx.goto_ptr_ok = entry;
             Ok(entry)

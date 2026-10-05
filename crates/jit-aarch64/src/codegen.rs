@@ -141,6 +141,10 @@ pub(crate) struct ChainGen {
     /// log2 of the guest page size of the TLB tables at [`TLB_OFFSET`], or `None` to leave
     /// `qemu_ld` and `qemu_st` to the window or the service routine.
     pub(crate) tlb_page_bits: Option<u32>,
+    /// The routine calls to `lookup_tb_ptr` go to instead of the service routine, or 0. It
+    /// takes the same arguments: the context, the request index with the [`Gen::insn`] of the
+    /// call in its upper 32 bits, so that neither routine need look it up, and the metadata.
+    pub(crate) lookup: u64,
 }
 
 /// Choices for code generation beyond the block itself.
@@ -193,6 +197,9 @@ pub(crate) enum Request {
         args: Vec<HelperType>,
         /// Number of input words.
         nin: usize,
+        /// The helper has `TCG_CALL_NO_SE`: it has no side effects and so cannot raise an
+        /// exception or look at where the guest is.
+        pure: bool,
     },
     /// `qemu_ld`: the address is in word 0, the value comes back in words 0 and 1.
     Load(MemOpIdx),
@@ -358,6 +365,7 @@ pub(crate) fn generate(
         meta: chain.meta,
         goto_tb: Vec::new(),
         service,
+        lookup: chain.lookup,
         exit: 0,
         bounds: 0,
         static_end: 0,
@@ -538,6 +546,8 @@ struct Gen {
     /// For each `goto_tb`: its slot, the word index of its jump, and [`Gen::insn`] there.
     goto_tb: Vec<(u32, usize, u64)>,
     service: u64,
+    /// See [`ChainGen::lookup`].
+    lookup: u64,
     exit: usize,
     bounds: usize,
     /// The furthest end of a constant offset CPU state access, and that access.
@@ -697,13 +707,19 @@ impl Gen {
     /// [`Self::service`], with `after` emitted right after the call returns, before the check
     /// for leaving.
     fn service_then(&mut self, req: Request, after: Option<u32>) {
+        self.service_via(req, after, self.service, self.insn);
+    }
+
+    /// [`Self::service_then`] through the routine at `routine`, with `tag` in the upper half
+    /// of the request index.
+    fn service_via(&mut self, req: Request, after: Option<u32>, routine: u64, tag: u64) {
         let idx = self.requests.len();
         self.requests.push(req);
         self.insn_of.push(self.insn);
         self.a.movr(true, X0, CTX);
-        self.a.movi(Type::I64, X1, idx as u64);
+        self.a.movi(Type::I64, X1, idx as u64 | tag << 32);
         self.a.movi(Type::I64, X2, self.meta);
-        self.a.movi(Type::I64, TMP0, self.service);
+        self.a.movi(Type::I64, TMP0, routine);
         self.a.breg(i::BLR, TMP0);
         if let Some(w) = after {
             self.a.emit(w);
@@ -1912,8 +1928,15 @@ impl Target for Gen {
             self.a.emit(DMB_ISHST);
         }
         self.after_full_dmb = false;
-        let req = Request::Call { name: info.name, ret: info.ret, args: info.args, nin: ni };
-        self.service_then(req, if fence { Some(DMB_ISHLD) } else { None });
+        let lookup = self.lookup != 0 && info.name == crate::runtime::LOOKUP_TB_PTR;
+        let pure = info.flags & call_flags::NO_SIDE_EFFECTS != 0;
+        let req = Request::Call { name: info.name, ret: info.ret, args: info.args, nin: ni, pure };
+        let after = if fence { Some(DMB_ISHLD) } else { None };
+        if lookup {
+            self.service_via(req, after, self.lookup, self.insn);
+        } else {
+            self.service_then(req, after);
+        }
         Ok(())
     }
 }

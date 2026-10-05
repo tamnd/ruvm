@@ -217,7 +217,7 @@ fn run(
     let (m, warnings) =
         TcgMachine::new(board, &cpu, vec![clock, rtc_clock], &cfg, handler).unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
-    assert_eq!(m.mttcg(), thread == Some(ThreadMode::Multi));
+    assert_eq!(m.mttcg(), thread != Some(ThreadMode::Single));
     m.start();
     if std::env::var_os("RUVM_TCG_TRACE").is_some() {
         for _ in 0..10 {
@@ -271,7 +271,7 @@ fn hello_interp_round_robin() {
     check("hello", b"Hello World\n", Some(BackendKind::Interp), Some(ThreadMode::Single));
 }
 
-/// With a thread per vCPU, as `thread=multi` asks; round robin is the default here.
+/// With a thread per vCPU, as `thread=multi` asks, which is also the default.
 #[test]
 fn interrupt_native() {
     check("interrupt", b"", None, Some(ThreadMode::Multi));
