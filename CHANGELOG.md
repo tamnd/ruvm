@@ -6,6 +6,16 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.3.5
+
+This patch is mostly about JIT speed. An x86-64 guest on an x86-64 host now runs bare metal CoreMark faster than QEMU 11.1's TCG, at about 1.32x its speed, where 0.3.4 was below 0.1x.
+
+Guest atomics now run as host atomics on guest RAM, so MTTCG no longer loses a spinlock release to a plain store from another vCPU, and both boards are back on MTTCG by default like QEMU (#138, #142, #143). Both native backends chain blocks and look up indirect jumps without leaving generated code, with an inline softmmu TLB fast path (#138). The x86 front end builds superblocks across short conditional jumps, indirect jumps, calls and returns use per call site inline caches, and side effect free helpers are called directly (#144). LDP and STP take the TLB fast path, which brings the aarch64 guest on an x86-64 host from 0.49x to 0.72x QEMU's speed (#145).
+
+Linux on q35 now boots to a shell in about 20 s of CPU time with one vCPU and 25 s with two (#143). An x86 memory map change now flushes every vCPU's TLB like QEMU, which fixes a SeaBIOS hang (#144).
+
+On arm, every test in QEMU's tests/tcg/aarch64/system runs and matches QEMU, EDK2 boots to the UEFI shell on virt, and `-cpu max` has FEAT_RNG (#142).
+
 ## 0.3.4
 
 This patch is the first one where Linux boots under TCG, on both q35 and the arm virt board.
