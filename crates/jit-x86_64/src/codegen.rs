@@ -153,6 +153,10 @@ pub(crate) struct GenOptions {
     /// log2 of the guest page size of the TLB tables at [`TLB_OFFSET`], or `None` to send
     /// every `qemu_ld` and `qemu_st` to the service routine.
     pub(crate) tlb_page_bits: Option<u32>,
+    /// The routine calls to `lookup_tb_ptr` go to instead of the service routine, or 0. It
+    /// takes the same arguments: the context, the request index with the [`Gen::insn`] of the
+    /// call in its upper 32 bits, so that neither routine need look it up, and the metadata.
+    pub(crate) lookup: u64,
 }
 
 /// Whether the host uses the Win64 calling convention rather than System V.
@@ -190,6 +194,9 @@ pub(crate) enum Request {
         args: Vec<HelperType>,
         /// Number of input words.
         nin: usize,
+        /// The helper has `TCG_CALL_NO_SE`: it has no side effects and so cannot raise an
+        /// exception or look at where the guest is.
+        pure: bool,
     },
     /// `qemu_ld`: the address is in word 0, the value comes back in words 0 and 1.
     Load(MemOpIdx),
@@ -400,6 +407,7 @@ pub(crate) fn generate(
         v256,
         goto_tb: Vec::new(),
         service,
+        lookup: opts.lookup,
         exit: 0,
         bounds: 0,
         static_end: 0,
@@ -644,6 +652,8 @@ struct Gen {
     /// For each `goto_tb`: its slot, the offset of its displacement, and [`Gen::insn`] there.
     goto_tb: Vec<(u32, usize, u64)>,
     service: u64,
+    /// See [`GenOptions::lookup`].
+    lookup: u64,
     exit: usize,
     bounds: usize,
     /// The furthest end of a constant offset CPU state access, and that access.
@@ -811,6 +821,12 @@ impl Gen {
 
     /// Call the service routine for `req`. Leaves the block if it reports an unwind or error.
     fn service(&mut self, req: Request) {
+        self.service_via(req, self.service, self.insn);
+    }
+
+    /// [`Gen::service`] through the routine at `routine`, with `tag` in the upper half of the
+    /// request index.
+    fn service_via(&mut self, req: Request, routine: u64, tag: u64) {
         let idx = self.requests.len();
         self.requests.push(req);
         self.insn_of.push(self.insn);
@@ -820,9 +836,9 @@ impl Gen {
             self.a.vex_opc(op::VZEROUPPER, 0, 0, 0, 0);
         }
         self.a.mov(P_REXW, ARGS[0], CTX);
-        self.a.movi(false, ARGS[1], idx as u64, false);
+        self.a.movi(true, ARGS[1], idx as u64 | tag << 32, false);
         self.a.movabs(ARGS[2], self.meta);
-        self.a.movabs(TMP0, self.service);
+        self.a.movabs(TMP0, routine);
         self.a.call_reg(TMP0);
         self.a.test(P_REXW, RAX, RAX);
         let ok = self.a.new_label();
@@ -2455,7 +2471,14 @@ impl Target for Gen {
     fn out_call(&mut self, f: &Func, op: &Op) -> R<()> {
         let info = f.helper_info(op.call_helper()).clone();
         let ni = op.calli as usize;
-        self.service(Request::Call { name: info.name, ret: info.ret, args: info.args, nin: ni });
+        let lookup = self.lookup != 0 && info.name == crate::runtime::LOOKUP_TB_PTR;
+        let pure = info.flags & ruvm_jit_core::types::call_flags::NO_SE != 0;
+        let req = Request::Call { name: info.name, ret: info.ret, args: info.args, nin: ni, pure };
+        if lookup {
+            self.service_via(req, self.lookup, self.insn);
+        } else {
+            self.service(req);
+        }
         Ok(())
     }
 }

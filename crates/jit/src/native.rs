@@ -150,19 +150,20 @@ impl TbChain {
     }
 
     /// `Chain::lookup_code`: the block is only cloned when generated code cannot jump to it.
+    #[inline]
     fn lookup_code(
         he: &mut HelperEnv<'_>,
+        key: [u64; 2],
         jump: &mut dyn FnMut(&host::CompiledTb) -> Option<u64>,
     ) -> Result<host::Found, Unwind> {
         let Some(mut cpu) = Cpu::from_helper_env(he) else { return Ok(host::Found::Leave(None)) };
-        let found = cpu_exec::helper_lookup_tb_ptr_with(&mut cpu, |tb| {
-            match TbChain::native(tb).and_then(jump) {
-                Some(entry) => host::Found::Jump(entry),
-                None => host::Found::Leave(Some(tb.clone() as Arc<dyn Any + Send + Sync>)),
-            }
+        let found = cpu_exec::helper_lookup_tb_ptr_jump(&mut cpu, key, |tb| {
+            TbChain::native(tb).and_then(jump)
         });
         match found {
-            Ok(f) => Ok(f.unwrap_or(host::Found::Leave(None))),
+            Ok(Some(Ok(entry))) => Ok(host::Found::Jump(entry)),
+            Ok(Some(Err(tb))) => Ok(host::Found::Leave(Some(tb as Arc<dyn Any + Send + Sync>))),
+            Ok(None) => Ok(host::Found::Leave(None)),
             Err(e) => Err(cpu.unwind(e)),
         }
     }
@@ -480,9 +481,10 @@ mod host {
         fn lookup_code(
             &self,
             he: &mut HelperEnv<'_>,
+            key: [u64; 2],
             jump: &mut dyn FnMut(&CompiledTb) -> Option<u64>,
         ) -> Result<Found, Unwind> {
-            TbChain::lookup_code(he, jump)
+            TbChain::lookup_code(he, key, jump)
         }
     }
 
@@ -572,9 +574,10 @@ mod host {
         fn lookup_code(
             &self,
             he: &mut HelperEnv<'_>,
+            key: [u64; 2],
             jump: &mut dyn FnMut(&CompiledTb) -> Option<u64>,
         ) -> Result<Found, Unwind> {
-            TbChain::lookup_code(he, jump)
+            TbChain::lookup_code(he, key, jump)
         }
     }
 

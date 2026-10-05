@@ -758,6 +758,7 @@ impl<'a> Cpu<'a> {
     }
 
     /// The CPU a helper runs on. `None` if the helper was not called by this runtime.
+    #[inline]
     pub fn from_helper_env<'b>(h: &'b mut HelperEnv<'_>) -> Option<Cpu<'b>> {
         let core = h.mem.as_any_mut()?.downcast_mut::<CpuCore>()?;
         Some(Cpu { env: &mut *h.env, core })

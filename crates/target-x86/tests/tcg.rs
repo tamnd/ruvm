@@ -348,6 +348,40 @@ fn divide_error_long_mode() {
 }
 
 #[test]
+fn div_idiv_64() {
+    const DIV_RBX: [u8; 4] = [0x48, 0xf7, 0xf3, 0xf4];
+    const IDIV_RBX: [u8; 4] = [0x48, 0xf7, 0xfb, 0xf4];
+    let div = |hi: u64, lo: u64, d: u64| run64(&[(R_EAX, lo), (R_EDX, hi), (R_EBX, d)], &DIV_RBX);
+    let idiv = |hi: i64, lo: i64, d: i64| -> X86CpuState {
+        run64(&[(R_EAX, lo as u64), (R_EDX, hi as u64), (R_EBX, d as u64)], &IDIV_RBX)
+    };
+    // The high half is zero, and then not.
+    let st = div(0, 100, 7);
+    assert_eq!((st.regs[R_EAX], st.regs[R_EDX]), (14, 2));
+    let n = 3u128 << 64 | 5;
+    let st = div(3, 5, 10);
+    assert_eq!((st.regs[R_EAX], st.regs[R_EDX]), ((n / 10) as u64, (n % 10) as u64));
+    // The quotient does not fit, and a zero divisor.
+    assert_eq!(vector64(&div(10, 0, 10)), 0);
+    assert_eq!(vector64(&div(0, 1, 0)), 0);
+    // A sign extended dividend.
+    let st = idiv(-1, -100, 7);
+    assert_eq!((st.regs[R_EAX] as i64, st.regs[R_EDX] as i64), (-14, -2));
+    let st = idiv(0, 100, -7);
+    assert_eq!((st.regs[R_EAX] as i64, st.regs[R_EDX] as i64), (-14, 2));
+    assert_eq!(vector64(&idiv(-1, i64::MIN, -1)), 0);
+    assert_eq!(vector64(&idiv(0, 5, 0)), 0);
+    // A dividend that needs both halves: -2^64 / -3.
+    let n = -(1i128 << 64);
+    let st = idiv(-1, 0, -3);
+    assert_eq!(st.regs[R_EAX] as i64 as i128, n / -3);
+    assert_eq!(st.regs[R_EDX] as i64 as i128, n % -3);
+    // 2^64 / 1 does not fit, nor does anything over zero.
+    assert_eq!(vector64(&idiv(1, 0, 1)), 0);
+    assert_eq!(vector64(&idiv(5, 0, 0)), 0);
+}
+
+#[test]
 fn divide_error_real_mode() {
     // div bl with bl = 0: the IVT handler runs with FLAGS, CS and IP pushed.
     let w = World::new();

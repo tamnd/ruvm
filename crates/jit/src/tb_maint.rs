@@ -35,6 +35,16 @@ use crate::{TB_JMP_CACHE_SIZE, cf};
 pub(crate) struct JcEntry {
     pub(crate) tb: Option<Arc<Tb>>,
     pub(crate) pc: u64,
+    /// The host address native code running with the key in the first two words jumps to for
+    /// `tb`, in the third, see [`tb_lookup_jump`]; all 0 when there is none. QEMU has no such
+    /// field, as its blocks have one entry address, `tb->tc.ptr`.
+    pub(crate) jump: [u64; 3],
+}
+
+impl JcEntry {
+    fn new(tb: &Arc<Tb>, pc: u64) -> JcEntry {
+        JcEntry { tb: Some(tb.clone()), pc, jump: [0; 3] }
+    }
 }
 
 const TB_JMP_PAGE_BITS: u32 = crate::TB_JMP_CACHE_BITS / 2;
@@ -96,10 +106,17 @@ fn jc_request(cpu: &CpuShared, f: impl FnOnce(&mut JcPending)) {
 }
 
 /// Apply the queued invalidations to the jump cache of `cpu`.
+#[inline]
 fn jc_sync(cpu: &mut Cpu<'_>) {
-    if !cpu.core.shared.jc_dirty.load(Ordering::Acquire) {
-        return;
+    if cpu.core.shared.jc_dirty.load(Ordering::Acquire) {
+        jc_sync_slow(cpu);
     }
+}
+
+/// [`jc_sync`] with invalidations queued.
+#[cold]
+#[inline(never)]
+fn jc_sync_slow(cpu: &mut Cpu<'_>) {
     let p = {
         let mut p = lock(&cpu.core.shared.jc_pending);
         cpu.core.shared.jc_dirty.store(false, Ordering::Relaxed);
@@ -195,16 +212,78 @@ pub(crate) fn tb_lookup_with<R>(
     // The page walk of the lookup may have queued invalidations; apply them first so that they
     // do not clear the new entry.
     jc_sync(cpu);
-    cpu.core.jmp_cache[hash] = JcEntry { tb: Some(tb.clone()), pc: s.pc };
+    cpu.core.jmp_cache[hash] = JcEntry::new(&tb, s.pc);
     assert!(tb.cflags() & cf::PCREL != 0 || tb.pc == s.pc);
     Ok(Some(f(&tb)))
+}
+
+/// [`tb_lookup`] for the `lookup_tb_ptr` of a native backend: `jump` gives the host address
+/// code run with `key` jumps to for a block, or `None` when it cannot jump there. The address
+/// is remembered in the jump cache entry with `key` (unless `key` is `[0, 0]`), so that the
+/// next lookup of the block with the same key does not call `jump`. Gives the address, or the
+/// block when there is none.
+#[inline]
+pub(crate) fn tb_lookup_jump(
+    cpu: &mut Cpu<'_>,
+    s: &TbCpuState,
+    key: [u64; 2],
+    jump: impl FnOnce(&Arc<Tb>) -> Option<u64>,
+) -> Result<Option<Result<u64, Arc<Tb>>>, CpuLoopExit> {
+    // We should never be trying to look up an INVALID tb.
+    debug_assert!(s.cflags & cf::INVALID == 0);
+    let keep = key != [0, 0];
+    jc_sync(cpu);
+    let hash = tb_jmp_cache_hash_func(&cpu.core.jit, s.pc);
+    let e = &mut cpu.core.jmp_cache[hash];
+    if let Some(tb) = &e.tb {
+        if e.pc == s.pc && tb.cs_base == s.cs_base && tb.flags == s.flags && tb.cflags() == s.cflags
+        {
+            assert!(tb.cflags() & cf::PCREL != 0 || tb.pc == s.pc);
+            if keep && e.jump[0] == key[0] && e.jump[1] == key[1] {
+                return Ok(Some(Ok(e.jump[2])));
+            }
+            return Ok(Some(match jump(tb) {
+                Some(addr) => {
+                    if keep {
+                        e.jump = [key[0], key[1], addr];
+                    }
+                    Ok(addr)
+                }
+                None => Err(tb.clone()),
+            }));
+        }
+    }
+    tb_lookup_jump_slow(cpu, *s, key, hash, jump)
+}
+
+/// [`tb_lookup_jump`] when the jump cache misses.
+#[inline(never)]
+fn tb_lookup_jump_slow(
+    cpu: &mut Cpu<'_>,
+    s: TbCpuState,
+    key: [u64; 2],
+    hash: usize,
+    jump: impl FnOnce(&Arc<Tb>) -> Option<u64>,
+) -> Result<Option<Result<u64, Arc<Tb>>>, CpuLoopExit> {
+    let Some(tb) = tb_htable_lookup(cpu, s)? else { return Ok(None) };
+    // The page walk of the lookup may have queued invalidations; apply them first so that they
+    // do not clear the new entry.
+    jc_sync(cpu);
+    assert!(tb.cflags() & cf::PCREL != 0 || tb.pc == s.pc);
+    let addr = jump(&tb);
+    let mut e = JcEntry::new(&tb, s.pc);
+    if let (Some(a), true) = (addr, key != [0, 0]) {
+        e.jump = [key[0], key[1], a];
+    }
+    cpu.core.jmp_cache[hash] = e;
+    Ok(Some(addr.ok_or(tb)))
 }
 
 /// Set the jump cache entry for `pc`, as `cpu_exec_loop()` does after `tb_gen_code()`.
 pub(crate) fn jc_set(cpu: &mut Cpu<'_>, pc: u64, tb: &Arc<Tb>) {
     jc_sync(cpu);
     let hash = tb_jmp_cache_hash_func(&cpu.core.jit, pc);
-    cpu.core.jmp_cache[hash] = JcEntry { tb: Some(tb.clone()), pc };
+    cpu.core.jmp_cache[hash] = JcEntry::new(tb, pc);
 }
 
 impl Jit {

@@ -390,42 +390,48 @@ fn h_idivl(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     })
 }
 
+/// `helper_divq_EAX()`. The common case of a dividend that fits in RAX divides in 64 bits, and
+/// the CPU is only set up for the #DE path.
 fn h_divq(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
-    run(h, |cpu| {
-        let num = u128::from(regv(cpu, R_EAX)) | (u128::from(regv(cpu, R_EDX)) << 64);
-        let den = u128::from(a[1]);
-        if den == 0 {
-            return de(cpu);
-        }
-        let q = num / den;
-        if q > u128::from(u64::MAX) {
-            return de(cpu);
-        }
-        let r = num % den;
-        set_reg(cpu, R_EAX, q as u64);
-        set_reg(cpu, R_EDX, r as u64);
-        Ok(0)
-    })
+    let den = a[1];
+    let lo = ld64(h.env, reg(R_EAX));
+    let hi = ld64(h.env, reg(R_EDX));
+    // The quotient fits in 64 bits exactly when the high half is below the divisor.
+    if den == 0 || hi >= den {
+        return run(h, de);
+    }
+    let (q, r) = if hi == 0 {
+        (lo / den, lo % den)
+    } else {
+        let num = u128::from(lo) | (u128::from(hi) << 64);
+        let q = (num / u128::from(den)) as u64;
+        (q, lo.wrapping_sub(q.wrapping_mul(den)))
+    };
+    st64(h.env, reg(R_EAX), q);
+    st64(h.env, reg(R_EDX), r);
+    Ok(0)
 }
 
+/// `helper_idivq_EAX()`, with the same 64-bit fast path as [`h_divq`].
 fn h_idivq(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
-    run(h, |cpu| {
-        let num = (u128::from(regv(cpu, R_EAX)) | (u128::from(regv(cpu, R_EDX)) << 64)) as i128;
-        let den = i128::from(a[1] as i64);
-        if den == 0 {
-            return de(cpu);
-        }
-        let (q, r) = match (num.checked_div(den), num.checked_rem(den)) {
-            (Some(q), Some(r)) => (q, r),
-            _ => return de(cpu),
-        };
-        if q != i128::from(q as i64) {
-            return de(cpu);
-        }
-        set_reg(cpu, R_EAX, q as u64);
-        set_reg(cpu, R_EDX, r as u64);
-        Ok(0)
-    })
+    let den = a[1] as i64;
+    let lo = ld64(h.env, reg(R_EAX));
+    let hi = ld64(h.env, reg(R_EDX));
+    let qr = if hi == ((lo as i64) >> 63) as u64 {
+        // The dividend is RAX sign extended; only i64::MIN / -1 overflows.
+        (lo as i64).checked_div(den).zip((lo as i64).checked_rem(den))
+    } else if den == 0 {
+        None
+    } else {
+        let num = (u128::from(lo) | (u128::from(hi) << 64)) as i128;
+        num.checked_div(i128::from(den))
+            .filter(|&q| q == i128::from(q as i64))
+            .map(|q| (q as i64, (num - q * i128::from(den)) as i64))
+    };
+    let Some((q, r)) = qr else { return run(h, de) };
+    st64(h.env, reg(R_EAX), q as u64);
+    st64(h.env, reg(R_EDX), r as u64);
+    Ok(0)
 }
 
 // BCD.

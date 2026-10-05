@@ -34,11 +34,14 @@ struct Inner {
     list: TimerList<Callback>,
 }
 
+type Notify = Arc<dyn Fn() + Send + Sync>;
+
 /// One clock and its timer list, `QEMUClock` plus its main loop `QEMUTimerList`.
 pub struct Clock {
     kind: ClockType,
     source: TimeSource,
     inner: Mutex<Inner>,
+    notify: Mutex<Option<Notify>>,
 }
 
 impl fmt::Debug for Clock {
@@ -53,6 +56,7 @@ impl Clock {
             kind,
             source,
             inner: Mutex::new(Inner { now: 0, list: TimerList::new() }),
+            notify: Mutex::new(None),
         })
     }
 
@@ -94,6 +98,20 @@ impl Clock {
     pub fn new_timer(self: &Arc<Self>, callback: impl Fn() + Send + Sync + 'static) -> Timer {
         let id = self.lock().list.insert(Arc::new(callback));
         Timer { clock: Arc::downgrade(self), id }
+    }
+
+    /// Sets the `notify_cb` of the timer list: called, with no lock held, when arming a timer
+    /// makes it the earliest one, so that whatever waits for the next deadline can wait again.
+    pub fn set_notify(&self, notify: impl Fn() + Send + Sync + 'static) {
+        *self.notify.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(notify));
+    }
+
+    /// `timerlist_notify()`.
+    fn notify(&self) {
+        let n = self.notify.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(n) = n {
+            n();
+        }
     }
 
     /// The earliest armed deadline, if any.
@@ -177,12 +195,27 @@ impl Timer {
 
     /// `timer_mod_ns()`: arms the timer for `deadline` on its clock.
     pub fn modify(&self, deadline: i64) {
-        self.with(|l| l.arm(self.id, deadline));
+        self.rearm(|l| l.arm(self.id, deadline));
     }
 
     /// `timer_mod_anticipate_ns()`.
     pub fn modify_anticipate(&self, deadline: i64) {
-        self.with(|l| l.arm_earlier(self.id, deadline));
+        self.rearm(|l| l.arm_earlier(self.id, deadline));
+    }
+
+    /// Arms the timer with `arm`, then `timerlist_rearm()`: notifies the clock when the timer
+    /// is now the first to fire.
+    fn rearm(&self, arm: impl FnOnce(&mut TimerList<Callback>)) {
+        let Some(clock) = self.clock.upgrade() else { return };
+        let first = {
+            let mut inner = clock.lock();
+            arm(&mut inner.list);
+            let d = inner.list.deadline_of(self.id);
+            d.is_some() && inner.list.next_deadline() == d
+        };
+        if first {
+            clock.notify();
+        }
     }
 
     /// `timer_del()`.
@@ -254,6 +287,26 @@ mod tests {
         clock.advance_to(95);
         assert_eq!(count.load(Ordering::SeqCst), 9);
         assert_eq!(slot.lock().unwrap().as_ref().unwrap().expire_time(), Some(100));
+    }
+
+    #[test]
+    fn arming_the_first_timer_notifies() {
+        let clock = Clock::manual(ClockType::Virtual);
+        let count = Arc::new(AtomicUsize::new(0));
+        let n = count.clone();
+        clock.set_notify(move || {
+            n.fetch_add(1, Ordering::SeqCst);
+        });
+        let (a, b) = (clock.new_timer(|| {}), clock.new_timer(|| {}));
+        a.modify(100);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // Later than the first: nothing waiting for the deadline needs to know.
+        b.modify(200);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        b.modify_anticipate(50);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        a.del();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
     #[test]

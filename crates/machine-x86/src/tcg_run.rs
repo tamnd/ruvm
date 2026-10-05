@@ -43,12 +43,9 @@
 //!   `KVM_CAP_X86_SMM`. SeaBIOS then skips its SMM setup.
 //! - The PC `pc` (i440FX) board does not exist yet, so only microvm and q35 run here.
 //! - Writes to RAM that do not come from a vCPU (DMA) do not invalidate translated code.
-//! - Without `thread=`, the vCPUs run round robin on one thread, while QEMU picks MTTCG for
-//!   x86. The runtime's atomic helpers (locked read-modify-write instructions, `cmpxchg`)
-//!   serialise against each other but not against plain stores from other vCPUs, so with
-//!   MTTCG Linux with more than one CPU can lose a spinlock release, or starve one vCPU of
-//!   the atomic lock while another spins on it, and hang. `thread=multi` still gives MTTCG,
-//!   without QEMU's warning, since the guest supports it.
+//! - Timers run on their own thread, woken when a timer becomes the first to expire as
+//!   `timerlist_notify()` wakes QEMU's main loop, but it also wakes at least every
+//!   100 ms (`TIMER_IDLE`) in case a wakeup was missed.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,7 +54,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ruvm_accel::VcpuControl;
-use ruvm_accel::tcg::{TcgOptions, TcgVcpus, ThreadMode};
+use ruvm_accel::tcg::{TcgOptions, TcgVcpus};
 use ruvm_base::ClockType;
 use ruvm_hw_acpi::SystemRequest;
 use ruvm_hw_core::{Clock, IrqLine};
@@ -85,14 +82,13 @@ use crate::board::X86Board;
 use crate::q35::CpuIdent;
 use crate::run_event::{EventHandler, GuestEvent, ShutdownReason};
 
-/// The longest the timer thread sleeps, since arming a timer does not wake it.
-const TIMER_SLICE: Duration = Duration::from_millis(1);
+/// The longest the timer thread sleeps. Arming a timer that becomes the first to fire wakes it
+/// through the clock's notify hook, as `timerlist_notify()` kicks QEMU's main loop, so this only
+/// bounds how long a missed wakeup could delay a timer.
+const TIMER_IDLE: Duration = Duration::from_millis(100);
 
 /// x86 has `TARGET_SUPPORTS_MTTCG`, so `thread=multi` gives no warning.
 const X86_SUPPORTS_MTTCG: bool = true;
-
-/// What an `-accel tcg` without `thread=` means here: round robin, see the module doc.
-const X86_DEFAULT_THREAD: ThreadMode = ThreadMode::Single;
 
 /// Whether TCG can run SMM, the `smm_available` of the board. QEMU's TCG can; the x86 front
 /// end here has no SMM yet.
@@ -542,8 +538,12 @@ fn control_loop(
 }
 
 fn timer_loop(shared: Arc<Shared>, clocks: Vec<Arc<Clock>>) {
+    for c in &clocks {
+        let me = std::thread::current();
+        c.set_notify(move || me.unpark());
+    }
     while !shared.quit.load(Ordering::Acquire) {
-        let mut sleep = TIMER_SLICE;
+        let mut sleep = TIMER_IDLE;
         for c in &clocks {
             c.run_timers();
             let d = c.deadline_ns();
@@ -552,7 +552,7 @@ fn timer_loop(shared: Arc<Shared>, clocks: Vec<Arc<Clock>>) {
             }
         }
         if !sleep.is_zero() {
-            std::thread::sleep(sleep);
+            std::thread::park_timeout(sleep);
         }
     }
 }
@@ -587,11 +587,7 @@ impl TcgMachine {
         handler: EventHandler,
     ) -> Result<(TcgMachine, Vec<String>), String> {
         let mut board = board;
-        let tcg = TcgOptions {
-            thread: Some(cfg.tcg.thread.unwrap_or(X86_DEFAULT_THREAD)),
-            ..cfg.tcg.clone()
-        };
-        let (config, warnings) = tcg.jit_config(jit_config(), X86_SUPPORTS_MTTCG)?;
+        let (config, warnings) = cfg.tcg.jit_config(jit_config(), X86_SUPPORTS_MTTCG)?;
         let backend = match cfg.backend {
             Some(kind) => backend_of_kind(kind, helper_registry(), config.code_gen_buffer_size),
             None => TcgOptions::backend(&config, helper_registry()),
@@ -763,6 +759,8 @@ impl TcgMachine {
         let threads =
             std::mem::take(&mut *self.threads.lock().unwrap_or_else(PoisonError::into_inner));
         for t in threads {
+            // The timer thread may be parked until its next deadline.
+            t.thread().unpark();
             let _ = t.join();
         }
         drop(self.vcpus.quit());

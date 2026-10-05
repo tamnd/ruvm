@@ -24,7 +24,7 @@ use std::sync::atomic::Ordering;
 use crate::backend::TbRet;
 use crate::cpu::{Cpu, CpuLoopExit};
 use crate::tb::{Tb, TbCpuState};
-use crate::tb_maint::{jc_set, tb_lookup, tb_lookup_with};
+use crate::tb_maint::{jc_set, tb_lookup, tb_lookup_jump, tb_lookup_with};
 use crate::translate::tb_gen_code;
 use crate::{bp, cf, excp, interrupt};
 use ruvm_jit_core::types::tb_exit;
@@ -191,26 +191,48 @@ fn check_for_breakpoints_slow(cpu: &mut Cpu<'_>, pc: u64, cflags: &mut u32) -> b
 
 /// `helper_lookup_tb_ptr()`: the block to continue with, for `lookup_and_goto_ptr`.
 pub(crate) fn helper_lookup_tb_ptr(cpu: &mut Cpu<'_>) -> Result<Option<Arc<Tb>>, CpuLoopExit> {
-    helper_lookup_tb_ptr_with(cpu, Arc::clone)
+    let mut s = lookup_tb_ptr_state(cpu);
+    lookup_tb_ptr_cflags(cpu, &mut s)?;
+    tb_lookup_with(cpu, s, Arc::clone)
 }
 
-/// [`helper_lookup_tb_ptr`] giving `f` the block found, as [`tb_lookup_with`] does.
-pub(crate) fn helper_lookup_tb_ptr_with<R>(
+/// [`helper_lookup_tb_ptr`] for native code, which gets the host address to jump to as
+/// [`tb_lookup_jump`] finds it, or the block when it cannot jump there.
+#[inline]
+pub(crate) fn helper_lookup_tb_ptr_jump(
     cpu: &mut Cpu<'_>,
-    f: impl FnOnce(&Arc<Tb>) -> R,
-) -> Result<Option<R>, CpuLoopExit> {
+    key: [u64; 2],
+    jump: impl FnOnce(&Arc<Tb>) -> Option<u64>,
+) -> Result<Option<Result<u64, Arc<Tb>>>, CpuLoopExit> {
+    // The state stays where the target wrote it and is passed by reference: moving it as a
+    // whole reads the two 32-bit fields just written with one 64-bit load, which the host
+    // cannot forward from the stores.
+    let mut s = lookup_tb_ptr_state(cpu);
+    lookup_tb_ptr_cflags(cpu, &mut s)?;
+    tb_lookup_jump(cpu, &s, key, jump)
+}
+
+/// The start of `helper_lookup_tb_ptr()`: the state to look the next block up by, without its
+/// compile flags.
+#[inline]
+fn lookup_tb_ptr_state(cpu: &mut Cpu<'_>) -> TbCpuState {
     // By definition we've just finished a TB, so I/O is OK. Avoid the possibility of calling
     // cpu_io_recompile() if a page table walk triggered by tb_lookup() calling
     // probe_access_internal() happens to touch an MMIO device. The next TB, if we chain to
     // it, will clear the flag again.
     cpu.set_can_do_io(true);
     let c: &Cpu<'_> = cpu;
-    let mut s = c.core.ops.get_tb_cpu_state(c);
+    c.core.ops.get_tb_cpu_state(c)
+}
+
+/// The compile flags of `s` and the breakpoint check of `helper_lookup_tb_ptr()`.
+#[inline]
+fn lookup_tb_ptr_cflags(cpu: &mut Cpu<'_>, s: &mut TbCpuState) -> Result<(), CpuLoopExit> {
     s.cflags = cpu.curr_cflags();
     if check_for_breakpoints(cpu, s.pc, &mut s.cflags) {
         return Err(cpu.cpu_loop_exit());
     }
-    tb_lookup_with(cpu, s, f)
+    Ok(())
 }
 
 /// `cpu_tb_exec()`: run `itb` and what it chains to.
