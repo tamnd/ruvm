@@ -92,6 +92,10 @@ pub const MAX_SLOT_WORDS: usize = 1 << 16;
 /// The name of the helper whose result `goto_ptr` jumps to.
 pub(crate) const LOOKUP_TB_PTR: &str = "lookup_tb_ptr";
 
+/// `lookup_tb_ptr` with the guest program counter as a second argument, which this backend
+/// serves the same way.
+pub(crate) const LOOKUP_TB_PTR_IC: &str = "lookup_tb_ptr_ic";
+
 /// The blocks a run may chain to and how to find them, for [`CompiledTb::run_chained`]. This
 /// is the runtime side of `lookup_and_goto_ptr`.
 pub trait Chain {
@@ -329,7 +333,11 @@ impl CodeRegion {
             .requests
             .iter()
             .map(|r| match (r, opts.helpers) {
-                (Request::Call { name, .. }, _) if name == LOOKUP_TB_PTR => Fast::Lookup,
+                (Request::Call { name, .. }, _)
+                    if name == LOOKUP_TB_PTR || name == LOOKUP_TB_PTR_IC =>
+                {
+                    Fast::Lookup
+                }
                 (Request::Call { name, ret, args, nin, pure }, Some(reg)) => reg
                     .get(name)
                     .filter(|e| e.ret == *ret && e.args == *args)

@@ -429,6 +429,8 @@ impl Jit {
             let _g = lock(&tb.jmp_lock);
             tb.set_invalid();
         }
+        // Not in QEMU: no inline cache of a lookup site may jump to it any more.
+        self.backend.tb_invalidated(tb);
         // Remove the TB from the hash list.
         let removed = {
             let mut ht = self.htable.write().unwrap_or_else(|e| e.into_inner());
@@ -553,30 +555,40 @@ pub(crate) fn tb_invalidate_phys_page_range_locked(
         _ => None,
     };
     let mut current_tb_modified = false;
-    let list: Vec<Arc<Tb>> = pages.get(&idx).cloned().unwrap_or_default();
-    for tb in &list {
-        // A TB may span two physical pages.
-        let n = if tb.page_addr[0] >> jit.config.page_bits == idx { 0 } else { 1 };
-        let mut tb_start = tb.page_addr[0];
-        let mut tb_last = tb_start + u64::from(tb.size).max(1) - 1;
-        if n == 0 {
-            tb_last = tb_last.min(tb_start | !jit.page_mask());
-        } else {
-            tb_start = tb.page_addr[1];
-            tb_last = tb_start + (tb_last & !jit.page_mask());
-        }
-        if !(tb_last < start || tb_start > last) {
-            if let Some(cur) = &current_tb {
-                if Arc::ptr_eq(cur, tb) && cur.cflags() & cf::COUNT_MASK != 1 {
-                    // We are modifying the current TB, so stop its execution.
-                    current_tb_modified = true;
-                    if let Some(c) = cpu.as_mut() {
-                        c.cpu_restore_state(ra);
+    // The blocks to invalidate, found before any is: invalidating one takes it off the list.
+    // Most writes to a page with code hit none of it, so the list itself is not copied.
+    let hit: Vec<Arc<Tb>> = pages
+        .get(&idx)
+        .map(|list| {
+            list.iter()
+                .filter(|tb| {
+                    // A TB may span two physical pages.
+                    let n = if tb.page_addr[0] >> jit.config.page_bits == idx { 0 } else { 1 };
+                    let mut tb_start = tb.page_addr[0];
+                    let mut tb_last = tb_start + u64::from(tb.size).max(1) - 1;
+                    if n == 0 {
+                        tb_last = tb_last.min(tb_start | !jit.page_mask());
+                    } else {
+                        tb_start = tb.page_addr[1];
+                        tb_last = tb_start + (tb_last & !jit.page_mask());
                     }
+                    !(tb_last < start || tb_start > last)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    for tb in &hit {
+        if let Some(cur) = &current_tb {
+            if Arc::ptr_eq(cur, tb) && cur.cflags() & cf::COUNT_MASK != 1 {
+                // We are modifying the current TB, so stop its execution.
+                current_tb_modified = true;
+                if let Some(c) = cpu.as_mut() {
+                    c.cpu_restore_state(ra);
                 }
             }
-            jit.do_tb_phys_invalidate(tb, Some(pages));
         }
+        jit.do_tb_phys_invalidate(tb, Some(pages));
     }
     // If no code remaining, no need to continue to use slow writes.
     if pages.get(&idx).is_none_or(Vec::is_empty) {

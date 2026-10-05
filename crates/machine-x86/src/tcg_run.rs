@@ -26,6 +26,10 @@
 //! - The APIC timers run on the virtual clock, fired by the timer thread like the board's
 //!   timers.
 //!
+//! A change to the memory map, such as SeaBIOS moving the PAM registers to shadow the BIOS
+//! in RAM, queues a TLB flush on every vCPU (`tcg_commit()`), so no TLB entry keeps pointing
+//! at the old view.
+//!
 //! Resets stop every vCPU, reset the board, drop all translated code, load each vCPU with its
 //! reset state, cold reset the APICs and let them go again. A triple fault requests a reset,
 //! as on a PC. Guest shutdown and `-no-reboot` resets are reported to the [`EventHandler`]
@@ -70,7 +74,7 @@ use ruvm_jit::{
 };
 use ruvm_jit_core::Type;
 use ruvm_jit_core::types::INSN_START_WORDS;
-use ruvm_mem::{MemTxAttrs, MemTxResult};
+use ruvm_mem::{MemTxAttrs, MemTxResult, MemoryListener};
 use ruvm_target_x86::cpuid::topo::X86CpuTopoInfo;
 use ruvm_target_x86::cpuid::{Accel, X86Cpu};
 use ruvm_target_x86::tcg::{
@@ -322,6 +326,24 @@ impl CpuOps for PcCpu {
     /// board around it.
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         self.x86.as_any()
+    }
+}
+
+/// `tcg_commit()`: a change to the memory map flushes every vCPU's TLB so no entry points at
+/// the old view. As in QEMU the flush is queued with `async_run_on_cpu()`, which kicks the
+/// vCPU out of its translated code.
+struct TlbCommit(Weak<Jit>);
+
+impl MemoryListener for TlbCommit {
+    fn name(&self) -> &str {
+        "tcg"
+    }
+
+    fn commit(&self) {
+        let Some(jit) = self.0.upgrade() else { return };
+        for cpu in jit.cpu_list() {
+            cpu.async_run_on_cpu(tlb_flush);
+        }
     }
 }
 
@@ -684,6 +706,10 @@ impl TcgMachine {
         }
 
         board.machine_done()?;
+        board
+            .memory_system()
+            .register_listener(Arc::new(TlbCommit(Arc::downgrade(&jit))), board.memory_as())
+            .map_err(|e| e.to_string())?;
         let board = Arc::new(Mutex::new(board));
         let vcpus = Arc::new(TcgVcpus::start(&jit, vcpus));
 

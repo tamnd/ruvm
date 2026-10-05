@@ -272,12 +272,7 @@ impl S<'_, '_, '_> {
                 } else {
                     self.ldl()? as u32 as i32 as i64
                 };
-                let l1 = self.label();
-                self.gen_jcc1(b & 0xf, l1);
-                self.gen_jmp_rel_csize(0, 1);
-                self.set_label(l1);
-                let ot = self.d.dflag;
-                self.gen_jmp_rel(ot, diff, 0);
+                self.gen_jcc_rel(b & 0xf, diff);
             }
             0x80..=0x83 => self.grp1(b)?,
             0x84 | 0x85 | 0xa8 | 0xa9 => {
@@ -544,6 +539,7 @@ impl S<'_, '_, '_> {
                 self.gen_stack_update(val + (1 << ot));
                 // gen_pop_t0() zero extends.
                 self.gen_op_jmp_v(g.t0);
+                self.d.jmp_ic = true;
                 self.b.is_jmp = DISAS_JUMP;
             }
             0xc4 | 0xc5 => {
@@ -2110,6 +2106,7 @@ impl S<'_, '_, '_> {
                     self.gen_push_v(t);
                 }
                 self.gen_op_jmp_v(g.t0);
+                self.d.jmp_ic = true;
                 self.b.is_jmp = DISAS_JUMP;
             }
             3 | 5 => {

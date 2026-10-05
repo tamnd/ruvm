@@ -73,6 +73,11 @@
 //!   after, since there is no big lock here to keep another thread from raising it in
 //!   between.
 //! - PAUSE ends the block like any other instruction rather than leaving the execution loop.
+//! - A block that ends with a near RET, a near indirect JMP or CALL, or a direct jump to
+//!   another page looks the next block up with `lookup_tb_ptr_ic`, passing the linear EIP, so
+//!   that a backend can cache the target where the block jumps. QEMU calls
+//!   `helper_lookup_tb_ptr` there. Far transfers keep the plain lookup, since they can change
+//!   CS and the block flags.
 //! - RCL and RCR are computed inline in generated code instead of calling `helper_rcl*` and
 //!   `helper_rcr*`; the results and flags are the same. ROL and ROR with an immediate count
 //!   go through the same code as a count in CL.

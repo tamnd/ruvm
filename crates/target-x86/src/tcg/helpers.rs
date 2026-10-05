@@ -142,19 +142,33 @@ fn h_cc_compute_c(_h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     Ok(u128::from(compute_c(a[0], a[1], a[2], a32(a, 3))))
 }
 
+extern "C" fn n_cc_compute_all(dst: u64, src1: u64, src2: u64, op: u64) -> u64 {
+    u64::from(compute_all(dst, src1, src2, op as u32))
+}
+
+extern "C" fn n_cc_compute_c(dst: u64, src1: u64, src2: u64, op: u64) -> u64 {
+    compute_c(dst, src1, src2, op as u32)
+}
+
 def!(CC_COMPUTE_NZ, "cc_compute_nz", NO_RWG_SE, I64, [I64, I64, I32], h_cc_compute_nz);
 
 /// `helper_cc_compute_nz()`: a value that is zero exactly when ZF is set.
 fn h_cc_compute_nz(_h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
-    let op = a32(a, 2);
-    let v = if cc_op_has_eflags(op) {
-        !a[1] & u64::from(CC_Z)
+    Ok(u128::from(compute_nz(a[0], a[1], a32(a, 2))))
+}
+
+extern "C" fn n_cc_compute_nz(dst: u64, src1: u64, op: u64, _: u64) -> u64 {
+    compute_nz(dst, src1, op as u32)
+}
+
+fn compute_nz(dst: u64, src1: u64, op: u32) -> u64 {
+    if cc_op_has_eflags(op) {
+        !src1 & u64::from(CC_Z)
     } else {
         let bits = 8u32 << cc_op_size(op);
         let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
-        a[0] & mask
-    };
-    Ok(u128::from(v))
+        dst & mask
+    }
 }
 
 // Exceptions.
@@ -1320,4 +1334,9 @@ pub(crate) fn register(r: &mut HelperRegistry) {
     for d in ALL.iter().chain(vec::ALL).chain(fpu::ALL) {
         r.register_info(&d.info(), d.f);
     }
+    // The lazy flags helpers run between most flag users, so generated code calls them
+    // directly, as QEMU's does.
+    r.register_native(CC_COMPUTE_ALL.name, n_cc_compute_all);
+    r.register_native(CC_COMPUTE_C.name, n_cc_compute_c);
+    r.register_native(CC_COMPUTE_NZ.name, n_cc_compute_nz);
 }

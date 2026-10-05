@@ -16,6 +16,15 @@ pub fn lookup_tb_ptr() -> HelperInfo {
     HelperInfo::new("lookup_tb_ptr", NO_WG_SE, Ptr, &[Ptr])
 }
 
+/// `lookup_tb_ptr_ic(env, pc) -> ptr`: `lookup_tb_ptr` at the end of a block whose CPU state,
+/// apart from the program counter, is the one the block started with, and where the code
+/// computed the program counter as `pc`. It returns what `lookup_tb_ptr` returns, so it can be
+/// implemented by it; a backend may use the two promises to cache the next block at the call
+/// site. Not in QEMU.
+pub fn lookup_tb_ptr_ic() -> HelperInfo {
+    HelperInfo::new("lookup_tb_ptr_ic", NO_WG_SE, Ptr, &[Ptr, I64])
+}
+
 /// `exit_atomic(env)`, which never returns.
 pub fn exit_atomic() -> HelperInfo {
     HelperInfo::new("exit_atomic", NO_WG | NO_RETURN, Void, &[Ptr])

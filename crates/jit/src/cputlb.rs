@@ -924,7 +924,8 @@ fn notdirty_write(
         DirtyMask::NONE.with(DirtyClient::Vga).with(DirtyClient::Migration),
     );
     // We remove the notdirty callback only if the code has been flushed.
-    if !ram_is_clean(&jit, block, off, ram_addr) {
+    let clean = ram_is_clean(&jit, block, off, ram_addr);
+    if !clean {
         tlb_set_dirty(cpu, vaddr);
     }
     Ok(())

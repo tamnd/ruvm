@@ -13,6 +13,19 @@
 //! the end of block code; [`insn`] holds the per opcode decoder and emitters, [`ext`] the
 //! later extensions with their own decoding and [`sse`] the table driven decoder of the vector
 //! instructions.
+//!
+//! Differences from QEMU:
+//!
+//! - A near `jcc` does not always end the block (superblocks). Up to `MAX_SIDE_EXITS` times
+//!   per block, the block goes on with the fall-through path, and the taken edge branches to
+//!   an exit emitted after the last instruction. The fall-through path keeps guest registers
+//!   in host registers and the flags state across the branch, and skips the exit request
+//!   check a new block would make. Control only moves forward inside a block, so it still
+//!   cannot loop without passing that check. Not with icount, single step, an interrupt
+//!   shadow or RF set. The exits get the two `goto_tb` slots in program order, and the
+//!   others go through the jump cache.
+//! - A near jump, call or return that leaves the CPU state as the block found it apart from
+//!   EIP looks the next block up through an inline cache, `lookup_tb_ptr_ic`.
 
 mod ext;
 mod insn;
@@ -198,6 +211,30 @@ pub(crate) struct DisasContext {
     popl_esp_hack: i64,
     prev_insn_start: Option<OpId>,
     prev_insn_end: Option<OpId>,
+    /// The `DISAS_JUMP` that ends the block is a near jump, call or return, which leaves the
+    /// CPU state other than EIP as the block found it, so the next block may be cached where
+    /// it is looked up (`gen_lookup_and_goto_ptr_ic`). Not in QEMU.
+    jmp_ic: bool,
+    /// The `goto_tb` exit slots this block has used, one bit per slot. Not in QEMU, which
+    /// has at most two direct exits per block by construction; superblocks can have more
+    /// exits than slots, and the rest go through the jump cache.
+    goto_tb_used: u8,
+    /// Conditional branches whose fall-through was translated in line, see
+    /// [`SideExit`]. Not in QEMU.
+    side_exits: Vec<SideExit>,
+}
+
+/// The taken edge of a conditional branch whose fall-through path the block continues
+/// with (a superblock, not in QEMU). Its exit is emitted out of line when the block
+/// ends, so the fall-through path keeps guest registers in host registers.
+#[derive(Clone, Copy)]
+struct SideExit {
+    label: Label,
+    new_eip: u64,
+    new_pc: u64,
+    flags: u32,
+    /// The `goto_tb` slot kept for this exit.
+    slot: Option<u64>,
 }
 
 impl Feat {
@@ -283,6 +320,9 @@ impl DisasContext {
             popl_esp_hack: 0,
             prev_insn_start: None,
             prev_insn_end: None,
+            jmp_ic: false,
+            goto_tb_used: 0,
+            side_exits: Vec::new(),
         }
     }
 }
@@ -1314,6 +1354,9 @@ impl S<'_, '_, '_> {
             self.f().gen_exit_tb(0, 0);
         } else if self.d.flags & TF_MASK != 0 {
             self.call(&helpers::SINGLE_STEP, None, &[env.into()]);
+        } else if mode == DISAS_JUMP && !had_inhibit && self.d.jmp_ic {
+            let pc = self.linear_pc();
+            self.f().gen_lookup_and_goto_ptr_ic(pc);
         } else if mode == DISAS_JUMP && !had_inhibit {
             // Give interrupts a chance to happen after an instruction that inhibited them.
             self.f().gen_lookup_and_goto_ptr();
@@ -1321,12 +1364,31 @@ impl S<'_, '_, '_> {
             self.f().gen_exit_tb(0, 0);
         }
         self.d.flags = saved_flags;
+        self.d.jmp_ic = false;
         self.b.is_jmp = DisasJumpType::NoReturn;
     }
 
-    /// `gen_jmp_rel()`: jump to the next instruction plus `diff`, with an operand size of
+    /// The linear address of EIP, as `get_tb_cpu_state` computes the program counter, for a
+    /// block end where CS is the one the block started with.
+    fn linear_pc(&mut self) -> TempI64 {
+        let eip = self.g.eip;
+        if self.d.cs_base == 0 && self.code64() {
+            return eip;
+        }
+        let pc = self.new64();
+        let cs_base = self.d.cs_base as i64;
+        let code64 = self.code64();
+        let f = self.f();
+        f.gen_addi_i64(pc, eip, cs_base);
+        if !code64 {
+            f.gen_ext32u_i64(pc, pc);
+        }
+        pc
+    }
+
+    /// The EIP and linear PC of the next instruction plus `diff`, with an operand size of
     /// `ot`.
-    fn gen_jmp_rel(&mut self, ot: u32, diff: i64, tb_num: u64) {
+    fn jmp_target(&mut self, ot: u32, diff: i64) -> (u64, u64) {
         let new_pc = self.d.pc.wrapping_add(diff as u64);
         let mask: u64 = if ot == OT16 {
             0xffff
@@ -1336,25 +1398,48 @@ impl S<'_, '_, '_> {
             !0
         };
         let new_eip = new_pc.wrapping_sub(self.d.cs_base) & mask;
-        self.gen_update_cc_op();
-        self.set_cc_op(CC_OP_DYNAMIC);
         let mut new_pc = new_eip.wrapping_add(self.d.cs_base);
         if !self.code64() {
             new_pc &= 0xffff_ffff;
         }
+        (new_eip, new_pc)
+    }
+
+    /// `gen_jmp_rel()`: jump to the next instruction plus `diff`, with an operand size of
+    /// `ot`.
+    fn gen_jmp_rel(&mut self, ot: u32, diff: i64, tb_num: u64) {
+        let (new_eip, new_pc) = self.jmp_target(ot, diff);
+        self.gen_update_cc_op();
+        self.set_cc_op(CC_OP_DYNAMIC);
+        self.gen_jmp_to(new_eip, new_pc, tb_num);
+    }
+
+    /// The `goto_tb` slot to use for an exit that would like slot `tb_num`: that one if it
+    /// is free, else the other, else none.
+    fn goto_tb_slot(&self, tb_num: u64) -> Option<u64> {
+        [tb_num, tb_num ^ 1].into_iter().find(|&n| self.d.goto_tb_used & (1 << n) == 0)
+    }
+
+    /// The jump of [`Self::gen_jmp_rel`] once the target is known and the flags state is
+    /// written back.
+    fn gen_jmp_to(&mut self, new_eip: u64, new_pc: u64, tb_num: u64) {
         let eip = self.g.eip;
-        if self.d.jmp_opt && self.b.translator_use_goto_tb(new_pc) {
+        let slot = self.goto_tb_slot(tb_num);
+        let same_page = self.b.translator_use_goto_tb(new_pc);
+        if let (true, true, Some(n)) = (self.d.jmp_opt, same_page, slot) {
             // Jump to the same page: we can use a direct jump.
+            self.d.goto_tb_used |= 1 << n;
             let id = self.b.tb.id;
             let f = self.f();
-            f.gen_goto_tb(tb_num);
+            f.gen_goto_tb(n);
             f.gen_movi_i64(eip, new_eip as i64);
-            f.gen_exit_tb(id, tb_num);
+            f.gen_exit_tb(id, n);
             self.b.is_jmp = DisasJumpType::NoReturn;
         } else {
             self.f().gen_movi_i64(eip, new_eip as i64);
             if self.d.jmp_opt {
-                // Jump to another page.
+                // Jump to another page, or a block with no free direct exit.
+                self.d.jmp_ic = true;
                 self.gen_eob(DISAS_JUMP);
             } else {
                 // Exit to the main loop.
@@ -1363,12 +1448,77 @@ impl S<'_, '_, '_> {
         }
     }
 
+    /// Whether a conditional branch here may continue the block with its fall-through
+    /// path rather than end it (a superblock, not in QEMU). Not with icount, which charges
+    /// a whole block's instructions on entry, and not when the block end has to do more
+    /// than jump (single step, an interrupt shadow, or RF to clear).
+    fn can_inline_jcc(&self) -> bool {
+        self.d.jmp_opt
+            && self.b.tb.cflags & cf::USE_ICOUNT == 0
+            && self.b.tb.flags & RF_MASK == 0
+            && self.d.flags & (TF_MASK | HF_INHIBIT_IRQ_MASK) == 0
+            && self.d.side_exits.len() < MAX_SIDE_EXITS
+    }
+
+    /// `jcc` with a relative target `diff` on condition `b`. When it can, the block goes on
+    /// with the fall-through path and the taken edge becomes a [`SideExit`].
+    fn gen_jcc_rel(&mut self, b: u32, diff: i64) {
+        let l1 = self.label();
+        if self.can_inline_jcc() {
+            let ot = self.d.dflag;
+            let (new_eip, new_pc) = self.jmp_target(ot, diff);
+            self.gen_jcc1(b, l1);
+            let flags = self.d.flags;
+            // The earlier exits get the direct slots: every run of the block passes their
+            // branch, not all reach the later ones.
+            let mut slot = None;
+            if self.b.translator_use_goto_tb(new_pc) {
+                slot = self.goto_tb_slot(0);
+                if let Some(n) = slot {
+                    self.d.goto_tb_used |= 1 << n;
+                }
+            }
+            self.d.side_exits.push(SideExit { label: l1, new_eip, new_pc, flags, slot });
+            return;
+        }
+        self.gen_jcc1(b, l1);
+        self.gen_jmp_rel_csize(0, 1);
+        self.set_label(l1);
+        let ot = self.d.dflag;
+        self.gen_jmp_rel(ot, diff, 0);
+    }
+
+    /// Emit the exits of the conditional branches the block went past, after its last
+    /// instruction. The flags state was written back before each branch.
+    fn gen_side_exits(&mut self) {
+        let exits = std::mem::take(&mut self.d.side_exits);
+        let saved_flags = self.d.flags;
+        for e in &exits {
+            self.set_label(e.label);
+            self.d.flags = e.flags;
+            self.d.cc_op = CC_OP_DYNAMIC;
+            self.d.cc_op_dirty = false;
+            let mut n = 0;
+            if let Some(k) = e.slot {
+                self.d.goto_tb_used &= !(1 << k);
+                n = k;
+            }
+            self.gen_jmp_to(e.new_eip, e.new_pc, n);
+        }
+        self.d.flags = saved_flags;
+        self.d.side_exits = exits;
+        self.d.side_exits.clear();
+    }
+
     /// `gen_jmp_rel_csize()`.
     fn gen_jmp_rel_csize(&mut self, diff: i64, tb_num: u64) {
         let ot = if self.d.code32 { OT32 } else { OT16 };
         self.gen_jmp_rel(ot, diff, tb_num);
     }
 }
+
+/// The most conditional branches one block goes past, see [`SideExit`].
+const MAX_SIDE_EXITS: usize = 8;
 
 const R_DS_I: i32 = 3;
 const R_EBP_I: i32 = 5;
@@ -1402,6 +1552,8 @@ impl TranslatorOps for DisasContext {
         self.repz_opt = cflags & cf::USE_ICOUNT == 0;
         self.cc_op = CC_OP_DYNAMIC;
         self.cc_op_dirty = false;
+        self.goto_tb_used = 0;
+        self.side_exits.clear();
 
         let f = &mut db.tb.f;
         let env = f.env();
@@ -1518,5 +1670,6 @@ impl TranslatorOps for DisasContext {
             }
             m => s.gen_eob(m),
         }
+        s.gen_side_exits();
     }
 }

@@ -465,6 +465,66 @@ fn conditions() {
 }
 
 #[test]
+fn branches_inside_a_block() {
+    // A loop whose body has more forward branches than a block has direct exits, some
+    // taken and some not, with flags read after a branch that was not taken.
+    let code = [
+        0x89, 0xca, // top: mov edx, ecx
+        0x83, 0xe2, 0x07, // and edx, 7
+        0x83, 0xfa, 0x03, // cmp edx, 3
+        0x75, 0x02, // jne +2
+        0x01, 0xc8, // add eax, ecx
+        0x83, 0xfa, 0x05, // cmp edx, 5
+        0x72, 0x03, // jb +3
+        0x83, 0xc0, 0x64, // add eax, 100
+        0x83, 0xfa, 0x06, // cmp edx, 6
+        0x73, 0x03, // jae +3
+        0x83, 0xd3, 0x00, // adc ebx, 0
+        0xf7, 0xc1, 0x01, 0x00, 0x00, 0x00, // test ecx, 1
+        0x74, 0x02, // je +2
+        0xff, 0xc6, // inc esi
+        0x83, 0xfa, 0x00, // cmp edx, 0
+        0x75, 0x03, // jne +3
+        0x83, 0xc7, 0x07, // add edi, 7
+        0xff, 0xc9, // dec ecx
+        0x75, 0xce, // jnz top
+        0xf4, // hlt
+    ];
+    let (mut a, mut b, mut si, mut di) = (0u64, 0u64, 0u64, 0u64);
+    for c in (1..=100u64).rev() {
+        let d = c & 7;
+        if d == 3 {
+            a += c;
+        }
+        if d >= 5 {
+            a += 100;
+        }
+        if d < 6 {
+            b += 1;
+        }
+        if c & 1 != 0 {
+            si += 1;
+        }
+        if d == 0 {
+            di += 7;
+        }
+    }
+    let st = run64(&[(R_ECX, 100)], &code);
+    assert_eq!(st.rip, CODE + code.len() as u64);
+    assert_eq!(
+        (st.regs[R_EAX], st.regs[R_EBX], st.regs[R_ESI], st.regs[R_EDI], st.regs[R_ECX]),
+        (a, b, si, di, 0)
+    );
+
+    // A fault after a branch that was not taken sees the flags from before it.
+    // cmp eax, ebx; jne +2; div ecx; hlt
+    let code = [0x39, 0xd8, 0x75, 0x02, 0xf7, 0xf1, 0xf4];
+    let st = run64(&[(R_EAX, 5), (R_EBX, 5), (R_ECX, 0)], &code);
+    assert_eq!(vector64(&st), 0);
+    assert_eq!(st.rflags & ARITH, ZF | PF);
+}
+
+#[test]
 fn rep_movs_overlap_and_df() {
     // rep movsb forward with the destination one byte above the source.
     let w = World::new();

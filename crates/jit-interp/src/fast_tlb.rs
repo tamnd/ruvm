@@ -27,8 +27,10 @@
 //!
 //! Differences from QEMU:
 //!
-//! - Generated code finds the descriptor through its run context rather than at a fixed negative
-//!   offset from `env`, because the CPU state here belongs to the target and has no room for it.
+//! - Generated code reads a copy of the descriptor kept in its run context rather than the
+//!   descriptor at a fixed negative offset from `env`, because the CPU state here belongs to the
+//!   target and has no room for it. A resize bumps [`FastTlb::generation`] so that runs know to
+//!   copy it again.
 //! - MMU indexes that have no table point at a one entry table that never matches, so an access
 //!   with any MMU index below [`TLB_MAX_MMU_MODES`] can be looked up.
 
@@ -83,6 +85,8 @@ struct Keep {
 pub struct FastTlb {
     page_bits: u32,
     desc: Box<[AtomicU64]>,
+    /// Bumped each time the descriptor changes.
+    generation: AtomicU64,
     keep: Mutex<Keep>,
 }
 
@@ -96,6 +100,13 @@ impl FastTlb {
     /// The table addresses in it stay valid while a run is open ([`FastTlb::enter_run`]).
     pub fn desc(&self) -> &[AtomicU64] {
         &self.desc
+    }
+
+    /// A count that changes whenever [`FastTlb::desc`] does, so that a run keeping a copy of the
+    /// descriptor can tell when to copy it again. The descriptor changes only on the thread of
+    /// an open run, so that thread sees every change.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// A descriptor whose every entry fails to match, for a run without a TLB to read.
@@ -191,7 +202,10 @@ impl TlbTables {
         named.resize(TLB_MAX_MMU_MODES, miss);
         let desc = desc_for(&named);
         let keep = Mutex::new(Keep { cur: named, retired: Vec::new(), runner: None });
-        TlbTables { cur, fast: Arc::new(FastTlb { page_bits, desc, keep }) }
+        TlbTables {
+            cur,
+            fast: Arc::new(FastTlb { page_bits, desc, generation: AtomicU64::new(0), keep }),
+        }
     }
 
     /// The part generated code reads.
@@ -310,6 +324,7 @@ impl TlbTables {
             None => false,
         };
         write_desc(&self.fast.desc, mmu_idx, &t);
+        self.fast.generation.fetch_add(1, Ordering::AcqRel);
         let old = std::mem::replace(&mut k.cur[mmu_idx], t.clone());
         if open {
             k.retired.push(old);

@@ -50,7 +50,7 @@ use ruvm_jit_core::opcode::Opcode;
 use ruvm_jit_core::types::{Cond, INSN_START_WORDS, MemOpIdx, TempKind, Type, bswap};
 
 pub use fast_tlb::{FastTlb, RunGuard, TlbTables};
-pub use helpers::{HelperEntry, HelperEnv, HelperFn, HelperRegistry, Unwind};
+pub use helpers::{HelperEntry, HelperEnv, HelperFn, HelperRegistry, NativeHelperFn, Unwind};
 pub use mem::{
     FaultKind, FlatMemory, GuestMemory, MemFault, NoMemory, guest_load, guest_load_env,
     guest_store, guest_store_env,
