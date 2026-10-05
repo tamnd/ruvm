@@ -101,6 +101,11 @@ pub(crate) const LOOKUP_TB_PTR: &str = "lookup_tb_ptr";
 /// [`CompiledTb::set_ic_key`].
 pub(crate) const LOOKUP_TB_PTR_IC: &str = "lookup_tb_ptr_ic";
 
+/// Set in the request word of a `lookup_tb_ptr_ic` call, so that [`lookup_service`] knows
+/// the call has an inline cache without reading the metadata of the block, which is often
+/// not in the host cache at the end of a block.
+pub(crate) const LOOKUP_IC_SITE: u64 = 1 << 31;
+
 /// The program counter word of a block header that no inline cache may jump through. Its
 /// address word is 0 too, so even a guest jump to this program counter does not use it.
 const IC_NONE: u64 = u64::MAX;
@@ -973,13 +978,14 @@ fn jump_key(region: &CodeRegion, env_len: u64) -> [u64; 2] {
 /// [`GenOptions::lookup`]. In a chained run it serves the call with [`serve_lookup`];
 /// otherwise the call is served like any other.
 extern "C" fn lookup_service(ctx: &mut RunCtx<'_>, req: u64, meta: *const BlockMeta) -> u64 {
-    let Some(chain) = ctx.chain else { return service(ctx, req, meta) };
+    let Some(chain) = ctx.chain else { return service(ctx, req & !LOOKUP_IC_SITE, meta) };
     ctx.meta = meta;
     // `helper_lookup_tb_ptr()` runs at the end of a block and does not restore the state of an
     // instruction, so the guest memory is not told about the block or instruction.
     ctx.insn = req >> 32;
-    let i = (req & u64::from(u32::MAX)) as usize;
-    match catch_unwind(AssertUnwindSafe(|| serve_lookup(ctx, chain, i))) {
+    let ic = req & LOOKUP_IC_SITE != 0;
+    let i = (req & u64::from(u32::MAX) & !LOOKUP_IC_SITE) as usize;
+    match catch_unwind(AssertUnwindSafe(|| serve_lookup(ctx, chain, i, ic))) {
         Ok(Ok(v)) => {
             ctx.args[0] = v;
             ctx.args[1] = 0;
@@ -999,11 +1005,21 @@ extern "C" fn lookup_service(ctx: &mut RunCtx<'_>, req: u64, meta: *const BlockM
 }
 
 /// `lookup_tb_ptr` in a chained run: the entry of the next block when generated code may jump
-/// there, which `goto_ptr` then does, or 0 to leave.
-fn serve_lookup(ctx: &mut RunCtx<'_>, chain: &dyn Chain, i: usize) -> Result<u64, Unwind> {
-    let site = match meta_of(ctx.meta).fast.get(i) {
-        Some(&Fast::LookupIc(word)) => Some(word),
-        _ => None,
+/// there, which `goto_ptr` then does, or 0 to leave. `ic` says whether request `i` has an
+/// inline cache.
+fn serve_lookup(
+    ctx: &mut RunCtx<'_>,
+    chain: &dyn Chain,
+    i: usize,
+    ic: bool,
+) -> Result<u64, Unwind> {
+    let site = if ic {
+        match meta_of(ctx.meta).fast.get(i) {
+            Some(&Fast::LookupIc(word)) => Some(word),
+            _ => None,
+        }
+    } else {
+        None
     };
     let pc = ctx.args[1];
     // SAFETY: as in `serve`: `env` and `env_len` come from the `&mut [u8]` that `run_in` holds
