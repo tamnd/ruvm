@@ -1928,7 +1928,10 @@ impl Target for Gen {
             self.a.emit(DMB_ISHST);
         }
         self.after_full_dmb = false;
-        let lookup = self.lookup != 0 && info.name == crate::runtime::LOOKUP_TB_PTR;
+        // `lookup_tb_ptr_ic` is served like `lookup_tb_ptr`; this backend has no inline cache.
+        let lookup = self.lookup != 0
+            && (info.name == crate::runtime::LOOKUP_TB_PTR
+                || info.name == crate::runtime::LOOKUP_TB_PTR_IC);
         let pure = info.flags & call_flags::NO_SIDE_EFFECTS != 0;
         let req = Request::Call { name: info.name, ret: info.ret, args: info.args, nin: ni, pure };
         let after = if fence { Some(DMB_ISHLD) } else { None };

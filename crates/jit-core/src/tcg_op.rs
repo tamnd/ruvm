@@ -570,6 +570,24 @@ impl Func {
         self.temp_free(ptr);
     }
 
+    /// [`Func::gen_lookup_and_goto_ptr`] through `lookup_tb_ptr_ic` instead of
+    /// `lookup_tb_ptr`, for a block end where the CPU state other than the program counter is
+    /// the one the block started with and `pc` holds the program counter, as
+    /// `get_tb_cpu_state` would compute it. Not in QEMU; see
+    /// [`crate::helpers::lookup_tb_ptr_ic`].
+    pub fn gen_lookup_and_goto_ptr_ic(&mut self, pc: TempI64) {
+        if self.config.no_goto_ptr {
+            self.gen_exit_tb(0, 0);
+            return;
+        }
+        let ptr = self.temp_ebb_new_ptr();
+        let h = self.helper(crate::helpers::lookup_tb_ptr_ic());
+        let env = self.env();
+        self.gen_call(h, Some(ptr.0), &[env.0, pc.0]);
+        self.emit_op(Opcode::GotoPtr, Type::PTR, &[ptr.arg()]);
+        self.temp_free(ptr);
+    }
+
     /// `tcg_gen_callN`: call a helper. `ret` must be given exactly when the helper returns a
     /// value; an I128 value names the low half of its pair.
     pub fn gen_call(&mut self, helper: HelperId, ret: Option<Temp>, args: &[Temp]) -> OpId {

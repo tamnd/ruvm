@@ -54,6 +54,15 @@
 //! - `lookup_and_goto_ptr` calls its own lookup routine, which finds the block through a
 //!   per-CPU cache that also keeps the address to jump to, so a hit costs no reference count
 //!   and no chain check; QEMU's `helper_lookup_tb_ptr` reads `tb->tc.ptr` from its jump cache.
+//! - A `lookup_tb_ptr_ic` call has an inline cache of [`IC_WAYS`] entries, direct mapped by
+//!   the guest program counter. Each names the header of a block, which holds the program
+//!   counter the block starts at and the address to jump to; generated code jumps when the
+//!   program counter matches, and otherwise calls the lookup routine, which fills the entry
+//!   when the block found was translated for the same CPU state as the calling block
+//!   ([`CompiledTb::set_ic_key`]). Invalidating a block clears its header
+//!   ([`CompiledTb::clear_ic`]). QEMU has no such cache: every `lookup_and_goto_ptr` calls
+//!   `helper_lookup_tb_ptr`. Like a chained `goto_tb`, a hit skips what the lookup does
+//!   besides finding the block: the breakpoint check and setting `can_do_io`.
 //! - A call to a helper with `TCG_CALL_NO_SE` does not tell the guest memory which block and
 //!   instruction it is in, since such a helper cannot raise an exception; the next request
 //!   that may raise one, or the end of the run, does. QEMU needs no such step because it
@@ -67,6 +76,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use ruvm_jit_core::ir::{Func, HelperType};
 use ruvm_jit_core::types::INSN_START_WORDS;
+use ruvm_jit_interp::fast_tlb::{TLB_DESC_WORDS, TLB_MAX_MMU_MODES};
 use ruvm_jit_interp::{
     Exit, FastTlb, GuestMemory, HelperEnv, HelperFn, HelperRegistry, InterpError, Unwind,
     guest_load_env, guest_store_env,
@@ -74,8 +84,8 @@ use ruvm_jit_interp::{
 
 use crate::buffer::{BufferError, CodeBuffer};
 use crate::codegen::{
-    self, DECR_OFFSET, ENV_LEN_OFFSET, GOTO_PTR_OK_OFFSET, GenCodeError, GenOptions, INSN_OFFSET,
-    META_OFFSET, NARGS, RET_OFFSET, Request, TLB_OFFSET, kind,
+    self, DECR_OFFSET, ENV_LEN_OFFSET, GOTO_PTR_OK_OFFSET, GenCodeError, GenOptions, IC_WAYS,
+    INSN_OFFSET, META_OFFSET, NARGS, RET_OFFSET, Request, TLB_OFFSET, ic_way, kind,
 };
 use crate::features::HostFeatures;
 
@@ -86,6 +96,22 @@ pub const MAX_SLOT_WORDS: usize = 1 << 16;
 
 /// The name of the helper whose result `goto_ptr` jumps to.
 pub(crate) const LOOKUP_TB_PTR: &str = "lookup_tb_ptr";
+
+/// The name of the `lookup_tb_ptr` variant whose calls get an inline cache, see
+/// [`CompiledTb::set_ic_key`].
+pub(crate) const LOOKUP_TB_PTR_IC: &str = "lookup_tb_ptr_ic";
+
+/// The program counter word of a block header that no inline cache may jump through. Its
+/// address word is 0 too, so even a guest jump to this program counter does not use it.
+const IC_NONE: u64 = u64::MAX;
+
+/// The header inline cache entries name before they are filled.
+static IC_EMPTY: [u64; 2] = [IC_NONE, 0];
+
+/// The words of a block header: the program counter and the entry past the bounds check, then
+/// the program counter again and the entry before the check. An inline cache names the first
+/// half when the calling block's check covers the callee's, and the second half otherwise.
+const IC_HEAD: usize = 4;
 
 /// The blocks a run may chain to and how to find them, for [`CompiledTb::run_chained`]. This
 /// is the runtime side of `lookup_and_goto_ptr`.
@@ -162,6 +188,17 @@ pub(crate) struct BlockMeta {
     /// For each request, what the service routine can do without looking at the request.
     fast: Vec<Fast>,
     owner: OnceLock<Weak<dyn Any + Send + Sync>>,
+    /// The block header ([`IC_HEAD`] words, see [`CompiledTb::set_ic_key`]), followed by [`IC_WAYS`] words for each inline cache of
+    /// the block. Generated code reads it, the runtime writes it.
+    ic: Box<[AtomicU64]>,
+    /// The CPU state the block runs with, apart from the program counter, as given to
+    /// [`CompiledTb::set_ic_key`].
+    ic_key: OnceLock<[u64; 2]>,
+    /// The chain of the region of the block and its place in it, see [`CodeRegion::reaches`].
+    chain: u64,
+    seq: u64,
+    /// [`Generated::env_need`](codegen::Generated::env_need).
+    env_need: u64,
 }
 
 /// How the service routine serves a request, decided when the block is compiled.
@@ -173,11 +210,21 @@ enum Fast {
     Helper { f: HelperFn, nin: usize, ret: bool, pure: bool },
     /// A call to `lookup_tb_ptr`.
     Lookup,
+    /// A call to `lookup_tb_ptr_ic` with an inline cache at this word of [`BlockMeta::ic`].
+    LookupIc(usize),
     /// Anything else.
     Other,
 }
 
 impl BlockMeta {
+    /// Make every inline cache that names this block's header miss.
+    fn clear_ic(&self) {
+        self.ic[0].store(IC_NONE, Ordering::Release);
+        self.ic[2].store(IC_NONE, Ordering::Release);
+        self.ic[1].store(0, Ordering::Release);
+        self.ic[3].store(0, Ordering::Release);
+    }
+
     fn owner(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         self.owner.get().and_then(Weak::upgrade)
     }
@@ -207,7 +254,9 @@ pub struct CodeRegion {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CompileOptions<'a> {
     /// The helpers the block will call. Calls to helpers found here with the right signature
-    /// skip the lookup by name when they run.
+    /// skip the lookup by name when they run. A call to a `TCG_CALL_NO_SE` helper that has a
+    /// native entry point (`HelperRegistry::register_native`) is a direct host call that does
+    /// not leave the block.
     pub helpers: Option<&'a HelperRegistry>,
     /// A 32-bit load at this constant offset from `env` reads the `icount_decr` word given to
     /// [`CompiledTb::run_chained`] instead of the CPU state, as the check at the start of each
@@ -277,6 +326,18 @@ impl CodeRegion {
         self.buf.size()
     }
 
+    /// Stop inline caches from jumping to any block of this region and the regions before it,
+    /// for when the blocks are all dropped.
+    pub fn clear_ic(&self) {
+        let mut r = Some(self);
+        while let Some(region) = r {
+            for m in region.metas.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                m.clear_ic();
+            }
+            r = region._prev.as_deref();
+        }
+    }
+
     /// Whether code running in this region may jump into `other`: it is this region or one
     /// before it in the chain, which this one keeps mapped.
     fn reaches(&self, other: &CodeRegion) -> bool {
@@ -314,12 +375,14 @@ impl CodeRegion {
                     lookup_service;
                 f as usize as u64
             },
+            helpers: opts.helpers,
         };
         let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let offset = next.next_multiple_of(16);
         let base = self.buf.addr() + offset as u64;
         let service_fn: extern "C" fn(&mut RunCtx<'_>, u64, *const BlockMeta) -> u64 = service;
         let g = codegen::generate(f, base, service_fn as usize as u64, self.features, &gen_opts)?;
+        let mut g = g;
         if g.slot_words > MAX_SLOT_WORDS {
             return Err(GenCodeError::TooLarge);
         }
@@ -328,6 +391,22 @@ impl CodeRegion {
             return Err(GenCodeError::TooLarge);
         }
         let m = Arc::get_mut(&mut meta).expect("the metadata is not shared yet");
+        // The header, then the cache words of each inline cache, which start out naming the
+        // empty header. The code finds them through the address patched into it.
+        let empty = IC_EMPTY.as_ptr() as u64;
+        m.ic = (0..IC_HEAD + IC_WAYS * g.ic_sites.len())
+            .map(|k| AtomicU64::new(if k < IC_HEAD { IC_EMPTY[k % 2] } else { empty }))
+            .collect();
+        let mut ic_fast = Vec::with_capacity(g.ic_sites.len());
+        for (j, &(req, at)) in g.ic_sites.iter().enumerate() {
+            let word = IC_HEAD + IC_WAYS * j;
+            let addr = m.ic[word..].as_ptr() as u64;
+            g.bytes[at..at + 8].copy_from_slice(&addr.to_le_bytes());
+            ic_fast.push((req, word));
+        }
+        m.chain = self.chain;
+        m.seq = self.seq;
+        m.env_need = g.env_need;
         m.fast = g
             .requests
             .iter()
@@ -345,6 +424,9 @@ impl CodeRegion {
                 _ => Fast::Other,
             })
             .collect();
+        for (req, word) in ic_fast {
+            m.fast[req] = Fast::LookupIc(word);
+        }
         m.requests = g.requests;
         m.insn_of = g.insn_of;
         self.buf.write(offset, &g.bytes).map_err(|_| GenCodeError::TooLarge)?;
@@ -414,6 +496,26 @@ impl CompiledTb {
     /// Only the first call has an effect.
     pub fn set_owner(&self, owner: Weak<dyn Any + Send + Sync>) {
         let _ = self.meta.owner.set(owner);
+    }
+
+    /// Let the inline caches of `lookup_tb_ptr_ic` calls jump to this block: it starts at the
+    /// guest program counter `pc`, and `key` stands for the rest of the CPU state it was
+    /// translated for. A block whose `lookup_tb_ptr_ic` call finds this one remembers it in its
+    /// cache when both have the same `key`, so the call must only be made where the CPU state
+    /// apart from the program counter is the one its block started with. Only the first call
+    /// has an effect.
+    pub fn set_ic_key(&self, pc: u64, key: [u64; 2]) {
+        if self.meta.ic_key.set(key).is_ok() && pc != IC_NONE {
+            self.meta.ic[1].store(self.addr() + self.fast_body as u64, Ordering::Release);
+            self.meta.ic[3].store(self.entry(), Ordering::Release);
+            self.meta.ic[0].store(pc, Ordering::Release);
+            self.meta.ic[2].store(pc, Ordering::Release);
+        }
+    }
+
+    /// Stop inline caches from jumping to this block, for when it is invalidated.
+    pub fn clear_ic(&self) {
+        self.meta.clear_ic();
     }
 
     /// Mark `goto_tb` slot `idx` as chained or not, `tb_target_set_jmp_target`. A chained slot
@@ -523,10 +625,7 @@ impl CompiledTb {
         let bits = self.region.tlb_page_bits.get().copied();
         let fast = mem.fast_tlb().filter(|t| Some(t.page_bits()) == bits);
         let _run = fast.as_ref().map(|t| t.enter_run());
-        let tlb = match &fast {
-            Some(t) => t.desc().as_ptr(),
-            None => FastTlb::miss_desc().as_ptr(),
-        };
+        let tlb = copy_desc(fast.as_deref().map_or(FastTlb::miss_desc(), FastTlb::desc));
         let mut ctx = RunCtx {
             args: [0; NARGS],
             ret: 0,
@@ -536,6 +635,8 @@ impl CompiledTb {
             decr: decr.as_ptr(),
             goto_ptr_ok: 0,
             tlb,
+            fast_tlb: fast.as_deref(),
+            tlb_generation: fast.as_ref().map_or(0, |t| t.generation()),
             jump_key: jump_key(&self.region, env_len as u64),
             meta_seen: meta,
             insn_delivered: 0,
@@ -603,8 +704,12 @@ pub(crate) struct RunCtx<'a> {
     decr: *const u32,
     /// The one address `goto_ptr` may jump to, or 0 for none.
     goto_ptr_ok: u64,
-    /// The TLB descriptor inlined lookups read.
-    tlb: *const AtomicU64,
+    /// A copy of the TLB descriptor, which inlined lookups read. Copied again after any call
+    /// out of generated code that changed the descriptor.
+    tlb: [u64; TLB_MAX_MMU_MODES * TLB_DESC_WORDS],
+    /// The TLB the descriptor is copied from, if any, and its generation at the last copy.
+    fast_tlb: Option<&'a FastTlb>,
+    tlb_generation: u64,
     /// The key [`Chain::lookup_code`] is given, see [`jump_key`].
     jump_key: [u64; 2],
     /// The block the service routine last told the guest memory about.
@@ -635,7 +740,24 @@ const _: () =
     assert!(std::mem::offset_of!(RunCtx<'static>, goto_ptr_ok) == GOTO_PTR_OK_OFFSET as usize);
 const _: () = assert!(std::mem::offset_of!(RunCtx<'static>, tlb) == TLB_OFFSET as usize);
 
+/// The descriptor words generated code reads, which [`RunCtx::tlb`] holds a copy of.
+fn copy_desc(desc: &[AtomicU64]) -> [u64; TLB_MAX_MMU_MODES * TLB_DESC_WORDS] {
+    std::array::from_fn(|i| desc[i].load(Ordering::Acquire))
+}
+
 impl RunCtx<'_> {
+    /// Copy the TLB descriptor again if it changed since the last copy. Called before going
+    /// back to generated code after a call out of it.
+    fn refresh_tlb(&mut self) {
+        if let Some(t) = self.fast_tlb {
+            let g = t.generation();
+            if g != self.tlb_generation {
+                self.tlb_generation = g;
+                self.tlb = copy_desc(t.desc());
+            }
+        }
+    }
+
     /// The metadata of the running block.
     fn meta_ref(&self) -> &BlockMeta {
         meta_of(self.meta)
@@ -697,16 +819,23 @@ fn enter(
     // uses instruction set extensions the region was created for. It reads and writes only the
     // `env_len` bytes at `env` that `ctx` records (every access is bounds checked against that
     // length), at most `MAX_SLOT_WORDS` words at `slots`, which `run_in` checks the caller
-    // provides, the words of `ctx` up to `tlb`, and the `icount_decr` word `ctx` points
-    // to, which it only reads. It reads the TLB descriptor `ctx.tlb` points to and the tables it
-    // names, which `run_in` keeps alive for the call with `FastTlb::enter_run`, and it accesses
-    // host memory directly only at `addr + addend` for an entry whose comparator matched the
-    // page of `addr`, which `TlbTables::set` requires to be mapped while the entry is there. It calls only `service`, with `ctx`. It jumps only to other
-    // blocks with the same frame layout and the same guarantees: to the targets
-    // `set_goto_tb_target` patched in, which are in this region or one before it in its chain,
-    // all kept mapped by this region, and to the one address `serve_lookup` checked the same
-    // way. `env` comes from a `&mut [u8]` the caller holds for the whole call, and nothing else
-    // uses these pointers until the block returns.
+    // provides, the words of `ctx` up to `tlb`, and the `icount_decr` word `ctx` points to,
+    // which it only reads. It reads the copy of the TLB descriptor in `ctx.tlb` and the tables
+    // it names, which `run_in` keeps alive for the call with `FastTlb::enter_run` and which
+    // `RunCtx::refresh_tlb` copies again whenever a call out of generated code changed them,
+    // and it accesses host memory directly only at `addr + addend` for an entry whose
+    // comparator matched the page of `addr`, which `TlbTables::set` requires to be mapped
+    // while the entry is there. It calls only `service`, with `ctx`, and the safe
+    // `NativeHelperFn`s of the registry it was compiled with, with words as arguments. It
+    // jumps only to other blocks with the same frame layout and the same guarantees: to the
+    // targets `set_goto_tb_target` patched in, which are in this region or one before it in
+    // its chain, all kept mapped by this region, to the one address `serve_lookup` checked the
+    // same way, and through inline caches to the addresses in block headers, which `ic_fill`
+    // only makes them name for blocks in a region the caching block's region keeps mapped, and
+    // which hold either 0 (not jumped to) or the entry of the block after the static check,
+    // taken only when the block needs no more CPU state than the one jumping, which passed its
+    // own check. `env` comes from a `&mut [u8]` the caller holds for the whole call, and
+    // nothing else uses these pointers until the block returns.
     let k = unsafe {
         let f = std::mem::transmute::<usize, Entry>(addr as usize);
         f(env, ctx, slots)
@@ -730,7 +859,10 @@ fn enter(
 extern "C" fn service(ctx: &mut RunCtx<'_>, req: u64, meta: *const BlockMeta) -> u64 {
     ctx.meta = meta;
     match catch_unwind(AssertUnwindSafe(|| serve(ctx, req))) {
-        Ok(Ok(())) => 0,
+        Ok(Ok(())) => {
+            ctx.refresh_tlb();
+            0
+        }
         Ok(Err(Leave::Unwind(u))) => {
             ctx.unwind = Some(u);
             kind::UNWIND
@@ -846,10 +978,12 @@ extern "C" fn lookup_service(ctx: &mut RunCtx<'_>, req: u64, meta: *const BlockM
     // `helper_lookup_tb_ptr()` runs at the end of a block and does not restore the state of an
     // instruction, so the guest memory is not told about the block or instruction.
     ctx.insn = req >> 32;
-    match catch_unwind(AssertUnwindSafe(|| serve_lookup(ctx, chain))) {
+    let i = (req & u64::from(u32::MAX)) as usize;
+    match catch_unwind(AssertUnwindSafe(|| serve_lookup(ctx, chain, i))) {
         Ok(Ok(v)) => {
             ctx.args[0] = v;
             ctx.args[1] = 0;
+            ctx.refresh_tlb();
             0
         }
         Ok(Err(u)) => {
@@ -866,7 +1000,12 @@ extern "C" fn lookup_service(ctx: &mut RunCtx<'_>, req: u64, meta: *const BlockM
 
 /// `lookup_tb_ptr` in a chained run: the entry of the next block when generated code may jump
 /// there, which `goto_ptr` then does, or 0 to leave.
-fn serve_lookup(ctx: &mut RunCtx<'_>, chain: &dyn Chain) -> Result<u64, Unwind> {
+fn serve_lookup(ctx: &mut RunCtx<'_>, chain: &dyn Chain, i: usize) -> Result<u64, Unwind> {
+    let site = match meta_of(ctx.meta).fast.get(i) {
+        Some(&Fast::LookupIc(word)) => Some(word),
+        _ => None,
+    };
+    let pc = ctx.args[1];
     // SAFETY: as in `serve`: `env` and `env_len` come from the `&mut [u8]` that `run_in` holds
     // for the whole run, generated code is suspended in this call, and the slice does not
     // outlive it.
@@ -874,9 +1013,21 @@ fn serve_lookup(ctx: &mut RunCtx<'_>, chain: &dyn Chain) -> Result<u64, Unwind> 
     let region = ctx.region;
     let env_len = env.len() as u64;
     let mut he = HelperEnv { env, mem: &mut *ctx.mem };
-    let mut jump = |c: &CompiledTb| region.reaches(&c.region).then(|| c.chain_entry(env_len));
-    match chain.lookup_code(&mut he, ctx.jump_key, &mut jump)? {
+    let mut target: Option<Arc<BlockMeta>> = None;
+    let mut jump = |c: &CompiledTb| {
+        let entry = region.reaches(&c.region).then(|| c.chain_entry(env_len));
+        if entry.is_some() && site.is_some() {
+            target = Some(Arc::clone(&c.meta));
+        }
+        entry
+    };
+    // An inline cache needs the block found, which a remembered entry does not give.
+    let key = if site.is_some() { [0, 0] } else { ctx.jump_key };
+    match chain.lookup_code(&mut he, key, &mut jump)? {
         Found::Jump(entry) => {
+            if let (Some(word), Some(b)) = (site, target) {
+                ic_fill(meta_of(ctx.meta), word, &b, pc);
+            }
             ctx.goto_ptr_ok = entry;
             Ok(entry)
         }
@@ -886,6 +1037,25 @@ fn serve_lookup(ctx: &mut RunCtx<'_>, chain: &dyn Chain) -> Result<u64, Unwind> 
             }
             Ok(0)
         }
+    }
+}
+
+/// Remember block `b`, found for the program counter `pc`, in the inline cache at `word` of
+/// block `a`, when code jumping there from `a` is right whatever the CPU state: `b` was
+/// translated for the state `a` was ([`CompiledTb::set_ic_key`]), which the call promises
+/// is the state at the call; it is in a region `a` keeps mapped; and it has not been
+/// invalidated. The cache skips the bounds check of `b` only when `a`'s covers it.
+fn ic_fill(a: &BlockMeta, word: usize, b: &BlockMeta, pc: u64) {
+    let (Some(ka), Some(kb)) = (a.ic_key.get(), b.ic_key.get()) else { return };
+    if ka != kb || a.chain != b.chain || b.seq > a.seq {
+        return;
+    }
+    let half = if b.env_need <= a.env_need { 0 } else { 2 };
+    if b.ic[half].load(Ordering::Acquire) != pc || b.ic[half + 1].load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if let Some(slot) = a.ic.get(word + ic_way(pc)) {
+        slot.store(b.ic[half..].as_ptr() as u64, Ordering::Release);
     }
 }
 

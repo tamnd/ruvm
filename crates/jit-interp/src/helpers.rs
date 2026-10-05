@@ -52,6 +52,13 @@ impl fmt::Debug for HelperEnv<'_> {
 /// A helper implementation.
 pub type HelperFn = fn(&mut HelperEnv<'_>, &[u64]) -> Result<u128, Unwind>;
 
+/// A helper without side effects in the host's C calling convention, which generated code may
+/// call directly instead of going through the service routine: up to four argument words in,
+/// one word out, unused arguments being anything. It gets neither the CPU state nor guest
+/// memory, so only `TCG_CALL_NO_SE` helpers that need neither can have one. Not in QEMU, where
+/// every helper is a C function to begin with.
+pub type NativeHelperFn = extern "C" fn(u64, u64, u64, u64) -> u64;
+
 /// A registered helper.
 #[derive(Clone, Debug)]
 pub struct HelperEntry {
@@ -67,6 +74,7 @@ pub struct HelperEntry {
 #[derive(Clone, Debug, Default)]
 pub struct HelperRegistry {
     map: HashMap<String, HelperEntry>,
+    native: HashMap<String, NativeHelperFn>,
 }
 
 impl HelperRegistry {
@@ -79,12 +87,31 @@ impl HelperRegistry {
 
     /// A registry with nothing in it.
     pub fn empty() -> HelperRegistry {
-        HelperRegistry { map: HashMap::new() }
+        HelperRegistry { map: HashMap::new(), native: HashMap::new() }
     }
 
     /// Register `f` under `name`, replacing any earlier helper of that name.
     pub fn register(&mut self, name: &str, ret: HelperType, args: &[HelperType], f: HelperFn) {
+        self.native.remove(name);
         self.map.insert(name.to_string(), HelperEntry { ret, args: args.to_vec(), f });
+    }
+
+    /// Give the helper already registered under `name` a [`NativeHelperFn`] doing the same
+    /// work, for backends that call helpers directly. Ignored when nothing is registered under
+    /// `name`, or when it is not `I64`, `I32` or `Void` valued with at most four `I64` or `I32`
+    /// arguments; registering the helper again drops it.
+    pub fn register_native(&mut self, name: &str, f: NativeHelperFn) {
+        use HelperType::{I32, I64, Void};
+        let Some(e) = self.map.get(name) else { return };
+        let word = |t: &HelperType| matches!(t, I32 | I64);
+        if (word(&e.ret) || e.ret == Void) && e.args.len() <= 4 && e.args.iter().all(word) {
+            self.native.insert(name.to_string(), f);
+        }
+    }
+
+    /// The [`NativeHelperFn`] of the helper registered under `name`, if it has one.
+    pub fn native(&self, name: &str) -> Option<NativeHelperFn> {
+        self.native.get(name).copied()
     }
 
     /// Register `f` with the name and signature of a [`HelperInfo`].
@@ -110,6 +137,7 @@ impl HelperRegistry {
     fn add_builtins(&mut self) {
         use HelperType::{I32, I64, I128, Ptr, Void};
         self.register("lookup_tb_ptr", Ptr, &[Ptr], |_, _| Ok(0));
+        self.register("lookup_tb_ptr_ic", Ptr, &[Ptr, I64], |_, _| Ok(0));
         self.register("exit_atomic", Void, &[Ptr], |_, _| Err(Unwind::ExitAtomic));
 
         const SUFFIXES: [(&str, u32); 9] = [
@@ -328,4 +356,46 @@ fn cmpxchg_locked(e: &mut HelperEnv<'_>, args: &[u64]) -> Result<u128, Unwind> {
         guest_store_env(e.mem, e.env, addr, newv, oi).map_err(Unwind::Mem)?;
     }
     Ok(old)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" fn sum(a: u64, b: u64, c: u64, d: u64) -> u64 {
+        a + b + c + d
+    }
+
+    fn zero(_: &mut HelperEnv<'_>, _: &[u64]) -> Result<u128, Unwind> {
+        Ok(0)
+    }
+
+    #[test]
+    fn native_entry_points_follow_their_helper() {
+        use HelperType::{I32, I64, I128, Ptr, Void};
+        let mut r = HelperRegistry::empty();
+        // Nothing registered under the name.
+        r.register_native("a", sum);
+        assert!(r.native("a").is_none());
+        // Word valued helpers with up to four word arguments get one.
+        r.register("a", I64, &[I64, I32, I64, I32], zero);
+        r.register_native("a", sum);
+        assert_eq!(r.native("a").map(|f| f(1, 2, 3, 4)), Some(10));
+        r.register("v", Void, &[], zero);
+        r.register_native("v", sum);
+        assert!(r.native("v").is_some());
+        // Registering the helper again drops it.
+        r.register("a", I64, &[I64], zero);
+        assert!(r.native("a").is_none());
+        // Other signatures do not.
+        for (name, ret, args) in [
+            ("p", I64, &[Ptr][..]),
+            ("w", I128, &[I64][..]),
+            ("five", I32, &[I32, I32, I32, I32, I32][..]),
+        ] {
+            r.register(name, ret, args, zero);
+            r.register_native(name, sum);
+            assert!(r.native(name).is_none(), "{name}");
+        }
+    }
 }

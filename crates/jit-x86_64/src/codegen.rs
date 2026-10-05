@@ -77,6 +77,8 @@
 //! - `goto_ptr` jumps to the address `lookup_tb_ptr` returned only if the runtime vouched for
 //!   it in the run context, and leaves with [`ruvm_jit_interp::Exit::GotoPtr`] otherwise.
 //!   QEMU jumps to whatever the helper returned.
+//! - A call to `lookup_tb_ptr_ic` first looks the guest program counter up in an inline cache
+//!   of block headers and jumps straight to the block on a hit; see the runtime. Not in QEMU.
 //! - A 32-bit load of the `icount_decr` word at the offset the runtime gives reads the shared
 //!   atomic through a pointer in the run context, so that exit requests from other threads
 //!   are seen without leaving generated code. In QEMU the word is part of the CPU state.
@@ -87,13 +89,15 @@ use ruvm_jit_core::regalloc::{self, Letter, RegSet, Target};
 use ruvm_jit_core::types::{
     Cond, INSN_START_WORDS, MemOpIdx, TempKind, Type, bswap, dup_const, mo, opf,
 };
+use ruvm_jit_interp::HelperRegistry;
 use ruvm_jit_interp::fast_tlb::{
     TLB_ADDEND_WORD, TLB_DESC_WORDS, TLB_ENTRY_BITS, TLB_FLAGS_SHIFT, TLB_MAX_MMU_MODES,
 };
 
 use crate::asm::{
-    Asm, AsmError, Mem, P_DATA16, P_REXB_RM, P_REXW, P_VEXL, R8, R9, R10, R11, R12, R13, R14, R15,
-    RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, Reg, arith, cc, cond_code, ext3, op, shift, xmm,
+    Asm, AsmError, Mem, P_DATA16, P_REXB_R, P_REXB_RM, P_REXW, P_VEXL, R8, R9, R10, R11, R12, R13,
+    R14, R15, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, Reg, arith, cc, cond_code, ext3, op, shift,
+    xmm,
 };
 use crate::features::HostFeatures;
 
@@ -135,13 +139,14 @@ pub(crate) const DECR_OFFSET: i64 = META_OFFSET + 8;
 /// Byte offset of the one block entry address `goto_ptr` may jump to, as the service routine
 /// last checked it.
 pub(crate) const GOTO_PTR_OK_OFFSET: i64 = DECR_OFFSET + 8;
-/// Byte offset of the address of the TLB descriptor the inline softmmu fast path reads, a
-/// [`ruvm_jit_interp::FastTlb::desc`].
+/// Byte offset of the copy of the TLB descriptor the inline softmmu fast path reads, a
+/// [`ruvm_jit_interp::FastTlb::desc`], so that a lookup reads the mask and table straight from
+/// the run context, as QEMU's reads them from `env`.
 pub(crate) const TLB_OFFSET: i64 = GOTO_PTR_OK_OFFSET + 8;
 
 /// What [`generate`] needs besides the IR.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct GenOptions {
+pub(crate) struct GenOptions<'a> {
     /// Passed to the service routine with each request, so that it knows which block's requests
     /// it serves, and stored at [`META_OFFSET`] in the run context when the block leaves, so
     /// that the runtime knows which block left.
@@ -157,6 +162,9 @@ pub(crate) struct GenOptions {
     /// takes the same arguments: the context, the request index with the [`Gen::insn`] of the
     /// call in its upper 32 bits, so that neither routine need look it up, and the metadata.
     pub(crate) lookup: u64,
+    /// Calls to helpers with a [`ruvm_jit_interp::NativeHelperFn`] here, and the declared signature, go straight
+    /// to it rather than through the service routine.
+    pub(crate) helpers: Option<&'a HelperRegistry>,
 }
 
 /// Whether the host uses the Win64 calling convention rather than System V.
@@ -267,6 +275,20 @@ pub(crate) struct Generated {
     /// For each `goto_tb`: its slot, the byte offset of its 4-byte aligned jump displacement,
     /// and the displacement that sends it to the exit stub.
     pub(crate) goto_tb: Vec<(u32, usize, u32)>,
+    /// For each `lookup_tb_ptr_ic` call with an inline cache: the index of its request and the
+    /// byte offset of the 8-byte address of its [`IC_WAYS`] cache words, which is 0 until the
+    /// caller patches it.
+    pub(crate) ic_sites: Vec<(usize, usize)>,
+}
+
+/// Entries of the inline cache of a `lookup_tb_ptr_ic` call. Each is the address of the
+/// two-word header of a block: the guest program counter it starts at, and the address to
+/// jump to, or 0 for none.
+pub(crate) const IC_WAYS: usize = 8;
+
+/// The entry of the inline cache for the program counter `pc`.
+pub(crate) fn ic_way(pc: u64) -> usize {
+    ((pc ^ (pc >> 4)) as usize) & (IC_WAYS - 1)
 }
 
 const fn bit(r: Reg) -> u64 {
@@ -392,7 +414,7 @@ pub(crate) fn generate(
     _base: u64,
     service: u64,
     feat: HostFeatures,
-    opts: &GenOptions,
+    opts: &GenOptions<'_>,
 ) -> R<Generated> {
     let v256 = check_types(f, feat)?;
     let f = regalloc::prepare(f, &extra_flags);
@@ -419,6 +441,8 @@ pub(crate) fn generate(
         err: None,
         tlb_page_bits: opts.tlb_page_bits,
         ldst: Vec::new(),
+        ic_sites: Vec::new(),
+        helpers: opts.helpers,
     };
     g.exit = g.a.new_label();
     g.bounds = g.a.new_label();
@@ -523,9 +547,19 @@ pub(crate) fn generate(
 
     // The temp slots, the carry word, then two 32-byte lanes of vector scratch.
     let slot_words = (f.nb_temps() + 1) * SLOT_BYTES / 8 + 2 * SLOT_BYTES / 8;
-    let (requests, insn_of) = (g.requests, g.insn_of);
+    let (requests, insn_of, ic_sites) = (g.requests, g.insn_of, g.ic_sites);
     let bytes = g.a.finish()?;
-    Ok(Generated { bytes, requests, insn_of, slot_words, body, fast_body, env_need: end, goto_tb })
+    Ok(Generated {
+        bytes,
+        requests,
+        insn_of,
+        slot_words,
+        body,
+        fast_body,
+        env_need: end,
+        goto_tb,
+        ic_sites,
+    })
 }
 
 /// Refuse temps of types this backend has no registers for, and calls with more arguments
@@ -636,7 +670,7 @@ enum Lane {
     Cmp(Cond),
 }
 
-struct Gen {
+struct Gen<'h> {
     a: Asm,
     feat: HostFeatures,
     labels: Vec<Option<usize>>,
@@ -672,6 +706,10 @@ struct Gen {
     tlb_page_bits: Option<u32>,
     /// The TLB miss paths, emitted after the body.
     ldst: Vec<LdstSlow>,
+    /// See [`Generated::ic_sites`].
+    ic_sites: Vec<(usize, usize)>,
+    /// See [`GenOptions::helpers`].
+    helpers: Option<&'h HelperRegistry>,
 }
 
 /// The out of line TLB miss path of one `qemu_ld` or `qemu_st`, QEMU's `TCGLabelQemuLdst`.
@@ -721,7 +759,7 @@ const C_X_X_R: &[&str] = &["x", "x", "r"];
 const C_X4: &[&str] = &["x", "x", "x", "x"];
 const C_X5: &[&str] = &["x", "x", "x", "x", "x"];
 
-impl Gen {
+impl Gen<'_> {
     fn label(&mut self, op: &Op, i: usize) -> R<usize> {
         let id = op.arg_label(i).id() as usize;
         let slot = self.labels.get_mut(id).ok_or_else(|| bad(op, "unknown label"))?;
@@ -848,6 +886,27 @@ impl Gen {
         self.a.bind(ok);
     }
 
+    /// A direct call to the [`ruvm_jit_interp::NativeHelperFn`] at `addr` of a helper with `nin` argument words,
+    /// taking them from and leaving its result in the argument words, as the service routine
+    /// would. Such a helper has no side effects, so it cannot raise an exception and needs no
+    /// guest state, and as in QEMU the call is all there is to it.
+    fn call_native(&mut self, addr: u64, nin: usize, ret: HelperType) {
+        if self.v256 {
+            self.a.vex_opc(op::VZEROUPPER, 0, 0, 0, 0);
+        }
+        let regs = if WIN64 { [RCX, RDX, R8, R9] } else { [RDI, RSI, RDX, RCX] };
+        for (k, &r) in regs.iter().enumerate().take(nin) {
+            self.a.load(r, Mem::Base(CTX, 8 * k as i32), 8, false, P_REXW);
+        }
+        self.a.movabs(TMP0, addr);
+        self.a.call_reg(TMP0);
+        match ret {
+            HelperType::Void => {}
+            HelperType::I32 => self.a.store(RAX, Mem::Base(CTX, 0), 4),
+            _ => self.a.store(RAX, Mem::Base(CTX, 0), 8),
+        }
+    }
+
     /// `qemu_ld` through the service routine: the value of `oi` at `addr` into `out`.
     fn qemu_ld_slow(&mut self, ty: Type, oi: MemOpIdx, out: Reg, addr: Reg) {
         self.put_args(&[addr as u64]);
@@ -901,12 +960,11 @@ impl Gen {
         } else {
             addr
         };
-        let desc = (mmu_idx * TLB_DESC_WORDS * 8) as i32;
-        self.a.load(TMP0, Mem::Base(CTX, TLB_OFFSET as i32), 8, false, P_REXW);
+        let desc = TLB_OFFSET as i32 + (mmu_idx * TLB_DESC_WORDS * 8) as i32;
         self.a.mov(P_REXW, TMP1, addr);
         self.a.shifti(shift::SHR, P_REXW, TMP1, page_bits - TLB_ENTRY_BITS);
-        self.a.arith_mem(arith::AND, P_REXW, TMP1, Mem::Base(TMP0, desc));
-        self.a.arith_mem(arith::ADD, P_REXW, TMP1, Mem::Base(TMP0, desc + 8));
+        self.a.arith_mem(arith::AND, P_REXW, TMP1, Mem::Base(CTX, desc));
+        self.a.arith_mem(arith::ADD, P_REXW, TMP1, Mem::Base(CTX, desc + 8));
         // An access that is less aligned than its size must not cross the page: check the
         // address of its last byte, as QEMU does.
         if a_mask >= s_mask {
@@ -1342,6 +1400,11 @@ impl Gen {
                 }
                 if len == bits {
                     self.a.mov(w, d, r(2));
+                } else if ofs == 0 && len == 8 {
+                    // As tcg/i386 does: a byte move into the low byte, `d` being `a1`.
+                    self.a.modrm(op::MOVB_EV_GV | P_REXB_R | P_REXB_RM, r(2), d);
+                } else if ofs == 0 && len == 16 {
+                    self.a.modrm(op::MOVL_EV_GV | P_DATA16, r(2), d);
                 } else {
                     let fm = field_mask(len) << ofs;
                     self.a.mov(w, TMP0, r(2));
@@ -2156,9 +2219,34 @@ impl Gen {
         }
         Ok(())
     }
+
+    /// The inline cache of a `lookup_tb_ptr_ic` call, whose arguments are already in the run
+    /// context: when the entry for the program counter in argument 1 names a block header with
+    /// that program counter and a nonzero address, jump there; otherwise fall through to the
+    /// lookup. The address of the cache words is patched in by the runtime.
+    fn ic_probe(&mut self) {
+        let miss = self.a.new_label();
+        self.a.load(TMP0, Mem::Base(CTX, 8), 8, false, P_REXW);
+        self.a.mov(0, RAX, TMP0);
+        self.a.shifti(shift::SHR, 0, RAX, 4);
+        self.a.arith(arith::XOR, 0, RAX, TMP0);
+        self.a.arithi(arith::AND, 0, RAX, (IC_WAYS - 1) as i64);
+        self.a.shifti(shift::SHL, 0, RAX, 3);
+        let at = self.a.pos() + 2;
+        self.a.movabs(TMP1, 0);
+        self.ic_sites.push((self.requests.len(), at));
+        self.a.load(TMP1, Mem::Index(TMP1, RAX, 0), 8, false, P_REXW);
+        self.a.cmp_mem(P_REXW, TMP0, Mem::Base(TMP1, 0));
+        self.a.jump(Some(cc::NE), miss, true);
+        self.a.load(RAX, Mem::Base(TMP1, 8), 8, false, P_REXW);
+        self.a.test(P_REXW, RAX, RAX);
+        self.a.jump(Some(cc::E), miss, true);
+        self.a.jmp_reg(RAX);
+        self.a.bind(miss);
+    }
 }
 
-impl Target for Gen {
+impl Target for Gen<'_> {
     type Error = GenCodeError;
 
     fn bad_ir(&self, msg: String) -> GenCodeError {
@@ -2471,9 +2559,24 @@ impl Target for Gen {
     fn out_call(&mut self, f: &Func, op: &Op) -> R<()> {
         let info = f.helper_info(op.call_helper()).clone();
         let ni = op.calli as usize;
-        let lookup = self.lookup != 0 && info.name == crate::runtime::LOOKUP_TB_PTR;
+        let ic = self.lookup != 0 && info.name == crate::runtime::LOOKUP_TB_PTR_IC && ni == 2;
+        let lookup = ic || self.lookup != 0 && info.name == crate::runtime::LOOKUP_TB_PTR;
         let pure = info.flags & ruvm_jit_core::types::call_flags::NO_SE != 0;
+        let native = match self.helpers {
+            Some(h) if pure && !lookup => h
+                .get(&info.name)
+                .filter(|e| e.ret == info.ret && e.args == info.args)
+                .and_then(|_| h.native(&info.name)),
+            _ => None,
+        };
+        if let Some(nf) = native {
+            self.call_native(nf as usize as u64, ni, info.ret);
+            return Ok(());
+        }
         let req = Request::Call { name: info.name, ret: info.ret, args: info.args, nin: ni, pure };
+        if ic {
+            self.ic_probe();
+        }
         if lookup {
             self.service_via(req, self.lookup, self.insn);
         } else {

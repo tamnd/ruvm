@@ -71,6 +71,12 @@ pub trait Backend: Send + Sync + fmt::Debug {
         let _ = tb;
     }
 
+    /// Block `tb` was invalidated, so code must stop jumping to it from lookup sites. Not in
+    /// QEMU, whose lookup sites have no inline cache. The default does nothing.
+    fn tb_invalidated(&self, tb: &Arc<Tb>) {
+        let _ = tb;
+    }
+
     /// `tcg_region_reset_all()`: every block was dropped, and none is running. Code made from
     /// now on is never chained to code made before. The default does nothing.
     fn tb_flush(&self) {}
@@ -147,6 +153,12 @@ impl InterpBackend {
     /// target's helpers go here. `lookup_tb_ptr` is replaced by the runtime's.
     pub fn with_helpers(mut helpers: HelperRegistry) -> InterpBackend {
         helpers.register("lookup_tb_ptr", HelperType::Ptr, &[HelperType::Ptr], lookup_tb_ptr);
+        helpers.register(
+            "lookup_tb_ptr_ic",
+            HelperType::Ptr,
+            &[HelperType::Ptr, HelperType::I64],
+            lookup_tb_ptr,
+        );
         crate::plugin::register_helpers(&mut helpers);
         InterpBackend { helpers }
     }

@@ -220,6 +220,12 @@ impl NativeBackend {
             &[HelperType::Ptr],
             crate::backend::lookup_tb_ptr,
         );
+        helpers.register(
+            "lookup_tb_ptr_ic",
+            HelperType::Ptr,
+            &[HelperType::Ptr, HelperType::I64],
+            crate::backend::lookup_tb_ptr,
+        );
         crate::plugin::register_helpers(&mut helpers);
         Some(NativeBackend {
             helpers,
@@ -318,11 +324,20 @@ impl Backend for NativeBackend {
         if let Body::Native(c) = &native_code(tb).body {
             let owner: Weak<dyn Any + Send + Sync> = Arc::downgrade(tb) as Weak<Tb>;
             host::set_owner(c, owner);
+            let key = [tb.cs_base, u64::from(tb.flags) | u64::from(tb.cflags()) << 32];
+            host::set_ic_key(c, tb.pc, key);
+        }
+    }
+
+    fn tb_invalidated(&self, tb: &Arc<Tb>) {
+        if let Body::Native(c) = &native_code(tb).body {
+            host::clear_ic(c);
         }
     }
 
     fn tb_flush(&self) {
         let mut cur = lock(&self.region);
+        host::clear_region_ic(&cur);
         if cur.used() > 0 {
             if let Some(fresh) = host::new_region(self.region_size) {
                 *cur = fresh;
@@ -466,6 +481,12 @@ mod host {
         c.set_owner(owner);
     }
 
+    pub(super) fn set_ic_key(_c: &CompiledTb, _pc: u64, _key: [u64; 2]) {}
+
+    pub(super) fn clear_ic(_c: &CompiledTb) {}
+
+    pub(super) fn clear_region_ic(_r: &CodeRegion) {}
+
     impl Chain for TbChain {
         fn lookup_tb_ptr(
             &self,
@@ -557,6 +578,18 @@ mod host {
 
     pub(super) fn set_owner(c: &CompiledTb, owner: Weak<dyn Any + Send + Sync>) {
         c.set_owner(owner);
+    }
+
+    pub(super) fn set_ic_key(c: &CompiledTb, pc: u64, key: [u64; 2]) {
+        c.set_ic_key(pc, key);
+    }
+
+    pub(super) fn clear_ic(c: &CompiledTb) {
+        c.clear_ic();
+    }
+
+    pub(super) fn clear_region_ic(r: &CodeRegion) {
+        r.clear_ic();
     }
 
     impl Chain for TbChain {
@@ -669,6 +702,16 @@ mod host {
     pub(super) fn set_owner(c: &CompiledTb, _owner: Weak<dyn Any + Send + Sync>) {
         match *c {}
     }
+
+    pub(super) fn set_ic_key(c: &CompiledTb, _pc: u64, _key: [u64; 2]) {
+        match *c {}
+    }
+
+    pub(super) fn clear_ic(c: &CompiledTb) {
+        match *c {}
+    }
+
+    pub(super) fn clear_region_ic(_r: &CodeRegion) {}
 
     pub(super) fn run(
         c: &CompiledTb,

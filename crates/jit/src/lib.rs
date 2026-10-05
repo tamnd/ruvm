@@ -61,6 +61,8 @@
 //! - The runtime does not listen to memory map changes. A machine that changes the map must
 //!   flush the TLBs, which is what QEMU's `tcg_commit()` does. IO accesses are dispatched through
 //!   the CPU's address space by physical address instead of through a saved section.
+//! - A TLB starts with 1024 entries per MMU index ([`CPU_TLB_DYN_DEFAULT_BITS`]) where QEMU
+//!   starts with 256, and is resized from there as in QEMU.
 //! - Ranges behind an IOMMU are treated as IO.
 //! - Only the legacy `tlb_fill` hook is supported, so alignment is checked before paging, and the
 //!   interpreter checks alignment before it calls the softmmu. `MO_ALIGN_TLB_ONLY` and
@@ -252,7 +254,9 @@ pub const TARGET_PAGE_BITS_MIN: u32 = 9;
 pub const CPU_VTLB_SIZE: usize = 8;
 /// `CPU_TLB_DYN_MIN_BITS`.
 pub const CPU_TLB_DYN_MIN_BITS: u32 = 6;
-/// `CPU_TLB_DYN_DEFAULT_BITS`.
-pub const CPU_TLB_DYN_DEFAULT_BITS: u32 = 8;
+/// `CPU_TLB_DYN_DEFAULT_BITS`, 10 here where QEMU has 8. With 256 entries the BIOS copy loops
+/// of a PC boot keep two pages that share a slot swapping through the victim TLB; 1024 entries
+/// keep them apart.
+pub const CPU_TLB_DYN_DEFAULT_BITS: u32 = 10;
 /// `CPU_TLB_ENTRY_BITS`.
 pub const CPU_TLB_ENTRY_BITS: u32 = 5;

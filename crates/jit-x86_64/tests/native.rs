@@ -220,6 +220,12 @@ impl Gen<'_> {
     }
 
     fn field(&mut self, width: u32) -> (u32, u32) {
+        // The low byte and the low half word have their own code.
+        match self.rng.below(4) {
+            0 => return (0, 8),
+            1 => return (0, 16),
+            _ => {}
+        }
         let ofs = self.rng.below(width as u64) as u32;
         let len = 1 + self.rng.below((width - ofs) as u64) as u32;
         (ofs, len)
@@ -706,6 +712,95 @@ fn helper_calls() {
     bad.register("store_env", HelperType::Void, &[HelperType::Ptr], helper_store_env);
     let (x, _, _) = check(&f, &[0u8; ENV_SIZE], &mem, &bad, [false; 2]);
     assert_eq!(x, Err(InterpError::HelperSignature("store_env".into())));
+}
+
+static NATIVE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn native_add3(a: u64, b: u64, c: u64, _: u64) -> u64 {
+    NATIVE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    u64::from((a as u32).wrapping_add(b as u32).wrapping_add(c as u32))
+}
+
+fn helper_mix4(_: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    Ok(u128::from(a[0].rotate_left(7) ^ a[1].wrapping_mul(3) ^ a[2] ^ (a[3] << 1)))
+}
+
+extern "C" fn native_mix4(a: u64, b: u64, c: u64, d: u64) -> u64 {
+    NATIVE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    a.rotate_left(7) ^ b.wrapping_mul(3) ^ c ^ (d << 1)
+}
+
+/// Pure helpers with a native entry point are called straight from generated code, with
+/// the same result as through the service call.
+#[test]
+fn native_helper_calls() {
+    let add3 = HelperInfo::new(
+        "add3",
+        call_flags::NO_RWG | call_flags::NO_SE,
+        HelperType::I32,
+        &[HelperType::I32, HelperType::I32, HelperType::I32],
+    );
+    let mix4 = HelperInfo::new(
+        "mix4",
+        call_flags::NO_RWG | call_flags::NO_SE,
+        HelperType::I64,
+        &[HelperType::I64, HelperType::I64, HelperType::I32, HelperType::I64],
+    );
+    let mut reg = HelperRegistry::new();
+    reg.register_info(&add3, helper_add3);
+    reg.register_info(&mix4, helper_mix4);
+    reg.register_native("add3", native_add3);
+    reg.register_native("mix4", native_mix4);
+
+    let mut f = Func::new(FuncConfig::default());
+    let env = f.env();
+    let o = f.global_mem_new_i32(env, 0x108, "o");
+    let m = f.global_mem_new_i64(env, 0x110, "m");
+    let g = f.global_mem_new_i64(env, 0x100, "g");
+    // Values live across the calls stay correct.
+    let keep = f.temp_new_i64();
+    f.gen_movi_i64(keep, 0x1234_5678_9abc_def0);
+    let h = f.helper(add3.clone());
+    let (a, b, c) = (f.constant_i32(5), f.constant_i32(-2), f.constant_i32(0x7fff_ffff));
+    f.gen_call(h, Some(o.temp()), &[a.temp(), b.temp(), c.temp()]);
+    let h = f.helper(mix4.clone());
+    let x = f.constant_i64(0x0102_0304_0506_0708);
+    let y = f.constant_i64(-9);
+    let z = f.constant_i32(0x55);
+    f.gen_call(h, Some(m.temp()), &[x.temp(), y.temp(), z.temp(), keep.temp()]);
+    f.gen_mov_i64(g, keep);
+    f.gen_exit_tb(0, 0);
+
+    let mem = FlatMemory::new(MEM_BASE, 16);
+    let env0 = [0u8; ENV_SIZE];
+    let want = interp(&f, &env0, &mem, &reg, [false; 2]);
+    assert_eq!(want.0, Ok(Exit::ExitTb(0)));
+    assert_eq!(rd64(&want.1, 0x108) as u32, 0x8000_0002);
+    let k = 0x1234_5678_9abc_def0u64;
+    assert_eq!(
+        rd64(&want.1, 0x110),
+        0x0102_0304_0506_0708u64.rotate_left(7) ^ (-27i64 as u64) ^ 0x55 ^ (k << 1)
+    );
+    assert_eq!(rd64(&want.1, 0x100), k);
+    let mut opt = f.clone();
+    opt.gen_code(true, LogMask::default());
+    for (name, feat) in tiers() {
+        let r = region_with(feat);
+        for g in [&f, &opt] {
+            let opts =
+                ruvm_jit_x86_64::CompileOptions { helpers: Some(&reg), ..Default::default() };
+            let tb = r.compile_with(g, &opts).expect("compile");
+            if !NATIVE {
+                continue;
+            }
+            let before = NATIVE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let got = native(&tb, &env0, &mem, &reg);
+            assert_eq!(got.0, want.0, "{name}");
+            assert_eq!(got.1, want.1, "{name}");
+            let calls = NATIVE_CALLS.load(std::sync::atomic::Ordering::Relaxed) - before;
+            assert!(calls >= 2, "{name}: {calls} native calls");
+        }
+    }
 }
 
 #[test]

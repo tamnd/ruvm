@@ -203,3 +203,87 @@ fn jumps_stay_within_a_chain_of_regions() {
         }
     }
 }
+
+/// `lookup_tb_ptr`: always `then`, counting the calls.
+struct CountingChain {
+    then: Arc<Blk>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Chain for CountingChain {
+    fn lookup_tb_ptr(
+        &self,
+        _: &mut HelperEnv<'_>,
+    ) -> Result<Option<Arc<dyn Any + Send + Sync>>, Unwind> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(Arc::clone(&self.then) as Arc<dyn Any + Send + Sync>))
+    }
+
+    fn code<'a>(&self, block: &'a (dyn Any + Send + Sync)) -> Option<&'a CompiledTb> {
+        block.downcast_ref::<Blk>().map(|b| &b.code)
+    }
+}
+
+/// `d`: count in `G1` and `lookup_and_goto_ptr` with an inline cache, for the program
+/// counter in `G2`.
+fn block_ic() -> Func {
+    let mut f = Func::new(FuncConfig::default());
+    let env = f.env();
+    let g1 = f.global_mem_new_i64(env, G1, "g1");
+    let g2 = f.global_mem_new_i64(env, G2, "g2");
+    f.gen_addi_i64(g1, g1, 1);
+    f.gen_lookup_and_goto_ptr_ic(g2);
+    f
+}
+
+/// `e`: count in `G0`, leave when it reaches 100, else take `goto_tb` 0.
+fn block_count() -> Func {
+    let mut f = Func::new(FuncConfig::default());
+    let env = f.env();
+    let g0 = f.global_mem_new_i64(env, G0, "g0");
+    f.gen_addi_i64(g0, g0, 1);
+    let out = f.new_label();
+    f.gen_brcondi_i64(Cond::Geu, g0, 100, out);
+    f.gen_goto_tb(0);
+    f.gen_exit_tb(0x2000, 0);
+    f.gen_set_label(out);
+    f.gen_exit_tb(0, 0);
+    f
+}
+
+#[test]
+fn inline_caches_fill_hit_and_miss() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let r = CodeRegion::new(1 << 20).unwrap();
+    let d = compile(&r, "d", &block_ic());
+    let e = compile(&r, "e", &block_count());
+    let other = compile(&r, "other", &block_count());
+    d.code.set_ic_key(0x3000, [1, 2]);
+    e.code.set_ic_key(0x4000, [1, 2]);
+    other.code.set_ic_key(0x4000, [1, 3]);
+    assert!(e.code.set_goto_tb_target(0, Some(&d.code)));
+    assert!(other.code.set_goto_tb_target(0, Some(&d.code)));
+    if !NATIVE {
+        return;
+    }
+    let go = |then: &Arc<Blk>, pc: u64| {
+        let chain = CountingChain { then: Arc::clone(then), calls: Default::default() };
+        let mut env = vec![0u8; ENV_SIZE];
+        env[G2 as usize..G2 as usize + 8].copy_from_slice(&pc.to_le_bytes());
+        let x = run(&d, &mut env, &chain, 0);
+        assert_eq!(x.exit, Exit::ExitTb(0));
+        assert_eq!((rd64(&env, G0), rd64(&env, G1)), (100, 100));
+        chain.calls.load(Relaxed)
+    };
+
+    // A block for another CPU state, or found for a program counter it does not start at, is
+    // never cached.
+    assert_eq!(go(&other, 0x4000), 100);
+    assert_eq!(go(&e, 0x5000), 100);
+    // The first lookup fills the cache and the rest hit, in this run and the next.
+    assert_eq!(go(&e, 0x4000), 1);
+    assert_eq!(go(&e, 0x4000), 0);
+    // An invalidated block misses, and is not cached again.
+    e.code.clear_ic();
+    assert_eq!(go(&e, 0x4000), 100);
+}
