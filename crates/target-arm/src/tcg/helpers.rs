@@ -21,8 +21,8 @@ use ruvm_jit_interp::{HelperEnv, HelperRegistry, Unwind};
 use super::{GicAccess, arm_of, exception_target_el, psci, sysreg};
 use crate::cpu::{
     CpuArmState, EXCP_HVC, EXCP_HYP_TRAP, EXCP_PREFETCH_ABORT, EXCP_SMC, EXCP_UDEF, HCR_HCD,
-    HCR_NV, HCR_TGE, HCR_TSC, HCR_TWI, PSTATE_DAIF, PSTATE_IL, PSTATE_NRW, PSTATE_NZCV, PSTATE_PAN,
-    PSTATE_SS, PSTATE_UAO, SCR_HCE, SCR_SMD, SCR_TWI, SCTLR_NTWI, SCTLR_UMA,
+    HCR_NV, HCR_TGE, HCR_TSC, HCR_TWI, HFLAGS, PSTATE_DAIF, PSTATE_IL, PSTATE_NRW, PSTATE_NZCV,
+    PSTATE_PAN, PSTATE_SS, PSTATE_UAO, SCR_HCE, SCR_SMD, SCR_TWI, SCTLR_NTWI, SCTLR_UMA,
 };
 use crate::syndrome::{
     EC_ADVSIMDFPACCESSTRAP, syn_aa64_sysregtrap, syn_get_ec, syn_pcalignment, syn_uncategorized,
@@ -95,7 +95,7 @@ pub(crate) fn raise_exception(
     }
     st.exception_syndrome = syndrome;
     st.exception_target_el = target_el;
-    st.store(cpu.env);
+    super::commit(cpu, &mut st);
     cpu.raise_exception(excp, ra)
 }
 
@@ -138,6 +138,7 @@ def!(CRC32_64, "crc32_64", NO_RWG_SE, I64, [I64, I64, I32], h_crc32_64);
 def!(CRC32C_64, "crc32c_64", NO_RWG_SE, I64, [I64, I64, I32], h_crc32c_64);
 def!(RBIT64, "rbit64", NO_RWG_SE, I64, [I64], h_rbit64);
 def!(SDIV64, "sdiv64", NO_RWG_SE, I64, [I64, I64], h_sdiv64);
+def!(REBUILD_HFLAGS, "rebuild_hflags_a64", 0, Void, [Ptr], h_rebuild_hflags);
 def!(UDIV64, "udiv64", NO_RWG_SE, I64, [I64, I64], h_udiv64);
 
 /// Every AArch64 helper.
@@ -161,15 +162,35 @@ pub(crate) const ALL: &[Def] = &[
     RBIT64,
     SDIV64,
     UDIV64,
+    REBUILD_HFLAGS,
 ];
 
 /// Register every helper in `r`.
 pub(crate) fn register(r: &mut HelperRegistry) {
-    let lists =
-        [ALL, super::vfp::ALL, super::vec_helper::ALL, super::crypto::ALL, super::sve_helper::ALL];
+    let lists = [
+        ALL,
+        super::vfp::ALL,
+        super::vec_helper::ALL,
+        super::crypto::ALL,
+        super::sve_helper::ALL,
+        super::pauth::ALL,
+        super::mte::ALL,
+    ];
     for d in lists.iter().copied().flatten() {
         r.register_info(&d.info(), d.f);
     }
+}
+
+/// `HELPER(rebuild_hflags_a64)`: after generated code stored a register the TB flags
+/// depend on.
+fn h_rebuild_hflags(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
+    run(h, |cpu| {
+        let ops = cpu.ops();
+        let st = CpuArmState::load_system(cpu.env);
+        let flags = super::tb_flags(arm_of(&ops).features(), &st);
+        cpu.env[HFLAGS..HFLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+        Ok(0)
+    })
 }
 
 /// `HELPER(exception_with_syndrome_el)`.
@@ -189,7 +210,7 @@ fn h_exception_pc_alignment(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Un
         let mut st = CpuArmState::load(cpu.env);
         let target_el = exception_target_el(&st);
         st.exception_vaddress = a[1];
-        st.store(cpu.env);
+        super::commit(cpu, &mut st);
         Err(raise_exception(cpu, EXCP_PREFETCH_ABORT, syn_pcalignment(), target_el, Ra::None))
     })
 }
@@ -208,7 +229,7 @@ fn h_wfi(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
         }
         if target_el != 0 {
             st.pc = st.pc.wrapping_sub(insn_len);
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
             return Err(raise_exception(cpu, EXCP_UDEF, syn_wfx(1, 0xe, 0), target_el, Ra::None));
         }
         cpu.core.exception_index = excp::HLT;
@@ -256,13 +277,16 @@ fn el_from_spsr(spsr: u64) -> Option<u32> {
 }
 
 /// `aarch64_pstate_valid_mask()` for the features of the model.
-fn pstate_valid_mask(pan: bool, uao: bool) -> u32 {
+fn pstate_valid_mask(f: &crate::cpu::ArmFeatures) -> u32 {
     let mut valid = PSTATE_M_ALL | PSTATE_DAIF | PSTATE_IL | PSTATE_SS | PSTATE_NZCV;
-    if pan {
+    if f.pan {
         valid |= PSTATE_PAN;
     }
-    if uao {
+    if f.uao {
         valid |= PSTATE_UAO;
+    }
+    if f.mte >= 2 {
+        valid |= crate::cpu::PSTATE_TCO;
     }
     valid
 }
@@ -296,7 +320,7 @@ fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> 
         let target = el_from_spsr(spsr).filter(|&el| legal(el));
         match target {
             Some(new_el) => {
-                let spsr = spsr as u32 & pstate_valid_mask(feat.pan, feat.uao);
+                let spsr = spsr as u32 & pstate_valid_mask(&feat);
                 st.pstate_write(spsr);
                 // Single step is never active, so PSTATE.SS is always cleared.
                 st.pstate &= !PSTATE_SS;
@@ -329,7 +353,7 @@ fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> 
                 st.restore_sp(cur_el);
             }
         }
-        st.store(cpu.env);
+        super::commit(cpu, &mut st);
         if target.is_some() {
             // arm_call_el_change_hook().
             arm_of(&ops).gic_el_change(cpu.core.shared().cpu_index, &st);
@@ -357,7 +381,7 @@ fn h_msr_i_daifset(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
         daif_check(cpu, 0x1e, imm)?;
         let mut st = CpuArmState::load(cpu.env);
         st.daif |= (imm << 6) & PSTATE_DAIF;
-        st.store(cpu.env);
+        super::commit(cpu, &mut st);
         Ok(0)
     })
 }
@@ -369,7 +393,7 @@ fn h_msr_i_daifclear(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
         daif_check(cpu, 0x1f, imm)?;
         let mut st = CpuArmState::load(cpu.env);
         st.daif &= !((imm << 6) & PSTATE_DAIF);
-        st.store(cpu.env);
+        super::commit(cpu, &mut st);
         Ok(0)
     })
 }
@@ -379,7 +403,7 @@ fn h_msr_i_spsel(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
         let mut st = CpuArmState::load(cpu.env);
         st.update_spsel(a[1] as u32);
-        st.store(cpu.env);
+        super::commit(cpu, &mut st);
         Ok(0)
     })
 }
@@ -458,7 +482,7 @@ fn h_pre_hvc(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
         let ops = cpu.ops();
         let arm = arm_of(&ops);
         let f = arm.features();
-        if psci::is_psci_call(arm, cpu, EXCP_HVC) {
+        if psci::is_psci_call(arm, EXCP_HVC) {
             // If PSCI is enabled and this looks like a valid PSCI call then that overrides
             // the architecturally mandated HVC behaviour.
             return Ok(0);
@@ -514,7 +538,7 @@ fn h_pre_smc(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
         }
         // If PSCI is enabled and this looks like a valid PSCI call then suppress the UNDEF
         // that a set SCR.SMD or a missing EL3 would cause.
-        if !psci::is_psci_call(arm, cpu, EXCP_SMC) && (smd || !f.el3) {
+        if !psci::is_psci_call(arm, EXCP_SMC) && (smd || !f.el3) {
             return Err(undef(cpu));
         }
         Ok(0)

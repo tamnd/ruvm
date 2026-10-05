@@ -984,7 +984,8 @@ impl S<'_, '_> {
         if self.fp_access_check() {
             let mop = self.memop_asimd(a.sz);
             let imm = i64::from(a.imm);
-            let (dirty, clean) = self.addr_imm_pre(a.rn, imm, a.p != 0);
+            let dirty = self.addr_imm_dirty(a.rn, imm, a.p != 0);
+            let clean = self.mte_check1(dirty, !is_load, a.w != 0 || a.rn != 31, mop);
             self.fp_ldst(is_load, a.rt, clean, mop);
             self.addr_imm_post(a.rn, dirty, imm, a.w != 0, a.p != 0);
         }
@@ -997,7 +998,7 @@ impl S<'_, '_> {
         }
         if self.fp_access_check() {
             let mop = self.memop_asimd(a.sz);
-            let clean = self.addr_reg(a);
+            let clean = self.addr_reg(a, !is_load, mop);
             self.fp_ldst(is_load, a.rt, clean, mop);
         }
         true
@@ -1007,7 +1008,9 @@ impl S<'_, '_> {
         if self.fp_access_check() {
             let offset = i64::from(a.imm) << a.sz;
             let mop = self.memop_asimd(a.sz);
-            let (dirty, clean) = self.addr_imm_pre(a.rn, offset, a.p != 0);
+            let dirty = self.addr_imm_dirty(a.rn, offset, a.p != 0);
+            let tag_checked = a.w != 0 || a.rn != 31;
+            let clean = self.mte_check_n(dirty, !is_load, tag_checked, 2 << a.sz, mop);
             self.fp_ldst(is_load, a.rt, clean, mop);
             self.f().gen_addi_i64(clean, clean, 1 << a.sz);
             self.fp_ldst(is_load, a.rt2, clean, mop);
@@ -1057,7 +1060,6 @@ impl S<'_, '_> {
         }
         let total = a.rpt * a.selem * oprsz(a.q) as i32;
         let base = self.reg_sp(a.rn);
-        let clean = self.clean_data_tbi(base);
         // Consecutive little endian elements from one register are loaded 64 bits at a time.
         let mut size = a.sz;
         let mut align = MemOp::ALIGN;
@@ -1069,6 +1071,8 @@ impl S<'_, '_> {
             align = MemOp(0);
         }
         let mop = MemOp(size as u32) | align | MemOp::LE;
+        let tag_checked = a.p != 0 || a.rn != 31;
+        let clean = self.mte_check_n(base, !is_load, tag_checked, total as u32, mop);
         let elements = oprsz(a.q) as i32 >> size;
         for r in 0..a.rpt {
             for e in 0..elements {
@@ -1103,7 +1107,8 @@ impl S<'_, '_> {
         let total = a.selem << a.scale;
         let base = self.reg_sp(a.rn);
         let mop = self.memop_asimd(a.scale);
-        let clean = self.clean_data_tbi(base);
+        let tag_checked = a.p != 0 || a.rn != 31;
+        let clean = self.mte_check_n(base, !is_load, tag_checked, total as u32, mop);
         for xs in 0..a.selem {
             let rt = (a.rt + xs) % 32;
             self.vec_ldst(is_load, rt, a.index, clean, mop);
@@ -1124,7 +1129,8 @@ impl S<'_, '_> {
         let total = a.selem << a.scale;
         let base = self.reg_sp(a.rn);
         let mop = self.memop_asimd(a.scale);
-        let clean = self.clean_data_tbi(base);
+        let tag_checked = a.p != 0 || a.rn != 31;
+        let clean = self.mte_check_n(base, false, tag_checked, total as u32, mop);
         let idx = self.get_mem_index();
         for xs in 0..a.selem {
             let rt = (a.rt + xs) % 32;

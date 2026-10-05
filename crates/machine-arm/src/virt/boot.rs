@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use flate2::{Decompress, FlushDecompress, Status};
 use ruvm_mem::RamBlock;
+use ruvm_target_arm::tcg::PsciConduit;
 
 use crate::fdt::{Fdt, sized_cells};
 
@@ -139,6 +140,8 @@ pub struct RamRange {
     pub block: Arc<RamBlock>,
     /// Where `addr` is in `block`.
     pub offset: u64,
+    /// A ROM device, a flash: the ROMs are written into it, but it is not RAM.
+    pub rom_device: bool,
 }
 
 /// Copy `data` to `addr` and zero the following `zeros` bytes, in RAM only.
@@ -729,15 +732,21 @@ fn load_device_tree(ld: &mut Loader, filename: &str) -> Option<Fdt> {
     Some(fdt)
 }
 
-/// `fdt_add_psci_node()` for PSCI 1.0 over HVC on an AArch64 CPU.
-fn add_psci_node(fdt: &mut Fdt) -> Result<(), String> {
+/// `fdt_add_psci_node()` for PSCI 1.0 on an AArch64 CPU: nothing when the conduit is
+/// disabled.
+fn add_psci_node(fdt: &mut Fdt, conduit: PsciConduit) -> Result<(), String> {
+    let method = match conduit {
+        PsciConduit::Disabled => return Ok(()),
+        PsciConduit::Hvc => "hvc",
+        PsciConduit::Smc => "smc",
+    };
     // A /psci node already there may have other function IDs: replace it.
     if fdt.exists("/psci") {
         fdt.nop_node("/psci")?;
     }
     fdt.add_subnode("/psci")?;
     fdt.setprop("/psci", "compatible", b"arm,psci-1.0\0arm,psci-0.2\0arm,psci\0")?;
-    fdt.setprop_string("/psci", "method", "hvc")?;
+    fdt.setprop_string("/psci", "method", method)?;
     fdt.setprop_cell("/psci", "cpu_suspend", QEMU_PSCI_0_2_FN64_CPU_SUSPEND)?;
     fdt.setprop_cell("/psci", "cpu_off", QEMU_PSCI_0_2_FN_CPU_OFF)?;
     fdt.setprop_cell("/psci", "cpu_on", QEMU_PSCI_0_2_FN64_CPU_ON)?;
@@ -746,13 +755,15 @@ fn add_psci_node(fdt: &mut Fdt) -> Result<(), String> {
 
 /// `arm_load_dtb()`: finish the tree (the board's, or the user's `-dtb`) and add it to the
 /// ROM list at `info.dtb_start`. Returns the tree, or `None` if it does not fit below
-/// `info.dtb_limit`, which QEMU does not treat as an error.
+/// `info.dtb_limit`, which QEMU does not treat as an error. `conduit` is the CPUs'
+/// `psci-conduit`.
 pub(crate) fn arm_load_dtb(
     ld: &mut Loader,
     info: &BootInfo,
     board_fdt: &Fdt,
     dtb_filename: Option<&str>,
     cmdline: &str,
+    conduit: PsciConduit,
 ) -> Result<Option<Fdt>, String> {
     let addr = info.dtb_start;
     let addr_limit = info.dtb_limit;
@@ -808,7 +819,7 @@ pub(crate) fn arm_load_dtb(
         fdt.setprop("/chosen", "linux,initrd-end", &end)?;
     }
 
-    add_psci_node(&mut fdt)?;
+    add_psci_node(&mut fdt, conduit)?;
 
     // The blob is a ROM so that it is copied again at every reset.
     ld.add(Rom::blob("dtb", addr, fdt.as_bytes().to_vec()));

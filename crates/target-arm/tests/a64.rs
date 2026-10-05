@@ -687,6 +687,23 @@ fn system_registers() {
 }
 
 #[test]
+fn rndr_needs_feat_rng_and_clears_the_flags() {
+    // mrs x0, rndr; mrs x1, rndrrs, with every flag set first.
+    let w = World::new(ArmCpuModel::max());
+    let mut st = w.state();
+    st.set_nzcv(0xf << 28);
+    let st = w.run(&st, &[0xd53b_2400, 0xd53b_2421, WFI]);
+    assert_eq!(st.nzcv() >> 28, 0);
+    assert_ne!(st.xregs[0], st.xregs[1]);
+    assert_eq!(st.pc, CODE + 12);
+    // ID_AA64ISAR0_EL1.RNDR says so.
+    assert_eq!(ArmCpuModel::max().id_aa64isar0 >> 60, 1);
+    let w = World::a76();
+    let st = run_one(&w, w.state(), 0xd53b_2400, [0; 4], 0);
+    assert_sync_el1(&st, CODE, ESR_UNDEF);
+}
+
+#[test]
 fn branches() {
     let w = World::a57();
     let code = [

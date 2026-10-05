@@ -34,6 +34,18 @@ dump virt-a57-smp2-linux -cpu cortex-a57,pmu=off -smp 2 -m 512M \
 dump virt-max-smp3 -cpu max,pmu=off -smp 3 -m 1G
 dump virt-a76-smp20 -cpu cortex-a76,pmu=off -smp 20 -m 256M
 
+dump_m() {
+    local name=$1 opts=$2
+    shift 2
+    "$QEMU" -nodefaults -display none -M "$M$opts,dumpdtb=$TMP/$name.dtb" "$@"
+    gzip -9n -c "$TMP/$name.dtb" > "$name.dtb.gz"
+}
+head -c 4096 /dev/zero > "$TMP/bios.fd"
+dump_m virt-max-el2-el3 ,virtualization=on,secure=on -cpu max,pmu=off -smp 2
+dump_m virt-a57-el2-serial2 ,virtualization=on -cpu cortex-a57,pmu=off -smp 2 \
+    -serial null -serial null
+dump_m virt-max-secure-bios ,secure=on -cpu max,pmu=off -smp 2 -bios "$TMP/bios.fd"
+
 # A user -dtb: QEMU drops its memory nodes and /psci and adds its own.
 dtc -q -I dts -O dtb -o "$TMP/user.dtb" user.dts
 cp "$TMP/user.dtb" user.dtb

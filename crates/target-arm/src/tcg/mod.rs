@@ -85,7 +85,9 @@
 //!   SCVTF and UCVTF from a SIMD register of the other size) are unallocated.
 //! - SME streaming mode does not exist, so the FP access check has no streaming case.
 //! - FP and SIMD data accesses are little endian only (SCTLR.EE and E0E are ignored, as for
-//!   the integer loads and stores) and there are no MTE tag checks or SP alignment checks.
+//!   the integer loads and stores) and there are no SP alignment checks. The SVE loads and
+//!   stores are not tag checked (QEMU's `sve_cont_ldst_mte_check()` and the gather and
+//!   scatter descriptors); the other FP and SIMD ones are.
 //! - FHM, FCMA, JSCVT (FJCVTZS), FRINTTS (FRINT32 and FRINT64), BF16, I8MM, SHA512, SHA3, SM3
 //!   and SM4 are absent, as in the models: they raise UNDEF.
 //! - The translator keeps no TCG globals for X0 to X30, SP, the PC, NZCV or the exclusive
@@ -123,9 +125,14 @@
 //! - Self-hosted debug (breakpoints, watchpoints, single step) and the PMU are not
 //!   implemented. MDSCR_EL1 and the OS lock registers are only storage.
 //! - WFE and YIELD are no-ops rather than leaving the execution loop. The pointer
-//!   authentication hints (PACIASP and friends) are no-ops because the models have no
-//!   FEAT_PAuth; QEMU does the same. BTI, MTE, FlagM, LRCPC2, CSSC, MOPS, SB, WFET and the
-//!   128-bit atomics are UNDEFINED because the models do not have them.
+//!   authentication hints (PACIASP and friends) are no-ops on the models without FEAT_PAuth;
+//!   QEMU does the same. BTI, FlagM, LRCPC2, CSSC, MOPS, SB, WFET and the 128-bit atomics are
+//!   UNDEFINED because the models do not have them.
+//! - MTE (`mte.rs`): `max` has FEAT_MTE3 when the board gives it tag memory (virt's
+//!   `mte=on`) and only the EL0 instructions otherwise, as in QEMU. The tags of Secure RAM
+//!   are not kept, a tag check walks the page tables again to find the tag memory, where
+//!   QEMU keeps the Tagged attribute in the TLB entry, and FEAT_MTE_STORE_ONLY,
+//!   FEAT_MTE_CANONICAL_TAGS and FEAT_MTX are not implemented, as in the models.
 //! - The ID registers in the ID space that this port does not model read as zero. CCSIDR
 //!   reports the model's cache geometry as QEMU's `ccsidr[]` does. FEAT_IDST is not
 //!   implemented, so unknown registers are an uncategorized UNDEF.
@@ -138,6 +145,8 @@ mod crypto;
 mod gic;
 mod gtimer;
 mod helpers;
+mod mte;
+mod pauth;
 mod psci;
 mod ptw;
 mod semihost;
@@ -164,16 +173,19 @@ use ruvm_mem::{AddressSpace, MemTxAttrs, MemTxResult};
 
 use crate::cpu::{
     ArmCpuModel, ArmFeatures, CpuArmState, ENV_SIZE, EXCP_BKPT, EXCP_DATA_ABORT, EXCP_FIQ,
-    EXCP_HVC, EXCP_HYP_TRAP, EXCP_IRQ, EXCP_PREFETCH_ABORT, EXCP_SEMIHOST, EXCP_SMC, EXCP_SWI,
-    EXCP_UDEF, EXCP_VFIQ, EXCP_VIRQ, EXCP_VSERR, HCR_AMO, HCR_E2H, HCR_FMO, HCR_IMO, HCR_TGE,
-    HCR_VF, HCR_VI, HCR_VSE, MMU_IDX_E2, MMU_IDX_E3, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN,
-    MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NB_MMU_MODES, PC, PSTATE_A, PSTATE_DAIF, PSTATE_F, PSTATE_I,
-    PSTATE_IL, PSTATE_PAN, PSTATE_SP, PSTATE_UAO, SCR_EA, SCR_FIQ, SCR_IRQ, SCTLR_A, SCTLR_SPAN,
+    EXCP_GPC, EXCP_HVC, EXCP_HYP_TRAP, EXCP_IRQ, EXCP_PREFETCH_ABORT, EXCP_SEMIHOST, EXCP_SMC,
+    EXCP_SWI, EXCP_UDEF, EXCP_VFIQ, EXCP_VIRQ, EXCP_VSERR, HCR_AMO, HCR_E2H, HCR_FMO, HCR_IMO,
+    HCR_TGE, HCR_VF, HCR_VI, HCR_VSE, HFLAGS, MMU_IDX_E2, MMU_IDX_E3, MMU_IDX_E10_1,
+    MMU_IDX_E10_1_PAN, MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NB_MMU_MODES, PC, PSTATE_A, PSTATE_DAIF,
+    PSTATE_F, PSTATE_I, PSTATE_IL, PSTATE_PAN, PSTATE_SP, PSTATE_TCO, PSTATE_UAO, SCR_EA, SCR_FIQ,
+    SCR_IRQ, SCTLR_A, SCTLR_ENDA, SCTLR_ENDB, SCTLR_ENIA, SCTLR_ENIB, SCTLR_SPAN, SCTLR_TCF,
+    SCTLR_TCF0,
 };
 use crate::syndrome::{EC_ADVSIMDFPACCESSTRAP, fsc, syn_get_ec, syn_serror};
 
 pub use gic::{GicAccess, GicCpuInterface, GicCpuState, IccEncoding};
 pub use gtimer::GTIMER_NAMES;
+pub use mte::TagMemory;
 pub use psci::{
     PSCI_OFF, PSCI_ON, PSCI_ON_PENDING, PSCI_RET_ALREADY_ON, PSCI_RET_DENIED,
     PSCI_RET_INTERNAL_FAILURE, PSCI_RET_INVALID_PARAMS, PSCI_RET_NOT_SUPPORTED,
@@ -205,6 +217,19 @@ pub const TB_MMUIDX_SHIFT: u32 = 12;
 pub const TB_SVEEXC_EL_SHIFT: u32 = 16;
 /// Where the SVE vector length in quadwords minus one (`VL`, 4 bits) sits in the TB flags.
 pub const TB_VL_SHIFT: u32 = 18;
+/// TB flags: PAuth is active (`PAUTH_ACTIVE`), some key is enabled in the SCTLR of the
+/// current regime, so the PAC instructions call their helpers rather than being NOPs.
+pub const TB_PAUTH_ACTIVE: u32 = 1 << 22;
+/// TB flags: allocation tag access is enabled for the instructions (`ATA`).
+pub const TB_ATA: u32 = 1 << 23;
+/// TB flags: allocation tag access is enabled for the unprivileged instructions (`ATA0`).
+pub const TB_ATA0: u32 = 1 << 24;
+/// TB flags: loads and stores may be tag checked (`MTE_ACTIVE`).
+pub const TB_MTE_ACTIVE: u32 = 1 << 25;
+/// TB flags: unprivileged loads and stores may be tag checked (`MTE0_ACTIVE`).
+pub const TB_MTE0_ACTIVE: u32 = 1 << 26;
+/// TB flags: the shift of the two TCMA bits of the regime (`TCMA`).
+pub const TB_TCMA_SHIFT: u32 = 27;
 
 /// `CPU_INTERRUPT_FIQ`.
 pub const INTERRUPT_FIQ: u32 = 0x0010;
@@ -297,6 +322,7 @@ pub struct Arm {
     board: Option<Arc<dyn ArmBoard>>,
     gic: Option<Arc<dyn GicCpuInterface>>,
     semihost: Option<semihost::Semihosting>,
+    tag_memory: Option<Arc<TagMemory>>,
     lines: Mutex<Vec<CpuLines>>,
 }
 
@@ -307,6 +333,7 @@ impl fmt::Debug for Arm {
             .field("psci_conduit", &self.psci_conduit)
             .field("gicv3", &self.gic.is_some())
             .field("semihosting", &self.semihost.is_some())
+            .field("tag_memory", &self.tag_memory.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -321,6 +348,7 @@ impl Arm {
             board: None,
             gic: None,
             semihost: None,
+            tag_memory: None,
             lines: Mutex::new(Vec::new()),
         }
     }
@@ -376,6 +404,25 @@ impl Arm {
     pub fn with_semihosting(mut self, host: Arc<dyn SemihostingHost>, userspace: bool) -> Arm {
         self.semihost = Some(semihost::Semihosting::new(host, userspace));
         self
+    }
+
+    /// The same CPU with allocation tag storage, QEMU's `tag-memory` link that the virt
+    /// board's `mte=on` sets: a model with FEAT_MTE then has all of it, FEAT_MTE3 with
+    /// ID_AA64PFR1_EL1.MTE at 3, where without tag memory it has only the instructions that
+    /// work at EL0 (MTE 1), as `arm_cpu_realizefn()` reduces it. A model without MTE is
+    /// unchanged; the board refuses `mte=on` for it.
+    pub fn with_tag_memory(mut self, tags: Arc<TagMemory>) -> Arm {
+        if self.model.features.mte != 0 {
+            self.model.features.mte = 3;
+            self.model.id_aa64pfr1 = (self.model.id_aa64pfr1 & !0xf00) | 0x300;
+        }
+        self.tag_memory = Some(tags);
+        self
+    }
+
+    /// The tag memory of [`Arm::with_tag_memory`].
+    pub fn tag_memory(&self) -> Option<&Arc<TagMemory>> {
+        self.tag_memory.as_ref()
     }
 
     /// The CPU model.
@@ -468,7 +515,7 @@ impl Arm {
             st.emulate_firmware_reset(arm.features(), target_el);
             st.pc = entry;
             st.xregs[0] = context_id;
-            st.store(cpu.env);
+            commit(cpu, &mut st);
             ruvm_jit::cputlb::tlb_flush(cpu);
             {
                 let (mut g, i) = arm.lines(index);
@@ -566,7 +613,7 @@ impl Arm {
             let arm = arm_of(&ops);
             let mut st = CpuArmState::load(cpu.env);
             gtimer::recalc(arm, cpu, &mut st, timer);
-            st.store(cpu.env);
+            commit(cpu, &mut st);
         });
     }
 
@@ -605,6 +652,19 @@ pub(crate) fn arm_of(ops: &Arc<dyn CpuOps>) -> &Arm {
 /// Read a little endian `u64` from `env`.
 pub(crate) fn ld64(env: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(env[off..off + 8].try_into().expect("8 bytes"))
+}
+
+/// Store `st` into the vCPU `cpu` with its cached TB flags rebuilt, as QEMU calls
+/// `arm_rebuild_hflags()` after changing the state they come from.
+pub(crate) fn commit(cpu: &mut Cpu<'_>, st: &mut CpuArmState) {
+    let ops = cpu.ops();
+    st.rebuild_hflags(arm_of(&ops).features());
+    st.store(cpu.env);
+}
+
+/// Read a little endian `u32` from `env`.
+pub(crate) fn ld32(env: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(env[off..off + 4].try_into().expect("4 bytes"))
 }
 
 /// Write a little endian `u64` to `env`.
@@ -663,6 +723,18 @@ pub(crate) fn tb_flags(f: &ArmFeatures, st: &CpuArmState) -> u32 {
     }
     let (tbid, tbid_bits) = tbi_bits(st.tcr_el[rel], mmu_idx);
     let tbii = tbid & !tbid_bits;
+    if f.pauth != 0 {
+        // In order to save space in flags, we record only whether pauth is "inactive",
+        // meaning all insns are implemented as a nop, or "active" when some action must be
+        // performed. The decision of which action to take is left to a helper.
+        let sctlr = if el == 0 { sysreg::sctlr_el0(f, st) } else { st.sctlr_el[el as usize] };
+        if sctlr & (SCTLR_ENIA | SCTLR_ENIB | SCTLR_ENDA | SCTLR_ENDB) != 0 {
+            flags |= TB_PAUTH_ACTIVE;
+        }
+    }
+    if f.mte >= 2 {
+        flags |= mte_flags(f, st, el, mmu_idx, tbid, flags & TB_UNPRIV != 0);
+    }
     let fp_el = fp_exception_el(f, st);
     if f.sve {
         let mut sve_el = sve_exception_el(f, st, el);
@@ -679,6 +751,65 @@ pub(crate) fn tb_flags(f: &ArmFeatures, st: &CpuArmState) -> u32 {
         flags |= sve_el << TB_SVEEXC_EL_SHIFT;
     }
     flags | (tbii << TB_TBII_SHIFT) | (tbid << TB_TBID_SHIFT) | (fp_el << TB_FPEXC_EL_SHIFT)
+}
+
+/// The MTE part of `rebuild_hflags_a64()`.
+fn mte_flags(
+    f: &ArmFeatures,
+    st: &CpuArmState,
+    el: u32,
+    mmu_idx: usize,
+    tbid: u32,
+    unpriv: bool,
+) -> u32 {
+    let sctlr = if el == 0 { sysreg::sctlr_el0(f, st) } else { st.sctlr_el[el as usize] };
+    let tco = st.pstate & PSTATE_TCO != 0;
+    let mut flags = 0;
+    // Set MTE_ACTIVE if any access may be Checked, and leave clear if all accesses must be
+    // Unchecked:
+    // 1) If TBI is unset, accesses are Unchecked.
+    // 2) If Tag Check Override, then all accesses are Unchecked,
+    // 3) If Tag Check Fail == 0, then Checked access have no effect,
+    // 4) If no Allocation Tag Access, then all accesses are Unchecked.
+    if mte::allocation_tag_access_enabled(f, st, el, sctlr) {
+        flags |= TB_ATA;
+        let tcf = if el == 0 { SCTLR_TCF0 } else { SCTLR_TCF };
+        if tbid != 0 && !tco && sctlr & tcf != 0 {
+            flags |= TB_MTE_ACTIVE;
+            if !unpriv {
+                // In non-unpriv contexts (eg EL0), unpriv load/stores act like normal ones;
+                // duplicate the MTE info to avoid the translator having to check UNPRIV to
+                // see whether it is OK to index into MTE_ACTIVE[].
+                flags |= TB_MTE0_ACTIVE;
+            }
+        }
+    }
+    // And again for unprivileged accesses, if required.
+    if unpriv
+        && tbid != 0
+        && !tco
+        && sctlr & SCTLR_TCF0 != 0
+        && mte::allocation_tag_access_enabled(f, st, 0, sctlr)
+    {
+        flags |= TB_MTE0_ACTIVE;
+    }
+    // For unpriv tag-setting accesses we also need ATA0. Again, in contexts where unpriv and
+    // normal insns are the same we duplicate the ATA bit to save effort for the translator.
+    if unpriv {
+        if mte::allocation_tag_access_enabled(f, st, 0, sctlr) {
+            flags |= TB_ATA0;
+        }
+    } else if flags & TB_ATA != 0 {
+        flags |= TB_ATA0;
+    }
+    // Cache TCMA as well as TBI: aa64_va_parameter_tcma().
+    let tcr = st.tcr_el[regime_el(mmu_idx) as usize];
+    let tcma = if regime_has_2_ranges(mmu_idx) {
+        ((tcr >> 57) & 3) as u32
+    } else {
+        ((tcr >> 30) & 1) as u32 * 3
+    };
+    flags | (tcma << TB_TCMA_SHIFT)
 }
 
 /// `fp_exception_el()`: the EL that FP and AdvSIMD instructions trap to under CPACR_EL1,
@@ -892,9 +1023,9 @@ impl Arm {
         }
 
         match excp {
-            EXCP_PREFETCH_ABORT | EXCP_DATA_ABORT | EXCP_BKPT | EXCP_UDEF | EXCP_SWI | EXCP_HVC
-            | EXCP_HYP_TRAP | EXCP_SMC => {
-                if excp == EXCP_PREFETCH_ABORT || excp == EXCP_DATA_ABORT {
+            EXCP_PREFETCH_ABORT | EXCP_DATA_ABORT | EXCP_GPC | EXCP_BKPT | EXCP_UDEF | EXCP_SWI
+            | EXCP_HVC | EXCP_HYP_TRAP | EXCP_SMC => {
+                if matches!(excp, EXCP_PREFETCH_ABORT | EXCP_DATA_ABORT | EXCP_GPC) {
                     st.far_el[ne] = st.exception_vaddress;
                 }
                 if syn_get_ec(st.exception_syndrome) == EC_ADVSIMDFPACCESSTRAP {
@@ -933,10 +1064,13 @@ impl Arm {
                 new_mode |= PSTATE_PAN;
             }
         }
+        if self.features().mte >= 2 {
+            new_mode |= PSTATE_TCO;
+        }
         st.pstate_write(PSTATE_DAIF | new_mode);
         st.restore_sp(new_el);
         st.pc = addr;
-        st.store(cpu.env);
+        commit(cpu, &mut st);
         // arm_call_el_change_hook().
         self.gic_el_change(cpu.core.shared().cpu_index, &st);
         cpu.core.shared().set_interrupt(interrupt::EXITTB);
@@ -951,8 +1085,16 @@ impl CpuOps for Arm {
     }
 
     fn get_tb_cpu_state(&self, cpu: &Cpu<'_>) -> TbCpuState {
-        let st = CpuArmState::load_system(cpu.env);
-        TbCpuState { pc: st.pc, flags: tb_flags(self.features(), &st), cflags: 0, cs_base: 0 }
+        // The flags are cached in `hflags`, as `arm_get_tb_cpu_state()` reads `env->hflags`.
+        let flags = ld32(cpu.env, HFLAGS);
+        #[cfg(debug_assertions)]
+        {
+            // `assert_hflags_rebuild_correctly()`.
+            let st = CpuArmState::load_system(cpu.env);
+            let want = tb_flags(self.features(), &st);
+            assert_eq!(flags, want, "stale hflags {flags:#x}, want {want:#x} at pc {:#x}", st.pc);
+        }
+        TbCpuState { pc: ld64(cpu.env, PC), flags, cflags: 0, cs_base: 0 }
     }
 
     fn restore_state_to_opc(&self, cpu: &mut Cpu<'_>, _tb: &Tb, data: &[u64; 3]) {
@@ -998,7 +1140,7 @@ impl CpuOps for Arm {
             }
             cpu.core.exception_index = excp;
             st.exception_target_el = target_el;
-            st.store(cpu.env);
+            commit(cpu, &mut st);
             self.do_interrupt_aarch64(cpu);
             return true;
         }
@@ -1007,7 +1149,7 @@ impl CpuOps for Arm {
 
     fn do_interrupt(&self, cpu: &mut Cpu<'_>) {
         // arm_cpu_do_interrupt(): PSCI calls are handled before the exception is taken.
-        if psci::is_psci_call(self, cpu, cpu.core.exception_index) {
+        if psci::is_psci_call(self, cpu.core.exception_index) {
             psci::handle_psci_call(self, cpu);
             return;
         }
@@ -1085,7 +1227,8 @@ impl CpuOps for Arm {
     }
 
     fn mmu_index(&self, cpu: &Cpu<'_>, _ifetch: bool) -> usize {
-        CpuArmState::load_system(cpu.env).mmu_idx(self.features())
+        // `arm_env_mmu_index()`: the MMU index field of the cached flags.
+        ((ld32(cpu.env, HFLAGS) >> TB_MMUIDX_SHIFT) & 0xf) as usize
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -1130,6 +1273,7 @@ pub fn create_vcpu(
         // VMPIDR_EL2 resets to the MPIDR_EL1 value, which depends on the vCPU index.
         st.vmpidr_el2 = (1 << 31) | ops.mp_affinity(v.shared().cpu_index);
     }
+    st.rebuild_hflags(ops.features());
     st.store(&mut v.env);
     v
 }

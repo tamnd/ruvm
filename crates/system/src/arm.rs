@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The Arm `virt` board from the command line: what `-machine virt`, `-m`, `-smp`, `-cpu`,
-//! `-kernel`, `-initrd`, `-append`, `-dtb`, `-serial`, `-semihosting` and
+//! `-kernel`, `-initrd`, `-append`, `-dtb`, `-bios`, `-serial`, `-semihosting` and
 //! `-semihosting-config` turn into, and the board running on TCG.
 //!
-//! `-serial` (or `-nographic`) connects `serial_hd(0)` to the PL011. Semihosting writes its
+//! `-serial` (or `-nographic`) connects `serial_hd(0)` to the PL011, and a second `-serial`
+//! connects `serial_hd(1)` to the second PL011 (the secure one with `secure=on`). `-bios`
+//! loads the firmware into the first flash. Semihosting writes its
 //! console to the `chardev` of `-semihosting-config`, or to standard error without one, as
 //! semihosting/console.c does, and SYS_EXIT ends ruvm with the guest's status.
 //!
@@ -15,7 +17,7 @@
 //!   models virt accepts fail with "... is not supported by ruvm yet", and so do the CPU
 //!   properties other than `sve-max-vq` and `pmu=off` (there is no PMU).
 //! - The machine properties are taken only where their value describes the board that exists:
-//!   `gic-version=3`, `its=off`, `secure=off`, `virtualization=off`, `mte=off`, `ras=off`,
+//!   `gic-version=3`, `its=off`, `secure`, `virtualization`, `mte`, `ras=off`,
 //!   `acpi=off` or `auto`, `iommu=none`, `msi=off` or `auto` and 32 virtio-mmio transports.
 //!   Other values fail with "... is not supported by ruvm yet". The board has no ITS, where
 //!   QEMU's default is `its=on`, and it behaves as with `dtb-randomness=off` whatever that
@@ -27,7 +29,10 @@
 //!   event first.
 //! - A vCPU waiting in SYS_READC or SYS_READ from the console blocks its thread rather than
 //!   halting, so `stop` on the monitor waits until the console has input.
-//! - `-drive`, `-device`, `-bios` and the flash devices do not exist for virt yet.
+//! - `-drive` (so `if=pflash`) and `-device` do not exist for virt yet, and `-bios` takes a
+//!   path: the name is not looked up in the firmware directories as `qemu_find_file()` does.
+//! - With `secure=on` the secure-only devices are in the one address space, visible to
+//!   non-secure accesses too.
 
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -53,7 +58,7 @@ use ruvm_qapi::types::{
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor};
 use ruvm_qapi::{QDict, QValue};
-use ruvm_target_arm::cpu::{ARM_MAX_VQ, ArmCpuModel};
+use ruvm_target_arm::cpu::{ARM_MAX_VQ, ArmCpuModel, PauthAlg};
 use ruvm_target_arm::tcg::SemihostingHost;
 
 use crate::runstate::Runstate;
@@ -181,6 +186,14 @@ pub(crate) struct BoardOptions {
     pub initrd: Option<String>,
     pub append: Option<String>,
     pub dtb: Option<String>,
+    /// `firmware`, from `-bios`.
+    pub firmware: Option<String>,
+    /// `secure`.
+    pub secure: bool,
+    /// `virtualization`.
+    pub virtualization: bool,
+    /// `mte`.
+    pub mte: bool,
     /// `dumpdtb`: write the device tree there and exit.
     pub dumpdtb: Option<String>,
 }
@@ -225,7 +238,7 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
         if prop_bool(name, value)? == want { Ok(()) } else { Err(not_supported(name, value)) }
     };
     match name {
-        "secure" | "virtualization" | "mte" | "ras" | "its" | "usb" => want_bool(false),
+        "ras" | "its" | "usb" => want_bool(false),
         // These change nothing on a board without high memory devices, and the board always
         // behaves as with dtb-randomness=off.
         "highmem"
@@ -382,7 +395,10 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
             "append" => o.append = Some(prop_string(name, value)?),
             "dtb" => o.dtb = Some(prop_string(name, value)?),
             "dumpdtb" => o.dumpdtb = Some(prop_string(name, value)?),
-            "firmware" => return Err(Error::generic("-bios is not supported by ruvm yet")),
+            "firmware" => o.firmware = Some(prop_string(name, value)?),
+            "secure" => o.secure = prop_bool(name, &prop_string(name, value)?)?,
+            "virtualization" => o.virtualization = prop_bool(name, &prop_string(name, value)?)?,
+            "mte" => o.mte = prop_bool(name, &prop_string(name, value)?)?,
             // Generic machine properties that change nothing here.
             "dump-guest-core" | "mem-merge" | "graphics" | "suppress-vmdesc" => {}
             _ => check_virt_prop(name, &prop_string(name, value)?)?,
@@ -391,6 +407,7 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
     o.kernel = o.kernel.filter(|k| !k.is_empty());
     o.initrd = o.initrd.filter(|i| !i.is_empty());
     o.dtb = o.dtb.filter(|d| !d.is_empty());
+    o.firmware = o.firmware.filter(|f| !f.is_empty());
     Ok(o)
 }
 
@@ -420,6 +437,9 @@ pub(crate) fn parse_cpu(arg: Option<&str>) -> Result<ArmCpuModel> {
         }
         return Err(Error::generic(format!("unable to find CPU model '{name}'")));
     };
+    // arm_cpu_pauth_finalize() runs after every property is set.
+    let mut pauth = model.features.pauth != 0;
+    let (mut impdef, mut qarma3, mut qarma5) = (false, false, false);
     for feat in parts.filter(|f| !f.is_empty()) {
         let (prop, value) = match feat.split_once('=') {
             Some((p, v)) => (p, v),
@@ -441,6 +461,12 @@ pub(crate) fn parse_cpu(arg: Option<&str>) -> Result<ArmCpuModel> {
             }
             "sve" if model.features.sve && prop_bool(prop, value)? => {}
             "aarch64" if prop_bool(prop, value)? => {}
+            "pauth" if name == "max" => pauth = prop_bool(prop, value)?,
+            // FEAT_RME with FEAT_RME_GPC3; the board takes it away again without EL3.
+            "x-rme" if name == "max" => model = model.with_rme(prop_bool(prop, value)?),
+            "pauth-impdef" if name == "max" => impdef = prop_bool(prop, value)?,
+            "pauth-qarma3" if name == "max" => qarma3 = prop_bool(prop, value)?,
+            "pauth-qarma5" if name == "max" => qarma5 = prop_bool(prop, value)?,
             // There is no PMU, so the device tree has no pmu node either way.
             "pmu" if !prop_bool(prop, value)? => {}
             "sve" | "sme" | "sme-fa64" | "pauth" | "pauth-impdef" | "pauth-qarma3"
@@ -458,6 +484,31 @@ pub(crate) fn parse_cpu(arg: Option<&str>) -> Result<ArmCpuModel> {
                 )));
             }
         }
+    }
+    if name == "max" {
+        let alg = if pauth {
+            if u8::from(impdef) + u8::from(qarma3) + u8::from(qarma5) > 1 {
+                return Err(Error::generic(
+                    "cannot enable pauth-impdef, pauth-qarma3 and pauth-qarma5 at the same time",
+                ));
+            }
+            Some(if qarma5 {
+                PauthAlg::Qarma5
+            } else if qarma3 {
+                PauthAlg::Qarma3
+            } else {
+                PauthAlg::Impdef
+            })
+        } else {
+            if impdef || qarma3 || qarma5 {
+                return Err(Error::generic(
+                    "cannot enable pauth-impdef, pauth-qarma3 or pauth-qarma5 without pauth",
+                )
+                .hint("Add pauth=on to the CPU property list.\n"));
+            }
+            None
+        };
+        model = model.with_pauth(alg);
     }
     Ok(model)
 }
@@ -501,6 +552,16 @@ impl Frontend for ChardevPl011 {
                 input = &input[k..];
             }
         }
+    }
+}
+
+/// Stands in for the chardev of the second UART until the board exists and it can be
+/// connected.
+struct Unconnected;
+
+impl SerialBackend for Unconnected {
+    fn write(&self, bytes: &[u8]) -> usize {
+        bytes.len()
     }
 }
 
@@ -742,6 +803,15 @@ pub(crate) fn start_board_tcg(
     cfg.initrd = opts.initrd;
     cfg.append = opts.append;
     cfg.dtb = opts.dtb;
+    cfg.firmware = opts.firmware;
+    cfg.secure = opts.secure;
+    cfg.virtualization = opts.virtualization;
+    cfg.mte = opts.mte;
+    // serial_hd(1) makes the second UART exist; its chardev is connected once it does.
+    let serial1 = serial_hds.get(1).cloned().flatten();
+    if serial1.is_some() {
+        cfg.serial1 = Some(Arc::new(Unconnected));
+    }
     cfg.semihosting = console.clone().map(|c| c as Arc<dyn SemihostingHost>);
     cfg.semihosting_userspace = semi.userspace;
     cfg.clock = Some(Arc::clone(&clock));
@@ -761,6 +831,16 @@ pub(crate) fn start_board_tcg(
         let fe = Arc::new(ChardevPl011 { uart: Arc::clone(board.uart()), chr: Arc::clone(chr) });
         board.set_serial_backend(Some(fe.clone()));
         attachments.push(chr.attach(fe).map_err(|e| vec![Located(None, e)])?);
+    }
+    match (serial1, board.uart1()) {
+        (Some(chr), Some(uart)) => {
+            let fe = Arc::new(ChardevPl011 { uart: Arc::clone(uart), chr: Arc::clone(&chr) });
+            board.set_serial1_backend(Some(fe.clone()));
+            attachments.push(chr.attach(fe).map_err(|e| vec![Located(None, e)])?);
+        }
+        // The secure UART without a chardev.
+        (None, Some(_)) => board.set_serial1_backend(None),
+        _ => {}
     }
     if let (Some(console), Some(chr)) = (&console, &console_chr) {
         let fe = Arc::new(SemiConsoleFrontend(Arc::clone(console)));
@@ -851,7 +931,7 @@ mod tests {
         );
         assert_eq!(parse_cpu(Some("foo")).unwrap_err().message(), "unable to find CPU model 'foo'");
         assert_eq!(
-            parse_cpu(Some("max,pauth-qarma5=on")).unwrap_err().message(),
+            parse_cpu(Some("cortex-a57,pauth-qarma5=on")).unwrap_err().message(),
             "CPU property pauth-qarma5=on is not supported by ruvm yet"
         );
         assert_eq!(
@@ -872,9 +952,19 @@ mod tests {
         assert_eq!(o.dtb.as_deref(), Some("d.dtb"));
         let mut m = QDict::new();
         m.put("secure", "on");
+        m.put("virtualization", "on");
+        m.put("firmware", "edk2.fd");
+        let o = take_board_options(&m).unwrap();
+        assert!(o.secure && o.virtualization);
+        assert_eq!(o.firmware.as_deref(), Some("edk2.fd"));
+        let mut m = QDict::new();
+        m.put("mte", "on");
+        assert!(take_board_options(&m).unwrap().mte);
+        let mut m = QDict::new();
+        m.put("ras", "on");
         assert_eq!(
             take_board_options(&m).unwrap_err().message(),
-            "secure=on is not supported by ruvm yet"
+            "ras=on is not supported by ruvm yet"
         );
         let mut m = QDict::new();
         m.put("foo", "on");

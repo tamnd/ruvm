@@ -1,0 +1,14 @@
+VTimer Test
+cntvoff_el2=1
+cntv_cval_el0=ffffffffffffffff
+cntv_ctl_el0=1
+0: cntv_cval_el0=ffffffffffffffff
+1: cntv_cval_el0=ffffffffffffffff
+2: cntv_cval_el0=ffffffffffffffff
+3: cntv_cval_el0=ffffffffffffffff
+4: cntv_cval_el0=ffffffffffffffff
+5: cntv_cval_el0=ffffffffffffffff
+6: cntv_cval_el0=ffffffffffffffff
+7: cntv_cval_el0=ffffffffffffffff
+8: cntv_cval_el0=ffffffffffffffff
+9: cntv_cval_el0=ffffffffffffffff

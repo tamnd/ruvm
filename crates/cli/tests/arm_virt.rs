@@ -70,7 +70,15 @@ fn virt_errors() {
             &["-M", "virt", "-cpu", "max,sve-max-vq=17"],
             format!("{p}unsupported SVE vector length\nValid sve-max-vq in range [1-16]\n"),
         ),
-        (&["-M", "virt,secure=on"], format!("{p}secure=on is not supported by ruvm yet\n")),
+        (&["-M", "virt,ras=on"], format!("{p}ras=on is not supported by ruvm yet\n")),
+        (
+            &["-M", "virt,mte=on", "-cpu", "cortex-a57"],
+            format!("{p}MTE requested, but not supported by the guest CPU\n"),
+        ),
+        (
+            &["-M", "virt", "-bios", "/nonexistent/ruvm.fd"],
+            format!("{p}Could not find ROM image '/nonexistent/ruvm.fd'\n"),
+        ),
         (&["-M", "virt,foo=on"], format!("{p}Property 'virt-11.1-machine.foo' not found\n")),
         (
             &["-M", "virt", "-smp", "124"],
