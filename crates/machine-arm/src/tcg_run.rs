@@ -7,8 +7,9 @@
 //! [`VirtTcgMachine::new`] takes a board with its devices plugged. It creates the runtime with
 //! the `-accel tcg` options ([`TcgOptions`]), finishes the board with `machine_done()`, makes
 //! one vCPU per CPU (the secondaries powered off, for PSCI CPU_ON to start) and starts the
-//! vCPU threads stopped: `CPU n/TCG` with MTTCG (`thread=multi`) and `ALL CPUs/TCG` in round
-//! robin mode, the default here. [`VirtTcgMachine::start`] lets them run. A thread fires the
+//! vCPU threads stopped: `CPU n/TCG` with MTTCG (`thread=multi`, the default, as AArch64
+//! supports it) and `ALL CPUs/TCG` in round robin mode (`thread=single`).
+//! [`VirtTcgMachine::start`] lets them run. A thread fires the
 //! timers of the board clocks (the generic timers and the RTC).
 //!
 //! PSCI SYSTEM_RESET stops every vCPU, resets the board, drops all translated code, resets each
@@ -21,12 +22,8 @@
 //! - The timers of the board clocks are fired by a thread of their own that sleeps at most
 //!   1 ms at a time, rather than by the main loop's poll.
 //! - Writes to RAM that do not come from a vCPU (DMA) do not invalidate translated code.
-//! - Without `thread=`, the vCPUs run round robin on one thread, while QEMU picks MTTCG for
-//!   AArch64. The runtime's atomic helpers (LSE atomics, compare and swap) serialise against
-//!   each other but not against plain stores from other vCPUs, so with MTTCG an atomic can
-//!   overwrite a concurrent store: Linux loses a spinlock release and hangs with more than
-//!   one CPU. `thread=multi` still gives MTTCG, without QEMU's warning, since the guest
-//!   supports it.
+//! - A memory map change (`tcg_commit()`) queues a TLB flush on every vCPU, including the one
+//!   that made it, which finishes its current block first; QEMU flushes that one at once.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,11 +32,14 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use ruvm_accel::VcpuControl;
-use ruvm_accel::tcg::{TcgOptions, TcgVcpus, ThreadMode};
+use ruvm_accel::tcg::{TcgOptions, TcgVcpus};
 use ruvm_hw_core::Clock;
 use ruvm_jit::Jit;
+use ruvm_jit::cputlb::tlb_flush;
 use ruvm_jit::native::{BackendKind, backend_of_kind};
 use ruvm_target_arm::tcg::{helper_registry, jit_config};
+
+use ruvm_mem::MemoryListener;
 
 use crate::virt::{VirtMachine, VirtRequest};
 
@@ -48,9 +48,6 @@ const TIMER_SLICE: Duration = Duration::from_millis(1);
 
 /// AArch64 has `TARGET_SUPPORTS_MTTCG`, so `thread=multi` gives no warning.
 const ARM_SUPPORTS_MTTCG: bool = true;
-
-/// What an `-accel tcg` without `thread=` means here: round robin, see the module doc.
-const ARM_DEFAULT_THREAD: ThreadMode = ThreadMode::Single;
 
 /// Why the guest asked to stop.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -175,6 +172,25 @@ fn timer_loop(shared: Arc<Shared>, clocks: Vec<Arc<Clock>>) {
     }
 }
 
+/// `tcg_commit()`: a change to the memory map, such as a flash leaving romd mode for a
+/// command, flushes every vCPU's TLB so no entry points at the old view. The flush is queued
+/// on each vCPU, so the vCPU that made the change runs to the end of its block first; QEMU
+/// flushes that one at once.
+struct TlbCommit(std::sync::Weak<Jit>);
+
+impl MemoryListener for TlbCommit {
+    fn name(&self) -> &str {
+        "tcg"
+    }
+
+    fn commit(&self) {
+        let Some(jit) = self.0.upgrade() else { return };
+        for cpu in jit.cpu_list() {
+            cpu.async_run_on_cpu(tlb_flush);
+        }
+    }
+}
+
 /// The virt board running on TCG.
 pub struct VirtTcgMachine {
     shared: Arc<Shared>,
@@ -211,11 +227,7 @@ impl VirtTcgMachine {
         handler: VirtEventHandler,
     ) -> Result<(VirtTcgMachine, Vec<String>), String> {
         let mut board = board;
-        let tcg = TcgOptions {
-            thread: Some(cfg.tcg.thread.unwrap_or(ARM_DEFAULT_THREAD)),
-            ..cfg.tcg.clone()
-        };
-        let (config, warnings) = tcg.jit_config(jit_config(), ARM_SUPPORTS_MTTCG)?;
+        let (config, warnings) = cfg.tcg.jit_config(jit_config(), ARM_SUPPORTS_MTTCG)?;
         let backend = match cfg.backend {
             Some(kind) => backend_of_kind(kind, helper_registry(), config.code_gen_buffer_size),
             None => TcgOptions::backend(&config, helper_registry()),
@@ -244,6 +256,10 @@ impl VirtTcgMachine {
 
         board.machine_done()?;
         let vcpus = board.create_vcpus(&jit)?;
+        board
+            .memory_system()
+            .register_listener(Arc::new(TlbCommit(Arc::downgrade(&jit))), board.memory_as())
+            .map_err(|e| e.to_string())?;
         let board = Arc::new(Mutex::new(board));
         let vcpus = Arc::new(TcgVcpus::start(&jit, vcpus));
 

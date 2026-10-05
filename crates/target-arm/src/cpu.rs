@@ -118,6 +118,10 @@ arm_state! {
         pub cf: u32,
         /// V in bit 31.
         pub vf: u32,
+        /// The cached TB flags, QEMU's `env->hflags`: what `tcg::tb_flags()` computes from the
+        /// rest of the state, rebuilt by [`CpuArmState::rebuild_hflags`] whenever something
+        /// it depends on changes, so that looking up a TB only reads this word and the PC.
+        pub hflags: u32,
         /// SP_ELx while it is not the current SP.
         pub sp_el: [u64; 4],
         /// ELR_ELx.
@@ -205,6 +209,23 @@ arm_state! {
         pub cntvoff_el2: u64,
         /// VSESR_EL2.
         pub vsesr_el2: u64,
+        /// The PAuth keys, QEMU's `keys`: the low and high halves of APIAKey, APIBKey,
+        /// APDAKey, APDBKey and APGAKey, in that order.
+        pub pac_keys: [u64; 10],
+        /// GCR_EL1.
+        pub gcr_el1: u64,
+        /// RGSR_EL1.
+        pub rgsr_el1: u64,
+        /// TFSR_ELx (index 1 to 3) and TFSRE0_EL1 (index 0).
+        pub tfsr_el: [u64; 4],
+        /// GPCCR_EL3.
+        pub gpccr_el3: u64,
+        /// GPTBR_EL3.
+        pub gptbr_el3: u64,
+        /// GPCBW_EL3.
+        pub gpcbw_el3: u64,
+        /// MFAR_EL3.
+        pub mfar_el3: u64,
         /// The address the exclusive monitor watches, or all ones when it is open.
         pub exclusive_addr: u64,
         /// The value loaded by the last load exclusive.
@@ -268,6 +289,12 @@ pub const ZF: usize = env_off(offset_of!(CpuArmState, zf));
 pub const CF: usize = env_off(offset_of!(CpuArmState, cf));
 /// The `env` offset of `vf`.
 pub const VF: usize = env_off(offset_of!(CpuArmState, vf));
+/// The `env` offset of `hflags`.
+pub const HFLAGS: usize = env_off(offset_of!(CpuArmState, hflags));
+/// The `env` offset of `rgsr_el1`.
+pub const RGSR_EL1: usize = env_off(offset_of!(CpuArmState, rgsr_el1));
+/// The `env` offset of `tfsr_el`.
+pub const TFSR_EL: usize = env_off(offset_of!(CpuArmState, tfsr_el));
 /// The `env` offset of `exclusive_addr`.
 pub const EXCLUSIVE_ADDR: usize = env_off(offset_of!(CpuArmState, exclusive_addr));
 /// The `env` offset of `exclusive_val`.
@@ -331,6 +358,8 @@ pub const PSTATE_SS: u32 = 1 << 21;
 pub const PSTATE_PAN: u32 = 1 << 22;
 /// `PSTATE_UAO`.
 pub const PSTATE_UAO: u32 = 1 << 23;
+/// `PSTATE_TCO`: tag check override.
+pub const PSTATE_TCO: u32 = 1 << 25;
 /// `PSTATE_V`.
 pub const PSTATE_V: u32 = 1 << 28;
 /// `PSTATE_C`.
@@ -354,6 +383,8 @@ pub const SCTLR_M: u64 = 1 << 0;
 pub const SCTLR_A: u64 = 1 << 1;
 /// `SCTLR_UMA`: EL0 access to DAIF.
 pub const SCTLR_UMA: u64 = 1 << 9;
+/// `SCTLR_I`: instruction access cacheability.
+pub const SCTLR_I: u64 = 1 << 12;
 /// `SCTLR_DZE`: EL0 access to DC ZVA.
 pub const SCTLR_DZE: u64 = 1 << 14;
 /// `SCTLR_UCT`: EL0 access to CTR_EL0.
@@ -366,6 +397,32 @@ pub const SCTLR_WXN: u64 = 1 << 19;
 pub const SCTLR_SPAN: u64 = 1 << 23;
 /// `SCTLR_UCI`: EL0 access to cache maintenance by VA.
 pub const SCTLR_UCI: u64 = 1 << 26;
+/// `SCTLR_EnDB`: the DB key is enabled.
+pub const SCTLR_ENDB: u64 = 1 << 13;
+/// `SCTLR_EnDA`: the DA key is enabled.
+pub const SCTLR_ENDA: u64 = 1 << 27;
+/// `SCTLR_EnIB`: the IB key is enabled.
+pub const SCTLR_ENIB: u64 = 1 << 30;
+/// `SCTLR_EnIA`: the IA key is enabled.
+pub const SCTLR_ENIA: u64 = 1 << 31;
+/// `SCTLR_ITFSB`: tag check faults are synchronized on exception entry.
+pub const SCTLR_ITFSB: u64 = 1 << 37;
+/// `SCTLR_TCF0`, two bits: the tag check fault mode for EL0.
+pub const SCTLR_TCF0_SHIFT: u32 = 38;
+/// `SCTLR_TCF`, two bits: the tag check fault mode for the EL.
+pub const SCTLR_TCF_SHIFT: u32 = 40;
+/// `SCTLR_ATA0`: EL0 access to allocation tags.
+pub const SCTLR_ATA0: u64 = 1 << 42;
+/// `SCTLR_ATA`: access to allocation tags at the EL.
+pub const SCTLR_ATA: u64 = 1 << 43;
+/// `SCTLR_TCF0`: both bits of the EL0 tag check fault mode.
+pub const SCTLR_TCF0: u64 = 3 << SCTLR_TCF0_SHIFT;
+/// `SCTLR_TCF`: both bits of the tag check fault mode.
+pub const SCTLR_TCF: u64 = 3 << SCTLR_TCF_SHIFT;
+/// `SCTLR_TCSO0`: FEAT_MTE_STORE_ONLY for EL0, RES0 here.
+pub const SCTLR_TCSO0: u64 = 1 << 58;
+/// `SCTLR_TCSO`: FEAT_MTE_STORE_ONLY, RES0 here.
+pub const SCTLR_TCSO: u64 = 1 << 59;
 
 /// `EXCP_UDEF`.
 pub const EXCP_UDEF: i32 = 1;
@@ -395,6 +452,8 @@ pub const EXCP_VFIQ: i32 = 15;
 pub const EXCP_SEMIHOST: i32 = 16;
 /// `EXCP_VSERR`.
 pub const EXCP_VSERR: i32 = 24;
+/// `EXCP_GPC`: a granule protection check fault reported to EL3.
+pub const EXCP_GPC: i32 = 25;
 
 /// `PSTATE_MODE_EL2t`.
 pub const PSTATE_MODE_EL2T: u32 = 8;
@@ -437,6 +496,16 @@ pub const SCR_TWE: u64 = 1 << 13;
 pub const SCR_TLOR: u64 = 1 << 14;
 /// `SCR_TCR2EN`.
 pub const SCR_TCR2EN: u64 = 1 << 43;
+/// `SCR_APK`: the PAuth key registers are not trapped.
+pub const SCR_APK: u64 = 1 << 16;
+/// `SCR_API`: the PAuth instructions are not trapped.
+pub const SCR_API: u64 = 1 << 17;
+/// `SCR_ATA`: allocation tag access is allowed below EL3.
+pub const SCR_ATA: u64 = 1 << 26;
+/// `SCR_GPF`: granule protection faults are reported to EL3.
+pub const SCR_GPF: u64 = 1 << 48;
+/// `SCR_NSE`: with NS, the security state of the lower ELs (Realm or Root).
+pub const SCR_NSE: u64 = 1 << 62;
 
 /// `HCR_VM`.
 pub const HCR_VM: u64 = 1 << 0;
@@ -518,6 +587,8 @@ pub const HCR_NV1: u64 = 1 << 43;
 pub const HCR_FWB: u64 = 1 << 46;
 /// `HCR_TID4`.
 pub const HCR_TID4: u64 = 1 << 49;
+/// `HCR_GPF`: granule protection faults at EL0 and EL1 are routed to EL2.
+pub const HCR_GPF: u64 = 1 << 48;
 /// `HCR_TICAB`.
 pub const HCR_TICAB: u64 = 1 << 50;
 /// `HCR_TOCU`.
@@ -530,6 +601,14 @@ pub const HCR_TTLBIS: u64 = 1 << 54;
 pub const HCR_TTLBOS: u64 = 1 << 55;
 /// `HCR_TID5`.
 pub const HCR_TID5: u64 = 1 << 58;
+/// `HCR_APK`: the PAuth key registers are not trapped.
+pub const HCR_APK: u64 = 1 << 40;
+/// `HCR_API`: the PAuth instructions are not trapped.
+pub const HCR_API: u64 = 1 << 41;
+/// `HCR_ATA`: allocation tag access is allowed at EL1 and EL0.
+pub const HCR_ATA: u64 = 1 << 56;
+/// `HCR_DCT`: with DC, stage 1 memory is Tagged.
+pub const HCR_DCT: u64 = 1 << 57;
 
 /// `GTIMER_PHYS`: the EL1 physical timer.
 pub const GTIMER_PHYS: usize = 0;
@@ -564,6 +643,13 @@ pub const MMU_IDX_E3: usize = 12;
 pub const NB_MMU_MODES: usize = 16;
 
 impl CpuArmState {
+    /// `arm_rebuild_hflags()`: recompute the cached TB flags. Anything that changes the
+    /// state they come from (the EL, PSTATE.{IL,PAN,UAO,TCO}, HCR_EL2, SCR_EL3, the SCTLR,
+    /// TCR, CPACR, CPTR and ZCR registers) calls it before storing the state back.
+    pub fn rebuild_hflags(&mut self, f: &ArmFeatures) {
+        self.hflags = crate::tcg::tb_flags(f, self);
+    }
+
     /// `arm_current_el()`.
     pub fn current_el(&self) -> u32 {
         (self.pstate >> 2) & 3
@@ -734,6 +820,18 @@ impl CpuArmState {
         if f.tcr2 {
             valid |= SCR_TCR2EN;
         }
+        if f.pauth != 0 {
+            valid |= SCR_API | SCR_APK;
+        }
+        if f.mte >= 2 {
+            valid |= SCR_ATA;
+        }
+        let mut value = value;
+        if f.rme {
+            // With RME and without FEAT_SEL2, NS is RES1.
+            value |= SCR_NS;
+            valid |= SCR_NSE | SCR_GPF;
+        }
         if !f.el2 {
             valid &= !SCR_HCE;
         }
@@ -756,6 +854,15 @@ impl CpuArmState {
         }
         if f.lor {
             valid |= HCR_TLOR;
+        }
+        if f.pauth != 0 {
+            valid |= HCR_API | HCR_APK;
+        }
+        if f.mte >= 2 {
+            valid |= HCR_ATA | HCR_DCT | HCR_TID5;
+        }
+        if f.rme {
+            valid |= HCR_GPF;
         }
         self.hcr_el2 = (value & valid) | HCR_RW;
     }
@@ -790,6 +897,7 @@ impl CpuArmState {
         s.exclusive_addr = u64::MAX;
         // The OS lock is locked out of reset.
         s.oslsr_el1 = 10;
+        s.rebuild_hflags(f);
         s
     }
 
@@ -803,7 +911,23 @@ impl CpuArmState {
             _ => {}
         }
         if f.el3 {
+            // Set the EL3 state so code can run at EL2. This should match the requirements
+            // set by Linux in its booting spec.
             self.scr_el3 |= SCR_RW;
+            if f.pauth != 0 {
+                self.scr_el3 |= SCR_API | SCR_APK;
+            }
+            if f.mte >= 2 {
+                self.scr_el3 |= SCR_ATA;
+            }
+            if f.sve {
+                // CPTR_EL3.EZ.
+                self.cptr_el[3] |= 1 << 8;
+                self.zcr_el[3] = 0xf;
+            }
+            if f.tcr2 {
+                self.scr_el3 |= SCR_TCR2EN;
+            }
             if target_el == 2 {
                 // If the guest is at EL2 then Linux expects the HVC insn to work.
                 self.scr_el3 |= SCR_HCE;
@@ -815,6 +939,7 @@ impl CpuArmState {
             self.hcr_el2 |= HCR_RW;
         }
         self.pstate_write((target_el << 2) | PSTATE_SP | (self.pstate_read() & !0x1f));
+        self.rebuild_hflags(f);
     }
 }
 
@@ -904,6 +1029,40 @@ pub struct ArmFeatures {
     /// The preemption bits of the attached GICv3 CPU interface (`cs->prebits`), which decide
     /// whether ICC_AP0R1_EL1 to ICC_AP1R3_EL1 exist.
     pub gic_prebits: u8,
+    /// FEAT_PAuth and its extensions, QEMU's `ARMPauthFeature`: 0 without PAuth, up to
+    /// [`PAUTH_FPACCOMBINED`].
+    pub pauth: u8,
+    /// The PAC algorithm, which the ID registers say as the field that holds `pauth`.
+    pub pauth_alg: PauthAlg,
+    /// FEAT_MTE, ID_AA64PFR1_EL1.MTE: 0 without it, 1 for the instructions only, 2 with
+    /// tag memory (FEAT_MTE2) and 3 with asymmetric checks (FEAT_MTE3).
+    pub mte: u8,
+    /// FEAT_RME with the granule protection check (`-cpu max,x-rme=on`).
+    pub rme: bool,
+    /// FEAT_RNG: RNDR and RNDRRS.
+    pub rng: bool,
+}
+
+/// `PauthFeat_EPAC`.
+pub const PAUTH_EPAC: u8 = 2;
+/// `PauthFeat_2`.
+pub const PAUTH_2: u8 = 3;
+/// `PauthFeat_FPAC`.
+pub const PAUTH_FPAC: u8 = 4;
+/// `PauthFeat_FPACCOMBINED`.
+pub const PAUTH_FPACCOMBINED: u8 = 5;
+
+/// The PAC algorithm, QEMU's `pauth-impdef`, `pauth-qarma5` and `pauth-qarma3` properties.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PauthAlg {
+    /// The IMPLEMENTATION DEFINED algorithm, QEMU's `qemu_xxhash64_4()` (ID_AA64ISAR1_EL1.API
+    /// and GPI).
+    #[default]
+    Impdef,
+    /// The architected QARMA5 (ID_AA64ISAR1_EL1.APA and GPA).
+    Qarma5,
+    /// The architected QARMA3 (ID_AA64ISAR2_EL1.APA3 and GPA3).
+    Qarma3,
 }
 
 /// A CPU model: the identification registers and reset values of `aarch64_*_initfn()`.
@@ -945,6 +1104,8 @@ pub struct ArmCpuModel {
     pub id_aa64isar0: u64,
     /// ID_AA64ISAR1_EL1.
     pub id_aa64isar1: u64,
+    /// ID_AA64ISAR2_EL1.
+    pub id_aa64isar2: u64,
     /// ID_AA64MMFR0_EL1.
     pub id_aa64mmfr0: u64,
     /// ID_AA64MMFR1_EL1.
@@ -1017,6 +1178,7 @@ impl ArmCpuModel {
             // AES 2 (with PMULL), SHA1 1, SHA2 1 and CRC32 1, QEMU's 0x00011120.
             id_aa64isar0: 0x0001_1120,
             id_aa64isar1: 0,
+            id_aa64isar2: 0,
             // PARange 4, 44 bits.
             id_aa64mmfr0: MMFR0_4K_ONLY | 4,
             id_aa64mmfr1: 0,
@@ -1070,6 +1232,7 @@ impl ArmCpuModel {
             id_aa64isar0: 0x0000_1000_1021_1120,
             // LRCPC 1 and DPB 1.
             id_aa64isar1: 0x0010_0001,
+            id_aa64isar2: 0,
             // PARange 2, 40 bits, and all three granules: QEMU's 0x00101122 without
             // BigEnd.
             id_aa64mmfr0: 0x0010_1022,
@@ -1135,6 +1298,7 @@ impl ArmCpuModel {
             id_aa64zfr0: 0,
             id_aa64isar0: 0x0001_1120,
             id_aa64isar1: 0,
+            id_aa64isar2: 0,
             // QEMU's 0x00001124 without BigEnd: PARange 4, 16 bit ASIDs, 4K and 64K
             // granules.
             id_aa64mmfr0: 0x0000_1024,
@@ -1159,9 +1323,11 @@ impl ArmCpuModel {
     /// SM4 extensions, F32MM, F64MM, BF16 and I8MM, at vector lengths up to 2048 bits. The
     /// vector length limit is [`ArmCpuModel::with_sve_max_vq`], `-cpu max,sve-max-vq=N`.
     /// It also has FEAT_TLBIOS, FEAT_XS, FEAT_TCR2 and FEAT_ASID2, which are only maintenance
-    /// operations and register bits here. QEMU's `max` has many more features (SVE2p1, EBF16,
-    /// SVE_B16B16, SME, MTE, PAuth and so on) that this port does not; their ID register
-    /// fields read as zero here.
+    /// operations and register bits here, PAuth up to FEAT_FPACCOMBINED with QEMU's
+    /// IMPLEMENTATION DEFINED algorithm ([`ArmCpuModel::with_pauth`] picks another), and
+    /// FEAT_MTE (the instructions only) that becomes FEAT_MTE3 with tag storage. QEMU's
+    /// `max` has many more features (SVE2p1, EBF16, SVE_B16B16, SME, BTI and so on) that
+    /// this port does not; their ID register fields read as zero here.
     pub fn max() -> ArmCpuModel {
         let a76 = ArmCpuModel::cortex_a76();
         ArmCpuModel {
@@ -1189,10 +1355,16 @@ impl ArmCpuModel {
             // I8MM 1, F32MM 1 and F64MM 1. QEMU's `max` sets SVEver 2 (SVE2p1), BF16 2
             // (FEAT_EBF16) and B16B16 1; those fields come up when their instructions land.
             id_aa64zfr0: 0x0110_1101_0011_0021,
-            // ID_AA64ISAR0_EL1.TLB = 1 (FEAT_TLBIOS). QEMU's `max` has 2, FEAT_TLBIRANGE.
-            id_aa64isar0: a76.id_aa64isar0 | (1 << 56),
-            // ID_AA64ISAR1_EL1.XS = 1.
-            id_aa64isar1: a76.id_aa64isar1 | (1 << 56),
+            // ID_AA64ISAR0_EL1.TLB = 1 (FEAT_TLBIOS) and RNDR = 1 (FEAT_RNG). QEMU's `max`
+            // has TLB 2, FEAT_TLBIRANGE.
+            id_aa64isar0: a76.id_aa64isar0 | (1 << 56) | (1 << 60),
+            // ID_AA64ISAR1_EL1.XS = 1, and API = 5 (FEAT_FPACCOMBINED) with GPI = 1: PAuth
+            // with the IMPLEMENTATION DEFINED algorithm, QEMU's default.
+            id_aa64isar1: a76.id_aa64isar1 | (1 << 56) | (5 << 8) | (1 << 28),
+            // ID_AA64PFR1_EL1.MTE = 1: the MTE instructions without tag storage, which is
+            // what QEMU's `max` (MTE 3) is reduced to without `mte=on`; see
+            // `Arm::with_tag_memory`.
+            id_aa64pfr1: a76.id_aa64pfr1 | (1 << 8),
             // ID_AA64MMFR3_EL1.TCRX = 1.
             id_aa64mmfr3: 1,
             // ID_AA64MMFR4_EL1.ASID2 = 1.
@@ -1213,6 +1385,10 @@ impl ArmCpuModel {
                 sve_bf16: true,
                 sve_i8mm: true,
                 sve_max_vq: ARM_MAX_VQ as u32,
+                pauth: PAUTH_FPACCOMBINED,
+                pauth_alg: PauthAlg::Impdef,
+                mte: 1,
+                rng: true,
                 ..a76.features
             },
             ..a76
@@ -1229,12 +1405,44 @@ impl ArmCpuModel {
         self
     }
 
+    /// The model with PAuth off (`None`, `-cpu max,pauth=off`) or using the algorithm `alg`
+    /// (`pauth-impdef`, `pauth-qarma5` or `pauth-qarma3`), as `aarch64_cpu_pauth_finalize()`
+    /// moves the PAuth level into the ID register field of the algorithm. It has no effect
+    /// on a model without PAuth.
+    pub fn with_pauth(mut self, alg: Option<PauthAlg>) -> ArmCpuModel {
+        let level = u64::from(self.features.pauth);
+        if level == 0 {
+            return self;
+        }
+        // APA, API, GPA and GPI; APA3 and GPA3.
+        self.id_aa64isar1 &= !0xff00_0ff0;
+        self.id_aa64isar2 &= !0xff00;
+        match alg {
+            None => self.features.pauth = 0,
+            Some(PauthAlg::Impdef) => self.id_aa64isar1 |= (level << 8) | (1 << 28),
+            Some(PauthAlg::Qarma5) => self.id_aa64isar1 |= (level << 4) | (1 << 24),
+            Some(PauthAlg::Qarma3) => self.id_aa64isar2 |= (level << 12) | (1 << 8),
+        }
+        if let Some(alg) = alg {
+            self.features.pauth_alg = alg;
+        }
+        self
+    }
+
     /// The model with EL2 implemented (AArch64 only), as the virt board's
     /// `virtualization=on` leaves `ARM_FEATURE_EL2` set. The models start without EL2 and
     /// EL3, as the virt board's defaults leave them.
     pub fn with_el2(mut self) -> ArmCpuModel {
         self.features.el2 = true;
         self.id_aa64pfr0 = (self.id_aa64pfr0 & !0xf00) | 0x100;
+        self
+    }
+
+    /// `x-rme`: FEAT_RME with FEAT_RME_GPC3 (ID_AA64PFR0_EL1.RME 3), or without RME. RME
+    /// needs EL3; a board that takes EL3 away takes RME with it.
+    pub fn with_rme(mut self, on: bool) -> ArmCpuModel {
+        self.features.rme = on;
+        self.id_aa64pfr0 = (self.id_aa64pfr0 & !(0xf << 52)) | (u64::from(on) * 3) << 52;
         self
     }
 

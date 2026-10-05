@@ -21,16 +21,19 @@ use ruvm_jit_core::{Func, MemOp, Temp};
 use ruvm_mem::Endian;
 
 use super::helpers::{self, Def};
+use super::mte::{self, LOG2_TAG_GRANULE, TAG_GRANULE};
+use super::pauth;
 use super::sysreg::{self, Kind};
 use super::{
-    TB_ALIGN_MEM, TB_E2H, TB_EL_MASK, TB_FPEXC_EL_SHIFT, TB_MMUIDX_SHIFT, TB_PSTATE_IL,
-    TB_SVEEXC_EL_SHIFT, TB_TBID_SHIFT, TB_TBII_SHIFT, TB_UNPRIV, TB_VL_SHIFT, regime_has_2_ranges,
+    TB_ALIGN_MEM, TB_ATA, TB_ATA0, TB_E2H, TB_EL_MASK, TB_FPEXC_EL_SHIFT, TB_MMUIDX_SHIFT,
+    TB_MTE_ACTIVE, TB_MTE0_ACTIVE, TB_PAUTH_ACTIVE, TB_PSTATE_IL, TB_SVEEXC_EL_SHIFT,
+    TB_TBID_SHIFT, TB_TBII_SHIFT, TB_TCMA_SHIFT, TB_UNPRIV, TB_VL_SHIFT, regime_has_2_ranges,
 };
 use crate::cpu::{
     ArmCpuModel, CF, EXCLUSIVE_ADDR, EXCLUSIVE_HIGH, EXCLUSIVE_VAL, EXCP_BKPT, EXCP_HVC,
     EXCP_SEMIHOST, EXCP_SMC, EXCP_SWI, EXCP_UDEF, MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN,
     MMU_IDX_E20_0, MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NF, PC, PSTATE, PSTATE_PAN, PSTATE_SP,
-    PSTATE_UAO, VF, ZF, xreg_off,
+    PSTATE_TCO, PSTATE_UAO, VF, ZF, xreg_off,
 };
 use crate::syndrome::{
     syn_aa64_bkpt, syn_aa64_hvc, syn_aa64_smc, syn_aa64_svc, syn_aa64_sysregtrap, syn_illegalstate,
@@ -56,11 +59,12 @@ mod sve;
 use simd::{Chk, Feat, Mov, RA, RF, RM, RN, RP, RZ, cop, fop, nop};
 
 use decode::{
-    DisasA64, arg_addsub_ext, arg_addsub_shift, arg_atomic, arg_bitfield, arg_cbz, arg_disas_a6426,
-    arg_disas_a6432, arg_disas_a6434, arg_disas_a6436, arg_disas_a6439, arg_disas_a6445,
-    arg_disas_a6461, arg_disas_a6462, arg_extract, arg_i, arg_ldlit, arg_ldst, arg_ldst_imm,
-    arg_ldstpair, arg_logic_shift, arg_movw, arg_r, arg_ri, arg_rr, arg_rr_sf, arg_rri_log,
-    arg_rri_sf, arg_rrr, arg_rrr_e, arg_rrr_sf, arg_rrrr, arg_stlr, arg_stxr, arg_tbz,
+    DisasA64, arg_LDRA, arg_XPACI, arg_addsub_ext, arg_addsub_shift, arg_atomic, arg_bitfield,
+    arg_bra, arg_braz, arg_cbz, arg_disas_a6426, arg_disas_a6432, arg_disas_a6434, arg_disas_a6436,
+    arg_disas_a6439, arg_disas_a6445, arg_disas_a6461, arg_disas_a6462, arg_extract, arg_i,
+    arg_ldlit, arg_ldst, arg_ldst_imm, arg_ldst_tag, arg_ldstpair, arg_logic_shift, arg_movw,
+    arg_pacaut, arg_r, arg_reta, arg_ri, arg_rr, arg_rr_sf, arg_rri_log, arg_rri_sf, arg_rri_tag,
+    arg_rrr, arg_rrr_e, arg_rrr_sf, arg_rrrr, arg_stlr, arg_stxr, arg_tbz,
 };
 
 /// `DISAS_EXIT`: exit to the main loop without touching the PC.
@@ -97,6 +101,15 @@ pub(crate) struct DisasContext {
     sve_excp_el: u32,
     /// The SVE vector length in bytes.
     vl: u32,
+    /// Some PAuth key is enabled (`pauth_active`).
+    pauth_active: bool,
+    /// Allocation tag access is enabled, for the normal and the unprivileged instructions
+    /// (`ata`).
+    ata: [bool; 2],
+    /// Loads and stores may be tag checked, normal and unprivileged (`mte_active`).
+    mte_active: [bool; 2],
+    /// The TCMA bits of the regime (`tcma`).
+    tcma: u32,
     /// Semihosting calls are on (`semihosting_enabled(false)`).
     semihosting: bool,
     /// Semihosting calls are also allowed from EL0 (`-semihosting-config userspace=on`).
@@ -122,6 +135,10 @@ impl DisasContext {
             fp_excp_el: 0,
             sve_excp_el: 0,
             vl: 16,
+            pauth_active: false,
+            ata: [false; 2],
+            mte_active: [false; 2],
+            tcma: 0,
             semihosting: semihosting.is_some(),
             semihosting_user: semihosting == Some(true),
         }
@@ -323,11 +340,168 @@ impl S<'_, '_> {
         t
     }
 
+    /// The `MTEDESC` of a tag check of `size` bytes at `midx`, aligned to `1 << align`.
+    fn mte_desc(&self, midx: u32, is_write: bool, align: u32, size: u32) -> i32 {
+        let desc = (midx << mte::MTEDESC_MIDX_SHIFT)
+            | (self.d.tbid << mte::MTEDESC_TBI_SHIFT)
+            | (self.d.tcma << mte::MTEDESC_TCMA_SHIFT)
+            | if is_write { mte::MTEDESC_WRITE } else { 0 }
+            | (align << mte::MTEDESC_ALIGN_SHIFT)
+            | ((size - 1) << mte::MTEDESC_SIZEM1_SHIFT);
+        desc as i32
+    }
+
+    /// The `mte_check` helper call: the clean address of the checked access at `addr`.
+    fn gen_mte_check(&mut self, desc: i32, addr: TempI64) -> TempI64 {
+        let ret = self.new64();
+        let d = self.c32(desc);
+        let env = self.env();
+        self.call(&mte::MTE_CHECK, Some(ret.into()), &[env.into(), d.into(), addr.into()]);
+        ret
+    }
+
+    /// `gen_mte_check1_mmuidx()`: for MTE, check a single logical or atomic access. This
+    /// probes a single address, the exact one specified. The size and alignment of the
+    /// access is not relevant to MTE, per se, but watchpoints do require the size, and we
+    /// want to recognize those before making any other changes to state.
+    fn mte_check1_mmuidx(
+        &mut self,
+        addr: TempI64,
+        is_write: bool,
+        tag_checked: bool,
+        memop: MemOp,
+        is_unpriv: bool,
+        core_idx: u32,
+    ) -> TempI64 {
+        if tag_checked && self.d.mte_active[usize::from(is_unpriv)] {
+            let desc =
+                self.mte_desc(core_idx, is_write, memop.alignment_bits(), memop.size_bytes());
+            return self.gen_mte_check(desc, addr);
+        }
+        self.clean_data_tbi(addr)
+    }
+
+    /// `gen_mte_check1()`.
+    fn mte_check1(
+        &mut self,
+        addr: TempI64,
+        is_write: bool,
+        tag_checked: bool,
+        memop: MemOp,
+    ) -> TempI64 {
+        let idx = self.get_mem_index();
+        self.mte_check1_mmuidx(addr, is_write, tag_checked, memop, false, idx)
+    }
+
+    /// `gen_mte_checkN()`: for MTE, check multiple logical sequential accesses.
+    fn mte_check_n(
+        &mut self,
+        addr: TempI64,
+        is_write: bool,
+        tag_checked: bool,
+        total_size: u32,
+        single_mop: MemOp,
+    ) -> TempI64 {
+        if tag_checked && self.d.mte_active[0] {
+            let idx = self.get_mem_index();
+            let desc = self.mte_desc(idx, is_write, single_mop.alignment_bits(), total_size);
+            return self.gen_mte_check(desc, addr);
+        }
+        self.clean_data_tbi(addr)
+    }
+
+    /// `gen_probe_access()`.
+    fn gen_probe_access(&mut self, ptr: TempI64, is_write: bool, size: u32) {
+        let acc = self.c32(i32::from(is_write));
+        let idx = self.c32(self.get_mem_index() as i32);
+        let sz = self.c32(size as i32);
+        let env = self.env();
+        self.call(
+            &mte::PROBE_ACCESS,
+            None,
+            &[env.into(), ptr.into(), acc.into(), idx.into(), sz.into()],
+        );
+    }
+
+    /// `gen_address_with_allocation_tag0()`: insert a zero tag into `src`, with the result at
+    /// `dst`.
+    fn address_with_allocation_tag0(&mut self, dst: TempI64, src: TempI64) {
+        self.f().gen_andi_i64(dst, src, !(0xf << 56));
+    }
+
     /// Declare and call a helper.
     fn call(&mut self, d: &Def, ret: Option<Temp>, args: &[Temp]) {
         let f = self.f();
         let h = f.helper(d.info());
         f.gen_call(h, ret, args);
+    }
+
+    fn has_pauth(&self) -> bool {
+        self.d.model.features.pauth != 0
+    }
+
+    /// `rd = helper(env, rd, modifier)` for the PAuth helpers.
+    fn pac_op(&mut self, d: &Def, rd: i32, modifier: TempI64) {
+        let x = self.reg(rd);
+        let env = self.env();
+        self.call(d, Some(x.into()), &[env.into(), x.into(), modifier.into()]);
+        self.set_reg(rd, x);
+    }
+
+    /// `rd = helper(env, rd)` for XPACI and XPACD.
+    fn pac_op1(&mut self, d: &Def, rd: i32) {
+        let x = self.reg(rd);
+        let env = self.env();
+        self.call(d, Some(x.into()), &[env.into(), x.into()]);
+        self.set_reg(rd, x);
+    }
+
+    /// `auth_branch_target()`.
+    fn auth_branch_target(&mut self, dst: TempI64, modifier: TempI64, use_key_a: bool) -> TempI64 {
+        if !self.d.pauth_active {
+            return dst;
+        }
+        let t = self.new64();
+        let d = if use_key_a { &pauth::AUTIA_COMBINED } else { &pauth::AUTIB_COMBINED };
+        let env = self.env();
+        self.call(d, Some(t.into()), &[env.into(), dst.into(), modifier.into()]);
+        t
+    }
+
+    /// `gen_pacaut()`: the register forms of PAC* and AUT*.
+    fn gen_pacaut(&mut self, a: &arg_pacaut, d: &Def) -> bool {
+        if !self.has_pauth() {
+            return false;
+        }
+        if a.z != 0 && a.rn != 31 {
+            return false;
+        }
+        if self.d.pauth_active {
+            let m = if a.z != 0 { self.c64(0) } else { self.reg_sp(a.rn) };
+            self.pac_op(d, a.rd, m);
+        }
+        true
+    }
+
+    /// `trans_ERET()` and `trans_ERETA()`; `auth` is `Some(use_key_a)` for ERETA.
+    fn eret(&mut self, auth: Option<bool>) -> bool {
+        let el = self.d.current_el;
+        if el == 0 {
+            return false;
+        }
+        let elr = crate::cpu::env_off(std::mem::offset_of!(crate::cpu::CpuArmState, elr_el))
+            + 8 * el as usize;
+        let mut dst = self.ld_env64(elr);
+        if let Some(key_a) = auth {
+            let sp = self.reg_sp(31);
+            dst = self.auth_branch_target(dst, sp, key_a);
+        }
+        self.update_pc(0);
+        let env = self.env();
+        self.call(&helpers::EXCEPTION_RETURN, None, &[env.into(), dst.into()]);
+        // Must exit loop to check un-masked IRQs
+        self.b.is_jmp = DISAS_EXIT;
+        true
     }
 
     /// `gen_exception_insn()`: raise `excp` at `pc_curr + diff` to the default EL.
@@ -715,14 +889,14 @@ impl S<'_, '_> {
         t
     }
 
-    /// `op_addr_ldst_imm_pre()`: the dirty and clean addresses of an immediate offset access.
-    fn addr_imm_pre(&mut self, rn: i32, imm: i64, p: bool) -> (TempI64, TempI64) {
+    /// The first half of `op_addr_ldst_imm_pre()` and `op_addr_ldstpair_pre()`: the dirty
+    /// address of an immediate offset access, which the caller checks.
+    fn addr_imm_dirty(&mut self, rn: i32, imm: i64, p: bool) -> TempI64 {
         let dirty = self.read_cpu_reg_sp(rn, true);
         if !p {
             self.f().gen_addi_i64(dirty, dirty, imm);
         }
-        let clean = self.clean_data_tbi(dirty);
-        (dirty, clean)
+        dirty
     }
 
     /// `op_addr_ldst_imm_post()` and `op_addr_ldstpair_post()`: the base register writeback.
@@ -736,12 +910,12 @@ impl S<'_, '_> {
     }
 
     /// `op_addr_ldst_pre()`: the clean address of a register offset access.
-    fn addr_reg(&mut self, a: &arg_ldst) -> TempI64 {
+    fn addr_reg(&mut self, a: &arg_ldst, is_store: bool, memop: MemOp) -> TempI64 {
         let dirty = self.read_cpu_reg_sp(a.rn, true);
         let rm = self.read_cpu_reg(a.rm, true);
         self.ext_and_shift_reg(rm, rm, a.opt, if a.s != 0 { a.sz } else { 0 });
         self.f().gen_add_i64(dirty, dirty, rm);
-        self.clean_data_tbi(dirty)
+        self.mte_check1(dirty, is_store, true, memop)
     }
 
     /// `gen_load_exclusive()`.
@@ -749,7 +923,7 @@ impl S<'_, '_> {
         let idx = self.get_mem_index();
         let memop = self.check_atomic_align(MemOp((size + i32::from(is_pair)) as u32));
         let dirty = self.reg_sp(rn);
-        let clean = self.clean_data_tbi(dirty);
+        let clean = self.mte_check1(dirty, false, rn != 31, memop);
         let val = self.new64();
         if is_pair {
             if size == 2 {
@@ -789,6 +963,7 @@ impl S<'_, '_> {
         self.f().gen_brcond_i64(Cond::Ne, clean, excl_addr, fail_label);
         // Without FEAT_LSE2 every size needs alignment.
         let memop = self.finalize_memop(MemOp((size + i32::from(is_pair)) as u32) | MemOp::ALIGN);
+        self.mte_check1(dirty, true, rn != 31, memop);
         let idx = self.get_mem_index();
         let excl_val = self.ld_env64(EXCLUSIVE_VAL);
         let tmp = self.new64();
@@ -840,7 +1015,7 @@ impl S<'_, '_> {
         let mop = MemOp(a.sz as u32 | if sign { MemOp::SIGN.0 } else { 0 });
         let mop = self.check_atomic_align(mop);
         let dirty = self.reg_sp(a.rn);
-        let clean = self.clean_data_tbi(dirty);
+        let clean = self.mte_check1(dirty, false, a.rn != 31, mop);
         let rs = self.read_cpu_reg(a.rs, true);
         let rt = self.new64();
         let idx = self.get_mem_index();
@@ -1163,9 +1338,48 @@ impl S<'_, '_> {
             Kind::DcZva => {
                 // Writes clear the aligned block of memory which rt points into.
                 let v = self.reg(rt);
-                let addr = self.clean_data_tbi(v);
+                let addr = if self.d.mte_active[0] {
+                    let idx = self.get_mem_index();
+                    let desc = (idx << mte::MTEDESC_MIDX_SHIFT)
+                        | (self.d.tbid << mte::MTEDESC_TBI_SHIFT)
+                        | (self.d.tcma << mte::MTEDESC_TCMA_SHIFT);
+                    let t = self.new64();
+                    let d = self.c32(desc as i32);
+                    let env = self.env();
+                    self.call(
+                        &mte::MTE_CHECK_ZVA,
+                        Some(t.into()),
+                        &[env.into(), d.into(), v.into()],
+                    );
+                    t
+                } else {
+                    self.clean_data_tbi(v)
+                };
                 let env = self.env();
                 self.call(&helpers::DC_ZVA, None, &[env.into(), addr.into()]);
+                return;
+            }
+            Kind::DcGva => {
+                // DC_GVA, like DC_ZVA, requires that we supply the original pointer for an
+                // invalid page. Probe that address first.
+                let v = self.reg(rt);
+                let clean = self.clean_data_tbi(v);
+                self.gen_probe_access(clean, true, 1);
+                if self.d.ata[0] {
+                    // Extract the tag from the register to match STZGM.
+                    self.gen_stzgm_tags(clean, v);
+                }
+                return;
+            }
+            Kind::DcGzva => {
+                // For DC_GZVA, we can rely on DC_ZVA for the proper fault.
+                let v = self.reg(rt);
+                let clean = self.clean_data_tbi(v);
+                let env = self.env();
+                self.call(&helpers::DC_ZVA, None, &[env.into(), clean.into()]);
+                if self.d.ata[0] {
+                    self.gen_stzgm_tags(clean, v);
+                }
                 return;
             }
             Kind::Model(get) => {
@@ -1190,6 +1404,8 @@ impl S<'_, '_> {
                         self.f().gen_andi_i64(t, t, mask as i64);
                     }
                     self.st_env64(t, off);
+                    // The register may be one the TB flags come from (CPACR_EL1, CPTR_ELx).
+                    self.gen_rebuild_hflags();
                 }
             }
             Kind::Special => {
@@ -1215,7 +1431,8 @@ impl S<'_, '_> {
         }
     }
 
-    /// Set or clear `bit` of PSTATE, as `set_pstate_bits()` and `clear_pstate_bits()` do.
+    /// Set or clear `bit` of PSTATE, as `set_pstate_bits()` and `clear_pstate_bits()` do,
+    /// and rebuild the TB flags, which PAN, UAO and TCO feed.
     fn pstate_bit(&mut self, bit: u32, set: bool) {
         let t = self.ld_env32(PSTATE);
         let f = self.f();
@@ -1225,6 +1442,13 @@ impl S<'_, '_> {
             f.gen_andi_i32(t, t, !bit as i32);
         }
         self.st_env32(t, PSTATE);
+        self.gen_rebuild_hflags();
+    }
+
+    /// `gen_rebuild_hflags()`.
+    fn gen_rebuild_hflags(&mut self) {
+        let env = self.env();
+        self.call(&helpers::REBUILD_HFLAGS, None, &[env.into()]);
     }
 
     /// The helper call of the MSR (immediate) forms that go through one.
@@ -1233,6 +1457,118 @@ impl S<'_, '_> {
         let env = self.env();
         let i = self.c32(imm);
         self.call(d, None, &[env.into(), i.into()]);
+    }
+
+    fn has_mte_insn_reg(&self) -> bool {
+        self.d.model.features.mte >= 1
+    }
+
+    fn has_mte(&self) -> bool {
+        self.d.model.features.mte >= 2
+    }
+
+    /// `gen_helper_stzgm_tags()` with the tag in the top byte of `tagged`.
+    fn gen_stzgm_tags(&mut self, addr: TempI64, tagged: TempI64) {
+        let tag = self.new64();
+        self.f().gen_shri_i64(tag, tagged, 56);
+        let env = self.env();
+        self.call(&mte::STZGM_TAGS, None, &[env.into(), addr.into(), tag.into()]);
+    }
+
+    /// The base plus `imm` of STZGM, STGM and LDGM.
+    fn tag_mult_addr(&mut self, a: &arg_ldst_tag) -> TempI64 {
+        let addr = self.read_cpu_reg_sp(a.rn, true);
+        self.f().gen_addi_i64(addr, addr, i64::from(a.imm));
+        addr
+    }
+
+    /// `do_STG()`.
+    fn do_stg(&mut self, a: &arg_ldst_tag, is_zero: bool, is_pair: bool) -> bool {
+        if !self.has_mte_insn_reg() {
+            return false;
+        }
+        let addr = self.read_cpu_reg_sp(a.rn, true);
+        if a.p == 0 {
+            // pre-index or signed offset
+            self.f().gen_addi_i64(addr, addr, i64::from(a.imm));
+        }
+        let rt = self.reg_sp(a.rt);
+        let env = self.env();
+        if !self.d.ata[0] {
+            // For STG and ST2G, we need to check alignment and probe memory.
+            let d = if is_pair { &mte::ST2G_STUB } else { &mte::STG_STUB };
+            self.call(d, None, &[env.into(), addr.into()]);
+        } else {
+            let d = if is_pair { &mte::ST2G } else { &mte::STG };
+            self.call(d, None, &[env.into(), addr.into(), rt.into()]);
+        }
+        if is_zero {
+            let clean = self.clean_data_tbi(addr);
+            let idx = self.get_mem_index();
+            let mop = self.finalize_memop(MemOp::MO_128 | MemOp::ALIGN);
+            let f = self.f();
+            let zero = f.temp_new_i128();
+            let z = f.constant_i64(0);
+            f.gen_concat_i64_i128(zero, z, z);
+            // This is 1 or 2 atomic 16-byte operations.
+            f.gen_qemu_st_i128(zero, clean, idx, mop);
+            if is_pair {
+                f.gen_addi_i64(clean, clean, 16);
+                f.gen_qemu_st_i128(zero, clean, idx, mop);
+            }
+        }
+        if a.w != 0 {
+            // pre-index or post-index
+            if a.p != 0 {
+                // post-index
+                self.f().gen_addi_i64(addr, addr, i64::from(a.imm));
+            }
+            self.set_reg_sp(a.rn, addr);
+        }
+        true
+    }
+
+    /// `gen_add_sub_imm_with_tags()`.
+    fn add_sub_imm_with_tags(&mut self, a: &arg_rri_tag, sub_op: bool) -> bool {
+        if !self.has_mte_insn_reg() {
+            return false;
+        }
+        let mut imm = a.uimm6 << LOG2_TAG_GRANULE;
+        if sub_op {
+            imm = -imm;
+        }
+        let rn = self.reg_sp(a.rn);
+        let rd = self.new64();
+        if self.d.ata[0] {
+            let i = self.c32(imm);
+            let t = self.c32(a.uimm4);
+            let env = self.env();
+            self.call(&mte::ADDSUBG, Some(rd.into()), &[env.into(), rn.into(), i.into(), t.into()]);
+        } else {
+            self.f().gen_addi_i64(rd, rn, i64::from(imm));
+            self.address_with_allocation_tag0(rd, rd);
+        }
+        self.set_reg_sp(a.rd, rd);
+        true
+    }
+
+    /// `do_subp()`.
+    fn do_subp(&mut self, a: &arg_rrr, setflag: bool) -> bool {
+        if !self.has_mte_insn_reg() {
+            return false;
+        }
+        let n = self.read_cpu_reg_sp(a.rn, true);
+        let m = self.read_cpu_reg_sp(a.rm, true);
+        let d = self.new64();
+        self.f().gen_sextract_i64(n, n, 0, 56);
+        self.f().gen_sextract_i64(m, m, 0, 56);
+        if setflag {
+            self.sub_cc(true, d, n, m);
+        } else {
+            self.f().gen_sub_i64(d, n, m);
+        }
+        self.set_reg(a.rd, d);
+        true
     }
 }
 
@@ -1590,20 +1926,168 @@ impl DisasA64 for S<'_, '_> {
         true
     }
 
-    fn trans_ERET(&mut self, _a: &mut arg_disas_a6432) -> bool {
-        let el = self.d.current_el;
-        if el == 0 {
+    fn trans_BRAZ(&mut self, a: &mut arg_braz) -> bool {
+        if !self.has_pauth() {
             return false;
         }
-        let elr = crate::cpu::env_off(std::mem::offset_of!(crate::cpu::CpuArmState, elr_el))
-            + 8 * el as usize;
-        let dst = self.ld_env64(elr);
-        self.update_pc(0);
-        let env = self.env();
-        self.call(&helpers::EXCEPTION_RETURN, None, &[env.into(), dst.into()]);
-        // Must exit loop to check un-masked IRQs
-        self.b.is_jmp = DISAS_EXIT;
+        let rn = self.reg(a.rn);
+        let z = self.c64(0);
+        let dst = self.auth_branch_target(rn, z, a.m == 0);
+        self.set_pc(dst);
+        self.b.is_jmp = DISAS_JUMP;
         true
+    }
+
+    fn trans_BLRAZ(&mut self, a: &mut arg_braz) -> bool {
+        if !self.has_pauth() {
+            return false;
+        }
+        let rn = self.reg(a.rn);
+        let z = self.c64(0);
+        let dst = self.auth_branch_target(rn, z, a.m == 0);
+        let lr = self.c64(self.d.pc_curr.wrapping_add(4) as i64);
+        self.set_pc(dst);
+        self.set_reg(30, lr);
+        self.b.is_jmp = DISAS_JUMP;
+        true
+    }
+
+    fn trans_RETA(&mut self, a: &mut arg_reta) -> bool {
+        if !self.has_pauth() {
+            return false;
+        }
+        let lr = self.reg(30);
+        let sp = self.reg_sp(31);
+        let dst = self.auth_branch_target(lr, sp, a.m == 0);
+        self.set_pc(dst);
+        self.b.is_jmp = DISAS_JUMP;
+        true
+    }
+
+    fn trans_BRA(&mut self, a: &mut arg_bra) -> bool {
+        if !self.has_pauth() {
+            return false;
+        }
+        let rn = self.reg(a.rn);
+        let rm = self.reg_sp(a.rm);
+        let dst = self.auth_branch_target(rn, rm, a.m == 0);
+        self.set_pc(dst);
+        self.b.is_jmp = DISAS_JUMP;
+        true
+    }
+
+    fn trans_BLRA(&mut self, a: &mut arg_bra) -> bool {
+        if !self.has_pauth() {
+            return false;
+        }
+        let rn = self.reg(a.rn);
+        let rm = self.reg_sp(a.rm);
+        let dst = self.auth_branch_target(rn, rm, a.m == 0);
+        let lr = self.c64(self.d.pc_curr.wrapping_add(4) as i64);
+        self.set_pc(dst);
+        self.set_reg(30, lr);
+        self.b.is_jmp = DISAS_JUMP;
+        true
+    }
+
+    fn trans_PACIA(&mut self, a: &mut arg_pacaut) -> bool {
+        self.gen_pacaut(a, &pauth::PACIA)
+    }
+
+    fn trans_PACIB(&mut self, a: &mut arg_pacaut) -> bool {
+        self.gen_pacaut(a, &pauth::PACIB)
+    }
+
+    fn trans_PACDA(&mut self, a: &mut arg_pacaut) -> bool {
+        self.gen_pacaut(a, &pauth::PACDA)
+    }
+
+    fn trans_PACDB(&mut self, a: &mut arg_pacaut) -> bool {
+        self.gen_pacaut(a, &pauth::PACDB)
+    }
+
+    fn trans_AUTIA(&mut self, a: &mut arg_pacaut) -> bool {
+        self.gen_pacaut(a, &pauth::AUTIA)
+    }
+
+    fn trans_AUTIB(&mut self, a: &mut arg_pacaut) -> bool {
+        self.gen_pacaut(a, &pauth::AUTIB)
+    }
+
+    fn trans_AUTDA(&mut self, a: &mut arg_pacaut) -> bool {
+        self.gen_pacaut(a, &pauth::AUTDA)
+    }
+
+    fn trans_AUTDB(&mut self, a: &mut arg_pacaut) -> bool {
+        self.gen_pacaut(a, &pauth::AUTDB)
+    }
+
+    fn trans_XPACI(&mut self, a: &mut arg_XPACI) -> bool {
+        if !self.has_pauth() {
+            return false;
+        }
+        if self.d.pauth_active {
+            self.pac_op1(&pauth::XPACI, a.rd);
+        }
+        true
+    }
+
+    fn trans_XPACD(&mut self, a: &mut arg_XPACI) -> bool {
+        if !self.has_pauth() {
+            return false;
+        }
+        if self.d.pauth_active {
+            self.pac_op1(&pauth::XPACD, a.rd);
+        }
+        true
+    }
+
+    fn trans_PACGA(&mut self, a: &mut arg_rrr) -> bool {
+        if !self.has_pauth() {
+            return false;
+        }
+        let n = self.reg(a.rn);
+        let m = self.reg_sp(a.rm);
+        let t = self.new64();
+        let env = self.env();
+        self.call(&pauth::PACGA, Some(t.into()), &[env.into(), n.into(), m.into()]);
+        self.set_reg(a.rd, t);
+        true
+    }
+
+    fn trans_LDRA(&mut self, a: &mut arg_LDRA) -> bool {
+        if !self.has_pauth() {
+            return false;
+        }
+        let dirty = self.read_cpu_reg_sp(a.rn, true);
+        if self.d.pauth_active {
+            let z = self.c64(0);
+            let d = if a.m == 0 { &pauth::AUTDA_COMBINED } else { &pauth::AUTDB_COMBINED };
+            let env = self.env();
+            self.call(d, Some(dirty.into()), &[env.into(), dirty.into(), z.into()]);
+        }
+        self.f().gen_addi_i64(dirty, dirty, i64::from(a.imm));
+        let mop = self.finalize_memop(MemOp(3));
+        // Note that "clean" and "dirty" here refer to TBI not PAC.
+        let clean = self.mte_check1(dirty, false, a.w != 0 || a.rn != 31, mop);
+        let idx = self.get_mem_index();
+        let t = self.gpr_ld(clean, mop, false, idx);
+        self.set_reg(a.rt, t);
+        if a.w != 0 {
+            self.set_reg_sp(a.rn, dirty);
+        }
+        true
+    }
+
+    fn trans_ERETA(&mut self, a: &mut arg_reta) -> bool {
+        if !self.has_pauth() {
+            return false;
+        }
+        self.eret(Some(a.m == 0))
+    }
+
+    fn trans_ERET(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        self.eret(None)
     }
 
     // Hints
@@ -1646,54 +2130,105 @@ impl DisasA64 for S<'_, '_> {
     }
 
     fn trans_XPACLRI(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            self.pac_op1(&pauth::XPACI, 30);
+        }
         true
     }
 
     fn trans_PACIA1716(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.reg(16);
+            self.pac_op(&pauth::PACIA, 17, m);
+        }
         true
     }
 
     fn trans_PACIB1716(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.reg(16);
+            self.pac_op(&pauth::PACIB, 17, m);
+        }
         true
     }
 
     fn trans_AUTIA1716(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.reg(16);
+            self.pac_op(&pauth::AUTIA, 17, m);
+        }
         true
     }
 
     fn trans_AUTIB1716(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.reg(16);
+            self.pac_op(&pauth::AUTIB, 17, m);
+        }
         true
     }
 
     fn trans_PACIAZ(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.c64(0);
+            self.pac_op(&pauth::PACIA, 30, m);
+        }
         true
     }
 
     fn trans_PACIASP(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.reg_sp(31);
+            self.pac_op(&pauth::PACIA, 30, m);
+        }
         true
     }
 
     fn trans_PACIBZ(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.c64(0);
+            self.pac_op(&pauth::PACIB, 30, m);
+        }
         true
     }
 
     fn trans_PACIBSP(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.reg_sp(31);
+            self.pac_op(&pauth::PACIB, 30, m);
+        }
         true
     }
 
     fn trans_AUTIAZ(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.c64(0);
+            self.pac_op(&pauth::AUTIA, 30, m);
+        }
         true
     }
 
     fn trans_AUTIASP(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.reg_sp(31);
+            self.pac_op(&pauth::AUTIA, 30, m);
+        }
         true
     }
 
     fn trans_AUTIBZ(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.c64(0);
+            self.pac_op(&pauth::AUTIB, 30, m);
+        }
         true
     }
 
     fn trans_AUTIBSP(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        if self.d.pauth_active {
+            let m = self.reg_sp(31);
+            self.pac_op(&pauth::AUTIB, 30, m);
+        }
         true
     }
 
@@ -1766,6 +2301,20 @@ impl DisasA64 for S<'_, '_> {
         self.msr_i_helper(&helpers::MSR_I_SPSEL, a.imm & PSTATE_SP as i32);
         self.b.is_jmp = DisasJumpType::TooMany;
         true
+    }
+
+    fn trans_MSR_i_TCO(&mut self, a: &mut arg_i) -> bool {
+        let mte = self.feat().mte;
+        if mte >= 2 {
+            // Full MTE is enabled -- set the TCO bit as directed.
+            self.pstate_bit(PSTATE_TCO, a.imm & 1 != 0);
+            // Many factors, including TCO, go into MTE_ACTIVE.
+            self.b.is_jmp = DISAS_UPDATE_EXIT;
+            true
+        } else {
+            // Only "instructions accessible at EL0" -- PSTATE.TCO is WI.
+            mte >= 1
+        }
     }
 
     fn trans_MSR_i_DAIFSET(&mut self, a: &mut arg_i) -> bool {
@@ -1898,7 +2447,7 @@ impl DisasA64 for S<'_, '_> {
         self.f().gen_mb(mo::ALL | mo::BAR_STRL);
         let memop = self.check_ordered_align(MemOp(a.sz as u32));
         let dirty = self.reg_sp(a.rn);
-        let clean = self.clean_data_tbi(dirty);
+        let clean = self.mte_check1(dirty, true, a.rn != 31, memop);
         let rt = self.reg(a.rt);
         let idx = self.get_mem_index();
         self.f().gen_qemu_st_i64(rt, clean, idx, memop);
@@ -1912,7 +2461,7 @@ impl DisasA64 for S<'_, '_> {
         }
         let memop = self.check_ordered_align(MemOp(a.sz as u32));
         let dirty = self.reg_sp(a.rn);
-        let clean = self.clean_data_tbi(dirty);
+        let clean = self.mte_check1(dirty, false, a.rn != 31, memop);
         let idx = self.get_mem_index();
         let t = self.gpr_ld(clean, memop, false, idx);
         self.set_reg(a.rt, t);
@@ -1931,7 +2480,7 @@ impl DisasA64 for S<'_, '_> {
         let rt = self.reg(a.rt);
         let memop = self.check_atomic_align(MemOp(a.sz as u32));
         let dirty = self.reg_sp(a.rn);
-        let clean = self.clean_data_tbi(dirty);
+        let clean = self.mte_check1(dirty, true, a.rn != 31, memop);
         let idx = self.get_mem_index();
         self.f().gen_atomic_cmpxchg_i64(rs, clean, rs, rt, idx, memop);
         self.set_reg(a.rs, rs);
@@ -1952,7 +2501,7 @@ impl DisasA64 for S<'_, '_> {
         let t2 = self.reg(a.rt + 1);
         let memop = self.check_atomic_align(MemOp((a.sz + 1) as u32));
         let dirty = self.reg_sp(a.rn);
-        let clean = self.clean_data_tbi(dirty);
+        let clean = self.mte_check1(dirty, true, a.rn != 31, memop);
         let idx = self.get_mem_index();
         if a.sz == 2 {
             let cmp = self.new64();
@@ -1987,19 +2536,212 @@ impl DisasA64 for S<'_, '_> {
         true
     }
 
+    // Memory tagging
+
+    fn trans_STGP(&mut self, a: &mut arg_ldstpair) -> bool {
+        // STGP only comes in one size.
+        if !self.has_mte_insn_reg() {
+            return false;
+        }
+        let offset = i64::from(a.imm) << LOG2_TAG_GRANULE;
+        let dirty = self.read_cpu_reg_sp(a.rn, true);
+        if a.p == 0 {
+            self.f().gen_addi_i64(dirty, dirty, offset);
+        }
+        let clean = self.clean_data_tbi(dirty);
+        let rt = self.reg(a.rt);
+        let rt2 = self.reg(a.rt2);
+        // STGP is defined as two 8-byte memory operations, aligned to TAG_GRANULE, and one
+        // tag operation. We implement it as one single aligned 16-byte memory operation for
+        // convenience. Note that the alignment ensures MO_ATOM_IFALIGN_PAIR produces 8-byte
+        // atomicity for the memory store.
+        let mop = self.finalize_memop_atom(MemOp::MO_128 | MemOp::ALIGN, MemOp::ATOM_IFALIGN_PAIR);
+        let idx = self.get_mem_index();
+        let f = self.f();
+        let tmp = f.temp_new_i128();
+        f.gen_concat_i64_i128(tmp, rt, rt2);
+        f.gen_qemu_st_i128(tmp, clean, idx, mop);
+        // Perform the tag store, if tag access enabled.
+        if self.d.ata[0] {
+            let env = self.env();
+            self.call(&mte::STG, None, &[env.into(), dirty.into(), dirty.into()]);
+        }
+        self.addr_imm_post(a.rn, dirty, offset, a.w != 0, a.p != 0);
+        true
+    }
+
+    fn trans_STZGM(&mut self, a: &mut arg_ldst_tag) -> bool {
+        if !self.has_mte() || self.d.current_el == 0 {
+            return false;
+        }
+        let size = 4i64 << (self.d.model.dczid & 0xf);
+        let addr = self.tag_mult_addr(a);
+        let rt = self.reg(a.rt);
+        if self.d.ata[0] {
+            let env = self.env();
+            self.call(&mte::STZGM_TAGS, None, &[env.into(), addr.into(), rt.into()]);
+        }
+        // The non-tags portion of STZGM is mostly like DC_ZVA, except the alignment happens
+        // before the access.
+        let clean = self.clean_data_tbi(addr);
+        self.f().gen_andi_i64(clean, clean, -size);
+        let env = self.env();
+        self.call(&helpers::DC_ZVA, None, &[env.into(), clean.into()]);
+        true
+    }
+
+    fn trans_STGM(&mut self, a: &mut arg_ldst_tag) -> bool {
+        if !self.has_mte() || self.d.current_el == 0 {
+            return false;
+        }
+        let addr = self.tag_mult_addr(a);
+        let rt = self.reg(a.rt);
+        if self.d.ata[0] {
+            let env = self.env();
+            self.call(&mte::STGM, None, &[env.into(), addr.into(), rt.into()]);
+        } else {
+            let size = 4 << mte::GM_BLOCKSIZE;
+            let clean = self.clean_data_tbi(addr);
+            self.f().gen_andi_i64(clean, clean, -i64::from(size));
+            self.gen_probe_access(clean, true, size);
+        }
+        true
+    }
+
+    fn trans_LDGM(&mut self, a: &mut arg_ldst_tag) -> bool {
+        if !self.has_mte() || self.d.current_el == 0 {
+            return false;
+        }
+        let addr = self.tag_mult_addr(a);
+        let rt = self.new64();
+        if self.d.ata[0] {
+            let env = self.env();
+            self.call(&mte::LDGM, Some(rt.into()), &[env.into(), addr.into()]);
+        } else {
+            let size = 4 << mte::GM_BLOCKSIZE;
+            let clean = self.clean_data_tbi(addr);
+            self.f().gen_andi_i64(clean, clean, -i64::from(size));
+            self.gen_probe_access(clean, false, size);
+            // The result tags are zeros.
+            self.f().gen_movi_i64(rt, 0);
+        }
+        self.set_reg(a.rt, rt);
+        true
+    }
+
+    fn trans_LDG(&mut self, a: &mut arg_ldst_tag) -> bool {
+        if !self.has_mte_insn_reg() {
+            return false;
+        }
+        let addr = self.read_cpu_reg_sp(a.rn, true);
+        if a.p == 0 {
+            // pre-index or signed offset
+            self.f().gen_addi_i64(addr, addr, i64::from(a.imm));
+        }
+        self.f().gen_andi_i64(addr, addr, -(TAG_GRANULE as i64));
+        let rt = self.reg(a.rt);
+        if self.d.ata[0] {
+            let env = self.env();
+            self.call(&mte::LDG, Some(rt.into()), &[env.into(), addr.into(), rt.into()]);
+        } else {
+            // Tag access disabled: we must check for aborts on the load from [rn+offset],
+            // and then insert a 0 tag into rt.
+            let clean = self.clean_data_tbi(addr);
+            self.gen_probe_access(clean, false, 1);
+            self.address_with_allocation_tag0(rt, rt);
+        }
+        self.set_reg(a.rt, rt);
+        if a.w != 0 {
+            // pre-index or post-index
+            if a.p != 0 {
+                // post-index
+                self.f().gen_addi_i64(addr, addr, i64::from(a.imm));
+            }
+            self.set_reg_sp(a.rn, addr);
+        }
+        true
+    }
+
+    fn trans_STG(&mut self, a: &mut arg_ldst_tag) -> bool {
+        self.do_stg(a, false, false)
+    }
+
+    fn trans_STZG(&mut self, a: &mut arg_ldst_tag) -> bool {
+        self.do_stg(a, true, false)
+    }
+
+    fn trans_ST2G(&mut self, a: &mut arg_ldst_tag) -> bool {
+        self.do_stg(a, false, true)
+    }
+
+    fn trans_STZ2G(&mut self, a: &mut arg_ldst_tag) -> bool {
+        self.do_stg(a, true, true)
+    }
+
+    fn trans_ADDG_i(&mut self, a: &mut arg_rri_tag) -> bool {
+        self.add_sub_imm_with_tags(a, false)
+    }
+
+    fn trans_SUBG_i(&mut self, a: &mut arg_rri_tag) -> bool {
+        self.add_sub_imm_with_tags(a, true)
+    }
+
+    fn trans_SUBP(&mut self, a: &mut arg_rrr) -> bool {
+        self.do_subp(a, false)
+    }
+
+    fn trans_SUBPS(&mut self, a: &mut arg_rrr) -> bool {
+        self.do_subp(a, true)
+    }
+
+    fn trans_IRG(&mut self, a: &mut arg_rrr) -> bool {
+        if !self.has_mte_insn_reg() {
+            return false;
+        }
+        let rn = self.reg_sp(a.rn);
+        let rd = self.new64();
+        if self.d.ata[0] {
+            let rm = self.reg(a.rm);
+            let env = self.env();
+            self.call(&mte::IRG, Some(rd.into()), &[env.into(), rn.into(), rm.into()]);
+        } else {
+            self.address_with_allocation_tag0(rd, rn);
+        }
+        self.set_reg_sp(a.rd, rd);
+        true
+    }
+
+    fn trans_GMI(&mut self, a: &mut arg_rrr) -> bool {
+        if !self.has_mte_insn_reg() {
+            return false;
+        }
+        let rn = self.reg_sp(a.rn);
+        let rm = self.reg(a.rm);
+        let t = self.new64();
+        let one = self.c64(1);
+        let f = self.f();
+        f.gen_extract_i64(t, rn, 56, 4);
+        f.gen_shl_i64(t, one, t);
+        f.gen_or_i64(t, rm, t);
+        self.set_reg(a.rd, t);
+        true
+    }
+
     // Load/store pair
 
     fn trans_STP(&mut self, a: &mut arg_ldstpair) -> bool {
         let offset = i64::from(a.imm) << a.sz;
-        let (dirty, clean) = self.addr_imm_pre(a.rn, offset, a.p != 0);
-        let rt = self.reg(a.rt);
-        let rt2 = self.reg(a.rt2);
         // The single paired access, aligned to the element size when SCTLR.A is set.
         let mut mop = MemOp((a.sz + 1) as u32);
         if self.d.align_mem {
             mop = mop | if a.sz == 2 { MemOp::ALIGN_4 } else { MemOp::ALIGN_8 };
         }
         let mop = self.finalize_memop_atom(mop, MemOp::ATOM_IFALIGN_PAIR);
+        let dirty = self.addr_imm_dirty(a.rn, offset, a.p != 0);
+        let tag_checked = a.w != 0 || a.rn != 31;
+        let clean = self.mte_check_n(dirty, true, tag_checked, 2 << a.sz, mop);
+        let rt = self.reg(a.rt);
+        let rt2 = self.reg(a.rt2);
         let idx = self.get_mem_index();
         if a.sz == 2 {
             let tmp = self.new64();
@@ -2018,7 +2760,6 @@ impl DisasA64 for S<'_, '_> {
 
     fn trans_LDP(&mut self, a: &mut arg_ldstpair) -> bool {
         let offset = i64::from(a.imm) << a.sz;
-        let (dirty, clean) = self.addr_imm_pre(a.rn, offset, a.p != 0);
         // This treats sign-extending loads like zero-extending loads, since that reuses the
         // most code below.
         let mut mop = MemOp((a.sz + 1) as u32);
@@ -2026,6 +2767,9 @@ impl DisasA64 for S<'_, '_> {
             mop = mop | if a.sz == 2 { MemOp::ALIGN_4 } else { MemOp::ALIGN_8 };
         }
         let mop = self.finalize_memop_atom(mop, MemOp::ATOM_IFALIGN_PAIR);
+        let dirty = self.addr_imm_dirty(a.rn, offset, a.p != 0);
+        let tag_checked = a.w != 0 || a.rn != 31;
+        let clean = self.mte_check_n(dirty, false, tag_checked, 2 << a.sz, mop);
         let idx = self.get_mem_index();
         let rt = self.new64();
         let rt2 = self.new64();
@@ -2057,7 +2801,9 @@ impl DisasA64 for S<'_, '_> {
         let mop = self.finalize_memop(MemOp(a.sz as u32));
         let memidx = self.user_mem_index(a.unpriv != 0);
         let imm = i64::from(a.imm);
-        let (dirty, clean) = self.addr_imm_pre(a.rn, imm, a.p != 0);
+        let dirty = self.addr_imm_dirty(a.rn, imm, a.p != 0);
+        let tag_checked = a.w != 0 || a.rn != 31;
+        let clean = self.mte_check1_mmuidx(dirty, true, tag_checked, mop, a.unpriv != 0, memidx);
         let rt = self.reg(a.rt);
         self.f().gen_qemu_st_i64(rt, clean, memidx, mop);
         self.addr_imm_post(a.rn, dirty, imm, a.w != 0, a.p != 0);
@@ -2068,7 +2814,10 @@ impl DisasA64 for S<'_, '_> {
         let mop = self.finalize_memop(MemOp((a.sz + 8 * a.sign) as u32));
         let memidx = self.user_mem_index(a.unpriv != 0);
         let imm = i64::from(a.imm);
-        let (dirty, clean) = self.addr_imm_pre(a.rn, imm, a.p != 0);
+        let dirty = self.addr_imm_dirty(a.rn, imm, a.p != 0);
+        let tag_checked = a.w != 0 || a.rn != 31;
+        let unpriv = a.unpriv != 0;
+        let clean = self.mte_check1_mmuidx(dirty, false, tag_checked, mop, unpriv, memidx);
         let t = self.gpr_ld(clean, mop, a.ext != 0, memidx);
         self.set_reg(a.rt, t);
         self.addr_imm_post(a.rn, dirty, imm, a.w != 0, a.p != 0);
@@ -2082,7 +2831,7 @@ impl DisasA64 for S<'_, '_> {
             return false;
         }
         let mop = self.finalize_memop(MemOp(a.sz as u32));
-        let clean = self.addr_reg(a);
+        let clean = self.addr_reg(a, true, mop);
         let rt = self.reg(a.rt);
         let idx = self.get_mem_index();
         self.f().gen_qemu_st_i64(rt, clean, idx, mop);
@@ -2094,7 +2843,7 @@ impl DisasA64 for S<'_, '_> {
             return false;
         }
         let mop = self.finalize_memop(MemOp((a.sz + 8 * a.sign) as u32));
-        let clean = self.addr_reg(a);
+        let clean = self.addr_reg(a, false, mop);
         let idx = self.get_mem_index();
         let t = self.gpr_ld(clean, mop, a.ext != 0, idx);
         self.set_reg(a.rt, t);
@@ -2146,7 +2895,7 @@ impl DisasA64 for S<'_, '_> {
         }
         let mop = self.check_ordered_align(MemOp(a.sz as u32));
         let dirty = self.reg_sp(a.rn);
-        let clean = self.clean_data_tbi(dirty);
+        let clean = self.mte_check1(dirty, false, a.rn != 31, mop);
         let idx = self.get_mem_index();
         // LDAPR* are a special case because they are a simple load, not a
         // fetch-and-do-something op. The architectural consistency requirements here are
@@ -2511,6 +3260,10 @@ impl TranslatorOps for DisasContext {
         self.e2h = flags & TB_E2H != 0;
         self.sve_excp_el = (flags >> TB_SVEEXC_EL_SHIFT) & 3;
         self.vl = (((flags >> TB_VL_SHIFT) & 0xf) + 1) * 16;
+        self.pauth_active = flags & TB_PAUTH_ACTIVE != 0;
+        self.ata = [flags & TB_ATA != 0, flags & TB_ATA0 != 0];
+        self.mte_active = [flags & TB_MTE_ACTIVE != 0, flags & TB_MTE0_ACTIVE != 0];
+        self.tcma = (flags >> TB_TCMA_SHIFT) & 3;
 
         // Bound the number of insns to execute to those left on the page.
         let bound = (db.pc_first | !0xfff).wrapping_neg() / 4;

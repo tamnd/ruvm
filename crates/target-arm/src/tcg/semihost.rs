@@ -375,7 +375,7 @@ pub(crate) fn handle(arm: &Arm, sh: &Semihosting, cpu: &mut Cpu<'_>) {
         st.xregs[0] = ret;
     }
     st.pc = st.pc.wrapping_add(4);
-    st.store(cpu.env);
+    super::commit(cpu, &mut st);
     if matches!(nr, SYS_EXIT | SYS_EXIT_EXTENDED) || (ret.is_none() && !is_known(nr)) {
         arm.cpu_off(cpu);
     }

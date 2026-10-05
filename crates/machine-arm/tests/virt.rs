@@ -192,8 +192,16 @@ fn parse(blob: &[u8]) -> Vec<Node> {
     out
 }
 
-/// The nodes QEMU's dumps have for devices the board does not model.
-const MISSING: [&str; 4] = ["/flash@0", "/pcie@10000000", "/pl061@9030000", "/gpio-keys"];
+/// The nodes QEMU's dumps have for devices the board does not model: PCIe, the PL061 with
+/// its key, and the secure PL061 of `secure=on` with its poweroff and restart lines.
+const MISSING: [&str; 6] = [
+    "/pcie@10000000",
+    "/pl061@9030000",
+    "/gpio-keys",
+    "/pl061@90b0000",
+    "/gpio-poweroff",
+    "/gpio-restart",
+];
 
 fn strip(nodes: Vec<Node>) -> Vec<Node> {
     nodes
@@ -254,6 +262,78 @@ fn dtb_a76_smp20_matches_qemu() {
     compare_with_qemu(cfg, "virt-a76-smp20.dtb.gz");
 }
 
+/// A chardev that drops what it is given.
+struct NullSerial;
+
+impl ruvm_hw_char::serial::SerialBackend for NullSerial {
+    fn write(&self, bytes: &[u8]) -> usize {
+        bytes.len()
+    }
+}
+
+#[test]
+fn dtb_max_el2_el3_matches_qemu() {
+    // EL3 without firmware: the CPUs start in EL3, so the SMC conduit is disabled and there
+    // is no /psci, but the CPU nodes still say psci. The secure UART, RAM and flash appear.
+    let mut cfg = VirtConfig::new(model("max"));
+    cfg.smp = 2;
+    cfg.virtualization = true;
+    cfg.secure = true;
+    compare_with_qemu(cfg, "virt-max-el2-el3.dtb.gz");
+}
+
+#[test]
+fn dtb_a57_el2_serial2_matches_qemu() {
+    // EL2: PSCI through SMC, the GIC maintenance interrupt, and a second -serial adds the
+    // non-secure UART1 before UART0.
+    let mut cfg = VirtConfig::new(model("cortex-a57"));
+    cfg.smp = 2;
+    cfg.virtualization = true;
+    cfg.serial1 = Some(Arc::new(NullSerial));
+    compare_with_qemu(cfg, "virt-a57-el2-serial2.dtb.gz");
+}
+
+#[test]
+fn dtb_max_secure_bios_matches_qemu() {
+    // secure=on with firmware: PSCI is the firmware's, so no enable-method either.
+    let bios = TmpFile::new("secbios", "bios.fd", &[0; 4096]);
+    let mut cfg = VirtConfig::new(model("max"));
+    cfg.smp = 2;
+    cfg.secure = true;
+    cfg.firmware = Some(bios.path());
+    compare_with_qemu(cfg, "virt-max-secure-bios.dtb.gz");
+}
+
+#[test]
+fn bios_goes_into_flash0() {
+    let image: Vec<u8> = (0..8192u32).map(|i| (i * 7) as u8).collect();
+    let bios = TmpFile::new("bios", "bios.fd", &image);
+    let mut cfg = a57();
+    cfg.firmware = Some(bios.path());
+    let mut m = VirtMachine::new(cfg).unwrap();
+    m.machine_done().unwrap();
+    assert_eq!(read(&m, 0, image.len()), image);
+    // The rest of the flash reads as erased, zeros for the virt flash, and so does flash1.
+    assert_eq!(read(&m, image.len() as u64, 16), [0; 16]);
+    assert_eq!(read(&m, 0x0400_0000, 16), [0; 16]);
+    // Firmware boot: the vCPUs start at 0.
+    assert!(!m.boot_info().direct);
+
+    let mut cfg = a57();
+    cfg.firmware = Some("/nonexistent/ruvm.fd".to_string());
+    assert_eq!(
+        VirtMachine::new(cfg).unwrap_err(),
+        "Could not find ROM image '/nonexistent/ruvm.fd'"
+    );
+    let big = TmpFile::new("bigbios", "bios.fd", &vec![0; 64 * MIB as usize + 1]);
+    let mut cfg = a57();
+    cfg.firmware = Some(big.path());
+    assert_eq!(
+        VirtMachine::new(cfg).unwrap_err(),
+        format!("Could not load ROM image '{}'", big.path())
+    );
+}
+
 #[test]
 fn user_dtb_matches_qemu_byte_for_byte() {
     let image = TmpFile::new("userdtb", "Image", &fake_image(0x20000));
@@ -285,9 +365,16 @@ fn memory_map() {
     m.machine_done().unwrap();
     // RAM.
     let ram = m.ram_ranges();
-    assert_eq!(ram.len(), 1);
-    assert_eq!((ram[0].addr, ram[0].size), (VIRT_MEM, 128 * MIB));
-    assert_eq!(ram[0].block.name(), "mach-virt.ram");
+    let names: Vec<_> =
+        ram.iter().map(|r| (r.addr, r.size, r.block.name().to_string(), r.rom_device)).collect();
+    assert_eq!(
+        names,
+        [
+            (0, 64 * MIB, "virt.flash0".to_string(), true),
+            (0x0400_0000, 64 * MIB, "virt.flash1".to_string(), true),
+            (VIRT_MEM, 128 * MIB, "mach-virt.ram".to_string(), false),
+        ]
+    );
     // GICD_PIDR2: architecture revision 3.
     assert_eq!(r32(&m, VIRT_GIC_DIST + 0xffe8), 0x3b);
     // The PrimeCell IDs of the PL011 and the PL031.

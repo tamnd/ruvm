@@ -8,9 +8,11 @@
 use ruvm_target_arm::cpu::ArmCpuModel;
 
 use super::{
-    VIRT_FW_CFG, VIRT_FW_CFG_SIZE, VIRT_GIC_DIST, VIRT_GIC_REDIST, VIRT_GIC_REDIST_SIZE, VIRT_MMIO,
-    VIRT_MMIO_IRQ, VIRT_MMIO_SIZE, VIRT_PLATFORM_BUS, VIRT_PLATFORM_BUS_SIZE, VIRT_RTC,
-    VIRT_RTC_IRQ, VIRT_RTC_SIZE, VIRT_UART, VIRT_UART_IRQ, VIRT_UART_SIZE, VIRTIO_TRANSPORTS,
+    VIRT_FLASH, VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE, VIRT_GIC_DIST, VIRT_GIC_REDIST,
+    VIRT_GIC_REDIST_SIZE, VIRT_MMIO, VIRT_MMIO_IRQ, VIRT_MMIO_SIZE, VIRT_PLATFORM_BUS,
+    VIRT_PLATFORM_BUS_SIZE, VIRT_RTC, VIRT_RTC_IRQ, VIRT_RTC_SIZE, VIRT_SECURE_MEM,
+    VIRT_SECURE_MEM_SIZE, VIRT_UART, VIRT_UART_IRQ, VIRT_UART_SIZE, VIRT_UART1, VIRT_UART1_IRQ,
+    VIRTIO_TRANSPORTS,
 };
 use crate::fdt::{Fdt, sized_cells};
 use ruvm_hw_intc::gicv3::GICV3_DIST_SIZE;
@@ -29,6 +31,10 @@ const ARCH_TIMER_S_EL1_IRQ: u32 = 13;
 const ARCH_TIMER_NS_EL1_IRQ: u32 = 14;
 const ARCH_TIMER_VIRT_IRQ: u32 = 11;
 const ARCH_TIMER_NS_EL2_IRQ: u32 = 10;
+/// `ARCH_TIMER_NS_EL2_VIRT_IRQ` as a PPI number.
+const ARCH_TIMER_NS_EL2_VIRT_IRQ: u32 = 12;
+/// `ARCH_GIC_MAINT_IRQ` as a PPI number.
+const ARCH_GIC_MAINT_IRQ: u32 = 9;
 /// `ARM_AFF3_MASK`.
 const ARM_AFF3_MASK: u64 = 0xff << 32;
 /// `CLIDR_CTYPE_MAX_CACHE_LEVEL`, also the mask of one Ctype field.
@@ -50,8 +56,8 @@ pub(crate) fn setprop_sized_cells(
 }
 
 /// `create_fdt()`. Returns the clock phandle. `dtb-randomness` is off: no `kaslr-seed` and
-/// no `rng-seed`.
-pub(crate) fn create_fdt(fdt: &mut Fdt) -> Result<u32, String> {
+/// no `rng-seed`. `secure` is `secure=on`, which adds `/secure-chosen`.
+pub(crate) fn create_fdt(fdt: &mut Fdt, secure: bool) -> Result<u32, String> {
     fdt.setprop_string("/", "compatible", "linux,dummy-virt")?;
     fdt.setprop_cell("/", "#address-cells", 0x2)?;
     fdt.setprop_cell("/", "#size-cells", 0x2)?;
@@ -61,6 +67,9 @@ pub(crate) fn create_fdt(fdt: &mut Fdt) -> Result<u32, String> {
 
     // /chosen must exist for load_dtb to fill in necessary properties later.
     fdt.add_subnode("/chosen")?;
+    if secure {
+        fdt.add_subnode("/secure-chosen")?;
+    }
     // /aliases is filled in by the devices.
     fdt.add_subnode("/aliases")?;
 
@@ -77,30 +86,25 @@ pub(crate) fn create_fdt(fdt: &mut Fdt) -> Result<u32, String> {
     Ok(clock)
 }
 
-/// `fdt_add_timer_nodes()` for a GICv3, without the EL2 virtual timer.
-pub(crate) fn add_timer_nodes(fdt: &mut Fdt) -> Result<(), String> {
+/// `fdt_add_timer_nodes()` for a GICv3. `ns_el2_virt_timer_irq` adds the EL2 virtual timer,
+/// which a CPU with EL2 and FEAT_VHE has.
+pub(crate) fn add_timer_nodes(fdt: &mut Fdt, ns_el2_virt_timer_irq: bool) -> Result<(), String> {
     let irqflags = GIC_FDT_IRQ_FLAGS_LEVEL_HI;
     fdt.add_subnode("/timer")?;
     fdt.setprop("/timer", "compatible", b"arm,armv8-timer\0arm,armv7-timer\0")?;
     fdt.setprop("/timer", "always-on", &[])?;
-    fdt.setprop_cells(
-        "/timer",
-        "interrupts",
-        &[
-            GIC_FDT_IRQ_TYPE_PPI,
-            ARCH_TIMER_S_EL1_IRQ,
-            irqflags,
-            GIC_FDT_IRQ_TYPE_PPI,
-            ARCH_TIMER_NS_EL1_IRQ,
-            irqflags,
-            GIC_FDT_IRQ_TYPE_PPI,
-            ARCH_TIMER_VIRT_IRQ,
-            irqflags,
-            GIC_FDT_IRQ_TYPE_PPI,
-            ARCH_TIMER_NS_EL2_IRQ,
-            irqflags,
-        ],
-    )
+    let mut ppis = vec![
+        ARCH_TIMER_S_EL1_IRQ,
+        ARCH_TIMER_NS_EL1_IRQ,
+        ARCH_TIMER_VIRT_IRQ,
+        ARCH_TIMER_NS_EL2_IRQ,
+    ];
+    if ns_el2_virt_timer_irq {
+        ppis.push(ARCH_TIMER_NS_EL2_VIRT_IRQ);
+    }
+    let cells: Vec<u32> =
+        ppis.iter().flat_map(|&ppi| [GIC_FDT_IRQ_TYPE_PPI, ppi, irqflags]).collect();
+    fdt.setprop_cells("/timer", "interrupts", &cells)
 }
 
 /// `CPUCoreCaches`.
@@ -211,9 +215,45 @@ pub(crate) fn add_cpu_nodes(
     Ok(())
 }
 
-/// `fdt_add_gic_node()` for a GICv3 with one redistributor region and no ITS. Returns the GIC
-/// phandle.
-pub(crate) fn add_gic_node(fdt: &mut Fdt) -> Result<u32, String> {
+/// `virt_flash_fdt()`. Without a separate secure address space (`secure=off`) both flashes
+/// are one node; with `secure=on` the first is marked as for the secure world only.
+pub(crate) fn virt_flash_fdt(fdt: &mut Fdt, secure: bool) -> Result<(), String> {
+    let flashsize = VIRT_FLASH_SIZE / 2;
+    let flashbase = VIRT_FLASH;
+    if !secure {
+        // Report both flash devices as a single node in the DT.
+        let nodename = format!("/flash@{flashbase:x}");
+        fdt.add_subnode(&nodename)?;
+        fdt.setprop_string(&nodename, "compatible", "cfi-flash")?;
+        setprop_sized_cells(
+            fdt,
+            &nodename,
+            "reg",
+            &[(2, flashbase), (2, flashsize), (2, flashbase + flashsize), (2, flashsize)],
+        )?;
+        fdt.setprop_cell(&nodename, "bank-width", 4)
+    } else {
+        // Report the devices as separate nodes so we can mark one as only visible to the
+        // secure world.
+        let nodename = format!("/secflash@{flashbase:x}");
+        fdt.add_subnode(&nodename)?;
+        fdt.setprop_string(&nodename, "compatible", "cfi-flash")?;
+        setprop_sized_cells(fdt, &nodename, "reg", &[(2, flashbase), (2, flashsize)])?;
+        fdt.setprop_cell(&nodename, "bank-width", 4)?;
+        fdt.setprop_string(&nodename, "status", "disabled")?;
+        fdt.setprop_string(&nodename, "secure-status", "okay")?;
+
+        let nodename = format!("/flash@{:x}", flashbase + flashsize);
+        fdt.add_subnode(&nodename)?;
+        fdt.setprop_string(&nodename, "compatible", "cfi-flash")?;
+        setprop_sized_cells(fdt, &nodename, "reg", &[(2, flashbase + flashsize), (2, flashsize)])?;
+        fdt.setprop_cell(&nodename, "bank-width", 4)
+    }
+}
+
+/// `fdt_add_gic_node()` for a GICv3 with one redistributor region and no ITS. `virt` is
+/// `virtualization=on`, which describes the maintenance interrupt. Returns the GIC phandle.
+pub(crate) fn add_gic_node(fdt: &mut Fdt, virt: bool) -> Result<u32, String> {
     let gic = fdt.alloc_phandle();
     fdt.setprop_cell("/", "interrupt-parent", gic)?;
 
@@ -237,26 +277,69 @@ pub(crate) fn add_gic_node(fdt: &mut Fdt) -> Result<u32, String> {
             (2, VIRT_GIC_REDIST_SIZE),
         ],
     )?;
+    if virt {
+        fdt.setprop_cells(
+            &nodename,
+            "interrupts",
+            &[GIC_FDT_IRQ_TYPE_PPI, ARCH_GIC_MAINT_IRQ, GIC_FDT_IRQ_FLAGS_LEVEL_HI],
+        )?;
+    }
     fdt.setprop_cell(&nodename, "phandle", gic)?;
     Ok(gic)
 }
 
-/// The FDT part of `create_uart()` for the non-secure UART0.
-pub(crate) fn create_uart(fdt: &mut Fdt, clock: u32) -> Result<(), String> {
-    let nodename = format!("/pl011@{VIRT_UART:x}");
+/// Which UART [`create_uart`] describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Uart {
+    /// `VIRT_UART0`, the console.
+    Uart0,
+    /// `VIRT_UART1`, for the normal world (`-serial` given twice without `secure=on`).
+    Uart1,
+    /// `VIRT_UART1` for the secure world only, with `secure=on`.
+    SecureUart1,
+}
+
+/// The FDT part of `create_uart()`.
+pub(crate) fn create_uart(fdt: &mut Fdt, clock: u32, uart: Uart) -> Result<(), String> {
+    let (base, size, irq) = match uart {
+        Uart::Uart0 => (VIRT_UART, VIRT_UART_SIZE, VIRT_UART_IRQ),
+        Uart::Uart1 | Uart::SecureUart1 => (VIRT_UART1, VIRT_UART_SIZE, VIRT_UART1_IRQ),
+    };
+    let nodename = format!("/pl011@{base:x}");
     fdt.add_subnode(&nodename)?;
     // Note that we can't use setprop_string because of the embedded NUL.
     fdt.setprop(&nodename, "compatible", b"arm,pl011\0arm,primecell\0")?;
-    setprop_sized_cells(fdt, &nodename, "reg", &[(2, VIRT_UART), (2, VIRT_UART_SIZE)])?;
+    setprop_sized_cells(fdt, &nodename, "reg", &[(2, base), (2, size)])?;
     fdt.setprop_cells(
         &nodename,
         "interrupts",
-        &[GIC_FDT_IRQ_TYPE_SPI, VIRT_UART_IRQ, GIC_FDT_IRQ_FLAGS_LEVEL_HI],
+        &[GIC_FDT_IRQ_TYPE_SPI, irq, GIC_FDT_IRQ_FLAGS_LEVEL_HI],
     )?;
     fdt.setprop_cells(&nodename, "clocks", &[clock, clock])?;
     fdt.setprop(&nodename, "clock-names", b"uartclk\0apb_pclk\0")?;
-    fdt.setprop_string("/chosen", "stdout-path", &nodename)?;
-    fdt.setprop_string("/aliases", "serial0", &nodename)
+    if uart == Uart::Uart0 {
+        fdt.setprop_string("/chosen", "stdout-path", &nodename)?;
+        fdt.setprop_string("/aliases", "serial0", &nodename)?;
+    } else {
+        fdt.setprop_string("/aliases", "serial1", &nodename)?;
+    }
+    if uart == Uart::SecureUart1 {
+        // Mark as not usable by the normal world.
+        fdt.setprop_string(&nodename, "status", "disabled")?;
+        fdt.setprop_string(&nodename, "secure-status", "okay")?;
+        fdt.setprop_string("/secure-chosen", "stdout-path", &nodename)?;
+    }
+    Ok(())
+}
+
+/// The FDT part of `create_secure_ram()`.
+pub(crate) fn create_secure_ram(fdt: &mut Fdt) -> Result<(), String> {
+    let nodename = format!("/secram@{VIRT_SECURE_MEM:x}");
+    fdt.add_subnode(&nodename)?;
+    fdt.setprop_string(&nodename, "device_type", "memory")?;
+    setprop_sized_cells(fdt, &nodename, "reg", &[(2, VIRT_SECURE_MEM), (2, VIRT_SECURE_MEM_SIZE)])?;
+    fdt.setprop_string(&nodename, "status", "disabled")?;
+    fdt.setprop_string(&nodename, "secure-status", "okay")
 }
 
 /// The FDT part of `create_rtc()`.

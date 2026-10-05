@@ -142,6 +142,48 @@ pub const fn syn_pcalignment() -> u32 {
     (EC_PCALIGNMENT << EC_SHIFT) | IL
 }
 
+/// `EC_PACTRAP`.
+pub const EC_PACTRAP: u32 = 0x09;
+/// `EC_PACFAIL`.
+pub const EC_PACFAIL: u32 = 0x1c;
+/// `EC_GPC`.
+pub const EC_GPC: u32 = 0x1e;
+
+/// `syn_pactrap()`: a PAuth instruction trapped by HCR_EL2.API or SCR_EL3.API.
+pub const fn syn_pactrap() -> u32 {
+    (EC_PACTRAP << EC_SHIFT) | IL
+}
+
+/// `syn_pacfail()`: a failed authentication with FEAT_FPAC, `data` for a data key and
+/// `keynumber` 1 for a B key.
+pub const fn syn_pacfail(data: bool, keynumber: u32) -> u32 {
+    (EC_PACFAIL << EC_SHIFT) | IL | ((data as u32) << 1) | (keynumber & 1)
+}
+
+/// `syn_gpc()`: a granule protection check fault taken to EL3.
+#[allow(clippy::too_many_arguments)]
+pub const fn syn_gpc(
+    s2ptw: bool,
+    ind: bool,
+    gpcsc: u32,
+    vncr: bool,
+    cm: bool,
+    s1ptw: bool,
+    wnr: bool,
+    fsc: u32,
+) -> u32 {
+    (EC_GPC << EC_SHIFT)
+        | IL
+        | ((s2ptw as u32) << 21)
+        | ((ind as u32) << 20)
+        | ((gpcsc & 0x3f) << 14)
+        | ((vncr as u32) << 13)
+        | ((cm as u32) << 8)
+        | ((s1ptw as u32) << 7)
+        | ((wnr as u32) << 6)
+        | (fsc & 0x3f)
+}
+
 /// Fault status codes in the long descriptor format (`ARMFaultType` as reported by
 /// `arm_fi_to_lfsc()`).
 pub mod fsc {

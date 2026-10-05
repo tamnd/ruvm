@@ -586,10 +586,11 @@ fn psci_through_the_conduit() {
     let (st, _) = run(PsciConduit::Hvc, a57(), [0x8400_0006, 0, 0, 0], hvc(0));
     assert_eq!(st.xregs[20], 2);
 
-    // A function ID that is not PSCI is an ordinary HVC: UNDEFINED without EL2.
-    let (st, _) = run(PsciConduit::Hvc, a57(), [0x1234, 0, 0, 0], hvc(0));
-    assert_vector(&st, 1, CUR_SYNC);
-    assert_eq!(st.esr_el[1], ESR_UNDEF);
+    // Any other function ID on the conduit (here SMCCC_VERSION, which UEFI probes) is
+    // NOT_SUPPORTED too, rather than an ordinary HVC, as in QEMU 11.1.
+    let (st, _) = run(PsciConduit::Hvc, a57(), [0x8000_0000, 0, 0, 0], hvc(0));
+    assert_eq!(st.xregs[20] as i64, -1);
+    assert_eq!(st.pc, CODE + 0x14);
 
     // The other conduit is not PSCI: SMC without EL3 is UNDEFINED.
     let (st, _) = run(PsciConduit::Hvc, a57(), [0x8400_0000, 0, 0, 0], smc(0));

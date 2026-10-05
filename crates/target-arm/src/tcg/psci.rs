@@ -4,8 +4,8 @@
 //! the virt board turns on (through the `psci-conduit` property, here
 //! [`Arm::with_psci`](super::Arm::with_psci)) when no guest firmware runs at EL3 or EL2.
 //!
-//! An HVC or SMC on the conduit with a PSCI function ID in X0 is handled here instead of
-//! being taken as an exception; the result goes to X0 and execution continues after the
+//! An HVC or SMC on the conduit is handled here instead of being taken as an exception
+//! (QEMU 11.1 takes every function ID, answering NOT_SUPPORTED to the ones it lacks); the result goes to X0 and execution continues after the
 //! instruction. The calls that reach the rest of the machine go through
 //! [`ArmBoard`](super::ArmBoard), standing in for QEMU's `arm_set_cpu_on()`,
 //! `arm_get_cpu_by_id()` and the system reset and shutdown requests.
@@ -25,7 +25,6 @@ const FN01_BASE: u64 = 0x95c1_ba5e;
 const FN01_CPU_SUSPEND: u64 = FN01_BASE;
 const FN01_CPU_OFF: u64 = FN01_BASE + 1;
 const FN01_CPU_ON: u64 = FN01_BASE + 2;
-const FN01_MIGRATE: u64 = FN01_BASE + 3;
 /// `QEMU_PSCI_0_2_FN_BASE`.
 const FN_BASE: u64 = 0x8400_0000;
 const FN_PSCI_VERSION: u64 = FN_BASE;
@@ -33,17 +32,13 @@ const FN_CPU_SUSPEND: u64 = FN_BASE + 1;
 const FN_CPU_OFF: u64 = FN_BASE + 2;
 const FN_CPU_ON: u64 = FN_BASE + 3;
 const FN_AFFINITY_INFO: u64 = FN_BASE + 4;
-const FN_MIGRATE: u64 = FN_BASE + 5;
 const FN_MIGRATE_INFO_TYPE: u64 = FN_BASE + 6;
-const FN_MIGRATE_INFO_UP_CPU: u64 = FN_BASE + 7;
 const FN_SYSTEM_OFF: u64 = FN_BASE + 8;
 const FN_SYSTEM_RESET: u64 = FN_BASE + 9;
 const FN_PSCI_FEATURES: u64 = FN_BASE + 10;
 const FN64_CPU_SUSPEND: u64 = FN_CPU_SUSPEND | PSCI_64BIT;
 const FN64_CPU_ON: u64 = FN_CPU_ON | PSCI_64BIT;
 const FN64_AFFINITY_INFO: u64 = FN_AFFINITY_INFO | PSCI_64BIT;
-const FN64_MIGRATE: u64 = FN_MIGRATE | PSCI_64BIT;
-const FN64_MIGRATE_INFO_UP_CPU: u64 = FN_MIGRATE_INFO_UP_CPU | PSCI_64BIT;
 
 /// `QEMU_PSCI_VERSION_1_1`.
 const PSCI_VERSION_1_1: i64 = 0x10001;
@@ -73,34 +68,15 @@ pub const PSCI_OFF: u32 = 1;
 pub const PSCI_ON_PENDING: u32 = 2;
 
 /// `arm_is_psci_call()`: whether the exception `excp` is a PSCI call on the conduit.
-pub(crate) fn is_psci_call(arm: &Arm, cpu: &Cpu<'_>, excp: i32) -> bool {
-    match (arm.psci_conduit(), excp) {
-        (PsciConduit::Hvc, EXCP_HVC) | (PsciConduit::Smc, EXCP_SMC) => {}
-        _ => return false,
-    }
-    let param = CpuArmState::load(cpu.env).xregs[0];
+pub(crate) fn is_psci_call(arm: &Arm, excp: i32) -> bool {
+    // Return true if the exception type matches the configured PSCI conduit. This is called
+    // before the SMC/HVC instruction is executed, to decide whether we should treat it as a
+    // PSCI call or with the architecturally defined behaviour for an SMC or HVC (which might
+    // be UNDEF or trap to EL2 or to EL3). Every function ID is then a PSCI call: the ones
+    // PSCI does not have (the SMCCC and TRNG calls firmware probes) return NOT_SUPPORTED.
     matches!(
-        param,
-        FN_PSCI_VERSION
-            | FN_MIGRATE_INFO_TYPE
-            | FN_PSCI_FEATURES
-            | FN_SYSTEM_RESET
-            | FN_SYSTEM_OFF
-            | FN_CPU_ON
-            | FN64_CPU_ON
-            | FN_CPU_OFF
-            | FN_CPU_SUSPEND
-            | FN64_CPU_SUSPEND
-            | FN_AFFINITY_INFO
-            | FN64_AFFINITY_INFO
-            | FN_MIGRATE
-            | FN64_MIGRATE
-            | FN_MIGRATE_INFO_UP_CPU
-            | FN64_MIGRATE_INFO_UP_CPU
-            | FN01_CPU_SUSPEND
-            | FN01_CPU_OFF
-            | FN01_CPU_ON
-            | FN01_MIGRATE
+        (arm.psci_conduit(), excp),
+        (PsciConduit::Hvc, EXCP_HVC) | (PsciConduit::Smc, EXCP_SMC)
     )
 }
 
@@ -167,7 +143,7 @@ pub(crate) fn handle_psci_call(arm: &Arm, cpu: &mut Cpu<'_>) {
             } else {
                 // Powerdown is not supported, we always go into WFI.
                 st.xregs[0] = 0;
-                st.store(cpu.env);
+                super::commit(cpu, &mut st);
                 if !cpu.has_work() {
                     cpu.core.shared().set_interrupt(interrupt::HALT);
                 }
@@ -176,12 +152,13 @@ pub(crate) fn handle_psci_call(arm: &Arm, cpu: &mut Cpu<'_>) {
         }
         FN_PSCI_FEATURES => match param[1] {
             FN_PSCI_VERSION | FN_MIGRATE_INFO_TYPE | FN_AFFINITY_INFO | FN64_AFFINITY_INFO
-            | FN_SYSTEM_RESET | FN_SYSTEM_OFF | FN_CPU_ON | FN64_CPU_ON | FN_CPU_OFF
-            | FN_CPU_SUSPEND | FN64_CPU_SUSPEND | FN_PSCI_FEATURES => 0,
+            | FN_SYSTEM_RESET | FN_SYSTEM_OFF | FN01_CPU_ON | FN_CPU_ON | FN64_CPU_ON
+            | FN01_CPU_OFF | FN_CPU_OFF | FN01_CPU_SUSPEND | FN_CPU_SUSPEND | FN64_CPU_SUSPEND
+            | FN_PSCI_FEATURES => 0,
             _ => PSCI_RET_NOT_SUPPORTED,
         },
         _ => PSCI_RET_NOT_SUPPORTED,
     };
     st.xregs[0] = ret as u64;
-    st.store(cpu.env);
+    super::commit(cpu, &mut st);
 }

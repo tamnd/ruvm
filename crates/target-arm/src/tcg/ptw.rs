@@ -15,6 +15,11 @@
 //!   (52 bit addresses) are not implemented, and neither is FEAT_TTST.
 //! - Secure and Non-secure accesses go to the same address space, and the NS bits of the
 //!   descriptors are ignored.
+//! - With FEAT_RME the granule protection check (`arm_granule_protection_check()`) sees
+//!   the physical address space of the translation regime: Root for EL3, and otherwise
+//!   the one SCR_EL3.NS and NSE select. The NS and NSE bits of the descriptors do not
+//!   change it. As QEMU does, GPCCR_EL3 writes do not flush the TLB, so a granule that
+//!   is already in the TLB is not checked again until the next flush.
 //! - Memory attributes are not combined across the two stages; the stage 1 attributes are
 //!   reported. Stage 2 has no FEAT_S2FWB and no FEAT_XNX (TTS2UXN).
 //! - HCR_EL2.PTW (stage 1 walks to Device memory) never faults, and the stage 1 walk does
@@ -28,11 +33,17 @@ use ruvm_mem::{AddressSpace, Endian, MemTxAttrs, MemTxResult};
 
 use super::{Arm, exception_target_el, regime_el, regime_has_2_ranges};
 use crate::cpu::{
-    ArmFeatures, CpuArmState, EXCP_DATA_ABORT, EXCP_PREFETCH_ABORT, HCR_DC, HCR_TGE, HCR_VM,
-    MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN, MMU_IDX_E20_0, MMU_IDX_E20_2_PAN, SCTLR_M,
-    SCTLR_WXN, pa_range_bits,
+    ArmFeatures, CpuArmState, EXCP_DATA_ABORT, EXCP_GPC, EXCP_PREFETCH_ABORT, HCR_DC, HCR_DCT,
+    HCR_GPF, HCR_TGE, HCR_VM, MMU_IDX_E3, MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN,
+    MMU_IDX_E20_0, MMU_IDX_E20_2_PAN, SCR_GPF, SCR_NS, SCR_NSE, SCTLR_I, SCTLR_M, SCTLR_WXN,
+    pa_range_bits,
 };
-use crate::syndrome::{fsc, syn_data_abort_no_iss, syn_insn_abort};
+use crate::syndrome::{fsc, syn_data_abort_no_iss, syn_gpc, syn_insn_abort};
+
+/// MFAR_EL3.NS.
+const MFAR_NS: u64 = 1 << 63;
+/// MFAR_EL3.NSE.
+const MFAR_NSE: u64 = 1 << 62;
 
 /// A translation fault: the long descriptor fault status code (with the level folded in),
 /// the external abort type, and for stage 2 faults the IPA.
@@ -48,12 +59,68 @@ pub(crate) struct Fault {
     pub(crate) s1ptw: bool,
     /// The faulting IPA of a stage 2 fault (`fi->s2addr`).
     pub(crate) s2addr: u64,
+    /// The granule protection check fault, `fi->gpcf`.
+    pub(crate) gpcf: Option<Gpcf>,
+    /// The level reported in the GPCSC field of a GPC exception (`fi->level`).
+    pub(crate) gpc_level: u32,
+    /// The physical address a granule protection check failed on (`fi->paddr`).
+    pub(crate) paddr: u64,
+    /// The physical address space of `paddr` (`fi->paddr_space`), one of the `SS_`
+    /// constants.
+    pub(crate) paddr_space: u8,
 }
 
 impl Fault {
     pub(crate) fn new(fsc: u32) -> Fault {
-        Fault { fsc, ea: false, stage2: false, s1ptw: false, s2addr: 0 }
+        Fault {
+            fsc,
+            ea: false,
+            stage2: false,
+            s1ptw: false,
+            s2addr: 0,
+            gpcf: None,
+            gpc_level: 0,
+            paddr: 0,
+            paddr_space: 0,
+        }
     }
+}
+
+/// `ARMGPCF`: the kind of a granule protection check fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gpcf {
+    /// `GPCF_AddressSize`: GPTBR_EL3 is beyond the protected physical address size.
+    AddressSize,
+    /// `GPCF_Walk`: an invalid configuration or table entry.
+    Walk,
+    /// `GPCF_Fail`: the granule is not accessible from the address space.
+    Fail,
+    /// `GPCF_EABT`: an external abort reading the table.
+    Eabt,
+}
+
+/// `ARMSS_Secure`.
+pub(crate) const SS_SECURE: u8 = 0;
+/// `ARMSS_NonSecure`.
+pub(crate) const SS_NONSECURE: u8 = 1;
+/// `ARMSS_Root`.
+pub(crate) const SS_ROOT: u8 = 2;
+/// `ARMSS_Realm`.
+pub(crate) const SS_REALM: u8 = 3;
+
+/// The GPCCR_EL3 fields the check reads.
+const GPCCR_GPC: u64 = 1 << 16;
+const GPCCR_GPCBW: u64 = 1 << 29;
+const GPCCR_APPSAA: u64 = 1 << 24;
+const GPCCR_NSO: u64 = 1 << 19;
+
+/// The fault status code of a GPC fault on the output address, `ARMFault_GPCFOnOutput`.
+const FSC_GPCF_ON_OUTPUT: u32 = 0x28;
+
+/// The fault status code of a GPC fault on a table walk at `level`,
+/// `ARMFault_GPCFOnWalk`.
+const fn fsc_gpcf_on_walk(level: u32) -> u32 {
+    0x24 | level
 }
 
 /// A successful translation.
@@ -203,6 +270,20 @@ fn va_parameters(f: &ArmFeatures, tcr: u64, va: u64, mmu_idx: usize, data: bool)
     }
 }
 
+/// The `tsz`, clamped as `aa64_va_parameters()` clamps it, and the `tbi` of the stage 1
+/// regime of `mmu_idx` for `va`: what PAuth needs to find the PAC field.
+pub(crate) fn pauth_va_params(
+    f: &ArmFeatures,
+    st: &CpuArmState,
+    va: u64,
+    mmu_idx: usize,
+    data: bool,
+) -> (u32, bool) {
+    let tcr = st.tcr_el[regime_el(mmu_idx) as usize];
+    let p = va_parameters(f, tcr, va, mmu_idx, data);
+    (p.tsz.clamp(16, 39), p.tbi)
+}
+
 /// Whether a block descriptor is allowed at `level` for the granule (without FEAT_LPA2).
 fn block_level_ok(gran: Gran, level: u32) -> bool {
     match gran {
@@ -229,8 +310,238 @@ impl Walker<'_> {
         pa_range_bits(parange.min(ps)).min(48)
     }
 
-    /// Read a descriptor at `pa`.
-    fn load_desc(&self, pa: u64, level: u32) -> Result<u64, Fault> {
+    /// The physical address space of the translation regime of `mmu_idx`
+    /// (`arm_security_space()` without the descriptor NS bits).
+    fn space_of(&self, mmu_idx: usize) -> u8 {
+        let f = self.feat();
+        if !f.el3 {
+            return SS_NONSECURE;
+        }
+        if mmu_idx == MMU_IDX_E3 {
+            return if f.rme { SS_ROOT } else { SS_SECURE };
+        }
+        let scr = self.st.scr_el3;
+        match (scr & SCR_NSE != 0 && f.rme, scr & SCR_NS != 0) {
+            (true, true) => SS_REALM,
+            (_, true) => SS_NONSECURE,
+            _ => SS_SECURE,
+        }
+    }
+
+    /// The granule protection check of `pa` in `space`, when GPCCR_EL3.GPC is set; the
+    /// fault, if any, carries the `fsc` given.
+    fn gpc(&self, pa: u64, space: u8, fsc: impl FnOnce(&Fault) -> u32) -> Result<(), Fault> {
+        if self.st.gpccr_el3 & GPCCR_GPC == 0 {
+            return Ok(());
+        }
+        match self.granule_protection_check(pa, space, space) {
+            Ok(()) => Ok(()),
+            Err(mut f) => {
+                f.fsc = fsc(&f);
+                Err(f)
+            }
+        }
+    }
+
+    /// `arm_granule_protection_check()`: whether `paddress` in the address space `pspace`
+    /// may be accessed from the security state `ss`, under GPCCR_EL3, GPCBW_EL3 and the
+    /// granule protection table at GPTBR_EL3. GPCCR_EL3.GPC is set.
+    fn granule_protection_check(&self, paddress: u64, pspace: u8, ss: u8) -> Result<(), Fault> {
+        let st = self.st;
+        let gpccr = st.gpccr_el3;
+        let gpcbw = st.gpcbw_el3;
+        let mut level = 0u32;
+        let fault = |gpcf: Gpcf, level: u32| Fault {
+            gpcf: Some(gpcf),
+            gpc_level: level,
+            paddr: paddress,
+            paddr_space: pspace,
+            ..Fault::new(0)
+        };
+        let walk = |level: u32| Err(fault(Gpcf::Walk, level));
+
+        let bw_size_field = extract64(gpcbw, 37, 3);
+        let bw_stride_field = extract64(gpcbw, 32, 5);
+        let bw_addr = extract64(gpcbw, 0, 25) << 30;
+        let mut bw_mask = 0u64;
+
+        // GPC Priority 1: an invalid GPCCR_EL3 is a walk fault at level 0. PPS beyond the
+        // implemented physical address size is invalid.
+        let parange = (self.arm.model().id_aa64mmfr0 & 0xf) as u32;
+        let pps_field = extract64(gpccr, 0, 3) as u32;
+        if pps_field > parange {
+            return walk(0);
+        }
+        let pps = pa_range_bits(pps_field);
+        let pps_mask = if pps >= 64 { !0 } else { (1u64 << pps) - 1 };
+
+        match extract64(gpccr, 12, 2) {
+            // Outer shareable.
+            0b10 => {}
+            // Non-shareable and Inner shareable: Inner and Outer Non-cacheable needs
+            // Outer shareable.
+            0b00 | 0b11 => {
+                if extract64(gpccr, 10, 2) == 0 && extract64(gpccr, 8, 2) == 0 {
+                    return walk(0);
+                }
+            }
+            _ => return walk(0),
+        }
+        let pgs = match extract64(gpccr, 14, 2) {
+            0b00 => 12,
+            0b01 => 16,
+            0b10 => 14,
+            _ => return walk(0),
+        };
+
+        // With GPCCR_EL3.GPCBW, an invalid GPCBW_EL3 is a walk fault at level 0.
+        if gpccr & GPCCR_GPCBW != 0 {
+            let bw_size = match bw_size_field {
+                0b000 | 0b001 | 0b010 | 0b100 | 0b110 => 1u64 << (bw_size_field + 30),
+                _ => return walk(0),
+            };
+            let bw_stride = match bw_stride_field {
+                0b00000 | 0b00010 | 0b00100 | 0b00110 | 0b00111 | 0b01000 | 0b01001 | 0b01010
+                | 0b10000 => 1u64 << (bw_stride_field + 40),
+                _ => return walk(0),
+            };
+            // The base must be aligned to the size and below the stride: bw_mask marks the
+            // bits it may have.
+            bw_mask = bw_stride.wrapping_sub(bw_size);
+            if bw_addr & !bw_mask != 0 {
+                return walk(0);
+            }
+        }
+
+        // L0GPTSZ is read only and fixed at reset.
+        let l0gptsz = 30 + extract64(gpccr, 20, 4) as u32;
+
+        // GPC Priority 2: an address space disabled by SPAD, NSPAD or RLPAD.
+        let disable = match pspace {
+            SS_SECURE => 1 << 7,
+            SS_NONSECURE => 1 << 6,
+            SS_REALM => 1 << 5,
+            _ => 0,
+        };
+        if gpccr & disable != 0 {
+            return Err(fault(Gpcf::Fail, level));
+        }
+
+        // GPC Priority 3: a Secure, Realm or Root address beyond PPS fails unless APPSAA
+        // is set; a Non-secure one does not fault.
+        if paddress & !pps_mask != 0 {
+            if pspace == SS_NONSECURE || gpccr & GPCCR_APPSAA != 0 {
+                return Ok(());
+            }
+            return Err(fault(Gpcf::Fail, level));
+        }
+
+        // The bypass window check comes right after priority 3.
+        if gpccr & GPCCR_GPCBW != 0 && paddress & bw_mask == bw_addr {
+            return Ok(());
+        }
+
+        // GPC Priority 4: the base address in GPTBR_EL3 beyond PPS.
+        let mut tableaddr = st.gptbr_el3 << 12;
+        if tableaddr & !pps_mask != 0 {
+            return Err(fault(Gpcf::AddressSize, level));
+        }
+        // BADDR is aligned per a function of PPS and L0GPTSZ; the low bits are RES0 but
+        // not a configuration error.
+        let align = (pps.saturating_sub(l0gptsz) + 3).max(12);
+        tableaddr &= !((1u64 << align) - 1);
+
+        let load = |addr: u64| -> Option<u64> {
+            let (d, res) = self.as_.load(addr, 8, Endian::Little, MemTxAttrs::default());
+            res.is_ok().then_some(d)
+        };
+
+        // Level 0.
+        tableaddr += extract64(paddress, l0gptsz, pps.saturating_sub(l0gptsz)) * 8;
+        let Some(entry) = load(tableaddr) else {
+            return Err(fault(Gpcf::Eabt, level));
+        };
+        let gpi = match entry & 0xf {
+            // Block descriptor.
+            1 => {
+                if entry >> 8 != 0 {
+                    return walk(level);
+                }
+                extract64(entry, 4, 4)
+            }
+            // Table descriptor.
+            3 => {
+                tableaddr = entry & !0xf;
+                let align = (l0gptsz - pgs - 1).max(12);
+                if tableaddr & (!pps_mask | ((1u64 << align) - 1)) != 0 {
+                    return walk(level);
+                }
+                // Level 1.
+                level = 1;
+                tableaddr += extract64(paddress, pgs + 4, l0gptsz - pgs - 4) * 8;
+                let Some(entry) = load(tableaddr) else {
+                    return Err(fault(Gpcf::Eabt, level));
+                };
+                if entry & 0xf == 1 {
+                    // Contiguous descriptor; the TLB is flushed whole, so the range does
+                    // not matter.
+                    if entry >> 10 != 0 || extract64(entry, 8, 2) == 0 {
+                        return walk(level);
+                    }
+                    extract64(entry, 4, 4)
+                } else {
+                    let index = extract64(paddress, pgs, 4);
+                    extract64(entry, (index * 4) as u32, 4)
+                }
+            }
+            _ => return walk(level),
+        };
+
+        let gpi = gpi as u8;
+        let ok = match gpi {
+            // No access.
+            0b0000 => false,
+            // All access.
+            0b1111 => return Ok(()),
+            // System agent only, Non-secure protected, and No access when NA6 or NA7 is
+            // set; otherwise reserved.
+            0b0100..=0b0111 => {
+                let bit = match gpi {
+                    0b0100 => 25,
+                    0b0101 => 26,
+                    0b0110 => 27,
+                    _ => 28,
+                };
+                if gpccr & (1 << bit) == 0 {
+                    return walk(level);
+                }
+                false
+            }
+            // Secure, which needs FEAT_SEL2 (not implemented).
+            0b1000 => return walk(level),
+            // Non-secure, Root and Realm.
+            0b1001..=0b1011 => pspace == gpi & 3,
+            // Non-secure only.
+            0b1101 => {
+                if gpccr & GPCCR_NSO == 0 {
+                    return walk(level);
+                }
+                if pspace == SS_NONSECURE && (ss == SS_NONSECURE || ss == SS_ROOT) {
+                    return Ok(());
+                }
+                return Err(fault(Gpcf::Fail, level));
+            }
+            _ => return walk(level),
+        };
+        if ok { Ok(()) } else { Err(fault(Gpcf::Fail, level)) }
+    }
+
+    /// Read a descriptor at `pa` in the address space `space`; a granule protection
+    /// fault on it is a GPC fault on the walk at `level`.
+    fn load_desc(&self, pa: u64, level: u32, space: u8) -> Result<u64, Fault> {
+        // QEMU reports the translation level in fi->level of a walk fault.
+        self.gpc(pa, space, |_| fsc_gpcf_on_walk(level))
+            .map_err(|f| Fault { gpc_level: level, ..f })?;
         let (d, res) = self.as_.load(pa, 8, Endian::Little, MemTxAttrs::default());
         if res.is_ok() {
             Ok(d)
@@ -275,7 +586,10 @@ impl Walker<'_> {
     ) -> Result<Translation, Fault> {
         let s2 = !stage1_only && self.stage2_enabled(mmu_idx);
         let s1 = self.stage1(address, access, mmu_idx, s2, is_at)?;
+        let space = self.space_of(mmu_idx);
         if !s2 {
+            // get_phys_addr_gpc(): the granule protection check of the output address.
+            self.gpc(s1.pa, space, |_| FSC_GPCF_ON_OUTPUT)?;
             return Ok(s1);
         }
         // get_phys_addr_twostage(): the stage 1 output is an IPA.
@@ -285,6 +599,7 @@ impl Walker<'_> {
             f.stage2 = true;
             f
         })?;
+        self.gpc(t2.pa, space, |_| FSC_GPCF_ON_OUTPUT)?;
         Ok(Translation {
             pa: t2.pa,
             prot: s1.prot & t2.prot,
@@ -309,6 +624,7 @@ impl Walker<'_> {
         let feat = self.feat();
         let rel = regime_el(mmu_idx) as usize;
         let tcr = st.tcr_el[rel];
+        let space = self.space_of(mmu_idx);
         let data = access != MmuAccessType::InstFetch;
         let param = va_parameters(feat, tcr, address, mmu_idx, data);
 
@@ -319,11 +635,28 @@ impl Walker<'_> {
             if extract64(address, pamax, addrtop - pamax + 1) != 0 {
                 return Err(Fault::new(fsc::address_size(0)));
             }
+            // Fill in cacheattr a-la AArch64.TranslateAddressS1Off.
+            let mut attrs = 0u8; // Device nGnRnE
+            let mut sh = 0u8; // non-shareable
+            if rel == 1 {
+                let hcr = st.hcr_el2_eff(feat);
+                if hcr & HCR_DC != 0 {
+                    // Tagged, Normal, WB, RWA, or without HCR_EL2.DCT Normal, WB, RWA.
+                    attrs = if hcr & HCR_DCT != 0 { 0xf0 } else { 0xff };
+                }
+            }
+            if attrs == 0 {
+                if !data {
+                    // Normal, WT, RA, NT, or Normal, NC.
+                    attrs = if st.sctlr_el[rel] & SCTLR_I != 0 { 0xee } else { 0x44 };
+                }
+                sh = 2; // outer shareable
+            }
             return Ok(Translation {
                 pa: extract64(address, 0, 52),
                 prot: page::READ | page::WRITE | page::EXEC,
-                attrs: 0,
-                sh: 2,
+                attrs,
+                sh,
                 page_size: 4096,
             });
         }
@@ -386,8 +719,19 @@ impl Walker<'_> {
                         f
                     })?;
                 desc_pa = t.pa;
+                // The stage 2 output is checked as QEMU's S1_ptw_translate() does: a GPC
+                // fault on it is a stage 2 fault on the walk.
+                let s2space = self.space_of(MMU_IDX_E10_1);
+                self.gpc(desc_pa, s2space, |f| fsc_gpcf_on_walk(f.gpc_level)).map_err(
+                    |mut f| {
+                        f.stage2 = true;
+                        f.s1ptw = true;
+                        f.s2addr = descaddr;
+                        f
+                    },
+                )?;
             }
-            let descriptor = self.load_desc(desc_pa, level)?;
+            let descriptor = self.load_desc(desc_pa, level, space)?;
 
             if descriptor & 1 == 0 || (descriptor & 2 == 0 && level == 3) {
                 // Invalid, or the Reserved level 3 encoding.
@@ -502,6 +846,7 @@ impl Walker<'_> {
     fn stage2(&self, ipa: u64, access: MmuAccessType, is_at: bool) -> Result<Translation, Fault> {
         let _ = is_at;
         let st = self.st;
+        let space = self.space_of(MMU_IDX_E10_1);
         let vtcr = st.vtcr_el2;
         let tsz = extract64(vtcr, 0, 6) as u32;
         let sl0 = extract64(vtcr, 6, 2) as u32;
@@ -555,7 +900,7 @@ impl Walker<'_> {
         let descriptor = loop {
             descaddr |= (ipa >> (stride * (4 - level))) & indexmask;
             descaddr &= !7;
-            let descriptor = self.load_desc(descaddr, level)?;
+            let descriptor = self.load_desc(descaddr, level, space)?;
             if descriptor & 1 == 0 || (descriptor & 2 == 0 && level == 3) {
                 return Err(Fault::new(fsc::translation(level)));
             }
@@ -652,6 +997,49 @@ pub(crate) fn deliver_fault(
 ) -> CpuLoopExit {
     let mut st = CpuArmState::load(cpu.env);
     let mut target_el = exception_target_el(&st);
+    let current_el = st.current_el();
+    if let Some(gpcf) = fault.gpcf {
+        // report_as_gpc_exception(): GPT faults are GPC exceptions, and so is a granule
+        // protection fault below EL3 when SCR_EL3.GPF is set.
+        let as_gpc = match gpcf {
+            Gpcf::Fail => st.scr_el3 & SCR_GPF != 0 && current_el != 3,
+            _ => true,
+        };
+        if as_gpc {
+            let gpcsc = match gpcf {
+                Gpcf::AddressSize => 0b000000,
+                Gpcf::Walk => 0b000100,
+                Gpcf::Fail => 0b001100,
+                Gpcf::Eabt => 0b010100,
+            } | fault.gpc_level;
+            let syn = syn_gpc(
+                fault.stage2 && fault.fsc != FSC_GPCF_ON_OUTPUT,
+                access == MmuAccessType::InstFetch,
+                gpcsc,
+                false,
+                false,
+                fault.s1ptw,
+                access == MmuAccessType::DataStore,
+                fault.fsc,
+            );
+            st.mfar_el3 = fault.paddr
+                | match fault.paddr_space {
+                    SS_NONSECURE => MFAR_NS,
+                    SS_ROOT => MFAR_NSE,
+                    SS_REALM => MFAR_NSE | MFAR_NS,
+                    _ => 0,
+                };
+            st.exception_vaddress = addr;
+            st.exception_syndrome = syn;
+            st.exception_target_el = 3;
+            super::commit(cpu, &mut st);
+            return cpu.raise_exception(EXCP_GPC, ra);
+        }
+        // Without SCR_EL3.GPF, a granule protection fault may still go to EL2.
+        if gpcf == Gpcf::Fail && target_el < 2 && st.hcr_el2_eff(arm.features()) & HCR_GPF != 0 {
+            target_el = 2;
+        }
+    }
     if fault.stage2 {
         target_el = 2;
         st.hpfar_el2 = extract64(fault.s2addr, 12, 47) << 4;
@@ -659,7 +1047,7 @@ pub(crate) fn deliver_fault(
         // raise_exception() redirects the exception to EL2.
         target_el = 2;
     }
-    let same_el = st.current_el() == target_el;
+    let same_el = current_el == target_el;
     let (excp, syn) = if access == MmuAccessType::InstFetch {
         (EXCP_PREFETCH_ABORT, syn_insn_abort(same_el, fault.ea, fault.s1ptw, fault.fsc))
     } else {
@@ -669,6 +1057,6 @@ pub(crate) fn deliver_fault(
     st.exception_vaddress = addr;
     st.exception_syndrome = syn;
     st.exception_target_el = target_el;
-    st.store(cpu.env);
+    super::commit(cpu, &mut st);
     cpu.raise_exception(excp, ra)
 }

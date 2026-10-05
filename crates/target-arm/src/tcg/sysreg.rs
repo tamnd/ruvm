@@ -45,11 +45,13 @@ use ruvm_jit::{Cpu, MmuAccessType};
 use super::{Arm, PsciConduit, arm_of, gic, gtimer, ptw, regime_has_2_ranges, vfp};
 use crate::cpu::{
     ArmCpuModel, ArmFeatures, CpuArmState, GTIMER_HYP, GTIMER_HYPVIRT, GTIMER_PHYS, GTIMER_SEC,
-    GTIMER_VIRT, HCR_DC, HCR_E2H, HCR_FWB, HCR_NV, HCR_NV1, HCR_PTW, HCR_TACR, HCR_TDZ, HCR_TGE,
-    HCR_TID1, HCR_TID2, HCR_TID3, HCR_TPCP, HCR_TPU, HCR_TRVM, HCR_TSW, HCR_TTLB, HCR_TVM, HCR_VM,
-    MMU_IDX_E2, MMU_IDX_E3, MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN, MMU_IDX_E20_0,
-    MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, PSTATE_DAIF, PSTATE_PAN, PSTATE_SP, PSTATE_UAO, SCR_NS,
-    SCR_TCR2EN, SCTLR_DZE, SCTLR_UCI, SCTLR_UCT, SCTLR_UMA, env_off,
+    GTIMER_VIRT, HCR_APK, HCR_ATA, HCR_DC, HCR_E2H, HCR_FWB, HCR_NV, HCR_NV1, HCR_PTW, HCR_TACR,
+    HCR_TDZ, HCR_TGE, HCR_TID1, HCR_TID2, HCR_TID3, HCR_TID5, HCR_TPCP, HCR_TPU, HCR_TRVM, HCR_TSW,
+    HCR_TTLB, HCR_TVM, HCR_VM, MMU_IDX_E2, MMU_IDX_E3, MMU_IDX_E10_0, MMU_IDX_E10_1,
+    MMU_IDX_E10_1_PAN, MMU_IDX_E20_0, MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, PSTATE_DAIF, PSTATE_PAN,
+    PSTATE_SP, PSTATE_TCO, PSTATE_UAO, SCR_APK, SCR_ATA, SCR_NS, SCR_NSE, SCR_TCR2EN, SCTLR_ATA,
+    SCTLR_ATA0, SCTLR_DZE, SCTLR_ITFSB, SCTLR_TCF, SCTLR_TCF0, SCTLR_TCSO, SCTLR_TCSO0, SCTLR_UCI,
+    SCTLR_UCT, SCTLR_UMA, env_off,
 };
 
 /// `PL3_R`.
@@ -148,6 +150,13 @@ pub(crate) enum Trap {
     Cpacr,
     /// `cptr_access()`: CPTR_EL3.TCPAC for CPTR_EL2.
     Cptr,
+    /// `access_pauth()`: HCR_EL2.APK and SCR_EL3.APK.
+    Apk,
+    /// `access_mte()`: HCR_EL2.ATA and SCR_EL3.ATA. Without FEAT_NV this is also
+    /// `access_tfsr_el1()` and `access_tfsr_el2()`.
+    Mte,
+    /// `access_tid5()`: HCR_EL2.TID5.
+    Tid5,
     /// The `accessfn` of a GICv3 CPU interface register (`gicv3_irqfiq_access()` and
     /// friends), which the interface decides: see `gic.rs`.
     Gic,
@@ -272,6 +281,26 @@ impl Trap {
             Trap::Tid1 => el1_hcr(HCR_TID1),
             Trap::Tid2 => el1_hcr(HCR_TID2),
             Trap::Tid3 => el1_hcr(HCR_TID3),
+            Trap::Tid5 => {
+                if el < 2 && hcr & HCR_TID5 != 0 {
+                    Access::TrapEl2
+                } else {
+                    Access::Ok
+                }
+            }
+            Trap::Mte => {
+                if el < 2
+                    && st.is_el2_enabled(f)
+                    && hcr & HCR_ATA == 0
+                    && hcr & (HCR_E2H | HCR_TGE) != HCR_E2H | HCR_TGE
+                {
+                    Access::TrapEl2
+                } else if el < 3 && f.el3 && st.scr_el3 & SCR_ATA == 0 {
+                    Access::TrapEl3
+                } else {
+                    Access::Ok
+                }
+            }
             Trap::Tacr => el1_hcr(HCR_TACR),
             Trap::Ttlb => el1_hcr(HCR_TTLB),
             Trap::Tcr2 => {
@@ -297,6 +326,15 @@ impl Trap {
             }
             Trap::Cptr => {
                 if el == 2 && f.el3 && st.cptr_el[3] & (1 << 31) != 0 {
+                    Access::TrapEl3
+                } else {
+                    Access::Ok
+                }
+            }
+            Trap::Apk => {
+                if el < 2 && st.is_el2_enabled(f) && hcr & HCR_APK == 0 {
+                    Access::TrapEl2
+                } else if el < 3 && f.el3 && st.scr_el3 & SCR_APK == 0 {
                     Access::TrapEl3
                 } else {
                     Access::Ok
@@ -330,6 +368,10 @@ pub(crate) enum Kind {
     Special,
     /// DC ZVA (`ARM_CP_DC_ZVA`).
     DcZva,
+    /// DC GVA (`ARM_CP_DC_GVA`).
+    DcGva,
+    /// DC GZVA (`ARM_CP_DC_GZVA`).
+    DcGzva,
 }
 
 /// A system register, the parts of `ARMCPRegInfo` this port uses.
@@ -382,8 +424,34 @@ fn has_tlbios(f: &ArmFeatures) -> bool {
     f.tlbios
 }
 
+fn has_pauth(f: &ArmFeatures) -> bool {
+    f.pauth != 0
+}
+
 fn has_tcr2(f: &ArmFeatures) -> bool {
     f.tcr2
+}
+
+fn has_rme(f: &ArmFeatures) -> bool {
+    f.rme
+}
+
+fn has_rng(f: &ArmFeatures) -> bool {
+    f.rng
+}
+
+/// `aa64_mte_insn_reg`: the MTE instructions and the EL0 cache operations.
+fn has_mte_insn_reg(f: &ArmFeatures) -> bool {
+    f.mte >= 1
+}
+
+/// `aa64_mte`: the tag storage and the tag check registers.
+fn has_mte(f: &ArmFeatures) -> bool {
+    f.mte >= 2
+}
+
+fn has_rme_mte(f: &ArmFeatures) -> bool {
+    f.rme && f.mte >= 2
 }
 
 /// The `env` offset of element `i` of an array field.
@@ -454,6 +522,10 @@ pub(crate) const SPSEL: u32 = key(3, 0, 4, 2, 0);
 pub(crate) const PAN: u32 = key(3, 0, 4, 2, 3);
 /// UAO.
 pub(crate) const UAO: u32 = key(3, 0, 4, 2, 4);
+/// TCO.
+pub(crate) const TCO: u32 = key(3, 3, 4, 2, 7);
+pub(crate) const RNDR: u32 = key(3, 3, 2, 4, 0);
+pub(crate) const RNDRRS: u32 = key(3, 3, 2, 4, 1);
 /// MPIDR_EL1.
 pub(crate) const MPIDR_EL1: u32 = key(3, 0, 0, 0, 5);
 /// CCSIDR_EL1.
@@ -494,6 +566,10 @@ pub(crate) const CNTHCTL_EL2: u32 = key(3, 4, 14, 1, 0);
 pub(crate) const SCTLR_EL3: u32 = key(3, 6, 1, 0, 0);
 /// SCR_EL3.
 pub(crate) const SCR_EL3: u32 = key(3, 6, 1, 1, 0);
+/// GPCBW_EL3.
+pub(crate) const GPCBW_EL3: u32 = key(3, 6, 2, 1, 5);
+/// GPCCR_EL3.
+pub(crate) const GPCCR_EL3: u32 = key(3, 6, 2, 1, 6);
 /// TTBR0_EL3.
 pub(crate) const TTBR0_EL3: u32 = key(3, 6, 2, 0, 0);
 /// TCR_EL3.
@@ -554,6 +630,7 @@ static REGS: &[Reg] = &[
     r!("ID_AA64DFR0_EL1", (3, 0, 0, 5, 0), PL1_R, Tid3, Kind::Model(|m| m.id_aa64dfr0)),
     r!("ID_AA64ISAR0_EL1", (3, 0, 0, 6, 0), PL1_R, Tid3, Kind::Model(|m| m.id_aa64isar0)),
     r!("ID_AA64ISAR1_EL1", (3, 0, 0, 6, 1), PL1_R, Tid3, Kind::Model(|m| m.id_aa64isar1)),
+    r!("ID_AA64ISAR2_EL1", (3, 0, 0, 6, 2), PL1_R, Tid3, Kind::Model(|m| m.id_aa64isar2)),
     r!("ID_AA64MMFR0_EL1", (3, 0, 0, 7, 0), PL1_R, Tid3, Kind::Model(|m| m.id_aa64mmfr0)),
     r!("ID_AA64MMFR1_EL1", (3, 0, 0, 7, 1), PL1_R, Tid3, Kind::Model(|m| m.id_aa64mmfr1)),
     r!("ID_AA64MMFR2_EL1", (3, 0, 0, 7, 2), PL1_R, Tid3, Kind::Model(|m| m.id_aa64mmfr2)),
@@ -585,6 +662,17 @@ static REGS: &[Reg] = &[
     r!("TTBR1_EL1", (3, 0, 2, 0, 1), PL1_RW, Tvm, Kind::Special),
     r!("TCR_EL1", (3, 0, 2, 0, 2), PL1_RW, Tvm, Kind::Special),
     r!("TCR2_EL1", (3, 0, 2, 0, 3), PL1_RW, Tcr2, Kind::Special, has_tcr2),
+    // pauth_reginfo.
+    r!("APIAKEYLO_EL1", (3, 0, 2, 1, 0), PL1_RW, Apk, field(off!(pac_keys[0])), has_pauth),
+    r!("APIAKEYHI_EL1", (3, 0, 2, 1, 1), PL1_RW, Apk, field(off!(pac_keys[1])), has_pauth),
+    r!("APIBKEYLO_EL1", (3, 0, 2, 1, 2), PL1_RW, Apk, field(off!(pac_keys[2])), has_pauth),
+    r!("APIBKEYHI_EL1", (3, 0, 2, 1, 3), PL1_RW, Apk, field(off!(pac_keys[3])), has_pauth),
+    r!("APDAKEYLO_EL1", (3, 0, 2, 2, 0), PL1_RW, Apk, field(off!(pac_keys[4])), has_pauth),
+    r!("APDAKEYHI_EL1", (3, 0, 2, 2, 1), PL1_RW, Apk, field(off!(pac_keys[5])), has_pauth),
+    r!("APDBKEYLO_EL1", (3, 0, 2, 2, 2), PL1_RW, Apk, field(off!(pac_keys[6])), has_pauth),
+    r!("APDBKEYHI_EL1", (3, 0, 2, 2, 3), PL1_RW, Apk, field(off!(pac_keys[7])), has_pauth),
+    r!("APGAKEYLO_EL1", (3, 0, 2, 3, 0), PL1_RW, Apk, field(off!(pac_keys[8])), has_pauth),
+    r!("APGAKEYHI_EL1", (3, 0, 2, 3, 1), PL1_RW, Apk, field(off!(pac_keys[9])), has_pauth),
     // Exception handling.
     r!("SPSR_EL1", (3, 0, 4, 0, 0), PL1_RW, None, field(off!(spsr_el[1]))),
     r!("ELR_EL1", (3, 0, 4, 0, 1), PL1_RW, None, field(off!(elr_el[1]))),
@@ -655,6 +743,46 @@ static REGS: &[Reg] = &[
     r!("DC_CVAU", (1, 3, 7, 11, 1), PL0_W, Pou, Kind::Nop),
     r!("DC_CVAP", (1, 3, 7, 12, 1), PL0_W, Poc, Kind::Nop, has_dpb),
     r!("DC_CIVAC", (1, 3, 7, 14, 1), PL0_W, Poc, Kind::Nop),
+    // GMID_EL1 and mte_reginfo.
+    r!(
+        "GMID_EL1",
+        (3, 1, 0, 0, 4),
+        PL1_R,
+        Tid5,
+        Kind::Model(|_| super::mte::GM_BLOCKSIZE as u64),
+        has_mte
+    ),
+    r!("TFSRE0_EL1", (3, 0, 5, 6, 1), PL1_RW, Mte, field(off!(tfsr_el[0])), has_mte),
+    r!("TFSR_EL1", (3, 0, 5, 6, 0), PL1_RW, Mte, field(off!(tfsr_el[1])), has_mte),
+    r!("TFSR_EL2", (3, 4, 5, 6, 0), PL2_RW, Mte, field(off!(tfsr_el[2])), has_mte),
+    r!("TFSR_EL3", (3, 6, 5, 6, 0), PL3_RW, None, field(off!(tfsr_el[3])), has_mte),
+    r!("RGSR_EL1", (3, 0, 1, 0, 5), PL1_RW, Mte, field(off!(rgsr_el1)), has_mte),
+    r!("GCR_EL1", (3, 0, 1, 0, 6), PL1_RW, Mte, field(off!(gcr_el1)), has_mte),
+    // mte_reginfo's TCO, and mte_tco_ro_reginfo's RAZ/WI one without FEAT_MTE2 (see read()
+    // and write()).
+    r!("TCO", (3, 3, 4, 2, 7), PL0_RW, None, Kind::Special, has_mte_insn_reg),
+    // rndr_reginfo, without FEAT_RNG_TRAP.
+    r!("RNDR", (3, 3, 2, 4, 0), PL0_R, None, Kind::Special, has_rng),
+    r!("RNDRRS", (3, 3, 2, 4, 1), PL0_R, None, Kind::Special, has_rng),
+    r!("DC_IGVAC", (1, 0, 7, 6, 3), PL1_W, Poc, Kind::Nop, has_mte),
+    r!("DC_IGSW", (1, 0, 7, 6, 4), PL1_W, Tsw, Kind::Nop, has_mte),
+    r!("DC_IGDVAC", (1, 0, 7, 6, 5), PL1_W, Poc, Kind::Nop, has_mte),
+    r!("DC_IGDSW", (1, 0, 7, 6, 6), PL1_W, Tsw, Kind::Nop, has_mte),
+    r!("DC_CGSW", (1, 0, 7, 10, 4), PL1_W, Tsw, Kind::Nop, has_mte),
+    r!("DC_CGDSW", (1, 0, 7, 10, 6), PL1_W, Tsw, Kind::Nop, has_mte),
+    r!("DC_CIGSW", (1, 0, 7, 14, 4), PL1_W, Tsw, Kind::Nop, has_mte),
+    r!("DC_CIGDSW", (1, 0, 7, 14, 6), PL1_W, Tsw, Kind::Nop, has_mte),
+    // mte_el0_cacheop_reginfo.
+    r!("DC_CGVAC", (1, 3, 7, 10, 3), PL0_W, Poc, Kind::Nop, has_mte_insn_reg),
+    r!("DC_CGDVAC", (1, 3, 7, 10, 5), PL0_W, Poc, Kind::Nop, has_mte_insn_reg),
+    r!("DC_CGVAP", (1, 3, 7, 12, 3), PL0_W, Poc, Kind::Nop, has_mte_insn_reg),
+    r!("DC_CGDVAP", (1, 3, 7, 12, 5), PL0_W, Poc, Kind::Nop, has_mte_insn_reg),
+    r!("DC_CGVADP", (1, 3, 7, 13, 3), PL0_W, Poc, Kind::Nop, has_mte_insn_reg),
+    r!("DC_CGDVADP", (1, 3, 7, 13, 5), PL0_W, Poc, Kind::Nop, has_mte_insn_reg),
+    r!("DC_CIGVAC", (1, 3, 7, 14, 3), PL0_W, Poc, Kind::Nop, has_mte_insn_reg),
+    r!("DC_CIGDVAC", (1, 3, 7, 14, 5), PL0_W, Poc, Kind::Nop, has_mte_insn_reg),
+    r!("DC_GVA", (1, 3, 7, 4, 3), PL0_W, Dze, Kind::DcGva, has_mte_insn_reg),
+    r!("DC_GZVA", (1, 3, 7, 4, 4), PL0_W, Dze, Kind::DcGzva, has_mte_insn_reg),
     // Address translation.
     at!("AT_S1E1R", 0, 0, PL1_W),
     at!("AT_S1E1W", 0, 1, PL1_W),
@@ -792,6 +920,13 @@ static EL3_REGS: &[Reg] = &[
         Kind::Field { off: off!(vbar_el[3]), mask: !0x1f }
     ),
     r!("TPIDR_EL3", (3, 6, 13, 0, 2), PL3_RW, None, field(off!(tpidr_el[3]))),
+    // rme_reginfo and rme_mte_reginfo.
+    r!("GPCCR_EL3", (3, 6, 2, 1, 6), PL3_RW, None, Kind::Special, has_rme),
+    r!("GPCBW_EL3", (3, 6, 2, 1, 5), PL3_RW, None, Kind::Special, has_rme),
+    r!("GPTBR_EL3", (3, 6, 2, 1, 4), PL3_RW, None, field(off!(gptbr_el3)), has_rme),
+    r!("MFAR_EL3", (3, 6, 6, 0, 5), PL3_RW, None, field(off!(mfar_el3)), has_rme),
+    r!("DC_CIPAPA", (1, 6, 7, 14, 1), PL3_W, None, Kind::Nop, has_rme),
+    r!("DC_CIGDPAPA", (1, 6, 7, 14, 5), PL3_W, None, Kind::Nop, has_rme_mte),
     r!("CNTPS_TVAL_EL1", (3, 7, 14, 2, 0), PL1_RW, CntSTimer, Kind::Special),
     r!("CNTPS_CTL_EL1", (3, 7, 14, 2, 1), PL1_RW, CntSTimer, Kind::Special),
     r!("CNTPS_CVAL_EL1", (3, 7, 14, 2, 2), PL1_RW, CntSTimer, Kind::Special),
@@ -823,6 +958,7 @@ static E2H_REDIRECTS: &[(u32, u32)] = &[
     (key(3, 0, 5, 1, 0), key(3, 4, 5, 1, 0)),   // AFSR0
     (key(3, 0, 5, 1, 1), key(3, 4, 5, 1, 1)),   // AFSR1
     (key(3, 0, 5, 2, 0), key(3, 4, 5, 2, 0)),   // ESR
+    (key(3, 0, 5, 6, 0), key(3, 4, 5, 6, 0)),   // TFSR
     (key(3, 0, 6, 0, 0), key(3, 4, 6, 0, 0)),   // FAR
     (key(3, 0, 10, 2, 0), key(3, 4, 10, 2, 0)), // MAIR
     (key(3, 0, 10, 3, 0), key(3, 4, 10, 3, 0)), // AMAIR
@@ -972,6 +1108,14 @@ fn timer_of(f: &ArmFeatures, st: &CpuArmState, op1: u32, crm: u32) -> (usize, bo
     }
 }
 
+/// 64 random bits, `qemu_guest_getrandom()` without `-seed`.
+fn guest_random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(0);
+    h.finish()
+}
+
 /// Read a [`Kind::Special`] register.
 pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
     let ops = cpu.ops();
@@ -1023,6 +1167,8 @@ pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
         TCR2_EL1 | TCR2_EL2 => st.tcr2_el[el_of(key_)],
         HCR_EL2 => st.hcr_el2,
         SCR_EL3 => st.scr_el3,
+        GPCCR_EL3 => st.gpccr_el3,
+        GPCBW_EL3 => st.gpcbw_el3,
         VTTBR_EL2 => st.vttbr_el2,
         VTCR_EL2 => st.vtcr_el2,
         CNTVOFF_EL2 => st.cntvoff_el2,
@@ -1034,6 +1180,15 @@ pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
         SPSEL => u64::from(st.pstate & PSTATE_SP),
         PAN => u64::from(st.pstate & PSTATE_PAN),
         UAO => u64::from(st.pstate & PSTATE_UAO),
+        TCO if f.mte >= 2 => u64::from(st.pstate & PSTATE_TCO),
+        TCO => 0,
+        RNDR | RNDRRS => {
+            // rndr_readfn(): NZCV is 0b0000 for a good number; getting one never fails here.
+            let mut st = st;
+            st.set_nzcv(0);
+            super::commit(cpu, &mut st);
+            guest_random_u64()
+        }
         OSLSR_EL1 => st.oslsr_el1,
         ZCR_EL1 | ZCR_EL2 | ZCR_EL3 => st.zcr_el[el_of(key_)],
         CNTPCT_EL0 => gtimer::phys_count(arm, &st),
@@ -1055,7 +1210,7 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
             1 => gtimer::ctl_write(arm, cpu, &mut st, timer, value),
             _ => gtimer::cval_write(arm, cpu, &mut st, timer, value),
         }
-        st.store(cpu.env);
+        super::commit(cpu, &mut st);
         return;
     }
     if arm.gic_write(cpu.core.shared().cpu_index, key_, &st, value) {
@@ -1063,8 +1218,28 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
     }
     match key_ {
         SCTLR_EL1 | SCTLR_EL2 | SCTLR_EL3 => {
+            let el3 = key_ == SCTLR_EL3;
+            let value = if f.mte < 2 {
+                if el3 {
+                    value & !(SCTLR_ITFSB | SCTLR_TCF | SCTLR_ATA | SCTLR_TCSO)
+                } else {
+                    value
+                        & !(SCTLR_ITFSB
+                            | SCTLR_TCF0
+                            | SCTLR_TCF
+                            | SCTLR_ATA0
+                            | SCTLR_ATA
+                            | SCTLR_TCSO
+                            | SCTLR_TCSO0)
+                }
+            } else if el3 {
+                // No FEAT_MTE_STORE_ONLY.
+                value & !SCTLR_TCSO
+            } else {
+                value & !(SCTLR_TCSO | SCTLR_TCSO0)
+            };
             st.sctlr_el[el_of(key_)] = value;
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
             // This may enable or disable the MMU, so do a TLB flush.
             tlb_flush(cpu);
         }
@@ -1072,7 +1247,7 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
             // vmsa_tcr_el12_write(): flush, then write.
             tlb_flush(cpu);
             st.tcr_el[el_of(key_)] = value;
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
         }
         TCR2_EL1 | TCR2_EL2 => {
             // tcr2_el1_write() and tcr2_el2_write(): of the fields only ASID2's are
@@ -1083,7 +1258,7 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
             let valid = if f.asid2 { 0x7 << 16 } else { 0 };
             let old = st.tcr2_el[el];
             st.tcr2_el[el] = value & valid;
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
             if f.asid2 && (old ^ value) & TCR2_A2 != 0 {
                 tlb_flush_by_mmuidx(cpu, if el == 1 { E10_MASK } else { ALLE2_MASK });
             }
@@ -1098,7 +1273,7 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
             let old = *slot;
             *slot = value;
             let e2h = st.hcr_el2_eff(f) & HCR_E2H != 0;
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
             // If the ASID changes we must flush the TLB; only the EL1&0 and, with E2H, the
             // EL2&0 regimes have one.
             if (old ^ value) >> 48 != 0 {
@@ -1113,7 +1288,7 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
             let old = st.hcr_el2;
             st.hcr_write(f, arm.psci_conduit() == PsciConduit::Smc, value);
             let changed = old ^ st.hcr_el2;
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
             // These bits change the stage 2 setup or the regime, so flush.
             if changed & (HCR_VM | HCR_PTW | HCR_DC | HCR_FWB | HCR_NV | HCR_NV1) != 0 {
                 tlb_flush(cpu);
@@ -1126,17 +1301,37 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
         SCR_EL3 => {
             let old = st.scr_el3;
             st.scr_write(f, value);
-            st.store(cpu.env);
-            // If the NS bit changes, the Security state of EL2 and below changes.
-            if (old ^ st.scr_el3) & SCR_NS != 0 {
+            super::commit(cpu, &mut st);
+            // If the NS or NSE bit changes, the Security state of EL2 and below changes.
+            if (old ^ st.scr_el3) & (SCR_NS | SCR_NSE) != 0 {
                 tlb_flush(cpu);
             }
+        }
+        GPCCR_EL3 => {
+            // gpccr_write(): L0GPTSZ is read only and the bits not mentioned are RES0. The
+            // model has FEAT_RME_GPC3, so the GPC2 and GPC3 fields are writable. As in
+            // QEMU, this does not flush the TLB.
+            let rw_mask = 0x7 // PPS
+                | (0xf << 8) // IRGN, ORGN
+                | (0xf << 12) // SH, PGS
+                | (0x3 << 16) // GPC, GPCP
+                | (1 << 24) | (1 << 19) | (0x7 << 5) // APPSAA, NSO, SPAD, NSPAD, RLPAD
+                | (1 << 29); // GPCBW
+            st.gpccr_el3 = (value & rw_mask) | (st.gpccr_el3 & !rw_mask);
+            super::commit(cpu, &mut st);
+        }
+        GPCBW_EL3 => {
+            // gpcbw_write(): BWADDR, BWSTRIDE and BWSIZE.
+            tlb_flush(cpu);
+            let rw_mask = ((1u64 << 25) - 1) | (0x1f << 32) | (0x7 << 37);
+            st.gpcbw_el3 = value & rw_mask;
+            super::commit(cpu, &mut st);
         }
         VTTBR_EL2 | VTCR_EL2 => {
             let slot = if key_ == VTTBR_EL2 { &mut st.vttbr_el2 } else { &mut st.vtcr_el2 };
             let old = *slot;
             *slot = value;
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
             if old != value {
                 // The TLB has no VMID tags, so a new stage 2 setup flushes EL1&0.
                 tlb_flush_by_mmuidx(cpu, E10_MASK);
@@ -1144,44 +1339,49 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
         }
         CNTVOFF_EL2 => {
             gtimer::cntvoff_write(arm, cpu, &mut st, value);
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
         }
         CNTHCTL_EL2 => {
             st.cnthctl_el2 = value & 0xfff;
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
         }
         NZCV => {
             st.set_nzcv(value as u32);
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
         }
         DAIF => {
             st.daif = value as u32 & PSTATE_DAIF;
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
         }
         FPCR => {
             vfp::set_fpcr(&mut st, value as u32, f);
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
         }
         FPSR => {
             vfp::set_fpsr(&mut st, value as u32);
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
         }
         SPSEL => {
             st.update_spsel(value as u32);
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
         }
         PAN => {
             st.pstate = (st.pstate & !PSTATE_PAN) | (value as u32 & PSTATE_PAN);
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
         }
         UAO => {
             st.pstate = (st.pstate & !PSTATE_UAO) | (value as u32 & PSTATE_UAO);
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
+        }
+        TCO if f.mte < 2 => {}
+        TCO => {
+            st.pstate = (st.pstate & !PSTATE_TCO) | (value as u32 & PSTATE_TCO);
+            super::commit(cpu, &mut st);
         }
         OSLAR_EL1 => {
             // oslar_write(): OSLSR_EL1.OSLK follows bit 0.
             st.oslsr_el1 = (st.oslsr_el1 & !2) | ((value & 1) << 1);
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
         }
         ZCR_EL1 | ZCR_EL2 | ZCR_EL3 => {
             // zcr_write(): bits other than [3:0] are RAZ/WI. Because we arrived here, we
@@ -1194,7 +1394,7 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
             if new_len < old_len {
                 super::sve_narrow_vq(&mut st, new_len as usize + 1);
             }
-            st.store(cpu.env);
+            super::commit(cpu, &mut st);
         }
         _ if key_ >> 14 == 1 && (key_ >> 7) & 0xf == 7 => at(arm, cpu, &st, key_, value),
         // CRn 9 is the nXS forms.
@@ -1250,7 +1450,7 @@ fn at(arm: &Arm, cpu: &mut Cpu<'_>, st: &CpuArmState, key_: u32, value: u64) {
     };
     let mut st = CpuArmState::load(cpu.env);
     st.par_el1 = par;
-    st.store(cpu.env);
+    super::commit(cpu, &mut st);
 }
 
 /// `vae1_tlbmask()`: the regime the EL1 TLBIs operate on, and an MMU index in it.

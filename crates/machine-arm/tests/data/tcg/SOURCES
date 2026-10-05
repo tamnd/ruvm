@@ -10,6 +10,15 @@ tests/tcg_run.rs and by the ruvm-cli tests. They are QEMU's own sources
   asid2.gz      tests/tcg/aarch64/system/asid2.c
   feat-xs.gz    tests/tcg/aarch64/system/feat-xs.c
   semiheap.gz   tests/tcg/aarch64/system/semiheap.c
+  pauth-3.gz    tests/tcg/aarch64/system/pauth-3.c, with -march=armv8.3-a
+  mte.gz        tests/tcg/aarch64/system/mte.S, with -march=armv8.5-a+memtag
+  vtimer.gz     tests/tcg/aarch64/system/vtimer.c
+  semiconsole.gz tests/tcg/aarch64/system/semiconsole.c
+  rme_gdi.gz    tests/tcg/aarch64/system/rme_gdi.c
+  gpc-test.gz   tests/tcg/aarch64/system/gpc-test.c, linked with a boot.S built
+                with -DLOGGING_VECTOR_TABLE instead
+  memory-sve.gz tests/tcg/multiarch/system/memory.c, with -DCHECK_UNALIGNED=1
+                -march=armv8.1-a+sve -O3
 
 each linked with tests/tcg/aarch64/system/boot.S, tests/tcg/minilib/printf.c
 and tests/tcg/aarch64/system/kernel.ld, built on x86_64 Ubuntu 24.04 with
@@ -35,3 +44,14 @@ asid2.out, semiheap.out and memory.out.gz are what qemu-system-aarch64 11.1
 
 which exits with status 0 for all six. hello writes "Hello World\n";
 interrupt and feat-xs write nothing.
+
+The others run with the options of the Makefile's run- rules: pauth-3 on
+-cpu max,pauth-qarma5=on (writes "OK\n"), mte on -M virt,mte=on (writes
+nothing), vtimer on -M virt,virtualization=on -cpu cortex-a57 -smp 4 with
+arg=2 (vtimer.out), gpc-test on -M virt,virtualization=on,secure=on
+-cpu max,x-rme=on with arg=3 (gpc-test.out), rme_gdi like hello (writes
+"SKIP: GDI not implemented\n"), memory-sve like memory (memory.out.gz).
+semiconsole is manual only in QEMU; tcg_run.rs types "hello worldX" into
+it. All exit with status 0, except that mte passes main's return value, the
+address 0x40400000 of its tagged page, to SYS_EXIT; QEMU exits with that,
+which the shell sees as 0.
