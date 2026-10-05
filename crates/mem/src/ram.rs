@@ -46,6 +46,13 @@ impl RamBlock {
         self.mem.as_slice()
     }
 
+    /// The bytes, for host atomic operations on guest RAM (see `ruvm_sys::hostatomic`), the
+    /// way TCG's atomic helpers work on `ramblock_ptr()`. Writes through this do not mark pages
+    /// dirty.
+    pub fn atomic_bytes(&self) -> &[AtomicU8] {
+        self.bytes()
+    }
+
     /// The host address of the first byte, `ramblock_ptr(block, 0)`, for accelerators that map
     /// guest RAM into the hypervisor.
     pub fn host_addr(&self) -> usize {

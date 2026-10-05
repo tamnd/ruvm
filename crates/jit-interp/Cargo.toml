@@ -11,10 +11,11 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 3
 
 [dependencies]
 ruvm-jit-core.workspace = true
+ruvm-sys.workspace = true
 
 [lints]
 workspace = true

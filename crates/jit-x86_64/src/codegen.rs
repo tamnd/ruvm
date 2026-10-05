@@ -41,11 +41,15 @@
 //! - Loads and stores through a pointer that is not `env` can fault, so the allocator syncs
 //!   globals before them, as it does for ops with side effects.
 //! - Helper calls, guest memory accesses and `divs2`/`divu2` go through the service routine,
-//!   with every argument in memory, instead of the host calling convention and the softmmu
-//!   fast path.
-//! - `insn_start` stores the index of its words in the run context rather than recording them
-//!   in a table next to the code; the runtime reports them to the guest memory before each
-//!   service request and to the caller at the end.
+//!   with every argument in memory, instead of the host calling convention. Only the TLB miss
+//!   path of a `qemu_ld` or `qemu_st` does: with [`GenOptions::tlb_page_bits`] the lookup is
+//!   inlined as in QEMU, except for byte swapped and 128-bit accesses, which always take the
+//!   slow path (QEMU inlines those too).
+//! - `insn_start` emits no code. Each service request carries the index of the `insn_start`
+//!   of its instruction, fixed when the block is compiled, and each exit stores it in the run
+//!   context, instead of QEMU's table of host code offsets next to the code; the runtime
+//!   reports the words to the guest memory before each service request and to the caller at
+//!   the end.
 //! - rcx is never allocated, so the shift ops take any register for the count (QEMU's `c`
 //!   constraint is not used) and the code moves the count into cl itself.
 //! - `div`, `rem`, `muluh` and `mulsh` take any registers and shuffle rax and rdx through the
@@ -62,14 +66,29 @@
 //!   way QEMU does it on hosts without AVX for 64 and 128-bit vectors.
 //! - The add and subtract with carry ops keep the carry in a word of the slot array, and only
 //!   pass it in the flags between two adjacent ops of the same family.
-//! - `goto_tb` is a `jmp` whose displacement is 0 (fall through) until the block is linked,
-//!   when it is patched to reach an exit stub; QEMU jumps straight to the next block.
+//! - `goto_tb` is a `jmp` whose displacement is 0 (fall through) until the block is linked.
+//!   Linking patches it to jump straight to the next block, as in QEMU, when that block is in
+//!   a region this one keeps mapped and within reach of a 32-bit displacement, and to an exit
+//!   stub that leaves with [`ruvm_jit_interp::Exit::GotoTb`] otherwise.
+//! - Every block has its own prologue and epilogue, with the same frame, and chained jumps
+//!   enter a block after its prologue. QEMU shares one prologue for the whole buffer. The
+//!   first thing after the prologue stores the address of the block's request table in the
+//!   run context, so the service routine knows which block a request comes from.
+//! - `goto_ptr` jumps to the address `lookup_tb_ptr` returned only if the runtime vouched for
+//!   it in the run context, and leaves with [`ruvm_jit_interp::Exit::GotoPtr`] otherwise.
+//!   QEMU jumps to whatever the helper returned.
+//! - A 32-bit load of the `icount_decr` word at the offset the runtime gives reads the shared
+//!   atomic through a pointer in the run context, so that exit requests from other threads
+//!   are seen without leaving generated code. In QEMU the word is part of the CPU state.
 
 use ruvm_jit_core::ir::{Func, HelperType, Op, OpId, Temp};
 use ruvm_jit_core::opcode::Opcode;
 use ruvm_jit_core::regalloc::{self, Letter, RegSet, Target};
 use ruvm_jit_core::types::{
     Cond, INSN_START_WORDS, MemOpIdx, TempKind, Type, bswap, dup_const, mo, opf,
+};
+use ruvm_jit_interp::fast_tlb::{
+    TLB_ADDEND_WORD, TLB_DESC_WORDS, TLB_ENTRY_BITS, TLB_FLAGS_SHIFT, TLB_MAX_MMU_MODES,
 };
 
 use crate::asm::{
@@ -102,10 +121,39 @@ pub(crate) const SLOT_BYTES: usize = 32;
 pub(crate) const NARGS: usize = 32;
 /// Byte offset of the return value word in the run context, right after the argument words.
 pub(crate) const RET_OFFSET: i64 = 8 * NARGS as i64;
-/// Byte offset of the word holding one more than the index of the last `insn_start` request.
+/// Byte offset of the word holding one more than the index of the last `insn_start` request
+/// before the exit generated code left through.
 pub(crate) const INSN_OFFSET: i64 = RET_OFFSET + 8;
 /// Byte offset of the length of the CPU state buffer.
 pub(crate) const ENV_LEN_OFFSET: i64 = INSN_OFFSET + 8;
+/// Byte offset of the word where a block stores the address of its [`GenOptions::meta`] when
+/// it leaves.
+pub(crate) const META_OFFSET: i64 = ENV_LEN_OFFSET + 8;
+/// Byte offset of the address of the `icount_decr` word that [`GenOptions::icount_decr`]
+/// loads read.
+pub(crate) const DECR_OFFSET: i64 = META_OFFSET + 8;
+/// Byte offset of the one block entry address `goto_ptr` may jump to, as the service routine
+/// last checked it.
+pub(crate) const GOTO_PTR_OK_OFFSET: i64 = DECR_OFFSET + 8;
+/// Byte offset of the address of the TLB descriptor the inline softmmu fast path reads, a
+/// [`ruvm_jit_interp::FastTlb::desc`].
+pub(crate) const TLB_OFFSET: i64 = GOTO_PTR_OK_OFFSET + 8;
+
+/// What [`generate`] needs besides the IR.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GenOptions {
+    /// Passed to the service routine with each request, so that it knows which block's requests
+    /// it serves, and stored at [`META_OFFSET`] in the run context when the block leaves, so
+    /// that the runtime knows which block left.
+    pub(crate) meta: u64,
+    /// A 32-bit load at this constant offset from `env` reads the word whose address is at
+    /// [`DECR_OFFSET`] instead, so that the `icount_decr` check at the start of a chained block
+    /// sees exit requests from other threads.
+    pub(crate) icount_decr: Option<i64>,
+    /// log2 of the guest page size of the TLB tables at [`TLB_OFFSET`], or `None` to send
+    /// every `qemu_ld` and `qemu_st` to the service routine.
+    pub(crate) tlb_page_bits: Option<u32>,
+}
 
 /// Whether the host uses the Win64 calling convention rather than System V.
 const WIN64: bool = cfg!(windows);
@@ -147,7 +195,7 @@ pub(crate) enum Request {
     Load(MemOpIdx),
     /// `qemu_st`: the value is in words 0 and 1, the address in word 2.
     Store(MemOpIdx),
-    /// The words of an `insn_start`. Never called; the code stores its index in the context.
+    /// The words of an `insn_start`. Never called; [`Generated::insn_of`] refers to it.
     InsnStart([u64; INSN_START_WORDS]),
     /// `divs2` or `divu2` at this width: low, high and divisor in words 0 to 2, quotient and
     /// remainder back in words 0 and 1.
@@ -196,8 +244,19 @@ type R<T> = Result<T, GenCodeError>;
 pub(crate) struct Generated {
     pub(crate) bytes: Vec<u8>,
     pub(crate) requests: Vec<Request>,
+    /// For each request, one more than the index of the `insn_start` request before it in the
+    /// code, or 0: the instruction a request made by a helper call or a memory access is part
+    /// of, as QEMU finds it from the host return address.
+    pub(crate) insn_of: Vec<u64>,
     /// Number of 64-bit words of slot array the code uses.
     pub(crate) slot_words: usize,
+    /// The byte offset where another block's chained jump enters, after the prologue.
+    pub(crate) body: usize,
+    /// The byte offset after the static bounds check, where a chained jump may enter when the
+    /// run's CPU state is known to be at least [`Generated::env_need`] bytes long.
+    pub(crate) fast_body: usize,
+    /// The length of CPU state the static bounds check asks for (`u64::MAX` if it always fails).
+    pub(crate) env_need: u64,
     /// For each `goto_tb`: its slot, the byte offset of its 4-byte aligned jump displacement,
     /// and the displacement that sends it to the exit stub.
     pub(crate) goto_tb: Vec<(u32, usize, u32)>,
@@ -321,14 +380,24 @@ const ARGS: [Reg; 3] = if WIN64 { [RCX, RDX, R8] } else { [RDI, RSI, RDX] };
 
 /// Compile `f` for code that will live at `base`. `service` is the address of the service
 /// routine.
-pub(crate) fn generate(f: &Func, _base: u64, service: u64, feat: HostFeatures) -> R<Generated> {
-    check_types(f, feat)?;
+pub(crate) fn generate(
+    f: &Func,
+    _base: u64,
+    service: u64,
+    feat: HostFeatures,
+    opts: &GenOptions,
+) -> R<Generated> {
+    let v256 = check_types(f, feat)?;
     let f = regalloc::prepare(f, &extra_flags);
     let mut g = Gen {
         a: Asm::new(),
         feat,
         labels: vec![None; f.nb_labels()],
         requests: Vec::new(),
+        insn_of: Vec::new(),
+        insn: 0,
+        meta: opts.meta,
+        v256,
         goto_tb: Vec::new(),
         service,
         exit: 0,
@@ -337,8 +406,11 @@ pub(crate) fn generate(f: &Func, _base: u64, service: u64, feat: HostFeatures) -
         static_access: (0, 0),
         static_always_fails: false,
         nb_temps: f.nb_temps(),
+        icount_decr: opts.icount_decr,
         carry_live: false,
         err: None,
+        tlb_page_bits: opts.tlb_page_bits,
+        ldst: Vec::new(),
     };
     g.exit = g.a.new_label();
     g.bounds = g.a.new_label();
@@ -357,11 +429,14 @@ pub(crate) fn generate(f: &Func, _base: u64, service: u64, feat: HostFeatures) -
     g.a.mov(P_REXW, ENV, ARGS[0]);
     g.a.mov(P_REXW, CTX, ARGS[1]);
     g.a.mov(P_REXW, SLOTS, ARGS[2]);
+    // Chained jumps from other blocks enter here, with the fixed registers set up.
+    let body = g.a.pos();
     // The static bounds check; the immediate is patched once the body is known.
     let check_at = g.a.pos() + 2;
     g.a.movabs(TMP0, 0);
     g.a.cmp_mem(P_REXW, TMP0, Mem::Base(CTX, ENV_LEN_OFFSET as i32));
     g.a.jump(Some(cc::A), static_fail, false);
+    let fast_body = g.a.pos();
 
     regalloc::reg_alloc(&f, &mut g)?;
     if let Some(e) = g.err.take() {
@@ -369,10 +444,23 @@ pub(crate) fn generate(f: &Func, _base: u64, service: u64, feat: HostFeatures) -
     }
     g.exit_with(kind::FELL_OFF, None);
 
+    // The TLB miss paths.
+    for l in std::mem::take(&mut g.ldst) {
+        g.a.bind(l.label);
+        g.insn = l.insn;
+        match l.val {
+            None => g.qemu_ld_slow(l.ty, l.oi, l.out, l.addr),
+            Some(v) => g.qemu_st_slow(l.ty, l.oi, v, l.addr),
+        }
+        g.a.jump(None, l.back, false);
+    }
+
     // Exit stubs for linked goto_tb slots.
     let mut goto_tb = Vec::new();
-    for (slot, at) in std::mem::take(&mut g.goto_tb) {
+    for (slot, at, insn) in std::mem::take(&mut g.goto_tb) {
         let stub = g.a.pos();
+        g.insn = insn;
+        g.note_exit();
         g.a.movi(false, RDX, slot as u64, false);
         g.a.movi(false, RAX, kind::GOTO_TB, false);
         g.a.jump(None, g.exit, false);
@@ -388,6 +476,8 @@ pub(crate) fn generate(f: &Func, _base: u64, service: u64, feat: HostFeatures) -
 
     // A failed bounds check: the offset in r11, its end in r10.
     g.a.bind(g.bounds);
+    g.a.movabs(TMP2, g.meta);
+    g.a.store(TMP2, Mem::Base(CTX, META_OFFSET as i32), 8);
     g.a.mov(P_REXW, RCX, TMP1);
     g.a.arith(arith::SUB, P_REXW, RCX, TMP0);
     g.a.store(RCX, Mem::Base(CTX, 0), 8);
@@ -425,14 +515,15 @@ pub(crate) fn generate(f: &Func, _base: u64, service: u64, feat: HostFeatures) -
 
     // The temp slots, the carry word, then two 32-byte lanes of vector scratch.
     let slot_words = (f.nb_temps() + 1) * SLOT_BYTES / 8 + 2 * SLOT_BYTES / 8;
-    let requests = g.requests;
+    let (requests, insn_of) = (g.requests, g.insn_of);
     let bytes = g.a.finish()?;
-    Ok(Generated { bytes, requests, slot_words, goto_tb })
+    Ok(Generated { bytes, requests, insn_of, slot_words, body, fast_body, env_need: end, goto_tb })
 }
 
 /// Refuse temps of types this backend has no registers for, and calls with more arguments
-/// than the run context holds.
-fn check_types(f: &Func, feat: HostFeatures) -> R<()> {
+/// than the run context holds. Returns whether `f` uses 256-bit vectors.
+fn check_types(f: &Func, feat: HostFeatures) -> R<bool> {
+    let mut v256 = false;
     let ok = |ty: Type| match ty {
         Type::I32 | Type::I64 | Type::V64 | Type::V128 => true,
         Type::V256 => feat.avx2,
@@ -442,6 +533,7 @@ fn check_types(f: &Func, feat: HostFeatures) -> R<()> {
         let n = op.nb_oargs() + op.nb_iargs();
         for k in 0..n {
             let ty = f.temp(op.arg_temp(k)).ty;
+            v256 |= ty == Type::V256;
             if !ok(ty) {
                 return Err(GenCodeError::Unsupported(format!("{}: {ty:?} temps", op.opc.name())));
             }
@@ -452,8 +544,9 @@ fn check_types(f: &Func, feat: HostFeatures) -> R<()> {
         if op.opc == Opcode::Call && (op.calli as usize > NARGS || op.callo > 2) {
             return Err(bad(op, "too many call arguments"));
         }
+        v256 |= op.ty == Type::V256;
     }
-    Ok(())
+    Ok(v256)
 }
 
 fn bad(op: &Op, what: &str) -> GenCodeError {
@@ -540,7 +633,16 @@ struct Gen {
     feat: HostFeatures,
     labels: Vec<Option<usize>>,
     requests: Vec<Request>,
-    goto_tb: Vec<(u32, usize)>,
+    /// See [`Generated::insn_of`].
+    insn_of: Vec<u64>,
+    /// One more than the index of the last `insn_start` request so far, or 0.
+    insn: u64,
+    /// See [`GenOptions::meta`].
+    meta: u64,
+    /// The block uses 256-bit vectors, so it leaves the upper vector state dirty.
+    v256: bool,
+    /// For each `goto_tb`: its slot, the offset of its displacement, and [`Gen::insn`] there.
+    goto_tb: Vec<(u32, usize, u64)>,
     service: u64,
     exit: usize,
     bounds: usize,
@@ -550,10 +652,33 @@ struct Gen {
     /// A constant offset access is outside what the check on entry can describe.
     static_always_fails: bool,
     nb_temps: usize,
+    /// See [`GenOptions::icount_decr`].
+    icount_decr: Option<i64>,
     /// The carry flag holds a carry between two fused ops, so moves must not change the flags.
     carry_live: bool,
     /// An error from a hook that cannot return one.
     err: Option<GenCodeError>,
+    /// See [`GenOptions::tlb_page_bits`].
+    tlb_page_bits: Option<u32>,
+    /// The TLB miss paths, emitted after the body.
+    ldst: Vec<LdstSlow>,
+}
+
+/// The out of line TLB miss path of one `qemu_ld` or `qemu_st`, QEMU's `TCGLabelQemuLdst`.
+struct LdstSlow {
+    /// Where the miss path starts.
+    label: usize,
+    /// Where it goes back to.
+    back: usize,
+    oi: MemOpIdx,
+    ty: Type,
+    addr: Reg,
+    /// For a load, the register of the value; for a store, the value and whether it is a
+    /// constant.
+    val: Option<(u64, bool)>,
+    out: Reg,
+    /// [`Gen::insn`] at the access.
+    insn: u64,
 }
 
 // Constraint sets, `tcg-target-con-set.h`.
@@ -611,11 +736,19 @@ impl Gen {
     }
 
     fn exit_with(&mut self, k: u64, value: Option<u64>) {
+        self.note_exit();
         if let Some(v) = value {
             self.a.movi(true, RDX, v, false);
         }
         self.a.movi(false, RAX, k, false);
         self.a.jump(None, self.exit, false);
+    }
+
+    /// Record in the run context that this block left, after the instruction of [`Gen::insn`].
+    fn note_exit(&mut self) {
+        self.a.movabs(TMP0, self.meta);
+        self.a.store(TMP0, Mem::Base(CTX, META_OFFSET as i32), 8);
+        self.a.store_imm(self.insn, Mem::Base(CTX, INSN_OFFSET as i32), 8);
     }
 
     /// `tcg_out_movi`, leaving the flags alone while a carry is live.
@@ -680,11 +813,15 @@ impl Gen {
     fn service(&mut self, req: Request) {
         let idx = self.requests.len();
         self.requests.push(req);
-        if self.feat.avx {
+        self.insn_of.push(self.insn);
+        // As in QEMU, helpers are called with whatever upper vector state the code left, but
+        // a block that uses 256-bit vectors clears it, which costs little next to its work.
+        if self.v256 {
             self.a.vex_opc(op::VZEROUPPER, 0, 0, 0, 0);
         }
         self.a.mov(P_REXW, ARGS[0], CTX);
         self.a.movi(false, ARGS[1], idx as u64, false);
+        self.a.movabs(ARGS[2], self.meta);
         self.a.movabs(TMP0, self.service);
         self.a.call_reg(TMP0);
         self.a.test(P_REXW, RAX, RAX);
@@ -693,6 +830,81 @@ impl Gen {
         self.a.movi(false, RDX, 0, false);
         self.a.jump(None, self.exit, false);
         self.a.bind(ok);
+    }
+
+    /// `qemu_ld` through the service routine: the value of `oi` at `addr` into `out`.
+    fn qemu_ld_slow(&mut self, ty: Type, oi: MemOpIdx, out: Reg, addr: Reg) {
+        self.put_args(&[addr as u64]);
+        self.service(Request::Load(oi));
+        self.a.load(out, Mem::Base(CTX, 0), ty.size(), false, rexw(ty));
+    }
+
+    /// `qemu_st` through the service routine: `val` (a register, or a constant if the flag is
+    /// set) stored as `oi` says at `addr`.
+    fn qemu_st_slow(&mut self, ty: Type, oi: MemOpIdx, val: (u64, bool), addr: Reg) {
+        let (v, is_const) = val;
+        if is_const && ty == Type::I32 {
+            // Zero extended: the low word, then a zero high word.
+            self.a.store_imm(v, Mem::Base(CTX, 0), 4);
+            self.a.store_imm(0, Mem::Base(CTX, 4), 4);
+        } else if is_const {
+            self.a.store_imm(v, Mem::Base(CTX, 0), 8);
+        } else {
+            self.a.store(v as Reg, Mem::Base(CTX, 0), 8);
+        }
+        self.a.store_imm(0, Mem::Base(CTX, 8), 8);
+        self.a.store(addr, Mem::Base(CTX, 16), 8);
+        self.service(Request::Store(oi));
+    }
+
+    /// The inline TLB lookup of a `qemu_ld` or `qemu_st`, QEMU's `prepare_host_addr`. On a hit
+    /// it falls through with the entry's addend in `TMP1`, so the access is at `(addr, TMP1)`
+    /// for the returned address register; on a miss it jumps to the returned label. `None`
+    /// when the access always takes the slow path: no TLB to read, a byte swapped or 128-bit
+    /// access, or an alignment the compare cannot check.
+    fn tlb_fast_path(
+        &mut self,
+        f: &Func,
+        addr: Reg,
+        oi: MemOpIdx,
+        store: bool,
+    ) -> Option<(Reg, usize)> {
+        let page_bits = self.tlb_page_bits?;
+        let m = oi.memop();
+        let mmu_idx = oi.mmu_idx() as usize;
+        let (s_bits, a_bits) = (m.size(), m.alignment_bits());
+        // Alignment bits must stay below the comparator's flag bits, or a misaligned address
+        // could match a flagged comparator.
+        if s_bits > 3 || m.is_bswap() || a_bits > TLB_FLAGS_SHIFT || mmu_idx >= TLB_MAX_MMU_MODES {
+            return None;
+        }
+        let (s_mask, a_mask) = ((1u64 << s_bits) - 1, (1u64 << a_bits) - 1);
+        let addr = if f.config.addr_type == Type::I32 {
+            self.a.mov(0, TMP2, addr);
+            TMP2
+        } else {
+            addr
+        };
+        let desc = (mmu_idx * TLB_DESC_WORDS * 8) as i32;
+        self.a.load(TMP0, Mem::Base(CTX, TLB_OFFSET as i32), 8, false, P_REXW);
+        self.a.mov(P_REXW, TMP1, addr);
+        self.a.shifti(shift::SHR, P_REXW, TMP1, page_bits - TLB_ENTRY_BITS);
+        self.a.arith_mem(arith::AND, P_REXW, TMP1, Mem::Base(TMP0, desc));
+        self.a.arith_mem(arith::ADD, P_REXW, TMP1, Mem::Base(TMP0, desc + 8));
+        // An access that is less aligned than its size must not cross the page: check the
+        // address of its last byte, as QEMU does.
+        if a_mask >= s_mask {
+            self.a.mov(P_REXW, TMP0, addr);
+        } else {
+            self.a.lea(P_REXW, TMP0, Mem::Base(addr, (s_mask - a_mask) as i32));
+        }
+        self.a.arithi(arith::AND, P_REXW, TMP0, ((u64::MAX << page_bits) | a_mask) as i64);
+        let cmp = if store { 8 } else { 0 };
+        self.a.cmp_mem(P_REXW, TMP0, Mem::Base(TMP1, cmp));
+        let miss = self.a.new_label();
+        self.a.jump(Some(cc::NE), miss, false);
+        self.a.load(TMP1, Mem::Base(TMP1, (TLB_ADDEND_WORD * 8) as i32), 8, false, P_REXW);
+        Some((addr, miss))
     }
 
     /// Set the flags for `c` from `a` and `b`, `tcg_out_cmp`, and return the x86 condition
@@ -1139,6 +1351,12 @@ impl Gen {
                     (0, 16, true) => self.a.modrm(op::MOVSWL | w, d, a1),
                     (0, 32, false) if ty == Type::I64 => self.a.modrm(op::MOVL_GV_EV, d, a1),
                     (0, 32, true) if ty == Type::I64 => self.a.modrm(op::MOVSLQ, d, a1),
+                    // QEMU's `tcg_gen_extract_*` makes this an `andi` on x86 hosts. A 32-bit
+                    // `and` also clears the high half.
+                    (0, _, false) if len < 32 => {
+                        self.a.mov(0, d, a1);
+                        self.a.arithi(arith::AND, 0, d, (1i64 << len) - 1);
+                    }
                     _ => {
                         self.a.mov(w, d, a1);
                         if bits - ofs - len != 0 {
@@ -1219,7 +1437,13 @@ impl Gen {
                     _ => (ty.size(), false),
                 };
                 let addr = self.host_addr(f, op, args, const_args, 1, size as u64);
-                self.a.load(d, addr.mem(), size, signed, w);
+                match addr {
+                    Addr::Static(off) if size == 4 && Some(off) == self.icount_decr => {
+                        self.a.load(TMP0, Mem::Base(CTX, DECR_OFFSET as i32), 8, false, P_REXW);
+                        self.a.load(d, Mem::Base(TMP0, 0), size, signed, w);
+                    }
+                    _ => self.a.load(d, addr.mem(), size, signed, w),
+                }
             }
             Opcode::St8 | Opcode::St16 | Opcode::St32 | Opcode::St => {
                 let size = match op.opc {
@@ -1235,39 +1459,88 @@ impl Gen {
                     self.a.store(d, addr.mem(), size);
                 }
             }
-            Opcode::QemuLd | Opcode::QemuLd2 => {
-                let two = op.opc == Opcode::QemuLd2;
-                let ai = if two { 2 } else { 1 };
-                self.put_args(&args[ai..ai + 1]);
-                self.service(Request::Load(MemOpIdx(op.args[ai + 1] as u32)));
-                if two {
-                    self.a.load(r(0), Mem::Base(CTX, 0), 8, false, P_REXW);
-                    self.a.load(r(1), Mem::Base(CTX, 8), 8, false, P_REXW);
-                } else {
-                    self.a.load(r(0), Mem::Base(CTX, 0), ty.size(), false, w);
+            Opcode::QemuLd2 => {
+                self.put_args(&args[2..3]);
+                self.service(Request::Load(MemOpIdx(op.args[3] as u32)));
+                self.a.load(r(0), Mem::Base(CTX, 0), 8, false, P_REXW);
+                self.a.load(r(1), Mem::Base(CTX, 8), 8, false, P_REXW);
+            }
+            Opcode::QemuLd => {
+                let oi = MemOpIdx(op.args[2] as u32);
+                match self.tlb_fast_path(f, r(1), oi, false) {
+                    Some((addr, label)) => {
+                        let m = oi.memop();
+                        let host = Mem::Index(addr, TMP1, 0);
+                        self.a.load(r(0), host, m.size_bytes(), m.is_signed(), w);
+                        let back = self.a.new_label();
+                        self.a.bind(back);
+                        let addr = r(1);
+                        self.ldst.push(LdstSlow {
+                            label,
+                            back,
+                            oi,
+                            ty,
+                            addr,
+                            val: None,
+                            out: r(0),
+                            insn: self.insn,
+                        });
+                    }
+                    None => self.qemu_ld_slow(ty, oi, r(0), r(1)),
                 }
             }
-            Opcode::QemuSt | Opcode::QemuSt2 => {
-                let two = op.opc == Opcode::QemuSt2;
-                let ai = if two { 2 } else { 1 };
+            Opcode::QemuSt => {
+                let oi = MemOpIdx(op.args[2] as u32);
+                let val = (args[0], const_args[0]);
+                match self.tlb_fast_path(f, r(1), oi, true) {
+                    Some((addr, label)) => {
+                        let host = Mem::Index(addr, TMP1, 0);
+                        let size = oi.memop().size_bytes();
+                        if val.1 {
+                            self.a.store_imm(val.0, host, size);
+                        } else {
+                            self.a.store(val.0 as Reg, host, size);
+                        }
+                        let back = self.a.new_label();
+                        self.a.bind(back);
+                        let addr = r(1);
+                        self.ldst.push(LdstSlow {
+                            label,
+                            back,
+                            oi,
+                            ty,
+                            addr,
+                            val: Some(val),
+                            out: 0,
+                            insn: self.insn,
+                        });
+                    }
+                    None => self.qemu_st_slow(ty, oi, val, r(1)),
+                }
+            }
+            Opcode::QemuSt2 => {
                 for k in 0..2 {
                     let at = Mem::Base(CTX, 8 * k as i32);
-                    if k == 1 && !two {
-                        self.a.store_imm(0, at, 8);
-                    } else if const_args[k] && ty == Type::I32 && !two {
-                        // Zero extended: the low word, then a zero high word.
-                        self.a.store_imm(args[k], at, 4);
-                        self.a.store_imm(0, Mem::Base(CTX, 4), 4);
-                    } else if const_args[k] {
+                    if const_args[k] {
                         self.a.store_imm(args[k], at, 8);
                     } else {
                         self.a.store(r(k), at, 8);
                     }
                 }
-                self.a.store(r(ai), Mem::Base(CTX, 16), 8);
-                self.service(Request::Store(MemOpIdx(op.args[ai + 1] as u32)));
+                self.a.store(r(2), Mem::Base(CTX, 16), 8);
+                self.service(Request::Store(MemOpIdx(op.args[3] as u32)));
             }
             Opcode::GotoPtr => {
+                // Jump straight to the block when the service routine vouched for the address
+                // (`lookup_tb_ptr` found a block it can enter); leave otherwise. The context
+                // holds 0 when no address is vouched for, so 0 itself always leaves.
+                let out = self.a.new_label();
+                self.a.test(P_REXW, r(0), r(0));
+                self.a.jump(Some(cc::E), out, true);
+                self.a.cmp_mem(P_REXW, r(0), Mem::Base(CTX, GOTO_PTR_OK_OFFSET as i32));
+                self.a.jump(Some(cc::NE), out, true);
+                self.a.jmp_reg(r(0));
+                self.a.bind(out);
                 self.a.mov(P_REXW, RDX, r(0));
                 self.exit_with(kind::GOTO_PTR, None);
             }
@@ -2141,8 +2414,8 @@ impl Target for Gen {
                 let mut words = [0u64; INSN_START_WORDS];
                 words.copy_from_slice(&op.args[..INSN_START_WORDS]);
                 self.requests.push(Request::InsnStart(words));
-                let n = self.requests.len() as u64;
-                self.a.store_imm(n, Mem::Base(CTX, INSN_OFFSET as i32), 8);
+                self.insn = self.requests.len() as u64;
+                self.insn_of.push(self.insn);
             }
             Opcode::ExitTb => self.exit_with(kind::EXIT_TB, Some(op.args[0])),
             Opcode::GotoTb => {
@@ -2153,7 +2426,7 @@ impl Target for Gen {
                 self.a.b8(op::JMP_LONG as u8);
                 let at = self.a.pos();
                 self.a.b32(0);
-                self.goto_tb.push((op.args[0] as u32, at));
+                self.goto_tb.push((op.args[0] as u32, at, self.insn));
             }
             Opcode::Brcond => {
                 let c = cond_arg(op, 2)?;

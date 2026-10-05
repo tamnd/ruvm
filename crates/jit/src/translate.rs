@@ -108,6 +108,7 @@ pub fn tb_gen_code(cpu: &mut Cpu<'_>, s: TbCpuState) -> Result<Arc<Tb>, CpuLoopE
                 addr_type: ops.addr_type(),
                 no_goto_ptr: cflags & cf::NO_GOTO_PTR != 0,
                 fence_mapping: jit.backend.fence_mapping(ops.guest_default_memory_order()),
+                tlb_page_bits: Some(jit.config.page_bits),
             };
             let mut b = TbBuild {
                 f: Func::new(config),
@@ -171,6 +172,7 @@ pub fn tb_gen_code(cpu: &mut Cpu<'_>, s: TbCpuState) -> Result<Arc<Tb>, CpuLoopE
                 code,
                 code_size,
             ));
+            jit.backend.tb_created(&tb);
             // Init original jump addresses.
             for (n, used) in goto_tb_used.iter().enumerate() {
                 if *used {

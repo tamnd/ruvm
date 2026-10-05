@@ -11,7 +11,7 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 1
 
 [features]
 # Run every runtime made with the interpreter backend on the host's native backend instead,
@@ -23,6 +23,7 @@ force-native = []
 ruvm-jit-core.workspace = true
 ruvm-jit-interp.workspace = true
 ruvm-mem.workspace = true
+ruvm-sys.workspace = true
 
 [target.'cfg(all(unix, target_arch = "aarch64"))'.dependencies]
 ruvm-jit-aarch64.workspace = true

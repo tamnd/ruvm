@@ -258,6 +258,7 @@ pub(crate) mod ext3 {
 /// The `EXT5_*` group 5 operations.
 pub(crate) mod ext5 {
     pub(crate) const CALLN_EV: u8 = 2;
+    pub(crate) const JMPN_EV: u8 = 4;
 }
 
 /// The `OPC_GRPBT_*` operations.
@@ -621,7 +622,12 @@ impl Asm {
 
     /// `cmp s, (mem)`: flags from `r - mem`.
     pub(crate) fn cmp_mem(&mut self, rexw: u32, r: Reg, m: Mem) {
-        self.modrm_mem((op::ARITH_GV_EV + (arith::CMP as u32) * 8) | rexw, r, m);
+        self.arith_mem(arith::CMP, rexw, r, m);
+    }
+
+    /// A group 1 op with a memory source: `r = r op (mem)`.
+    pub(crate) fn arith_mem(&mut self, code: u8, rexw: u32, r: Reg, m: Mem) {
+        self.modrm_mem((op::ARITH_GV_EV + (code as u32) * 8) | rexw, r, m);
     }
 
     /// `tcg_out_shifti`.
@@ -711,6 +717,11 @@ impl Asm {
     /// `call *r`.
     pub(crate) fn call_reg(&mut self, r: Reg) {
         self.modrm(op::GRP5, ext5::CALLN_EV, r);
+    }
+
+    /// `jmp *r`.
+    pub(crate) fn jmp_reg(&mut self, r: Reg) {
+        self.modrm(op::GRP5, ext5::JMPN_EV, r);
     }
 
     /// `lock orl $0, (%rsp)`, `tcg_out_mb`.

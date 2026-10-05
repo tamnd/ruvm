@@ -187,7 +187,7 @@ impl Jit {
         } else {
             self.rr_halt.clone()
         };
-        let tlb = CpuTlb::new(self.config.nb_mmu_modes, self.now_ns());
+        let tlb = CpuTlb::new(self.config.page_bits, self.config.nb_mmu_modes, self.now_ns());
         let shared = Arc::new(CpuShared::new(cpu_index, self.self_ref.clone(), halt, tlb));
         cpus.push(shared.clone());
         drop(cpus);

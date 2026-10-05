@@ -17,8 +17,13 @@
 //! Code can be generated on any host, but only run on an x86-64 one. Both the System V and the
 //! Win64 calling conventions are supported.
 //!
-//! All unsafe code is in the code buffer (mapping and writing executable memory) and in the two
-//! places the runtime crosses into and back out of generated code.
+//! [`CompiledTb::run_chained`] runs a block and the blocks it chains to without coming back in
+//! between: [`CompiledTb::set_goto_tb_target`] patches `goto_tb` jumps to go straight to the
+//! next block, and a [`Chain`] supplies the blocks `lookup_and_goto_ptr` jumps to.
+//!
+//! All unsafe code is in the code buffer (mapping and writing executable memory), in the two
+//! places the runtime crosses into and back out of generated code, and where the service
+//! routine reads the metadata of the block that called it.
 
 #[allow(
     dead_code,
@@ -34,4 +39,6 @@ mod runtime;
 pub use buffer::{BufferError, CodeBuffer};
 pub use codegen::GenCodeError;
 pub use features::HostFeatures;
-pub use runtime::{CodeRegion, CompiledTb};
+pub use runtime::{
+    Chain, ChainExit, CodeRegion, CompileOptions, CompiledTb, Found, MAX_SLOT_WORDS,
+};
