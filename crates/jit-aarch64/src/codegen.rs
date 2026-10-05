@@ -58,8 +58,11 @@
 //! - With [`ChainGen::tlb_page_bits`], `qemu_ld` and `qemu_st` of up to 64 bits look up the
 //!   softmmu TLB inline as QEMU's `prepare_host_addr` does, and use the service routine on a
 //!   miss. The descriptor is found through the run context rather than at a fixed offset from
-//!   `env`, the miss path is inline rather than out of line, and byte swapped and 128-bit
-//!   accesses always take the slow path (QEMU inlines those too).
+//!   `env`, the miss path is inline rather than out of line, and byte swapped accesses and
+//!   128-bit accesses that must be atomic as a whole always take the slow path (QEMU inlines
+//!   those too). A 128-bit access whose halves need only be atomic each
+//!   (`MO_ATOM_IFALIGN_PAIR`, such as aarch64 `ldp` and `stp` of X registers) or not at all is
+//!   one `ldp` or `stp` on a hit.
 //! - `goto_tb` is a `nop` until the block is linked. Linking patches it to a `b` straight to
 //!   the next block, as in QEMU, when that block is in a region this one keeps mapped and
 //!   within the 128 MiB reach of `b`, and to an exit stub that leaves with
@@ -1114,7 +1117,15 @@ impl Gen {
                 let acquire = op.flags & ldst_flags::ACQUIRE_PC != 0;
                 let done = self.a.new_label();
                 self.after_full_dmb = false;
-                if !two && self.tlb_fits(oi) {
+                if two && !acquire && self.tlb_pair_fits(oi) {
+                    // Two 64-bit halves, each atomic on its own at most: one `ldp`.
+                    let slow = self.a.new_label();
+                    self.tlb_addr(r(ai), oi, false, false, slow);
+                    self.a.rrr(i::ADD, true, TMP0, TMP0, TMP1);
+                    self.a.ldstpair(i::LDP, r(0), r(1), TMP0, 0, true, false);
+                    self.a.b_label(done);
+                    self.a.bind(slow);
+                } else if !two && self.tlb_fits(oi) {
                     let slow = self.a.new_label();
                     self.tlb_addr(r(ai), oi, false, acquire, slow);
                     self.window_load(ty, r(0), oi.memop(), acquire);
@@ -1147,7 +1158,15 @@ impl Gen {
                 let release = op.flags & ldst_flags::RELEASE != 0;
                 let done = self.a.new_label();
                 self.after_full_dmb = false;
-                if !two && self.tlb_fits(oi) {
+                if two && !release && self.tlb_pair_fits(oi) {
+                    // Two 64-bit halves, each atomic on its own at most: one `stp`.
+                    let slow = self.a.new_label();
+                    self.tlb_addr(r(ai), oi, true, false, slow);
+                    self.a.rrr(i::ADD, true, TMP0, TMP0, TMP1);
+                    self.a.ldstpair(i::STP, r(0), r(1), TMP0, 0, true, false);
+                    self.a.b_label(done);
+                    self.a.bind(slow);
+                } else if !two && self.tlb_fits(oi) {
                     let slow = self.a.new_label();
                     self.tlb_addr(r(ai), oi, true, release, slow);
                     self.window_store(r(0), oi.memop(), release);
@@ -1236,6 +1255,22 @@ impl Gen {
             && m.0 & MemOp::BSWAP.0 == 0
             && m.size() <= 3
             && m.alignment_bits().max(m.size()) <= TLB_FLAGS_SHIFT
+            && (oi.mmu_idx() as usize) < TLB_MAX_MMU_MODES
+    }
+
+    /// True if a 128-bit guest access with `oi` can be looked up in the TLB inline and done as
+    /// one `ldp` or `stp` of two 64-bit halves: there is a TLB, the access needs no byte swap,
+    /// and its halves need only be atomic each (`MO_ATOM_IFALIGN_PAIR`, as for aarch64 `ldp`
+    /// and `stp` of X registers) or not at all. A 128-bit access that must be atomic as a
+    /// whole takes the slow path.
+    fn tlb_pair_fits(&self, oi: MemOpIdx) -> bool {
+        let m = oi.memop();
+        let atom = m.0 & MemOp::ATOM_MASK.0;
+        self.tlb_page_bits.is_some()
+            && m.0 & MemOp::BSWAP.0 == 0
+            && m.size() == 4
+            && (atom == MemOp::ATOM_IFALIGN_PAIR.0 || atom == MemOp::ATOM_NONE.0)
+            && m.alignment_bits() <= TLB_FLAGS_SHIFT
             && (oi.mmu_idx() as usize) < TLB_MAX_MMU_MODES
     }
 

@@ -43,8 +43,11 @@
 //! - Helper calls, guest memory accesses and `divs2`/`divu2` go through the service routine,
 //!   with every argument in memory, instead of the host calling convention. Only the TLB miss
 //!   path of a `qemu_ld` or `qemu_st` does: with [`GenOptions::tlb_page_bits`] the lookup is
-//!   inlined as in QEMU, except for byte swapped and 128-bit accesses, which always take the
-//!   slow path (QEMU inlines those too).
+//!   inlined as in QEMU, except for byte swapped accesses and 128-bit accesses that must be
+//!   atomic as a whole, which always take the slow path (QEMU inlines those too). A 128-bit
+//!   access is inlined as two 64-bit host accesses when its halves need only be atomic each
+//!   (`MO_ATOM_IFALIGN_PAIR`, such as an aarch64 `ldp` or `stp` of two X registers) or not at
+//!   all.
 //! - `insn_start` emits no code. Each service request carries the index of the `insn_start`
 //!   of its instruction, fixed when the block is compiled, and each exit stores it in the run
 //!   context, instead of QEMU's table of host code offsets next to the code; the runtime
@@ -87,7 +90,7 @@ use ruvm_jit_core::ir::{Func, HelperType, Op, OpId, Temp};
 use ruvm_jit_core::opcode::Opcode;
 use ruvm_jit_core::regalloc::{self, Letter, RegSet, Target};
 use ruvm_jit_core::types::{
-    Cond, INSN_START_WORDS, MemOpIdx, TempKind, Type, bswap, dup_const, mo, opf,
+    Cond, INSN_START_WORDS, MemOp, MemOpIdx, TempKind, Type, bswap, dup_const, mo, opf,
 };
 use ruvm_jit_interp::HelperRegistry;
 use ruvm_jit_interp::fast_tlb::{
@@ -480,9 +483,11 @@ pub(crate) fn generate(
     for l in std::mem::take(&mut g.ldst) {
         g.a.bind(l.label);
         g.insn = l.insn;
-        match l.val {
-            None => g.qemu_ld_slow(l.ty, l.oi, l.out, l.addr),
-            Some(v) => g.qemu_st_slow(l.ty, l.oi, v, l.addr),
+        match (l.val, l.hi) {
+            (None, None) => g.qemu_ld_slow(l.ty, l.oi, l.out, l.addr),
+            (Some(v), None) => g.qemu_st_slow(l.ty, l.oi, v, l.addr),
+            (None, Some((hi, _))) => g.qemu_ld2_slow(l.oi, l.out, hi as Reg, l.addr),
+            (Some(v), Some(hi)) => g.qemu_st2_slow(l.oi, [v, hi], l.addr),
         }
         g.a.jump(None, l.back, false);
     }
@@ -725,6 +730,9 @@ struct LdstSlow {
     /// constant.
     val: Option<(u64, bool)>,
     out: Reg,
+    /// For a 128-bit access, the high half: the register of a load, or the value of a store
+    /// and whether it is a constant. `val` and `out` are then the low half.
+    hi: Option<(u64, bool)>,
     /// [`Gen::insn`] at the access.
     insn: u64,
 }
@@ -859,13 +867,14 @@ impl Gen<'_> {
 
     /// Call the service routine for `req`. Leaves the block if it reports an unwind or error.
     fn service(&mut self, req: Request) {
-        self.service_via(req, self.service, self.insn);
+        self.service_via(req, self.service, self.insn, 0);
     }
 
     /// [`Gen::service`] through the routine at `routine`, with `tag` in the upper half of the
-    /// request index.
-    fn service_via(&mut self, req: Request, routine: u64, tag: u64) {
+    /// request index and `flags` ORed into its lower half.
+    fn service_via(&mut self, req: Request, routine: u64, tag: u64, flags: u64) {
         let idx = self.requests.len();
+        debug_assert!(idx < 1 << 31);
         self.requests.push(req);
         self.insn_of.push(self.insn);
         // As in QEMU, helpers are called with whatever upper vector state the code left, but
@@ -874,7 +883,7 @@ impl Gen<'_> {
             self.a.vex_opc(op::VZEROUPPER, 0, 0, 0, 0);
         }
         self.a.mov(P_REXW, ARGS[0], CTX);
-        self.a.movi(true, ARGS[1], idx as u64 | tag << 32, false);
+        self.a.movi(true, ARGS[1], idx as u64 | flags | tag << 32, false);
         self.a.movabs(ARGS[2], self.meta);
         self.a.movabs(TMP0, routine);
         self.a.call_reg(TMP0);
@@ -914,6 +923,30 @@ impl Gen<'_> {
         self.a.load(out, Mem::Base(CTX, 0), ty.size(), false, rexw(ty));
     }
 
+    /// `qemu_ld2` through the service routine: the 128-bit value of `oi` at `addr` into `lo`
+    /// and `hi`.
+    fn qemu_ld2_slow(&mut self, oi: MemOpIdx, lo: Reg, hi: Reg, addr: Reg) {
+        self.put_args(&[addr as u64]);
+        self.service(Request::Load(oi));
+        self.a.load(lo, Mem::Base(CTX, 0), 8, false, P_REXW);
+        self.a.load(hi, Mem::Base(CTX, 8), 8, false, P_REXW);
+    }
+
+    /// `qemu_st2` through the service routine: the low and high halves in `val`, each a
+    /// register or a constant if its flag is set, stored as `oi` says at `addr`.
+    fn qemu_st2_slow(&mut self, oi: MemOpIdx, val: [(u64, bool); 2], addr: Reg) {
+        for (k, (v, is_const)) in val.into_iter().enumerate() {
+            let at = Mem::Base(CTX, 8 * k as i32);
+            if is_const {
+                self.a.store_imm(v, at, 8);
+            } else {
+                self.a.store(v as Reg, at, 8);
+            }
+        }
+        self.a.store(addr, Mem::Base(CTX, 16), 8);
+        self.service(Request::Store(oi));
+    }
+
     /// `qemu_st` through the service routine: `val` (a register, or a constant if the flag is
     /// set) stored as `oi` says at `addr`.
     fn qemu_st_slow(&mut self, ty: Type, oi: MemOpIdx, val: (u64, bool), addr: Reg) {
@@ -935,8 +968,9 @@ impl Gen<'_> {
     /// The inline TLB lookup of a `qemu_ld` or `qemu_st`, QEMU's `prepare_host_addr`. On a hit
     /// it falls through with the entry's addend in `TMP1`, so the access is at `(addr, TMP1)`
     /// for the returned address register; on a miss it jumps to the returned label. `None`
-    /// when the access always takes the slow path: no TLB to read, a byte swapped or 128-bit
-    /// access, or an alignment the compare cannot check.
+    /// when the access always takes the slow path: no TLB to read, a byte swapped access, a
+    /// 128-bit access that two 64-bit host accesses cannot make, or an alignment the compare
+    /// cannot check.
     fn tlb_fast_path(
         &mut self,
         f: &Func,
@@ -950,7 +984,15 @@ impl Gen<'_> {
         let (s_bits, a_bits) = (m.size(), m.alignment_bits());
         // Alignment bits must stay below the comparator's flag bits, or a misaligned address
         // could match a flagged comparator.
-        if s_bits > 3 || m.is_bswap() || a_bits > TLB_FLAGS_SHIFT || mmu_idx >= TLB_MAX_MMU_MODES {
+        // Two 64-bit host accesses make a 128-bit one whose halves need only be atomic each.
+        let atom = m.0 & MemOp::ATOM_MASK.0;
+        let pair_ok = atom == MemOp::ATOM_IFALIGN_PAIR.0 || atom == MemOp::ATOM_NONE.0;
+        if s_bits > 4
+            || (s_bits == 4 && !pair_ok)
+            || m.is_bswap()
+            || a_bits > TLB_FLAGS_SHIFT
+            || mmu_idx >= TLB_MAX_MMU_MODES
+        {
             return None;
         }
         let (s_mask, a_mask) = ((1u64 << s_bits) - 1, (1u64 << a_bits) - 1);
@@ -1539,10 +1581,30 @@ impl Gen<'_> {
                 }
             }
             Opcode::QemuLd2 => {
-                self.put_args(&args[2..3]);
-                self.service(Request::Load(MemOpIdx(op.args[3] as u32)));
-                self.a.load(r(0), Mem::Base(CTX, 0), 8, false, P_REXW);
-                self.a.load(r(1), Mem::Base(CTX, 8), 8, false, P_REXW);
+                let oi = MemOpIdx(op.args[3] as u32);
+                match self.tlb_fast_path(f, r(2), oi, false) {
+                    Some((addr, label)) => {
+                        // Load the half whose register is the address last.
+                        let halves = if r(0) == addr { [(1, 8), (0, 0)] } else { [(0, 0), (1, 8)] };
+                        for (k, disp) in halves {
+                            self.a.load(r(k), Mem::Index(addr, TMP1, disp), 8, false, P_REXW);
+                        }
+                        let back = self.a.new_label();
+                        self.a.bind(back);
+                        self.ldst.push(LdstSlow {
+                            label,
+                            back,
+                            oi,
+                            ty,
+                            addr: r(2),
+                            val: None,
+                            out: r(0),
+                            hi: Some((r(1) as u64, false)),
+                            insn: self.insn,
+                        });
+                    }
+                    None => self.qemu_ld2_slow(oi, r(0), r(1), r(2)),
+                }
             }
             Opcode::QemuLd => {
                 let oi = MemOpIdx(op.args[2] as u32);
@@ -1562,6 +1624,7 @@ impl Gen<'_> {
                             addr,
                             val: None,
                             out: r(0),
+                            hi: None,
                             insn: self.insn,
                         });
                     }
@@ -1591,6 +1654,7 @@ impl Gen<'_> {
                             addr,
                             val: Some(val),
                             out: 0,
+                            hi: None,
                             insn: self.insn,
                         });
                     }
@@ -1598,16 +1662,34 @@ impl Gen<'_> {
                 }
             }
             Opcode::QemuSt2 => {
-                for k in 0..2 {
-                    let at = Mem::Base(CTX, 8 * k as i32);
-                    if const_args[k] {
-                        self.a.store_imm(args[k], at, 8);
-                    } else {
-                        self.a.store(r(k), at, 8);
+                let oi = MemOpIdx(op.args[3] as u32);
+                let val = [(args[0], const_args[0]), (args[1], const_args[1])];
+                match self.tlb_fast_path(f, r(2), oi, true) {
+                    Some((addr, label)) => {
+                        for (k, (v, is_const)) in val.into_iter().enumerate() {
+                            let host = Mem::Index(addr, TMP1, 8 * k as i32);
+                            if is_const {
+                                self.a.store_imm(v, host, 8);
+                            } else {
+                                self.a.store(v as Reg, host, 8);
+                            }
+                        }
+                        let back = self.a.new_label();
+                        self.a.bind(back);
+                        self.ldst.push(LdstSlow {
+                            label,
+                            back,
+                            oi,
+                            ty,
+                            addr: r(2),
+                            val: Some(val[0]),
+                            out: 0,
+                            hi: Some(val[1]),
+                            insn: self.insn,
+                        });
                     }
+                    None => self.qemu_st2_slow(oi, val, r(2)),
                 }
-                self.a.store(r(2), Mem::Base(CTX, 16), 8);
-                self.service(Request::Store(MemOpIdx(op.args[3] as u32)));
             }
             Opcode::GotoPtr => {
                 // Jump straight to the block when the service routine vouched for the address
@@ -2578,7 +2660,8 @@ impl Target for Gen<'_> {
             self.ic_probe();
         }
         if lookup {
-            self.service_via(req, self.lookup, self.insn);
+            let site = if ic { crate::runtime::LOOKUP_IC_SITE } else { 0 };
+            self.service_via(req, self.lookup, self.insn, site);
         } else {
             self.service(req);
         }

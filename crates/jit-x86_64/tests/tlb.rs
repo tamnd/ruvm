@@ -3,7 +3,8 @@
 //! The inline softmmu TLB lookup of `qemu_ld` and `qemu_st` ([`CompileOptions::tlb_page_bits`]):
 //! accesses that hit go straight to host memory, and misses, flagged comparators, misaligned
 //! and page crossing accesses, and accesses after the TLB is resized in the middle of a block go
-//! to the guest memory, with the same results.
+//! to the guest memory, with the same results. 128-bit accesses whose halves need only be atomic
+//! each are two host accesses on a hit.
 //!
 //! Generated code only runs on an x86-64 host; elsewhere these tests only compile and link.
 
@@ -411,4 +412,81 @@ fn a_miss_is_served_in_the_instruction_of_the_access() {
     assert_eq!(mem.seen, [0x10, 0x20, 0x30]);
     assert_eq!(last, Some([0x30, 0, 0]));
     assert_eq!(rd64(&env, 0x108), mem.peek(GUEST + PAGE + 0x10, 8));
+}
+
+/// 128-bit loads and stores through MMU index 0, the address in a register from env word 0x180:
+/// pairs (`MO_ATOM_IFALIGN_PAIR`, as an aarch64 `ldp` or `stp`), a page crossing pair, and one
+/// that must be atomic as a whole when `parallel` is set.
+fn pair_block(parallel: bool) -> Func {
+    let mut f = Func::new(FuncConfig { parallel, ..FuncConfig::default() });
+    let env = f.env();
+    let base = f.global_mem_new_i64(env, 0x180, "base");
+    let r: Vec<TempI64> =
+        (0..6).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, &format!("r{i}"))).collect();
+    let pair = MemOp::MO_128.or(MemOp::ATOM_IFALIGN_PAIR);
+    let load = |f: &mut Func, off: i64, mop: MemOp, lo: TempI64, hi: TempI64| {
+        // The address dies at the load, so the allocator may reuse its register for a half.
+        let a = f.temp_new_i64();
+        f.gen_addi_i64(a, base, off);
+        let t = f.temp_new_i128();
+        f.gen_qemu_ld_i128(t, a, 0, mop);
+        f.gen_extr_i128_i64(lo, hi, t);
+    };
+    load(&mut f, 0x20, pair, r[0], r[1]);
+    // Store them swapped to page 1, then a constant pair next to them.
+    let t = f.temp_new_i128();
+    f.gen_concat_i64_i128(t, r[1], r[0]);
+    let a = f.temp_new_i64();
+    f.gen_addi_i64(a, base, PAGE as i64 + 0x40);
+    f.gen_qemu_st_i128(t, a, 0, pair.or(MemOp::ALIGN));
+    let (c0, c1) = (f.constant_i64(0x55), f.constant_i64(-2));
+    let t = f.temp_new_i128();
+    f.gen_concat_i64_i128(t, c0, c1);
+    let a = f.temp_new_i64();
+    f.gen_addi_i64(a, base, PAGE as i64 + 0x50);
+    f.gen_qemu_st_i128(t, a, 0, pair);
+    load(&mut f, PAGE as i64 - 8, pair, r[2], r[3]);
+    load(&mut f, 0x60, MemOp::MO_128, r[4], r[5]);
+    f.gen_exit_tb(0, 0);
+    f
+}
+
+#[test]
+fn pairs_of_halves_use_the_fast_path() {
+    if !NATIVE {
+        return;
+    }
+    for (parallel, mapped) in [(true, true), (false, true), (true, false)] {
+        let tb = compile(&pair_block(parallel));
+        let t = TlbTables::new(PAGE_BITS, MODES, ENTRIES);
+        let mut mem = TlbMem::new(Arc::clone(t.fast()));
+        if mapped {
+            for p in 0..PAGES {
+                map(&t, &mem, 0, p, true);
+            }
+        }
+        let mut env = vec![0u8; ENV_SIZE];
+        env[0x180..0x188].copy_from_slice(&GUEST.to_le_bytes());
+        let x = tb.run(&mut env, &mut mem, &HelperRegistry::new());
+        assert_eq!(x, Ok(Exit::ExitTb(0)), "mapped {mapped}");
+        let (lo, hi) = (mem.peek(GUEST + 0x20, 8), mem.peek(GUEST + 0x28, 8));
+        assert_eq!((rd64(&env, 0x100), rd64(&env, 0x108)), (lo, hi));
+        assert_eq!((mem.peek(GUEST + PAGE + 0x40, 8), mem.peek(GUEST + PAGE + 0x48, 8)), (hi, lo));
+        assert_eq!(mem.peek(GUEST + PAGE + 0x50, 8), 0x55);
+        assert_eq!(mem.peek(GUEST + PAGE + 0x58, 8), u64::MAX - 1);
+        let cross = (mem.peek(GUEST + PAGE - 8, 8), mem.peek(GUEST + PAGE, 8));
+        assert_eq!((rd64(&env, 0x110), rd64(&env, 0x118)), cross);
+        let whole = (mem.peek(GUEST + 0x60, 8), mem.peek(GUEST + 0x68, 8));
+        assert_eq!((rd64(&env, 0x120), rd64(&env, 0x128)), whole);
+        // Mapped, only the page crossing pair and, with `parallel`, the access that must be
+        // atomic as a whole are slow.
+        let want = if !mapped {
+            (3, 2)
+        } else if parallel {
+            (2, 0)
+        } else {
+            (1, 0)
+        };
+        assert_eq!((mem.reads, mem.writes), want, "mapped {mapped}");
+    }
 }
