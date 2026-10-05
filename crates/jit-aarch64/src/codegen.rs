@@ -37,9 +37,11 @@
 //! - Helper calls, guest memory accesses and `divs2`/`divu2` go through the service routine,
 //!   with every argument in memory, instead of the host calling convention and the softmmu
 //!   fast path.
-//! - `insn_start` stores the index of its words in the run context rather than recording them
-//!   in a table next to the code; the runtime reports them to the guest memory before each
-//!   service request and to the caller at the end.
+//! - `insn_start` emits no code. Each service request carries the index of the `insn_start`
+//!   of its instruction, fixed when the block is compiled, and each exit stores it in the run
+//!   context, instead of QEMU's table of host code offsets next to the code; the runtime
+//!   reports the words to the guest memory before each service request and to the caller at
+//!   the end.
 //! - Ops QEMU's backend does not implement and instead expands (`nand`, `nor`, `rotl`, `ctpop`,
 //!   I32 `mulsh` and `muluh`, `muls2` and `mulu2`, and vector `mul`, `smin` and the like at 64
 //!   bit elements, `rotli`, the shifts by vector and by scalar, `cmpsel`) are expanded inline
@@ -53,6 +55,26 @@
 //!   when the address is outside it, misaligned or byte swapped. This stands in for QEMU's
 //!   softmmu fast path. Accesses flagged by a fence mapping use `ldapr` and `stlr` there; see
 //!   [`crate::memory_order`] for those and for the barriers around helper calls.
+//! - With [`ChainGen::tlb_page_bits`], `qemu_ld` and `qemu_st` of up to 64 bits look up the
+//!   softmmu TLB inline as QEMU's `prepare_host_addr` does, and use the service routine on a
+//!   miss. The descriptor is found through the run context rather than at a fixed offset from
+//!   `env`, the miss path is inline rather than out of line, and byte swapped and 128-bit
+//!   accesses always take the slow path (QEMU inlines those too).
+//! - `goto_tb` is a `nop` until the block is linked. Linking patches it to a `b` straight to
+//!   the next block, as in QEMU, when that block is in a region this one keeps mapped and
+//!   within the 128 MiB reach of `b`, and to an exit stub that leaves with
+//!   [`ruvm_jit_interp::Exit::GotoTb`] otherwise. QEMU uses an indirect jump through a table
+//!   when the target is out of reach.
+//! - Every block has its own prologue and epilogue, with the same frame, and chained jumps
+//!   enter a block after its prologue. QEMU shares one prologue for the whole buffer. The
+//!   first thing after the prologue stores the address of the block's request table in the
+//!   run context, so the service routine knows which block a request comes from.
+//! - `goto_ptr` jumps to the address `lookup_tb_ptr` returned only if the runtime vouched for
+//!   it in the run context, and leaves with [`ruvm_jit_interp::Exit::GotoPtr`] otherwise.
+//!   QEMU jumps to whatever the helper returned.
+//! - A 32-bit load of the `icount_decr` word at the offset the runtime gives reads the shared
+//!   atomic through a pointer in the run context, so that exit requests from other threads
+//!   are seen without leaving generated code. In QEMU the word is part of the CPU state.
 
 use ruvm_jit_core::ir::{Func, HelperType, Op, OpId, Temp};
 use ruvm_jit_core::memory_model::{FenceMapping, ldst_flags};
@@ -61,8 +83,11 @@ use ruvm_jit_core::regalloc::{self, Letter, RegSet, Target};
 use ruvm_jit_core::types::{
     Cond, INSN_START_WORDS, MemOp, MemOpIdx, TempKind, Type, bswap, call_flags, dup_const, opf,
 };
+use ruvm_jit_interp::fast_tlb::{
+    TLB_ADDEND_WORD, TLB_DESC_WORDS, TLB_ENTRY_BITS, TLB_FLAGS_SHIFT, TLB_MAX_MMU_MODES,
+};
 
-use crate::asm::{self, Asm, AsmError, LR, Reg, TMP0, TMP1, VTMP0, VTMP1, XZR, cc, i};
+use crate::asm::{self, Asm, AsmError, LR, Reg, TMP0, TMP1, TMP2, VTMP0, VTMP1, XZR, cc, i};
 use crate::memory_order::{DMB_ISH_FULL, DMB_ISHLD, DMB_ISHST, HostFeatures, dmb_for};
 
 /// Base of the CPU state buffer.
@@ -85,7 +110,8 @@ pub(crate) const SLOT_BYTES: usize = 32;
 pub(crate) const NARGS: usize = 32;
 /// Byte offset of the return value word in the run context, right after the argument words.
 pub(crate) const RET_OFFSET: i64 = 8 * NARGS as i64;
-/// Byte offset of the word holding one more than the index of the last `insn_start` request.
+/// Byte offset of the word holding one more than the index of the last `insn_start` request
+/// before the exit generated code left through.
 pub(crate) const INSN_OFFSET: i64 = RET_OFFSET + 8;
 /// Byte offset of the guest address the host window starts at.
 pub(crate) const WIN_BASE_OFFSET: i64 = INSN_OFFSET + 8;
@@ -93,6 +119,29 @@ pub(crate) const WIN_BASE_OFFSET: i64 = INSN_OFFSET + 8;
 pub(crate) const WIN_LIMIT_OFFSET: i64 = INSN_OFFSET + 16;
 /// Byte offset of the host address of the window.
 pub(crate) const WIN_HOST_OFFSET: i64 = INSN_OFFSET + 24;
+/// Byte offset of the word each block stores the address of its metadata in when it leaves.
+pub(crate) const META_OFFSET: i64 = INSN_OFFSET + 32;
+/// Byte offset of the address of the `icount_decr` word.
+pub(crate) const DECR_OFFSET: i64 = META_OFFSET + 8;
+/// Byte offset of the one address `goto_ptr` may jump to, or 0.
+pub(crate) const GOTO_PTR_OK_OFFSET: i64 = DECR_OFFSET + 8;
+/// Byte offset of the address of the TLB descriptor the inline softmmu fast path reads, a
+/// [`ruvm_jit_interp::FastTlb::desc`].
+pub(crate) const TLB_OFFSET: i64 = GOTO_PTR_OK_OFFSET + 8;
+
+/// What the runtime needs built into a block so that blocks can chain without returning.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ChainGen {
+    /// The address of the block's metadata, passed to the service routine with each request
+    /// and stored in the run context when the block leaves.
+    pub(crate) meta: u64,
+    /// A 32-bit load at this constant `env` offset reads the `icount_decr` word the run
+    /// context points to instead.
+    pub(crate) icount_decr: Option<i64>,
+    /// log2 of the guest page size of the TLB tables at [`TLB_OFFSET`], or `None` to leave
+    /// `qemu_ld` and `qemu_st` to the window or the service routine.
+    pub(crate) tlb_page_bits: Option<u32>,
+}
 
 /// Choices for code generation beyond the block itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -149,7 +198,7 @@ pub(crate) enum Request {
     Load(MemOpIdx),
     /// `qemu_st`: the value is in words 0 and 1, the address in word 2.
     Store(MemOpIdx),
-    /// The words of an `insn_start`. Never called; the code stores its index in the context.
+    /// The words of an `insn_start`. Never called; [`Generated::insn_of`] refers to it.
     InsnStart([u64; INSN_START_WORDS]),
     /// `divs2` or `divu2` at this width: low, high and divisor in words 0 to 2, quotient and
     /// remainder back in words 0 and 1.
@@ -198,11 +247,22 @@ type R<T> = Result<T, GenCodeError>;
 pub(crate) struct Generated {
     pub(crate) bytes: Vec<u8>,
     pub(crate) requests: Vec<Request>,
+    /// For each request, one more than the index of the `insn_start` request before it in the
+    /// code, or 0: the instruction a request made by a helper call or a memory access is part
+    /// of, as QEMU finds it from the host return address.
+    pub(crate) insn_of: Vec<u64>,
     /// Number of 64-bit words of slot array the code uses.
     pub(crate) slot_words: usize,
     /// For each `goto_tb`: its slot, the byte offset of its patchable word, and the word that
     /// sends it to the exit stub.
     pub(crate) goto_tb: Vec<(u32, usize, u32)>,
+    /// The byte offset chained jumps enter the block at, after the prologue.
+    pub(crate) body: usize,
+    /// The byte offset after the static bounds check, where a chained jump may enter when the
+    /// run's CPU state is known to be at least [`Generated::env_need`] bytes long.
+    pub(crate) fast_body: usize,
+    /// The length of CPU state the static bounds check asks for (`u64::MAX` if it always fails).
+    pub(crate) env_need: u64,
 }
 
 /// The general registers the allocator may use: x0 to x15 and x23 to x28.
@@ -275,7 +335,13 @@ fn static_offset(f: &Func, base: Temp, off: i64) -> Option<i64> {
 
 /// Compile `f` for code that will live at `base`. `service` is the address of the service
 /// routine.
-pub(crate) fn generate(f: &Func, base: u64, service: u64, opts: &CodegenOptions) -> R<Generated> {
+pub(crate) fn generate(
+    f: &Func,
+    base: u64,
+    service: u64,
+    opts: &CodegenOptions,
+    chain: &ChainGen,
+) -> R<Generated> {
     check_types(f)?;
     let f = regalloc::prepare(f, &extra_flags);
     let c = &f.config;
@@ -287,6 +353,9 @@ pub(crate) fn generate(f: &Func, base: u64, service: u64, opts: &CodegenOptions)
         a: Asm::new(base),
         labels: vec![None; f.nb_labels()],
         requests: Vec::new(),
+        insn_of: Vec::new(),
+        insn: 0,
+        meta: chain.meta,
         goto_tb: Vec::new(),
         service,
         exit: 0,
@@ -295,6 +364,8 @@ pub(crate) fn generate(f: &Func, base: u64, service: u64, opts: &CodegenOptions)
         static_access: (0, 0),
         static_always_fails: false,
         nb_temps: f.nb_temps(),
+        icount_decr: chain.icount_decr,
+        tlb_page_bits: chain.tlb_page_bits,
         err: None,
     };
     g.exit = g.a.new_label();
@@ -313,12 +384,15 @@ pub(crate) fn generate(f: &Func, base: u64, service: u64, opts: &CodegenOptions)
     g.a.movr(true, ENV_LEN, X1);
     g.a.movr(true, CTX, X2);
     g.a.movr(true, SLOTS, X3);
+    // Chained jumps from other blocks enter here, with the same frame and fixed registers.
+    let body = g.a.pos() * 4;
     // The static bounds check; the two immediates are patched once the body is known.
     let check_at = g.a.pos();
     g.a.movw(i::MOVZ, true, TMP0, 0, 0);
     g.a.movw(i::MOVK, true, TMP0, 0, 16);
     g.a.rrr(i::SUBS, true, XZR, ENV_LEN, TMP0);
     g.a.bcond_label(cc::LO, static_fail);
+    let fast_body = g.a.pos() * 4;
 
     regalloc::reg_alloc(&f, &mut g)?;
     if let Some(e) = g.err.take() {
@@ -328,8 +402,10 @@ pub(crate) fn generate(f: &Func, base: u64, service: u64, opts: &CodegenOptions)
 
     // Exit stubs for linked goto_tb slots.
     let mut goto_tb = Vec::new();
-    for (slot, at) in std::mem::take(&mut g.goto_tb) {
+    for (slot, at, insn) in std::mem::take(&mut g.goto_tb) {
         let stub = g.a.pos();
+        g.insn = insn;
+        g.note_exit();
         g.a.movi(Type::I64, X1, slot as u64);
         g.a.movi(Type::I64, X0, kind::GOTO_TB);
         g.a.b_label(g.exit);
@@ -345,6 +421,8 @@ pub(crate) fn generate(f: &Func, base: u64, service: u64, opts: &CodegenOptions)
 
     // A failed bounds check: offset in x16, length in x30.
     g.a.bind(g.bounds);
+    g.a.movi(Type::I64, TMP1, g.meta);
+    g.a.st(Type::I64, TMP1, CTX, META_OFFSET);
     g.a.st(Type::I64, LR, CTX, 0);
     g.a.movr(true, X1, TMP0);
     g.a.movi(Type::I64, X0, kind::BOUNDS);
@@ -377,9 +455,19 @@ pub(crate) fn generate(f: &Func, base: u64, service: u64, opts: &CodegenOptions)
     }
 
     let slot_words = (f.nb_temps() + 1) * SLOT_BYTES / 8;
-    let requests = g.requests;
+    let (requests, insn_of) = (g.requests, g.insn_of);
     let out = g.a.finish()?;
-    Ok(Generated { bytes: out.bytes, requests, slot_words, goto_tb })
+    let env_need = if g.static_always_fails { u64::MAX } else { end };
+    Ok(Generated {
+        bytes: out.bytes,
+        requests,
+        insn_of,
+        slot_words,
+        goto_tb,
+        body,
+        fast_body,
+        env_need,
+    })
 }
 
 /// Refuse temps of types this backend has no registers for, and calls with more arguments
@@ -441,7 +529,14 @@ struct Gen {
     a: Asm,
     labels: Vec<Option<usize>>,
     requests: Vec<Request>,
-    goto_tb: Vec<(u32, usize)>,
+    /// See [`Generated::insn_of`].
+    insn_of: Vec<u64>,
+    /// One more than the index of the last `insn_start` request so far, or 0.
+    insn: u64,
+    /// See [`ChainGen::meta`].
+    meta: u64,
+    /// For each `goto_tb`: its slot, the word index of its jump, and [`Gen::insn`] there.
+    goto_tb: Vec<(u32, usize, u64)>,
     service: u64,
     exit: usize,
     bounds: usize,
@@ -451,6 +546,10 @@ struct Gen {
     /// A constant offset access is outside what the check on entry can describe.
     static_always_fails: bool,
     nb_temps: usize,
+    /// See [`ChainGen::icount_decr`].
+    icount_decr: Option<i64>,
+    /// See [`ChainGen::tlb_page_bits`].
+    tlb_page_bits: Option<u32>,
     /// An error from a hook that cannot return one.
     err: Option<GenCodeError>,
 }
@@ -503,11 +602,20 @@ impl Gen {
     }
 
     fn exit_with(&mut self, k: u64, value: Option<u64>) {
+        self.note_exit();
         if let Some(v) = value {
             self.a.movi(Type::I64, X1, v);
         }
         self.a.movi(Type::I64, X0, k);
         self.a.b_label(self.exit);
+    }
+
+    /// Record in the run context that this block left, after the instruction of [`Gen::insn`].
+    fn note_exit(&mut self) {
+        self.a.movi(Type::I64, TMP0, self.meta);
+        self.a.st(Type::I64, TMP0, CTX, META_OFFSET);
+        self.a.movi(Type::I64, TMP0, self.insn);
+        self.a.st(Type::I64, TMP0, CTX, INSN_OFFSET);
     }
 
     /// `rd = rn + v` in 64 bits. Uses x17 for a large `v`.
@@ -591,8 +699,10 @@ impl Gen {
     fn service_then(&mut self, req: Request, after: Option<u32>) {
         let idx = self.requests.len();
         self.requests.push(req);
+        self.insn_of.push(self.insn);
         self.a.movr(true, X0, CTX);
         self.a.movi(Type::I64, X1, idx as u64);
+        self.a.movi(Type::I64, X2, self.meta);
         self.a.movi(Type::I64, TMP0, self.service);
         self.a.breg(i::BLR, TMP0);
         if let Some(w) = after {
@@ -962,7 +1072,14 @@ impl Gen {
                     _ => (if ext { i::LDRX } else { i::LDRW }, if ext { 3 } else { 2 }),
                 };
                 let addr = self.host_addr(f, op, args, const_args, 1, 1 << lg);
-                self.host_access(addr, insn, d, lg);
+                match addr {
+                    Addr::Static(off) if lg == 2 && Some(off) == self.icount_decr => {
+                        // `icount_decr` is read where other threads set it.
+                        self.a.ld(Type::I64, TMP1, CTX, DECR_OFFSET);
+                        self.a.ldst(insn, d, TMP1, 0, lg);
+                    }
+                    _ => self.host_access(addr, insn, d, lg),
+                }
             }
             Opcode::St8 | Opcode::St16 | Opcode::St32 | Opcode::St => {
                 let (insn, lg) = match op.opc {
@@ -981,7 +1098,13 @@ impl Gen {
                 let acquire = op.flags & ldst_flags::ACQUIRE_PC != 0;
                 let done = self.a.new_label();
                 self.after_full_dmb = false;
-                if !two && self.window_fits(oi.memop()) {
+                if !two && self.tlb_fits(oi) {
+                    let slow = self.a.new_label();
+                    self.tlb_addr(r(ai), oi, false, acquire, slow);
+                    self.window_load(ty, r(0), oi.memop(), acquire);
+                    self.a.b_label(done);
+                    self.a.bind(slow);
+                } else if !two && self.window_fits(oi.memop()) {
                     let slow = self.a.new_label();
                     self.window_addr(r(ai), oi.memop(), acquire, slow);
                     self.window_load(ty, r(0), oi.memop(), acquire);
@@ -1008,7 +1131,13 @@ impl Gen {
                 let release = op.flags & ldst_flags::RELEASE != 0;
                 let done = self.a.new_label();
                 self.after_full_dmb = false;
-                if !two && self.window_fits(oi.memop()) {
+                if !two && self.tlb_fits(oi) {
+                    let slow = self.a.new_label();
+                    self.tlb_addr(r(ai), oi, true, release, slow);
+                    self.window_store(r(0), oi.memop(), release);
+                    self.a.b_label(done);
+                    self.a.bind(slow);
+                } else if !two && self.window_fits(oi.memop()) {
                     let slow = self.a.new_label();
                     self.window_addr(r(ai), oi.memop(), release, slow);
                     self.window_store(r(0), oi.memop(), release);
@@ -1028,6 +1157,17 @@ impl Gen {
                 self.a.bind(done);
             }
             Opcode::GotoPtr => {
+                // Jump straight to the block when the service routine vouched for the address
+                // (`lookup_tb_ptr` found a block it can enter); leave otherwise. The context
+                // holds 0 when no address is vouched for, so 0 itself always leaves.
+                let out = self.a.new_label();
+                self.a.reloc_here(asm::Reloc::Condbr19, out);
+                self.a.cbz(i::CBZ, true, r(0), 0);
+                self.a.ld(Type::I64, TMP0, CTX, GOTO_PTR_OK_OFFSET);
+                self.a.rrr(i::SUBS, true, XZR, r(0), TMP0);
+                self.a.bcond_label(cc::NE, out);
+                self.a.breg(i::BR, r(0));
+                self.a.bind(out);
                 self.a.movr(true, X1, r(0));
                 self.exit_with(kind::GOTO_PTR, None);
             }
@@ -1069,6 +1209,57 @@ impl Gen {
             self.a.bcond_label(cc::NE, slow);
         }
         self.a.ld(Type::I64, TMP1, CTX, WIN_HOST_OFFSET);
+    }
+
+    /// True if a guest access with `oi` can be looked up in the TLB inline: there is a TLB, and
+    /// the access is at most 64 bits, needs no byte swap, and needs no more low address bits
+    /// clear than the comparators keep free of flags.
+    fn tlb_fits(&self, oi: MemOpIdx) -> bool {
+        let m = oi.memop();
+        self.tlb_page_bits.is_some()
+            && m.0 & MemOp::BSWAP.0 == 0
+            && m.size() <= 3
+            && m.alignment_bits().max(m.size()) <= TLB_FLAGS_SHIFT
+            && (oi.mmu_idx() as usize) < TLB_MAX_MMU_MODES
+    }
+
+    /// The inline TLB lookup of the guest access at `addr`, QEMU's `prepare_host_addr`: on a hit
+    /// put the guest address in x16 and the entry's addend in x17, so that the access is at
+    /// x16 + x17 as for the window; on a miss branch to `slow`. An `ordered` access must also
+    /// be naturally aligned, as `ldapr` and `stlr` require.
+    fn tlb_addr(&mut self, addr: Reg, oi: MemOpIdx, store: bool, ordered: bool, slow: usize) {
+        let page_bits = self.tlb_page_bits.expect("tlb_fits checked there is a TLB");
+        let m = oi.memop();
+        let s_mask = (1u64 << m.size()) - 1;
+        let a_bits = if ordered { m.alignment_bits().max(m.size()) } else { m.alignment_bits() };
+        let a_mask = (1u64 << a_bits) - 1;
+        let desc = (oi.mmu_idx() as usize * TLB_DESC_WORDS * 8) as i64;
+        self.a.ld(Type::I64, TMP1, CTX, TLB_OFFSET);
+        self.a.ld(Type::I64, TMP0, TMP1, desc);
+        self.a.ld(Type::I64, TMP1, TMP1, desc + 8);
+        let src = if self.addr32 {
+            self.a.movr(false, TMP2, addr);
+            TMP2
+        } else {
+            addr
+        };
+        // The entry: table + ((addr >> (page_bits - TLB_ENTRY_BITS)) & mask).
+        self.a.realshift(i::AND_LSR, true, TMP0, TMP0, src, page_bits - TLB_ENTRY_BITS);
+        self.a.rrr(i::ADD, true, TMP1, TMP1, TMP0);
+        self.a.ld(Type::I64, TMP0, TMP1, if store { 8 } else { 0 });
+        // An access less aligned than its size must not cross the page: compare the page of
+        // its last byte, as QEMU does.
+        let cmp_mask = (u64::MAX << page_bits) | a_mask;
+        if a_mask >= s_mask {
+            self.a.logicali(i::ANDI, true, TMP2, src, cmp_mask);
+        } else {
+            self.a.addsub_imm(i::ADDI, true, TMP2, src, s_mask - a_mask);
+            self.a.logicali(i::ANDI, true, TMP2, TMP2, cmp_mask);
+        }
+        self.a.rrr(i::SUBS, true, XZR, TMP2, TMP0);
+        self.a.bcond_label(cc::NE, slow);
+        self.a.ld(Type::I64, TMP1, TMP1, (TLB_ADDEND_WORD * 8) as i64);
+        self.a.movr(!self.addr32, TMP0, addr);
     }
 
     /// Load `rt` from the window, at the offset in x16 from the address in x17. An `acquire`
@@ -1681,14 +1872,14 @@ impl Target for Gen {
                 let mut words = [0u64; INSN_START_WORDS];
                 words.copy_from_slice(&op.args[..INSN_START_WORDS]);
                 self.requests.push(Request::InsnStart(words));
-                self.a.movi(Type::I64, TMP0, self.requests.len() as u64);
-                self.a.st(Type::I64, TMP0, CTX, INSN_OFFSET);
+                self.insn = self.requests.len() as u64;
+                self.insn_of.push(self.insn);
             }
             Opcode::ExitTb => self.exit_with(kind::EXIT_TB, Some(op.args[0])),
             Opcode::GotoTb => {
                 let at = self.a.pos();
                 self.a.emit(i::NOP);
-                self.goto_tb.push((op.args[0] as u32, at));
+                self.goto_tb.push((op.args[0] as u32, at, self.insn));
             }
             Opcode::Brcond => {
                 let c = cond_arg(op, 2)?;

@@ -10,22 +10,31 @@
 //!
 //! Differences from QEMU:
 //!
-//! - The "host address" of RAM is its `ram_addr` (see the crate docs). An entry's `addend` turns
-//!   a virtual address into the `ram_addr`, and the bytes are read from the `RamBlock` the full
-//!   entry names.
+//! - The fast tables live in [`TlbTables`], whose words are atomics, because generated code reads
+//!   them without the TLB lock (see [`ruvm_jit_interp::fast_tlb`]). As in QEMU an entry's
+//!   `addend` turns a virtual address into a host address; the slow path turns that back into an
+//!   offset in the `RamBlock` the full entry names, and [`probe_access`] and
+//!   [`get_page_addr_code`] answer with the `ram_addr` (see the crate docs) instead of the host
+//!   address.
 //! - MMIO goes through the CPU's address space by physical address, not a saved section. Writes
 //!   to a ROM device go the same way.
 //! - Alignment is checked by the interpreter before the softmmu is called, and
 //!   `TLB_CHECK_ALIGNED` does not add the atomicity requirement of the access.
 //! - The used entry count saturates at zero instead of underflowing when the victim table
 //!   flush counts an entry twice.
+//! - A naturally aligned RAM access of 2, 4 or 8 bytes is one host atomic load or store, so it
+//!   is single-copy atomic against the atomic read-modify-writes other vCPUs do with
+//!   [`atomic_mmu_lookup`] on the same bytes. Other RAM accesses copy byte by byte.
 //! - The TLB lock is a mutex that the owning vCPU also takes on every access. It is never held
 //!   while calling into the target or a device.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
 
 use ruvm_jit_core::types::{MemOp, MemOpIdx};
+use ruvm_jit_interp::fast_tlb::{TLB_ADDEND_WORD, TlbTables};
 use ruvm_mem::{DirtyClient, DirtyMask, Endian, MemTxAttrs, MemTxResult, RamBlock, RegionType};
+use ruvm_sys::hostatomic;
 
 use crate::cpu::{Cpu, CpuLoopExit, MmuAccessType, Ra};
 use crate::jit::Jit;
@@ -95,6 +104,14 @@ impl TlbEntry {
     fn is_empty(&self) -> bool {
         self.addr == [u64::MAX; 3]
     }
+
+    fn from_words(w: [u64; 4]) -> TlbEntry {
+        TlbEntry { addr: [w[0], w[1], w[2]], addend: w[TLB_ADDEND_WORD] }
+    }
+
+    fn words(&self) -> [u64; 4] {
+        [self.addr[0], self.addr[1], self.addr[2], self.addend]
+    }
 }
 
 pub(crate) struct TlbDesc {
@@ -113,18 +130,18 @@ pub(crate) struct TlbDesc {
 pub(crate) struct CpuTlb {
     dirty: u32,
     d: Vec<TlbDesc>,
-    table: Vec<Vec<TlbEntry>>,
+    table: TlbTables,
     pub(crate) full_flush_count: u64,
     pub(crate) part_flush_count: u64,
 }
 
 impl CpuTlb {
-    pub(crate) fn new(nb_mmu_modes: usize, now: i64) -> CpuTlb {
+    pub(crate) fn new(page_bits: u32, nb_mmu_modes: usize, now: i64) -> CpuTlb {
         let n = 1usize << CPU_TLB_DYN_DEFAULT_BITS;
         let mut t = CpuTlb {
             dirty: 0,
             d: Vec::new(),
-            table: Vec::new(),
+            table: TlbTables::new(page_bits, nb_mmu_modes, n),
             full_flush_count: 0,
             part_flush_count: 0,
         };
@@ -140,20 +157,44 @@ impl CpuTlb {
                 vfulltlb: vec![TlbEntryFull::default(); CPU_VTLB_SIZE],
                 fulltlb: vec![TlbEntryFull::default(); n],
             });
-            t.table.push(vec![EMPTY; n]);
         }
         t
     }
 
+    /// The part of the fast tables generated code reads.
+    pub(crate) fn fast(&self) -> &Arc<ruvm_jit_interp::FastTlb> {
+        self.table.fast()
+    }
+
     fn index(&self, page_bits: u32, mmu_idx: usize, addr: u64) -> usize {
-        ((addr >> page_bits) as usize) & (self.table[mmu_idx].len() - 1)
+        ((addr >> page_bits) as usize) & (self.table.len(mmu_idx) - 1)
+    }
+
+    fn entry(&self, mmu_idx: usize, index: usize) -> TlbEntry {
+        TlbEntry::from_words(self.table.get(mmu_idx, index))
+    }
+
+    /// Store `e` at `index` of `mmu_idx`'s fast table, with its full entry `full`, which must
+    /// be the full entry of `e`.
+    #[allow(unsafe_code)]
+    fn store(&mut self, mmu_idx: usize, index: usize, e: &TlbEntry, full: TlbEntryFull) {
+        debug_assert!(e.is_empty() || ram_block_of(&full).is_some() || e.addend == 0);
+        // SAFETY: every comparator of `e` that can match is for a page of the RamBlock that
+        // `full` names, and `addend` gives that page's host bytes in the block's mapping (see
+        // tlb_set_page_full), which is fixed for the block's life. `full` goes into the same
+        // slot of the full table, and its Arc keeps the block alive until the slot is
+        // replaced, which only happens here or in a flush that first makes the entry match
+        // nothing. Entries of IO pages carry TLB_FORCE_SLOW in every comparator, so they never
+        // match. The TLB lock is held, so no other thread changes the slot meanwhile.
+        unsafe { self.table.set(mmu_idx, index, e.words()) };
+        self.d[mmu_idx].fulltlb[index] = full;
     }
 
     /// `tlb_mmu_resize_locked()`.
     fn resize(&mut self, jit: &Jit, mmu_idx: usize, now: i64) {
         let max_bits = 22.min(jit.config.target_long_bits - jit.config.page_bits);
         let desc = &mut self.d[mmu_idx];
-        let old_size = self.table[mmu_idx].len();
+        let old_size = self.table.len(mmu_idx);
         let mut new_size = old_size;
         let window_len_ns = 100 * 1000 * 1000;
         let window_expired = now > desc.window_begin_ns + window_len_ns;
@@ -181,8 +222,8 @@ impl CpuTlb {
         }
         desc.window_begin_ns = now;
         desc.window_max_entries = 0;
+        self.table.resize(mmu_idx, new_size);
         desc.fulltlb = vec![TlbEntryFull::default(); new_size];
-        self.table[mmu_idx] = vec![EMPTY; new_size];
     }
 
     /// `tlb_mmu_flush_locked()`.
@@ -193,7 +234,7 @@ impl CpuTlb {
         desc.large_page_mask = u64::MAX;
         desc.vindex = 0;
         desc.vtable = [EMPTY; CPU_VTLB_SIZE];
-        self.table[mmu_idx].fill(EMPTY);
+        self.table.invalidate_all(mmu_idx);
     }
 
     /// `tlb_flush_one_mmuidx_locked()`.
@@ -225,7 +266,7 @@ impl CpuTlb {
             self.flush_one_mmuidx_locked(jit, mmu_idx, jit.now_ns());
         } else {
             let i = self.index(jit.config.page_bits, mmu_idx, page);
-            if flush_entry_mask_locked(jit, &mut self.table[mmu_idx][i], page, u64::MAX) {
+            if self.flush_table_entry_mask_locked(jit, mmu_idx, i, page, u64::MAX) {
                 self.n_used_dec(mmu_idx);
             }
             self.flush_vtlb_page_mask_locked(jit, mmu_idx, page, u64::MAX);
@@ -235,7 +276,7 @@ impl CpuTlb {
     /// `tlb_flush_range_locked()`.
     fn flush_range_locked(&mut self, jit: &Jit, mmu_idx: usize, addr: u64, len: u64, bits: u32) {
         let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
-        let f_mask = ((self.table[mmu_idx].len() as u64) - 1) << CPU_TLB_ENTRY_BITS;
+        let f_mask = ((self.table.len(mmu_idx) as u64) - 1) << CPU_TLB_ENTRY_BITS;
         // If bits is smaller than the tlb size, there may be multiple entries within the TLB;
         // if len is larger than the tlb size, testing every entry costs more than a flush.
         if mask < f_mask || len > f_mask {
@@ -253,12 +294,29 @@ impl CpuTlb {
         while i < len {
             let page = addr.wrapping_add(i);
             let idx = self.index(jit.config.page_bits, mmu_idx, page);
-            if flush_entry_mask_locked(jit, &mut self.table[mmu_idx][idx], page, mask) {
+            if self.flush_table_entry_mask_locked(jit, mmu_idx, idx, page, mask) {
                 self.n_used_dec(mmu_idx);
             }
             self.flush_vtlb_page_mask_locked(jit, mmu_idx, page, mask);
             i += jit.page_size();
         }
+    }
+
+    /// [`flush_entry_mask_locked`] on entry `index` of the fast table.
+    fn flush_table_entry_mask_locked(
+        &mut self,
+        jit: &Jit,
+        mmu_idx: usize,
+        index: usize,
+        page: u64,
+        mask: u64,
+    ) -> bool {
+        let mut e = self.entry(mmu_idx, index);
+        let hit = flush_entry_mask_locked(jit, &mut e, page, mask);
+        if hit {
+            self.table.invalidate(mmu_idx, index);
+        }
+        hit
     }
 }
 
@@ -485,8 +543,9 @@ fn reset_dirty_range_locked(
     let flags = (addr | u64::from(full.slow_flags[MmuAccessType::DataStore as usize]))
         & (tlb::INVALID_MASK | u64::from(tlb::MMIO | tlb::DISCARD_WRITE) | tlb::NOTDIRTY);
     if flags == 0 {
-        let host = (addr & jit.page_mask()).wrapping_add(e.addend);
-        if host.wrapping_sub(start) < len {
+        // The entry is for RAM, so xlat_offset gives the ram_addr.
+        let ram_addr = (addr & jit.page_mask()).wrapping_add(full.xlat_offset);
+        if ram_addr.wrapping_sub(start) < len {
             e.addr[MmuAccessType::DataStore as usize] = addr | tlb::NOTDIRTY;
         }
     }
@@ -498,9 +557,17 @@ pub(crate) fn tlb_reset_dirty_range_all(jit: &Jit, start: u64, len: u64) {
     for cpu in jit.cpu_list() {
         let mut t = lock(&cpu.tlb);
         let t = &mut *t;
+        let st = MmuAccessType::DataStore as usize;
         for mmu_idx in 0..t.d.len() {
-            for (e, full) in t.table[mmu_idx].iter_mut().zip(&t.d[mmu_idx].fulltlb) {
-                reset_dirty_range_locked(jit, e, full, start, len);
+            for (i, full) in t.d[mmu_idx].fulltlb.iter().enumerate() {
+                let mut e = t.entry(mmu_idx, i);
+                let old = e.addr[st];
+                reset_dirty_range_locked(jit, &mut e, full, start, len);
+                if e.addr[st] != old {
+                    // Generated code of the owner may be reading the entry; only the flag
+                    // changes.
+                    t.table.add_flags(mmu_idx, i, st, tlb::NOTDIRTY);
+                }
             }
             let d = &mut t.d[mmu_idx];
             for (e, full) in d.vtable.iter_mut().zip(&d.vfulltlb) {
@@ -518,10 +585,7 @@ fn tlb_set_dirty(cpu: &Cpu<'_>, addr: u64) {
     let st = MmuAccessType::DataStore as usize;
     for mmu_idx in 0..t.d.len() {
         let i = t.index(jit.config.page_bits, mmu_idx, addr);
-        let e = &mut t.table[mmu_idx][i];
-        if e.addr[st] == addr | tlb::NOTDIRTY {
-            e.addr[st] = addr;
-        }
+        t.table.replace_flags(mmu_idx, i, st, addr | tlb::NOTDIRTY, addr);
     }
     for d in &mut t.d {
         for e in &mut d.vtable {
@@ -609,7 +673,12 @@ pub fn tlb_set_page_full(cpu: &mut Cpu<'_>, mmu_idx: usize, addr: u64, full: &Tl
         read_flags |= tlb::INVALID_MASK;
     }
     // RAM and ROMD both have associated host memory; IO does not.
-    let addend = if is_ram || is_romd { page_ram_addr } else { 0 };
+    let host_page = match &section {
+        TlbSection::Ram { block, ram_base } | TlbSection::Romd { block, ram_base } => {
+            block.host_addr() as u64 + (page_ram_addr - ram_base)
+        }
+        TlbSection::Io => addr_page,
+    };
     let mut write_flags = read_flags;
     let iotlb;
     let mut check_clean = false;
@@ -654,7 +723,7 @@ pub fn tlb_set_page_full(cpu: &mut Cpu<'_>, mmu_idx: usize, addr: u64, full: &Tl
     t.flush_vtlb_page_mask_locked(&jit, mmu_idx, addr_page, u64::MAX);
 
     let index = t.index(page_bits, mmu_idx, addr_page);
-    let te = t.table[mmu_idx][index];
+    let te = t.entry(mmu_idx, index);
     // Only evict the old entry to the victim tlb if it's for a different page; otherwise just
     // overwrite the stale data.
     if !tlb_hit_page_anyprot(&jit, &te, addr_page) && !te.is_empty() {
@@ -670,7 +739,7 @@ pub fn tlb_set_page_full(cpu: &mut Cpu<'_>, mmu_idx: usize, addr: u64, full: &Tl
     nf.xlat_offset = iotlb.wrapping_sub(addr_page);
     nf.phys_addr = paddr_page;
     nf.section = section;
-    let mut tn = TlbEntry { addr: [u64::MAX; 3], addend: addend.wrapping_sub(addr_page) };
+    let mut tn = TlbEntry { addr: [u64::MAX; 3], addend: host_page.wrapping_sub(addr_page) };
 
     let set_compare =
         |nf: &mut TlbEntryFull, tn: &mut TlbEntry, flags: u64, at: MmuAccessType, enable: bool| {
@@ -701,8 +770,7 @@ pub fn tlb_set_page_full(cpu: &mut Cpu<'_>, mmu_idx: usize, addr: u64, full: &Tl
     }
     set_compare(&mut nf, &mut tn, write_flags, MmuAccessType::DataStore, prot & page::WRITE != 0);
 
-    t.table[mmu_idx][index] = tn;
-    t.d[mmu_idx].fulltlb[index] = nf;
+    t.store(mmu_idx, index, &tn, nf);
     t.d[mmu_idx].n_used_entries += 1;
 }
 
@@ -752,9 +820,13 @@ fn victim_tlb_hit(
         let cmp = t.d[mmu_idx].vtable[vidx].addr[at as usize];
         if cmp == page {
             // Found entry in victim tlb, swap tlb and iotlb.
+            let old = t.entry(mmu_idx, index);
             let d = &mut t.d[mmu_idx];
-            std::mem::swap(&mut t.table[mmu_idx][index], &mut d.vtable[vidx]);
-            std::mem::swap(&mut d.fulltlb[index], &mut d.vfulltlb[vidx]);
+            let ve = std::mem::replace(&mut d.vtable[vidx], old);
+            let vfull = std::mem::take(&mut d.vfulltlb[vidx]);
+            let full = std::mem::take(&mut d.fulltlb[index]);
+            t.d[mmu_idx].vfulltlb[vidx] = full;
+            t.store(mmu_idx, index, &ve, vfull);
             return true;
         }
     }
@@ -780,12 +852,12 @@ fn tlb_lookup_nofill(
     let jit = &cpu.core.jit;
     let mut t = lock(&cpu.core.shared.tlb);
     let index = t.index(jit.config.page_bits, mmu_idx, addr);
-    let e = t.table[mmu_idx][index];
+    let e = t.entry(mmu_idx, index);
     let tlb_addr = e.addr[at as usize];
     if tlb_hit(jit, tlb_addr, addr)
         || victim_tlb_hit(&mut t, mmu_idx, index, at, addr & jit.page_mask())
     {
-        let e = t.table[mmu_idx][index];
+        let e = t.entry(mmu_idx, index);
         Some((e.addr[at as usize], e.addend, t.d[mmu_idx].fulltlb[index].clone()))
     } else {
         None
@@ -801,7 +873,7 @@ fn tlb_read_entry(
     let jit = &cpu.core.jit;
     let t = lock(&cpu.core.shared.tlb);
     let index = t.index(jit.config.page_bits, mmu_idx, addr);
-    let e = t.table[mmu_idx][index];
+    let e = t.entry(mmu_idx, index);
     (e.addr[at as usize], e.addend, t.d[mmu_idx].fulltlb[index].clone())
 }
 
@@ -945,13 +1017,24 @@ fn io_prepare(cpu: &mut Cpu<'_>, ra: Ra) -> Result<(), CpuLoopExit> {
     Ok(())
 }
 
-fn ram_of(full: &TlbEntryFull, haddr: u64) -> Option<(&Arc<RamBlock>, u64)> {
+fn ram_block_of(full: &TlbEntryFull) -> Option<(&Arc<RamBlock>, u64)> {
     match &full.section {
         TlbSection::Ram { block, ram_base } | TlbSection::Romd { block, ram_base } => {
-            Some((block, haddr - ram_base))
+            Some((block, *ram_base))
         }
         TlbSection::Io => None,
     }
+}
+
+/// The block behind the host address `haddr` of an entry, and the offset of `haddr` in it.
+fn ram_of(full: &TlbEntryFull, haddr: u64) -> Option<(&Arc<RamBlock>, u64)> {
+    ram_block_of(full).map(|(block, _)| (block, haddr.wrapping_sub(block.host_addr() as u64)))
+}
+
+/// The `ram_addr` of the host address `haddr` of an entry.
+fn ram_addr_of(full: &TlbEntryFull, haddr: u64) -> Option<u64> {
+    ram_block_of(full)
+        .map(|(block, ram_base)| ram_base + haddr.wrapping_sub(block.host_addr() as u64))
 }
 
 /// The access sizes for MMIO: aligned pieces of up to 8 bytes.
@@ -988,8 +1071,40 @@ fn do_ld_piece(
         return Ok(());
     }
     let (block, off) = ram_of(&p.full, p.haddr).expect("RAM TLB entry without a block");
-    block.read(off, buf).expect("RAM TLB entry outside its block");
+    if !ram_load_atomic(block, off, buf) {
+        block.read(off, buf).expect("RAM TLB entry outside its block");
+    }
     Ok(())
+}
+
+/// The bytes of an aligned 2, 4 or 8-byte access to RAM, which must be one host access so
+/// that other vCPUs never see half of it.
+fn ram_word(block: &RamBlock, off: u64, n: usize) -> Option<&[AtomicU8]> {
+    if !matches!(n, 2 | 4 | 8) || off % n as u64 != 0 {
+        return None;
+    }
+    let off = usize::try_from(off).ok()?;
+    block.atomic_bytes().get(off..off.checked_add(n)?)
+}
+
+/// Load an aligned access from RAM with one host load. False if it is not one.
+fn ram_load_atomic(block: &RamBlock, off: u64, buf: &mut [u8]) -> bool {
+    let n = buf.len();
+    match ram_word(block, off, n).and_then(hostatomic::load) {
+        Some(v) => {
+            buf.copy_from_slice(&v.to_le_bytes()[..n]);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Store an aligned access to RAM with one host store. False if it is not one.
+fn ram_store_atomic(block: &RamBlock, off: u64, data: &[u8]) -> bool {
+    let Some(bytes) = ram_word(block, off, data.len()) else { return false };
+    let mut b = [0u8; 8];
+    b[..data.len()].copy_from_slice(data);
+    hostatomic::store(bytes, u64::from_le_bytes(b))
 }
 
 fn do_st_piece(
@@ -1024,7 +1139,9 @@ fn do_st_piece(
         return Ok(());
     }
     let (block, off) = ram_of(&p.full, p.haddr).expect("RAM TLB entry without a block");
-    block.write(off, data).expect("RAM TLB entry outside its block");
+    if !ram_store_atomic(block, off, data) {
+        block.write(off, data).expect("RAM TLB entry outside its block");
+    }
     Ok(())
 }
 
@@ -1081,6 +1198,93 @@ pub fn do_st_bytes(
         }
     }
     Ok(())
+}
+
+/// `atomic_mmu_lookup()`: the RAM block and offset of the `size` bytes at `addr` for an atomic
+/// read-modify-write, after checking that the page is readable and writable, the guest's
+/// alignment, watchpoints and notdirty. An access the host cannot do with one atomic operation
+/// (not aligned to its size, MMIO, or a discarded write) leaves with
+/// [`Cpu::cpu_loop_exit_atomic`], so the instruction runs again with the other vCPUs stopped.
+pub(crate) fn atomic_mmu_lookup(
+    cpu: &mut Cpu<'_>,
+    addr: u64,
+    oi: MemOpIdx,
+    size: usize,
+    ra: Ra,
+) -> Result<(Arc<RamBlock>, u64), CpuLoopExit> {
+    let mmu_idx = oi.mmu_idx() as usize;
+    let mop = oi.memop();
+    let store = MmuAccessType::DataStore;
+
+    // Check TLB entry and enforce page permissions.
+    let (tlb_addr, addend, full) = match tlb_lookup_nofill(cpu, addr, store, mmu_idx) {
+        Some(x) => x,
+        None => {
+            let ops = cpu.ops();
+            let ok = ops.tlb_fill(cpu, addr, size, store, mmu_idx, false, ra)?;
+            assert!(ok, "tlb_fill must not fail without probe");
+            let (a, addend, full) = tlb_read_entry(cpu, addr, store, mmu_idx);
+            (a & !tlb::INVALID_MASK, addend, full)
+        }
+    };
+
+    // Let the guest notice RMW on a write-only page. We have just verified that the page is
+    // writable. Subpage lookups may have left TLB_INVALID_MASK set, but addr_read will only be
+    // -1 if PAGE_READ was unset.
+    let addr_read = tlb_read_entry(cpu, addr, MmuAccessType::DataLoad, mmu_idx).0;
+    if addr_read == u64::MAX {
+        let ops = cpu.ops();
+        ops.tlb_fill(cpu, addr, size, MmuAccessType::DataLoad, mmu_idx, false, ra)?;
+        // Since we don't support reads and writes to different addresses, and we do have the
+        // proper page loaded for write, this shouldn't ever return.
+        unreachable!("tlb_fill for a load on a writable page returned");
+    }
+
+    // Enforce guest required alignment.
+    let a_bits = mop.alignment_bits();
+    if a_bits != 0 && addr & ((1u64 << a_bits) - 1) != 0 {
+        let ops = cpu.ops();
+        return Err(ops.do_unaligned_access(cpu, addr, store, mmu_idx, ra));
+    }
+
+    // Enforce qemu required alignment.
+    if addr & (size as u64 - 1) != 0 {
+        // We get here if guest alignment was not requested, or was not enforced by
+        // cpu_unaligned_access above. We might widen the access and emulate, but for now
+        // mark an exception and exit the cpu loop.
+        return Err(cpu.cpu_loop_exit_atomic(ra));
+    }
+
+    // Finish collecting tlb flags for both read and write.
+    let mut flags = (tlb_addr | addr_read) & (tlb::FLAGS_MASK & !tlb::FORCE_SLOW);
+    flags |= u64::from(full.slow_flags[store as usize]);
+    flags |= u64::from(full.slow_flags[MmuAccessType::DataLoad as usize]);
+
+    // Notice an IO access or a needs-MMU-lookup access.
+    if flags & u64::from(tlb::MMIO | tlb::DISCARD_WRITE) != 0 {
+        // There's really nothing that can be done to support this apart from stop-the-world.
+        return Err(cpu.cpu_loop_exit_atomic(ra));
+    }
+    let Some((block, off)) = ram_of(&full, addr.wrapping_add(addend)) else {
+        return Err(cpu.cpu_loop_exit_atomic(ra));
+    };
+    let block = block.clone();
+
+    if flags & tlb::NOTDIRTY != 0 {
+        notdirty_write(cpu, addr, size, &full, ra)?;
+    }
+
+    if flags & u64::from(tlb::WATCHPOINT) != 0 {
+        let mut wp_flags = 0;
+        if full.slow_flags[store as usize] & tlb::WATCHPOINT != 0 {
+            wp_flags |= bp::MEM_WRITE;
+        }
+        if full.slow_flags[MmuAccessType::DataLoad as usize] & tlb::WATCHPOINT != 0 {
+            wp_flags |= bp::MEM_READ;
+        }
+        cpu.check_watchpoint(addr, size as u64, full.attrs, wp_flags, ra)?;
+    }
+    Ok((block, off))
 }
 
 /// `cpu_ld*_mmu()`: load the value `oi` describes, for target helpers.
@@ -1189,7 +1393,8 @@ fn probe_access_internal(
         return Ok((u64::from(tlb::MMIO), None, Some(full)));
     }
     // Everything else is RAM.
-    Ok((flags, Some(addr.wrapping_add(addend)), Some(full)))
+    let host = ram_addr_of(&full, addr.wrapping_add(addend));
+    Ok((flags, host, Some(full)))
 }
 
 /// `probe_access()`: make sure `size` bytes at `addr` can be accessed, raising the guest fault
@@ -1257,7 +1462,7 @@ pub fn tlb_flush_counts(cpu: &Cpu<'_>) -> (u64, u64) {
 
 /// The number of entries in the fast table of `mmu_idx`.
 pub fn tlb_n_entries(cpu: &Cpu<'_>, mmu_idx: usize) -> usize {
-    lock(&cpu.core.shared.tlb).table[mmu_idx].len()
+    lock(&cpu.core.shared.tlb).table.len(mmu_idx)
 }
 
 impl Cpu<'_> {

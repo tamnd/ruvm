@@ -15,10 +15,14 @@
 //! - A block the native code generator refuses (an op or type it does not handle) runs with
 //!   the interpreter instead. QEMU has no such fallback because its backends handle every op.
 //! - Code lives in a chain of regions. When the current one has no room left for a block a new
-//!   one is started, and the old one is unmapped once the blocks in it are gone, which the
-//!   runtime's own code budget and `tb_flush` see to. QEMU flushes when its one buffer fills.
-//! - Chained `goto_tb` jumps come back to this loop, which runs the next block, rather than
-//!   jumping straight to its code.
+//!   one is started that keeps the old ones mapped, so that blocks in it can jump to blocks in
+//!   them. `tb_flush` starts a new chain, and the old one is unmapped once the blocks in it are
+//!   gone. The runtime's own code budget decides when to flush. QEMU flushes when its one
+//!   buffer fills.
+//! - Native blocks chain as in QEMU: a linked `goto_tb` jumps straight to the next block's code,
+//!   and `lookup_and_goto_ptr` jumps to the code `helper_lookup_tb_ptr()` finds without
+//!   leaving generated code. Jumps to a block run by the interpreter, or to a block of an older
+//!   chain of regions, come back to this loop instead, which runs the block.
 
 use std::any::Any;
 use std::fmt;
@@ -26,10 +30,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use ruvm_jit_core::{Func, HelperType};
-use ruvm_jit_interp::{Exit, HelperRegistry, Machine, Unwind};
+use ruvm_jit_interp::{Exit, HelperEnv, HelperRegistry, Machine, Unwind};
 
 use crate::backend::{Backend, GenCodeError, InterpBackend, TbRet};
 use crate::cpu::{Cpu, CpuLoopExit};
+use crate::cpu_exec;
 use crate::tb::{Tb, lock};
 
 /// The environment variable that picks the backend: `interp` or `native`.
@@ -112,6 +117,62 @@ enum Body {
     Interp(Box<Func>),
 }
 
+/// What a run of native code ended with.
+struct Ran {
+    exit: Exit,
+    /// The block running when the code left, if the code chained on from the first one.
+    block: Option<Arc<Tb>>,
+    /// After `goto_ptr` with 0: the block to run next, which native code could not jump to.
+    /// After `goto_tb` from an interpreted block: the target of the slot.
+    next: Option<Arc<Tb>>,
+}
+
+/// `lookup_and_goto_ptr` for native code: the runtime's `helper_lookup_tb_ptr()`.
+#[cfg_attr(not(any(all(unix, target_arch = "aarch64"), target_arch = "x86_64")), allow(dead_code))]
+struct TbChain;
+
+#[cfg_attr(not(any(all(unix, target_arch = "aarch64"), target_arch = "x86_64")), allow(dead_code))]
+impl TbChain {
+    fn lookup(he: &mut HelperEnv<'_>) -> Result<Option<Arc<Tb>>, Unwind> {
+        let Some(mut cpu) = Cpu::from_helper_env(he) else { return Ok(None) };
+        cpu_exec::helper_lookup_tb_ptr(&mut cpu).map_err(|e| cpu.unwind(e))
+    }
+
+    fn code(block: &(dyn Any + Send + Sync)) -> Option<&host::CompiledTb> {
+        TbChain::native(block.downcast_ref::<Tb>()?)
+    }
+
+    fn native(tb: &Tb) -> Option<&host::CompiledTb> {
+        match &native_code(tb).body {
+            Body::Native(c) => Some(c),
+            Body::Interp(_) => None,
+        }
+    }
+
+    /// `Chain::lookup_code`: the block is only cloned when generated code cannot jump to it.
+    fn lookup_code(
+        he: &mut HelperEnv<'_>,
+        jump: &mut dyn FnMut(&host::CompiledTb) -> Option<u64>,
+    ) -> Result<host::Found, Unwind> {
+        let Some(mut cpu) = Cpu::from_helper_env(he) else { return Ok(host::Found::Leave(None)) };
+        let found = cpu_exec::helper_lookup_tb_ptr_with(&mut cpu, |tb| {
+            match TbChain::native(tb).and_then(jump) {
+                Some(entry) => host::Found::Jump(entry),
+                None => host::Found::Leave(Some(tb.clone() as Arc<dyn Any + Send + Sync>)),
+            }
+        });
+        match found {
+            Ok(f) => Ok(f.unwrap_or(host::Found::Leave(None))),
+            Err(e) => Err(cpu.unwind(e)),
+        }
+    }
+}
+
+#[cfg_attr(not(any(all(unix, target_arch = "aarch64"), target_arch = "x86_64")), allow(dead_code))]
+fn as_tb(b: Option<Arc<dyn Any + Send + Sync>>) -> Option<Arc<Tb>> {
+    b.and_then(|b| b.downcast::<Tb>().ok())
+}
+
 /// The code of a block for [`NativeBackend`].
 struct NativeCode {
     body: Body,
@@ -186,13 +247,14 @@ impl NativeBackend {
     /// Compile `f`, starting a new region when the current one is full.
     fn compile(&self, f: &Func) -> Result<host::CompiledTb, host::GenCodeError> {
         let region = lock(&self.region).clone();
-        match host::compile(&region, f) {
+        match host::compile(&region, f, &self.helpers) {
             Err(host::GenCodeError::TooLarge) if region.used() > 0 => {}
             r => return r,
         }
         // The block may just not fit in what is left; try a fresh region.
-        let fresh = host::new_region(self.region_size).ok_or(host::GenCodeError::TooLarge)?;
-        let c = host::compile(&fresh, f)?;
+        let fresh =
+            host::next_region(&region, self.region_size).ok_or(host::GenCodeError::TooLarge)?;
+        let c = host::compile(&fresh, f, &self.helpers)?;
         let mut cur = lock(&self.region);
         if Arc::ptr_eq(&cur, &region) {
             *cur = fresh;
@@ -233,60 +295,101 @@ impl Backend for NativeBackend {
     fn set_jmp_target(&self, tb: &Arc<Tb>, n: usize, dest: Option<&Arc<Tb>>) {
         let code = native_code(tb);
         let mut t = lock(&code.targets);
-        t[n] = dest.map(Arc::downgrade);
         // Patch under the lock, so that code seen to take the jump finds its target set.
         if let Body::Native(c) = &code.body {
-            c.set_goto_tb_linked(n as u32, dest.is_some());
+            // An unlinked slot keeps its old target, so that code that left through the jump
+            // just before it was unlinked still finds the block it was jumping to.
+            if let Some(d) = dest {
+                t[n] = Some(Arc::downgrade(d));
+            }
+            let n = n as u32;
+            match dest.map(|d| &native_code(d).body) {
+                None => c.set_goto_tb_linked(n, false),
+                Some(Body::Native(d)) => host::set_goto_tb_target(c, n, d),
+                Some(Body::Interp(_)) => c.set_goto_tb_linked(n, true),
+            };
+        } else {
+            t[n] = dest.map(Arc::downgrade);
+        }
+    }
+
+    fn tb_created(&self, tb: &Arc<Tb>) {
+        if let Body::Native(c) = &native_code(tb).body {
+            let owner: Weak<dyn Any + Send + Sync> = Arc::downgrade(tb) as Weak<Tb>;
+            host::set_owner(c, owner);
+        }
+    }
+
+    fn tb_flush(&self) {
+        let mut cur = lock(&self.region);
+        if cur.used() > 0 {
+            if let Some(fresh) = host::new_region(self.region_size) {
+                *cur = fresh;
+            }
         }
     }
 
     fn exec(&self, cpu: &mut Cpu<'_>, tb: &Arc<Tb>) -> Result<TbRet, CpuLoopExit> {
+        let shared = cpu.core.shared.clone();
         let mut tb = tb.clone();
         let r = loop {
             cpu.core.current_tb = Some(tb.clone());
             cpu.core.cur_insn = None;
-            crate::backend::copy_icount_decr(cpu);
             let code = native_code(&tb);
-            let targets = crate::backend::live_targets(&code.targets);
-            let exit = match &code.body {
+            let ran = match &code.body {
                 Body::Native(c) => {
-                    let mut last = None;
-                    c.run_traced(&mut *cpu.env, &mut *cpu.core, &self.helpers, &mut last)
+                    host::run(c, &mut *cpu.env, &mut *cpu.core, &self.helpers, &shared.icount_decr)
                 }
                 Body::Interp(func) => {
+                    crate::backend::copy_icount_decr(cpu);
+                    let targets = crate::backend::live_targets(&code.targets);
                     let mut m = Machine::new(&mut *cpu.env, &mut *cpu.core, &self.helpers);
                     m.linked = [targets[0].is_some(), targets[1].is_some()];
-                    m.run(func)
+                    m.run(func).map(|exit| {
+                        // The slot is followed as it was linked when the block started.
+                        let next = match exit {
+                            Exit::GotoTb(n) => targets[n as usize & 1].clone(),
+                            _ => None,
+                        };
+                        Ran { exit, block: None, next }
+                    })
                 }
             };
-            match exit {
-                Ok(Exit::ExitTb(v)) => {
+            let ran = match ran {
+                Ok(r) => r,
+                Err(e) => {
+                    let pc = cpu.core.current_tb.as_ref().map_or(tb.pc, |t| t.pc);
+                    panic!("{} backend error in the block at pc {pc:#x}: {e}", host::NAME)
+                }
+            };
+            // The block that left, which is not the first one when native code chained on.
+            let last = ran.block.unwrap_or_else(|| tb.clone());
+            match ran.exit {
+                Exit::ExitTb(v) => {
                     let id = v & !3;
                     if id == 0 {
                         break Ok(TbRet { last_tb: None, exit: v & 3 });
                     }
-                    assert_eq!(id, tb.id, "exit_tb names a block that is not running");
-                    break Ok(TbRet { last_tb: Some(tb), exit: v & 3 });
+                    assert_eq!(id, last.id, "exit_tb names a block that is not running");
+                    break Ok(TbRet { last_tb: Some(last), exit: v & 3 });
                 }
-                Ok(Exit::GotoTb(n)) => {
+                Exit::GotoTb(n) => {
                     let n = n as usize & 1;
-                    // The jump may have been linked after the targets were read.
-                    let next = match &targets[n] {
-                        Some(t) => Some(t.clone()),
-                        None => crate::backend::live_targets(&code.targets)[n].clone(),
-                    };
+                    let next = ran.next.or_else(|| {
+                        crate::backend::live_targets(&native_code(&last).targets)[n].clone()
+                    });
                     tb = next.expect("goto_tb on an unlinked slot");
                 }
-                Ok(Exit::GotoPtr(0)) => break Ok(TbRet { last_tb: None, exit: 0 }),
-                Ok(Exit::GotoPtr(p)) => {
+                Exit::GotoPtr(0) => match ran.next {
+                    Some(next) => tb = next,
+                    None => break Ok(TbRet { last_tb: None, exit: 0 }),
+                },
+                Exit::GotoPtr(p) => {
                     let next = cpu.core.goto_ptr_target.take().expect("goto_ptr without a lookup");
                     assert_eq!(next.id, p, "goto_ptr to a block lookup_tb_ptr did not return");
                     tb = next;
                 }
-                Ok(Exit::Unwind(u)) => break Err(unwind(cpu, u)),
-                Err(e) => {
-                    panic!("{} backend error in the block at pc {:#x}: {e}", host::NAME, tb.pc)
-                }
+                Exit::Unwind(u) => break Err(unwind(cpu, u)),
             }
         };
         cpu.core.current_tb = None;
@@ -313,12 +416,21 @@ fn unwind(cpu: &mut Cpu<'_>, u: Unwind) -> CpuLoopExit {
 
 #[cfg(all(unix, target_arch = "aarch64"))]
 mod host {
-    use std::sync::Arc;
+    use std::any::Any;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, Weak};
 
-    use ruvm_jit_aarch64::{CodegenOptions, HostFeatures, select_fence_mapping};
+    use ruvm_jit_aarch64::select_fence_mapping;
+    use ruvm_jit_aarch64::{Chain, CodegenOptions, CompileOptions, HostFeatures};
     use ruvm_jit_core::{FenceMapping, Func};
+    use ruvm_jit_interp::{GuestMemory, HelperEnv, HelperRegistry, InterpError, Unwind};
 
-    pub(super) use ruvm_jit_aarch64::{CodeRegion, CompiledTb, GenCodeError, TARGET_DEFAULT_MO};
+    pub(super) use ruvm_jit_aarch64::{
+        CodeRegion, CompiledTb, Found, GenCodeError, TARGET_DEFAULT_MO,
+    };
+
+    use super::{Ran, TbChain, as_tb};
+    use crate::ENV_ICOUNT_DECR_OFFSET;
 
     pub(super) const AVAILABLE: bool = true;
     pub(super) const NAME: &str = "aarch64";
@@ -327,9 +439,62 @@ mod host {
         CodeRegion::new(size).ok()
     }
 
-    pub(super) fn compile(r: &Arc<CodeRegion>, f: &Func) -> Result<CompiledTb, GenCodeError> {
-        let opts = CodegenOptions { guest_window: false, features: features() };
-        r.compile_with(f, &opts)
+    pub(super) fn next_region(r: &Arc<CodeRegion>, size: usize) -> Option<Arc<CodeRegion>> {
+        r.successor(size).ok()
+    }
+
+    pub(super) fn compile(
+        r: &Arc<CodeRegion>,
+        f: &Func,
+        helpers: &HelperRegistry,
+    ) -> Result<CompiledTb, GenCodeError> {
+        let gen_opts = CodegenOptions { guest_window: false, features: features() };
+        let opts = CompileOptions {
+            helpers: Some(helpers),
+            icount_decr_offset: Some(ENV_ICOUNT_DECR_OFFSET),
+            tlb_page_bits: f.config.tlb_page_bits,
+        };
+        r.compile_chained(f, &gen_opts, &opts)
+    }
+
+    pub(super) fn set_goto_tb_target(c: &CompiledTb, n: u32, dest: &CompiledTb) -> bool {
+        c.set_goto_tb_target(n, Some(dest))
+    }
+
+    pub(super) fn set_owner(c: &CompiledTb, owner: Weak<dyn Any + Send + Sync>) {
+        c.set_owner(owner);
+    }
+
+    impl Chain for TbChain {
+        fn lookup_tb_ptr(
+            &self,
+            he: &mut HelperEnv<'_>,
+        ) -> Result<Option<Arc<dyn Any + Send + Sync>>, Unwind> {
+            Ok(TbChain::lookup(he)?.map(|t| t as Arc<dyn Any + Send + Sync>))
+        }
+
+        fn code<'a>(&self, block: &'a (dyn Any + Send + Sync)) -> Option<&'a CompiledTb> {
+            TbChain::code(block)
+        }
+
+        fn lookup_code(
+            &self,
+            he: &mut HelperEnv<'_>,
+            jump: &mut dyn FnMut(&CompiledTb) -> Option<u64>,
+        ) -> Result<Found, Unwind> {
+            TbChain::lookup_code(he, jump)
+        }
+    }
+
+    pub(super) fn run(
+        c: &CompiledTb,
+        env: &mut [u8],
+        mem: &mut dyn GuestMemory,
+        helpers: &HelperRegistry,
+        icount_decr: &AtomicU32,
+    ) -> Result<Ran, InterpError> {
+        let x = c.run_chained(env, mem, helpers, &TbChain, icount_decr)?;
+        Ok(Ran { exit: x.exit, block: as_tb(x.block), next: as_tb(x.next) })
     }
 
     fn features() -> HostFeatures {
@@ -344,12 +509,19 @@ mod host {
 
 #[cfg(target_arch = "x86_64")]
 mod host {
-    use std::sync::Arc;
+    use std::any::Any;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, Weak};
 
     use ruvm_jit_core::types::mo;
     use ruvm_jit_core::{FenceMapping, Func};
+    use ruvm_jit_interp::{GuestMemory, HelperEnv, HelperRegistry, InterpError, Unwind};
+    use ruvm_jit_x86_64::{Chain, CompileOptions};
 
-    pub(super) use ruvm_jit_x86_64::{CodeRegion, CompiledTb, GenCodeError};
+    pub(super) use ruvm_jit_x86_64::{CodeRegion, CompiledTb, Found, GenCodeError};
+
+    use super::{Ran, TbChain, as_tb};
+    use crate::ENV_ICOUNT_DECR_OFFSET;
 
     pub(super) const AVAILABLE: bool = true;
     pub(super) const NAME: &str = "x86_64";
@@ -360,8 +532,61 @@ mod host {
         CodeRegion::new(size).ok()
     }
 
-    pub(super) fn compile(r: &Arc<CodeRegion>, f: &Func) -> Result<CompiledTb, GenCodeError> {
-        r.compile(f)
+    pub(super) fn next_region(r: &Arc<CodeRegion>, size: usize) -> Option<Arc<CodeRegion>> {
+        r.successor(size).ok()
+    }
+
+    pub(super) fn compile(
+        r: &Arc<CodeRegion>,
+        f: &Func,
+        helpers: &HelperRegistry,
+    ) -> Result<CompiledTb, GenCodeError> {
+        let opts = CompileOptions {
+            helpers: Some(helpers),
+            icount_decr_offset: Some(ENV_ICOUNT_DECR_OFFSET),
+            tlb_page_bits: f.config.tlb_page_bits,
+        };
+        r.compile_with(f, &opts)
+    }
+
+    pub(super) fn set_goto_tb_target(c: &CompiledTb, n: u32, dest: &CompiledTb) -> bool {
+        c.set_goto_tb_target(n, Some(dest))
+    }
+
+    pub(super) fn set_owner(c: &CompiledTb, owner: Weak<dyn Any + Send + Sync>) {
+        c.set_owner(owner);
+    }
+
+    impl Chain for TbChain {
+        fn lookup_tb_ptr(
+            &self,
+            he: &mut HelperEnv<'_>,
+        ) -> Result<Option<Arc<dyn Any + Send + Sync>>, Unwind> {
+            Ok(TbChain::lookup(he)?.map(|t| t as Arc<dyn Any + Send + Sync>))
+        }
+
+        fn code<'a>(&self, block: &'a (dyn Any + Send + Sync)) -> Option<&'a CompiledTb> {
+            TbChain::code(block)
+        }
+
+        fn lookup_code(
+            &self,
+            he: &mut HelperEnv<'_>,
+            jump: &mut dyn FnMut(&CompiledTb) -> Option<u64>,
+        ) -> Result<Found, Unwind> {
+            TbChain::lookup_code(he, jump)
+        }
+    }
+
+    pub(super) fn run(
+        c: &CompiledTb,
+        env: &mut [u8],
+        mem: &mut dyn GuestMemory,
+        helpers: &HelperRegistry,
+        icount_decr: &AtomicU32,
+    ) -> Result<Ran, InterpError> {
+        let x = c.run_chained(env, mem, helpers, &TbChain, icount_decr)?;
+        Ok(Ran { exit: x.exit, block: as_tb(x.block), next: as_tb(x.next) })
     }
 
     pub(super) fn fence_mapping(_guest_mo: u32) -> FenceMapping {
@@ -372,10 +597,14 @@ mod host {
 /// A host without a native backend: nothing here can be made.
 #[cfg(not(any(all(unix, target_arch = "aarch64"), target_arch = "x86_64")))]
 mod host {
-    use std::sync::Arc;
+    use std::any::Any;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, Weak};
 
     use ruvm_jit_core::{FenceMapping, Func};
-    use ruvm_jit_interp::{Exit, GuestMemory, HelperRegistry, InterpError};
+    use ruvm_jit_interp::{GuestMemory, HelperRegistry, InterpError};
+
+    use super::Ran;
 
     pub(super) const AVAILABLE: bool = false;
     pub(super) const NAME: &str = "none";
@@ -398,6 +627,12 @@ mod host {
     #[derive(Debug)]
     pub(super) enum CompiledTb {}
 
+    #[allow(dead_code)]
+    pub(super) enum Found {
+        Jump(u64),
+        Leave(Option<Arc<dyn Any + Send + Sync>>),
+    }
+
     impl CompiledTb {
         pub(super) fn size(&self) -> usize {
             match *self {}
@@ -406,24 +641,40 @@ mod host {
         pub(super) fn set_goto_tb_linked(&self, _idx: u32, _linked: bool) -> bool {
             match *self {}
         }
-
-        pub(super) fn run_traced(
-            &self,
-            _env: &mut [u8],
-            _mem: &mut dyn GuestMemory,
-            _helpers: &HelperRegistry,
-            _last: &mut Option<[u64; ruvm_jit_core::types::INSN_START_WORDS]>,
-        ) -> Result<Exit, InterpError> {
-            match *self {}
-        }
     }
 
     pub(super) fn new_region(_size: usize) -> Option<Arc<CodeRegion>> {
         None
     }
 
-    pub(super) fn compile(_r: &Arc<CodeRegion>, _f: &Func) -> Result<CompiledTb, GenCodeError> {
+    pub(super) fn next_region(_r: &Arc<CodeRegion>, _size: usize) -> Option<Arc<CodeRegion>> {
+        None
+    }
+
+    pub(super) fn compile(
+        _r: &Arc<CodeRegion>,
+        _f: &Func,
+        _helpers: &HelperRegistry,
+    ) -> Result<CompiledTb, GenCodeError> {
         Err(GenCodeError::TooLarge)
+    }
+
+    pub(super) fn set_goto_tb_target(c: &CompiledTb, _n: u32, _dest: &CompiledTb) -> bool {
+        match *c {}
+    }
+
+    pub(super) fn set_owner(c: &CompiledTb, _owner: Weak<dyn Any + Send + Sync>) {
+        match *c {}
+    }
+
+    pub(super) fn run(
+        c: &CompiledTb,
+        _env: &mut [u8],
+        _mem: &mut dyn GuestMemory,
+        _helpers: &HelperRegistry,
+        _icount_decr: &AtomicU32,
+    ) -> Result<Ran, InterpError> {
+        match *c {}
     }
 
     pub(super) fn fence_mapping(_guest_mo: u32) -> FenceMapping {

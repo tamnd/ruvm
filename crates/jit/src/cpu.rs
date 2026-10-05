@@ -22,7 +22,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::ThreadId;
 
@@ -34,7 +34,7 @@ use ruvm_mem::{AddressSpace, MemTxAttrs, MemTxResult};
 use crate::cputlb::{self, CpuTlb};
 use crate::jit::Jit;
 use crate::tb::{Tb, TbCpuState, lock};
-use crate::tb_maint::JcEntry;
+use crate::tb_maint::{JcEntry, JcPending};
 use crate::translate::TbBuild;
 use crate::{ENV_CAN_DO_IO_OFFSET, TB_JMP_CACHE_SIZE, bp, cf, excp, interrupt};
 
@@ -291,7 +291,11 @@ pub struct CpuShared {
     pub(crate) halt: Arc<(Mutex<()>, Condvar)>,
     pub(crate) thread: Mutex<Option<ThreadId>>,
     pub(crate) tlb: Mutex<CpuTlb>,
-    pub(crate) jmp_cache: Mutex<Vec<JcEntry>>,
+    /// The part of `tlb` generated code reads.
+    pub(crate) fast_tlb: Arc<ruvm_jit_interp::FastTlb>,
+    /// Jump cache invalidations for the vCPU to apply, and whether there are any.
+    pub(crate) jc_pending: Mutex<JcPending>,
+    pub(crate) jc_dirty: AtomicBool,
 }
 
 impl fmt::Debug for CpuShared {
@@ -327,8 +331,10 @@ impl CpuShared {
             work: Mutex::new(VecDeque::new()),
             halt,
             thread: Mutex::new(None),
+            fast_tlb: Arc::clone(tlb.fast()),
             tlb: Mutex::new(tlb),
-            jmp_cache: Mutex::new(vec![JcEntry::default(); TB_JMP_CACHE_SIZE]),
+            jc_pending: Mutex::new(JcPending::default()),
+            jc_dirty: AtomicBool::new(false),
         }
     }
 
@@ -539,6 +545,8 @@ pub struct CpuCore {
     pub(crate) unwinding: Option<CpuLoopExit>,
     pub(crate) goto_ptr_target: Option<Arc<Tb>>,
     pub(crate) atomic_depth: u32,
+    /// `tb_jmp_cache`, which only this vCPU reads or writes.
+    pub(crate) jmp_cache: Vec<JcEntry>,
     /// `breakpoints`, GDB ones first.
     pub breakpoints: Vec<Breakpoint>,
     /// `watchpoints`, GDB ones first.
@@ -581,6 +589,7 @@ impl CpuCore {
             unwinding: None,
             goto_ptr_target: None,
             atomic_depth: 0,
+            jmp_cache: vec![JcEntry::default(); TB_JMP_CACHE_SIZE],
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
             watchpoint_hit: None,
@@ -657,6 +666,29 @@ impl GuestMemory for CpuCore {
         r.map_err(|e| self.fault(e, addr, true, oi))
     }
 
+    fn atomic_access(
+        &mut self,
+        env: &mut [u8],
+        addr: u64,
+        oi: MemOpIdx,
+        op: &mut dyn FnMut(&[AtomicU8]),
+    ) -> Result<bool, Unwind> {
+        let size = oi.memop().size_bytes() as usize;
+        let r = {
+            let mut cpu = Cpu { env, core: self };
+            cputlb::atomic_mmu_lookup(&mut cpu, addr, oi, size, Ra::Tb)
+        };
+        let (block, off) = r.map_err(|e| Unwind::Mem(self.fault(e, addr, true, oi)))?;
+        let bytes = usize::try_from(off)
+            .ok()
+            .and_then(|o| block.atomic_bytes().get(o..o.checked_add(size)?));
+        match bytes {
+            Some(b) => op(b),
+            None => return Err(Unwind::ExitAtomic),
+        }
+        Ok(true)
+    }
+
     fn atomic_begin(&mut self) {
         if self.atomic_depth == 0 {
             self.jit.atomic_lock();
@@ -673,6 +705,15 @@ impl GuestMemory for CpuCore {
 
     fn insn_start(&mut self, words: &[u64; INSN_START_WORDS]) {
         self.cur_insn = Some(*words);
+    }
+
+    fn enter_block(&mut self, block: Option<Arc<dyn std::any::Any + Send + Sync>>) {
+        self.current_tb = block.and_then(|b| b.downcast::<Tb>().ok());
+        self.cur_insn = None;
+    }
+
+    fn fast_tlb(&self) -> Option<Arc<ruvm_jit_interp::FastTlb>> {
+        Some(Arc::clone(&self.shared.fast_tlb))
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

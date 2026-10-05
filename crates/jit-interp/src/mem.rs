@@ -6,7 +6,11 @@
 //! itself and only asks the memory for raw bytes, so an implementation is a plain byte store with
 //! whatever translation and permission checks the machine needs.
 
+use std::sync::atomic::AtomicU8;
+
 use ruvm_jit_core::types::{MemOp, MemOpIdx};
+
+use crate::helpers::Unwind;
 
 /// Why a guest memory access failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -67,8 +71,27 @@ pub trait GuestMemory {
         self.write(addr, data, oi)
     }
 
-    /// Called before the load and store of an atomic helper. A memory shared between threads
-    /// takes a lock here so the pair is indivisible. The default does nothing.
+    /// Give an atomic helper the host bytes of the access `oi` describes at `addr`, so it can
+    /// work on them with host atomic operations, as QEMU's `atomic_mmu_lookup()` gives it a host
+    /// pointer. Calls `op` with exactly the access's bytes and returns true, or returns false
+    /// without calling it when the memory has no host bytes to give, in which case the helper
+    /// falls back to a load and a store between [`GuestMemory::atomic_begin`] and
+    /// [`GuestMemory::atomic_end`]. A fault, or an access that can only be done with the other
+    /// vCPUs stopped, is an error. The default returns false.
+    fn atomic_access(
+        &mut self,
+        env: &mut [u8],
+        addr: u64,
+        oi: MemOpIdx,
+        op: &mut dyn FnMut(&[AtomicU8]),
+    ) -> Result<bool, Unwind> {
+        let _ = (env, addr, oi, op);
+        Ok(false)
+    }
+
+    /// Called before the load and store of an atomic helper that could not use
+    /// [`GuestMemory::atomic_access`]. A memory shared between threads takes a lock here so the
+    /// pair is indivisible against other atomic helpers. The default does nothing.
     fn atomic_begin(&mut self) {}
 
     /// Called after an atomic helper is done with memory, whether it succeeded or not.
@@ -79,6 +102,22 @@ pub trait GuestMemory {
     /// block's unwind data with the host return address. The default does nothing.
     fn insn_start(&mut self, words: &[u64; ruvm_jit_core::types::INSN_START_WORDS]) {
         let _ = words;
+    }
+
+    /// Generated code that chains blocks without returning moved on to another block, given
+    /// as its owner (see the host backends' `CompiledTb::set_owner`), or `None` if it has
+    /// none. Called before the first request the new block makes, so that a fault in it is
+    /// unwound against the right block. The `insn_start` reports that follow are for that
+    /// block. The default does nothing.
+    fn enter_block(&mut self, block: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>) {
+        let _ = block;
+    }
+
+    /// The inline TLB tables generated code may read for this memory's `qemu_ld` and `qemu_st`
+    /// before calling it, or `None` if every access must call it. A host backend uses them only
+    /// if they are for the page size it compiled its fast paths for. The default is `None`.
+    fn fast_tlb(&self) -> Option<std::sync::Arc<crate::FastTlb>> {
+        None
     }
 
     /// The memory as [`Any`](std::any::Any), so helpers can reach the runtime behind it. The

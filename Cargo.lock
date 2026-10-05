@@ -751,6 +751,7 @@ dependencies = [
  "ruvm-jit-interp",
  "ruvm-jit-x86_64",
  "ruvm-mem",
+ "ruvm-sys",
 ]
 
 [[package]]
@@ -771,6 +772,7 @@ name = "ruvm-jit-interp"
 version = "0.3.4"
 dependencies = [
  "ruvm-jit-core",
+ "ruvm-sys",
 ]
 
 [[package]]

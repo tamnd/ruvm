@@ -40,9 +40,9 @@
 //!   generated code" or "in the current block". The instruction is the one whose `insn_start`
 //!   ran last, which the interpreter reports through `GuestMemory::insn_start`, instead of a
 //!   search of the block's unwind data by host PC.
-//! - `icount_decr` lives in an atomic shared with other threads and is copied into `env` before
-//!   every block, chained ones included, since generated code only sees `env`. `can_do_io` lives
-//!   only in `env`.
+//! - `icount_decr` lives in an atomic shared with other threads. Native code reads that atomic
+//!   directly; for interpreted blocks it is copied into `env` before every block, chained ones
+//!   included, since the interpreter only sees `env`. `can_do_io` lives only in `env`.
 //! - There is no big QEMU lock. Device callbacks (MMIO) are called without one; `ruvm-mem`
 //!   devices do their own locking. Work items and `run_on_cpu()` wait on the runtime's own lock.
 //! - Translation holds no page locks, and one mutex covers all the per page block lists. Two
@@ -52,7 +52,8 @@
 //!   region until `tb_flush`, so a stale pointer to a block is always safe to follow.
 //! - Physical pages of RAM are named by a runtime assigned `ram_addr`: each `RamBlock` gets a
 //!   page aligned base the first time the TLB sees it. The TLB `addend` turns a guest virtual
-//!   address into that `ram_addr` instead of a host pointer.
+//!   address into a host pointer as in QEMU, but `probe_access` and `get_page_addr_code` answer
+//!   with the `ram_addr`.
 //! - Self modifying code tracking uses the runtime's own "page holds translated code" bit instead
 //!   of the `DIRTY_MEMORY_CODE` bitmap. Writes that do not go through the softmmu, such as DMA,
 //!   must call [`jit::Jit::tb_invalidate_phys_range`] themselves; QEMU does it from
@@ -64,12 +65,13 @@
 //! - Only the legacy `tlb_fill` hook is supported, so alignment is checked before paging, and the
 //!   interpreter checks alignment before it calls the softmmu. `MO_ALIGN_TLB_ONLY` and
 //!   `TLB_CHECK_ALIGNED` are therefore checked as plain alignment.
-//! - Guest atomics under `CF_PARALLEL` are made indivisible by one global lock around the
-//!   load and store pair, since the interpreter's atomic helpers are a load and a store.
+//! - Guest atomics under `CF_PARALLEL` are one host atomic operation on the bytes of guest RAM,
+//!   as in QEMU, found with `atomic_mmu_lookup`. Only memory with no RAM bytes behind it (not a
+//!   `CpuCore`) falls back to one global lock around a load and store pair.
 //! - No icount, no `-d exec` style logging, no perf maps, and no user mode. TCG plugins are
 //!   supported through [`plugin`], with the differences listed there.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod accel;
 pub mod backend;

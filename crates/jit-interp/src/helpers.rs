@@ -8,14 +8,19 @@
 //! zero extended. The result is returned as a `u128` whose low slots are used.
 //!
 //! [`HelperRegistry::new`] comes with the runtime helpers the builder itself emits:
-//! `lookup_tb_ptr`, `exit_atomic` and the `atomic_*` family. The atomic helpers are not atomic:
-//! the interpreter runs one thread, so a load followed by a store is enough.
+//! `lookup_tb_ptr`, `exit_atomic` and the `atomic_*` family. The atomic helpers do one host
+//! atomic operation on the bytes [`GuestMemory::atomic_access`] gives them, as QEMU's do on the
+//! host address of guest RAM, so they stay atomic against plain stores from other threads. A
+//! memory with no host bytes to give (a test memory, say) gets a load and a store between
+//! [`GuestMemory::atomic_begin`] and [`GuestMemory::atomic_end`] instead.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::AtomicU8;
 
 use ruvm_jit_core::ir::{HelperInfo, HelperType};
 use ruvm_jit_core::types::MemOpIdx;
+use ruvm_sys::hostatomic;
 
 use crate::mem::{GuestMemory, MemFault, guest_load_env, guest_store_env, plain};
 
@@ -173,28 +178,9 @@ fn sext(v: u128, bits: u32) -> i128 {
     ((v << sh) as i128) >> sh
 }
 
-fn rmw(e: &mut HelperEnv<'_>, args: &[u64], op: Rmw, new_value: bool) -> Result<u128, Unwind> {
-    e.mem.atomic_begin();
-    let r = rmw_locked(e, args, op, new_value);
-    e.mem.atomic_end();
-    r
-}
-
-fn rmw_locked(
-    e: &mut HelperEnv<'_>,
-    args: &[u64],
-    op: Rmw,
-    new_value: bool,
-) -> Result<u128, Unwind> {
-    let wide = args.len() == 5;
-    let addr = args[1];
-    let val = value(args, 2, wide);
-    let oi = plain(MemOpIdx(args[args.len() - 1] as u32));
-    let bits = 8 * oi.memop().size_bytes();
-    let mask = if bits == 128 { !0u128 } else { (1u128 << bits) - 1 };
-    let val = val & mask;
-    let old = guest_load_env(e.mem, e.env, addr, oi).map_err(Unwind::Mem)? & mask;
-    let new = match op {
+/// The new value of a read-modify-write `op` on `old` with operand `val`, both `bits` wide.
+fn apply(op: Rmw, old: u128, val: u128, bits: u32) -> u128 {
+    match op {
         Rmw::Add => old.wrapping_add(val),
         Rmw::And => old & val,
         Rmw::Or => old | val,
@@ -216,24 +202,122 @@ fn rmw_locked(
         }
         Rmw::Umax => old.max(val),
         Rmw::Xchg => val,
-    } & mask;
+    }
+}
+
+/// The operands of an atomic helper: address, memop, width in bits and the mask of that many
+/// bits.
+fn operands(args: &[u64]) -> (u64, MemOpIdx, u32, u128) {
+    let addr = args[1];
+    let oi = plain(MemOpIdx(args[args.len() - 1] as u32));
+    let bits = 8 * oi.memop().size_bytes();
+    let mask = if bits == 128 { !0u128 } else { (1u128 << bits) - 1 };
+    (addr, oi, bits, mask)
+}
+
+/// Convert between a value and how its `bits` are laid out in memory, little endian first.
+fn swap(v: u128, bits: u32, bswap: bool) -> u128 {
+    if bswap { v.swap_bytes() >> (128 - bits) } else { v }
+}
+
+/// Replace the value at `bytes` with `f` of it with host atomics. Returns the old value, or
+/// `None` when the host cannot do it in one atomic operation.
+fn host_update(
+    bytes: &[AtomicU8],
+    bits: u32,
+    bswap: bool,
+    mut f: impl FnMut(u128) -> u128,
+) -> Option<u128> {
+    let old = if bits == 128 {
+        hostatomic::fetch_update128(bytes, |m| swap(f(swap(m, bits, bswap)), bits, bswap))?
+    } else {
+        let g = |m: u64| swap(f(swap(m as u128, bits, bswap)), bits, bswap) as u64;
+        u128::from(hostatomic::fetch_update(bytes, g)?)
+    };
+    Some(swap(old, bits, bswap))
+}
+
+/// `cmpxchg` with host atomics, on the bytes of the access. Returns the old value, or `None`
+/// when the host cannot do it in one atomic operation.
+fn host_cmpxchg(
+    bytes: &[AtomicU8],
+    bits: u32,
+    bswap: bool,
+    cmpv: u128,
+    newv: u128,
+) -> Option<u128> {
+    let (c, n) = (swap(cmpv, bits, bswap), swap(newv, bits, bswap));
+    let old = if bits == 128 {
+        hostatomic::cmpxchg128(bytes, c, n)?
+    } else {
+        u128::from(hostatomic::cmpxchg(bytes, c as u64, n as u64)?)
+    };
+    Some(swap(old, bits, bswap))
+}
+
+/// `atomic_<op>` helpers: a read-modify-write done as one host atomic operation on guest
+/// memory when the memory can give its bytes, the way `atomic_template.h` works on the host
+/// address `atomic_mmu_lookup()` returns.
+fn rmw(e: &mut HelperEnv<'_>, args: &[u64], op: Rmw, new_value: bool) -> Result<u128, Unwind> {
+    let wide = args.len() == 5;
+    let (addr, oi, bits, mask) = operands(args);
+    let val = value(args, 2, wide) & mask;
+    let bswap = oi.memop().is_bswap();
+    let mut old = None;
+    let mut run = |bytes: &[AtomicU8]| {
+        old = host_update(bytes, bits, bswap, |v| apply(op, v, val, bits) & mask);
+    };
+    if e.mem.atomic_access(e.env, addr, oi, &mut run)? {
+        let old = old.ok_or(Unwind::ExitAtomic)?;
+        return Ok(if new_value { apply(op, old, val, bits) & mask } else { old });
+    }
+    e.mem.atomic_begin();
+    let r = rmw_locked(e, args, op, new_value);
+    e.mem.atomic_end();
+    r
+}
+
+/// [`rmw`] for a memory without host bytes: a load and a store under the memory's lock.
+fn rmw_locked(
+    e: &mut HelperEnv<'_>,
+    args: &[u64],
+    op: Rmw,
+    new_value: bool,
+) -> Result<u128, Unwind> {
+    let wide = args.len() == 5;
+    let (addr, oi, bits, mask) = operands(args);
+    let val = value(args, 2, wide) & mask;
+    let old = guest_load_env(e.mem, e.env, addr, oi).map_err(Unwind::Mem)? & mask;
+    let new = apply(op, old, val, bits) & mask;
     guest_store_env(e.mem, e.env, addr, new, oi).map_err(Unwind::Mem)?;
     Ok(if new_value { new } else { old })
 }
 
+/// `atomic_cmpxchg` helpers, with host atomics as [`rmw`] does.
 fn cmpxchg(e: &mut HelperEnv<'_>, args: &[u64]) -> Result<u128, Unwind> {
+    let wide = args.len() == 7;
+    let (addr, oi, bits, mask) = operands(args);
+    let (cmpv, newv) = if wide {
+        (value(args, 2, true), value(args, 4, true))
+    } else {
+        (value(args, 2, false) & mask, value(args, 3, false) & mask)
+    };
+    let bswap = oi.memop().is_bswap();
+    let mut old = None;
+    let mut run = |bytes: &[AtomicU8]| old = host_cmpxchg(bytes, bits, bswap, cmpv, newv);
+    if e.mem.atomic_access(e.env, addr, oi, &mut run)? {
+        return old.ok_or(Unwind::ExitAtomic);
+    }
     e.mem.atomic_begin();
     let r = cmpxchg_locked(e, args);
     e.mem.atomic_end();
     r
 }
 
+/// [`cmpxchg`] for a memory without host bytes: a load and a store under the memory's lock.
 fn cmpxchg_locked(e: &mut HelperEnv<'_>, args: &[u64]) -> Result<u128, Unwind> {
     let wide = args.len() == 7;
-    let addr = args[1];
-    let oi = plain(MemOpIdx(args[args.len() - 1] as u32));
-    let bits = 8 * oi.memop().size_bytes();
-    let mask = if bits == 128 { !0u128 } else { (1u128 << bits) - 1 };
+    let (addr, oi, _, mask) = operands(args);
     let (cmpv, newv) = if wide {
         (value(args, 2, true), value(args, 4, true))
     } else {

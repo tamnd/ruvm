@@ -28,13 +28,17 @@
 //!
 //! - Values of globals are never cached: every read and write of a global goes to the CPU state
 //!   buffer, which is what QEMU's syncs amount to at every point where they are observable.
-//! - The `atomic_*` helpers are not atomic; the interpreter is single threaded.
+//! - The `atomic_*` helpers are atomic only when the memory gives them host bytes
+//!   ([`GuestMemory::atomic_access`]); otherwise they rely on [`GuestMemory::atomic_begin`].
+//! - The interpreter never reads the inline TLB tables of [`fast_tlb`]; every `qemu_ld` and
+//!   `qemu_st` goes through [`GuestMemory`]. The tables are here for the host backends.
 //! - `goto_ptr` does not look anything up; it returns the pointer, and the built-in
 //!   `lookup_tb_ptr` always answers 0 (go back to the main loop).
 //! - Plugin ops do nothing.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+pub mod fast_tlb;
 pub mod helpers;
 pub mod mem;
 mod vector;
@@ -45,6 +49,7 @@ use ruvm_jit_core::ir::{Func, Op, Temp};
 use ruvm_jit_core::opcode::Opcode;
 use ruvm_jit_core::types::{Cond, INSN_START_WORDS, MemOpIdx, TempKind, Type, bswap};
 
+pub use fast_tlb::{FastTlb, RunGuard, TlbTables};
 pub use helpers::{HelperEntry, HelperEnv, HelperFn, HelperRegistry, Unwind};
 pub use mem::{
     FaultKind, FlatMemory, GuestMemory, MemFault, NoMemory, guest_load, guest_load_env,

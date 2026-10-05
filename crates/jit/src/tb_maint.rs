@@ -5,12 +5,18 @@
 //! `goto_tb`, invalidation by physical range including self modifying code, and `tb_flush`.
 //!
 //! Lock order: the page lists, then the hash table, then a vCPU's TLB, then the code page set.
-//! Separately, a destination's `jmp_lock`, then a source's `jmp_dest`. A vCPU's jump cache lock
-//! is only ever held on its own.
+//! Separately, a destination's `jmp_lock`, then a source's `jmp_dest`. A vCPU's lock of pending
+//! jump cache invalidations is only ever held on its own.
 //!
 //! Differences from QEMU:
 //!
-//! - The jump cache is a mutex protected array per vCPU instead of an array of atomics.
+//! - The jump cache is a plain array that only its vCPU touches, instead of an array of atomics
+//!   other threads write to. Other threads, and code that only has the shared half of a vCPU,
+//!   queue their invalidations ([`JcPending`]) and the vCPU applies them before its next lookup.
+//!   A block that is invalid already never matches a lookup, because its `CF_INVALID` flag is
+//!   compared, so the delay does not change which block runs, as in QEMU where the reader may
+//!   also see an entry that is about to be cleared. Blocks in the jump cache of a vCPU that does
+//!   no more lookups (a halted one) stay allocated until it does.
 //! - Pages keep their (possibly empty) block list once they had code, as QEMU's page descriptors
 //!   stay allocated, so a write to a page that lost its code still turns the slow path off.
 
@@ -50,20 +56,83 @@ pub(crate) fn tb_jmp_cache_hash_func(jit: &Jit, pc: u64) -> usize {
     (((tmp >> sh) & TB_JMP_PAGE_MASK) | (tmp & TB_JMP_ADDR_MASK)) as usize
 }
 
+/// Jump cache invalidations queued through [`CpuShared`], for the vCPU to apply before its
+/// next lookup.
+#[derive(Debug, Default)]
+pub(crate) struct JcPending {
+    /// Clear every entry.
+    all: bool,
+    /// Clear the entries of the page that starts at each index.
+    pages: Vec<usize>,
+    /// Clear the entry at each index if it holds the block at the address.
+    tbs: Vec<(usize, usize)>,
+}
+
+/// More queued page or block invalidations than this clear the whole cache instead.
+const JC_PENDING_MAX: usize = 64;
+
+impl JcPending {
+    fn len(&self) -> usize {
+        self.pages.len() + self.tbs.len()
+    }
+
+    fn clear_all(&mut self) {
+        self.all = true;
+        self.pages = Vec::new();
+        self.tbs = Vec::new();
+    }
+}
+
+/// Queue an invalidation of the jump cache of `cpu`.
+fn jc_request(cpu: &CpuShared, f: impl FnOnce(&mut JcPending)) {
+    let mut p = lock(&cpu.jc_pending);
+    if !p.all {
+        f(&mut p);
+        if p.len() > JC_PENDING_MAX {
+            p.clear_all();
+        }
+    }
+    cpu.jc_dirty.store(true, Ordering::Release);
+}
+
+/// Apply the queued invalidations to the jump cache of `cpu`.
+fn jc_sync(cpu: &mut Cpu<'_>) {
+    if !cpu.core.shared.jc_dirty.load(Ordering::Acquire) {
+        return;
+    }
+    let p = {
+        let mut p = lock(&cpu.core.shared.jc_pending);
+        cpu.core.shared.jc_dirty.store(false, Ordering::Relaxed);
+        std::mem::take(&mut *p)
+    };
+    let jc = &mut cpu.core.jmp_cache;
+    if p.all {
+        for e in jc.iter_mut() {
+            e.tb = None;
+        }
+        return;
+    }
+    for i0 in p.pages {
+        for e in &mut jc[i0..i0 + TB_JMP_PAGE_SIZE as usize] {
+            e.tb = None;
+        }
+    }
+    for (h, tb) in p.tbs {
+        if jc[h].tb.as_ref().is_some_and(|t| Arc::as_ptr(t) as usize == tb) {
+            jc[h].tb = None;
+        }
+    }
+}
+
 /// `tcg_flush_jmp_cache()`.
 pub(crate) fn tcg_flush_jmp_cache(cpu: &CpuShared) {
-    for e in lock(&cpu.jmp_cache).iter_mut() {
-        e.tb = None;
-    }
+    jc_request(cpu, JcPending::clear_all);
 }
 
 /// `tb_jmp_cache_clear_page()`.
 pub(crate) fn tb_jmp_cache_clear_page(jit: &Jit, cpu: &CpuShared, page_addr: u64) {
     let i0 = tb_jmp_cache_hash_page(jit, page_addr);
-    let mut jc = lock(&cpu.jmp_cache);
-    for e in &mut jc[i0..i0 + TB_JMP_PAGE_SIZE as usize] {
-        e.tb = None;
-    }
+    jc_request(cpu, |p| p.pages.push(i0));
 }
 
 fn key_for(s: &TbCpuState, phys_pc: u64) -> TbKey {
@@ -100,38 +169,42 @@ pub(crate) fn tb_htable_lookup(
 
 /// `tb_lookup()`: the jump cache, then the hash table.
 pub(crate) fn tb_lookup(cpu: &mut Cpu<'_>, s: TbCpuState) -> Result<Option<Arc<Tb>>, CpuLoopExit> {
+    tb_lookup_with(cpu, s, Arc::clone)
+}
+
+/// [`tb_lookup`] giving `f` the block found instead of a new reference to it, so that a
+/// caller that only needs to look at the block does not touch its reference count.
+pub(crate) fn tb_lookup_with<R>(
+    cpu: &mut Cpu<'_>,
+    s: TbCpuState,
+    f: impl FnOnce(&Arc<Tb>) -> R,
+) -> Result<Option<R>, CpuLoopExit> {
     // We should never be trying to look up an INVALID tb.
     debug_assert!(s.cflags & cf::INVALID == 0);
-    let jit = cpu.jit();
-    let shared = cpu.shared();
-    let hash = tb_jmp_cache_hash_func(&jit, s.pc);
-    {
-        let jc = lock(&shared.jmp_cache);
-        let e = &jc[hash];
-        if let Some(tb) = &e.tb {
-            if e.pc == s.pc
-                && tb.cs_base == s.cs_base
-                && tb.flags == s.flags
-                && tb.cflags() == s.cflags
-            {
-                let tb = tb.clone();
-                assert!(tb.cflags() & cf::PCREL != 0 || tb.pc == s.pc);
-                return Ok(Some(tb));
-            }
+    jc_sync(cpu);
+    let hash = tb_jmp_cache_hash_func(&cpu.core.jit, s.pc);
+    let e = &cpu.core.jmp_cache[hash];
+    if let Some(tb) = &e.tb {
+        if e.pc == s.pc && tb.cs_base == s.cs_base && tb.flags == s.flags && tb.cflags() == s.cflags
+        {
+            assert!(tb.cflags() & cf::PCREL != 0 || tb.pc == s.pc);
+            return Ok(Some(f(tb)));
         }
     }
     let Some(tb) = tb_htable_lookup(cpu, s)? else { return Ok(None) };
-    let mut jc = lock(&shared.jmp_cache);
-    jc[hash] = JcEntry { tb: Some(tb.clone()), pc: s.pc };
-    drop(jc);
+    // The page walk of the lookup may have queued invalidations; apply them first so that they
+    // do not clear the new entry.
+    jc_sync(cpu);
+    cpu.core.jmp_cache[hash] = JcEntry { tb: Some(tb.clone()), pc: s.pc };
     assert!(tb.cflags() & cf::PCREL != 0 || tb.pc == s.pc);
-    Ok(Some(tb))
+    Ok(Some(f(&tb)))
 }
 
 /// Set the jump cache entry for `pc`, as `cpu_exec_loop()` does after `tb_gen_code()`.
-pub(crate) fn jc_set(cpu: &Cpu<'_>, pc: u64, tb: &Arc<Tb>) {
+pub(crate) fn jc_set(cpu: &mut Cpu<'_>, pc: u64, tb: &Arc<Tb>) {
+    jc_sync(cpu);
     let hash = tb_jmp_cache_hash_func(&cpu.core.jit, pc);
-    lock(&cpu.core.shared.jmp_cache)[hash] = JcEntry { tb: Some(tb.clone()), pc };
+    cpu.core.jmp_cache[hash] = JcEntry { tb: Some(tb.clone()), pc };
 }
 
 impl Jit {
@@ -221,11 +294,9 @@ impl Jit {
             }
         } else {
             let h = tb_jmp_cache_hash_func(self, tb.pc);
+            let ptr = Arc::as_ptr(tb) as usize;
             for cpu in self.cpu_list() {
-                let mut jc = lock(&cpu.jmp_cache);
-                if jc[h].tb.as_ref().is_some_and(|t| Arc::ptr_eq(t, tb)) {
-                    jc[h].tb = None;
-                }
+                jc_request(&cpu, |p| p.tbs.push((h, ptr)));
             }
         }
     }
@@ -356,6 +427,7 @@ impl Jit {
             r.full = false;
             r.tbs.clear();
         }
+        self.backend.tb_flush();
         self.tb_flush_count.fetch_add(1, Ordering::AcqRel);
         self.plugin_flush();
     }

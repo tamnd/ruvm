@@ -24,7 +24,7 @@ use std::sync::atomic::Ordering;
 use crate::backend::TbRet;
 use crate::cpu::{Cpu, CpuLoopExit};
 use crate::tb::{Tb, TbCpuState};
-use crate::tb_maint::{jc_set, tb_lookup};
+use crate::tb_maint::{jc_set, tb_lookup, tb_lookup_with};
 use crate::translate::tb_gen_code;
 use crate::{bp, cf, excp, interrupt};
 use ruvm_jit_core::types::tb_exit;
@@ -147,10 +147,14 @@ fn cpu_handle_interrupt(cpu: &mut Cpu<'_>, last_tb: &mut Option<Arc<Tb>>) -> boo
 
 /// `check_for_breakpoints()`: whether a breakpoint hit at `pc`. A breakpoint elsewhere on the
 /// page makes the block a single instruction.
+#[inline]
 fn check_for_breakpoints(cpu: &mut Cpu<'_>, pc: u64, cflags: &mut u32) -> bool {
-    if cpu.core.breakpoints.is_empty() {
-        return false;
-    }
+    !cpu.core.breakpoints.is_empty() && check_for_breakpoints_slow(cpu, pc, cflags)
+}
+
+/// [`check_for_breakpoints`] with at least one breakpoint set.
+#[cold]
+fn check_for_breakpoints_slow(cpu: &mut Cpu<'_>, pc: u64, cflags: &mut u32) -> bool {
     // Singlestep overrides breakpoints.
     if cpu.core.singlestep_enabled {
         return false;
@@ -187,18 +191,26 @@ fn check_for_breakpoints(cpu: &mut Cpu<'_>, pc: u64, cflags: &mut u32) -> bool {
 
 /// `helper_lookup_tb_ptr()`: the block to continue with, for `lookup_and_goto_ptr`.
 pub(crate) fn helper_lookup_tb_ptr(cpu: &mut Cpu<'_>) -> Result<Option<Arc<Tb>>, CpuLoopExit> {
+    helper_lookup_tb_ptr_with(cpu, Arc::clone)
+}
+
+/// [`helper_lookup_tb_ptr`] giving `f` the block found, as [`tb_lookup_with`] does.
+pub(crate) fn helper_lookup_tb_ptr_with<R>(
+    cpu: &mut Cpu<'_>,
+    f: impl FnOnce(&Arc<Tb>) -> R,
+) -> Result<Option<R>, CpuLoopExit> {
     // By definition we've just finished a TB, so I/O is OK. Avoid the possibility of calling
     // cpu_io_recompile() if a page table walk triggered by tb_lookup() calling
     // probe_access_internal() happens to touch an MMIO device. The next TB, if we chain to
     // it, will clear the flag again.
     cpu.set_can_do_io(true);
-    let ops = cpu.ops();
-    let mut s = ops.get_tb_cpu_state(cpu);
+    let c: &Cpu<'_> = cpu;
+    let mut s = c.core.ops.get_tb_cpu_state(c);
     s.cflags = cpu.curr_cflags();
     if check_for_breakpoints(cpu, s.pc, &mut s.cflags) {
         return Err(cpu.cpu_loop_exit());
     }
-    tb_lookup(cpu, s)
+    tb_lookup_with(cpu, s, f)
 }
 
 /// `cpu_tb_exec()`: run `itb` and what it chains to.

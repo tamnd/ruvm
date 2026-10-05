@@ -13,6 +13,9 @@
 //!   16 bytes per op.
 //! - [`InterpBackend`] replaces the interpreter's `lookup_tb_ptr` with the runtime's, so
 //!   `lookup_and_goto_ptr` chains blocks as in QEMU.
+//! - [`Backend::tb_created`] and [`Backend::tb_flush`] tell the backend about the block that
+//!   owns code it made and about a flush, which QEMU's backends do not need because the code
+//!   buffer and the `TranslationBlock` are laid out together.
 
 use std::any::Any;
 use std::fmt;
@@ -61,6 +64,16 @@ pub trait Backend: Send + Sync + fmt::Debug {
 
     /// Run `tb` and whatever it chains to until the code returns to the execution loop.
     fn exec(&self, cpu: &mut Cpu<'_>, tb: &Arc<Tb>) -> Result<TbRet, CpuLoopExit>;
+
+    /// The block whose code [`Backend::gen_code`] made was created as `tb`, so that the code
+    /// can name it. The default does nothing.
+    fn tb_created(&self, tb: &Arc<Tb>) {
+        let _ = tb;
+    }
+
+    /// `tcg_region_reset_all()`: every block was dropped, and none is running. Code made from
+    /// now on is never chained to code made before. The default does nothing.
+    fn tb_flush(&self) {}
 
     /// `TCG_TARGET_DEFAULT_MO`: the memory orders the host gives without barriers.
     fn target_default_mo(&self) -> u32 {

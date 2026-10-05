@@ -44,6 +44,10 @@ const SWI: u32 = 11;
 const EI: u32 = 12;
 const INC: u32 = 13;
 const NOP: u32 = 14;
+const XADD: u32 = 15;
+const SUB: u32 = 16;
+const ST16: u32 = 17;
+const LD16: u32 = 18;
 
 const EXCP_SWI: i32 = 3;
 const EXCP_PAGEFAULT: i32 = 14;
@@ -385,6 +389,32 @@ impl TranslatorOps for ToyDisas {
                     f.gen_addi_i64(v, v, 1);
                     f.gen_qemu_st_i64(v, addr, 0, MemOp::UL);
                 }
+            }
+            XADD => {
+                // a = fetch_add([b], a), 32 bits.
+                let addr = ld_reg(f, b);
+                let v = ld_reg(f, a);
+                f.gen_atomic_fetch_add_i64(v, addr, v, 0, MemOp::UL);
+                st_reg(f, a, v);
+            }
+            SUB => {
+                let x = ld_reg(f, a);
+                let y = ld_reg(f, b);
+                f.gen_sub_i64(x, x, y);
+                st_reg(f, a, x);
+            }
+            ST16 => {
+                let addr = ld_reg(f, b);
+                f.gen_addi_i64(addr, addr, imm);
+                let v = ld_reg(f, a);
+                f.gen_qemu_st_i64(v, addr, 0, MemOp::UW);
+            }
+            LD16 => {
+                let addr = ld_reg(f, b);
+                f.gen_addi_i64(addr, addr, imm);
+                let v = f.temp_new_i64();
+                f.gen_qemu_ld_i64(v, addr, 0, MemOp::UW);
+                st_reg(f, a, v);
             }
             BNEZ => {
                 let t = ld_reg(f, a);
@@ -813,6 +843,44 @@ fn mttcg_step_atomic_under_contention() {
     for v in &vcpus {
         assert_eq!(reg(v, 2), 0);
     }
+}
+
+/// Several vCPUs add `1 << 16` to the word at 0x5000 with an atomic fetch-and-add while
+/// another stores to its low half with plain 16-bit stores, as a spinlock's owner releases the
+/// lock byte while other vCPUs queue on the same word. The atomics must not undo a plain store
+/// and no increment may be lost.
+#[test]
+fn mttcg_atomics_do_not_lose_plain_stores() {
+    const N: i32 = 3000;
+    const ADDERS: usize = 3;
+    let w = world(JitConfig { mttcg: true, ..JitConfig::default() });
+    // Adders, at 0x1000: r1 = 0x10000, then N times fetch_add([r5], r1).
+    let mut a = Asm::new(0x1000);
+    a.li(5, 0x5000).li(1, 0x4000).i(ADD, 1, 1, 0).i(ADD, 1, 1, 0).li(2, N);
+    let head = a.pc();
+    a.addi(3, 1, 0).i(XADD, 3, 5, 0).addi(2, 2, -1).bnez(2, head).stop();
+    a.load(&w.as_);
+    // The storer, at 0x2000: for r4 in 1..=N, store r4 to the low half and read it back,
+    // counting mismatches in r6.
+    let mut b = Asm::new(0x2000);
+    b.li(5, 0x5000).li(2, N).li(4, 0).li(6, 0);
+    let head = b.pc();
+    b.addi(4, 4, 1).i(ST16, 4, 5, 0).i(LD16, 3, 5, 0).i(SUB, 3, 4, 0);
+    let check = b.pc();
+    b.bnez(3, check + 16).addi(2, 2, -1).bnez(2, head).stop();
+    b.addi(6, 6, 1).addi(2, 2, -1).bnez(2, head).stop();
+    b.load(&w.as_);
+
+    let mut vcpus: Vec<Vcpu> = (0..ADDERS).map(|_| w.vcpu(0x1000)).collect();
+    vcpus.push(w.vcpu(0x2000));
+    let threads = start_vcpus(&w.jit, vcpus);
+    assert!(threads.wait_all_stopped(Duration::from_secs(120)));
+    let vcpus = threads.stop_and_join();
+    let word = w.read32(0x5000);
+    assert_eq!(word >> 16, (ADDERS as u32 * N as u32) & 0xffff, "lost atomic increments");
+    assert_eq!(word & 0xffff, N as u32, "the last plain store was undone");
+    let storer = vcpus.iter().find(|v| reg(v, 4) == N as u64).expect("the storer finished");
+    assert_eq!(reg(storer, 6), 0, "plain stores were undone by an atomic");
 }
 
 #[test]

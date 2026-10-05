@@ -408,6 +408,9 @@ pub struct FuncConfig {
     /// How the orders in `guest_mo` that the host lacks are enforced; see
     /// [`crate::memory_model`]. [`FenceMapping::Qemu`] by default.
     pub fence_mapping: FenceMapping,
+    /// log2 of the guest page size of the softmmu TLB that the block's `qemu_ld` and `qemu_st`
+    /// look up, for host backends that inline the lookup, or `None` when there is no such TLB.
+    pub tlb_page_bits: Option<u32>,
 }
 
 impl Default for FuncConfig {
@@ -420,6 +423,7 @@ impl Default for FuncConfig {
             addr_type: Type::I64,
             no_goto_ptr: false,
             fence_mapping: FenceMapping::Qemu,
+            tlb_page_bits: None,
         }
     }
 }

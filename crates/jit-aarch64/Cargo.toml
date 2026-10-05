@@ -11,7 +11,7 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 12
+unsafe-budget = 16
 
 [dependencies]
 libc.workspace = true
