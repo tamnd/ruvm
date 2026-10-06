@@ -1243,3 +1243,84 @@ fn blocks_are_placed_one_after_another() {
     assert!(b.addr() >= a.addr() + a.code().len() as u64);
     assert!(r.used() <= r.size());
 }
+
+/// Divides `x` by `y` and takes the remainder of the same operands, at 32 or 64 bits, and
+/// stores both to `SCRATCH`.
+fn div_rem(signed: bool, wide: bool) -> Func {
+    let mut f = Func::new(FuncConfig::default());
+    let env = f.env();
+    if wide {
+        let x = f.global_mem_new_i64(env, G64, "x");
+        let y = f.global_mem_new_i64(env, G64 + 8, "y");
+        let (q, r) = (f.temp_new_i64(), f.temp_new_i64());
+        if signed {
+            f.gen_div_i64(q, x, y);
+            f.gen_rem_i64(r, x, y);
+        } else {
+            f.gen_divu_i64(q, x, y);
+            f.gen_remu_i64(r, x, y);
+        }
+        f.gen_st_i64(q, env, SCRATCH);
+        f.gen_st_i64(r, env, SCRATCH + 8);
+    } else {
+        let x = f.global_mem_new_i32(env, G32, "x");
+        let y = f.global_mem_new_i32(env, G32 + 4, "y");
+        let (q, r) = (f.temp_new_i32(), f.temp_new_i32());
+        if signed {
+            f.gen_div_i32(q, x, y);
+            f.gen_rem_i32(r, x, y);
+        } else {
+            f.gen_divu_i32(q, x, y);
+            f.gen_remu_i32(r, x, y);
+        }
+        f.gen_st_i32(q, env, SCRATCH);
+        f.gen_st_i32(r, env, SCRATCH + 8);
+    }
+    f.gen_exit_tb(0, 0);
+    f
+}
+
+#[test]
+fn rem_after_div_reuses_the_quotient() {
+    // `sdiv` and `udiv` at either width.
+    let divides =
+        |code: &[u8]| code.chunks(4).filter(|w| (rd32(w) & 0x7fe0_f800) == 0x1ac0_0800).count();
+    let reg = HelperRegistry::new();
+    let mem = FlatMemory::new(MEM_BASE, 16);
+    let pairs: [(u64, u64); 6] = [
+        (100, 7),
+        (u64::MAX, 3),
+        (5, 0),
+        (1 << 63, u64::MAX),
+        (0xffff_ffff_8000_0000, 0xffff_ffff_ffff_ffff),
+        (0x1234_5678_9abc_def0, 0x0001_8765_4321),
+    ];
+    let r = region();
+    for signed in [false, true] {
+        for wide in [false, true] {
+            let f = div_rem(signed, wide);
+            let mut opt = f.clone();
+            opt.gen_code(true, LogMask::default());
+            for g in [&f, &opt] {
+                assert_eq!(divides(&compile(&r, g).code()), 1, "{}", g.dump_ops(true));
+            }
+            for (a, b) in pairs {
+                let mut env = vec![0u8; ENV_SIZE];
+                let (xo, yo) = if wide { (G64, G64 + 8) } else { (G32, G32 + 4) };
+                let n = if wide { 8 } else { 4 };
+                env[xo as usize..xo as usize + n].copy_from_slice(&a.to_le_bytes()[..n]);
+                env[yo as usize..yo as usize + n].copy_from_slice(&b.to_le_bytes()[..n]);
+                let (x, e, _) = check(&f, &env, &mem, &reg, [false; 2]);
+                assert_eq!(x, Ok(Exit::ExitTb(0)));
+                if !signed && wide && b == 7 {
+                    assert_eq!(rd64(&e, SCRATCH as usize), 14);
+                    assert_eq!(rd64(&e, SCRATCH as usize + 8), 2);
+                }
+            }
+        }
+    }
+}
+
+fn rd32(w: &[u8]) -> u32 {
+    u32::from_le_bytes(w.try_into().unwrap())
+}

@@ -416,6 +416,36 @@ fn div_idiv_32() {
 }
 
 #[test]
+fn div_after_the_start_of_a_block() {
+    // After a NOP the DIV is not the first instruction of its block, so the cases the inline
+    // division leaves out go through a side exit back to the DIV.
+    const NOP_DIV_RBX: [u8; 5] = [0x90, 0x48, 0xf7, 0xf3, 0xf4];
+    const NOP_IDIV_EBX: [u8; 4] = [0x90, 0xf7, 0xfb, 0xf4];
+    let div = |hi: u64, lo: u64, d: u64| {
+        run64(&[(R_EAX, lo), (R_EDX, hi), (R_EBX, d), (R_ECX, 9)], &NOP_DIV_RBX)
+    };
+    let st = div(0, 100, 7);
+    assert_eq!((st.regs[R_EAX], st.regs[R_EDX]), (14, 2));
+    let n = 3u128 << 64 | 5;
+    let st = div(3, 5, 10);
+    assert_eq!((st.regs[R_EAX], st.regs[R_EDX]), ((n / 10) as u64, (n % 10) as u64));
+    assert_eq!((st.regs[R_ECX], st.rip), (9, CODE + 5));
+    assert_eq!(vector64(&div(10, 0, 10)), 0);
+    // #DE pushes the address of the DIV, not of the NOP.
+    let w = World::new();
+    let st = w.run(World::long64(), &[(R_EAX, 1), (R_EBX, 0)], &NOP_DIV_RBX);
+    assert_eq!(vector64(&st), 0);
+    assert_eq!(w.r64(st.regs[R_ESP]), CODE + 1);
+    let idiv = |hi: u32, lo: u32, d: u32| {
+        let regs = [(R_EAX, u64::from(lo)), (R_EDX, u64::from(hi)), (R_EBX, u64::from(d))];
+        run64(&regs, &NOP_IDIV_EBX)
+    };
+    let st = idiv(u32::MAX, 0, 2);
+    assert_eq!((st.regs[R_EAX], st.regs[R_EDX]), (u64::from(i32::MIN as u32), 0));
+    assert_eq!(vector64(&idiv(0, 0x8000_0000, 1)), 0);
+}
+
+#[test]
 fn divide_error_real_mode() {
     // div bl with bl = 0: the IVT handler runs with FLAGS, CS and IP pushed.
     let w = World::new();

@@ -1243,10 +1243,16 @@ impl S<'_, '_, '_> {
     /// IDIV), and a dividend whose high half is zero (RDX below the divisor for DIV r/m32) or
     /// the sign extension of the low half for IDIV r/m64, with the IDIV r/m32 quotient checked
     /// to fit. Everything else, including every #DE, goes to `helper_div*` as in QEMU.
+    ///
+    /// When the instruction is not the first of the block and the block may have side exits,
+    /// the other cases leave the block through a side exit to this instruction, which then
+    /// starts a block of its own and calls the helper there. The fast path then does not join
+    /// a slow one, so the guest registers stay in host registers across it.
     fn gen_div(&mut self, ot: u32, signed: bool) {
         let g = self.g;
         let (rax, rdx, den) = (g.regs[R_EAX], g.regs[R_EDX], g.t0);
-        let (slow, done) = (self.label(), self.label());
+        let slow = self.label();
+        let exit = self.can_inline_jcc() && self.d.pc_start != self.b.pc_first;
         // Both paths have to see the same cc_op.
         self.gen_update_cc_op();
         let q = self.new64();
@@ -1290,7 +1296,14 @@ impl S<'_, '_, '_> {
             }
             f.gen_mov_i64(rax, q);
         }
-        f.gen_br(done);
+        if exit {
+            let (new_eip, new_pc, flags) = (self.eip_cur(), self.d.pc_start, self.d.flags);
+            let e = SideExit { label: slow, new_eip, new_pc, flags, slot: None, back: false };
+            self.d.side_exits.push(e);
+            return;
+        }
+        let done = self.label();
+        self.f().gen_br(done);
         self.set_label(slow);
         let h = match (ot, signed) {
             (OT32, false) => &helpers::DIVL,

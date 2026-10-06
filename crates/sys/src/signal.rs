@@ -62,9 +62,14 @@ pub fn on_termination(on_signal: impl Fn(Killed) + Send + 'static) -> io::Result
     std::mem::forget(tx);
     std::thread::Builder::new().name("signals".into()).spawn(move || {
         let mut buf = [0u8; 16];
-        while let Ok(n) = rx.read(&mut buf) {
-            if n == 0 {
-                return;
+        loop {
+            // The handler may run on this thread and interrupt the read, without SA_RESTART
+            // as in QEMU: that is not the end of the stream.
+            match rx.read(&mut buf) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
             }
             let signo = SIGNO.load(Ordering::Acquire);
             let pid = PID.load(Ordering::Acquire);

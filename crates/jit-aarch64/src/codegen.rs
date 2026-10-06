@@ -50,6 +50,8 @@
 //!   here, using the scratch registers.
 //! - The vector immediate forms of `and`, `or`, `andc` and `orc` (`wO`, `wN`, `wV`) are not
 //!   used; such constants are loaded into a register.
+//! - A `rem` right after a `div` of the same operands, with no code between them, reuses the
+//!   quotient: it is one `msub`, where QEMU divides again.
 //! - The add and subtract with carry ops keep the carry in a word of the slot array, and only
 //!   pass it in the flags between two adjacent ops of the same family.
 //! - With [`CodegenOptions::guest_window`], `qemu_ld` and `qemu_st` of up to 64 bits first try
@@ -418,6 +420,7 @@ pub(crate) fn generate(
         ic_sites: Vec::new(),
         helpers: chain.helpers,
         slow_paths: Vec::new(),
+        last_div: None,
     };
     g.exit = g.a.new_label();
     g.bounds = g.a.new_label();
@@ -620,6 +623,9 @@ struct Gen<'h> {
     helpers: Option<&'h HelperRegistry>,
     /// The miss paths of guest accesses whose hit path is inline, emitted after the block.
     slow_paths: Vec<SlowPath>,
+    /// The last op was a division ending at this code offset, with these signedness, width,
+    /// quotient, dividend and divisor registers, and its divisor (or one) still in `TMP1`.
+    last_div: Option<(usize, bool, bool, Reg, Reg, Reg)>,
 }
 
 /// The miss path of one `qemu_ld` or `qemu_st`, kept until the end of the block as QEMU's
@@ -991,6 +997,7 @@ impl Gen<'_> {
         op: &Op,
         args: &[u64],
         const_args: &[bool],
+        last_div: Option<(usize, bool, bool, Reg, Reg, Reg)>,
     ) -> R<()> {
         let ty = op.ty;
         let ext = ty == Type::I64;
@@ -1152,8 +1159,19 @@ impl Gen<'_> {
             Opcode::Divs | Opcode::Divu | Opcode::Rems | Opcode::Remu => {
                 let signed = matches!(op.opc, Opcode::Divs | Opcode::Rems);
                 let rem = matches!(op.opc, Opcode::Rems | Opcode::Remu);
+                let b = r(2);
+                if rem {
+                    if let Some((pos, s, e, q, x, y)) = last_div {
+                        // The division right before computed this quotient from the same
+                        // registers, with nothing emitted since: only the multiply is left.
+                        if pos == self.a.pos() && s == signed && e == ext && x == a1 && y == b {
+                            self.a.rrrr(i::MSUB, ext, d, q, TMP1, a1);
+                            return Ok(());
+                        }
+                    }
+                }
                 // A zero divisor divides by one.
-                self.a.addsub_imm(i::SUBSI, ext, XZR, r(2), 0);
+                self.a.addsub_imm(i::SUBSI, ext, XZR, b, 0);
                 self.a.csel(i::CSINC, ext, TMP1, r(2), XZR, cc::NE);
                 let div = if signed { i::SDIV } else { i::UDIV };
                 if rem {
@@ -1161,6 +1179,9 @@ impl Gen<'_> {
                     self.a.rrrr(i::MSUB, ext, d, TMP0, TMP1, a1);
                 } else {
                     self.a.rrr(div, ext, d, a1, TMP1);
+                    if d != a1 && d != b {
+                        self.last_div = Some((self.a.pos(), signed, ext, d, a1, b));
+                    }
                 }
             }
             Opcode::Divs2 | Opcode::Divu2 => {
@@ -2084,6 +2105,7 @@ impl Target for Gen<'_> {
     }
 
     fn out_op(&mut self, f: &Func, id: OpId, op: &Op, args: &[u64], const_args: &[bool]) -> R<()> {
+        let last_div = self.last_div.take();
         match op.opc {
             Opcode::PluginCb | Opcode::PluginMemCb => {}
             Opcode::SetLabel => {
@@ -2125,7 +2147,7 @@ impl Target for Gen<'_> {
             _ if op.opc.def().flags & opf::VECTOR != 0 => {
                 self.out_vector(f, op, args, const_args)?
             }
-            _ => self.out_scalar(f, id, op, args, const_args)?,
+            _ => self.out_scalar(f, id, op, args, const_args, last_div)?,
         }
         Ok(())
     }

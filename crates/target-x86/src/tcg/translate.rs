@@ -22,8 +22,14 @@
 //!   in host registers and the flags state across the branch, and skips the exit request
 //!   check a new block would make. Control only moves forward inside a block, so it still
 //!   cannot loop without passing that check. Not with icount, single step, an interrupt
-//!   shadow or RF set. The exits get the two `goto_tb` slots in program order, and the
-//!   others go through the jump cache.
+//!   shadow or RF set. The exits get the two `goto_tb` slots in program order, except that
+//!   an exit to a target not after its branch, most likely a loop's back edge, takes the slot
+//!   of the last forward exit holding one when none is free. The others go through the jump
+//!   cache.
+//! - The slow path of the inline DIV and IDIV is a side exit back to the instruction when it
+//!   is not the first of the block, so that the fast path does not end at a join; the
+//!   instruction then runs again at the start of a block of its own, which calls the helper.
+//!   A divisor in memory is read twice on that path.
 //! - A near jump, call or return that leaves the CPU state as the block found it apart from
 //!   EIP looks the next block up through an inline cache, `lookup_tb_ptr_ic`.
 
@@ -235,6 +241,8 @@ struct SideExit {
     flags: u32,
     /// The `goto_tb` slot kept for this exit.
     slot: Option<u64>,
+    /// The target is not after the branch.
+    back: bool,
 }
 
 impl Feat {
@@ -1502,15 +1510,23 @@ impl S<'_, '_, '_> {
             self.gen_jcc1(b, l1);
             let flags = self.d.flags;
             // The earlier exits get the direct slots: every run of the block passes their
-            // branch, not all reach the later ones.
+            // branch, not all reach the later ones. A backward branch is most likely a loop
+            // that takes it nearly every time, so it may take a forward exit's slot.
+            let back = new_pc <= self.d.pc_start;
             let mut slot = None;
             if self.b.translator_use_goto_tb(new_pc) {
                 slot = self.goto_tb_slot(0);
+                if slot.is_none() && back {
+                    let exits = self.d.side_exits.iter_mut().rev();
+                    if let Some(e) = exits.filter(|e| !e.back).find(|e| e.slot.is_some()) {
+                        slot = e.slot.take();
+                    }
+                }
                 if let Some(n) = slot {
                     self.d.goto_tb_used |= 1 << n;
                 }
             }
-            self.d.side_exits.push(SideExit { label: l1, new_eip, new_pc, flags, slot });
+            self.d.side_exits.push(SideExit { label: l1, new_eip, new_pc, flags, slot, back });
             return;
         }
         self.gen_jcc1(b, l1);
