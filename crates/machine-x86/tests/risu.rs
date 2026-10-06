@@ -34,10 +34,8 @@
 //! 2 MiB, mapped again at `IMAGE_VA` where it runs. The image holds the memory block, so
 //! stores to it run through the translator's self-modifying code handling.
 //!
-//! Instructions the EPYC model advertises but the translator leaves out (it raises #UD for
-//! them, see `ruvm_target_x86::tcg::translate::sse`) are counted as skipped rather than
-//! reported, and so are the differences listed in `KNOWN`: ones the hardware traces found
-//! in the translator, which these tests do not fail on until they are fixed.
+//! The differences listed in `KNOWN` are reported but not failed on: the places where the
+//! translator follows QEMU 11.1 and QEMU differs from the hardware.
 //!
 //! `RUVM_RISU_DIR` names a directory of bigger traces, `x86_<name>.bin` (or `.bin.gz`) with
 //! `x86_<name>.trace` (or `.trace.gz`), which `big_traces` replays when it is set;
@@ -381,45 +379,14 @@ impl World {
     }
 }
 
-/// The instruction groups the translator decodes but raises #UD for, although the EPYC
-/// model advertises them, by opcode map (1 for 0F, 2 for 0F38, 3 for 0F3A, legacy or VEX
-/// encoded) and opcode.
-fn absent_feature(map: u8, op: u8) -> Option<&'static str> {
-    match (map, op) {
-        (2, 0xdb..=0xdf) | (3, 0xdf) => Some("AES-NI"),
-        (3, 0x60..=0x63) => Some("SSE4.2 PCMPxSTRx"),
-        (2, 0x90..=0x93) => Some("AVX2 gathers"),
-        (2, 0xc8..=0xcd) | (3, 0xcc) => Some("SHA"),
-        _ => None,
-    }
-}
-
-/// The opcode map and opcode of the instruction starting with `b`, if it is in map 0F, 0F38
-/// or 0F3A.
-fn opcode(b: &[u8]) -> Option<(u8, u8)> {
-    let start = b.iter().position(|&x| !matches!(x, 0x66 | 0xf2 | 0xf3 | 0x40..=0x4f))?;
-    match b[start..] {
-        [0xc4, m, _, op, ..] => Some((m & 0x1f, op)),
-        [0xc5, _, op, ..] => Some((1, op)),
-        [0x0f, 0x38, op, ..] => Some((2, op)),
-        [0x0f, 0x3a, op, ..] => Some((3, op)),
-        [0x0f, op, ..] => Some((1, op)),
-        _ => None,
-    }
-}
-
 /// Differences between the translator and the EPYC the traces found, by trace and the
-/// image offset of the compare, which the tests report but do not fail on. They are bugs or
-/// QEMU behaviours of `ruvm-target-x86`; take an entry out when it is fixed.
+/// image offset of the compare, which the tests report but do not fail on. Each is a place
+/// where QEMU 11.1's TCG does the same as `ruvm-target-x86` and differs from the hardware;
+/// a bug found by the traces is fixed rather than listed here.
 const KNOWN: &[(&str, u64, &str)] = &[
-    // CMPXCHG r/m8 with AL as r/m: the compare succeeds, so AL gets the source (r15b);
-    // ruvm then writes the old value back to AL.
-    ("x86_int", 0x7804, "CMPXCHG AL, r8 writes the old AL over the stored source"),
-    // CMPXCHG r/m32 failing with a register r/m: the hardware leaves r/m alone, ruvm writes
-    // it back zero extended.
-    ("x86_int", 0xa5f4, "a failing CMPXCHG r32, r32 zero extends the destination"),
     // RCPPS, RCPSS, RSQRTPS and RSQRTSS: the hardware returns its 12 bit approximation, ruvm
-    // (as QEMU) the exact result; for a denormal input the hardware returns infinity.
+    // and QEMU 11.1 (`helper_rcpps` and friends) the exact result, and for a denormal input
+    // the hardware returns infinity.
     ("x86_sse", 0x250c, "RCPSS approximation"),
     ("x86_sse", 0x2737, "RSQRTPS approximation and a denormal input"),
     ("x86_sse", 0x2e83, "RSQRTSS approximation"),
@@ -430,8 +397,8 @@ const KNOWN: &[(&str, u64, &str)] = &[
     ("x86_avx", 0x28dd, "VRSQRTPS approximation"),
     ("x86_avx", 0x4977, "VRCPPS approximation"),
     ("x86_avx", 0x4fc3, "VRCPSS of a denormal input"),
-    // Two quiet NaNs: SSE returns the first source operand, ruvm the NaN with the larger
-    // significand (the x87 rule).
+    // Two quiet NaNs: SSE returns the first source operand, ruvm and QEMU 11.1 (softfloat's
+    // x87 rule) the NaN with the larger significand.
     ("x86_sse", 0x4470, "MULPD of two NaNs returns the second"),
 ];
 
@@ -443,8 +410,6 @@ struct Report {
     mismatches: Vec<String>,
     /// Mismatches listed in `KNOWN`.
     known: Vec<String>,
-    /// Instructions the translator leaves out, by group.
-    skipped: BTreeMap<&'static str, usize>,
     /// The trace ended before TESTEND, or the replay lost sync with it.
     lost: Option<String>,
 }
@@ -560,28 +525,19 @@ fn replay(name: &str, image: &[u8], trace: &[u8]) -> Report {
             // ran past an op. An x86 instruction cannot be stepped over without decoding it,
             // so carry on from the hardware's state at the next register compare, taking
             // the memory blocks of the compares on the way.
-            let absent = if op == OP_SIGILL && off < w.image_len {
-                opcode(&w.read(IMAGE + off, 16)).and_then(|(map, op)| absent_feature(map, op))
+            let what = if op == OP_FAULT {
+                format!("ruvm took vector {vector} at {off:#x}")
             } else {
-                None
+                format!("ruvm {} at {off:#x}", op_name(op))
             };
-            if let Some(feature) = absent {
-                *rep.skipped.entry(feature).or_default() += 1;
-            } else {
-                let what = if op == OP_FAULT {
-                    format!("ruvm took vector {vector} at {off:#x}")
-                } else {
-                    format!("ruvm {} at {off:#x}", op_name(op))
-                };
-                let line = format!(
-                    "{} at {:#x} [{}]: {what} [{}]",
-                    op_name(rec.op),
-                    rec.pc,
-                    w.bytes(block, rec.pc),
-                    w.bytes(off, off + 8)
-                );
-                rep.differ(name, rec.pc, line);
-            }
+            let line = format!(
+                "{} at {:#x} [{}]: {what} [{}]",
+                op_name(rec.op),
+                rec.pc,
+                w.bytes(block, rec.pc),
+                w.bytes(off, off + 8)
+            );
+            rep.differ(name, rec.pc, line);
             let mut r = rec;
             loop {
                 match r.op {
@@ -642,9 +598,6 @@ fn replay_file(dir: &Path, name: &str) -> Report {
     );
     for m in rep.mismatches.iter().chain(&rep.known) {
         println!("  {m}");
-    }
-    for (feature, n) in &rep.skipped {
-        println!("  {n} instructions of {feature} skipped: not in the translator");
     }
     for k in KNOWN.iter().filter(|k| k.0 == name) {
         if !rep.known.iter().any(|m| m.contains(&format!(" at {:#x} ", k.1))) {

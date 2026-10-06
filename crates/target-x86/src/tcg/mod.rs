@@ -22,14 +22,18 @@
 //! VERW, INT, INT3, INTO, INT1, IRET, SYSCALL, SYSRET, SYSENTER, SYSEXIT, HLT, CLI, STI and INVLPG.
 //! Exceptions and interrupts are delivered through the IDT in all three modes, with double and
 //! triple fault detection. The page walk handles 32-bit paging (with PSE), PAE paging, and 4 and 5
-//! level long mode paging, with NX, WP, SMEP and SMAP.
+//! level long mode paging, with NX, WP, SMEP and SMAP, and in long mode the protection keys of
+//! PKRU (RDPKRU, WRPKRU) for user pages and `IA32_PKRS` for supervisor pages, as QEMU does.
 //!
 //! The x87 instructions (D8 to DF and FWAIT, `translate/x87.rs`) run on the 80-bit
 //! `floatx80` of `ruvm-softfloat`, with FPUC rounding and precision control and the FPUS
 //! exception flags, and FXSAVE, FXRSTOR, XSAVE, XRSTOR and XSAVEOPT save and restore the x87,
 //! SSE and AVX state (`helpers/fpu.rs`). MMX, SSE and AVX to AVX2 go through the table driven
-//! decoder of `translate/sse.rs` and the kernels of `helpers/vec.rs`. The EVEX prefix raises
-//! #UD, as do XSAVEC and XSAVES, which QEMU's TCG does not offer either. The VEX prefix is
+//! decoder of `translate/sse.rs` and the kernels of `helpers/vec.rs`, including AES-NI, SHA,
+//! the SSE4.2 PCMPESTRI, PCMPESTRM, PCMPISTRI and PCMPISTRM, and the AVX2 gathers
+//! (`helpers/crypto.rs` ports the AES, SHA and string compare parts of QEMU's `ops_sse.h`).
+//! The EVEX prefix raises #UD, as do XSAVEC, XSAVES, XRSTORS and INVPCID, which QEMU's TCG
+//! does not offer either; `-cpu max` does not advertise them, nor PCID. The VEX prefix is
 //! decoded in `translate/ext.rs`, along with the general purpose register instructions that
 //! come with this part of the instruction set: ANDN, BEXTR, BLSI, BLSMSK, BLSR, BZHI, MULX,
 //! PDEP, PEXT, RORX, SARX, SHLX and SHRX (VEX class 13, VEX.L must be 0), ADCX and ADOX (with
@@ -57,10 +61,10 @@
 //! - The TSC counts host nanoseconds since [`X86`] was made, plus `IA32_TSC` writes.
 //! - Unknown MSRs read as zero and ignore writes instead of raising #GP. Only the MSRs this
 //!   front end uses (EFER, STAR, LSTAR, CSTAR, FMASK, FS and GS base, KERNEL_GS_BASE, the
-//!   SYSENTER MSRs, TSC, TSC_AUX, PAT, APIC_BASE, MISC_ENABLE) are kept.
+//!   SYSENTER MSRs, TSC, TSC_AUX, PAT, APIC_BASE, MISC_ENABLE, PKRS) are kept.
 //! - Debug registers are stored but hardware breakpoints and watchpoints are not armed.
 //!   Single stepping with TF works.
-//! - SVM, VMX, SMM, protection keys, MPX, CET, FRED, LAM and nested paging are not modelled.
+//! - SVM, VMX, SMM, MPX, CET, FRED, LAM and nested paging are not modelled.
 //! - The local APIC, the PIC and system reset are reached through the [`X86Platform`] the
 //!   machine installs with [`X86::set_platform`], standing in for `cpu->apic_state`,
 //!   `isa_pic` and `qemu_system_reset_request()`. Without one, hardware interrupts come from
@@ -92,7 +96,7 @@
 //!
 //! Not translated yet (they raise #UD, and are left for a follow up): RSM, MONITOR and
 //! MWAIT, the SVM and VMX instructions, CMPccXADD, the MPX
-//! instructions, RDPKRU and WRPKRU, the AMD `lock mov cr0` alias for CR8, and the PCREL
+//! instructions, the AMD `lock mov cr0` alias for CR8, and the PCREL
 //! translation mode. I/O breakpoints (`bpt_io`) are not checked. Virtual 8086 mode decodes
 //! like real mode with the IOPL checks, but nothing enters it (see above).
 

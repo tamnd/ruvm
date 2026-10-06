@@ -427,3 +427,33 @@ fn topology_leaves() {
     assert_eq!(cpu.cpuid(0xb, 1), [3, 8, 0x201, 3]);
     assert_eq!(cpu.cpuid(0xb, 2), [0, 0, 2, 3]);
 }
+
+/// `-cpu max` under TCG gives the CPUID of QEMU 11.1, as `tests/data/cpuid_max.S` printed it
+/// running under `qemu-system-x86_64 -M q35 -accel tcg -cpu max` (CR4 and XCR0 at reset). The
+/// file has every leaf in range, with a subleaf only where it differs from the one before.
+#[test]
+fn max_cpuid_matches_qemu() {
+    let cpu = tcg("max");
+    let mut want = std::collections::BTreeMap::new();
+    for line in include_str!("../../tests/data/cpuid_max.txt").lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let v: Vec<u32> = line.split(' ').map(|w| u32::from_str_radix(w, 16).unwrap()).collect();
+        want.insert((v[0], v[1]), [v[2], v[3], v[4], v[5]]);
+    }
+    let mut bad = Vec::new();
+    for leaf in (0..=0xd).chain(0x4000_0000..=0x4000_0001).chain(0x8000_0000..=0x8000_0021) {
+        let mut exp = [0; 4];
+        for sub in 0..0x20 {
+            if let Some(r) = want.get(&(leaf, sub)) {
+                exp = *r;
+            }
+            let got = cpu.cpuid(leaf, sub);
+            if got != exp {
+                bad.push(format!("{leaf:#x}.{sub:#x}: {got:08x?} != {exp:08x?}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

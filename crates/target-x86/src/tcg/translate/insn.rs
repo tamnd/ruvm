@@ -1224,21 +1224,82 @@ impl S<'_, '_, '_> {
             }
             4 => self.gen_mul(ot, false),
             5 => self.gen_mul(ot, true),
+            _ if ot >= OT32 => self.gen_div(ot, op == 7),
             _ => {
                 let h = match (ot, op == 7) {
                     (OT8, false) => &helpers::DIVB,
                     (OT8, true) => &helpers::IDIVB,
-                    (OT16, false) => &helpers::DIVW,
-                    (OT16, true) => &helpers::IDIVW,
-                    (OT32, false) => &helpers::DIVL,
-                    (OT32, true) => &helpers::IDIVL,
-                    (_, false) => &helpers::DIVQ,
-                    (_, true) => &helpers::IDIVQ,
+                    (_, false) => &helpers::DIVW,
+                    (_, true) => &helpers::IDIVW,
                 };
                 self.env_call(h, None, &[g.t0.into()]);
             }
         }
         Ok(())
+    }
+
+    /// 32 and 64-bit DIV and IDIV of EDX:EAX or RDX:RAX by T0. The quotient and remainder are
+    /// computed inline when one host division gives them: a divisor other than 0 (and -1 for
+    /// IDIV), and a dividend whose high half is zero (RDX below the divisor for DIV r/m32) or
+    /// the sign extension of the low half for IDIV r/m64, with the IDIV r/m32 quotient checked
+    /// to fit. Everything else, including every #DE, goes to `helper_div*` as in QEMU.
+    fn gen_div(&mut self, ot: u32, signed: bool) {
+        let g = self.g;
+        let (rax, rdx, den) = (g.regs[R_EAX], g.regs[R_EDX], g.t0);
+        let (slow, done) = (self.label(), self.label());
+        // Both paths have to see the same cc_op.
+        self.gen_update_cc_op();
+        let q = self.new64();
+        let r = self.new64();
+        let f = self.f();
+        if ot == OT32 {
+            let num = f.temp_new_i64();
+            let d = f.temp_new_i64();
+            f.gen_concat32_i64(num, rax, rdx);
+            if signed {
+                f.gen_ext32s_i64(d, den);
+                f.gen_addi_i64(q, d, 1);
+                f.gen_brcondi_i64(Cond::Leu, q, 1, slow);
+                f.gen_div_i64(q, num, d);
+                f.gen_ext32s_i64(r, q);
+                f.gen_brcond_i64(Cond::Ne, q, r, slow);
+                f.gen_rem_i64(r, num, d);
+            } else {
+                f.gen_ext32u_i64(d, den);
+                f.gen_brcondi_i64(Cond::Eq, d, 0, slow);
+                f.gen_shri_i64(q, num, 32);
+                f.gen_brcond_i64(Cond::Geu, q, d, slow);
+                f.gen_divu_i64(q, num, d);
+                f.gen_remu_i64(r, num, d);
+            }
+            f.gen_ext32u_i64(rax, q);
+            f.gen_ext32u_i64(rdx, r);
+        } else {
+            if signed {
+                f.gen_addi_i64(q, den, 1);
+                f.gen_brcondi_i64(Cond::Leu, q, 1, slow);
+                f.gen_sari_i64(r, rax, 63);
+                f.gen_brcond_i64(Cond::Ne, rdx, r, slow);
+                f.gen_div_i64(q, rax, den);
+                f.gen_rem_i64(rdx, rax, den);
+            } else {
+                f.gen_brcondi_i64(Cond::Eq, den, 0, slow);
+                f.gen_brcondi_i64(Cond::Ne, rdx, 0, slow);
+                f.gen_divu_i64(q, rax, den);
+                f.gen_remu_i64(rdx, rax, den);
+            }
+            f.gen_mov_i64(rax, q);
+        }
+        f.gen_br(done);
+        self.set_label(slow);
+        let h = match (ot, signed) {
+            (OT32, false) => &helpers::DIVL,
+            (OT32, true) => &helpers::IDIVL,
+            (_, false) => &helpers::DIVQ,
+            (_, true) => &helpers::IDIVQ,
+        };
+        self.env_call(h, None, &[den.into()]);
+        self.set_label(done);
     }
 
     /// MUL and IMUL with the accumulator.
@@ -1782,18 +1843,20 @@ impl S<'_, '_, '_> {
             f.gen_mov_i64(g.cc_dst, g.t0);
             self.set_cc_op(CC_OP_BMILGB + ot);
         } else {
-            // BSF and BSR: only Z is defined, from the input. A zero input leaves the
-            // destination unchanged, as on real hardware.
+            // BSF and BSR: only Z is defined, from the input. A zero input leaves all
+            // 64 bits of the destination unchanged, as on real hardware, even for a
+            // 32-bit operand.
             f.gen_mov_i64(g.cc_dst, g.t0);
-            let r = g.regs[reg];
             if is_bsr {
-                f.gen_xori_i64(g.t1, r, 63);
-                f.gen_clz_i64(g.t0, g.t0, g.t1);
+                f.gen_clzi_i64(g.t0, g.t0, 64);
                 f.gen_xori_i64(g.t0, g.t0, 63);
             } else {
-                f.gen_ctz_i64(g.t0, g.t0, r);
+                f.gen_ctzi_i64(g.t0, g.t0, 64);
             }
             self.set_cc_op(CC_OP_LOGICB + ot);
+            let z = self.c64(0);
+            self.mov_reg_v_cond(Cond::Ne, g.cc_dst, z, ot, reg, g.t0);
+            return Ok(());
         }
         self.mov_reg_v(ot, reg, g.t0);
         Ok(())
@@ -1817,9 +1880,10 @@ impl S<'_, '_, '_> {
             let idx = self.d.mem_index;
             self.f().gen_atomic_cmpxchg_i64(oldv, g.a0, cmpv, newv, idx, mo(ot));
         } else if md == 3 {
+            // The destination register is written only when the compare succeeds, so a
+            // failing 32-bit form does not zero extend it.
             self.mov_v_reg(ot, oldv, rm);
-            self.f().gen_movcond_i64(Cond::Eq, newv, oldv, cmpv, newv, oldv);
-            self.mov_reg_v(ot, rm, newv);
+            self.mov_reg_v_cond(Cond::Eq, oldv, cmpv, ot, rm, newv);
         } else {
             self.gen_lea_modrm(m)?;
             self.ld_v(ot, oldv, g.a0);
@@ -1828,16 +1892,9 @@ impl S<'_, '_, '_> {
             self.st_v(ot, newv, g.a0);
         }
         // EAX is written only when the compare fails; that matters for the zero extension
-        // of a 32-bit operand.
-        let rax = g.regs[R_EAX];
-        if ot == OT32 {
-            let t = self.new64();
-            let f = self.f();
-            f.gen_movcond_i64(Cond::Eq, t, oldv, cmpv, rax, oldv);
-            f.gen_mov_i64(rax, t);
-        } else {
-            self.mov_reg_v(ot, R_EAX, oldv);
-        }
+        // of a 32-bit operand, and for a register form whose destination is AL/AX/EAX/RAX
+        // itself, where the new value must not be overwritten by the old one.
+        self.mov_reg_v_cond(Cond::Ne, oldv, cmpv, ot, R_EAX, oldv);
         let f = self.f();
         f.gen_mov_i64(g.cc_src, oldv);
         f.gen_mov_i64(g.cc_srct, cmpv);
@@ -2514,6 +2571,25 @@ impl S<'_, '_, '_> {
                     self.gen_set_eflags(AC_MASK);
                 }
                 self.b.is_jmp = DISAS_EOB_NEXT;
+                return Ok(());
+            }
+            0xee | 0xef => {
+                // RDPKRU and WRPKRU; the helpers raise #UD when CR4.PKE is clear.
+                if self.d.prefix & (PREFIX_DATA | PREFIX_REPZ | PREFIX_REPNZ) != 0 {
+                    self.gen_illegal_opcode();
+                    return Ok(());
+                }
+                let ecx = self.trunc32(g.regs[R_ECX]);
+                let v = self.new64();
+                if m == 0xee {
+                    self.env_call(&helpers::RDPKRU, Some(v.into()), &[ecx.into()]);
+                    let f = self.f();
+                    f.gen_ext32u_i64(g.regs[R_EAX], v);
+                    f.gen_shri_i64(g.regs[R_EDX], v, 32);
+                } else {
+                    self.f().gen_concat32_i64(v, g.regs[R_EAX], g.regs[R_EDX]);
+                    self.env_call(&helpers::WRPKRU, None, &[ecx.into(), v.into()]);
+                }
                 return Ok(());
             }
             0xf8 => {

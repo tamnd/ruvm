@@ -11,15 +11,15 @@ use ruvm_jit::cputlb::tlb_set_page;
 use ruvm_jit::{Cpu, CpuLoopExit, MmuAccessType, Ra, page};
 use ruvm_mem::{Endian, MemTxAttrs};
 
-use super::env::{A20_MASK, EFER, HFLAGS, cr, ld32, ld64, st64};
+use super::env::{A20_MASK, EFER, HFLAGS, PKRS, PKRU, cr, ld32, ld64, st64};
 use super::seg::raise_exception_err_ra;
 use super::{
     EXCP0D_GPF, EXCP0E_PAGE, MMU_KSMAP32_IDX, MMU_KSMAP64_IDX, MMU_NESTED_IDX, MMU_PHYS_IDX,
     MMU_USER32_IDX, MMU_USER64_IDX, X86,
 };
 use crate::state::{
-    CR0_PG_MASK, CR0_WP_MASK, CR4_LA57_MASK, CR4_PAE_MASK, CR4_PSE_MASK, CR4_SMEP_MASK,
-    HF_LMA_MASK, MSR_EFER_NXE,
+    CR0_PG_MASK, CR0_WP_MASK, CR4_LA57_MASK, CR4_PAE_MASK, CR4_PKE_MASK, CR4_PKS_MASK,
+    CR4_PSE_MASK, CR4_SMEP_MASK, HF_LMA_MASK, MSR_EFER_NXE,
 };
 
 const PG_PRESENT_MASK: u64 = 1 << 0;
@@ -32,6 +32,8 @@ const PG_PSE_PAT_MASK: u64 = 1 << 12;
 const PG_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const PG_HI_USER_MASK: u64 = 0x7ff0_0000_0000_0000;
 const PG_NX_MASK: u64 = 1 << 63;
+const PG_PKRU_BIT: u32 = 59;
+const PG_PKRU_MASK: u64 = 15 << PG_PKRU_BIT;
 
 /// Page fault error code bits.
 pub(crate) const PG_ERROR_P_MASK: u32 = 0x01;
@@ -39,6 +41,7 @@ pub(crate) const PG_ERROR_W_MASK: u32 = 0x02;
 pub(crate) const PG_ERROR_U_MASK: u32 = 0x04;
 pub(crate) const PG_ERROR_RSVD_MASK: u32 = 0x08;
 pub(crate) const PG_ERROR_I_D_MASK: u32 = 0x10;
+pub(crate) const PG_ERROR_PK_MASK: u32 = 0x20;
 
 const PG_MODE_PAE: u32 = 1 << 0;
 const PG_MODE_LMA: u32 = 1 << 1;
@@ -46,6 +49,8 @@ const PG_MODE_NXE: u32 = 1 << 2;
 const PG_MODE_PSE: u32 = 1 << 3;
 const PG_MODE_LA57: u32 = 1 << 4;
 const PG_MODE_WP: u32 = 1 << 16;
+const PG_MODE_PKE: u32 = 1 << 17;
+const PG_MODE_PKS: u32 = 1 << 18;
 const PG_MODE_SMEP: u32 = 1 << 19;
 const PG_MODE_PG: u32 = 1 << 20;
 
@@ -79,6 +84,12 @@ fn get_pg_mode(env: &[u8]) -> u32 {
     }
     if ld32(env, HFLAGS) & HF_LMA_MASK != 0 {
         m |= PG_MODE_LMA;
+        if cr4 & CR4_PKE_MASK != 0 {
+            m |= PG_MODE_PKE;
+        }
+        if cr4 & CR4_PKS_MASK != 0 {
+            m |= PG_MODE_PKS;
+        }
         if cr4 & CR4_LA57_MASK != 0 {
             m |= PG_MODE_LA57;
         }
@@ -300,7 +311,28 @@ fn mmu_translate(
                     {
                         prot |= page::EXEC;
                     }
-                    if prot & (1 << access_type as u32) == 0 {
+                    // Protection keys: PKRU for user pages, PKRS for supervisor ones.
+                    let pkr = match (ptep & PG_USER_MASK != 0, pg_mode) {
+                        (true, m) if m & PG_MODE_PKE != 0 => ld32(cpu.env, PKRU),
+                        (false, m) if m & PG_MODE_PKS != 0 => ld32(cpu.env, PKRS),
+                        _ => 0,
+                    };
+                    let mut pk_fault = false;
+                    if pkr != 0 {
+                        let pk = ((pte & PG_PKRU_MASK) >> PG_PKRU_BIT) as u32;
+                        let mut pkr_prot = page::READ | page::WRITE | page::EXEC;
+                        if (pkr >> (pk * 2)) & 1 != 0 {
+                            pkr_prot &= !(page::READ | page::WRITE);
+                        } else if (pkr >> (pk * 2)) & 2 != 0 && (user || pg_mode & PG_MODE_WP != 0)
+                        {
+                            pkr_prot &= !page::WRITE;
+                        }
+                        pk_fault = pkr_prot & (1 << access_type as u32) == 0;
+                        prot &= pkr_prot;
+                    }
+                    if pk_fault {
+                        PG_ERROR_PK_MASK | PG_ERROR_P_MASK
+                    } else if prot & (1 << access_type as u32) == 0 {
                         PG_ERROR_P_MASK
                     } else {
                         let mut set = PG_ACCESSED_MASK;

@@ -25,7 +25,7 @@ use super::super::env::{
     avx_enabled, cr, ld32, ld64, st32, st64,
 };
 use super::super::{EXCP0D_GPF, EXCP06_ILLOP, x86_of};
-use super::{Def, I32, I64, Ptr, TB, Void, a32, hflags, run, set_hflags, sh};
+use super::{Def, I32, I64, Ptr, TB, Void, a32, crypto, hflags, run, set_hflags, sh};
 use crate::state::CR4_OSXSAVE_MASK;
 
 /// The MXCSR exception flag bits.
@@ -98,7 +98,7 @@ kernels!(
     SarI, BslI, BsrI, ShlV, ShrV, SarV, PshufD, PshufHW, PshufLW, PshufW, BlendW, BlendV, Blend,
     MovSx, MovZx, Bcast, Ptest, MovMsk, Extr, Insr, Phminposuw, Mpsadbw, Pclmul, PermD, PermQ,
     Perm2, PermilV, PermilI, ShufP, MovSlDup, MovShDup, MovDDup, MaskLd, InsertPs, Extract128,
-    Insert128, Copy,
+    Insert128, Copy, Aes, AesImc, AesKeygen, Sha, Pcmpstr,
     // Floating point, the variant is 0 for ps, 1 for pd, 2 for ss and 3 for sd.
     FAdd, FSub, FMul, FDiv, FMin, FMax, FSqrt, FRsqrt, FRcp, FHAdd, FHSub, FAddSub, FCmp, Comi,
     Ucomi, Round, Dpp, Fma, // Conversions.
@@ -869,6 +869,74 @@ fn kernel(kk: K, k: &Kx, s: &mut FloatStatus) -> (V, u64) {
             r[o..o + 16].copy_from_slice(&k.b[..16]);
         }
         K::Copy => r = k.b,
+        K::Aes => {
+            // The variant is 0 for AESENC, 1 for AESENCLAST, 2 for AESDEC and 3 for
+            // AESDECLAST; `a` is the state and `b` the round key, per 128-bit lane.
+            for l in 0..lanes {
+                let o = l * 16;
+                let st: [u8; 16] = k.a[o..o + 16].try_into().unwrap_or_default();
+                let rk: [u8; 16] = k.b[o..o + 16].try_into().unwrap_or_default();
+                r[o..o + 16].copy_from_slice(&crypto::aes_round(k.var, &st, &rk));
+            }
+        }
+        K::AesImc => {
+            let st: [u8; 16] = k.b[..16].try_into().unwrap_or_default();
+            r[..16].copy_from_slice(&crypto::aes_imc(&st));
+        }
+        K::AesKeygen => {
+            let st: [u8; 16] = k.b[..16].try_into().unwrap_or_default();
+            r[..16].copy_from_slice(&crypto::aes_keygen(&st, k.imm));
+        }
+        K::Sha => {
+            // The variant selects the operation; SHA256RNDS2 reads XMM0 from `c`.
+            let op = match k.var {
+                0 => crypto::ShaOp::Sha1Rnds4(k.imm),
+                1 => crypto::ShaOp::Sha1Nexte,
+                2 => crypto::ShaOp::Sha1Msg1,
+                3 => crypto::ShaOp::Sha1Msg2,
+                4 => crypto::ShaOp::Sha256Rnds2(ge(&k.c, 2, 0) as u32, ge(&k.c, 2, 1) as u32),
+                5 => crypto::ShaOp::Sha256Msg1,
+                _ => crypto::ShaOp::Sha256Msg2,
+            };
+            let a: [u8; 16] = k.a[..16].try_into().unwrap_or_default();
+            let b: [u8; 16] = k.b[..16].try_into().unwrap_or_default();
+            r[..16].copy_from_slice(&crypto::sha(op, &a, &b));
+        }
+        K::Pcmpstr => {
+            // Variant bit 0: explicit lengths, from RAX in `x` and RDX in the low quadword
+            // of `c`; bit 1: the mask form, which writes the result to the destination
+            // (XMM0); bit 2: REX.W. The return value is the flags and, for the index
+            // forms, the new ECX in bits 63:32.
+            let ctrl = k.imm;
+            let d: [u8; 16] = k.a[..16].try_into().unwrap_or_default();
+            let s: [u8; 16] = k.b[..16].try_into().unwrap_or_default();
+            let (ls, ld) = if k.var & 1 != 0 {
+                let w = k.var & 4 != 0;
+                (crypto::pcmp_elen(ge(&k.c, 3, 0), ctrl, w), crypto::pcmp_elen(k.x, ctrl, w))
+            } else {
+                (crypto::pcmp_ilen(&s, ctrl), crypto::pcmp_ilen(&d, ctrl))
+            };
+            let (res, flags) = crypto::pcmpxstrx(&d, &s, ctrl, ls, ld);
+            ret = u64::from(flags);
+            if k.var & 2 == 0 {
+                let ecx = if res == 0 {
+                    16 >> (ctrl & 1)
+                } else if ctrl & 0x40 != 0 {
+                    31 - res.leading_zeros()
+                } else {
+                    res.trailing_zeros()
+                };
+                ret |= u64::from(ecx) << 32;
+            } else if ctrl & 0x40 != 0 {
+                let esz = ctrl & 1;
+                for i in 0..(16 >> esz) {
+                    let m = if res >> i & 1 != 0 { emask(esz) } else { 0 };
+                    pe(&mut r, esz, i, m);
+                }
+            } else {
+                pe(&mut r, 3, 0, u64::from(res));
+            }
+        }
         K::FAdd => r = fp_bin(k, Bin::Add, s),
         K::FSub => r = fp_bin(k, Bin::Sub, s),
         K::FMul => r = fp_bin(k, Bin::Mul, s),
