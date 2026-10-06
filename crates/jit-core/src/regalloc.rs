@@ -14,9 +14,10 @@
 //!
 //! Differences from QEMU:
 //!
-//! - [`liveness`] never removes or rewrites ops. Dead ops are allocated and emitted like any
-//!   other, with their outputs freed straight away, and `mov` to a dead, unsynced temp emits
-//!   nothing. Register preferences (`output_pref`) are not computed.
+//! - [`liveness`] never removes or rewrites ops. Instead the allocator emits nothing for an op
+//!   without side effects or a carry out whose results are all dead and unsynced, which is
+//!   what `liveness_pass_1` would have removed. Register preferences (`output_pref`) are not
+//!   computed.
 //! - A target can add `CALL_CLOBBER` and `SIDE_EFFECTS` to an op ([`Target::extra_op_flags`]),
 //!   for ops it implements with a call or ops that can fault, and both [`liveness`] and the
 //!   allocator honour them.
@@ -33,6 +34,12 @@
 //!   pointed at a stub emitted after the function, which stores it and jumps to the real label.
 //!   The fall through path then never stores it. Without the opt in the branch stores it in
 //!   line.
+//! - A TB temp is kept in memory at the end of a block, or before a conditional branch, only
+//!   if the label the block ends at or the branch goes to may read it before setting it again;
+//!   QEMU's `la_bb_end()` and `la_bb_sync()` keep every TB temp in memory there. The labels'
+//!   live sets come from a backward pass over the function, repeated when a branch back to
+//!   an earlier label saw a set that grew. This drops stores of the translators' scratch temps
+//!   that no later code loads.
 //! - Helper calls pass every argument through memory: the target says where each argument
 //!   word goes ([`Target::call_arg_home`]) and results come back the same way.
 
@@ -334,6 +341,8 @@ pub struct RegAlloc<'f> {
     next_label: u32,
     /// For each conditional branch, the globals that are dead on its fall through path.
     drops: Drops,
+    /// The TB temps live at each label.
+    tb: TbLive,
 }
 
 fn readonly(td: &TempData) -> bool {
@@ -344,8 +353,10 @@ fn readonly(td: &TempData) -> bool {
 /// must be up to date; see [`liveness`].
 pub fn reg_alloc<T: Target>(f: &Func, t: &mut T) -> Result<(), T::Error> {
     let mut ra = RegAlloc::new(f, t);
+    let extra = |f: &Func, op: &Op| t.extra_op_flags(f, op);
+    ra.tb = tb_live(f, &extra);
     if t.out_of_line_branches() {
-        ra.drops = scan(f, &|f, op| t.extra_op_flags(f, op)).1;
+        ra.drops = scan(f, &extra).1;
     }
     let mut last = None;
     for (id, op) in f.ops() {
@@ -363,6 +374,7 @@ pub fn reg_alloc<T: Target>(f: &Func, t: &mut T) -> Result<(), T::Error> {
 /// on `f` with the target's [`Target::extra_op_flags`].
 pub fn reg_alloc_live<T: Target>(f: &Func, live: Liveness, t: &mut T) -> Result<(), T::Error> {
     let mut ra = RegAlloc::new(f, t);
+    ra.tb = live.tb;
     if t.out_of_line_branches() {
         ra.drops = live.drops;
     }
@@ -409,6 +421,7 @@ impl<'f> RegAlloc<'f> {
             stubs: Vec::new(),
             next_label: f.nb_labels() as u32,
             drops: FastHashMap::default(),
+            tb: TbLive::default(),
         }
     }
 
@@ -618,16 +631,16 @@ impl<'f> RegAlloc<'f> {
         }
     }
 
-    /// `tcg_reg_alloc_bb_end`.
-    fn bb_end<T: Target>(&mut self, tg: &mut T, allocated: RegSet) {
+    /// `tcg_reg_alloc_bb_end`. `target` is the label the block ends at, if it ends at one.
+    fn bb_end<T: Target>(&mut self, tg: &mut T, allocated: RegSet, target: Option<Label>) {
         for i in self.f.nb_globals()..self.f.nb_temps() {
             let t = Temp::from_index(i);
             match self.td(t).kind {
-                TempKind::Tb => {
-                    if self.val[i] != Val::Mem {
-                        self.sync(tg, t, allocated, RegSet::EMPTY, -1);
-                    }
+                TempKind::Tb if self.val[i] == Val::Mem => {}
+                TempKind::Tb if self.tb.live_at(i, target) => {
+                    self.sync(tg, t, allocated, RegSet::EMPTY, -1);
                 }
+                TempKind::Tb => self.dead(t),
                 _ => {
                     if matches!(self.val[i], Val::Reg(_)) || self.td(t).kind == TempKind::Ebb {
                         self.dead(t);
@@ -638,12 +651,12 @@ impl<'f> RegAlloc<'f> {
         self.save_globals(tg, allocated);
     }
 
-    /// `tcg_reg_alloc_cbranch`.
-    fn cbranch<T: Target>(&mut self, tg: &mut T, allocated: RegSet) {
+    /// `tcg_reg_alloc_cbranch`. `target` is the branch's label, if it has one.
+    fn cbranch<T: Target>(&mut self, tg: &mut T, allocated: RegSet, target: Option<Label>) {
         self.sync_globals(tg, allocated);
         for i in self.f.nb_globals()..self.f.nb_temps() {
             let t = Temp::from_index(i);
-            if self.td(t).kind == TempKind::Tb {
+            if self.td(t).kind == TempKind::Tb && self.tb.live_at(i, target) {
                 self.sync(tg, t, allocated, RegSet::EMPTY, 0);
             }
         }
@@ -663,7 +676,8 @@ impl<'f> RegAlloc<'f> {
             let t = Temp::from_index(i);
             let td = self.td(t);
             let global = i < self.f.nb_globals();
-            if td.kind == TempKind::Tb || (global && !matches!(td.ty, Type::I32 | Type::I64)) {
+            let tb = td.kind == TempKind::Tb && self.tb.live_at(i, Some(target));
+            if tb || (global && !matches!(td.ty, Type::I32 | Type::I64)) {
                 self.sync(tg, t, allocated, RegSet::EMPTY, 0);
             }
         }
@@ -891,6 +905,21 @@ impl<'f> RegAlloc<'f> {
         let nb_oargs = def.nb_oargs as usize;
         let nb_iargs = def.nb_iargs as usize;
         let flags = def.flags | tg.extra_op_flags(self.f, op);
+        if nb_oargs > 0
+            && flags & (opf::SIDE_EFFECTS | opf::CARRY_OUT | opf::BB_END) == 0
+            && (0..nb_oargs).all(|i| op.is_dead_arg(i) && !op.need_sync_arg(i))
+        {
+            // Liveness would have removed this op.
+            for i in nb_oargs..nb_oargs + nb_iargs {
+                if op.is_dead_arg(i) {
+                    self.dead(op.arg_temp(i));
+                }
+            }
+            for i in 0..nb_oargs {
+                self.dead(op.arg_temp(i));
+            }
+            return Ok(());
+        }
         let mut new_args = [0u64; MAX_OP_ARGS];
         let mut const_args = [false; MAX_OP_ARGS];
         let nargs = (op.nargs as usize).max(nb_oargs + nb_iargs);
@@ -972,10 +1001,10 @@ impl<'f> RegAlloc<'f> {
             if op.opc == Opcode::Brcond && tg.out_of_line_branches() {
                 stub = self.cbranch_stub(tg, id, i_allocated, op.arg_label(3));
             } else {
-                self.cbranch(tg, i_allocated);
+                self.cbranch(tg, i_allocated, branch_label(op));
             }
         } else if flags & opf::BB_END != 0 {
-            self.bb_end(tg, i_allocated);
+            self.bb_end(tg, i_allocated, branch_label(op));
         } else {
             if flags & opf::CALL_CLOBBER != 0 {
                 for r in tg.call_clobber_regs().iter() {
@@ -1104,7 +1133,7 @@ const TS_MEM: u8 = 2;
 /// Compute `op.life` for every op, `liveness_pass_1` without its rewrites: no op is removed
 /// or lowered. `extra_flags` adds target flags to an op, as [`Target::extra_op_flags`] does.
 pub fn liveness(f: &mut Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) {
-    let (lives, _) = scan(f, extra_flags);
+    let (lives, _, _) = scan(f, extra_flags);
     let mut cur = f.first_op();
     while let Some(id) = cur {
         cur = f.next_op(id);
@@ -1119,6 +1148,7 @@ pub struct Liveness {
     /// `op.life`, indexed by [`OpId`].
     life: Vec<u32>,
     drops: Drops,
+    tb: TbLive,
 }
 
 impl Liveness {
@@ -1130,8 +1160,8 @@ impl Liveness {
 
 /// [`liveness`] without writing the result into `f`, for [`reg_alloc_live`].
 pub fn analyze(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> Liveness {
-    let (life, drops) = scan(f, extra_flags);
-    Liveness { life, drops }
+    let (life, drops, tb) = scan(f, extra_flags);
+    Liveness { life, drops, tb }
 }
 
 /// The pass behind [`liveness`]: `op.life` for every op, and for each conditional branch the
@@ -1188,7 +1218,107 @@ fn written_globals(
     map
 }
 
-fn scan(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> (Vec<u32>, Drops) {
+/// The TB temps live on entry to each label, as bit masks over the first 64 TB temps. A TB
+/// temp without a bit counts as live everywhere.
+#[derive(Clone, Debug, Default)]
+struct TbLive {
+    /// The bit of each temp; zero for temps that are not TB temps, and past the first 64.
+    bit: Vec<u64>,
+    /// The TB temps that may be read after each label before they are set again.
+    at: Vec<u64>,
+}
+
+impl TbLive {
+    /// Whether temp `i`, a TB temp, may be live at `label`. Without a label, or without the
+    /// analysis, it may be.
+    fn live_at(&self, i: usize, label: Option<Label>) -> bool {
+        let (Some(l), Some(&b)) = (label, self.bit.get(i)) else { return true };
+        b == 0 || self.at.get(l.id() as usize).is_none_or(|&m| m & b != 0)
+    }
+}
+
+/// The label a `set_label`, `br` or `brcond` op names.
+fn branch_label(op: &Op) -> Option<Label> {
+    match op.opc {
+        Opcode::SetLabel | Opcode::Br => Some(op.arg_label(0)),
+        Opcode::Brcond => Some(op.arg_label(3)),
+        _ => None,
+    }
+}
+
+/// Which TB temps are live at each label: a backward pass over the function, repeated while a
+/// branch back to an earlier label saw a set that has since grown. TB temps are dead where the
+/// function exits, and an op that ends a block without naming a label keeps them all live.
+fn tb_live(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> TbLive {
+    let mut bit = vec![0u64; f.nb_temps()];
+    let mut n = 0;
+    for (b, td) in bit.iter_mut().zip(f.temps()) {
+        if td.kind == TempKind::Tb && n < 64 {
+            *b = 1 << n;
+            n += 1;
+        }
+    }
+    let nl = f.nb_labels();
+    let mut at = vec![0u64; nl];
+    if n == 0 || nl == 0 {
+        return TbLive { bit, at };
+    }
+    let all = u64::MAX >> (64 - n);
+    let mut seen = vec![false; nl];
+    let mut stale = vec![false; nl];
+    loop {
+        seen.fill(false);
+        stale.fill(false);
+        let mut again = false;
+        let mut live = 0u64;
+        let mut cur = f.last_op();
+        while let Some(id) = cur {
+            cur = f.prev_op(id);
+            let op = f.op(id);
+            if op.opc == Opcode::InsnStart {
+                continue;
+            }
+            let no = op.nb_oargs();
+            let ni = if op.opc == Opcode::Discard { 0 } else { op.nb_iargs() };
+            for i in 0..no {
+                live &= !bit[op.arg_temp(i).index()];
+            }
+            if op.opc != Opcode::Call && op.opc != Opcode::Discard {
+                let flags = op.opc.def().flags | extra_flags(f, op);
+                let label = branch_label(op);
+                if let Some(l) = label {
+                    let l = l.id() as usize;
+                    if op.opc == Opcode::SetLabel {
+                        seen[l] = true;
+                        if at[l] != live {
+                            again |= stale[l];
+                            at[l] = live;
+                        }
+                    } else {
+                        stale[l] |= !seen[l];
+                        if op.opc == Opcode::Br {
+                            live = at[l];
+                        } else {
+                            live |= at[l];
+                        }
+                    }
+                } else if flags & opf::BB_EXIT != 0 {
+                    live = 0;
+                } else if flags & (opf::BB_END | opf::COND_BRANCH) != 0 {
+                    live = all;
+                }
+            }
+            for i in no..no + ni {
+                live |= bit[op.arg_temp(i).index()];
+            }
+        }
+        if !again {
+            return TbLive { bit, at };
+        }
+    }
+}
+
+fn scan(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> (Vec<u32>, Drops, TbLive) {
     let mut lives = vec![0u32; f.op_slots()];
     let mut drops = FastHashMap::default();
     let ng = f.nb_globals();
@@ -1207,6 +1337,7 @@ fn scan(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> (Vec<u32>, Drops) 
     };
     func_end(&mut st);
     let written = written_globals(f, extra_flags);
+    let tb = tb_live(f, extra_flags);
 
     let mut cur = f.last_op();
     while let Some(id) = cur {
@@ -1278,16 +1409,20 @@ fn scan(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> (Vec<u32>, Drops) 
                     if !dead.is_empty() {
                         drops.insert(id, dead.into_iter().map(Temp::from_index).collect());
                     }
-                    for (s, k) in st.iter_mut().zip(&kinds).skip(ng) {
-                        if *k == TempKind::Tb {
+                    // TB temps go to memory only if the branch target may read them.
+                    let target = branch_label(&op);
+                    for (i, (s, k)) in st.iter_mut().zip(&kinds).enumerate().skip(ng) {
+                        if *k == TempKind::Tb && tb.live_at(i, target) {
                             *s |= TS_MEM;
                         }
                     }
                 } else if flags & opf::BB_END != 0 {
-                    for (s, k) in st.iter_mut().zip(&kinds) {
+                    let target = branch_label(&op);
+                    for (i, (s, k)) in st.iter_mut().zip(&kinds).enumerate() {
                         *s = match k {
-                            TempKind::Fixed | TempKind::Global | TempKind::Tb => TS_DEAD | TS_MEM,
-                            TempKind::Ebb | TempKind::Const => TS_DEAD,
+                            TempKind::Fixed | TempKind::Global => TS_DEAD | TS_MEM,
+                            TempKind::Tb if tb.live_at(i, target) => TS_DEAD | TS_MEM,
+                            TempKind::Tb | TempKind::Ebb | TempKind::Const => TS_DEAD,
                         };
                     }
                 } else if flags & opf::SIDE_EFFECTS != 0 {
@@ -1305,7 +1440,7 @@ fn scan(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> (Vec<u32>, Drops) 
         }
         lives[id.index()] = life;
     }
-    (lives, drops)
+    (lives, drops, tb)
 }
 
 /// Get a copy of `f` ready for [`reg_alloc`]: indirect globals lowered to explicit loads and
@@ -1382,6 +1517,87 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, f.nb_ops());
+    }
+
+    /// The `life` of the `n`th op with opcode `opc` in `f`, after [`liveness`].
+    fn life_of(f: &Func, opc: Opcode, n: usize) -> u32 {
+        f.ops().filter(|(_, op)| op.opc == opc).nth(n).expect("op is there").1.life
+    }
+
+    #[test]
+    fn tb_temp_set_again_at_label_is_not_stored() {
+        use crate::ir::FuncConfig;
+        let mut f = Func::new(FuncConfig::default());
+        let env = f.env();
+        let r0 = f.global_mem_new_i64(env, 0, "r0");
+        let r1 = f.global_mem_new_i64(env, 8, "r1");
+        let t = f.temp_new_i64();
+        let l = f.new_label();
+        f.gen_add_i64(t, r0, r1);
+        f.gen_brcondi_i64(Cond::Eq, r0, 0, l);
+        f.gen_addi_i64(r0, t, 1);
+        f.gen_set_label(l);
+        f.gen_xor_i64(t, r1, r1);
+        f.gen_addi_i64(r1, t, 2);
+        f.gen_exit_tb(0, 0);
+        let none = |_: &Func, _: &Op| 0;
+        let tb = tb_live(&f, &none);
+        assert!(!tb.live_at(t.temp().index(), Some(l)));
+        liveness(&mut f, &none);
+        // The label sets `t` before reading it, so neither the branch nor the end of the
+        // fall through block needs it in memory, and its last read frees it.
+        assert_eq!(life_of(&f, Opcode::Add, 0) & (SYNC_ARG | DEAD_ARG), 0);
+        assert_eq!(life_of(&f, Opcode::Add, 1) & (DEAD_ARG << 1), DEAD_ARG << 1);
+    }
+
+    #[test]
+    fn tb_temp_read_at_label_is_stored() {
+        use crate::ir::FuncConfig;
+        let mut f = Func::new(FuncConfig::default());
+        let env = f.env();
+        let r0 = f.global_mem_new_i64(env, 0, "r0");
+        let r1 = f.global_mem_new_i64(env, 8, "r1");
+        let t = f.temp_new_i64();
+        let l = f.new_label();
+        f.gen_add_i64(t, r0, r1);
+        f.gen_brcondi_i64(Cond::Eq, r0, 0, l);
+        f.gen_addi_i64(r0, t, 1);
+        f.gen_set_label(l);
+        f.gen_addi_i64(r1, t, 2);
+        f.gen_exit_tb(0, 0);
+        let none = |_: &Func, _: &Op| 0;
+        assert!(tb_live(&f, &none).live_at(t.temp().index(), Some(l)));
+        liveness(&mut f, &none);
+        assert_eq!(life_of(&f, Opcode::Add, 0) & SYNC_ARG, SYNC_ARG);
+    }
+
+    #[test]
+    fn tb_temp_read_after_a_branch_back_is_stored() {
+        use crate::ir::FuncConfig;
+        let mut f = Func::new(FuncConfig::default());
+        let env = f.env();
+        let r0 = f.global_mem_new_i64(env, 0, "r0");
+        let r1 = f.global_mem_new_i64(env, 8, "r1");
+        let t = f.temp_new_i64();
+        let u = f.temp_new_i64();
+        let top = f.new_label();
+        f.gen_add_i64(t, r1, r1);
+        f.gen_set_label(top);
+        f.gen_add_i64(r0, t, r0);
+        f.gen_add_i64(t, r1, r0);
+        f.gen_add_i64(u, r0, r0);
+        f.gen_brcondi_i64(Cond::Ne, r0, 0, top);
+        f.gen_add_i64(r1, u, u);
+        f.gen_exit_tb(0, 0);
+        let none = |_: &Func, _: &Op| 0;
+        let tb = tb_live(&f, &none);
+        assert!(tb.live_at(t.temp().index(), Some(top)));
+        assert!(!tb.live_at(u.temp().index(), Some(top)));
+        liveness(&mut f, &none);
+        // `t` is read again after the branch back, `u` only on the way out.
+        assert_eq!(life_of(&f, Opcode::Add, 0) & SYNC_ARG, SYNC_ARG);
+        assert_eq!(life_of(&f, Opcode::Add, 2) & SYNC_ARG, SYNC_ARG);
+        assert_eq!(life_of(&f, Opcode::Add, 3) & SYNC_ARG, 0);
     }
 
     #[test]
