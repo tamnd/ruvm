@@ -6,6 +6,18 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.4.0
+
+M4 is done, so this is the first 0.4 release. The JIT runs real guests, and on CoreMark it is faster than QEMU 11.1's TCG on all three host and guest pairs we measure.
+
+For M4: QEMU 11.1's tests/tcg system tests for x86_64 and aarch64 print exactly what QEMU prints. risu matches hardware for every aarch64 group, and for the x86 groups except where QEMU itself differs from hardware (#149, #151). Linux boots to a shell under TCG on q35 and arm virt, on an x86-64 host and on an Apple M4. CoreMark runs at 1.32x QEMU's speed for an x86-64 guest on an x86-64 host, 1.37x to 1.46x for an aarch64 guest on an x86-64 host, and 1.43x for an x86-64 guest on an Apple M4. Since 0.3.6, a DIV side exit, quotient reuse for remainders, and loop back edge chaining bring bench.c g_s4 on the M4 from 1.24x to 1.30x (#153).
+
+The M4 exit criterion asks for SPEC CPU2017 intrate, which we have not run, because we don't have a license yet. Those numbers are tracked in #154. The x86-64 guest has what Windows checks for in `-cpu max`, but no Windows guest has booted under TCG yet. Windows on q35 is still open under M2.
+
+M5 has started, with the QEMU migration stream and precopy.
+
+Known issues: `sigterm_from_another_process` in sys was flaky and is fixed in #153. tests/tcg user mode tests wait on linux-user in M7.
+
 ## 0.3.6
 
 This patch makes the JIT faster than QEMU 11.1's TCG on bare metal CoreMark for all three host and guest pairs we measure, and finishes the x86-64 guest for M4.
