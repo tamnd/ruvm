@@ -6,6 +6,18 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.3.6
+
+This patch makes the JIT faster than QEMU 11.1's TCG on bare metal CoreMark for all three host and guest pairs we measure, and finishes the x86-64 guest for M4.
+
+CoreMark now runs at about 1.32x QEMU's speed for an x86-64 guest on an x86-64 host, 1.37x to 1.46x for an aarch64 guest on an x86-64 host, and 1.44x for an x86-64 guest on an Apple M4. The arm front end keeps guest registers in TCG globals and builds superblocks across short conditional branches (#147), and global stores are delayed to block exits (#148). The aarch64 backend gained inline caches, direct helper calls and out of line slow paths, and the register allocator's liveness pass is shared by both backends (#150). A leak that kept every finished vCPU alive is fixed, which brings the peak memory of the a64_simd tests from 3.5 GB to 54 MB (#148).
+
+risu harnesses for both guests are in (#149). The aarch64 groups match hardware with no differences, and the x86 groups match except where QEMU 11.1 itself differs from hardware.
+
+The x86-64 guest now has AES-NI, SHA, the SSE4.2 string compares, the AVX2 gathers, and protection keys (PKU and PKS). `-cpu max` CPUID matches QEMU 11.1 TCG exactly, and CMPXCHG and BSF/BSR edge cases now match QEMU. DIV and IDIV take an inline fast path when one host divide is enough (#151).
+
+Linux boots to a shell under TCG on q35 and arm virt on an aarch64 host as well as an x86-64 one.
+
 ## 0.3.5
 
 This patch is mostly about JIT speed. An x86-64 guest on an x86-64 host now runs bare metal CoreMark faster than QEMU 11.1's TCG, at about 1.32x its speed, where 0.3.4 was below 0.1x.
