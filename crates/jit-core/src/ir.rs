@@ -11,6 +11,7 @@
 //! 128-bit temp is two consecutive 64-bit temps, low half first, as on a 64-bit little-endian
 //! host.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
 use crate::memory_model::FenceMapping;
@@ -242,8 +243,9 @@ pub struct TempData {
     pub subindex: u8,
     /// The value of a constant. I32 constants are stored sign extended.
     pub val: i64,
-    /// The name of a global.
-    pub name: Option<String>,
+    /// The name of a global. Front ends name their globals with string literals, which are
+    /// kept without a copy since every block creates its globals again.
+    pub name: Option<Cow<'static, str>>,
     /// The pointer temp a global is stored relative to.
     pub mem_base: Option<Temp>,
     /// The offset of a global from its base.
@@ -428,6 +430,31 @@ impl Default for FuncConfig {
     }
 }
 
+/// The name a global is created with: a string literal is kept as it is, anything else is
+/// copied.
+pub trait GlobalName {
+    /// The name, without a copy when it is static.
+    fn into_name(self) -> Cow<'static, str>;
+}
+
+impl GlobalName for &'static str {
+    fn into_name(self) -> Cow<'static, str> {
+        Cow::Borrowed(self)
+    }
+}
+
+impl GlobalName for String {
+    fn into_name(self) -> Cow<'static, str> {
+        Cow::Owned(self)
+    }
+}
+
+impl GlobalName for &String {
+    fn into_name(self) -> Cow<'static, str> {
+        Cow::Owned(self.clone())
+    }
+}
+
 /// A translation block under construction, the per TB half of `TCGContext`.
 #[derive(Clone, Debug)]
 pub struct Func {
@@ -471,7 +498,7 @@ impl Func {
             num_insns: 0,
         };
         let mut env = TempData::new(TempKind::Fixed, Type::PTR, Type::PTR);
-        env.name = Some("env".to_string());
+        env.name = Some(Cow::Borrowed("env"));
         f.temps.push(env);
         f.nb_globals = 1;
         f
@@ -535,7 +562,13 @@ impl Func {
         t
     }
 
-    fn global_mem_new_internal(&mut self, base: Temp, offset: i64, name: &str, ty: Type) -> Temp {
+    fn global_mem_new_internal(
+        &mut self,
+        base: Temp,
+        offset: i64,
+        name: Cow<'static, str>,
+        ty: Type,
+    ) -> Temp {
         assert_eq!(self.nb_globals, self.temps.len(), "globals must be created before any temps");
         let indirect_reg = match self.temps[base.index()].kind {
             TempKind::Fixed => false,
@@ -554,25 +587,40 @@ impl Func {
         td.indirect_reg = indirect_reg;
         td.mem_base = Some(base);
         td.mem_offset = offset;
-        td.name = Some(name.to_string());
+        td.name = Some(name);
         let t = self.temp_alloc(td);
         self.nb_globals += 1;
         t
     }
 
     /// `tcg_global_mem_new_i32`.
-    pub fn global_mem_new_i32(&mut self, base: TempPtr, offset: i64, name: &str) -> TempI32 {
-        TempI32(self.global_mem_new_internal(base.0, offset, name, Type::I32))
+    pub fn global_mem_new_i32(
+        &mut self,
+        base: TempPtr,
+        offset: i64,
+        name: impl GlobalName,
+    ) -> TempI32 {
+        TempI32(self.global_mem_new_internal(base.0, offset, name.into_name(), Type::I32))
     }
 
     /// `tcg_global_mem_new_i64`.
-    pub fn global_mem_new_i64(&mut self, base: TempPtr, offset: i64, name: &str) -> TempI64 {
-        TempI64(self.global_mem_new_internal(base.0, offset, name, Type::I64))
+    pub fn global_mem_new_i64(
+        &mut self,
+        base: TempPtr,
+        offset: i64,
+        name: impl GlobalName,
+    ) -> TempI64 {
+        TempI64(self.global_mem_new_internal(base.0, offset, name.into_name(), Type::I64))
     }
 
     /// `tcg_global_mem_new_ptr`.
-    pub fn global_mem_new_ptr(&mut self, base: TempPtr, offset: i64, name: &str) -> TempPtr {
-        TempPtr(self.global_mem_new_internal(base.0, offset, name, Type::PTR))
+    pub fn global_mem_new_ptr(
+        &mut self,
+        base: TempPtr,
+        offset: i64,
+        name: impl GlobalName,
+    ) -> TempPtr {
+        TempPtr(self.global_mem_new_internal(base.0, offset, name.into_name(), Type::PTR))
     }
 
     /// `tcg_temp_new_internal`.

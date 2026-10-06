@@ -555,6 +555,14 @@ pub struct CpuCore {
     pub watchpoint_hit: Option<usize>,
 }
 
+/// `cpu_exec_unrealizefn()`: a vCPU leaves the CPU list when it goes away, so its TLB is freed
+/// and a runtime that creates vCPUs one after another does not keep every one of them.
+impl Drop for CpuCore {
+    fn drop(&mut self) {
+        self.jit.cpu_list_remove(&self.shared);
+    }
+}
+
 impl fmt::Debug for CpuCore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CpuCore")

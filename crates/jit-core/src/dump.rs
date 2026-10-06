@@ -83,7 +83,9 @@ impl Func {
         let td = self.temp(t);
         let rel = t.index() as i64 - self.nb_globals() as i64;
         match td.kind {
-            TempKind::Fixed | TempKind::Global => td.name.clone().unwrap_or_default(),
+            TempKind::Fixed | TempKind::Global => {
+                td.name.as_deref().unwrap_or_default().to_string()
+            }
             TempKind::Tb => format!("loc{rel}"),
             TempKind::Ebb => format!("tmp{rel}"),
             TempKind::Const => match td.ty {

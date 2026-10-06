@@ -19,8 +19,10 @@
 //!
 //! Deliberate differences from QEMU:
 //!
-//! - The timers of the board clocks are fired by a thread of their own that sleeps at most
-//!   1 ms at a time, rather than by the main loop's poll.
+//! - The timers of the board clocks are fired by a thread of their own rather than by the main
+//!   loop's poll. It sleeps until the next deadline and is woken when a timer becomes the first
+//!   to expire, as `timerlist_notify()` wakes QEMU's main loop, but it also wakes at least every
+//!   100 ms (`TIMER_IDLE`) in case a wakeup was missed.
 //! - Writes to RAM that do not come from a vCPU (DMA) do not invalidate translated code.
 //! - A memory map change (`tcg_commit()`) queues a TLB flush on every vCPU, including the one
 //!   that made it, which finishes its current block first; QEMU flushes that one at once.
@@ -43,8 +45,10 @@ use ruvm_mem::MemoryListener;
 
 use crate::virt::{VirtMachine, VirtRequest};
 
-/// The longest the timer thread sleeps, since arming a timer does not wake it.
-const TIMER_SLICE: Duration = Duration::from_millis(1);
+/// The longest the timer thread sleeps. Arming a timer that becomes the first to fire wakes it
+/// through the clock's notify hook, as `timerlist_notify()` kicks QEMU's main loop, so this only
+/// bounds how long a missed wakeup could delay a timer.
+const TIMER_IDLE: Duration = Duration::from_millis(100);
 
 /// AArch64 has `TARGET_SUPPORTS_MTTCG`, so `thread=multi` gives no warning.
 const ARM_SUPPORTS_MTTCG: bool = true;
@@ -157,8 +161,12 @@ fn control_loop(shared: Arc<Shared>, vcpus: Arc<TcgVcpus>, board: Arc<Mutex<Virt
 }
 
 fn timer_loop(shared: Arc<Shared>, clocks: Vec<Arc<Clock>>) {
+    for c in &clocks {
+        let me = std::thread::current();
+        c.set_notify(move || me.unpark());
+    }
     while !shared.quit.load(Ordering::Acquire) {
-        let mut sleep = TIMER_SLICE;
+        let mut sleep = TIMER_IDLE;
         for c in &clocks {
             c.run_timers();
             let d = c.deadline_ns();
@@ -167,7 +175,7 @@ fn timer_loop(shared: Arc<Shared>, clocks: Vec<Arc<Clock>>) {
             }
         }
         if !sleep.is_zero() {
-            std::thread::sleep(sleep);
+            std::thread::park_timeout(sleep);
         }
     }
 }
@@ -327,6 +335,8 @@ impl VirtTcgMachine {
         let threads =
             std::mem::take(&mut *self.threads.lock().unwrap_or_else(PoisonError::into_inner));
         for t in threads {
+            // The timer thread may be parked until its next deadline.
+            t.thread().unpark();
             let _ = t.join();
         }
         lock_board(&self.board).set_request_handler(None);

@@ -190,6 +190,8 @@ fn run_cases(cases: &[Case]) {
             ));
         }
     }
+    // Each case's vCPU is gone with its TLB, so a long run does not pile them up.
+    assert!(w.jit.cpu_list().is_empty());
     assert!(
         bad.is_empty(),
         "{} of {} cases differ:\n{}",

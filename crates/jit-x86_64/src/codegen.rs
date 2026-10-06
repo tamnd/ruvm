@@ -770,7 +770,11 @@ const C_X5: &[&str] = &["x", "x", "x", "x", "x"];
 impl Gen<'_> {
     fn label(&mut self, op: &Op, i: usize) -> R<usize> {
         let id = op.arg_label(i).id() as usize;
-        let slot = self.labels.get_mut(id).ok_or_else(|| bad(op, "unknown label"))?;
+        // The allocator numbers the labels of its branch stubs after the function's own.
+        if id >= self.labels.len() {
+            self.labels.resize(id + 1, None);
+        }
+        let slot = &mut self.labels[id];
         Ok(match slot {
             Some(l) => *l,
             None => {
@@ -2636,6 +2640,10 @@ impl Target for Gen<'_> {
 
     fn call_arg_home(&self, idx: usize) -> (Reg, i64) {
         (CTX, 8 * idx as i64)
+    }
+
+    fn out_of_line_branches(&self) -> bool {
+        true
     }
 
     fn out_call(&mut self, f: &Func, op: &Op) -> R<()> {
