@@ -7,17 +7,32 @@
 //! and every pattern left out returns false, which raises an Undefined Instruction exception
 //! just as QEMU's `unallocated_encoding()` does.
 //!
-//! QEMU keeps the general registers, the PC, the flags and the exclusive monitor in TCG
-//! globals. This port has no globals: every read loads from `env` and every write stores to it
-//! at once, which gives the same result because the generated code is the only writer while
-//! a block runs, and helpers only see `env` after the store. The PC is written to `env`
-//! before every helper that can raise an exception, so those helpers raise without unwinding.
+//! As in QEMU, the general registers, SP, the PC and the NZCV flags are TCG globals. The
+//! exclusive monitor is not: it is loaded and stored by offset like the rest of `env`. The
+//! [`S::ld_env64`] family maps the offsets of the globals to the globals, so a read or write
+//! of a register by offset uses the global too. The PC is written before every helper that
+//! can raise an exception, so those helpers raise without unwinding.
+//!
+//! Differences from QEMU:
+//!
+//! - A conditional branch (B.cond, CBZ, CBNZ, TBZ, TBNZ) does not always end the block
+//!   (superblocks). Up to `MAX_SIDE_EXITS` times per block, the block goes on with the
+//!   fall-through path, and the taken edge branches to an exit emitted after the last
+//!   instruction. The fall-through path keeps guest registers in host registers and skips
+//!   the exit request check a new block would make. Control only moves forward inside a
+//!   block, so it still cannot loop without passing that check. Not with icount or single
+//!   step. The exits get the two `goto_tb` slots in program order, and the others look the
+//!   next block up through an inline cache.
+//! - A branch to another page, and BR, BLR, RET and their PAuth forms, look the next block
+//!   up through an inline cache, `lookup_tb_ptr_ic`. They leave the CPU state other than
+//!   the PC as the block found it; that would not hold for BR and BLR with BTI, which this
+//!   port does not implement.
 
-use ruvm_jit::{Cpu, CpuLoopExit, DisasContextBase, DisasJumpType, TranslatorOps};
+use ruvm_jit::{Cpu, CpuLoopExit, DisasContextBase, DisasJumpType, TranslatorOps, cf};
 use ruvm_jit_core::ir::{TempI32, TempI64, TempPtr};
 use ruvm_jit_core::tcg_op_ldst::AtomicOp;
 use ruvm_jit_core::types::{Cond, mo};
-use ruvm_jit_core::{Func, MemOp, Temp};
+use ruvm_jit_core::{Func, Label, MemOp, Temp};
 use ruvm_mem::Endian;
 
 use super::helpers::{self, Def};
@@ -114,7 +129,49 @@ pub(crate) struct DisasContext {
     semihosting: bool,
     /// Semihosting calls are also allowed from EL0 (`-semihosting-config userspace=on`).
     semihosting_user: bool,
+    /// The TCG globals of the block, made by `init_disas_context`.
+    g: Option<G>,
+    /// The `goto_tb` exit slots this block has used, one bit per slot. Not in QEMU, which
+    /// has at most two direct exits per block by construction; superblocks can have more
+    /// exits than slots, and the rest go through the jump cache.
+    goto_tb_used: u8,
+    /// Conditional branches whose fall-through was translated in line, see [`SideExit`].
+    /// Not in QEMU.
+    side_exits: Vec<SideExit>,
 }
+
+/// The TCG globals: QEMU's `cpu_X`, `cpu_pc` and `cpu_NF` to `cpu_VF`.
+#[derive(Clone, Copy)]
+struct G {
+    /// X0 to X30, and SP as register 31.
+    x: [TempI64; 32],
+    pc: TempI64,
+    nf: TempI32,
+    zf: TempI32,
+    cf: TempI32,
+    vf: TempI32,
+}
+
+/// The names QEMU gives the register globals.
+const REG_NAMES: [&str; 32] = [
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
+    "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27",
+    "x28", "x29", "lr", "sp",
+];
+
+/// The taken edge of a conditional branch whose fall-through path the block continues with
+/// (a superblock, not in QEMU). Its exit is emitted out of line when the block ends.
+#[derive(Clone, Copy)]
+struct SideExit {
+    label: Label,
+    /// The branch target.
+    dest: u64,
+    /// The `goto_tb` slot kept for this exit.
+    slot: Option<u64>,
+}
+
+/// The most conditional branches one block goes past, see [`SideExit`].
+const MAX_SIDE_EXITS: usize = 8;
 
 impl DisasContext {
     /// A context for the CPU `model`, with semihosting on for EL1 and up when `semihosting`
@@ -141,6 +198,9 @@ impl DisasContext {
             tcma: 0,
             semihosting: semihosting.is_some(),
             semihosting_user: semihosting == Some(true),
+            g: None,
+            goto_tb_used: 0,
+            side_exits: Vec::new(),
         }
     }
 }
@@ -216,28 +276,68 @@ impl S<'_, '_> {
 
     // Registers and flags.
 
+    /// The global that holds the 64-bit `env` field at `off`, if there is one.
+    fn global64(&self, off: usize) -> Option<TempI64> {
+        let g = self.d.g.as_ref()?;
+        let x0 = xreg_off(0);
+        if off == PC {
+            Some(g.pc)
+        } else if off >= x0 && off < xreg_off(32) && (off - x0) % 8 == 0 {
+            Some(g.x[(off - x0) / 8])
+        } else {
+            None
+        }
+    }
+
+    /// The global that holds the 32-bit `env` field at `off`, if there is one.
+    fn global32(&self, off: usize) -> Option<TempI32> {
+        let g = self.d.g.as_ref()?;
+        [(NF, g.nf), (ZF, g.zf), (CF, g.cf), (VF, g.vf)]
+            .into_iter()
+            .find(|&(o, _)| o == off)
+            .map(|(_, t)| t)
+    }
+
+    /// The 64-bit `env` field at `off`, in a fresh temp.
     fn ld_env64(&mut self, off: usize) -> TempI64 {
         let t = self.new64();
-        let env = self.env();
-        self.f().gen_ld_i64(t, env, off as i64);
+        if let Some(g) = self.global64(off) {
+            self.f().gen_mov_i64(t, g);
+        } else {
+            let env = self.env();
+            self.f().gen_ld_i64(t, env, off as i64);
+        }
         t
     }
 
     fn st_env64(&mut self, t: TempI64, off: usize) {
-        let env = self.env();
-        self.f().gen_st_i64(t, env, off as i64);
+        if let Some(g) = self.global64(off) {
+            self.f().gen_mov_i64(g, t);
+        } else {
+            let env = self.env();
+            self.f().gen_st_i64(t, env, off as i64);
+        }
     }
 
+    /// The 32-bit `env` field at `off`, in a fresh temp.
     fn ld_env32(&mut self, off: usize) -> TempI32 {
         let t = self.new32();
-        let env = self.env();
-        self.f().gen_ld_i32(t, env, off as i64);
+        if let Some(g) = self.global32(off) {
+            self.f().gen_mov_i32(t, g);
+        } else {
+            let env = self.env();
+            self.f().gen_ld_i32(t, env, off as i64);
+        }
         t
     }
 
     fn st_env32(&mut self, t: TempI32, off: usize) {
-        let env = self.env();
-        self.f().gen_st_i32(t, env, off as i64);
+        if let Some(g) = self.global32(off) {
+            self.f().gen_mov_i32(g, t);
+        } else {
+            let env = self.env();
+            self.f().gen_st_i32(t, env, off as i64);
+        }
     }
 
     /// `cpu_reg()`: register `r`, with 31 reading as zero. The result is a fresh temp.
@@ -533,16 +633,78 @@ impl S<'_, '_> {
     /// `gen_goto_tb()`: go to `pc_curr + diff`, chaining when possible.
     fn gen_goto_tb(&mut self, n: u64, diff: i64) {
         let dest = self.d.pc_curr.wrapping_add(diff as u64);
-        if self.b.translator_use_goto_tb(dest) {
+        let slot = self.goto_tb_slot(n);
+        self.gen_goto_dest(slot, dest);
+    }
+
+    /// The `goto_tb` slot to use for an exit that would like slot `n`: that one if it is
+    /// free, else the other, else none.
+    fn goto_tb_slot(&self, n: u64) -> Option<u64> {
+        [n, n ^ 1].into_iter().find(|&k| self.d.goto_tb_used & (1 << k) == 0)
+    }
+
+    /// Go to `dest`, chaining through slot `slot` when there is one and `dest` is on the
+    /// page of the block, else through the inline cache (not in QEMU, which uses
+    /// `lookup_and_goto_ptr`).
+    fn gen_goto_dest(&mut self, slot: Option<u64>, dest: u64) {
+        let pc = self.c64(dest as i64);
+        if let (true, Some(n)) = (self.b.translator_use_goto_tb(dest), slot) {
+            self.d.goto_tb_used |= 1 << n;
             self.f().gen_goto_tb(n);
-            self.update_pc(diff);
+            self.st_env64(pc, PC);
             let id = self.b.tb.id;
             self.f().gen_exit_tb(id, n);
         } else {
-            self.update_pc(diff);
-            self.f().gen_lookup_and_goto_ptr();
+            self.st_env64(pc, PC);
+            self.f().gen_lookup_and_goto_ptr_ic(pc);
         }
         self.b.is_jmp = DisasJumpType::NoReturn;
+    }
+
+    /// Whether a conditional branch here may continue the block with its fall-through path
+    /// rather than end it (a superblock, not in QEMU). Not with icount, which charges a
+    /// whole block's instructions on entry, or single step.
+    fn can_inline_branch(&self) -> bool {
+        self.b.tb.cflags & (cf::USE_ICOUNT | cf::SINGLE_STEP) == 0
+            && self.d.side_exits.len() < MAX_SIDE_EXITS
+    }
+
+    /// The rest of a conditional branch to `pc_curr + imm` once the code branches to `label`
+    /// when it is taken. When it can, the block goes on with the fall-through path and the
+    /// taken edge becomes a [`SideExit`]; else the block ends with both edges, as in QEMU.
+    fn branch_to(&mut self, label: Label, imm: i64) {
+        if !self.can_inline_branch() {
+            self.gen_goto_tb(0, 4);
+            self.f().gen_set_label(label);
+            self.gen_goto_tb(1, imm);
+            return;
+        }
+        let dest = self.d.pc_curr.wrapping_add(imm as u64);
+        // The earlier exits get the direct slots: every run of the block passes their
+        // branch, not all reach the later ones.
+        let mut slot = None;
+        if self.b.translator_use_goto_tb(dest) {
+            slot = self.goto_tb_slot(0);
+            if let Some(n) = slot {
+                self.d.goto_tb_used |= 1 << n;
+            }
+        }
+        self.d.side_exits.push(SideExit { label, dest, slot });
+    }
+
+    /// Emit the exits of the conditional branches the block went past, after its last
+    /// instruction.
+    fn gen_side_exits(&mut self) {
+        let exits = std::mem::take(&mut self.d.side_exits);
+        for e in &exits {
+            self.f().gen_set_label(e.label);
+            if let Some(n) = e.slot {
+                self.d.goto_tb_used &= !(1 << n);
+            }
+            self.gen_goto_dest(e.slot, e.dest);
+        }
+        self.d.side_exits = exits;
+        self.d.side_exits.clear();
     }
 
     // Flags.
@@ -1266,9 +1428,7 @@ impl S<'_, '_> {
     fn cond_branch64(&mut self, cond: Cond, value: TempI64, imm: i32) {
         let label = self.f().new_label();
         self.f().gen_brcondi_i64(cond, value, 0, label);
-        self.gen_goto_tb(0, 4);
-        self.f().gen_set_label(label);
-        self.gen_goto_tb(1, i64::from(imm));
+        self.branch_to(label, i64::from(imm));
     }
 
     /// `handle_sys()`: MRS, MSR (register) and SYS.
@@ -1892,9 +2052,7 @@ impl DisasA64 for S<'_, '_> {
             let (cond, value) = self.test_cc(a.cond);
             let label = self.f().new_label();
             self.f().gen_brcondi_i32(cond, value, 0, label);
-            self.gen_goto_tb(0, 4);
-            self.f().gen_set_label(label);
-            self.gen_goto_tb(1, i64::from(a.imm));
+            self.branch_to(label, i64::from(a.imm));
         } else {
             // 0xe and 0xf are both "always" conditions
             self.gen_goto_tb(0, i64::from(a.imm));
@@ -3248,6 +3406,21 @@ impl DisasA64 for S<'_, '_> {
 
 impl TranslatorOps for DisasContext {
     fn init_disas_context(&mut self, db: &mut DisasContextBase<'_>, _cpu: &mut Cpu<'_>) {
+        let f = &mut db.tb.f;
+        let env = f.env();
+        let x =
+            std::array::from_fn(|r| f.global_mem_new_i64(env, xreg_off(r) as i64, REG_NAMES[r]));
+        self.g = Some(G {
+            x,
+            pc: f.global_mem_new_i64(env, PC as i64, "pc"),
+            nf: f.global_mem_new_i32(env, NF as i64, "NF"),
+            zf: f.global_mem_new_i32(env, ZF as i64, "ZF"),
+            cf: f.global_mem_new_i32(env, CF as i64, "CF"),
+            vf: f.global_mem_new_i32(env, VF as i64, "VF"),
+        });
+        self.goto_tb_used = 0;
+        self.side_exits.clear();
+
         let flags = db.tb.flags;
         self.current_el = flags & TB_EL_MASK;
         self.pstate_il = flags & TB_PSTATE_IL != 0;
@@ -3317,7 +3490,11 @@ impl TranslatorOps for DisasContext {
         match s.b.is_jmp {
             DisasJumpType::Next | DisasJumpType::TooMany => s.gen_goto_tb(1, 4),
             DisasJumpType::NoReturn => {}
-            DISAS_JUMP => s.f().gen_lookup_and_goto_ptr(),
+            DISAS_JUMP => {
+                // The branches that end a block this way only change the PC (no BTI).
+                let pc = s.ld_env64(PC);
+                s.f().gen_lookup_and_goto_ptr_ic(pc);
+            }
             DISAS_EXIT => s.f().gen_exit_tb(0, 0),
             DISAS_WFI => {
                 s.update_pc(4);
@@ -3334,6 +3511,7 @@ impl TranslatorOps for DisasContext {
                 s.f().gen_exit_tb(0, 0);
             }
         }
+        s.gen_side_exits();
     }
 }
 
