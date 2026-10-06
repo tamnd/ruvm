@@ -1,0 +1,37 @@
+From fb5e25c8d53795f4b04e94f33392bb649536ea33 Mon Sep 17 00:00:00 2001
+From: ruvm <ruvm@localhost>
+Date: Mon, 5 Oct 2026 18:43:35 +0200
+Subject: [PATCH 4/4] risu_reginfo_i386: index CPUID leaf 0xD by the feature
+ bit, not its mask
+
+xsave_feature_buf passed the XFEAT_ mask (4 for AVX) as the CPUID 0xD
+sub-leaf, which is the bit number. Sub-leaf 4 gives offset 0 on CPUs without
+that component, so the YMM high halves were read from the legacy FXSAVE area.
+---
+ risu_reginfo_i386.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/risu_reginfo_i386.c b/risu_reginfo_i386.c
+index b817968..f78e66b 100644
+--- a/risu_reginfo_i386.c
++++ b/risu_reginfo_i386.c
+@@ -83,6 +83,7 @@ int reginfo_size(struct reginfo *ri)
+     return sizeof(*ri);
+ }
+ 
++/* FEATURE is one XFEAT_ mask; CPUID leaf 0xD is indexed by its bit number. */
+ static void *xsave_feature_buf(struct _xstate *xs, int feature)
+ {
+     unsigned int eax, ebx, ecx, edx;
+@@ -92,7 +93,7 @@ static void *xsave_feature_buf(struct _xstate *xs, int feature)
+      * Get the location of the XSAVE feature from the cpuid leaf.
+      * Given that we know the xfeature bit is set, this must succeed.
+      */
+-    ok = __get_cpuid_count(0xd, feature, &eax, &ebx, &ecx, &edx);
++    ok = __get_cpuid_count(0xd, __builtin_ctz(feature), &eax, &ebx, &ecx, &edx);
+     assert(ok);
+ 
+     /* Sanity check that the frame stored by the kernel contains the data. */
+-- 
+2.43.0
+

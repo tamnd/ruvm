@@ -1,0 +1,334 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# risugen input for the x86-64 general purpose register instructions, written for ruvm:
+# the integer instructions (INT) and the BMI1, BMI2, ADX, ABM (LZCNT), POPCNT, MOVBE and
+# CRC32 extensions. Generate with --x86_64 and the risugen_x86 patches in
+# scripts/risu/patches, which provide osz(), byteop() and gpr() and act on
+# $_->{pre} and $_->{undef_flags}.
+#
+# gpr() keeps RSP out of every operand and keeps the base register of a memory operand
+# out of the other operands, since its value depends on where the memory block is.
+# $_->{undef_flags} lists the EFLAGS bits the instruction leaves undefined; risugen clears
+# them after the instruction so that the trace only holds defined state.
+# OF=0x800 SF=0x80 ZF=0x40 AF=0x10 PF=0x4 CF=0x1.
+
+.mode x86
+
+#
+# Arithmetic and logic
+#
+
+# ADD, OR, ADC, SBB, AND, SUB, XOR, CMP r/m8,r8 and r8,r/m8
+ALU8 INT 00 op:3 0 d 0 \
+  !constraints { byteop($_); modrm($_); gpr($_) } \
+  !memory { ($d || $op == 7) ? load(size => 1) : store(size => 1); }
+
+# ... r/m,r and r,r/m
+ALU INT 00 op:3 0 d 1 \
+  !constraints { osz($_); modrm($_); gpr($_) } \
+  !memory { ($d || $op == 7) ? load(size => $_->{osz}) : store(size => $_->{osz}); }
+
+# ... AL,imm8
+ALU_AL INT 00 op:3 100 \
+  !constraints { imm($_, width => 8); 1 }
+
+# ... eAX,imm
+ALU_AX INT 00 op:3 101 \
+  !constraints { osz($_); imm($_, width => $_->{osz} == 2 ? 16 : 32); 1 }
+
+# 80 /op ib
+ALU8_I INT 10000000 \
+  !constraints { byteop($_); modrm($_, reg => int(rand(8))); imm($_, width => 8); gpr($_, reg => 0) } \
+  !memory { $_->{modrm}{reg} == 7 ? load(size => 1) : store(size => 1); }
+
+# 81 /op iz
+ALU_I INT 10000001 \
+  !constraints { osz($_); modrm($_, reg => int(rand(8))); imm($_, width => $_->{osz} == 2 ? 16 : 32); gpr($_, reg => 0) } \
+  !memory { $_->{modrm}{reg} == 7 ? load(size => $_->{osz}) : store(size => $_->{osz}); }
+
+# 83 /op ib
+ALU_IB INT 10000011 \
+  !constraints { osz($_); modrm($_, reg => int(rand(8))); imm($_, width => 8); gpr($_, reg => 0) } \
+  !memory { $_->{modrm}{reg} == 7 ? load(size => $_->{osz}) : store(size => $_->{osz}); }
+
+# TEST r/m,r
+TEST8 INT 10000100 \
+  !constraints { byteop($_); modrm($_); gpr($_) } \
+  !memory { load(size => 1); }
+TEST INT 10000101 \
+  !constraints { osz($_); modrm($_); gpr($_) } \
+  !memory { load(size => $_->{osz}); }
+
+# TEST AL,imm8 and eAX,imm
+TEST_AL INT 10101000 \
+  !constraints { imm($_, width => 8); 1 }
+TEST_AX INT 10101001 \
+  !constraints { osz($_); imm($_, width => $_->{osz} == 2 ? 16 : 32); 1 }
+
+# F6 /0 ib, F7 /0 iz: TEST r/m,imm
+TEST8_I INT 11110110 \
+  !constraints { byteop($_); modrm($_, reg => 0); imm($_, width => 8); gpr($_, reg => 0) } \
+  !memory { load(size => 1); }
+TEST_I INT 11110111 \
+  !constraints { osz($_); modrm($_, reg => 0); imm($_, width => $_->{osz} == 2 ? 16 : 32); gpr($_, reg => 0) } \
+  !memory { load(size => $_->{osz}); }
+
+# F6/F7 /2 NOT, /3 NEG
+NOTNEG8 INT 11110110 \
+  !constraints { byteop($_); modrm($_, reg => 2 + int(rand(2))); gpr($_, reg => 0) } \
+  !memory { store(size => 1); }
+NOTNEG INT 11110111 \
+  !constraints { osz($_); modrm($_, reg => 2 + int(rand(2))); gpr($_, reg => 0) } \
+  !memory { store(size => $_->{osz}); }
+
+# FE/FF /0 INC, /1 DEC
+INCDEC8 INT 11111110 \
+  !constraints { byteop($_); modrm($_, reg => int(rand(2))); gpr($_, reg => 0) } \
+  !memory { store(size => 1); }
+INCDEC INT 11111111 \
+  !constraints { osz($_); modrm($_, reg => int(rand(2))); gpr($_, reg => 0) } \
+  !memory { store(size => $_->{osz}); }
+
+#
+# Multiplication and division
+#
+
+# F6/F7 /4 MUL, /5 IMUL: SF, ZF, AF and PF are undefined
+MUL8 INT 11110110 \
+  !constraints { byteop($_); modrm($_, reg => 4 + int(rand(2))); $_->{undef_flags} = 0xd4; gpr($_, reg => 0, implicit => [REG_RAX]) } \
+  !memory { load(size => 1); }
+MUL INT 11110111 \
+  !constraints { osz($_); modrm($_, reg => 4 + int(rand(2))); $_->{undef_flags} = 0xd4; gpr($_, reg => 0, implicit => [REG_RAX, REG_RDX]) } \
+  !memory { load(size => $_->{osz}); }
+
+# IMUL r,r/m
+IMUL2 INT 00001111 10101111 \
+  !constraints { osz($_); modrm($_); $_->{undef_flags} = 0xd4; gpr($_) } \
+  !memory { load(size => $_->{osz}); }
+
+# IMUL r,r/m,imm (69 iz, 6B ib)
+IMUL3 INT 011010 s 1 \
+  !constraints { osz($_); modrm($_); imm($_, width => $s ? 8 : ($_->{osz} == 2 ? 16 : 32)); $_->{undef_flags} = 0xd4; gpr($_) } \
+  !memory { load(size => $_->{osz}); }
+
+# F6/F7 /6 DIV, /7 IDIV, register divisors only. The dividend is set up so that the
+# quotient fits: AX zero extended from AL (MOVZX EAX,AL) or sign extended (CBW) for the
+# byte forms, RDX cleared (XOR EDX,EDX) or sign extended (CWD, CDQ, CQO) for the rest. The
+# divisor has bit 0 set (OR r64,1) so that it is not zero. All flags are undefined.
+DIV8 INT 11110110 \
+  !constraints { byteop($_); my $i = int(rand(2)); modrm($_, reg => 6 + $i); my $r = $_->{modrm}{reg2}; return 0 if !defined $r || $r == REG_RAX; $_->{pre} = [$i ? (0x66, 0x98) : (0x0F, 0xB6, 0xC0), 0x48 | ($r >> 3), 0x83, 0xC8 | ($r & 7), 0x01]; $_->{undef_flags} = 0x8d5; gpr($_, reg => 0) }
+DIV INT 11110111 \
+  !constraints { osz($_); my $i = int(rand(2)); modrm($_, reg => 6 + $i); my $r = $_->{modrm}{reg2}; return 0 if !defined $r || $r == REG_RAX || $r == REG_RDX; my @ext = !$i ? (0x31, 0xD2) : $_->{osz} == 2 ? (0x66, 0x99) : $_->{osz} == 4 ? (0x99) : (0x48, 0x99); $_->{pre} = [@ext, 0x48 | ($r >> 3), 0x83, 0xC8 | ($r & 7), 0x01]; $_->{undef_flags} = 0x8d5; gpr($_, reg => 0) }
+
+#
+# Shifts and rotates
+#
+
+# D0/D1 /n: by 1. AF is undefined after a shift. /6 is not used.
+SHIFT1_8 INT 11010000 \
+  !constraints { byteop($_); my $n = int(rand(7)); $n = 7 if $n == 6; modrm($_, reg => $n); $_->{undef_flags} = 0x10; gpr($_, reg => 0) } \
+  !memory { store(size => 1); }
+SHIFT1 INT 11010001 \
+  !constraints { osz($_); my $n = int(rand(7)); $n = 7 if $n == 6; modrm($_, reg => $n); $_->{undef_flags} = 0x10; gpr($_, reg => 0) } \
+  !memory { store(size => $_->{osz}); }
+
+# D2/D3 /n: by CL. OF is undefined unless the count is 1, AF after a shift.
+SHIFTCL8 INT 11010010 \
+  !constraints { byteop($_); my $n = int(rand(7)); $n = 7 if $n == 6; modrm($_, reg => $n); $_->{undef_flags} = 0x810; gpr($_, reg => 0, implicit => [REG_RCX]) } \
+  !memory { store(size => 1); }
+SHIFTCL INT 11010011 \
+  !constraints { osz($_); my $n = int(rand(7)); $n = 7 if $n == 6; modrm($_, reg => $n); $_->{undef_flags} = 0x810; gpr($_, reg => 0, implicit => [REG_RCX]) } \
+  !memory { store(size => $_->{osz}); }
+
+# C0/C1 /n ib
+SHIFTI8 INT 11000000 \
+  !constraints { byteop($_); my $n = int(rand(7)); $n = 7 if $n == 6; modrm($_, reg => $n); imm($_, width => 8); $_->{undef_flags} = 0x810; gpr($_, reg => 0) } \
+  !memory { store(size => 1); }
+SHIFTI INT 11000001 \
+  !constraints { osz($_); my $n = int(rand(7)); $n = 7 if $n == 6; modrm($_, reg => $n); imm($_, width => 8); $_->{undef_flags} = 0x810; gpr($_, reg => 0) } \
+  !memory { store(size => $_->{osz}); }
+
+# SHLD/SHRD r/m,r,imm8 (0F A4, AC) and r/m,r,CL (0F A5, AD), 32 and 64 bits: the result is
+# undefined for 16-bit operands shifted by more than 16.
+SHXD INT 00001111 1010 r 10 c \
+  !constraints { osz($_, nod16 => 1); modrm($_); imm($_, width => 8) if !$c; $_->{undef_flags} = 0x810; gpr($_, implicit => $c ? [REG_RCX] : []) } \
+  !memory { store(size => $_->{osz}); }
+
+#
+# Bit instructions
+#
+
+# BT, BTS, BTR, BTC r/m,r (0F A3, AB, B3, BB), register forms only: a register bit offset
+# can address memory outside the block. Only CF is defined.
+BT INT 00001111 101 op:2 011 \
+  !constraints { osz($_); modrm($_); return 0 if !defined $_->{modrm}{reg2}; $_->{undef_flags} = 0x8d4; gpr($_) }
+
+# 0F BA /4-7 ib: BT, BTS, BTR, BTC r/m,imm8
+BT_I INT 00001111 10111010 \
+  !constraints { osz($_); modrm($_, reg => 4 + int(rand(4))); imm($_, width => 8); $_->{undef_flags} = 0x8d4; gpr($_, reg => 0) } \
+  !memory { $_->{modrm}{reg} == 4 ? load(size => $_->{osz}) : store(size => $_->{osz}); }
+
+# BSF, BSR (0F BC, BD): only ZF is defined.
+BSFR INT 00001111 1011110 r \
+  !constraints { osz($_); modrm($_); $_->{undef_flags} = 0x895; gpr($_) } \
+  !memory { load(size => $_->{osz}); }
+
+# SETcc r/m8
+SETCC INT 00001111 1001 cc:4 \
+  !constraints { byteop($_); modrm($_, reg => 0); gpr($_, reg => 0) } \
+  !memory { store(size => 1); }
+
+# CMOVcc r,r/m
+CMOVCC INT 00001111 0100 cc:4 \
+  !constraints { osz($_); modrm($_); gpr($_) } \
+  !memory { load(size => $_->{osz}); }
+
+#
+# Data movement
+#
+
+# MOV r/m8,r8 and r8,r/m8
+MOV8 INT 100010 d 0 \
+  !constraints { byteop($_); modrm($_); gpr($_) } \
+  !memory { $d ? load(size => 1) : store(size => 1); }
+MOV INT 100010 d 1 \
+  !constraints { osz($_); modrm($_); gpr($_) } \
+  !memory { $d ? load(size => $_->{osz}) : store(size => $_->{osz}); }
+
+# C6/C7 /0: MOV r/m,imm
+MOV8_I INT 11000110 \
+  !constraints { byteop($_); modrm($_, reg => 0); imm($_, width => 8); gpr($_, reg => 0) } \
+  !memory { store(size => 1); }
+MOV_I INT 11000111 \
+  !constraints { osz($_); modrm($_, reg => 0); imm($_, width => $_->{osz} == 2 ? 16 : 32); gpr($_, reg => 0) } \
+  !memory { store(size => $_->{osz}); }
+
+# B8+r: MOV r,imm16/32/64 (registers 0 to 7, not RSP)
+MOV_RI INT 10111 r:3 \
+  !constraints { return 0 if $r == REG_RSP; osz($_); imm($_, width => 8 * $_->{osz}); 1 }
+
+# MOVZX, MOVSX r,r/m8 and r,r/m16 (0F B6, B7, BE, BF)
+MOVX INT 00001111 1011 s 11 w \
+  !constraints { osz($_); modrm($_); gpr($_) } \
+  !memory { load(size => $w ? 2 : 1); }
+
+# MOVSXD r64,r/m32
+MOVSXD INT 01100011 \
+  !constraints { rex($_, w => 1); modrm($_); gpr($_) } \
+  !memory { load(size => 4); }
+
+# XCHG r/m,r
+XCHG8 INT 10000110 \
+  !constraints { byteop($_); modrm($_); gpr($_) } \
+  !memory { store(size => 1); }
+XCHG INT 10000111 \
+  !constraints { osz($_); modrm($_); gpr($_) } \
+  !memory { store(size => $_->{osz}); }
+
+# XADD r/m,r (0F C0, C1)
+XADD8 INT 00001111 11000000 \
+  !constraints { byteop($_); modrm($_); gpr($_) } \
+  !memory { store(size => 1); }
+XADD INT 00001111 11000001 \
+  !constraints { osz($_); modrm($_); gpr($_) } \
+  !memory { store(size => $_->{osz}); }
+
+# CMPXCHG r/m,r (0F B0, B1)
+CMPXCHG8 INT 00001111 10110000 \
+  !constraints { byteop($_); modrm($_); gpr($_, implicit => [REG_RAX]) } \
+  !memory { store(size => 1); }
+CMPXCHG INT 00001111 10110001 \
+  !constraints { osz($_); modrm($_); gpr($_, implicit => [REG_RAX]) } \
+  !memory { store(size => $_->{osz}); }
+
+# BSWAP r32/r64 (registers 0 to 7, not RSP): undefined for 16 bits
+BSWAP INT 00001111 11001 r:3 \
+  !constraints { return 0 if $r == REG_RSP; osz($_, nod16 => 1); 1 }
+
+# CBW/CWDE/CDQE, CWD/CDQ/CQO
+CXX INT 1001100 c \
+  !constraints { osz($_); 1 }
+
+# SAHF, LAHF
+AHF INT 1001111 l
+
+# CMC, CLC, STC
+CMC INT 11110101
+CLSTC INT 1111100 s
+
+#
+# BMI1, BMI2, ADX, ABM, POPCNT, MOVBE and CRC32
+#
+
+# ANDN r,vvvv,r/m: AF and PF are undefined
+ANDN BMI1 11110010 \
+  !constraints { vex($_, m => 0x0F38, l => 128); modrm($_); $_->{undef_flags} = 0x14; gpr($_, v => 1) } \
+  !memory { load(size => $_->{vex}{w} ? 8 : 4); }
+
+# BEXTR r,r/m,vvvv: AF, SF and PF are undefined
+BEXTR BMI1 11110111 \
+  !constraints { vex($_, m => 0x0F38, l => 128); modrm($_); $_->{undef_flags} = 0x94; gpr($_, v => 1) } \
+  !memory { load(size => $_->{vex}{w} ? 8 : 4); }
+
+# VEX F3 /1 BLSR, /2 BLSMSK, /3 BLSI vvvv,r/m: AF and PF are undefined
+BLS BMI1 11110011 \
+  !constraints { vex($_, m => 0x0F38, l => 128); modrm($_, reg => 1 + int(rand(3))); $_->{undef_flags} = 0x14; gpr($_, reg => 0, v => 1) } \
+  !memory { load(size => $_->{vex}{w} ? 8 : 4); }
+
+# TZCNT (F3 0F BC): OF, SF, AF and PF are undefined
+TZCNT BMI1 00001111 10111100 \
+  !constraints { rep($_); osz($_); modrm($_); $_->{undef_flags} = 0x894; gpr($_) } \
+  !memory { load(size => $_->{osz}); }
+
+# LZCNT (F3 0F BD)
+LZCNT ABM 00001111 10111101 \
+  !constraints { rep($_); osz($_); modrm($_); $_->{undef_flags} = 0x894; gpr($_) } \
+  !memory { load(size => $_->{osz}); }
+
+# POPCNT (F3 0F B8)
+POPCNT POPCNT 00001111 10111000 \
+  !constraints { rep($_); osz($_); modrm($_); gpr($_) } \
+  !memory { load(size => $_->{osz}); }
+
+# BZHI r,r/m,vvvv: AF and PF are undefined
+BZHI BMI2 11110101 \
+  !constraints { vex($_, m => 0x0F38, l => 128); modrm($_); $_->{undef_flags} = 0x14; gpr($_, v => 1) } \
+  !memory { load(size => $_->{vex}{w} ? 8 : 4); }
+
+# PDEP (F2), PEXT (F3) r,vvvv,r/m
+PDEPEXT BMI2 11110101 \
+  !constraints { vex($_, m => 0x0F38, l => 128, p => (rand(2) < 1 ? 0xF2 : 0xF3)); modrm($_); gpr($_, v => 1) } \
+  !memory { load(size => $_->{vex}{w} ? 8 : 4); }
+
+# MULX r,vvvv,r/m with RDX: the two destinations differ
+MULX BMI2 11110110 \
+  !constraints { vex($_, m => 0x0F38, l => 128, p => 0xF2); modrm($_); return 0 if $_->{modrm}{reg} == $_->{vex}{v}; gpr($_, v => 1, implicit => [REG_RDX]) } \
+  !memory { load(size => $_->{vex}{w} ? 8 : 4); }
+
+# RORX r,r/m,imm8
+RORX BMI2 11110000 \
+  !constraints { vex($_, m => 0x0F3A, l => 128, p => 0xF2, v => 0); modrm($_); imm($_, width => 8); gpr($_) } \
+  !memory { load(size => $_->{vex}{w} ? 8 : 4); }
+
+# SARX (F3), SHLX (66), SHRX (F2) r,r/m,vvvv
+SHIFTX BMI2 11110111 \
+  !constraints { my @p = (0xF3, 0x66, 0xF2); vex($_, m => 0x0F38, l => 128, p => $p[int(rand(3))]); modrm($_); gpr($_, v => 1) } \
+  !memory { load(size => $_->{vex}{w} ? 8 : 4); }
+
+# ADCX (66 0F 38 F6), ADOX (F3 0F 38 F6), 32 and 64 bits
+ADX ADX 00001111 00111000 11110110 \
+  !constraints { rand(2) < 1 ? data16($_) : rep($_); rex($_, w => 1) if rand(2) < 1; $_->{osz} = defined $_->{rex} ? 8 : 4; modrm($_); gpr($_) } \
+  !memory { load(size => $_->{osz}); }
+
+# MOVBE r,m and m,r (0F 38 F0, F1)
+MOVBE MOVBE 00001111 00111000 1111000 d \
+  !constraints { osz($_); modrm($_); return 0 if defined $_->{modrm}{reg2}; gpr($_) } \
+  !memory { $d ? store(size => $_->{osz}) : load(size => $_->{osz}); }
+
+# CRC32 r32/r64,r/m8 and r/m16/32/64 (F2 0F 38 F0, F1)
+CRC32_8 CRC32 00001111 00111000 11110000 \
+  !constraints { repne($_); rex($_, w => int(rand(2))); modrm($_); gpr($_) } \
+  !memory { load(size => 1); }
+CRC32 CRC32 00001111 00111000 11110001 \
+  !constraints { repne($_); osz($_); modrm($_); gpr($_) } \
+  !memory { load(size => $_->{osz}); }

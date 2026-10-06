@@ -1,0 +1,46 @@
+From e2fee67bd98dbae40fc5a0110abc772f371e3243 Mon Sep 17 00:00:00 2001
+From: ruvm <ruvm@localhost>
+Date: Mon, 5 Oct 2026 11:29:36 +0200
+Subject: [PATCH 2/4] risu: report a fatal signal in the image with its offset
+ and registers
+
+---
+ risu.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/risu.c b/risu.c
+index c28b4a5..aa64ab4 100644
+--- a/risu.c
++++ b/risu.c
+@@ -323,8 +323,28 @@ static void apprentice_sigill(int sig, siginfo_t *si, void *uc)
+     }
+ }
+ 
++/* ruvm: report a fatal signal in the image with the faulting PC as an offset. */
++static void fatal_signal(int sig, siginfo_t *si, void *vuc)
++{
++    static struct reginfo r;
++    reginfo_init(&r, vuc, si->si_addr);
++    fprintf(stderr, "risu: signal %d at image offset 0x%" PRIxPTR ", si_addr %p\n",
++            sig, get_pc(&r), si->si_addr);
++    reginfo_dump(&r, stderr);
++    _exit(EXIT_FAILURE);
++}
++
+ static void set_sigill_handler(void (*fn) (int, siginfo_t *, void *))
+ {
++    struct sigaction fa;
++    memset(&fa, 0, sizeof(fa));
++    fa.sa_sigaction = fatal_signal;
++    fa.sa_flags = SA_SIGINFO | SA_ONSTACK;
++    sigemptyset(&fa.sa_mask);
++    sigaction(SIGSEGV, &fa, 0);
++    sigaction(SIGBUS, &fa, 0);
++    sigaction(SIGFPE, &fa, 0);
++
+     struct sigaction sa;
+     memset(&sa, 0, sizeof(struct sigaction));
+ 
+-- 
+2.43.0
+
