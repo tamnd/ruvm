@@ -337,9 +337,9 @@ fn build(seed: u64, init64: &[u64], init32: &[u32], consts: bool) -> Func {
     let mut f = Func::new(FuncConfig::default());
     let env = f.env();
     let mut v64: Vec<TempI64> =
-        (0..N64).map(|i| f.global_mem_new_i64(env, G64 + 8 * i as i64, &format!("r{i}"))).collect();
+        (0..N64).map(|i| f.global_mem_new_i64(env, G64 + 8 * i as i64, format!("r{i}"))).collect();
     let mut v32: Vec<TempI32> =
-        (0..N32).map(|i| f.global_mem_new_i32(env, G32 + 4 * i as i64, &format!("w{i}"))).collect();
+        (0..N32).map(|i| f.global_mem_new_i32(env, G32 + 4 * i as i64, format!("w{i}"))).collect();
     if consts {
         for (t, &v) in v64.iter().zip(init64) {
             f.gen_movi_i64(*t, v as i64);

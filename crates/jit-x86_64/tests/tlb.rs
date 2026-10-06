@@ -140,7 +140,7 @@ fn ldst_block(addr_type: Type) -> Func {
     let mut f = Func::new(FuncConfig { addr_type, ..FuncConfig::default() });
     let env = f.env();
     let r: Vec<TempI64> =
-        (0..6).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, &format!("r{i}"))).collect();
+        (0..6).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, format!("r{i}"))).collect();
     let w = f.global_mem_new_i32(env, 0x140, "w");
     let at = |f: &mut Func, a: u64| -> Temp {
         if addr_type == Type::I32 {
@@ -320,7 +320,7 @@ fn a_resize_during_a_block_is_seen_by_the_next_access() {
     let mut f = Func::new(FuncConfig::default());
     let env = f.env();
     let r: Vec<TempI64> =
-        (0..3).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, &format!("r{i}"))).collect();
+        (0..3).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, format!("r{i}"))).collect();
     let a = f.constant_i64((GUEST + 0x80) as i64);
     f.gen_qemu_ld_i64(r[0], a, 0, MemOp::UQ);
     let h = f.helper(info);
@@ -390,7 +390,7 @@ fn a_miss_is_served_in_the_instruction_of_the_access() {
     let mut f = Func::new(FuncConfig::default());
     let env = f.env();
     let r: Vec<TempI64> =
-        (0..3).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, &format!("r{i}"))).collect();
+        (0..3).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, format!("r{i}"))).collect();
     for (i, addr) in [GUEST + 8, GUEST + PAGE + 0x10, 0x10].into_iter().enumerate() {
         f.gen_insn_start(&[0x10 * (i as u64 + 1), 0, 0]);
         let a = f.constant_i64(addr as i64);
@@ -422,7 +422,7 @@ fn pair_block(parallel: bool) -> Func {
     let env = f.env();
     let base = f.global_mem_new_i64(env, 0x180, "base");
     let r: Vec<TempI64> =
-        (0..6).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, &format!("r{i}"))).collect();
+        (0..6).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, format!("r{i}"))).collect();
     let pair = MemOp::MO_128.or(MemOp::ATOM_IFALIGN_PAIR);
     let load = |f: &mut Func, off: i64, mop: MemOp, lo: TempI64, hi: TempI64| {
         // The address dies at the load, so the allocator may reuse its register for a half.

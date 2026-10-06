@@ -26,12 +26,19 @@
 //!   block, before a conditional branch and around calls, this allocator syncs them, so a
 //!   function with stale `op.life` still produces correct code, just slower code.
 //! - Register pairs (`TCG_CT_PAIR`) are not supported; no target here needs them.
+//! - A global that may have been set since the last point every global was in memory, and that
+//!   the fall through path of a conditional branch sets again before reading it, is not stored
+//!   before the branch as QEMU's `la_global_sync()` asks. [`liveness`] keeps it live up to the
+//!   branch, and a target that opts in ([`Target::out_of_line_branches`]) gets the branch
+//!   pointed at a stub emitted after the function, which stores it and jumps to the real label.
+//!   The fall through path then never stores it. Without the opt in the branch stores it in
+//!   line.
 //! - Helper calls pass every argument through memory: the target says where each argument
 //!   word goes ([`Target::call_arg_home`]) and results come back the same way.
 
 use std::collections::HashMap;
 
-use crate::ir::{DEAD_ARG, Func, MAX_OP_ARGS, Op, OpId, SYNC_ARG, Temp, TempData};
+use crate::ir::{DEAD_ARG, Func, Label, MAX_OP_ARGS, Op, OpId, SYNC_ARG, Temp, TempData};
 use crate::opcode::Opcode;
 use crate::types::{Cond, TempKind, Type, call_flags, dup_const, opf};
 
@@ -286,6 +293,27 @@ pub trait Target {
     fn call_arg_home(&self, idx: usize) -> (Reg, i64);
     /// Emit the call itself, once the arguments are stored.
     fn out_call(&mut self, f: &Func, op: &Op) -> Result<(), Self::Error>;
+
+    /// Whether the target accepts labels numbered from [`Func::nb_labels`] up in `set_label`,
+    /// `br` and `brcond`, so the allocator can send the taken edge of a conditional branch
+    /// through a stub that stores the dirty globals. Without it a branch stores them in line.
+    fn out_of_line_branches(&self) -> bool {
+        false
+    }
+}
+
+/// The taken edge of a conditional branch, emitted after the function: the stores that bring
+/// the globals the branch left dirty back to memory, then a jump to the branch's own label.
+#[derive(Debug)]
+struct BranchStub {
+    /// The label the branch was pointed at instead.
+    label: u32,
+    /// The branch's label.
+    target: Label,
+    /// Globals in registers: type, register, and memory home.
+    regs: Vec<(Type, Reg, Reg, i64)>,
+    /// Globals holding a constant: type, value, and memory home.
+    consts: Vec<(Type, i64, Reg, i64)>,
 }
 
 /// The allocator state for one function.
@@ -297,6 +325,10 @@ pub struct RegAlloc<'f> {
     reg_to_temp: [Option<Temp>; 64],
     reserved: RegSet,
     cache: HashMap<(usize, &'static [&'static str]), Vec<ArgConstraint>>,
+    stubs: Vec<BranchStub>,
+    next_label: u32,
+    /// For each conditional branch, the globals that are dead on its fall through path.
+    drops: Drops,
 }
 
 fn readonly(td: &TempData) -> bool {
@@ -307,10 +339,25 @@ fn readonly(td: &TempData) -> bool {
 /// must be up to date; see [`liveness`].
 pub fn reg_alloc<T: Target>(f: &Func, t: &mut T) -> Result<(), T::Error> {
     let mut ra = RegAlloc::new(f, t);
+    if t.out_of_line_branches() {
+        ra.drops = scan(f, &|f, op| t.extra_op_flags(f, op)).1;
+    }
+    let mut last = None;
     for (id, op) in f.ops() {
         ra.op(t, id, op)?;
+        last = Some(id);
     }
-    Ok(())
+    match last {
+        Some(id) => ra.out_stubs(t, id),
+        None => Ok(()),
+    }
+}
+
+/// A `set_label` or `br` op naming label `id`.
+fn label_op(opc: Opcode, id: u32) -> Op {
+    let mut args = [0; MAX_OP_ARGS];
+    args[0] = u64::from(id);
+    Op { opc, ty: Type::I64, vece: 0, flags: 0, callo: 0, calli: 0, life: 0, nargs: 1, args }
 }
 
 impl<'f> RegAlloc<'f> {
@@ -332,6 +379,9 @@ impl<'f> RegAlloc<'f> {
             reg_to_temp: [None; 64],
             reserved: t.reserved_regs(),
             cache: HashMap::new(),
+            stubs: Vec::new(),
+            next_label: f.nb_labels() as u32,
+            drops: HashMap::new(),
         }
     }
 
@@ -564,6 +614,99 @@ impl<'f> RegAlloc<'f> {
         }
     }
 
+    /// The out of line half of [`Self::cbranch`]: syncs TB temps and any global that is not a
+    /// plain integer in line, and returns the label of a stub that stores the rest, if any are
+    /// dirty. The fall through path keeps them in registers unless it no longer needs them.
+    fn cbranch_stub<T: Target>(
+        &mut self,
+        tg: &mut T,
+        id: OpId,
+        allocated: RegSet,
+        target: Label,
+    ) -> Option<u32> {
+        for i in 0..self.f.nb_temps() {
+            let t = Temp::from_index(i);
+            let td = self.td(t);
+            let global = i < self.f.nb_globals();
+            if td.kind == TempKind::Tb || (global && !matches!(td.ty, Type::I32 | Type::I64)) {
+                self.sync(tg, t, allocated, RegSet::EMPTY, 0);
+            }
+        }
+        // Collect only now: syncing a constant above may have spilled a register.
+        let mut regs = Vec::new();
+        let mut consts = Vec::new();
+        for i in 0..self.f.nb_globals() {
+            let t = Temp::from_index(i);
+            let td = self.td(t);
+            if readonly(td) || self.coherent[i] {
+                continue;
+            }
+            match self.val[i] {
+                Val::Reg(r) => {
+                    let (base, off) = tg.temp_home(self.f, t);
+                    regs.push((td.ty, r, base, off));
+                }
+                Val::Const(v) => {
+                    let (base, off) = tg.temp_home(self.f, t);
+                    consts.push((td.ty, v, base, off));
+                }
+                Val::Mem | Val::Dead => {}
+            }
+        }
+        // A global the fall through path sets again before reading it or needing it in
+        // memory gives up its register there; only the stub stores it.
+        if let Some(dead) = self.drops.remove(&id) {
+            for t in dead {
+                self.dead(t);
+            }
+        }
+        if regs.is_empty() && consts.is_empty() {
+            return None;
+        }
+        let label = self.next_label;
+        self.next_label += 1;
+        self.stubs.push(BranchStub { label, target, regs, consts });
+        Some(label)
+    }
+
+    /// Emit the [`BranchStub`]s after the last op, behind a jump in case the function falls
+    /// off its end.
+    fn out_stubs<T: Target>(&mut self, tg: &mut T, id: OpId) -> Result<(), T::Error> {
+        if self.stubs.is_empty() {
+            return Ok(());
+        }
+        let end = self.next_label;
+        self.next_label += 1;
+        let br = label_op(Opcode::Br, end);
+        tg.out_op(self.f, id, &br, &br.args[..1], &[true])?;
+        let scratch = tg
+            .alloc_order()
+            .iter()
+            .copied()
+            .find(|&r| !self.reserved.contains(r) && tg.available_regs(Type::I64).contains(r));
+        for s in std::mem::take(&mut self.stubs) {
+            let set = label_op(Opcode::SetLabel, s.label);
+            tg.out_op(self.f, id, &set, &set.args[..1], &[true])?;
+            for &(ty, r, base, off) in &s.regs {
+                tg.out_st(ty, r, base, off);
+            }
+            // The registers are all stored, so any of them can carry a constant.
+            for &(ty, v, base, off) in &s.consts {
+                if !tg.out_sti(ty, v, base, off) {
+                    let Some(r) = scratch else {
+                        return Err(tg.bad_ir("no register to store a constant global".into()));
+                    };
+                    tg.out_movi(ty, r, v);
+                    tg.out_st(ty, r, base, off);
+                }
+            }
+            let br = label_op(Opcode::Br, s.target.id());
+            tg.out_op(self.f, id, &br, &br.args[..1], &[true])?;
+        }
+        let set = label_op(Opcode::SetLabel, end);
+        tg.out_op(self.f, id, &set, &set.args[..1], &[true])
+    }
+
     fn op<T: Target>(&mut self, tg: &mut T, id: OpId, op: &Op) -> Result<(), T::Error> {
         match op.opc {
             Opcode::Mov | Opcode::MovVec => {
@@ -775,8 +918,13 @@ impl<'f> RegAlloc<'f> {
             }
         }
 
+        let mut stub = None;
         if flags & opf::COND_BRANCH != 0 {
-            self.cbranch(tg, i_allocated);
+            if op.opc == Opcode::Brcond && tg.out_of_line_branches() {
+                stub = self.cbranch_stub(tg, id, i_allocated, op.arg_label(3));
+            } else {
+                self.cbranch(tg, i_allocated);
+            }
         } else if flags & opf::BB_END != 0 {
             self.bb_end(tg, i_allocated);
         } else {
@@ -816,7 +964,14 @@ impl<'f> RegAlloc<'f> {
             }
         }
 
-        tg.out_op(self.f, id, op, &new_args[..nargs], &const_args[..nargs])?;
+        match stub {
+            Some(l) => {
+                let mut op = *op;
+                op.args[3] = u64::from(l);
+                tg.out_op(self.f, id, &op, &new_args[..nargs], &const_args[..nargs])?;
+            }
+            None => tg.out_op(self.f, id, op, &new_args[..nargs], &const_args[..nargs])?,
+        }
 
         for i in 0..nb_oargs {
             let ts = op.arg_temp(i);
@@ -900,6 +1055,66 @@ const TS_MEM: u8 = 2;
 /// Compute `op.life` for every op, `liveness_pass_1` without its rewrites: no op is removed
 /// or lowered. `extra_flags` adds target flags to an op, as [`Target::extra_op_flags`] does.
 pub fn liveness(f: &mut Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) {
+    let (lives, _) = scan(f, extra_flags);
+    for (id, life) in lives {
+        f.op_mut(id).life = life;
+    }
+}
+
+/// The pass behind [`liveness`]: `op.life` for every op, and for each conditional branch the
+/// globals its fall through path neither reads nor needs in memory before setting them again.
+/// The globals each conditional branch leaves for its stub to store, which the fall through
+/// path frees after the branch.
+type Drops = HashMap<OpId, Vec<Temp>>;
+
+/// Finds, for each conditional branch, the globals that may have been written since the
+/// last point where every global was forced to memory. Only these can be dirty at the
+/// branch, so only these need to stay live until it.
+fn written_globals(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> HashMap<OpId, Vec<usize>> {
+    let ng = f.nb_globals();
+    let global = |t: Temp| t.index() < ng && f.temp(t).kind == TempKind::Global;
+    let mut map = HashMap::new();
+    let mut written = vec![false; ng];
+    let mut cur = f.first_op();
+    while let Some(id) = cur {
+        cur = f.next_op(id);
+        let op = f.op(id);
+        let no = match op.opc {
+            Opcode::Call => {
+                let flags = f.helper_info(op.call_helper()).flags;
+                if flags & call_flags::NO_READ_GLOBALS == 0 {
+                    written.fill(false);
+                }
+                op.callo as usize
+            }
+            Opcode::InsnStart | Opcode::Discard => 0,
+            _ => {
+                let def = op.opc.def();
+                let flags = def.flags | extra_flags(f, op);
+                if flags & opf::COND_BRANCH != 0 {
+                    let w: Vec<usize> = (0..ng).filter(|&i| written[i]).collect();
+                    if !w.is_empty() {
+                        map.insert(id, w);
+                    }
+                } else if flags & (opf::BB_END | opf::BB_EXIT | opf::SIDE_EFFECTS) != 0 {
+                    written.fill(false);
+                }
+                def.nb_oargs as usize
+            }
+        };
+        for i in 0..no {
+            let t = op.arg_temp(i);
+            if global(t) {
+                written[t.index()] = true;
+            }
+        }
+    }
+    map
+}
+
+fn scan(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> (Vec<(OpId, u32)>, Drops) {
+    let mut lives = Vec::new();
+    let mut drops = HashMap::new();
     let ng = f.nb_globals();
     let kinds: Vec<TempKind> = f.temps().iter().map(|t| t.kind).collect();
     let nt = kinds.len();
@@ -915,6 +1130,7 @@ pub fn liveness(f: &mut Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) {
         }
     };
     func_end(&mut st);
+    let written = written_globals(f, extra_flags);
 
     let mut cur = f.last_op();
     while let Some(id) = cur {
@@ -973,7 +1189,19 @@ pub fn liveness(f: &mut Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) {
                 if flags & opf::BB_EXIT != 0 {
                     func_end(&mut st);
                 } else if flags & opf::COND_BRANCH != 0 {
+                    // A global that may be dirty here and is dead on the fallthrough is left
+                    // in its register for the branch's stub to store, saving the store on the
+                    // fallthrough. The others must be in memory, as in QEMU.
+                    let dirty = written.get(&id).map(Vec::as_slice).unwrap_or_default();
+                    let dead: Vec<usize> =
+                        dirty.iter().copied().filter(|&i| st[i] == TS_DEAD).collect();
                     global_sync(&mut st);
+                    for &i in &dead {
+                        st[i] = 0;
+                    }
+                    if !dead.is_empty() {
+                        drops.insert(id, dead.into_iter().map(Temp::from_index).collect());
+                    }
                     for (s, k) in st.iter_mut().zip(&kinds).skip(ng) {
                         if *k == TempKind::Tb {
                             *s |= TS_MEM;
@@ -999,8 +1227,9 @@ pub fn liveness(f: &mut Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) {
                 }
             }
         }
-        f.op_mut(id).life = life;
+        lives.push((id, life));
     }
+    (lives, drops)
 }
 
 /// Get a copy of `f` ready for [`reg_alloc`]: indirect globals lowered to explicit loads and

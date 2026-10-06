@@ -503,9 +503,9 @@ fn build_with(seed: u64, extra: usize, call: Option<&HelperInfo>) -> Func {
     let mut f = Func::new(FuncConfig::default());
     let env = f.env();
     let mut v64: Vec<TempI64> =
-        (0..N64).map(|i| f.global_mem_new_i64(env, G64 + 8 * i as i64, &format!("r{i}"))).collect();
+        (0..N64).map(|i| f.global_mem_new_i64(env, G64 + 8 * i as i64, format!("r{i}"))).collect();
     let mut v32: Vec<TempI32> =
-        (0..N32).map(|i| f.global_mem_new_i32(env, G32 + 4 * i as i64, &format!("w{i}"))).collect();
+        (0..N32).map(|i| f.global_mem_new_i32(env, G32 + 4 * i as i64, format!("w{i}"))).collect();
     let mut init = Rng::new(seed ^ 0x5eed);
     for i in 0..extra {
         let t = f.temp_new_i64();
@@ -705,7 +705,7 @@ fn guest_memory() {
     let mut f = Func::new(FuncConfig::default());
     let env = f.env();
     let r: Vec<TempI64> =
-        (0..6).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, &format!("r{i}"))).collect();
+        (0..6).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, format!("r{i}"))).collect();
     let w = f.global_mem_new_i32(env, 0x140, "w");
     let a = f.constant_i64(MEM_BASE as i64);
     f.gen_qemu_ld_i64(r[0], a, 0, MemOp::UQ);
@@ -958,9 +958,9 @@ fn build_vec(seed: u64, n64: usize, n128: usize) -> Func {
     let mut f = Func::new(FuncConfig::default());
     let env = f.env();
     let s64: Vec<TempI64> =
-        (0..N64).map(|i| f.global_mem_new_i64(env, G64 + 8 * i as i64, &format!("r{i}"))).collect();
+        (0..N64).map(|i| f.global_mem_new_i64(env, G64 + 8 * i as i64, format!("r{i}"))).collect();
     let s32: Vec<TempI32> =
-        (0..N32).map(|i| f.global_mem_new_i32(env, G32 + 4 * i as i64, &format!("w{i}"))).collect();
+        (0..N32).map(|i| f.global_mem_new_i32(env, G32 + 4 * i as i64, format!("w{i}"))).collect();
     let mut g =
         VGen { f: &mut f, rng: Rng::new(seed), v64: Vec::new(), v128: Vec::new(), s64, s32 };
     for i in 0..n64 + n128 {

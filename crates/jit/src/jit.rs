@@ -181,7 +181,8 @@ impl Jit {
     ) -> Vcpu {
         let jit = self.self_ref.upgrade().expect("Jit is alive");
         let mut cpus = self.cpus.write().unwrap_or_else(|e| e.into_inner());
-        let cpu_index = cpus.len();
+        // cpu_get_free_index(): one past the highest index in use, as vCPUs can leave the list.
+        let cpu_index = cpus.iter().map(|c| c.cpu_index + 1).max().unwrap_or(0);
         let halt = if self.config.mttcg {
             Arc::new((Mutex::new(()), Condvar::new()))
         } else {
@@ -196,6 +197,12 @@ impl Jit {
         let mut env = vec![0u8; ENV_TARGET_OFFSET + env_size];
         env[crate::ENV_CAN_DO_IO_OFFSET as usize] = 1;
         Vcpu { env, core: CpuCore::new(jit, shared, ops, as_, tcg_cflags) }
+    }
+
+    /// `cpu_list_remove()`: take `cpu` off the CPU list.
+    pub(crate) fn cpu_list_remove(&self, cpu: &Arc<CpuShared>) {
+        let mut cpus = self.cpus.write().unwrap_or_else(|e| e.into_inner());
+        cpus.retain(|c| !Arc::ptr_eq(c, cpu));
     }
 
     /// The vCPUs, `CPU_FOREACH`.

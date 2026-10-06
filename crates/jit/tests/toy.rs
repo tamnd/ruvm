@@ -554,6 +554,31 @@ fn straight_line_and_stop() {
     assert_eq!(w.jit.tb_count(), 1);
 }
 
+/// A vCPU leaves the CPU list, and frees its TLB, when it is dropped, so creating one per test
+/// case does not grow without bound. A new one takes the lowest free index.
+#[test]
+fn dropped_vcpus_leave_the_cpu_list() {
+    let w = world(JitConfig::default());
+    let mut a = Asm::new(0x1000);
+    a.li(1, 5).stop();
+    a.load(&w.as_);
+    for _ in 0..500 {
+        let mut v = w.vcpu(0x1000);
+        assert_eq!(run(&mut v), excp::DEBUG);
+        assert_eq!(v.shared().cpu_index, 0);
+        assert_eq!(w.jit.cpu_list().len(), 1);
+    }
+    assert!(w.jit.cpu_list().is_empty());
+    let a = w.vcpu(0x1000);
+    let b = w.vcpu(0x1000);
+    let c = w.vcpu(0x1000);
+    drop(b);
+    assert_eq!(w.jit.cpu_list().len(), 2);
+    let d = w.vcpu(0x1000);
+    assert_eq!([a.shared().cpu_index, c.shared().cpu_index, d.shared().cpu_index], [0, 2, 3]);
+    assert_eq!(w.jit.tb_count(), 1);
+}
+
 fn counting_loop(w: &World, n: i32) -> Vcpu {
     let mut a = Asm::new(0x1000);
     a.li(1, 0).li(2, n);

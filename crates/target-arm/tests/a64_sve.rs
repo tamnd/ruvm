@@ -366,6 +366,8 @@ fn run_vq(vq: usize, lines: &[&str]) -> Vec<String> {
             bad.push(format!("vq {vq} {asm}: got {}\n    want {}", diffs.join(" "), outs.trim()));
         }
     }
+    // Each case's vCPU is gone with its TLB, so a long run does not pile them up.
+    assert!(w.jit.cpu_list().is_empty() && w_p1.jit.cpu_list().is_empty());
     bad
 }
 
