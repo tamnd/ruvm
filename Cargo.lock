@@ -871,8 +871,10 @@ dependencies = [
  "ruvm-jit",
  "ruvm-jit-core",
  "ruvm-mem",
+ "ruvm-migration",
  "ruvm-target-x86",
  "ruvm-virtio-queue",
+ "ruvm-vmstate",
  "vmm-sys-util",
 ]
 
@@ -892,6 +894,12 @@ version = "0.4.0"
 [[package]]
 name = "ruvm-migration"
 version = "0.4.0"
+dependencies = [
+ "ruvm-base",
+ "ruvm-mem",
+ "ruvm-qapi",
+ "ruvm-vmstate",
+]
 
 [[package]]
 name = "ruvm-monitor"
@@ -1021,6 +1029,7 @@ dependencies = [
  "ruvm-machine-arm",
  "ruvm-machine-x86",
  "ruvm-mem",
+ "ruvm-migration",
  "ruvm-monitor",
  "ruvm-qapi",
  "ruvm-qapi-gen",

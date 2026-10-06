@@ -854,3 +854,75 @@ fn post_save_runs_after_a_failed_save() {
     assert_eq!(e.message(), "Save of field short/buf failed: buffer of 2 bytes cannot supply 4");
     assert!(state.0);
 }
+
+#[derive(Default)]
+struct DescSeg {
+    selector: u32,
+    base: u64,
+}
+
+#[derive(Default)]
+struct DescCpu {
+    segs: [DescSeg; 3],
+    regs: [u64; 2],
+    flags: u32,
+    extra: u8,
+}
+
+static VMSTATE_DESC_SEG: Vmsd<DescSeg> = LazyLock::new(|| {
+    VmStateDescription::new("segment").version_id(1).minimum_version_id(1).fields([
+        VmStateField::scalar("selector", |s: &mut DescSeg| &mut s.selector),
+        VmStateField::scalar("base", |s: &mut DescSeg| &mut s.base),
+    ])
+});
+
+static VMSTATE_DESC_CPU_EXTRA: Vmsd<DescCpu> = LazyLock::new(|| {
+    VmStateDescription::new("cpu/extra")
+        .version_id(1)
+        .minimum_version_id(1)
+        .needed(|s: &DescCpu| s.extra != 0)
+        .field(VmStateField::scalar("extra", |s: &mut DescCpu| &mut s.extra))
+});
+
+static VMSTATE_DESC_CPU: Vmsd<DescCpu> = LazyLock::new(|| {
+    VmStateDescription::new("cpu")
+        .version_id(3)
+        .minimum_version_id(1)
+        .fields([
+            VmStateField::struct_array("segs", &VMSTATE_DESC_SEG, |s: &mut DescCpu| &mut s.segs),
+            VmStateField::array("regs", |s: &mut DescCpu| &mut s.regs),
+            VmStateField::scalar("flags", |s: &mut DescCpu| &mut s.flags),
+            VmStateField::scalar("flags", |s: &mut DescCpu| &mut s.flags).test(|_, _| true),
+        ])
+        .subsection(&VMSTATE_DESC_CPU_EXTRA)
+});
+
+/// The vmdesc follows `vmstate_save_vmsd_v()`: compressed arrays, nested structs, duplicate
+/// names numbered, a test field described per element and subsections only when sent.
+#[test]
+fn vmdesc_describes_what_went_out() {
+    let mut cpu = DescCpu { extra: 1, ..DescCpu::default() };
+    let mut f = StreamWriter::new();
+    let mut desc = ruvm_vmstate::JsonWriter::new();
+    desc.start_object(None);
+    ruvm_vmstate::vmstate_save_state_vmdesc(&mut f, &VMSTATE_DESC_CPU, &mut cpu, Some(&mut desc))
+        .unwrap();
+    desc.end_object();
+    assert_eq!(
+        desc.as_str(),
+        concat!(
+            r#"{"vmsd_name": "cpu", "version": 3, "fields": ["#,
+            r#"{"name": "segs", "array_len": 3, "type": "struct", "struct": {"#,
+            r#""vmsd_name": "segment", "version": 1, "fields": ["#,
+            r#"{"name": "selector", "type": "uint32", "size": 4}, "#,
+            r#"{"name": "base", "type": "uint64", "size": 8}]}, "size": 12}, "#,
+            r#"{"name": "regs", "array_len": 2, "type": "uint64", "size": 8}, "#,
+            r#"{"name": "flags[0]", "type": "uint32", "size": 4}, "#,
+            r#"{"name": "flags[1]", "type": "uint32", "size": 4}], "#,
+            r#""subsections": [{"vmsd_name": "cpu/extra", "version": 1, "fields": ["#,
+            r#"{"name": "extra", "type": "uint8", "size": 1}]}]}"#,
+        )
+    );
+    // 3 * 12 + 2 * 8 + 2 * 4, then the subsection header and its byte.
+    assert_eq!(f.as_bytes().len(), 60 + 1 + 1 + 9 + 4 + 1);
+}

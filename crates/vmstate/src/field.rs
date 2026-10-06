@@ -14,6 +14,7 @@ use ruvm_base::{Result, bail};
 
 use crate::file::{StreamReader, StreamWriter};
 use crate::info::{Buffer, UnusedBuffer, VmStateInfo, VmStateType};
+use crate::json::JsonWriter;
 use crate::vmsd::VmStateDescription;
 use crate::vmstate::{load_vmsd, save_vmsd_v};
 use crate::{VMS_MARKER_PTR_NULL, VMS_MARKER_PTR_VALID};
@@ -75,6 +76,12 @@ impl<T: 'static> VmStateField<T> {
     /// The type name vmdesc reports, `vmfield_get_type_name()`.
     pub fn type_name(&self) -> &'static str {
         self.body.type_name()
+    }
+
+    /// `vmsd_can_compress()`: whether vmdesc may describe all elements of the array with one
+    /// entry.
+    pub(crate) fn can_compress(&self) -> bool {
+        self.field_exists.is_none() && self.body.can_compress()
     }
 
     /// The `_V` macro variants: the field is only in the stream from section version `version_id`
@@ -442,6 +449,16 @@ impl<T: 'static> VmStateField<T> {
 pub(crate) trait FieldBody<T>: Send + Sync {
     fn type_name(&self) -> &'static str;
 
+    /// `VMS_STRUCT`: vmdesc wraps the nested description in a "struct" object.
+    fn is_struct(&self) -> bool {
+        false
+    }
+
+    /// The flag half of `vmsd_can_compress()`.
+    fn can_compress(&self) -> bool {
+        true
+    }
+
     /// `vmstate_n_elems()`.
     fn n_elems(&self, s: &T) -> usize;
 
@@ -468,14 +485,33 @@ pub(crate) trait FieldBody<T>: Send + Sync {
         field_version: i32,
     ) -> Result<()>;
 
-    fn save_elem(&self, f: &mut StreamWriter, s: &mut T, i: usize, size: usize) -> Result<()>;
+    fn save_elem(
+        &self,
+        f: &mut StreamWriter,
+        s: &mut T,
+        i: usize,
+        size: usize,
+        vmdesc: Option<&mut JsonWriter>,
+    ) -> Result<()>;
 }
 
 /// How one element is coded: a leaf info or a nested description.
 pub(crate) trait ElemCodec<V: ?Sized>: Send + Sync {
     fn type_name(&self) -> &'static str;
+    fn is_struct(&self) -> bool {
+        false
+    }
+    fn can_compress(&self) -> bool {
+        true
+    }
     fn load(&self, f: &mut StreamReader<'_>, v: &mut V, size: usize) -> Result<()>;
-    fn save(&self, f: &mut StreamWriter, v: &mut V, size: usize) -> Result<()>;
+    fn save(
+        &self,
+        f: &mut StreamWriter,
+        v: &mut V,
+        size: usize,
+        vmdesc: Option<&mut JsonWriter>,
+    ) -> Result<()>;
 }
 
 struct InfoCodec<V: ?Sized + 'static>(&'static dyn VmStateInfo<V>);
@@ -489,7 +525,13 @@ impl<V: ?Sized + 'static> ElemCodec<V> for InfoCodec<V> {
         self.0.load(f, v, size)
     }
 
-    fn save(&self, f: &mut StreamWriter, v: &mut V, size: usize) -> Result<()> {
+    fn save(
+        &self,
+        f: &mut StreamWriter,
+        v: &mut V,
+        size: usize,
+        _vmdesc: Option<&mut JsonWriter>,
+    ) -> Result<()> {
         self.0.save(f, v, size)
     }
 }
@@ -505,14 +547,30 @@ impl<U: 'static> ElemCodec<U> for StructCodec<U> {
         if self.struct_version_id.is_some() { "vstruct" } else { "struct" }
     }
 
+    fn is_struct(&self) -> bool {
+        self.struct_version_id.is_none()
+    }
+
+    fn can_compress(&self) -> bool {
+        !self.is_struct()
+            || (self.vmsd.subsections.is_empty()
+                && self.vmsd.fields.iter().all(VmStateField::can_compress))
+    }
+
     fn load(&self, f: &mut StreamReader<'_>, v: &mut U, _size: usize) -> Result<()> {
         let version_id = self.struct_version_id.unwrap_or(self.vmsd.version_id);
         load_vmsd(f, self.vmsd, v, version_id)
     }
 
-    fn save(&self, f: &mut StreamWriter, v: &mut U, _size: usize) -> Result<()> {
+    fn save(
+        &self,
+        f: &mut StreamWriter,
+        v: &mut U,
+        _size: usize,
+        vmdesc: Option<&mut JsonWriter>,
+    ) -> Result<()> {
         let version_id = self.struct_version_id.unwrap_or(self.vmsd.version_id);
-        save_vmsd_v(f, self.vmsd, v, version_id)
+        save_vmsd_v(f, self.vmsd, v, version_id, vmdesc)
     }
 }
 
@@ -548,6 +606,14 @@ impl<T, V: ?Sized, C: ElemCodec<V>> FieldBody<T> for Single<T, V, C> {
         self.codec.type_name()
     }
 
+    fn is_struct(&self) -> bool {
+        self.codec.is_struct()
+    }
+
+    fn can_compress(&self) -> bool {
+        self.codec.can_compress()
+    }
+
     fn n_elems(&self, _s: &T) -> usize {
         1
     }
@@ -576,8 +642,15 @@ impl<T, V: ?Sized, C: ElemCodec<V>> FieldBody<T> for Single<T, V, C> {
         self.codec.load(f, (self.get)(s), size)
     }
 
-    fn save_elem(&self, f: &mut StreamWriter, s: &mut T, _i: usize, size: usize) -> Result<()> {
-        self.codec.save(f, (self.get)(s), size)
+    fn save_elem(
+        &self,
+        f: &mut StreamWriter,
+        s: &mut T,
+        _i: usize,
+        size: usize,
+        vmdesc: Option<&mut JsonWriter>,
+    ) -> Result<()> {
+        self.codec.save(f, (self.get)(s), size, vmdesc)
     }
 }
 
@@ -602,6 +675,14 @@ impl<T, V, C: ElemCodec<V>> FieldBody<T> for Array<T, V, C> {
         self.codec.type_name()
     }
 
+    fn is_struct(&self) -> bool {
+        self.codec.is_struct()
+    }
+
+    fn can_compress(&self) -> bool {
+        self.codec.can_compress()
+    }
+
     fn n_elems(&self, s: &T) -> usize {
         self.num.get(s)
     }
@@ -623,8 +704,15 @@ impl<T, V, C: ElemCodec<V>> FieldBody<T> for Array<T, V, C> {
         self.codec.load(f, element((self.get)(s), i)?, size)
     }
 
-    fn save_elem(&self, f: &mut StreamWriter, s: &mut T, i: usize, size: usize) -> Result<()> {
-        self.codec.save(f, element((self.get)(s), i)?, size)
+    fn save_elem(
+        &self,
+        f: &mut StreamWriter,
+        s: &mut T,
+        i: usize,
+        size: usize,
+        vmdesc: Option<&mut JsonWriter>,
+    ) -> Result<()> {
+        self.codec.save(f, element((self.get)(s), i)?, size, vmdesc)
     }
 }
 
@@ -640,6 +728,14 @@ struct PtrArray<T, V, C> {
 impl<T, V, C: ElemCodec<V>> FieldBody<T> for PtrArray<T, V, C> {
     fn type_name(&self) -> &'static str {
         self.codec.type_name()
+    }
+
+    fn is_struct(&self) -> bool {
+        self.codec.is_struct()
+    }
+
+    fn can_compress(&self) -> bool {
+        self.auto_alloc.is_none() && self.codec.can_compress()
     }
 
     fn n_elems(&self, s: &T) -> usize {
@@ -685,7 +781,14 @@ impl<T, V, C: ElemCodec<V>> FieldBody<T> for PtrArray<T, V, C> {
         }
     }
 
-    fn save_elem(&self, f: &mut StreamWriter, s: &mut T, i: usize, size: usize) -> Result<()> {
+    fn save_elem(
+        &self,
+        f: &mut StreamWriter,
+        s: &mut T,
+        i: usize,
+        size: usize,
+        vmdesc: Option<&mut JsonWriter>,
+    ) -> Result<()> {
         match element((self.get)(s), i)? {
             // vmstate_info_ptr_marker
             None => {
@@ -696,7 +799,7 @@ impl<T, V, C: ElemCodec<V>> FieldBody<T> for PtrArray<T, V, C> {
                 if self.auto_alloc.is_some() {
                     f.put_byte(VMS_MARKER_PTR_VALID);
                 }
-                self.codec.save(f, v, size)
+                self.codec.save(f, v, size, vmdesc)
             }
         }
     }
@@ -731,7 +834,14 @@ impl<T> FieldBody<T> for Unused {
         UnusedBuffer.load(f, &mut (), size)
     }
 
-    fn save_elem(&self, f: &mut StreamWriter, _s: &mut T, _i: usize, size: usize) -> Result<()> {
+    fn save_elem(
+        &self,
+        f: &mut StreamWriter,
+        _s: &mut T,
+        _i: usize,
+        size: usize,
+        _vmdesc: Option<&mut JsonWriter>,
+    ) -> Result<()> {
         UnusedBuffer.save(f, &(), size)
     }
 }
@@ -759,7 +869,14 @@ impl<T> FieldBody<T> for Validate {
         Ok(())
     }
 
-    fn save_elem(&self, _f: &mut StreamWriter, _s: &mut T, _i: usize, _size: usize) -> Result<()> {
+    fn save_elem(
+        &self,
+        _f: &mut StreamWriter,
+        _s: &mut T,
+        _i: usize,
+        _size: usize,
+        _vmdesc: Option<&mut JsonWriter>,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -796,8 +913,15 @@ impl<T, U: 'static> FieldBody<T> for Tmp<T, U> {
         Ok(())
     }
 
-    fn save_elem(&self, f: &mut StreamWriter, s: &mut T, _i: usize, _size: usize) -> Result<()> {
+    fn save_elem(
+        &self,
+        f: &mut StreamWriter,
+        s: &mut T,
+        _i: usize,
+        _size: usize,
+        vmdesc: Option<&mut JsonWriter>,
+    ) -> Result<()> {
         let mut tmp = (self.make)(s);
-        save_vmsd_v(f, self.vmsd, &mut tmp, self.vmsd.version_id)
+        save_vmsd_v(f, self.vmsd, &mut tmp, self.vmsd.version_id, vmdesc)
     }
 }

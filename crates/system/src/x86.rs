@@ -18,7 +18,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ruvm_accel::tcg::TcgOptions;
@@ -43,14 +43,16 @@ use ruvm_machine_x86::debugcon::{
     DEBUGCON_DEFAULT_IOBASE, DEBUGCON_DEFAULT_READBACK, DebugconConfig, IsaDebugcon,
     TYPE_ISA_DEBUGCON,
 };
+use ruvm_machine_x86::migration::q35_savevm;
 use ruvm_machine_x86::pflash::raw_block_length;
-use ruvm_machine_x86::q35::{CpuIdent, PflashDrive};
+use ruvm_machine_x86::q35::{CpuIdent, PflashDrive, Q35_MACHINE_NAME};
 use ruvm_machine_x86::run_event::{EventHandler, GuestEvent, ShutdownReason};
 use ruvm_machine_x86::tcg_run::{TCG_SMM_AVAILABLE, TcgCpuModel, TcgMachine, TcgRunConfig};
 use ruvm_machine_x86::{
     BoardKind, BoardSpec, FileBackend, FirmwareSearch, KernelFiles, MicrovmProps, PflashBacking,
     Q35Props, X86Board, build_board,
 };
+use ruvm_migration::Migration;
 use ruvm_qapi::events::{event_guest_panicked, event_reset};
 use ruvm_qapi::opts::{QemuOptsList, is_help_option};
 use ruvm_qapi::types::{
@@ -1405,7 +1407,29 @@ pub(crate) fn start_board_tcg(
     }
     let machine = Arc::new(machine);
     set_cpu_hook(vm, &machine, TcgMachine::start, TcgMachine::pause);
+    if kind == BoardKind::Q35 {
+        init_migration(vm, &machine, cmd.uuid).map_err(one)?;
+    }
     Ok(Running { machine: RunningMachine::Tcg(machine), _attachments: built.attachments })
+}
+
+/// `migration_object_init()` and the `register_savevm_live()` and `vmstate_register()` calls of
+/// a q35 board on TCG, the one machine ruvm migrates so far.
+fn init_migration(
+    vm: &Arc<Vm>,
+    machine: &TcgMachine,
+    uuid: Option<[u8; 16]>,
+) -> std::result::Result<(), String> {
+    let q = q35_savevm(machine, Q35_MACHINE_NAME, uuid)?;
+    let host = crate::migration::Host::new(
+        vm.runstate.clone(),
+        vm.qmp.clone(),
+        q.global_state,
+        vm.autostart.clone(),
+    );
+    let m = Migration::new(Arc::new(Mutex::new(q.savevm)), Some(q.ram_stats), Arc::new(host));
+    let _ = vm.migration.set(m);
+    Ok(())
 }
 
 /// The KVM side, Linux on x86_64 only.

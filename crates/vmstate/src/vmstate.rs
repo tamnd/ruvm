@@ -12,6 +12,7 @@ use ruvm_base::{Result, bail, err};
 use crate::QEMU_VM_SUBSECTION;
 use crate::field::VmStateField;
 use crate::file::{EINVAL, StreamReader, StreamWriter};
+use crate::json::JsonWriter;
 use crate::vmsd::{Hook, VmStateDescription};
 
 /// `vmstate_field_exists()`: a `field_exists` test decides alone, otherwise the field exists from
@@ -160,19 +161,60 @@ pub(crate) fn load_vmsd<T>(
     post_load(vmsd, opaque, version_id)
 }
 
-/// `vmstate_save_vmsd_v()`.
+/// `vmstate_save_vmsd_v()`. With `vmdesc`, the description of what went out is added to the
+/// object the caller has open.
 pub(crate) fn save_vmsd_v<T>(
     f: &mut StreamWriter,
     vmsd: &VmStateDescription<T>,
     opaque: &mut T,
     version_id: i32,
+    vmdesc: Option<&mut JsonWriter>,
 ) -> Result<()> {
     pre_save(vmsd, opaque)?;
-    let ret = save_fields(f, vmsd, opaque, version_id);
+    let ret = save_fields(f, vmsd, opaque, version_id, vmdesc);
     if let Some(post_save) = &vmsd.post_save {
         post_save(opaque);
     }
     ret
+}
+
+/// `vmsd_desc_field_start()`.
+fn desc_field_start<T>(
+    vmdesc: &mut JsonWriter,
+    vmsd: &VmStateDescription<T>,
+    field: &VmStateField<T>,
+    i: usize,
+    max: usize,
+) {
+    let same: Vec<_> = vmsd.fields.iter().filter(|f| f.name == field.name).collect();
+    let name = if same.len() > 1 {
+        let num = same.iter().position(|f| std::ptr::eq(*f, field)).unwrap_or(0);
+        format!("{}[{num}]", field.name)
+    } else {
+        field.name.to_owned()
+    };
+    vmdesc.start_object(None);
+    vmdesc.str(Some("name"), &name);
+    if max > 1 {
+        if field.can_compress() {
+            vmdesc.int64(Some("array_len"), max as i64);
+        } else {
+            vmdesc.int64(Some("index"), i as i64);
+        }
+    }
+    vmdesc.str(Some("type"), field.body.type_name());
+    if field.body.is_struct() {
+        vmdesc.start_object(Some("struct"));
+    }
+}
+
+/// `vmsd_desc_field_end()`.
+fn desc_field_end<T>(vmdesc: &mut JsonWriter, field: &VmStateField<T>, size: u64) {
+    if field.body.is_struct() {
+        vmdesc.end_object();
+    }
+    vmdesc.uint64(Some("size"), size);
+    vmdesc.end_object();
 }
 
 fn save_fields<T>(
@@ -180,16 +222,35 @@ fn save_fields<T>(
     vmsd: &VmStateDescription<T>,
     opaque: &mut T,
     version_id: i32,
+    mut vmdesc: Option<&mut JsonWriter>,
 ) -> Result<()> {
+    if let Some(d) = vmdesc.as_deref_mut() {
+        d.str(Some("vmsd_name"), vmsd.name);
+        d.int64(Some("version"), i64::from(version_id));
+        d.start_array(Some("fields"));
+    }
     for field in &vmsd.fields {
         if field_exists(field, opaque, version_id) {
             let body = &field.body;
             let n_elems = body.n_elems(opaque);
             let size = body.size(opaque);
+            let mut desc = vmdesc.as_deref_mut();
             for i in 0..n_elems {
-                body.save_elem(f, opaque, i, size).map_err(|e| {
+                let max_elems = if field.can_compress() { n_elems - i } else { 1 };
+                if let Some(d) = desc.as_deref_mut() {
+                    desc_field_start(d, vmsd, field, i, max_elems);
+                }
+                let before = f.transferred();
+                body.save_elem(f, opaque, i, size, desc.as_deref_mut()).map_err(|e| {
                     e.prepend(format_args!("Save of field {}/{} failed: ", vmsd.name, field.name))
                 })?;
+                if let Some(d) = desc.as_deref_mut() {
+                    desc_field_end(d, field, f.transferred() - before);
+                }
+                // A compressed array is described by its first element.
+                if max_elems > 1 {
+                    desc = None;
+                }
             }
         } else if field.must_exist {
             // QEMU reports this and then asserts. A library should not abort the process over
@@ -197,7 +258,10 @@ fn save_fields<T>(
             bail!("Output state validation failed: {}/{}", vmsd.name, field.name);
         }
     }
-    subsection_save(f, vmsd, opaque)
+    if let Some(d) = vmdesc.as_deref_mut() {
+        d.end_array();
+    }
+    subsection_save(f, vmsd, opaque, vmdesc)
 }
 
 /// `vmstate_get_subsection()`.
@@ -254,7 +318,9 @@ fn subsection_save<T>(
     f: &mut StreamWriter,
     vmsd: &VmStateDescription<T>,
     opaque: &mut T,
+    mut vmdesc: Option<&mut JsonWriter>,
 ) -> Result<()> {
+    let mut has_subsections = false;
     for sub in &vmsd.subsections {
         if !sub.section_needed(opaque) {
             continue;
@@ -262,11 +328,24 @@ fn subsection_save<T>(
         let Ok(len) = u8::try_from(sub.name.len()) else {
             return Err(err!("subsection name '{}' is longer than 255 bytes", sub.name));
         };
+        if let Some(d) = vmdesc.as_deref_mut() {
+            if !has_subsections {
+                d.start_array(Some("subsections"));
+                has_subsections = true;
+            }
+            d.start_object(None);
+        }
         f.put_byte(QEMU_VM_SUBSECTION);
         f.put_byte(len);
         f.put_buffer(sub.name.as_bytes());
         f.put_be32(sub.version_id as u32);
-        save_vmsd_v(f, sub, opaque, sub.version_id)?;
+        save_vmsd_v(f, sub, opaque, sub.version_id, vmdesc.as_deref_mut())?;
+        if let Some(d) = vmdesc.as_deref_mut() {
+            d.end_object();
+        }
+    }
+    if let Some(d) = vmdesc.filter(|_| has_subsections) {
+        d.end_array();
     }
     Ok(())
 }
@@ -277,7 +356,18 @@ pub fn vmstate_save_state<T>(
     vmsd: &VmStateDescription<T>,
     opaque: &mut T,
 ) -> Result<()> {
-    save_vmsd_v(f, vmsd, opaque, vmsd.version_id)
+    save_vmsd_v(f, vmsd, opaque, vmsd.version_id, None)
+}
+
+/// `vmstate_save_vmsd()` with a vmdesc writer: like [`vmstate_save_state`], and also adds
+/// `vmsd_name`, `version`, `fields` and `subsections` to the JSON object the caller has open.
+pub fn vmstate_save_state_vmdesc<T>(
+    f: &mut StreamWriter,
+    vmsd: &VmStateDescription<T>,
+    opaque: &mut T,
+    vmdesc: Option<&mut JsonWriter>,
+) -> Result<()> {
+    save_vmsd_v(f, vmsd, opaque, vmsd.version_id, vmdesc)
 }
 
 /// `vmstate_load_state()`: reads `opaque` from a stream that carries `version_id`.

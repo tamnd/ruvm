@@ -5,14 +5,16 @@
 //! `x-exit-preconfig` from system/vl.c.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use ruvm_base::{Error, Result};
 use ruvm_chardev::BACKENDS;
+use ruvm_migration::Migration;
 use ruvm_monitor::{Commands, MonitorQmp};
 use ruvm_qapi::commands::*;
 use ruvm_qapi::types::{
     ChardevBackendInfo, ChardevReturn, MachineInfo, NameInfo, ObjectOptions,
-    ObjectPropertiesValues, ObjectPropertyInfo, ObjectTypeInfo, ShutdownCause,
+    ObjectPropertiesValues, ObjectPropertyInfo, ObjectTypeInfo, RunState, ShutdownCause,
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, QObjectOutputVisitor, Visit, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
@@ -39,6 +41,59 @@ pub(crate) fn object_options_dict(opts: &mut ObjectOptions) -> Result<QDict> {
     }
 }
 
+/// The migration state of `vm`, on a machine ruvm can migrate.
+fn migration(vm: &Vm) -> Result<&Migration> {
+    vm.migration
+        .get()
+        .ok_or_else(|| Error::generic("migration is not supported with this machine by ruvm yet"))
+}
+
+/// The migration commands of migration/migration.c and migration/options.c.
+fn register_migration(vm: &Arc<Vm>, cmds: &mut Commands) {
+    let v = vm.clone();
+    register_migrate(cmds, move |_: &MonitorQmp, arg| {
+        if arg.resume.unwrap_or(false) {
+            return Err(Error::generic("Cannot resume if there is no paused migration"));
+        }
+        migration(&v)?.migrate(arg.uri.as_deref(), arg.channels.as_deref())
+    });
+    let v = vm.clone();
+    register_migrate_incoming(cmds, move |_: &MonitorQmp, arg| {
+        // INMIGRATE_DEFAULT_EXIT_ON_ERROR
+        let exit_on_error = arg.exit_on_error.unwrap_or(true);
+        migration(&v)?.incoming(arg.uri.as_deref(), arg.channels.as_deref(), exit_on_error)
+    });
+    let v = vm.clone();
+    register_query_migrate(cmds, move |_: &MonitorQmp| {
+        Ok(v.migration.get().map(Migration::query).unwrap_or_default())
+    });
+    let v = vm.clone();
+    register_migrate_set_capabilities(cmds, move |_: &MonitorQmp, arg| {
+        migration(&v)?.set_capabilities(&arg.capabilities)
+    });
+    let v = vm.clone();
+    register_query_migrate_capabilities(cmds, move |_: &MonitorQmp| {
+        Ok(migration(&v)?.query_capabilities())
+    });
+    let v = vm.clone();
+    register_migrate_set_parameters(cmds, move |_: &MonitorQmp, params| {
+        migration(&v)?.set_parameters(&params)
+    });
+    let v = vm.clone();
+    register_query_migrate_parameters(cmds, move |_: &MonitorQmp| {
+        Ok(migration(&v)?.query_parameters())
+    });
+    let v = vm.clone();
+    register_migrate_cancel(cmds, move |_: &MonitorQmp| match v.migration.get() {
+        Some(m) => m.cancel(),
+        None => Ok(()),
+    });
+    let v = vm.clone();
+    register_migrate_continue(cmds, move |_: &MonitorQmp, arg| {
+        migration(&v)?.continue_from(arg.state)
+    });
+}
+
 /// Registers every command in this module with `vm`'s dispatcher.
 pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
     let v = vm.clone();
@@ -46,7 +101,14 @@ pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
     let v = vm.clone();
     register_stop(cmds, move |_: &MonitorQmp| v.runstate.qmp_stop());
     let v = vm.clone();
-    register_cont(cmds, move |_: &MonitorQmp| v.runstate.qmp_cont());
+    register_cont(cmds, move |_: &MonitorQmp| {
+        // qmp_cont() while waiting for an incoming migration: start once it is in.
+        if v.runstate.get() == RunState::Inmigrate {
+            v.autostart.store(true, Ordering::Release);
+            return Ok(());
+        }
+        v.runstate.qmp_cont()
+    });
     let v = vm.clone();
     register_quit(cmds, move |_: &MonitorQmp| {
         v.runstate.shutdown_request(ShutdownCause::HostQmpQuit);
@@ -78,7 +140,8 @@ pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
     register_blockdev_add(cmds, move |_: &MonitorQmp, opts| v.block.blockdev_add(opts));
     let v = vm.clone();
     register_blockdev_del(cmds, move |_: &MonitorQmp, arg| v.block.blockdev_del(&arg.node_name));
-    // qmp_migrate_pause(): there is no migration, so it is never in a postcopy state.
+    register_migration(vm, cmds);
+    // qmp_migrate_pause(): there is no postcopy, so it is never in a postcopy state.
     register_migrate_pause(cmds, |_: &MonitorQmp| {
         Err(Error::generic(
             "migrate-pause is currently only supported during postcopy-active or postcopy-recover state",

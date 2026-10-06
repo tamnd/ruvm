@@ -244,6 +244,26 @@ impl Runstate {
         self.emit(event_stop(&self.qmp.policy()));
     }
 
+    /// `vm_stop_force_state()`: [`Runstate::vm_stop`] for a live guest, else just the new state.
+    pub fn vm_stop_force_state(&self, state: RunState) {
+        if is_live(self.get()) {
+            self.vm_stop(state);
+        } else {
+            self.set(state);
+        }
+    }
+
+    /// `vm_get_suspended()`: whether the guest was suspended when it was stopped.
+    pub fn vm_was_suspended(&self) -> bool {
+        let inner = lock(&self.inner);
+        inner.vm_was_suspended || inner.state == RunState::Suspended
+    }
+
+    /// `vm_set_suspended()`, from the global state of an incoming migration.
+    pub fn set_vm_was_suspended(&self, suspended: bool) {
+        lock(&self.inner).vm_was_suspended = suspended;
+    }
+
     /// `vm_shutdown()`, `do_vm_stop(RUN_STATE_SHUTDOWN, false)`: no STOP event, since the
     /// process is on its way out.
     pub fn vm_shutdown(&self) {

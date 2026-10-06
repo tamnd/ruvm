@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod arm;
+mod migration;
 pub mod options;
 mod qmp_cmds;
 pub mod qtest;
