@@ -19,11 +19,13 @@
 //! - The flag setting helpers (COMISS, UCOMISS, PTEST and VTESTPS/PD) return the flags and
 //!   the translator copies them into `cc_src`, where QEMU's helpers write `CC_SRC` and
 //!   `CC_OP` themselves.
-//! - The register overlap checks of VEX class 12 (the gathers) are not done, because the
-//!   gathers are not implemented.
-//! - These instructions decode but raise #UD when executed: EXTRQ and INSERTQ (SSE4a),
-//!   PCMPESTRI, PCMPESTRM, PCMPISTRI and PCMPISTRM, the SHA instructions, AESENC, AESENCLAST,
-//!   AESDEC, AESDECLAST, AESIMC and AESKEYGENASSIST, VPGATHER* and VGATHER*, and CMPccXADD.
+//! - The gathers are emitted inline, element by element, where QEMU calls a helper; the
+//!   result, including what a fault in the middle leaves behind, is the same.
+//! - PCMPESTRI and PCMPESTRM read 64-bit lengths from RAX and RDX with REX.W (VEX.W), as
+//!   hardware does. QEMU 11.1's new decoder lost the REX.W bit that `pcmp_elen()` checks
+//!   and always reads EAX and EDX.
+//! - These instructions decode but raise #UD when executed: EXTRQ and INSERTQ (SSE4a) and
+//!   CMPccXADD.
 //!
 //! QEMU behaviors kept on purpose, although real hardware differs:
 //!
@@ -54,7 +56,7 @@ use super::super::env::{
 use super::super::helpers::vec::{self, K, sse_offs, sse_op};
 use super::sse_tab::{self as tab, Dec, Ft, G as Gen};
 use super::*;
-use crate::state::{CPU_NB_REGS, HF_EM_MASK, HF_TS_MASK, R_DS, R_EDI};
+use crate::state::{CPU_NB_REGS, HF_EM_MASK, HF_TS_MASK, R_DS, R_EAX, R_EDI, R_EDX};
 
 /// The bits of an [`E`] entry's flags word.
 pub(super) mod flags {
@@ -755,7 +757,8 @@ impl S<'_, '_, '_> {
             x.op[i].n = n;
         } else {
             if x.mem.is_none() {
-                x.mem = Some(self.lea_modrm_0(m)?);
+                let vsib = x.e.flags & CLASS == VEX12;
+                x.mem = Some(self.lea_modrm_0v(m, vsib)?);
             }
             x.op[i].ea = true;
         }
@@ -825,6 +828,7 @@ impl S<'_, '_, '_> {
             }
             6 | 11 | 12 => {
                 (x.class == 12 && (x.modrm.unwrap_or(0) & 7 != 4 || self.d.aflag == OT16))
+                    || (x.class == 12 && self.vsib_overlap(x))
                     || !vex
                     || fl & HF_AVX_EN_MASK == 0
             }
@@ -852,6 +856,16 @@ impl S<'_, '_, '_> {
             return false;
         }
         true
+    }
+
+    /// The register overlap checks of VEX class 12: the destination, the mask and the VSIB
+    /// index must be three different registers.
+    fn vsib_overlap(&self, x: &Dx) -> bool {
+        let index = x.mem.map_or(-1, |m| m.index);
+        let n = |i: usize| x.op[i].n as i32;
+        (!x.op[0].ea && (n(0) == index || n(0) == n(1)))
+            || n(1) == index
+            || (!x.op[2].ea && (n(2) == index || n(2) == n(1)))
     }
 
     /// `disas_insn()` from the CPUID check on.
@@ -882,7 +896,11 @@ impl S<'_, '_, '_> {
         if self.mmx_noprefix(&e) {
             self.env_call(&vec::ENTER_MMX, None, &[]);
         }
-        if let Some(mem) = x.mem {
+        if let Some(mut mem) = x.mem {
+            if x.class == VEX12 {
+                // The VSIB index is a vector register, added per element by the emitter.
+                mem.index = -1;
+            }
             let ea = self.lea_modrm_1(mem);
             let (aflag, ovr) = (self.d.aflag, self.d.override_seg);
             self.lea_v_seg(aflag, ea, mem.def_seg, ovr);
@@ -1477,6 +1495,67 @@ impl S<'_, '_, '_> {
                     self.zero_env(zmm(i), ZMM_SIZE);
                 }
             }
+            Gen::Vaesenc | Gen::Vaesenclast | Gen::Vaesdec | Gen::Vaesdeclast => {
+                let var = match eg {
+                    Gen::Vaesenc => 0,
+                    Gen::Vaesenclast => 1,
+                    Gen::Vaesdec => 2,
+                    _ => 3,
+                };
+                self.kern(K::Aes, var, vl, 0, [o0, o1, o2, 0], None);
+            }
+            Gen::Vaesimc => {
+                self.kern(K::AesImc, 0, 16, 0, [o0, o2, o2, 0], None);
+            }
+            Gen::Vaeskeygen => {
+                self.kern(K::AesKeygen, 0, 16, imm, [o0, o1, o1, 0], None);
+            }
+            Gen::Sha1rnds4 => {
+                // SHA1RNDS4 has the operands V, W and I: the source is operand 1.
+                self.kern(K::Sha, 0, 16, imm & 3, [o0, o0, o1, 0], None);
+            }
+            Gen::Sha1nexte
+            | Gen::Sha1msg1
+            | Gen::Sha1msg2
+            | Gen::Sha256rnds2
+            | Gen::Sha256msg1
+            | Gen::Sha256msg2 => {
+                let var = match eg {
+                    Gen::Sha1nexte => 1,
+                    Gen::Sha1msg1 => 2,
+                    Gen::Sha1msg2 => 3,
+                    Gen::Sha256rnds2 => 4,
+                    Gen::Sha256msg1 => 5,
+                    _ => 6,
+                };
+                self.kern(K::Sha, var, 16, 0, [o0, o1, o2, zmm(0)], None);
+            }
+            Gen::Pcmpestri | Gen::Pcmpestrm | Gen::Pcmpistri | Gen::Pcmpistrm => {
+                let expl = matches!(eg, Gen::Pcmpestri | Gen::Pcmpestrm);
+                let mask = matches!(eg, Gen::Pcmpestrm | Gen::Pcmpistrm);
+                let var = u32::from(expl) | u32::from(mask) << 1 | u32::from(self.d.rex_w) << 2;
+                let rax = if expl {
+                    // RDX goes through the MMX scratch register, which the instruction does
+                    // not otherwise use.
+                    let rdx = g.regs[R_EDX];
+                    self.f().gen_st_i64(rdx, g.env, MMX_T0 as i64);
+                    Some(g.regs[R_EAX])
+                } else {
+                    None
+                };
+                let dst = if mask { zmm(0) } else { XMM_T0 };
+                let r = self.kern(K::Pcmpstr, var, 16, imm, [dst, o1, o2, MMX_T0], rax);
+                if mask {
+                    if vex {
+                        self.zero_env(zmm(0) + 16, 16);
+                    }
+                } else {
+                    self.f().gen_shri_i64(g.regs[R_ECX], r, 32);
+                }
+                self.f().gen_ext32u_i64(r, r);
+                self.sse_flags(r);
+            }
+            Gen::Vpgatherd | Gen::Vpgatherq => self.gather(x, eg == Gen::Vpgatherq),
             _ => {
                 // Listed as not implemented in the module documentation.
                 self.gen_illegal_opcode();
@@ -1484,6 +1563,58 @@ impl S<'_, '_, '_> {
             }
         }
         Ok(true)
+    }
+
+    /// VPGATHERDD, VPGATHERDQ, VPGATHERQD, VPGATHERQQ and the VGATHER forms, which are the
+    /// same operation: `helper_vpgather*` inline. Each element whose mask sign bit is set
+    /// is loaded from A0 plus the scaled, sign extended index element; the mask element is
+    /// cleared as it completes, so a fault leaves the finished elements behind.
+    fn gather(&mut self, x: &Dx, qidx: bool) {
+        let (a0, env, idx) = (self.g.a0, self.g.env, self.d.mem_index);
+        let Some(mem) = x.mem else { return };
+        let iof = zmm(mem.index as usize);
+        let (d, m) = (x.op[0].off, x.op[1].off);
+        let vl = if self.d.vex_l { 32 } else { 16 };
+        let dot = if self.d.vex_w { OT64 } else { OT32 };
+        let dsz = 1usize << dot;
+        let isz = if qidx { 8 } else { 4 };
+        let n = vl / dsz.max(isz);
+        let a32 = self.d.aflag != OT64;
+        let (t, a) = (self.new64(), self.new64());
+        let z = self.c64(0);
+        for i in 0..n {
+            let skip = self.label();
+            self.ld_env(OT8, t, m + i * dsz + dsz - 1);
+            let f = self.f();
+            f.gen_andi_i64(t, t, 0x80);
+            f.gen_brcondi_i64(Cond::Eq, t, 0, skip);
+            if qidx {
+                f.gen_ld_i64(a, env, (iof + i * 8) as i64);
+            } else {
+                f.gen_ld32s_i64(a, env, (iof + i * 4) as i64);
+            }
+            f.gen_shli_i64(a, a, i64::from(mem.scale));
+            f.gen_add_i64(a, a, a0);
+            if a32 {
+                f.gen_ext32u_i64(a, a);
+            }
+            let mop = if dot == OT64 { MemOp::LEUQ } else { MemOp::LEUL };
+            f.gen_qemu_ld_i64(t, a, idx, mop);
+            self.st_env(dot, t, d + i * dsz);
+            self.set_label(skip);
+            self.st_env(dot, z, m + i * dsz);
+        }
+        if qidx && dot == OT32 {
+            // Quadword indices with doubleword data fill half of the destination.
+            let half = vl / 2;
+            self.zero_env(d + half, half);
+            self.zero_env(m + half, half);
+        }
+        if !self.d.vex_l {
+            // There are two outputs: the writeback clears the upper half of the destination,
+            // and this the upper half of the mask.
+            self.zero_env(m + 16, 16);
+        }
     }
 
     /// Store the `n` elements of `size` bytes at `data` whose sign bit is set in the

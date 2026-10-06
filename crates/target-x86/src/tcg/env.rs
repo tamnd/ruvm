@@ -86,10 +86,10 @@ pub const EXCEPTION_IS_INT: usize = ERROR_CODE + 4;
 pub const EXCEPTION_NEXT_EIP: usize = EXCEPTION_IS_INT + 4;
 /// `old_exception`, 32 bits.
 pub const OLD_EXCEPTION: usize = EXCEPTION_NEXT_EIP + 8;
-/// Unused, keeps the next field aligned.
-pub const PAD0: usize = OLD_EXCEPTION + 4;
+/// `pkrs`, 32 bits: the supervisor protection key rights (`IA32_PKRS`).
+pub const PKRS: usize = OLD_EXCEPTION + 4;
 /// `tsc_offset`.
-pub const TSC_OFFSET: usize = PAD0 + 4;
+pub const TSC_OFFSET: usize = PKRS + 4;
 /// `pat`.
 pub const PAT: usize = TSC_OFFSET + 8;
 /// `apic_base`.
@@ -320,6 +320,7 @@ pub fn load_state(env: &mut [u8], s: &X86CpuState) {
     st32(env, EXCEPTION_IS_INT, 0);
     st64(env, EXCEPTION_NEXT_EIP, 0);
     st32(env, OLD_EXCEPTION, s.old_exception as u32);
+    st32(env, PKRS, s.pkrs);
     st64(env, TSC_OFFSET, 0);
     st64(env, PAT, s.pat);
     st64(env, APIC_BASE, s.apic_base);
@@ -397,6 +398,7 @@ pub fn save_state(env: &[u8], s: &mut X86CpuState) {
     s.a20_mask = ld64(env, A20_MASK) as i32;
     s.error_code = ld32(env, ERROR_CODE);
     s.old_exception = ld32(env, OLD_EXCEPTION) as i32;
+    s.pkrs = ld32(env, PKRS);
     s.pat = ld64(env, PAT);
     s.apic_base = ld64(env, APIC_BASE);
     s.tsc_aux = ld64(env, TSC_AUX);

@@ -899,6 +899,32 @@ impl S<'_, '_, '_> {
         }
     }
 
+    /// Like `mov_reg_v`, but the register is written only when `c1 cond c2`; otherwise
+    /// all 64 bits stay as they were (no zero extension of a 32-bit operand).
+    fn mov_reg_v_cond(
+        &mut self,
+        cond: Cond,
+        c1: TempI64,
+        c2: TempI64,
+        ot: u32,
+        r: usize,
+        t: TempI64,
+    ) {
+        let regs = self.g.regs;
+        let xh = ot == OT8 && self.byte_reg_is_xh(r);
+        let full = if xh { regs[r - 4] } else { regs[r] };
+        let v = self.new64();
+        let f = self.f();
+        match ot {
+            OT8 if xh => f.gen_deposit_i64(v, full, t, 8, 8),
+            OT8 => f.gen_deposit_i64(v, full, t, 0, 8),
+            OT16 => f.gen_deposit_i64(v, full, t, 0, 16),
+            OT32 => f.gen_ext32u_i64(v, t),
+            _ => f.gen_mov_i64(v, t),
+        }
+        f.gen_movcond_i64(cond, full, c1, c2, v, full);
+    }
+
     /// `gen_op_mov_v_reg()`: register `r` with size `ot`, zero extended, into `t`.
     fn mov_v_reg(&mut self, ot: u32, t: TempI64, r: usize) {
         let regs = self.g.regs;
@@ -999,6 +1025,12 @@ impl S<'_, '_, '_> {
 
     /// `gen_lea_modrm_0()`: decode the memory operand of `modrm`.
     fn lea_modrm_0(&mut self, modrm: u32) -> R<Addr> {
+        self.lea_modrm_0v(modrm, false)
+    }
+
+    /// `decode_modrm()`: decode the memory operand of `modrm`; with `vsib`, the SIB index
+    /// selects a vector register and index 4 is not "no index".
+    fn lea_modrm_0v(&mut self, modrm: u32, vsib: bool) -> R<Addr> {
         let mut def_seg = R_DS_I;
         let mut index = -1;
         let mut scale = 0;
@@ -1016,7 +1048,7 @@ impl S<'_, '_, '_> {
                     let code = self.ldub()? as u32;
                     scale = (code >> 6) & 3;
                     index = (((code >> 3) & 7) as usize | self.d.rex_x) as i32;
-                    if index == 4 {
+                    if index == 4 && !vsib {
                         index = -1;
                     }
                     base = ((code & 7) as usize | self.d.rex_b) as i32;

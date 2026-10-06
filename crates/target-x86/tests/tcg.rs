@@ -18,11 +18,11 @@ use ruvm_jit::{Jit, Vcpu, excp};
 use ruvm_mem::{AddressSpace, MemTxAttrs, MemorySystem};
 use ruvm_target_x86::cpuid::{Accel, X86Cpu};
 use ruvm_target_x86::state::{
-    CR0_ET_MASK, CR0_NE_MASK, CR0_PE_MASK, CR0_PG_MASK, CR0_WP_MASK, CR4_PAE_MASK, DESC_A_MASK,
-    DESC_B_MASK, DESC_CS_MASK, DESC_G_MASK, DESC_L_MASK, DESC_P_MASK, DESC_R_MASK, DESC_S_MASK,
-    DESC_W_MASK, HF_CS64_MASK, HF_LMA_MASK, IrqchipMode, MSR_EFER_LMA, MSR_EFER_LME, MSR_EFER_SCE,
-    R_CS, R_EAX, R_EBX, R_ECX, R_EDI, R_EDX, R_ESI, R_ESP, R_SS, ResetConfig, SegmentCache,
-    X86CpuState,
+    CR0_ET_MASK, CR0_NE_MASK, CR0_PE_MASK, CR0_PG_MASK, CR0_WP_MASK, CR4_PAE_MASK, CR4_PKE_MASK,
+    CR4_PKS_MASK, DESC_A_MASK, DESC_B_MASK, DESC_CS_MASK, DESC_G_MASK, DESC_L_MASK, DESC_P_MASK,
+    DESC_R_MASK, DESC_S_MASK, DESC_W_MASK, HF_CS64_MASK, HF_LMA_MASK, IrqchipMode, MSR_EFER_LMA,
+    MSR_EFER_LME, MSR_EFER_SCE, R_CS, R_EAX, R_EBX, R_ECX, R_EDI, R_EDX, R_ESI, R_ESP, R_SS,
+    ResetConfig, SegmentCache, X86CpuState,
 };
 use ruvm_target_x86::tcg::{X86, create_vcpu, new_jit, save_vcpu};
 
@@ -382,6 +382,40 @@ fn div_idiv_64() {
 }
 
 #[test]
+fn div_idiv_32() {
+    // The upper halves of RAX and RDX are ignored and the results zero extended.
+    const JUNK: u64 = 0xdead_beef << 32;
+    let run = |code: &[u8], hi: u32, lo: u32, d: u32| {
+        let regs = [
+            (R_EAX, JUNK | u64::from(lo)),
+            (R_EDX, JUNK | u64::from(hi)),
+            (R_EBX, JUNK | u64::from(d)),
+        ];
+        run64(&regs, code)
+    };
+    let div = |hi: u32, lo: u32, d: u32| run(&[0xf7, 0xf3, 0xf4], hi, lo, d);
+    let idiv = |hi: i32, lo: i32, d: i32| run(&[0xf7, 0xfb, 0xf4], hi as u32, lo as u32, d as u32);
+    let res = |st: &X86CpuState| (st.regs[R_EAX], st.regs[R_EDX]);
+    let n = 3u64 << 32 | 5;
+    assert_eq!(res(&div(0, 100, 7)), (14, 2));
+    assert_eq!(res(&div(3, 5, 10)), (n / 10, n % 10));
+    assert_eq!(res(&div(9, u32::MAX, 10)), (0xffff_ffff, 9));
+    assert_eq!(vector64(&div(10, 0, 10)), 0);
+    assert_eq!(vector64(&div(0, 1, 0)), 0);
+    let u = |v: i64| u64::from(v as u32);
+    assert_eq!(res(&idiv(-1, -100, 7)), (u(-14), u(-2)));
+    assert_eq!(res(&idiv(0, 100, -7)), (u(-14), u(2)));
+    // -2^32 / -3, and -2^32 / 2, the most negative quotient.
+    assert_eq!(res(&idiv(-1, 0, -3)), (u(-(1i64 << 32) / -3), u(-(1i64 << 32) % -3)));
+    assert_eq!(res(&idiv(-1, 0, 2)), (u(i64::from(i32::MIN)), 0));
+    // Overflow, -1 and zero divisors.
+    assert_eq!(vector64(&idiv(1, 0, 1)), 0);
+    assert_eq!(vector64(&idiv(-1, i32::MIN, -1)), 0);
+    assert_eq!(res(&idiv(-1, -6, -1)), (6, 0));
+    assert_eq!(vector64(&idiv(0, 5, 0)), 0);
+}
+
+#[test]
 fn divide_error_real_mode() {
     // div bl with bl = 0: the IVT handler runs with FLAGS, CS and IP pushed.
     let w = World::new();
@@ -421,6 +455,15 @@ fn bit_instructions() {
     check(&run64(&[(R_EBX, 0x100)], &[0x48, 0x0f, 0xbc, 0xc3, 0xf4]), 8, ZF, 0);
     // bsr eax, ebx with ebx = 0: ZF and the destination is unchanged.
     check(&run64(&[(R_EAX, 77), (R_EBX, 0)], &[0x0f, 0xbd, 0xc3, 0xf4]), 77, ZF, ZF);
+    // A zero 32-bit source leaves all 64 bits of the destination, as on hardware
+    // (risu x86_int: bsf ebx, r14d).
+    let st = run64(&[(R_EBX, 0xb6ab_e996_aa1b_f040), (14, 0)], &[0x41, 0x0f, 0xbc, 0xde, 0xf4]);
+    assert_eq!(st.regs[R_EBX], 0xb6ab_e996_aa1b_f040);
+    assert_ne!(st.rflags & ZF, 0);
+    let st = run64(&[(R_EAX, 0xffff_ffff_0000_0005), (R_EBX, 0)], &[0x0f, 0xbd, 0xc3, 0xf4]);
+    assert_eq!(st.regs[R_EAX], 0xffff_ffff_0000_0005);
+    // A nonzero 32-bit source zero extends.
+    check(&run64(&[(R_EAX, u64::MAX), (R_EBX, 0x8000)], &[0x0f, 0xbd, 0xc3, 0xf4]), 15, ZF, 0);
     // popcnt rax, rbx: qemu64 does not have POPCNT, EPYC does.
     let popcnt = [0xf3, 0x48, 0x0f, 0xb8, 0xc3, 0xf4];
     assert_eq!(vector64(&run64(&[], &popcnt)), 6);
@@ -681,6 +724,24 @@ fn exchange_and_atomics() {
     assert_eq!(st.regs[R_EAX], 10);
     assert_eq!(st.regs[R_EDX], 20);
     assert_eq!(st.rflags & ZF, 0);
+    // cmpxchg al, cl: the compare with itself succeeds and AL takes CL, not the old AL.
+    let st = run64(&[(R_EAX, 0x1122_3344_5566_7705), (R_ECX, 0x99)], &[0x0f, 0xb0, 0xc8, 0xf4]);
+    check(&st, 0x1122_3344_5566_7799, ZF, ZF);
+    // cmpxchg ebx, ecx fails: EBX keeps its upper half, RAX takes the zero extended EBX.
+    let st =
+        run64(&[(R_EAX, 1), (R_EBX, 0xffff_ffff_0000_0002), (R_ECX, 9)], &[0x0f, 0xb1, 0xcb, 0xf4]);
+    check(&st, 2, ZF, 0);
+    assert_eq!(st.regs[R_EBX], 0xffff_ffff_0000_0002);
+    // cmpxchg ebx, ecx succeeds: EBX is zero extended, RAX is not written.
+    let st = run64(
+        &[(R_EAX, 0xaaaa_0000_0000_0002), (R_EBX, 0xffff_ffff_0000_0002), (R_ECX, 9)],
+        &[0x0f, 0xb1, 0xcb, 0xf4],
+    );
+    check(&st, 0xaaaa_0000_0000_0002, ZF, ZF);
+    assert_eq!(st.regs[R_EBX], 9);
+    // cmpxchg ah, bl fails: AL takes AH.
+    let st = run64(&[(R_EAX, 0x1234), (R_EBX, 0x55)], &[0x0f, 0xb0, 0xdc, 0xf4]);
+    check(&st, 0x1212, ZF, 0);
     // LOCK on a register destination is #UD.
     let st = run64(&[], &[0xf0, 0x01, 0xc0, 0xf4]);
     assert_eq!(vector64(&st), 6);
@@ -764,6 +825,72 @@ fn page_fault_error_code_and_cr2() {
     assert_eq!(st.regs[R_ECX], 2);
     assert_eq!(st.regs[R_EDI], 0x20_0000);
     assert_eq!(w.r64(st.regs[R_ESP] + 8), CODE);
+}
+
+#[test]
+fn protection_keys() {
+    let max = || {
+        let mut m = X86Cpu::new("max", Accel::Tcg).unwrap();
+        m.realize().unwrap();
+        assert!(m.has_feature("pku") && m.has_feature("pks"));
+        World::with_model(X86::new(m))
+    };
+    let pk = || {
+        let mut st = World::long64();
+        st.cr4 |= CR4_PKE_MASK | CR4_PKS_MASK;
+        st
+    };
+    // rdpkru reads PKRU into EDX:EAX.
+    let mut st = pk();
+    st.pkru = 0xc;
+    let st = max().run(st, &[(R_EAX, u64::MAX), (R_EDX, u64::MAX)], &[0x0f, 0x01, 0xee, 0xf4]);
+    assert_eq!((st.regs[R_EAX], st.regs[R_EDX]), (0xc, 0));
+    // Without CR4.PKE both are #UD; ECX other than 0 or EDX other than 0 is #GP.
+    for code in [[0x0f, 0x01, 0xee, 0xf4], [0x0f, 0x01, 0xef, 0xf4]] {
+        assert_eq!(vector64(&max().run(World::long64(), &[], &code)), 6);
+    }
+    assert_eq!(vector64(&max().run(pk(), &[(R_ECX, 1)], &[0x0f, 0x01, 0xee, 0xf4])), 13);
+    assert_eq!(vector64(&max().run(pk(), &[(R_EDX, 1)], &[0x0f, 0x01, 0xef, 0xf4])), 13);
+    // The 2 to 4 MiB page gets key 1, writable, and user when `user`; the code, stack and
+    // tables stay on key 0.
+    let keyed = |user: bool| {
+        let w = max();
+        let u = if user { 4 } else { 0 };
+        w.w64(PML4, (PML4 + 0x1000) | 3 | u);
+        w.w64(PML4 + 0x1000, (PML4 + 0x2000) | 3 | u);
+        w.w64(PML4 + 0x2008, 0x20_0000 | 0x83 | u | 1 << 59);
+        w
+    };
+    let addr = 0x20_0100;
+    // PKRS covers the supervisor pages: access disable on key 1 faults a read with PK | P,
+    // write disable faults a write (CR0.WP is set) with PK | W | P but lets a read through.
+    // mov ecx, 0x6e1; mov eax, imm; xor edx, edx; wrmsr; mov al, [rbx]; mov [rbx], al
+    let pkrs = |v: u8| [0xb9, 0xe1, 6, 0, 0, 0xb8, v, 0, 0, 0, 0x31, 0xd2, 0x0f, 0x30];
+    let w = keyed(false);
+    let code = [&pkrs(4)[..], &[0x8a, 0x03, 0xf4]].concat();
+    let st = w.run(pk(), &[(R_EBX, addr)], &code);
+    assert_eq!(vector64(&st), 14);
+    assert_eq!((st.cr2, w.r64(st.regs[R_ESP])), (addr, 0x21));
+    let w = keyed(false);
+    let code = [&pkrs(8)[..], &[0x8a, 0x03, 0x88, 0x03, 0xf4]].concat();
+    let st = w.run(pk(), &[(R_EBX, addr)], &code);
+    assert_eq!(vector64(&st), 14);
+    assert_eq!(w.r64(st.regs[R_ESP]), 0x23);
+    assert_eq!(w.r64(st.regs[R_ESP] + 8), CODE + 16);
+    assert_eq!(st.pkrs, 8);
+    // PKRU covers the user pages, for supervisor accesses too (SMAP is off).
+    let w = keyed(true);
+    let regs = [(R_EAX, 4), (R_ECX, 0), (R_EDX, 0), (R_EBX, addr)];
+    let st = w.run(pk(), &regs, &[0x0f, 0x01, 0xef, 0x8a, 0x03, 0xf4]);
+    assert_eq!(vector64(&st), 14);
+    assert_eq!(w.r64(st.regs[R_ESP]), 0x21);
+    assert_eq!(st.pkru, 4);
+    // Without CR4.PKE the key is ignored.
+    let w = keyed(true);
+    let mut st = World::long64();
+    st.pkru = 0xc;
+    let st = w.run(st, &[(R_EBX, addr)], &[0x8a, 0x03, 0xf4]);
+    assert_eq!(st.rip, CODE + 3);
 }
 
 #[test]

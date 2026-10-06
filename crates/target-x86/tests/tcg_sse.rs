@@ -394,6 +394,7 @@ const F64: [u64; 19] = [
 ];
 const H16: [u16; 10] = [0, 0x8000, 0x3c00, 0x7c00, 0xfc00, 0x7e00, 0x7d00, 0x0001, 0x03ff, 0x7bff];
 const W16: [u16; 6] = [0, 0x7fff, 0x8000, 0xffff, 0x80, 0x7f];
+const TEXT: [u8; 10] = [0, b'a', b'a', b'b', b'b', b'c', b'z', 0x7f, 0x80, 0xff];
 const MXCSR: [u32; 6] = [0x1f80, 0x1f80, 0x3f80, 0x5f80, 0x7f80, 0x9fc0];
 
 impl Rng {
@@ -461,6 +462,7 @@ impl Rng {
                     let v = if self.below(2) == 0 { self.below(70) } else { self.next() };
                     b.extend_from_slice(&v.to_le_bytes());
                 }
+                "t" => b.push(TEXT[self.below(10) as usize]),
                 _ => {
                     let v = self.next();
                     b.extend_from_slice(&v.to_le_bytes());
@@ -471,6 +473,12 @@ impl Rng {
     }
 
     fn gpr(&mut self, kind: &str) -> u64 {
+        if kind == "t" {
+            return match self.below(4) {
+                0 => 1 << 32 | self.below(20),
+                _ => (self.below(41) as i64 - 20) as u64,
+            };
+        }
         if kind != "s" {
             return self.next();
         }
@@ -538,7 +546,9 @@ const QEMU_RESULT_DIFFS: &[&str] = &["maxpd_0"];
 #[test]
 fn native_vector_results_match() {
     let w0 = World::new("EPYC");
-    for f in ["avx", "avx2", "fma", "f16c", "pclmulqdq", "sse4.1", "ssse3"] {
+    for f in
+        ["avx", "avx2", "fma", "f16c", "pclmulqdq", "sse4.1", "ssse3", "aes", "sha-ni", "sse4.2"]
+    {
         assert!(w0.x86.model().has_feature(f), "{f}");
     }
     let data = include_str!("data/tcg_vec.txt");

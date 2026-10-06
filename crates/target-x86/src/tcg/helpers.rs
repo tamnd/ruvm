@@ -22,9 +22,9 @@ use super::cc::{CC_OP_EFLAGS, cc_op_has_eflags, cc_op_size, compute_all, compute
 use super::env::{
     APIC_BASE, CC_A, CC_C, CC_O, CC_OP, CC_SRC, CC_Z, CR8, CSTAR, EFER, EFLAGS, EIP, FMASK,
     HF_AVX_EN_MASK, HF_INHIBIT_IRQ_MASK, HF_OSFXSR_MASK, HF_SMAP_MASK, HF_UMIP_MASK, HFLAGS,
-    KERNELGSBASE, LSTAR, MISC_ENABLE, PAT, RF_MASK, SEG_BASE, STAR, SYSENTER_CS, SYSENTER_EIP,
-    SYSENTER_ESP, TF_MASK, TSC_AUX, TSC_OFFSET, XCR0, avx_enabled, cc_compute_all, compute_eflags,
-    cr, dr, ld32, ld64, load_eflags, reg, seg, st32, st64,
+    KERNELGSBASE, LSTAR, MISC_ENABLE, PAT, PKRS, PKRU, RF_MASK, SEG_BASE, STAR, SYSENTER_CS,
+    SYSENTER_EIP, SYSENTER_ESP, TF_MASK, TSC_AUX, TSC_OFFSET, XCR0, avx_enabled, cc_compute_all,
+    compute_eflags, cr, dr, ld32, ld64, load_eflags, reg, seg, st32, st64,
 };
 use super::seg::{self as sh, raise_exception_err_ra, raise_exception_ra, raise_interrupt2};
 use super::{
@@ -34,9 +34,9 @@ use super::{
 use crate::msr::{
     MSR_CSTAR, MSR_EFER, MSR_FMASK, MSR_FSBASE, MSR_GSBASE, MSR_IA32_APICBASE,
     MSR_IA32_APICBASE_BASE, MSR_IA32_APICBASE_BSP, MSR_IA32_APICBASE_ENABLE,
-    MSR_IA32_APICBASE_EXTD, MSR_IA32_MISC_ENABLE, MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_EIP,
-    MSR_IA32_SYSENTER_ESP, MSR_IA32_TSC, MSR_KERNELGSBASE, MSR_LSTAR, MSR_PAT, MSR_STAR,
-    MSR_TSC_AUX,
+    MSR_IA32_APICBASE_EXTD, MSR_IA32_MISC_ENABLE, MSR_IA32_PKRS, MSR_IA32_SYSENTER_CS,
+    MSR_IA32_SYSENTER_EIP, MSR_IA32_SYSENTER_ESP, MSR_IA32_TSC, MSR_KERNELGSBASE, MSR_LSTAR,
+    MSR_PAT, MSR_STAR, MSR_TSC_AUX,
 };
 use crate::state::{
     CR0_ET_MASK, CR0_PE_MASK, CR0_PG_MASK, CR0_TS_MASK, CR0_WP_MASK, CR4_CET_MASK, CR4_DE_MASK,
@@ -91,6 +91,7 @@ macro_rules! def {
     };
 }
 
+mod crypto;
 pub(crate) mod fpu;
 pub(crate) mod vec;
 
@@ -404,8 +405,9 @@ fn h_idivl(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     })
 }
 
-/// `helper_divq_EAX()`. The common case of a dividend that fits in RAX divides in 64 bits, and
-/// the CPU is only set up for the #DE path.
+/// `helper_divq_EAX()`. The translator divides inline when RDX is zero, so this sees the
+/// rest; a dividend that fits in RAX still divides in 64 bits, and the CPU is only set up for
+/// the #DE path.
 fn h_divq(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     let den = a[1];
     let lo = ld64(h.env, reg(R_EAX));
@@ -577,6 +579,8 @@ def!(CPUID, "x86_cpuid", 0, Void, [Ptr], h_cpuid);
 def!(RDTSC, "x86_rdtsc", 0, Void, [Ptr], h_rdtsc);
 def!(RDTSCP, "x86_rdtscp", 0, Void, [Ptr], h_rdtscp);
 def!(RDPMC, "x86_rdpmc", 0, Void, [Ptr], h_rdpmc);
+def!(RDPKRU, "x86_rdpkru", 0, I64, [Ptr, I32], h_rdpkru);
+def!(WRPKRU, "x86_wrpkru", 0, Void, [Ptr, I32, I64], h_wrpkru);
 
 fn h_cpuid(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
@@ -626,6 +630,34 @@ fn h_rdtscp(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
         rdtsc(cpu)?;
         let aux = ld64(cpu.env, TSC_AUX) & 0xffff_ffff;
         set_reg(cpu, R_ECX, aux);
+        Ok(0)
+    })
+}
+
+/// `helper_rdpkru()`.
+fn h_rdpkru(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    run(h, |cpu| {
+        if ld64(cpu.env, cr(4)) & CR4_PKE_MASK == 0 {
+            return Err(raise_exception_err_ra(cpu, EXCP06_ILLOP, 0, TB));
+        }
+        if a32(a, 1) != 0 {
+            return Err(raise_exception_err_ra(cpu, EXCP0D_GPF, 0, TB));
+        }
+        Ok(u64::from(ld32(cpu.env, PKRU)))
+    })
+}
+
+/// `helper_wrpkru()`.
+fn h_wrpkru(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    run(h, |cpu| {
+        if ld64(cpu.env, cr(4)) & CR4_PKE_MASK == 0 {
+            return Err(raise_exception_err_ra(cpu, EXCP06_ILLOP, 0, TB));
+        }
+        if a32(a, 1) != 0 || a[2] >> 32 != 0 {
+            return Err(raise_exception_err_ra(cpu, EXCP0D_GPF, 0, TB));
+        }
+        st32(cpu.env, PKRU, a[2] as u32);
+        tlb_flush(cpu);
         Ok(0)
     })
 }
@@ -759,6 +791,7 @@ fn h_rdmsr(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
             MSR_TSC_AUX => ld64(env, TSC_AUX),
             MSR_IA32_TSC => tsc(cpu),
             MSR_IA32_MISC_ENABLE => ld64(env, MISC_ENABLE),
+            MSR_IA32_PKRS => u64::from(ld32(env, PKRS)),
             // QEMU reads the MSRs it does not know as zero.
             _ => 0,
         };
@@ -828,6 +861,13 @@ fn h_wrmsr(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
                 st64(cpu.env, TSC_OFFSET, val.wrapping_sub(host));
             }
             MSR_IA32_MISC_ENABLE => st64(cpu.env, MISC_ENABLE, val),
+            MSR_IA32_PKRS => {
+                if val >> 32 != 0 {
+                    return Err(raise_exception_err_ra(cpu, EXCP0D_GPF, 0, TB));
+                }
+                st32(cpu.env, PKRS, val as u32);
+                tlb_flush(cpu);
+            }
             // QEMU ignores writes to the MSRs it does not know.
             _ => {}
         }
@@ -1290,6 +1330,8 @@ const ALL: &[&Def] = &[
     &RDTSC,
     &RDTSCP,
     &RDPMC,
+    &RDPKRU,
+    &WRPKRU,
     &INB,
     &INW,
     &INL,

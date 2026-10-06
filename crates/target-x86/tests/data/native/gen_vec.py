@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Usage: python3 gen_vec.py writes vec_cases.h; build vec.c with it on an x86-64 host with
-# AVX2, FMA, F16C and PCLMULQDQ (gcc -O1 -o vec vec.c) and run ./vec > ../tcg_vec.txt.
+# AVX2, FMA, F16C, PCLMULQDQ, AES-NI, SHA and SSE4.2 (gcc -O1 -o vec vec.c) and run ./vec > ../tcg_vec.txt.
 # Build the native harness for the MMX, SSE, AVX, AVX2, FMA and F16C test cases.
 import struct
 CF, PF, AF, ZF, SF, OF = 1, 4, 0x10, 0x40, 0x80, 0x800
@@ -21,6 +21,7 @@ F64 = [0, 0x8000000000000000, 0x3ff0000000000000, 0xbff8000000000000, 0x7ff00000
        0x43e0000000000000, 0x3ff8000000000000]
 H16 = [0, 0x8000, 0x3c00, 0x7c00, 0xfc00, 0x7e00, 0x7d00, 0x0001, 0x03ff, 0x7bff]
 W16 = [0, 0x7fff, 0x8000, 0xffff, 0x80, 0x7f]
+TEXT = b'\0aabbcz\x7f\x80\xff'
 MXCSR = [0x1f80, 0x1f80, 0x3f80, 0x5f80, 0x7f80, 0x9fc0]
 
 
@@ -59,7 +60,7 @@ class Rng:
 
     def val(self, kind, n):
         """n bytes of the given kind: i (random), s and d (floats), h (half floats), w
-        (16-bit integers near the saturation limits) or x (shift counts)."""
+        (16-bit integers near the saturation limits), x (shift counts) or t (string bytes)."""
         b = b''
         while len(b) < n:
             if kind == 's':
@@ -74,11 +75,18 @@ class Rng:
                 b += struct.pack('<H', W16[k] if k < 6 else self.bits(16))
             elif kind == 'x':
                 b += struct.pack('<Q', self.below(70) if self.below(2) == 0 else self.next())
+            elif kind == 't':
+                b += TEXT[self.below(10):][:1]
             else:
                 b += struct.pack('<Q', self.next())
         return b
 
     def gpr(self, kind):
+        if kind == 't':
+            # String lengths: small and signed, or with bit 32 set for the REX.W forms.
+            if self.below(4) == 0:
+                return struct.pack('<Q', 1 << 32 | self.below(20))
+            return struct.pack('<Q', (self.below(41) - 20) & M64)
         if kind == 's':
             k = self.below(4)
             v = [self.next, lambda: self.bits(31), lambda: -self.bits(20) & M64, lambda: 0][k]()
@@ -445,6 +453,48 @@ for base, order in ((0x00, '132'), (0x10, '213'), (0x20, '231')):
             if op >= 0x98:
                 vx(f'{nm}{order}s{kind}', 2, 0x66, op + base + 1, ls=(0,), w=w, kind=kind, n=1,
                    mx=True)
+
+# AES-NI, SHA and the SSE4.2 string compares.
+for op, nm in ((0xdc, 'aesenc'), (0xdd, 'aesenclast'), (0xde, 'aesdec'), (0xdf, 'aesdeclast')):
+    leg(nm, [0x66], [0x38, op], n=2)
+    vx('v' + nm, 2, 0x66, op, ls=(0,), n=1)
+leg('aesimc', [0x66], [0x38, 0xdb], n=2)
+vx('vaesimc', 2, 0x66, 0xdb, ls=(0,), v=0, n=1)
+leg('aeskeygenassist', [0x66], [0x3a, 0xdf], imm=[0x01, 0x36, 0x8d], n=1)
+vx('vaeskeygenassist', 3, 0x66, 0xdf, ls=(0,), v=0, imm=[0x1b], n=1)
+leg('sha1rnds4', [], [0x3a, 0xcc], imm=[0, 1, 2, 3], n=2)
+for op, nm in ((0xc8, 'sha1nexte'), (0xc9, 'sha1msg1'), (0xca, 'sha1msg2'), (0xcb, 'sha256rnds2'),
+               (0xcc, 'sha256msg1'), (0xcd, 'sha256msg2')):
+    leg(nm, [], [0x38, op], n=3)
+PCMP = [0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0c, 0x0d, 0x12, 0x14, 0x34, 0x38, 0x3a,
+        0x3e, 0x40, 0x45, 0x4c, 0x59, 0x6c, 0x7f]
+for op, nm in ((0x60, 'pcmpestrm'), (0x61, 'pcmpestri'), (0x62, 'pcmpistrm'),
+               (0x63, 'pcmpistri')):
+    leg(nm, [0x66], [0x3a, op], kind='t', imm=PCMP, n=2)
+    vx('v' + nm, 3, 0x66, op, ls=(0,), v=0, kind='t', imm=[0x0c, 0x44, 0x71], n=2)
+    if op < 0x62:
+        leg(nm + 'w', [0x66], [0x3a, op], kind='t', imm=[0x00, 0x0d, 0x44], w=1, n=3)
+
+
+def gather(name, op, w, scale, shift_op, shift):
+    """An AVX2 gather from [RDI + index * scale]. A shift first makes the index register YMM2
+    small enough that the elements stay in the 32 bytes of memory; YMM1 is the destination and
+    YMM3 the mask."""
+    for l in (0, 1):
+        code = vex3(1, 0, 2, l, 1) + [shift_op, modrm(3, 2, 2), shift]
+        code += vex3(2, w, 3, l, 1) + [op, modrm(0, 1, 4), scale << 6 | 2 << 3 | RDI]
+        add(name + ('256' if l else ''), code, n=3)
+
+
+for nm, op, w, scale, sh in (('vpgatherdd', 0x90, 0, 2, (0x72, 29)),
+                             ('vpgatherdq', 0x90, 1, 3, (0x72, 30)),
+                             ('vpgatherqd', 0x91, 0, 2, (0x73, 61)),
+                             ('vpgatherqq', 0x91, 1, 3, (0x73, 62)),
+                             ('vgatherdps', 0x92, 0, 2, (0x72, 29)),
+                             ('vgatherdpd', 0x92, 1, 3, (0x72, 30)),
+                             ('vgatherqps', 0x93, 0, 2, (0x73, 61)),
+                             ('vgatherqpd', 0x93, 1, 3, (0x73, 62))):
+    gather(nm, op, w, scale, *sh)
 
 
 def h(b):
