@@ -20,6 +20,9 @@ ruvm-jit-interp.workspace = true
 ruvm-mem.workspace = true
 ruvm-softfloat.workspace = true
 
+[dev-dependencies]
+flate2.workspace = true
+
 [build-dependencies]
 ruvm-decode.workspace = true
 

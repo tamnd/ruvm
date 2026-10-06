@@ -1,0 +1,160 @@
+From 4c34080cf1ef880ca89d565a024be5f45396fe10 Mon Sep 17 00:00:00 2001
+From: ruvm <ruvm@localhost>
+Date: Mon, 5 Oct 2026 11:39:10 +0200
+Subject: [PATCH 3/4] risugen_x86: canonicalise undefined flags, keep flags
+ across memory setup, add integer helpers
+
+---
+ risu_reginfo_i386.c        |  4 +--
+ risugen_x86.pm             | 34 +++++++++++++++++++++++--
+ risugen_x86_constraints.pm | 52 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/risu_reginfo_i386.c b/risu_reginfo_i386.c
+index 1c579fa..b817968 100644
+--- a/risu_reginfo_i386.c
++++ b/risu_reginfo_i386.c
+@@ -121,8 +121,8 @@ void reginfo_init(struct reginfo *ri, ucontext_t *uc, void *siaddr)
+             ri->gregs[i] = uc->uc_mcontext.gregs[i] - image_start_address;
+             break;
+         case REG_EFL:
+-            /* Store only the "flaggy" bits: SF, ZF, AF, PF, CF.  */
+-            ri->gregs[i] = uc->uc_mcontext.gregs[i] & 0xd5;
++            /* Store only the "flaggy" bits: OF, SF, ZF, AF, PF, CF.  */
++            ri->gregs[i] = uc->uc_mcontext.gregs[i] & 0x8d5;
+             break;
+         case REG_E(SP):
+             /* Ignore the stack.  */
+diff --git a/risugen_x86.pm b/risugen_x86.pm
+index ae11843..1a098e7 100644
+--- a/risugen_x86.pm
++++ b/risugen_x86.pm
+@@ -110,6 +110,28 @@ sub asm_insn_xchgT(%)
+     }
+ }
+ 
++# NOT r/m, which unlike NEG leaves the flags alone, so the rollback after a
++# memory access keeps the flags the instruction under test set.
++sub asm_insn_notT(%)
++{
++    my (%args) = @_;
++    insnv(value => 0x48, width => 8) if $is_x86_64;
++    insnv(value => 0xF7, width => 8);
++    insnv(value => 0xD0 | ($args{reg2} & 7), width => 8);
++}
++
++# Clear the flags in $mask, which the instruction under test leaves undefined:
++# PUSHFQ; AND QWORD [RSP], ~$mask; POPFQ.
++sub write_clear_flags($)
++{
++    my ($mask) = @_;
++    die "clearing undefined flags needs x86_64" unless $is_x86_64;
++    insnv(value => 0x9C, width => 8);
++    insnv(value => 0x48812424, width => 32);
++    insnv(value => (~$mask) & 0xFFFFFFFF, width => 32, bigendian => 0);
++    insnv(value => 0x9D, width => 8);
++}
++
+ sub write_random_regdata()
+ {
+     my $reg_cnt = $is_x86_64 ? 16 : 8;
+@@ -393,7 +415,7 @@ sub write_mem_getoffset_rollback(%)
+     # get value mismatches since the memory layout can be different.
+     asm_insn_xchgT(reg => $args{base}, reg2 => REG_RAX)
+         unless $args{base} == REG_RAX;
+-    asm_insn_negT(reg2 => REG_RAX);
++    asm_insn_notT(reg2 => REG_RAX);
+     asm_insn_risuop(RISUOP_GETMEMBLOCK);
+ 
+     # I didn't originally think this was neccessary, but there were
+@@ -402,7 +424,8 @@ sub write_mem_getoffset_rollback(%)
+     # range of int32 -- the first NEG would then pollute the EFLAGS
+     # register with this information. Using another NEG is a neat
+     # way of overwriting all this information with consistent values.
+-    asm_insn_negT(reg2 => REG_RAX);
++    # ruvm: NOT instead, which leaves the flags of the tested instruction.
++    asm_insn_notT(reg2 => REG_RAX);
+ }
+ 
+ sub gen_one_insn($)
+@@ -457,7 +480,14 @@ sub gen_one_insn($)
+         # above for details.
+         $insn{opcode}{value} >>= 32 - $insnwidth;
+ 
++        # ruvm: code to run before the instruction, and the flags it leaves
++        # undefined, from the constraints block.
++        my $pre = $insn{pre};
++        my $undef_flags = $insn{undef_flags};
++        delete @insn{qw(pre undef_flags osz)};
++        insnv(value => $_, width => 8) for @{$pre // []};
+         asm_insn(%insn);
++        write_clear_flags($undef_flags) if $undef_flags;
+         write_mem_getoffset_rollback(%memopts) if $memopts{rollback};
+         asm_insn_risuop(RISUOP_COMPAREMEM)     if $memopts{is_write};
+         asm_insn_risuop(RISUOP_COMPARE);
+diff --git a/risugen_x86_constraints.pm b/risugen_x86_constraints.pm
+index a4ee687..9bfafb2 100644
+--- a/risugen_x86_constraints.pm
++++ b/risugen_x86_constraints.pm
+@@ -127,6 +127,58 @@ sub imm($%)
+     $insn->{imm}{width} = $args{width};
+ }
+ 
++# ruvm: helpers for the general purpose register instructions in
++# x86_int.risu.
++
++# Pick an operand size of 16, 32 or 64 bits (32 or 64 with nod16), with the
++# 66 prefix or REX.W, and keep it in $insn->{osz} in bytes.
++sub osz($%)
++{
++    my ($insn, %args) = @_;
++    my $s = $args{nod16} ? 1 + int(rand(2)) : int(rand(3));
++    if ($s == 0) {
++        data16($insn);
++        $insn->{osz} = 2;
++    } elsif ($s == 1) {
++        $insn->{osz} = 4;
++    } else {
++        rex($insn, w => 1);
++        $insn->{osz} = 8;
++    }
++}
++
++# A byte operation: always with a REX prefix, so that registers 4 to 7 are
++# SPL to DIL rather than AH to BH, which alias other registers.
++sub byteop($)
++{
++    my ($insn) = @_;
++    rex($insn);
++    $insn->{osz} = 1;
++}
++
++# Whether the register operands are usable: none is RSP (the stack pointer
++# risu records as a constant), and none of MODRM.REG (unless reg => 0 says it
++# is an opcode extension), VEX.vvvv (with v => 1) and the implicit operands in
++# implicit => [...] is the base register of a memory operand, whose value
++# depends on where the memory block is.
++sub gpr($%)
++{
++    my ($insn, %args) = @_;
++    my $m = $insn->{modrm};
++    my @regs = ();
++    push @regs, $m->{reg} if !defined $args{reg} || $args{reg};
++    push @regs, $insn->{vex}{v} if $args{v};
++    for my $r (@regs, $m->{reg2}, $m->{base}, $m->{index}) {
++        return 0 if defined $r && $r == REG_RSP;
++    }
++    if (defined $m->{base}) {
++        for my $r (@regs, @{$args{implicit} // []}) {
++            return 0 if $r == $m->{base};
++        }
++    }
++    return 1;
++}
++
+ sub eval_constraints_block(%)
+ {
+     my (%args) = @_;
+-- 
+2.43.0
+

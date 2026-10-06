@@ -1283,6 +1283,22 @@ pub fn save_vcpu(v: &Vcpu) -> CpuArmState {
     CpuArmState::load(&v.env)
 }
 
+/// `vfp_get_fpsr()`: FPSR with the exception flags still held in the float status and the
+/// QC bit folded in, as an MRS reads it.
+pub fn vfp_get_fpsr(st: &CpuArmState) -> u32 {
+    vfp::get_fpsr(st)
+}
+
+/// `vfp_set_fpsr()`: write FPSR as an MSR does.
+pub fn vfp_set_fpsr(st: &mut CpuArmState, val: u32) {
+    vfp::set_fpsr(st, val);
+}
+
+/// `vfp_set_fpcr()`: write FPCR as an MSR does, updating the float status it controls.
+pub fn vfp_set_fpcr(st: &mut CpuArmState, val: u32, f: &ArmFeatures) {
+    vfp::set_fpcr(st, val, f);
+}
+
 /// Whether `v` is halted in WFI.
 pub fn vcpu_halted(v: &Vcpu) -> bool {
     v.shared().halted.load(Ordering::Acquire) != 0

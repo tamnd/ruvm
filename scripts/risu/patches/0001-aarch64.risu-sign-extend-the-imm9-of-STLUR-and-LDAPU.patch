@@ -1,0 +1,39 @@
+From 51c264bae320832ab7380d59439c1e26cafa07cf Mon Sep 17 00:00:00 2001
+From: ruvm <ruvm@localhost>
+Date: Mon, 5 Oct 2026 11:29:36 +0200
+Subject: [PATCH 1/4] aarch64.risu: sign-extend the imm9 of STLUR and LDAPUR
+
+---
+ aarch64.risu | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/aarch64.risu b/aarch64.risu
+index bfea659..870cd63 100644
+--- a/aarch64.risu
++++ b/aarch64.risu
+@@ -3036,18 +3036,18 @@ LDAPR A64 sz:2 111000 101 11111 1100 00 rn:5 rt:5 \
+ @v8_4_rcpc
+ STLUR A64 sz:2 011001 00 0 imm:9 00 rn:5 rt:5 \
+ !constraints { $rn != 31 && $rn != $rt } \
+-!memory { align(1 << $sz); reg_plus_imm($rn, $imm); }
++!memory { align(1 << $sz); reg_plus_imm($rn, sextract($imm, 9)); }
+ 
+ LDAPUR A64 sz:2 011001 01 0 imm:9 00 rn:5 rt:5 \
+ !constraints { $rn != 31 && $rn != $rt } \
+-!memory { align(1 << $sz); reg_plus_imm($rn, $imm); }
++!memory { align(1 << $sz); reg_plus_imm($rn, sextract($imm, 9)); }
+ 
+ LDAPURS64 A64 sz:2 011001 10 0 imm:9 00 rn:5 rt:5 \
+ !constraints { $rn != 31 && $rn != $rt && $sz != 3 } \
+-!memory { align(1 << $sz); reg_plus_imm($rn, $imm); }
++!memory { align(1 << $sz); reg_plus_imm($rn, sextract($imm, 9)); }
+ 
+ LDAPURS32 A64 sz:2 011001 11 0 imm:9 00 rn:5 rt:5 \
+ !constraints { $rn != 31 && $rn != $rt && $sz < 2 } \
+-!memory { align(1 << $sz); reg_plus_imm($rn, $imm); }
++!memory { align(1 << $sz); reg_plus_imm($rn, sextract($imm, 9)); }
+ 
+ @
+-- 
+2.43.0
+
