@@ -14,10 +14,10 @@
 //! memory with no host bytes to give (a test memory, say) gets a load and a store between
 //! [`GuestMemory::atomic_begin`] and [`GuestMemory::atomic_end`] instead.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::AtomicU8;
 
+use ruvm_jit_core::hash::FastHashMap;
 use ruvm_jit_core::ir::{HelperInfo, HelperType};
 use ruvm_jit_core::types::MemOpIdx;
 use ruvm_sys::hostatomic;
@@ -73,8 +73,8 @@ pub struct HelperEntry {
 /// Helpers by name.
 #[derive(Clone, Debug, Default)]
 pub struct HelperRegistry {
-    map: HashMap<String, HelperEntry>,
-    native: HashMap<String, NativeHelperFn>,
+    map: FastHashMap<String, HelperEntry>,
+    native: FastHashMap<String, NativeHelperFn>,
 }
 
 impl HelperRegistry {
@@ -87,7 +87,7 @@ impl HelperRegistry {
 
     /// A registry with nothing in it.
     pub fn empty() -> HelperRegistry {
-        HelperRegistry { map: HashMap::new(), native: HashMap::new() }
+        HelperRegistry { map: FastHashMap::default(), native: FastHashMap::default() }
     }
 
     /// Register `f` under `name`, replacing any earlier helper of that name.

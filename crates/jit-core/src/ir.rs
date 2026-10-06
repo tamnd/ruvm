@@ -12,8 +12,9 @@
 //! host.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
+use crate::hash::FastHashMap;
 use crate::memory_model::FenceMapping;
 use crate::opcode::Opcode;
 use crate::types::{INSN_START_WORDS, TempKind, Type};
@@ -461,7 +462,7 @@ pub struct Func {
     pub(crate) temps: Vec<TempData>,
     pub(crate) nb_globals: usize,
     pub(crate) nb_indirects: usize,
-    const_table: HashMap<(Type, i64), Temp>,
+    const_table: FastHashMap<(Type, i64), Temp>,
     free_temps: [BTreeSet<u32>; 6],
     pub(crate) labels: Vec<LabelData>,
     nodes: Vec<OpNode>,
@@ -469,7 +470,7 @@ pub struct Func {
     last: u32,
     nb_ops: usize,
     pub(crate) helpers: Vec<HelperInfo>,
-    helper_names: HashMap<String, HelperId>,
+    helper_names: FastHashMap<String, HelperId>,
     /// The settings for this block.
     pub config: FuncConfig,
     pub(crate) last_insn_start: Option<OpId>,
@@ -484,7 +485,7 @@ impl Func {
             temps: Vec::new(),
             nb_globals: 0,
             nb_indirects: 0,
-            const_table: HashMap::new(),
+            const_table: FastHashMap::default(),
             free_temps: Default::default(),
             labels: Vec::new(),
             nodes: Vec::new(),
@@ -492,7 +493,7 @@ impl Func {
             last: NIL,
             nb_ops: 0,
             helpers: Vec::new(),
-            helper_names: HashMap::new(),
+            helper_names: FastHashMap::default(),
             config,
             last_insn_start: None,
             num_insns: 0,
@@ -846,6 +847,11 @@ impl Func {
     /// The op with this id, for changing in place.
     pub fn op_mut(&mut self, id: OpId) -> &mut Op {
         &mut self.nodes[id.index()].op
+    }
+
+    /// The size of the op arena: every [`OpId`] of this function indexes below it.
+    pub(crate) fn op_slots(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Number of linked ops, `nb_ops`.

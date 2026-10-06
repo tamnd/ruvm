@@ -481,11 +481,17 @@ mod host {
         c.set_owner(owner);
     }
 
-    pub(super) fn set_ic_key(_c: &CompiledTb, _pc: u64, _key: [u64; 2]) {}
+    pub(super) fn set_ic_key(c: &CompiledTb, pc: u64, key: [u64; 2]) {
+        c.set_ic_key(pc, key);
+    }
 
-    pub(super) fn clear_ic(_c: &CompiledTb) {}
+    pub(super) fn clear_ic(c: &CompiledTb) {
+        c.clear_ic();
+    }
 
-    pub(super) fn clear_region_ic(_r: &CodeRegion) {}
+    pub(super) fn clear_region_ic(r: &CodeRegion) {
+        r.clear_ic();
+    }
 
     impl Chain for TbChain {
         fn lookup_tb_ptr(
