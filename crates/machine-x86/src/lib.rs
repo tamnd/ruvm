@@ -19,6 +19,7 @@ pub mod ich9_lpc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod kvm_run;
 pub mod microvm;
+pub mod migration;
 pub mod pc;
 pub mod pflash;
 pub mod q35;

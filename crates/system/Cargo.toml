@@ -29,6 +29,7 @@ ruvm-hw-virtio.workspace = true
 ruvm-machine-arm.workspace = true
 ruvm-machine-x86.workspace = true
 ruvm-mem.workspace = true
+ruvm-migration.workspace = true
 ruvm-monitor.workspace = true
 ruvm-qapi.workspace = true
 ruvm-qom.workspace = true

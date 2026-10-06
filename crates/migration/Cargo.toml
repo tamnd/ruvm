@@ -14,6 +14,10 @@ publish = false
 unsafe-budget = 0
 
 [dependencies]
+ruvm-base.workspace = true
+ruvm-mem.workspace = true
+ruvm-qapi.workspace = true
+ruvm-vmstate.workspace = true
 
 [lints]
 workspace = true

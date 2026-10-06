@@ -605,6 +605,8 @@ pub struct Q35 {
     io: RegionId,
     pci: RegionId,
     ram: RegionId,
+    /// `pc.rom`, the option ROM area.
+    option_rom: RegionId,
     memory_as: Arc<AddressSpace>,
     io_as: Arc<AddressSpace>,
     smm_root: Option<RegionId>,
@@ -1178,6 +1180,7 @@ impl Q35 {
             io,
             pci,
             ram,
+            option_rom: option_rom_mr,
             memory_as,
             io_as,
             smm_root,
@@ -1499,6 +1502,16 @@ impl Q35 {
     /// The RAM block behind `pc.ram`.
     pub fn ram_block(&self) -> Option<Arc<RamBlock>> {
         self.mem.ram_block(self.ram)
+    }
+
+    /// The RAM blocks that migrate, in QEMU's names: `pc.ram`, `pc.bios` when the firmware is
+    /// ROM, `pc.rom`, and the flash blocks.
+    pub fn migratable_ram_blocks(&self) -> Vec<Arc<RamBlock>> {
+        let mut ids = vec![self.ram];
+        ids.extend(self.bios.as_ref().map(|b| b.0));
+        ids.push(self.option_rom);
+        ids.extend(self.flashes.iter().map(|f| f.region()));
+        ids.into_iter().filter_map(|id| self.mem.ram_block(id)).collect()
     }
 
     /// The firmware region, `pc.bios`, or `None` when the firmware is in pflash.

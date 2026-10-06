@@ -297,3 +297,23 @@ impl VmStateInfo<()> for UnusedBuffer {
         Ok(())
     }
 }
+
+/// `vmstate_info_timer`: a `QEMUTimer` goes on the wire as its expiry time in nanoseconds, -1
+/// when it is not armed. Devices keep that number in their migration state and re-arm the timer
+/// from it after loading.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Timer;
+
+impl VmStateInfo<i64> for Timer {
+    fn name(&self) -> &'static str {
+        "timer"
+    }
+
+    fn load(&self, f: &mut StreamReader<'_>, v: &mut i64, size: usize) -> Result<()> {
+        Int64.load(f, v, size)
+    }
+
+    fn save(&self, f: &mut StreamWriter, v: &i64, size: usize) -> Result<()> {
+        Int64.save(f, v, size)
+    }
+}

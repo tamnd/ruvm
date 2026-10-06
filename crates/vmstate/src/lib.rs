@@ -13,22 +13,25 @@
 //! structs keep whatever layout suits them. What cannot change is the field list itself, which has
 //! to match QEMU's entry for entry.
 //!
-//! The vmdesc JSON that QEMU appends to a migration stream, and the list based infos (`qtailq`,
-//! `gtree`, `qlist`, `GByteArray`, `bitmap`, `timer`, `fd`), are not here yet.
+//! [`vmstate_save_state_vmdesc`] also writes the vmdesc JSON that QEMU appends to a migration
+//! stream. The list based infos (`qtailq`, `gtree`, `qlist`, `GByteArray`, `bitmap`, `fd`) are
+//! not here yet; `timer` is [`info::Timer`] over the expiry time.
 
 #![forbid(unsafe_code)]
 
 mod field;
 mod file;
 pub mod info;
+mod json;
 mod vmsd;
 mod vmstate;
 
 pub use field::VmStateField;
 pub use file::{EINVAL, EIO, StreamReader, StreamWriter};
 pub use info::{VmStateInfo, VmStateType};
+pub use json::JsonWriter;
 pub use vmsd::{MigPriority, VmStateDescription};
-pub use vmstate::{vmstate_load_state, vmstate_save_state};
+pub use vmstate::{vmstate_load_state, vmstate_save_state, vmstate_save_state_vmdesc};
 
 /// `QEMU_VM_EOF`, the byte that ends a migration stream.
 pub const QEMU_VM_EOF: u8 = 0x00;

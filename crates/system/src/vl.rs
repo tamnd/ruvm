@@ -32,12 +32,13 @@ use ruvm_hw_core::machine::{MACHINES, machine_type_name};
 use ruvm_hw_core::{Machine, create_machine};
 use ruvm_machine_x86::BoardKind;
 use ruvm_mem::MemorySystem;
+use ruvm_migration::Migration;
 use ruvm_monitor::Qmp;
 use ruvm_monitor::object::{TYPE_MONITOR_HMP, TYPE_MONITOR_QMP, monitor_compat_id, monitor_new};
 use ruvm_qapi::keyval::{keyval_merge, keyval_parse, keyval_parse_into};
 use ruvm_qapi::opts::{OptsHandle, QemuOptDesc, QemuOptType, QemuOptsList, is_help_option};
 use ruvm_qapi::types::{
-    Audiodev, DisplayOptions, MonitorMode, MonitorOptions, ObjectOptions, ShutdownCause,
+    Audiodev, DisplayOptions, MonitorMode, MonitorOptions, ObjectOptions, RunState, ShutdownCause,
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit};
 use ruvm_qapi::{QDict, QValue, json};
@@ -85,7 +86,12 @@ pub struct Vm {
     pub machine: OnceLock<Machine>,
     /// `qemu_name`, from `-name guest=...`.
     pub name: Option<String>,
-    autostart: bool,
+    /// `autostart`: `-S` clears it, and `cont` while waiting for an incoming migration sets it.
+    pub(crate) autostart: Arc<AtomicBool>,
+    /// `incoming`: the main channel of `-incoming`, or `defer`.
+    incoming: Option<String>,
+    /// The migration state, on a machine ruvm can migrate.
+    pub(crate) migration: OnceLock<Migration>,
     machine_initialized: AtomicBool,
     /// `qtest_driver()`: a test drives the machine over `-qtest`.
     qtest: bool,
@@ -109,7 +115,21 @@ impl Vm {
             }
         }
         self.qmp.set_machine_ready(true);
-        if self.autostart {
+        if let Some(uri) = &self.incoming {
+            if uri != "defer" {
+                let res = match self.migration.get() {
+                    Some(m) => m.incoming(Some(uri), None, true),
+                    None => Err(Error::generic(
+                        "migration is not supported with this machine by ruvm yet",
+                    )),
+                };
+                if let Err(e) = res {
+                    report_error(&e.prepend(format!("-incoming {uri}: ")));
+                    ruvm_chardev::stdio::term_exit();
+                    std::process::exit(1);
+                }
+            }
+        } else if self.autostart.load(Ordering::Acquire) {
             self.runstate.qmp_cont()?;
         }
         Ok(())
@@ -207,6 +227,8 @@ struct Config {
     /// `accelerators`, from `-machine accel=`.
     accelerators: Option<String>,
     autostart: bool,
+    /// `-incoming`: the main channel, or `defer`.
+    incoming: Option<String>,
     preconfig: bool,
     qtest: Option<String>,
     qtest_log: Option<String>,
@@ -238,6 +260,7 @@ impl Config {
             machine: QDict::new(),
             accelerators: None,
             autostart: true,
+            incoming: None,
             preconfig: false,
             qtest: None,
             qtest_log: None,
@@ -472,6 +495,7 @@ fn parse_options(
                 }
             }
             Opt::S => cfg.autostart = false,
+            Opt::Incoming => incoming_option_parse(cfg, arg)?,
             Opt::Preconfig => cfg.preconfig = true,
             Opt::Nodefaults => {
                 cfg.x86.has_defaults = false;
@@ -499,7 +523,22 @@ fn parse_options(
 }
 
 /// `qemu_validate_options()`.
+/// `incoming_option_parse()`: a URI or `defer`. The JSON form of a channel is not taken yet.
+fn incoming_option_parse(cfg: &mut Config, arg: &str) -> Flow<()> {
+    if arg != "defer" {
+        if arg.starts_with('{') {
+            return Err(fail_msg("-incoming with a JSON channel is not supported by ruvm yet"));
+        }
+        ruvm_migration::parse_uri(arg).map_err(|e| fail(&e))?;
+    }
+    cfg.incoming = Some(arg.to_string());
+    Ok(())
+}
+
 fn validate_options(cfg: &Config) -> Flow<()> {
+    if cfg.incoming.as_deref().is_some_and(|i| i != "defer") && cfg.preconfig {
+        return Err(fail_msg("'preconfig' supports '-incoming defer' only"));
+    }
     if cfg.machine.get("kernel").is_none() {
         if cfg.machine.get("append").is_some() {
             return Err(fail_msg("-append only allowed with -kernel option"));
@@ -905,11 +944,16 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         block: BlockGraph::new(),
         machine: OnceLock::new(),
         name,
-        autostart: cfg.autostart,
+        autostart: Arc::new(AtomicBool::new(cfg.autostart)),
+        incoming: cfg.incoming.clone(),
+        migration: OnceLock::new(),
         machine_initialized: AtomicBool::new(false),
         qtest: cfg.qtest.is_some(),
     });
     qmp.register(|cmds| qmp_cmds::register(&vm, cmds));
+    if cfg.incoming.is_some() {
+        runstate.set(RunState::Inmigrate);
+    }
 
     #[cfg(unix)]
     {
