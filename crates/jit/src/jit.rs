@@ -16,12 +16,13 @@
 //!   `DIRTY_MEMORY_CODE` bit, is a separate set so the TLB can test it without the page lock.
 //! - RAM blocks get a `ram_addr` the first time the runtime sees them; see the crate docs.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::Instant;
 
+use ruvm_jit_core::hash::{FastHashMap, FastHashSet};
 use ruvm_mem::{AddressSpace, RamBlock};
 
 use crate::backend::{Backend, InterpBackend};
@@ -75,7 +76,7 @@ pub(crate) const TB_HEADER_COST: usize = 128;
 pub(crate) struct Region {
     pub(crate) used: usize,
     pub(crate) full: bool,
-    pub(crate) tbs: HashMap<u64, Arc<Tb>>,
+    pub(crate) tbs: FastHashMap<u64, Arc<Tb>>,
 }
 
 /// One RAM block known to the runtime.
@@ -90,13 +91,13 @@ pub struct Jit {
     /// The configuration.
     pub config: JitConfig,
     pub(crate) backend: Arc<dyn Backend>,
-    pub(crate) htable: RwLock<HashMap<TbKey, Arc<Tb>>>,
+    pub(crate) htable: RwLock<FastHashMap<TbKey, Arc<Tb>>>,
     pub(crate) region: Mutex<Region>,
     pub(crate) next_tb_id: AtomicU64,
     pub(crate) tb_flush_count: AtomicU32,
     pub(crate) tb_phys_invalidate_count: AtomicU64,
-    pub(crate) pages: Mutex<HashMap<u64, Vec<Arc<Tb>>>>,
-    pub(crate) code_pages: RwLock<HashSet<u64>>,
+    pub(crate) pages: Mutex<FastHashMap<u64, Vec<Arc<Tb>>>>,
+    pub(crate) code_pages: RwLock<FastHashSet<u64>>,
     pub(crate) ram: RwLock<RamRegistry>,
     pub(crate) cpus: RwLock<Vec<Arc<CpuShared>>>,
     pub(crate) list_lock: Mutex<()>,
@@ -137,13 +138,13 @@ impl Jit {
         Arc::new_cyclic(|w| Jit {
             config,
             backend,
-            htable: RwLock::new(HashMap::new()),
+            htable: RwLock::new(FastHashMap::default()),
             region: Mutex::new(Region::default()),
             next_tb_id: AtomicU64::new(4),
             tb_flush_count: AtomicU32::new(0),
             tb_phys_invalidate_count: AtomicU64::new(0),
-            pages: Mutex::new(HashMap::new()),
-            code_pages: RwLock::new(HashSet::new()),
+            pages: Mutex::new(FastHashMap::default()),
+            code_pages: RwLock::new(FastHashSet::default()),
             ram: RwLock::new(RamRegistry::default()),
             cpus: RwLock::new(Vec::new()),
             list_lock: Mutex::new(()),

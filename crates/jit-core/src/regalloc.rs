@@ -36,8 +36,9 @@
 //! - Helper calls pass every argument through memory: the target says where each argument
 //!   word goes ([`Target::call_arg_home`]) and results come back the same way.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
 
+use crate::hash::FastHashMap;
 use crate::ir::{DEAD_ARG, Func, Label, MAX_OP_ARGS, Op, OpId, SYNC_ARG, Temp, TempData};
 use crate::opcode::Opcode;
 use crate::types::{Cond, TempKind, Type, call_flags, dup_const, opf};
@@ -324,7 +325,11 @@ pub struct RegAlloc<'f> {
     coherent: Vec<bool>,
     reg_to_temp: [Option<Temp>; 64],
     reserved: RegSet,
-    cache: HashMap<(usize, &'static [&'static str]), Vec<ArgConstraint>>,
+    /// Parsed constraint sets, keyed by output count and the address and length of the
+    /// target's static strings, so a lookup hashes three words rather than the strings.
+    cache: FastHashMap<(usize, usize, usize), usize>,
+    /// The sets `cache` points into.
+    ct_sets: Vec<Vec<ArgConstraint>>,
     stubs: Vec<BranchStub>,
     next_label: u32,
     /// For each conditional branch, the globals that are dead on its fall through path.
@@ -345,6 +350,27 @@ pub fn reg_alloc<T: Target>(f: &Func, t: &mut T) -> Result<(), T::Error> {
     let mut last = None;
     for (id, op) in f.ops() {
         ra.op(t, id, op)?;
+        last = Some(id);
+    }
+    match last {
+        Some(id) => ra.out_stubs(t, id),
+        None => Ok(()),
+    }
+}
+
+/// [`reg_alloc`] with `op.life` taken from `live` rather than from the ops, so a function
+/// can be allocated without a copy to write `op.life` into. `live` must come from [`analyze`]
+/// on `f` with the target's [`Target::extra_op_flags`].
+pub fn reg_alloc_live<T: Target>(f: &Func, live: Liveness, t: &mut T) -> Result<(), T::Error> {
+    let mut ra = RegAlloc::new(f, t);
+    if t.out_of_line_branches() {
+        ra.drops = live.drops;
+    }
+    let mut last = None;
+    for (id, op) in f.ops() {
+        let mut op = *op;
+        op.life = live.life[id.index()];
+        ra.op(t, id, &op)?;
         last = Some(id);
     }
     match last {
@@ -378,10 +404,11 @@ impl<'f> RegAlloc<'f> {
             coherent: vec![true; f.nb_temps()],
             reg_to_temp: [None; 64],
             reserved: t.reserved_regs(),
-            cache: HashMap::new(),
+            cache: FastHashMap::default(),
+            ct_sets: Vec::new(),
             stubs: Vec::new(),
             next_label: f.nb_labels() as u32,
-            drops: HashMap::new(),
+            drops: FastHashMap::default(),
         }
     }
 
@@ -486,7 +513,15 @@ impl<'f> RegAlloc<'f> {
         let sets = [required.minus(allocated).and(preferred), required.minus(allocated)];
         assert!(!sets[1].is_empty(), "no register left to allocate");
         let first = if sets[0].is_empty() || sets[0] == sets[1] { 1 } else { 0 };
-        let order: Vec<Reg> = tg.alloc_order().to_vec();
+        // A copy, since freeing a register below needs `tg` mutably.
+        let mut order_buf = [0 as Reg; 64];
+        let n = {
+            let order = tg.alloc_order();
+            let n = order.len().min(64);
+            order_buf[..n].copy_from_slice(&order[..n]);
+            n
+        };
+        let order = &order_buf[..n];
         for set in &sets[first..] {
             if set.len() == 1 {
                 let r = set.first().unwrap_or(0);
@@ -494,7 +529,7 @@ impl<'f> RegAlloc<'f> {
                     return r;
                 }
             } else {
-                for &r in &order {
+                for &r in order {
                     if self.reg_to_temp[r as usize].is_none() && set.contains(r) {
                         return r;
                     }
@@ -507,7 +542,7 @@ impl<'f> RegAlloc<'f> {
                 self.reg_free(tg, r, allocated);
                 return r;
             }
-            for &r in &order {
+            for &r in order {
                 if set.contains(r) {
                     self.reg_free(tg, r, allocated);
                     return r;
@@ -821,19 +856,33 @@ impl<'f> RegAlloc<'f> {
         self.do_movi(tg, ots, val, op);
     }
 
-    fn constraints<T: Target>(&mut self, tg: &T, op: &Op) -> Result<Vec<ArgConstraint>, T::Error> {
+    /// The parsed constraints of `op`, copied out of the cache so the caller can keep them
+    /// while it mutates the allocator.
+    fn constraints<T: Target>(
+        &mut self,
+        tg: &T,
+        op: &Op,
+    ) -> Result<[ArgConstraint; MAX_OP_ARGS], T::Error> {
         let set = tg.op_constraints(self.f, op)?;
         let nb_oargs = op.nb_oargs();
-        if set.len() != nb_oargs + op.nb_iargs() {
+        if set.len() != nb_oargs + op.nb_iargs() || set.len() > MAX_OP_ARGS {
             return Err(tg.bad_ir(format!("{}: constraint set has the wrong size", op.opc.name())));
         }
-        if let Some(c) = self.cache.get(&(nb_oargs, set)) {
-            return Ok(c.clone());
-        }
-        let c = parse_constraints(set, nb_oargs, &|ch| tg.constraint_letter(ch))
-            .map_err(|e| tg.bad_ir(format!("{}: {e}", op.opc.name())))?;
-        self.cache.insert((nb_oargs, set), c.clone());
-        Ok(c)
+        let key = (nb_oargs, set.as_ptr() as usize, set.len());
+        let idx = match self.cache.get(&key) {
+            Some(&i) => i,
+            None => {
+                let c = parse_constraints(set, nb_oargs, &|ch| tg.constraint_letter(ch))
+                    .map_err(|e| tg.bad_ir(format!("{}: {e}", op.opc.name())))?;
+                self.ct_sets.push(c);
+                self.cache.insert(key, self.ct_sets.len() - 1);
+                self.ct_sets.len() - 1
+            }
+        };
+        let c = &self.ct_sets[idx];
+        let mut out = [ArgConstraint::default(); MAX_OP_ARGS];
+        out[..c.len()].copy_from_slice(c);
+        Ok(out)
     }
 
     /// `tcg_reg_alloc_op`.
@@ -1056,24 +1105,51 @@ const TS_MEM: u8 = 2;
 /// or lowered. `extra_flags` adds target flags to an op, as [`Target::extra_op_flags`] does.
 pub fn liveness(f: &mut Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) {
     let (lives, _) = scan(f, extra_flags);
-    for (id, life) in lives {
-        f.op_mut(id).life = life;
+    let mut cur = f.first_op();
+    while let Some(id) = cur {
+        cur = f.next_op(id);
+        f.op_mut(id).life = lives[id.index()];
     }
+}
+
+/// What [`analyze`] finds: `op.life` for every op, and the globals each conditional branch
+/// leaves for its stub to store.
+#[derive(Clone, Debug, Default)]
+pub struct Liveness {
+    /// `op.life`, indexed by [`OpId`].
+    life: Vec<u32>,
+    drops: Drops,
+}
+
+impl Liveness {
+    /// The `op.life` [`liveness`] would give `id`.
+    pub fn life(&self, id: OpId) -> u32 {
+        self.life[id.index()]
+    }
+}
+
+/// [`liveness`] without writing the result into `f`, for [`reg_alloc_live`].
+pub fn analyze(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> Liveness {
+    let (life, drops) = scan(f, extra_flags);
+    Liveness { life, drops }
 }
 
 /// The pass behind [`liveness`]: `op.life` for every op, and for each conditional branch the
 /// globals its fall through path neither reads nor needs in memory before setting them again.
 /// The globals each conditional branch leaves for its stub to store, which the fall through
 /// path frees after the branch.
-type Drops = HashMap<OpId, Vec<Temp>>;
+type Drops = FastHashMap<OpId, Vec<Temp>>;
 
 /// Finds, for each conditional branch, the globals that may have been written since the
 /// last point where every global was forced to memory. Only these can be dirty at the
 /// branch, so only these need to stay live until it.
-fn written_globals(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> HashMap<OpId, Vec<usize>> {
+fn written_globals(
+    f: &Func,
+    extra_flags: &dyn Fn(&Func, &Op) -> u32,
+) -> FastHashMap<OpId, Vec<usize>> {
     let ng = f.nb_globals();
     let global = |t: Temp| t.index() < ng && f.temp(t).kind == TempKind::Global;
-    let mut map = HashMap::new();
+    let mut map = FastHashMap::default();
     let mut written = vec![false; ng];
     let mut cur = f.first_op();
     while let Some(id) = cur {
@@ -1112,9 +1188,9 @@ fn written_globals(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> HashMap
     map
 }
 
-fn scan(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> (Vec<(OpId, u32)>, Drops) {
-    let mut lives = Vec::new();
-    let mut drops = HashMap::new();
+fn scan(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> (Vec<u32>, Drops) {
+    let mut lives = vec![0u32; f.op_slots()];
+    let mut drops = FastHashMap::default();
     let ng = f.nb_globals();
     let kinds: Vec<TempKind> = f.temps().iter().map(|t| t.kind).collect();
     let nt = kinds.len();
@@ -1227,7 +1303,7 @@ fn scan(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> (Vec<(OpId, u32)>,
                 }
             }
         }
-        lives.push((id, life));
+        lives[id.index()] = life;
     }
     (lives, drops)
 }
@@ -1247,6 +1323,25 @@ pub fn prepare(f: &Func, extra_flags: &dyn Fn(&Func, &Op) -> u32) -> Func {
     g
 }
 
+/// [`prepare`] for [`reg_alloc_live`]: `f` itself when it uses no indirect global, which is
+/// the common case and needs no copy, and the lowered copy otherwise, with its liveness.
+pub fn prepare_live<'f>(
+    f: &'f Func,
+    extra_flags: &dyn Fn(&Func, &Op) -> u32,
+) -> (Cow<'f, Func>, Liveness) {
+    let used_indirect = f.nb_indirects() > 0
+        && f.ops().any(|(_, op)| {
+            let n = op.nb_oargs() + op.nb_iargs();
+            (0..n).any(|i| f.temp(op.arg_temp(i)).indirect_reg)
+        });
+    if !used_indirect {
+        return (Cow::Borrowed(f), analyze(f, extra_flags));
+    }
+    let g = prepare(f, extra_flags);
+    let live = analyze(&g, extra_flags);
+    (Cow::Owned(g), live)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,6 +1353,35 @@ mod tests {
             'A' => Some(Letter::Const(0x100)),
             _ => None,
         }
+    }
+
+    #[test]
+    fn analyze_matches_liveness() {
+        use crate::ir::FuncConfig;
+        let mut f = Func::new(FuncConfig::default());
+        let env = f.env();
+        let r0 = f.global_mem_new_i64(env, 0, "r0");
+        let r1 = f.global_mem_new_i64(env, 8, "r1");
+        let t = f.temp_new_i64();
+        let l = f.new_label();
+        f.gen_add_i64(t, r0, r1);
+        f.gen_addi_i64(r0, t, 1);
+        f.gen_brcondi_i64(Cond::Eq, t, 0, l);
+        f.gen_addi_i64(r0, r1, 2);
+        f.gen_set_label(l);
+        f.gen_movi_i64(r1, 3);
+        f.gen_exit_tb(0, 0);
+        let none = |_: &Func, _: &Op| 0;
+        let (g, live) = prepare_live(&f, &none);
+        assert!(matches!(g, Cow::Borrowed(_)), "no indirect globals, so no copy");
+        let mut want = f.clone();
+        liveness(&mut want, &none);
+        let mut n = 0;
+        for (id, op) in want.ops() {
+            assert_eq!(live.life(id), op.life, "{}", op.opc.name());
+            n += 1;
+        }
+        assert_eq!(n, f.nb_ops());
     }
 
     #[test]

@@ -420,7 +420,10 @@ pub(crate) fn generate(
     opts: &GenOptions<'_>,
 ) -> R<Generated> {
     let v256 = check_types(f, feat)?;
-    let f = regalloc::prepare(f, &extra_flags);
+    // Liveness goes alongside `f` rather than into a copy of it, unless it has indirect
+    // globals to lower.
+    let (prepared, live) = regalloc::prepare_live(f, &extra_flags);
+    let f: &Func = &prepared;
     let mut g = Gen {
         a: Asm::new(),
         feat,
@@ -473,7 +476,7 @@ pub(crate) fn generate(
     g.a.jump(Some(cc::A), static_fail, false);
     let fast_body = g.a.pos();
 
-    regalloc::reg_alloc(&f, &mut g)?;
+    regalloc::reg_alloc_live(f, live, &mut g)?;
     if let Some(e) = g.err.take() {
         return Err(e);
     }

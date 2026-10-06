@@ -36,7 +36,9 @@
 //!   globals before them, as it does for ops with side effects.
 //! - Helper calls, guest memory accesses and `divs2`/`divu2` go through the service routine,
 //!   with every argument in memory, instead of the host calling convention and the softmmu
-//!   fast path.
+//!   fast path. The exception is a `TCG_CALL_NO_SE` helper with a
+//!   [`ruvm_jit_interp::NativeHelperFn`] in [`ChainGen::helpers`]: that is a direct call, its
+//!   arguments loaded from memory into x0 to x3 and its result stored back.
 //! - `insn_start` emits no code. Each service request carries the index of the `insn_start`
 //!   of its instruction, fixed when the block is compiled, and each exit stores it in the run
 //!   context, instead of QEMU's table of host code offsets next to the code; the runtime
@@ -58,7 +60,7 @@
 //! - With [`ChainGen::tlb_page_bits`], `qemu_ld` and `qemu_st` of up to 64 bits look up the
 //!   softmmu TLB inline as QEMU's `prepare_host_addr` does, and use the service routine on a
 //!   miss. The descriptor is found through the run context rather than at a fixed offset from
-//!   `env`, the miss path is inline rather than out of line, and byte swapped accesses and
+//!   `env`, and byte swapped accesses and
 //!   128-bit accesses that must be atomic as a whole always take the slow path (QEMU inlines
 //!   those too). A 128-bit access whose halves need only be atomic each
 //!   (`MO_ATOM_IFALIGN_PAIR`, such as aarch64 `ldp` and `stp` of X registers) or not at all is
@@ -78,6 +80,8 @@
 //! - A 32-bit load of the `icount_decr` word at the offset the runtime gives reads the shared
 //!   atomic through a pointer in the run context, so that exit requests from other threads
 //!   are seen without leaving generated code. In QEMU the word is part of the CPU state.
+//! - A call to `lookup_tb_ptr_ic` first looks the guest program counter up in an inline cache
+//!   of block headers and jumps straight to the block on a hit; see the runtime. Not in QEMU.
 
 use ruvm_jit_core::ir::{Func, HelperType, Op, OpId, Temp};
 use ruvm_jit_core::memory_model::{FenceMapping, ldst_flags};
@@ -86,6 +90,7 @@ use ruvm_jit_core::regalloc::{self, Letter, RegSet, Target};
 use ruvm_jit_core::types::{
     Cond, INSN_START_WORDS, MemOp, MemOpIdx, TempKind, Type, bswap, call_flags, dup_const, opf,
 };
+use ruvm_jit_interp::HelperRegistry;
 use ruvm_jit_interp::fast_tlb::{
     TLB_ADDEND_WORD, TLB_DESC_WORDS, TLB_ENTRY_BITS, TLB_FLAGS_SHIFT, TLB_MAX_MMU_MODES,
 };
@@ -128,13 +133,14 @@ pub(crate) const META_OFFSET: i64 = INSN_OFFSET + 32;
 pub(crate) const DECR_OFFSET: i64 = META_OFFSET + 8;
 /// Byte offset of the one address `goto_ptr` may jump to, or 0.
 pub(crate) const GOTO_PTR_OK_OFFSET: i64 = DECR_OFFSET + 8;
-/// Byte offset of the address of the TLB descriptor the inline softmmu fast path reads, a
-/// [`ruvm_jit_interp::FastTlb::desc`].
+/// Byte offset of the copy of the TLB descriptor the inline softmmu fast path reads, a
+/// [`ruvm_jit_interp::FastTlb::desc`], so that a lookup reads the mask and table straight from
+/// the run context, as QEMU's reads them from `env`.
 pub(crate) const TLB_OFFSET: i64 = GOTO_PTR_OK_OFFSET + 8;
 
 /// What the runtime needs built into a block so that blocks can chain without returning.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ChainGen {
+pub(crate) struct ChainGen<'a> {
     /// The address of the block's metadata, passed to the service routine with each request
     /// and stored in the run context when the block leaves.
     pub(crate) meta: u64,
@@ -148,6 +154,9 @@ pub(crate) struct ChainGen {
     /// takes the same arguments: the context, the request index with the [`Gen::insn`] of the
     /// call in its upper 32 bits, so that neither routine need look it up, and the metadata.
     pub(crate) lookup: u64,
+    /// Calls to helpers with a [`ruvm_jit_interp::NativeHelperFn`] here, and the declared
+    /// signature, go straight to it rather than through the service routine.
+    pub(crate) helpers: Option<&'a HelperRegistry>,
 }
 
 /// Choices for code generation beyond the block itself.
@@ -273,6 +282,31 @@ pub(crate) struct Generated {
     pub(crate) fast_body: usize,
     /// The length of CPU state the static bounds check asks for (`u64::MAX` if it always fails).
     pub(crate) env_need: u64,
+    /// For each `lookup_tb_ptr_ic` call with an inline cache: the index of its request and the
+    /// byte offset of the four `movz` and `movk` words that load the address of its
+    /// [`IC_WAYS`] cache words, which is 0 until the caller patches it with [`patch_ic_addr`].
+    pub(crate) ic_sites: Vec<(usize, usize)>,
+}
+
+/// Entries of the inline cache of a `lookup_tb_ptr_ic` call. Each is the address of the
+/// two-word header of a block: the guest program counter it starts at, and the address to
+/// jump to, or 0 for none.
+pub(crate) const IC_WAYS: usize = 8;
+
+/// The entry of the inline cache for the program counter `pc`.
+pub(crate) fn ic_way(pc: u64) -> usize {
+    ((pc ^ (pc >> 4)) as usize) & (IC_WAYS - 1)
+}
+
+/// Put `addr` into the four `movz` and `movk` words at byte offset `at` of `bytes`, which
+/// [`Gen::ic_probe`] emitted with zero immediates.
+pub(crate) fn patch_ic_addr(bytes: &mut [u8], at: usize, addr: u64) {
+    for k in 0..4 {
+        let o = at + 4 * k;
+        let w = u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let w = w | (((addr >> (16 * k)) & 0xffff) as u32) << 5;
+        bytes[o..o + 4].copy_from_slice(&w.to_le_bytes());
+    }
 }
 
 /// The general registers the allocator may use: x0 to x15 and x23 to x28.
@@ -350,10 +384,13 @@ pub(crate) fn generate(
     base: u64,
     service: u64,
     opts: &CodegenOptions,
-    chain: &ChainGen,
+    chain: &ChainGen<'_>,
 ) -> R<Generated> {
     check_types(f)?;
-    let f = regalloc::prepare(f, &extra_flags);
+    // Liveness goes alongside `f` rather than into a copy of it, unless it has indirect
+    // globals to lower.
+    let (prepared, live) = regalloc::prepare_live(f, &extra_flags);
+    let f: &Func = &prepared;
     let c = &f.config;
     let mut g = Gen {
         opts: *opts,
@@ -378,6 +415,9 @@ pub(crate) fn generate(
         icount_decr: chain.icount_decr,
         tlb_page_bits: chain.tlb_page_bits,
         err: None,
+        ic_sites: Vec::new(),
+        helpers: chain.helpers,
+        slow_paths: Vec::new(),
     };
     g.exit = g.a.new_label();
     g.bounds = g.a.new_label();
@@ -405,11 +445,19 @@ pub(crate) fn generate(
     g.a.bcond_label(cc::LO, static_fail);
     let fast_body = g.a.pos() * 4;
 
-    regalloc::reg_alloc(&f, &mut g)?;
+    regalloc::reg_alloc_live(f, live, &mut g)?;
     if let Some(e) = g.err.take() {
         return Err(e);
     }
     g.exit_with(kind::FELL_OFF, None);
+
+    // The miss paths of inline guest accesses, `tcg_out_ldst_finalize`.
+    for sp in std::mem::take(&mut g.slow_paths) {
+        g.a.bind(sp.slow);
+        g.insn = sp.insn;
+        g.ldst_slow(&sp);
+        g.a.b_label(sp.done);
+    }
 
     // Exit stubs for linked goto_tb slots.
     let mut goto_tb = Vec::new();
@@ -466,7 +514,7 @@ pub(crate) fn generate(
     }
 
     let slot_words = (f.nb_temps() + 1) * SLOT_BYTES / 8;
-    let (requests, insn_of) = (g.requests, g.insn_of);
+    let (requests, insn_of, ic_sites) = (g.requests, g.insn_of, g.ic_sites);
     let out = g.a.finish()?;
     let env_need = if g.static_always_fails { u64::MAX } else { end };
     Ok(Generated {
@@ -478,6 +526,7 @@ pub(crate) fn generate(
         body,
         fast_body,
         env_need,
+        ic_sites,
     })
 }
 
@@ -528,7 +577,7 @@ enum Addr {
     Dyn,
 }
 
-struct Gen {
+struct Gen<'h> {
     opts: CodegenOptions,
     /// The fence mapping the block was built with, after `FenceMapping::effective`.
     mapping: FenceMapping,
@@ -565,6 +614,33 @@ struct Gen {
     tlb_page_bits: Option<u32>,
     /// An error from a hook that cannot return one.
     err: Option<GenCodeError>,
+    /// See [`Generated::ic_sites`].
+    ic_sites: Vec<(usize, usize)>,
+    /// See [`ChainGen::helpers`].
+    helpers: Option<&'h HelperRegistry>,
+    /// The miss paths of guest accesses whose hit path is inline, emitted after the block.
+    slow_paths: Vec<SlowPath>,
+}
+
+/// The miss path of one `qemu_ld` or `qemu_st`, kept until the end of the block as QEMU's
+/// `TCGLabelQemuLdst` is, so that a hit falls straight through.
+struct SlowPath {
+    /// Where the hit path branches on a miss, and where the miss path returns to.
+    slow: usize,
+    done: usize,
+    /// [`Gen::insn`] at the access.
+    insn: u64,
+    store: bool,
+    /// A 128-bit access in two registers.
+    two: bool,
+    /// The type of a load's result.
+    ty: Type,
+    /// An acquire load or a release store.
+    ordered: bool,
+    /// The data registers, and the address register.
+    data: [Reg; 2],
+    addr: Reg,
+    oi: MemOpIdx,
 }
 
 // Constraint sets, `tcg-target-con-set.h`.
@@ -595,7 +671,7 @@ const C_W_W_WZ: &[&str] = &["w", "w", "wZ"];
 const C_W4: &[&str] = &["w", "w", "w", "w"];
 const C_W5: &[&str] = &["w", "w", "w", "w", "w"];
 
-impl Gen {
+impl Gen<'_> {
     fn label(&mut self, op: &Op, i: usize) -> R<usize> {
         let id = op.arg_label(i).id() as usize;
         // The allocator numbers the labels of its branch stubs after the function's own.
@@ -714,17 +790,17 @@ impl Gen {
     /// [`Self::service`], with `after` emitted right after the call returns, before the check
     /// for leaving.
     fn service_then(&mut self, req: Request, after: Option<u32>) {
-        self.service_via(req, after, self.service, self.insn);
+        self.service_via(req, after, self.service, self.insn, 0);
     }
 
     /// [`Self::service_then`] through the routine at `routine`, with `tag` in the upper half
-    /// of the request index.
-    fn service_via(&mut self, req: Request, after: Option<u32>, routine: u64, tag: u64) {
+    /// of the request index and `site` or'ed into the lower half.
+    fn service_via(&mut self, req: Request, after: Option<u32>, routine: u64, tag: u64, site: u64) {
         let idx = self.requests.len();
         self.requests.push(req);
         self.insn_of.push(self.insn);
         self.a.movr(true, X0, CTX);
-        self.a.movi(Type::I64, X1, idx as u64 | tag << 32);
+        self.a.movi(Type::I64, X1, idx as u64 | site | tag << 32);
         self.a.movi(Type::I64, X2, self.meta);
         self.a.movi(Type::I64, TMP0, routine);
         self.a.breg(i::BLR, TMP0);
@@ -737,6 +813,53 @@ impl Gen {
         self.a.movi(Type::I64, X1, 0);
         self.a.b_label(self.exit);
         self.a.bind(ok);
+    }
+
+    /// A direct call to the [`ruvm_jit_interp::NativeHelperFn`] at `addr` of a helper with
+    /// `nin` argument words, taking them from and leaving its result in the argument words, as
+    /// the service routine would. Such a helper has no side effects, so it cannot raise an
+    /// exception and needs no guest state, and as in QEMU the call is all there is to it.
+    fn call_native(&mut self, addr: u64, nin: usize, ret: HelperType) {
+        for k in (0..nin).step_by(2) {
+            if k + 1 < nin {
+                self.a.ldstpair(i::LDP, k as Reg, k as Reg + 1, CTX, 8 * k as i64, true, false);
+            } else {
+                self.a.ld(Type::I64, k as Reg, CTX, 8 * k as i64);
+            }
+        }
+        self.a.jump_abs(addr, true);
+        if ret != HelperType::Void {
+            self.a.st(Type::I64, X0, CTX, 0);
+        }
+    }
+
+    /// The inline cache of a `lookup_tb_ptr_ic` call, whose arguments are already in the run
+    /// context: when the entry for the program counter in argument 1 names a block header with
+    /// that program counter and a nonzero address, jump there; otherwise fall through to the
+    /// lookup. The address of the cache words is patched in by the runtime. The entry is read
+    /// before the header it names, an address dependency, so a header published with a release
+    /// store before the entry is seen whole.
+    fn ic_probe(&mut self) {
+        let miss = self.a.new_label();
+        self.a.ld(Type::I64, TMP0, CTX, 8);
+        // The entry, ic_way(pc), as a byte offset: ((pc ^ pc >> 4) & 7) << 3.
+        self.a.realshift(i::EOR | 1 << 22, true, TMP2, TMP0, TMP0, 4);
+        let w = (IC_WAYS - 1).count_ones();
+        self.a.bitfield(i::UBFM, true, TMP2, TMP2, 1, 64 - 3, w - 1);
+        self.ic_sites.push((self.requests.len(), self.a.pos() * 4));
+        self.a.movw(i::MOVZ, true, TMP1, 0, 0);
+        self.a.movw(i::MOVK, true, TMP1, 0, 16);
+        self.a.movw(i::MOVK, true, TMP1, 0, 32);
+        self.a.movw(i::MOVK, true, TMP1, 0, 48);
+        self.a.ldst_reg(i::LDRX, TMP1, TMP1, true, TMP2);
+        self.a.ld(Type::I64, TMP2, TMP1, 0);
+        self.a.rrr(i::SUBS, true, XZR, TMP0, TMP2);
+        self.a.bcond_label(cc::NE, miss);
+        self.a.ld(Type::I64, TMP1, TMP1, 8);
+        self.a.reloc_here(asm::Reloc::Condbr19, miss);
+        self.a.cbz(i::CBZ, true, TMP1, 0);
+        self.a.breg(i::BR, TMP1);
+        self.a.bind(miss);
     }
 
     /// Set the flags for `c` from `a` and `b`, `tgen_cmp` and `tgen_cmpi`.
@@ -1119,81 +1242,76 @@ impl Gen {
                 let ai = if two { 2 } else { 1 };
                 let oi = MemOpIdx(op.args[ai + 1] as u32);
                 let acquire = op.flags & ldst_flags::ACQUIRE_PC != 0;
-                let done = self.a.new_label();
                 self.after_full_dmb = false;
-                if two && !acquire && self.tlb_pair_fits(oi) {
+                let sp = SlowPath {
+                    slow: self.a.new_label(),
+                    done: self.a.new_label(),
+                    insn: self.insn,
+                    store: false,
+                    two,
+                    ty,
+                    ordered: acquire,
+                    data: [r(0), if two { r(1) } else { 0 }],
+                    addr: r(ai),
+                    oi,
+                };
+                let inline = if two && !acquire && self.tlb_pair_fits(oi) {
                     // Two 64-bit halves, each atomic on its own at most: one `ldp`.
-                    let slow = self.a.new_label();
-                    self.tlb_addr(r(ai), oi, false, false, slow);
+                    let idx = self.tlb_addr(r(ai), oi, false, false, sp.slow);
+                    self.index_to_tmp0(idx);
                     self.a.rrr(i::ADD, true, TMP0, TMP0, TMP1);
                     self.a.ldstpair(i::LDP, r(0), r(1), TMP0, 0, true, false);
-                    self.a.b_label(done);
-                    self.a.bind(slow);
+                    true
                 } else if !two && self.tlb_fits(oi) {
-                    let slow = self.a.new_label();
-                    self.tlb_addr(r(ai), oi, false, acquire, slow);
-                    self.window_load(ty, r(0), oi.memop(), acquire);
-                    self.a.b_label(done);
-                    self.a.bind(slow);
+                    let idx = self.tlb_addr(r(ai), oi, false, acquire, sp.slow);
+                    self.window_load(ty, r(0), oi.memop(), acquire, idx);
+                    true
                 } else if !two && self.window_fits(oi.memop()) {
-                    let slow = self.a.new_label();
-                    self.window_addr(r(ai), oi.memop(), acquire, slow);
-                    self.window_load(ty, r(0), oi.memop(), acquire);
-                    self.a.b_label(done);
-                    self.a.bind(slow);
-                }
-                self.put_args(&args[ai..ai + 1]);
-                self.service(Request::Load(oi));
-                if two {
-                    self.a.ld(Type::I64, r(0), CTX, 0);
-                    self.a.ld(Type::I64, r(1), CTX, 8);
+                    self.window_addr(r(ai), oi.memop(), acquire, sp.slow);
+                    self.window_load(ty, r(0), oi.memop(), acquire, (TMP0, true));
+                    true
                 } else {
-                    self.a.ld(ty, r(0), CTX, 0);
-                }
-                if acquire {
-                    self.a.emit(DMB_ISHLD);
-                }
-                self.a.bind(done);
+                    false
+                };
+                self.finish_ldst(sp, inline);
             }
             Opcode::QemuSt | Opcode::QemuSt2 => {
                 let two = op.opc == Opcode::QemuSt2;
                 let ai = if two { 2 } else { 1 };
                 let oi = MemOpIdx(op.args[ai + 1] as u32);
                 let release = op.flags & ldst_flags::RELEASE != 0;
-                let done = self.a.new_label();
                 self.after_full_dmb = false;
-                if two && !release && self.tlb_pair_fits(oi) {
+                let sp = SlowPath {
+                    slow: self.a.new_label(),
+                    done: self.a.new_label(),
+                    insn: self.insn,
+                    store: true,
+                    two,
+                    ty,
+                    ordered: release,
+                    data: [r(0), if two { r(1) } else { XZR }],
+                    addr: r(ai),
+                    oi,
+                };
+                let inline = if two && !release && self.tlb_pair_fits(oi) {
                     // Two 64-bit halves, each atomic on its own at most: one `stp`.
-                    let slow = self.a.new_label();
-                    self.tlb_addr(r(ai), oi, true, false, slow);
+                    let idx = self.tlb_addr(r(ai), oi, true, false, sp.slow);
+                    self.index_to_tmp0(idx);
                     self.a.rrr(i::ADD, true, TMP0, TMP0, TMP1);
                     self.a.ldstpair(i::STP, r(0), r(1), TMP0, 0, true, false);
-                    self.a.b_label(done);
-                    self.a.bind(slow);
+                    true
                 } else if !two && self.tlb_fits(oi) {
-                    let slow = self.a.new_label();
-                    self.tlb_addr(r(ai), oi, true, release, slow);
-                    self.window_store(r(0), oi.memop(), release);
-                    self.a.b_label(done);
-                    self.a.bind(slow);
+                    let idx = self.tlb_addr(r(ai), oi, true, release, sp.slow);
+                    self.window_store(r(0), oi.memop(), release, idx);
+                    true
                 } else if !two && self.window_fits(oi.memop()) {
-                    let slow = self.a.new_label();
-                    self.window_addr(r(ai), oi.memop(), release, slow);
-                    self.window_store(r(0), oi.memop(), release);
-                    self.a.b_label(done);
-                    self.a.bind(slow);
-                }
-                if release {
-                    self.a.emit(DMB_ISH_FULL);
-                }
-                if two {
-                    self.put_args(&args[..2]);
+                    self.window_addr(r(ai), oi.memop(), release, sp.slow);
+                    self.window_store(r(0), oi.memop(), release, (TMP0, true));
+                    true
                 } else {
-                    self.put_args(&[args[0], XZR as u64]);
-                }
-                self.a.st(Type::I64, r(ai), CTX, 16);
-                self.service(Request::Store(oi));
-                self.a.bind(done);
+                    false
+                };
+                self.finish_ldst(sp, inline);
             }
             Opcode::GotoPtr => {
                 // Jump straight to the block when the service routine vouched for the address
@@ -1213,6 +1331,51 @@ impl Gen {
             other => return Err(GenCodeError::Unsupported(other.name().to_string())),
         }
         Ok(())
+    }
+
+    /// End a guest access: with an `inline` hit path, the hit falls through and the miss path
+    /// waits for the end of the block; without one, the miss path is all there is.
+    fn finish_ldst(&mut self, sp: SlowPath, inline: bool) {
+        if inline {
+            self.a.bind(sp.done);
+            self.slow_paths.push(sp);
+        } else {
+            self.ldst_slow(&sp);
+            self.a.bind(sp.done);
+        }
+    }
+
+    /// The service routine call of a guest access, `tcg_out_qemu_ld_slow_path` and
+    /// `tcg_out_qemu_st_slow_path`.
+    fn ldst_slow(&mut self, sp: &SlowPath) {
+        if sp.store {
+            if sp.ordered {
+                self.a.emit(DMB_ISH_FULL);
+            }
+            self.put_args(&[u64::from(sp.data[0]), u64::from(sp.data[1])]);
+            self.a.st(Type::I64, sp.addr, CTX, 16);
+            self.service(Request::Store(sp.oi));
+            return;
+        }
+        self.put_args(&[u64::from(sp.addr)]);
+        self.service(Request::Load(sp.oi));
+        if sp.two {
+            self.a.ld(Type::I64, sp.data[0], CTX, 0);
+            self.a.ld(Type::I64, sp.data[1], CTX, 8);
+        } else {
+            self.a.ld(sp.ty, sp.data[0], CTX, 0);
+        }
+        if sp.ordered {
+            self.a.emit(DMB_ISHLD);
+        }
+    }
+
+    /// Put the index register of a guest access in x16, zero extended from 32 bits unless
+    /// `idx.1` says it is 64 bits wide.
+    fn index_to_tmp0(&mut self, idx: (Reg, bool)) {
+        if idx.0 != TMP0 {
+            self.a.movr(idx.1, TMP0, idx.0);
+        }
     }
 
     /// True if a guest access with `memop` can be tried against the host window: the window is
@@ -1279,19 +1442,31 @@ impl Gen {
     }
 
     /// The inline TLB lookup of the guest access at `addr`, QEMU's `prepare_host_addr`: on a hit
-    /// put the guest address in x16 and the entry's addend in x17, so that the access is at
-    /// x16 + x17 as for the window; on a miss branch to `slow`. An `ordered` access must also
-    /// be naturally aligned, as `ldapr` and `stlr` require.
-    fn tlb_addr(&mut self, addr: Reg, oi: MemOpIdx, store: bool, ordered: bool, slow: usize) {
+    /// put the entry's addend in x17 and return the index register, so that the access is at
+    /// x17 plus that register (64 bits wide if the flag says so, else zero extended from 32),
+    /// as QEMU's `HostAddress` with `index_ext`; on a miss branch to `slow`. An `ordered`
+    /// access must also be naturally aligned, as `ldapr` and `stlr` require.
+    fn tlb_addr(
+        &mut self,
+        addr: Reg,
+        oi: MemOpIdx,
+        store: bool,
+        ordered: bool,
+        slow: usize,
+    ) -> (Reg, bool) {
         let page_bits = self.tlb_page_bits.expect("tlb_fits checked there is a TLB");
         let m = oi.memop();
         let s_mask = (1u64 << m.size()) - 1;
         let a_bits = if ordered { m.alignment_bits().max(m.size()) } else { m.alignment_bits() };
         let a_mask = (1u64 << a_bits) - 1;
-        let desc = (oi.mmu_idx() as usize * TLB_DESC_WORDS * 8) as i64;
-        self.a.ld(Type::I64, TMP1, CTX, TLB_OFFSET);
-        self.a.ld(Type::I64, TMP0, TMP1, desc);
-        self.a.ld(Type::I64, TMP1, TMP1, desc + 8);
+        // The mask and the table, from the copy of the descriptor in the run context.
+        let desc = TLB_OFFSET + (oi.mmu_idx() as usize * TLB_DESC_WORDS * 8) as i64;
+        if desc < 0x200 {
+            self.a.ldstpair(i::LDP, TMP0, TMP1, CTX, desc, true, false);
+        } else {
+            self.a.ld(Type::I64, TMP0, CTX, desc);
+            self.a.ld(Type::I64, TMP1, CTX, desc + 8);
+        }
         let src = if self.addr32 {
             self.a.movr(false, TMP2, addr);
             TMP2
@@ -1314,13 +1489,13 @@ impl Gen {
         self.a.rrr(i::SUBS, true, XZR, TMP2, TMP0);
         self.a.bcond_label(cc::NE, slow);
         self.a.ld(Type::I64, TMP1, TMP1, (TLB_ADDEND_WORD * 8) as i64);
-        self.a.movr(!self.addr32, TMP0, addr);
+        (addr, !self.addr32)
     }
 
-    /// Load `rt` from the window, at the offset in x16 from the address in x17. An `acquire`
-    /// load is `ldapr` (or `ldar` without FEAT_LRCPC), sign extended by `ldapurs*` with
-    /// FEAT_LRCPC2 or by `sbfm` without.
-    fn window_load(&mut self, ty: Type, rt: Reg, memop: MemOp, acquire: bool) {
+    /// Load `rt` from the window, at the offset in index register `idx` (see
+    /// [`Self::tlb_addr`]) from the address in x17. An `acquire` load is `ldapr` (or `ldar`
+    /// without FEAT_LRCPC), sign extended by `ldapurs*` with FEAT_LRCPC2 or by `sbfm` without.
+    fn window_load(&mut self, ty: Type, rt: Reg, memop: MemOp, acquire: bool, idx: (Reg, bool)) {
         let size = memop.size();
         let ext = ty == Type::I64;
         let signed = memop.is_signed() && size < 3 && (ext || size < 2);
@@ -1336,9 +1511,10 @@ impl Gen {
                 (2, false, _) => i::LDRW,
                 _ => i::LDRX,
             };
-            self.a.ldst_reg(insn, rt, TMP1, true, TMP0);
+            self.a.ldst_reg(insn, rt, TMP1, idx.1, idx.0);
             return;
         }
+        self.index_to_tmp0(idx);
         self.a.rrr(i::ADD, true, TMP0, TMP0, TMP1);
         let f = self.opts.features;
         if signed && f.lrcpc2 {
@@ -1353,17 +1529,18 @@ impl Gen {
         }
     }
 
-    /// Store `rt` to the window, at the offset in x16 from the address in x17; `stlr` for a
-    /// `release` store.
-    fn window_store(&mut self, rt: Reg, memop: MemOp, release: bool) {
+    /// Store `rt` to the window, at the offset in index register `idx` from the address in
+    /// x17, as [`Self::window_load`]; `stlr` for a `release` store.
+    fn window_store(&mut self, rt: Reg, memop: MemOp, release: bool, idx: (Reg, bool)) {
         let size = memop.size();
         if release {
+            self.index_to_tmp0(idx);
             self.a.rrr(i::ADD, true, TMP0, TMP0, TMP1);
             self.a.ldst_ordered(i::STLR, size, rt, TMP0);
             return;
         }
         let insn = [i::STRB, i::STRH, i::STRW, i::STRX][size as usize];
-        self.a.ldst_reg(insn, rt, TMP1, true, TMP0);
+        self.a.ldst_reg(insn, rt, TMP1, idx.1, idx.0);
     }
 
     /// [`Self::host_addr`] for a store, whose base is argument 1.
@@ -1671,7 +1848,7 @@ fn ty_mask(ty: Type) -> u64 {
     if ty == Type::I32 { 0xffff_ffff } else { u64::MAX }
 }
 
-impl Target for Gen {
+impl Target for Gen<'_> {
     type Error = GenCodeError;
 
     fn bad_ir(&self, msg: String) -> GenCodeError {
@@ -1971,15 +2148,29 @@ impl Target for Gen {
             self.a.emit(DMB_ISHST);
         }
         self.after_full_dmb = false;
-        // `lookup_tb_ptr_ic` is served like `lookup_tb_ptr`; this backend has no inline cache.
-        let lookup = self.lookup != 0
-            && (info.name == crate::runtime::LOOKUP_TB_PTR
-                || info.name == crate::runtime::LOOKUP_TB_PTR_IC);
+        let ic = self.lookup != 0 && info.name == crate::runtime::LOOKUP_TB_PTR_IC && ni == 2;
+        let lookup = ic || self.lookup != 0 && info.name == crate::runtime::LOOKUP_TB_PTR;
         let pure = info.flags & call_flags::NO_SIDE_EFFECTS != 0;
+        let native = match self.helpers {
+            Some(h) if pure && !lookup => h
+                .get(&info.name)
+                .filter(|e| e.ret == info.ret && e.args == info.args)
+                .and_then(|_| h.native(&info.name)),
+            _ => None,
+        };
+        if let Some(nf) = native {
+            // A helper without side effects needs no barriers around it.
+            self.call_native(nf as usize as u64, ni, info.ret);
+            return Ok(());
+        }
         let req = Request::Call { name: info.name, ret: info.ret, args: info.args, nin: ni, pure };
         let after = if fence { Some(DMB_ISHLD) } else { None };
+        if ic {
+            self.ic_probe();
+        }
         if lookup {
-            self.service_via(req, after, self.lookup, self.insn);
+            let site = if ic { crate::runtime::LOOKUP_IC_SITE } else { 0 };
+            self.service_via(req, after, self.lookup, self.insn, site);
         } else {
             self.service_then(req, after);
         }

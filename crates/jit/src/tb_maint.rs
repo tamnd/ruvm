@@ -20,9 +20,10 @@
 //! - Pages keep their (possibly empty) block list once they had code, as QEMU's page descriptors
 //!   stay allocated, so a write to a page that lost its code still turns the slow path off.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+use ruvm_jit_core::hash::FastHashMap;
 
 use crate::cpu::{Cpu, CpuLoopExit, CpuShared, Ra};
 use crate::cputlb;
@@ -339,7 +340,7 @@ impl Jit {
 
     fn tb_page_add(
         &self,
-        pages: &mut HashMap<u64, Vec<Arc<Tb>>>,
+        pages: &mut FastHashMap<u64, Vec<Arc<Tb>>>,
         idx: u64,
         tb: &Arc<Tb>,
         n: usize,
@@ -353,7 +354,7 @@ impl Jit {
     }
 
     /// `tb_remove()`: take `tb` off its page lists.
-    fn tb_remove(&self, pages: &mut HashMap<u64, Vec<Arc<Tb>>>, tb: &Arc<Tb>) {
+    fn tb_remove(&self, pages: &mut FastHashMap<u64, Vec<Arc<Tb>>>, tb: &Arc<Tb>) {
         for n in 0..2 {
             if tb.page_addr[n] == u64::MAX {
                 continue;
@@ -422,7 +423,7 @@ impl Jit {
     pub(crate) fn do_tb_phys_invalidate(
         &self,
         tb: &Arc<Tb>,
-        pages: Option<&mut HashMap<u64, Vec<Arc<Tb>>>>,
+        pages: Option<&mut FastHashMap<u64, Vec<Arc<Tb>>>>,
     ) {
         // Make sure no further incoming jumps will be chained to this TB.
         {
@@ -541,7 +542,7 @@ impl Jit {
 pub(crate) fn tb_invalidate_phys_page_range_locked(
     jit: &Jit,
     mut cpu: Option<&mut Cpu<'_>>,
-    pages: &mut HashMap<u64, Vec<Arc<Tb>>>,
+    pages: &mut FastHashMap<u64, Vec<Arc<Tb>>>,
     start: u64,
     last: u64,
     ra: Ra,
