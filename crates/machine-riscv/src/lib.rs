@@ -2,4 +2,11 @@
 
 //! RISC-V machines: virt, spike, sifive and the rest.
 //!
-//! Empty for now. The plan for this crate is in `spec/24-workspace-layout.md`.
+//! So far this is the `virt` board ([`virt`]), hw/riscv/virt.c, and the loop that runs it on
+//! TCG ([`tcg_run`]). The device tree writer and the CFI flashes are the ones of
+//! `ruvm-machine-arm`, which are not Arm specific.
+
+#![forbid(unsafe_code)]
+
+pub mod tcg_run;
+pub mod virt;

@@ -48,6 +48,7 @@ use crate::arm;
 use crate::options::{Opt, arch_available, help_text, lookup_opt};
 use crate::qmp_cmds::{self, object_options_dict};
 use crate::qtest::{self, VirtualClock};
+use crate::riscv;
 use crate::runstate::{Killed, Runstate};
 use crate::x86::{self, Accel, AccelInitError};
 
@@ -56,9 +57,10 @@ fn have_kvm(target: &str) -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64")) && x86::is_x86(target)
 }
 
-/// Whether TCG is built in for `target`: the x86 targets and aarch64, whose front ends exist.
+/// Whether TCG is built in for `target`: the x86 targets, aarch64 and riscv64, whose front
+/// ends exist.
 fn have_tcg(target: &str) -> bool {
-    x86::is_x86(target) || arm::is_arm(target)
+    x86::is_x86(target) || arm::is_arm(target) || riscv::is_riscv(target)
 }
 
 /// The accelerators this build has for `target`. qtest is left out of `-accel help`, as in
@@ -353,6 +355,8 @@ struct Keep {
     board: Option<x86::Running>,
     /// The virt board on TCG.
     arm_board: Option<arm::Running>,
+    /// The RISC-V virt board on TCG.
+    riscv_board: Option<riscv::Running>,
 }
 
 /// The option loop of `qemu_init()`.
@@ -660,6 +664,9 @@ fn machine_help(target: &str) -> String {
     if arm::is_arm(target) {
         lines.extend(arm::machine_help_lines());
     }
+    if riscv::is_riscv(target) {
+        lines.extend(riscv::machine_help_lines());
+    }
     lines.sort();
     let mut out = String::from("Supported machines are:\n");
     for (_, text) in lines {
@@ -752,6 +759,8 @@ enum MachineChoice {
     X86(BoardKind),
     /// The Arm virt board.
     ArmVirt,
+    /// The RISC-V virt board.
+    RiscvVirt,
 }
 
 /// `select_machine()`: no target has a default machine.
@@ -772,6 +781,9 @@ fn select_machine(target: &str, cfg: &mut Config) -> Flow<MachineChoice> {
     }
     if arm::is_arm(target) && arm::is_virt(&ty) {
         return Ok(MachineChoice::ArmVirt);
+    }
+    if riscv::is_riscv(target) && riscv::is_virt(&ty) {
+        return Ok(MachineChoice::RiscvVirt);
     }
     if !MACHINES.iter().any(|m| m.name == ty) {
         let e = Error::generic(format!("unsupported machine type: \"{ty}\"")).hint(hint);
@@ -974,10 +986,11 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     }
 
     let choice = select_machine(p.target, &mut cfg)?;
-    let virt = matches!(choice, MachineChoice::ArmVirt);
+    let rv_virt = matches!(choice, MachineChoice::RiscvVirt);
+    let virt = matches!(choice, MachineChoice::ArmVirt) || rv_virt;
     let (kind, machine) = match choice {
         MachineChoice::X86(kind) => (Some(kind), None),
-        MachineChoice::ArmVirt => (None, None),
+        MachineChoice::ArmVirt | MachineChoice::RiscvVirt => (None, None),
         MachineChoice::Qom(typename) => {
             let machine =
                 create_machine(&vm.registry, &typename, &vm.regions).map_err(|e| fail(&e))?;
@@ -1005,7 +1018,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     if virt && !cfg.x86.drives.is_empty() {
         return Err(fail_msg("-drive is not supported with this machine by ruvm yet"));
     }
-    if virt && !cfg.x86.devices.is_empty() {
+    if virt && !rv_virt && !cfg.x86.devices.is_empty() {
         return Err(fail_msg("-device is not supported with this machine by ruvm yet"));
     }
     let drives = parse_drives(kind, &cfg.x86.drives)?;
@@ -1013,12 +1026,18 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     // qemu_apply_legacy_machine_options() and qemu_apply_machine_options()
     let memdev = apply_legacy_machine_options(&mut cfg)?;
     let mut virt_opts = None;
+    let mut rv_virt_opts = None;
     let board_opts = match (kind, machine) {
         (None, None) if virt => {
             if memdev.is_some() {
                 return Err(fail_msg("memory-backend is not supported by ruvm yet"));
             }
-            virt_opts = Some(arm::take_board_options(&cfg.machine).map_err(|e| fail(&e))?);
+            if rv_virt {
+                let opts = riscv::take_board_options(&cfg.machine).map_err(|e| fail(&e))?;
+                rv_virt_opts = Some(opts);
+            } else {
+                virt_opts = Some(arm::take_board_options(&cfg.machine).map_err(|e| fail(&e))?);
+            }
             None
         }
         (Some(kind), _) => {
@@ -1075,8 +1094,29 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         resolve_machine_memdev(&vm, machine, &cfg, id)?;
     }
 
-    let mut keep = Keep { _qtest: qtest, _accel: None, board: None, arm_board: None };
-    if let Some(opts) = virt_opts {
+    let mut keep =
+        Keep { _qtest: qtest, _accel: None, board: None, arm_board: None, riscv_board: None };
+    if let Some(opts) = rv_virt_opts {
+        if cfg.preconfig {
+            return Err(fail_msg("-preconfig is not supported with this machine by ruvm yet"));
+        }
+        let Accel::Tcg(tcg) = accel else { unreachable!("checked above") };
+        let args = riscv::RiscvArgs {
+            cpu: cfg.x86.cpu.as_deref(),
+            no_reboot: cfg.x86.no_reboot,
+            semihosting: &cfg.semihosting,
+            devices: &cfg.x86.devices,
+            firmware: cfg.x86.firmware(),
+        };
+        let running =
+            riscv::start_board_tcg(&vm, tcg, opts, &args, &serial_hds).map_err(|errors| {
+                for e in &errors {
+                    e.report();
+                }
+                Exit(1)
+            })?;
+        keep.riscv_board = Some(running);
+    } else if let Some(opts) = virt_opts {
         if cfg.preconfig {
             return Err(fail_msg("-preconfig is not supported with this machine by ruvm yet"));
         }
@@ -1259,12 +1299,19 @@ fn main_loop(vm: &Arc<Vm>, keep: &Keep) -> u8 {
         // A vCPU waiting for semihosting console input would never stop otherwise.
         board.wake_console();
     }
+    if let Some(board) = &keep.riscv_board {
+        board.wake_console();
+    }
     vm.runstate.vm_shutdown();
     if let Some(board) = &keep.board {
         vm.runstate.set_cpu_hook(None);
         board.quit();
     }
     if let Some(board) = &keep.arm_board {
+        vm.runstate.set_cpu_hook(None);
+        board.quit();
+    }
+    if let Some(board) = &keep.riscv_board {
         vm.runstate.set_cpu_hook(None);
         board.quit();
     }

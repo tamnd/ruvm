@@ -841,6 +841,22 @@ version = "0.4.0"
 [[package]]
 name = "ruvm-machine-riscv"
 version = "0.4.0"
+dependencies = [
+ "ruvm-accel",
+ "ruvm-base",
+ "ruvm-hw-char",
+ "ruvm-hw-core",
+ "ruvm-hw-intc",
+ "ruvm-hw-misc",
+ "ruvm-hw-timer",
+ "ruvm-hw-virtio",
+ "ruvm-jit",
+ "ruvm-machine-arm",
+ "ruvm-mem",
+ "ruvm-qapi",
+ "ruvm-target-riscv",
+ "ruvm-virtio-queue",
+]
 
 [[package]]
 name = "ruvm-machine-s390x"
@@ -1027,6 +1043,7 @@ dependencies = [
  "ruvm-hw-storage",
  "ruvm-hw-virtio",
  "ruvm-machine-arm",
+ "ruvm-machine-riscv",
  "ruvm-machine-x86",
  "ruvm-mem",
  "ruvm-migration",
@@ -1036,6 +1053,7 @@ dependencies = [
  "ruvm-qom",
  "ruvm-sys",
  "ruvm-target-arm",
+ "ruvm-target-riscv",
 ]
 
 [[package]]
@@ -1094,6 +1112,14 @@ version = "0.4.0"
 [[package]]
 name = "ruvm-target-riscv"
 version = "0.4.0"
+dependencies = [
+ "ruvm-decode",
+ "ruvm-jit",
+ "ruvm-jit-core",
+ "ruvm-jit-interp",
+ "ruvm-mem",
+ "ruvm-softfloat",
+]
 
 [[package]]
 name = "ruvm-target-rx"

@@ -27,6 +27,7 @@ ruvm-hw-misc.workspace = true
 ruvm-hw-storage.workspace = true
 ruvm-hw-virtio.workspace = true
 ruvm-machine-arm.workspace = true
+ruvm-machine-riscv.workspace = true
 ruvm-machine-x86.workspace = true
 ruvm-mem.workspace = true
 ruvm-migration.workspace = true
@@ -34,6 +35,7 @@ ruvm-monitor.workspace = true
 ruvm-qapi.workspace = true
 ruvm-qom.workspace = true
 ruvm-target-arm.workspace = true
+ruvm-target-riscv.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 ruvm-sys.workspace = true

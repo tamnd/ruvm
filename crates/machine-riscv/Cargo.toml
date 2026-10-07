@@ -14,6 +14,20 @@ publish = false
 unsafe-budget = 0
 
 [dependencies]
+ruvm-accel.workspace = true
+ruvm-base.workspace = true
+ruvm-hw-char.workspace = true
+ruvm-hw-core.workspace = true
+ruvm-hw-intc.workspace = true
+ruvm-hw-misc.workspace = true
+ruvm-hw-timer.workspace = true
+ruvm-hw-virtio.workspace = true
+ruvm-jit.workspace = true
+ruvm-machine-arm.workspace = true
+ruvm-mem.workspace = true
+ruvm-qapi.workspace = true
+ruvm-target-riscv.workspace = true
+ruvm-virtio-queue.workspace = true
 
 [lints]
 workspace = true
