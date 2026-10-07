@@ -40,21 +40,26 @@ pub mod virtio;
 #[cfg(unix)]
 pub mod vsock;
 
-pub use balloon::{BalloonBackend, BalloonOp, RecordingBalloonBackend, VirtioBalloon};
+pub use balloon::{
+    BalloonBackend, BalloonOp, RecordingBalloonBackend, VirtioBalloon, VirtioBalloonVmState,
+};
 pub use blk::{BlockBackend, MemBlockBackend, VirtioBlk, VirtioBlkConf};
-pub use console::{ConsoleBackend, VirtioConsole};
+pub use console::{ConsoleBackend, VirtioConsole, VirtioConsolePortVmState, VirtioConsoleVmState};
 #[cfg(unix)]
 pub use fs::{VhostUserFs, VhostUserFsConf};
 pub use memory::AddressSpaceMemory;
-pub use mmio::VirtioMmio;
-pub use net::{NetPeer, RxOutcome, VirtioNet, VirtioNetConf, VirtioNetHdr};
-pub use pci::{VirtioPci, VirtioPciProps, VirtioPciVariant};
+pub use mmio::{VirtioMmio, VirtioMmioQueueVmState, VirtioMmioVmState};
+pub use net::{NetPeer, RxOutcome, VirtioNet, VirtioNetConf, VirtioNetHdr, VirtioNetVmState};
+pub use pci::{
+    VirtioPci, VirtioPciProps, VirtioPciQueueVmState, VirtioPciVariant, VirtioPciVmState,
+};
 pub use rng::{EntropySource, RandomFile, VirtioRng, VirtioRngConf};
 pub use scsi::{VirtioScsi, VirtioScsiConf};
 #[cfg(unix)]
 pub use vhost::{VhostDev, VhostMemRegion, VhostUserChardev};
 pub use virtio::{
-    SharedGuestMemory, VirtIODevice, VirtQueue, VirtioBackend, VirtioDeviceClass, VirtioTransport,
+    SharedGuestMemory, VirtIODevice, VirtQueue, VirtQueueVmState, VirtioBackend, VirtioDeviceClass,
+    VirtioTransport, VirtioVmState,
 };
 #[cfg(unix)]
 pub use vsock::{OnOffAuto, VhostUserVsock, VhostUserVsockConf, VhostVsock, VhostVsockConf};

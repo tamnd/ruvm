@@ -27,9 +27,13 @@
 //! - `BALLOON_CHANGE` events are collected in a list, see
 //!   [`VirtioBalloon::take_balloon_change_events`].
 //!
-//! Not ported: VMState and the migration of hint state, trace points, QOM registration, the
-//! single balloon handler registry, the rewind of `set_status` for a stopped VM, and the
-//! `qom-get` visitor for `guest-stats`.
+//! Migration state is in the `vmstate` submodule, [`VirtioBalloonVmState`]. The statistics
+//! buffer the guest handed over is not migrated; the destination takes it from the queue
+//! again after loading, as QEMU's `set_status` rewind does when the VM runs.
+//!
+//! Not ported: trace points, QOM registration, the single balloon handler registry, the
+//! rewind of `set_status` for a VM stopped and resumed without migrating, and the `qom-get`
+//! visitor for `guest-stats`.
 
 use std::any::Any;
 use std::fmt;
@@ -39,6 +43,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ruvm_base::{Error, Result};
 
 use crate::virtio::{VIRTQUEUE_MAX_SIZE, VirtIODevice, VirtioDeviceClass, feature};
+
+mod vmstate;
+
+pub use vmstate::VirtioBalloonVmState;
 
 /// `TYPE_VIRTIO_BALLOON`.
 pub const TYPE_VIRTIO_BALLOON: &str = "virtio-balloon-device";
@@ -757,6 +765,10 @@ impl VirtioDeviceClass for VirtioBalloon {
             q if Some(q) == self.reporting_vq => self.handle_report(vdev, q),
             _ => {}
         }
+    }
+
+    fn post_load(&mut self, vdev: &mut VirtIODevice) -> Result<()> {
+        self.vmstate_post_load(vdev)
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -28,7 +28,9 @@
 //! - The link status is set with [`VirtioNet::set_link_status`] and self announcement is started
 //!   with [`VirtioNet::announce`], both called by whoever owns the device.
 //!
-//! Not ported: VMState, trace points, QOM registration, vhost and vDPA, RSS and hash reporting
+//! Migration state is in the `vmstate` submodule, [`VirtioNetVmState`].
+//!
+//! Not ported: trace points, QOM registration, vhost and vDPA, RSS and hash reporting
 //! (the features stay off and the control commands are refused), receive segment coalescing,
 //! UDP tunnel offloads, failover (`VIRTIO_NET_F_STANDBY`), the announce timer and its rounds,
 //! the `NIC_RX_FILTER_CHANGED` event, `query-rx-filter`, the dhclient checksum workaround, and
@@ -40,6 +42,10 @@ use std::sync::Arc;
 
 use ruvm_base::{Error, Result};
 use ruvm_virtio_queue::DescriptorChain;
+
+mod vmstate;
+
+pub use vmstate::VirtioNetVmState;
 
 use crate::virtio::{
     VIRTIO_CONFIG_S_DRIVER_OK, VIRTIO_F_VERSION_1, VIRTIO_LEGACY_FEATURES, VIRTIO_QUEUE_MAX,
@@ -473,6 +479,8 @@ pub struct VirtioNet {
     nobcast: bool,
     mac_table: MacTable,
     vlans: Vec<u32>,
+    /// `saved_guest_offloads`: the migrated offloads, between loading them and `post_load`.
+    saved_guest_offloads: Option<u64>,
 }
 
 impl VirtioNet {
@@ -505,6 +513,7 @@ impl VirtioNet {
             nobcast: false,
             mac_table: MacTable::default(),
             vlans: vec![u32::MAX; usize::from(MAX_VLAN >> 5)],
+            saved_guest_offloads: None,
         }
     }
 
@@ -1451,6 +1460,14 @@ impl VirtioDeviceClass for VirtioNet {
 
     fn legacy_features(&self) -> u64 {
         VIRTIO_LEGACY_FEATURES | feature(VIRTIO_NET_F_GSO)
+    }
+
+    fn pre_load_queues(&mut self, vdev: &mut VirtIODevice, n: usize) -> Result<()> {
+        self.vmstate_pre_load_queues(vdev, n)
+    }
+
+    fn post_load(&mut self, vdev: &mut VirtIODevice) -> Result<()> {
+        self.vmstate_post_load(vdev)
     }
 
     fn as_any(&self) -> &dyn Any {

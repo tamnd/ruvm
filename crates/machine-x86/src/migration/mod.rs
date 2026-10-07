@@ -28,6 +28,7 @@ mod serial;
 mod skip;
 mod smbus;
 mod timer;
+mod virtio;
 
 use std::sync::{Arc, PoisonError, Weak};
 
@@ -37,21 +38,40 @@ use ruvm_migration::{
     EntryInfo, GlobalState, MachineConfig, RamHooks, RamSection, RamStats, SaveVm,
 };
 
-use ruvm_mem::RamBlock;
+use ruvm_base::error_report;
+use ruvm_hw_virtio::VirtioPci;
+use ruvm_mem::{GLOBAL_DIRTY_MIGRATION, MemorySystem, RamBlock};
 
 use crate::board::X86Board;
-use crate::microvm::Microvm;
+use crate::microvm::{Microvm, VIRTIO_MMIO_BASE, VIRTIO_MMIO_STRIDE};
 use crate::q35::{MAX_ISA_SERIAL_PORTS, Q35};
 use crate::tcg_run::TcgMachine;
 
 /// The RAM hooks of a TCG machine. The dirty bitmaps are set by the TLB's not-dirty path, so
-/// after bits are taken out the TLBs must forget which pages were already written.
+/// after bits are taken out the TLBs must forget which pages were already written. Device
+/// writes go through the address spaces, which mark pages for migration only while global
+/// dirty logging is on.
 #[derive(Debug)]
 struct TcgHooks {
     vcpus: Weak<TcgVcpus>,
+    mem: Weak<MemorySystem>,
 }
 
 impl RamHooks for TcgHooks {
+    fn log_start(&self) {
+        if let Some(m) = self.mem.upgrade() {
+            if let Err(e) = m.global_dirty_log_start(GLOBAL_DIRTY_MIGRATION) {
+                error_report(&format!("cannot start dirty logging: {e}"));
+            }
+        }
+    }
+
+    fn log_stop(&self) {
+        if let Some(m) = self.mem.upgrade() {
+            m.global_dirty_log_stop(GLOBAL_DIRTY_MIGRATION);
+        }
+    }
+
     fn after_clear(&self) {
         if let Some(v) = self.vcpus.upgrade() {
             v.run_on_each(tlb_flush);
@@ -92,7 +112,7 @@ pub fn x86_savevm(
     });
     let board = machine.board().lock().unwrap_or_else(PoisonError::into_inner);
     let ram_stats = match &*board {
-        X86Board::Q35(q35, _) => register_q35(&mut savevm, machine, q35),
+        X86Board::Q35(q35, devs) => register_q35(&mut savevm, machine, q35, devs),
         X86Board::Microvm(m) => register_microvm(&mut savevm, machine, m),
     };
     drop(board);
@@ -106,11 +126,15 @@ pub fn x86_savevm(
 fn register_common(
     savevm: &mut SaveVm,
     machine: &TcgMachine,
+    mem: &Arc<MemorySystem>,
     blocks: Vec<Arc<RamBlock>>,
 ) -> (Arc<timer::Ticks>, Arc<RamStats>) {
     let ticks = timer::Ticks::new(machine.tsc_base());
     timer::register(savevm, machine.virtual_clock(), &ticks);
-    let ram = RamSection::new(blocks, TcgHooks { vcpus: Arc::downgrade(machine.vcpus()) });
+    let ram = RamSection::new(
+        blocks,
+        TcgHooks { vcpus: Arc::downgrade(machine.vcpus()), mem: Arc::downgrade(mem) },
+    );
     let ram_stats = ram.stats();
     savevm.register_live(EntryInfo::new("ram", 4).instance(0), ram);
     // "dirty-bitmap": ruvm has no block dirty bitmaps to migrate.
@@ -152,8 +176,14 @@ fn register_cpus(savevm: &mut SaveVm, machine: &TcgMachine, ticks: &Arc<timer::T
 
 /// The sections of a q35 board, in the order QEMU registers them so they get QEMU's section
 /// ids: the common ones, the vCPUs, then the board.
-fn register_q35(savevm: &mut SaveVm, machine: &TcgMachine, q35: &Q35) -> Arc<RamStats> {
-    let (ticks, ram_stats) = register_common(savevm, machine, q35.migratable_ram_blocks());
+fn register_q35(
+    savevm: &mut SaveVm,
+    machine: &TcgMachine,
+    q35: &Q35,
+    devs: &[VirtioPci],
+) -> Arc<RamStats> {
+    let (ticks, ram_stats) =
+        register_common(savevm, machine, q35.memory_system(), q35.migratable_ram_blocks());
     register_cpus(savevm, machine, &ticks);
 
     // pc_q35_init(): fw_cfg, the host bridge and its bus, then the ISA bridge and the devices
@@ -201,6 +231,10 @@ fn register_q35(savevm: &mut SaveVm, machine: &TcgMachine, q35: &Q35) -> Arc<Ram
             savevm.reserve_section_id();
         }
     }
+    // The -device virtio functions, then acpi_build from the machine_done notifier.
+    for dev in devs {
+        virtio::register_pci(savevm, dev);
+    }
     let (get, set) = q35.acpi_patched();
     lpc::register_acpi_build(savevm, get, set);
     ram_stats
@@ -208,9 +242,11 @@ fn register_q35(savevm: &mut SaveVm, machine: &TcgMachine, q35: &Q35) -> Arc<Ram
 
 /// The sections of a microvm board, in QEMU's order: microvm_memory_init() creates fw_cfg
 /// before the vCPUs, then microvm_devices_init() adds the IOAPICs, the GED, the 8259 pair, the
-/// PIT, the RTC and the serial port. The virtio-mmio transports have no section of their own.
+/// PIT, the RTC and the serial port. The virtio-mmio transports have no section of their own;
+/// the devices plugged into them come last, as -device creates them after the board.
 fn register_microvm(savevm: &mut SaveVm, machine: &TcgMachine, m: &Microvm) -> Arc<RamStats> {
-    let (ticks, ram_stats) = register_common(savevm, machine, m.migratable_ram_blocks());
+    let (ticks, ram_stats) =
+        register_common(savevm, machine, m.memory_system(), m.migratable_ram_blocks());
     fw_cfg::register(savevm, m.fw_cfg());
     register_cpus(savevm, machine, &ticks);
     ioapic::register(savevm, 0, m.ioapic());
@@ -232,5 +268,41 @@ fn register_microvm(savevm: &mut SaveVm, machine: &TcgMachine, m: &Microvm) -> A
     if let Some(s) = m.serial() {
         serial::register(savevm, 0, s);
     }
+    for i in 0..m.virtio_transport_count() {
+        if !m.virtio_plugged(i) {
+            continue;
+        }
+        if let Some(t) = m.virtio_transport(i) {
+            virtio::register_mmio(savevm, VIRTIO_MMIO_BASE + i as u64 * VIRTIO_MMIO_STRIDE, t);
+        }
+    }
     ram_stats
+}
+
+#[cfg(test)]
+mod tests {
+    use ruvm_mem::{DirtyClient, MemTxAttrs};
+
+    use super::*;
+
+    #[test]
+    fn device_writes_are_dirty_while_migrating() {
+        let mem = Arc::new(MemorySystem::new());
+        let root = mem.new_container("system", 1 << 20).unwrap();
+        let ram = mem.new_ram("ram", 0x10000).unwrap();
+        mem.add_subregion(root, 0, ram).unwrap();
+        let space = mem.address_space_init(root, "memory").unwrap();
+        let block = mem.ram_block(ram).unwrap();
+        block.start_dirty_log(DirtyClient::Migration);
+        let hooks = TcgHooks { vcpus: Weak::new(), mem: Arc::downgrade(&mem) };
+
+        // What a virtio device does to a used ring, before and while the migration logs.
+        let _ = space.write(0x1000, MemTxAttrs::UNSPECIFIED, &[1]);
+        assert!(!block.get_dirty(0x1000, 1, DirtyClient::Migration));
+        hooks.log_start();
+        let _ = space.write(0x3000, MemTxAttrs::UNSPECIFIED, &[1]);
+        assert!(block.get_dirty(0x3000, 1, DirtyClient::Migration));
+        hooks.log_stop();
+        block.stop_dirty_log(DirtyClient::Migration);
+    }
 }

@@ -464,6 +464,13 @@ static AVX512: LazyLock<VmStateDescription<CpuMig>> = LazyLock::new(|| {
 
 sub1!(XSS, "cpu/xss", "env.xss", |c| c.s.xss != 0, s.xss);
 sub1!(UMWAIT, "cpu/umwait", "env.umwait", |c| c.s.umwait != 0, s.umwait);
+sub1!(
+    MSR_SMI_COUNT,
+    "cpu/msr_smi_count",
+    "env.msr_smi_count",
+    |c| c.s.msr_smi_count != 0,
+    s.msr_smi_count
+);
 sub1!(PKRU, "cpu/pkru", "env.pkru", |c| c.s.pkru != 0, s.pkru);
 sub1!(PKRS, "cpu/pkrs", "env.pkrs", |c| c.s.pkrs != 0, s.pkrs);
 sub1!(SPEC_CTRL, "cpu/spec_ctrl", "env.spec_ctrl", |c| c.s.spec_ctrl != 0, s.spec_ctrl);
@@ -580,6 +587,7 @@ pub(crate) static VMSTATE_X86_CPU: LazyLock<VmStateDescription<CpuMig>> = LazyLo
         .subsection(&AVX512)
         .subsection(&XSS)
         .subsection(&UMWAIT)
+        .subsection(&MSR_SMI_COUNT)
         .subsection(&PKRU)
         .subsection(&PKRS)
         .subsection(&SPEC_CTRL)
@@ -687,12 +695,14 @@ mod tests {
         let mut c = state();
         c.s.poll_control_msr = 0;
         c.s.fpip = 0x1234;
+        c.s.msr_smi_count = 3;
         let mut f = StreamWriter::new();
         vmstate_save_state(&mut f, &VMSTATE_X86_CPU, &mut c).unwrap();
         let bytes = f.into_inner();
         let find = |name: &[u8]| bytes.windows(name.len()).any(|w| w == name);
         assert!(find(b"cpu/poll_control_msr"));
         assert!(find(b"cpu/fpop_ip_dp"));
+        assert!(find(b"cpu/msr_smi_count"));
         assert!(!find(b"cpu/avx512"));
 
         let mut back = state();
@@ -700,5 +710,6 @@ mod tests {
             .unwrap();
         assert_eq!(back.s.poll_control_msr, 0);
         assert_eq!(back.s.fpip, 0x1234);
+        assert_eq!(back.s.msr_smi_count, 3);
     }
 }

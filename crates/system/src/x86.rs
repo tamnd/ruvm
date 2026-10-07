@@ -33,10 +33,12 @@ use ruvm_hw_core::timer::TimeSource;
 use ruvm_hw_misc::debugexit::{
     DEBUG_EXIT_DEFAULT_IOBASE, DEBUG_EXIT_DEFAULT_IOSIZE, IsaDebugExit, IsaDebugExitConfig,
 };
+use ruvm_hw_storage::scsi::{ScsiDiskConf, ScsiDiskKind};
 use ruvm_hw_storage::{BlockBackend, DriveConfig};
 use ruvm_hw_virtio::{
-    RandomFile, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass, VirtioRng,
-    VirtioRngConf,
+    BalloonBackend, RandomFile, VirtioBalloon, VirtioBlk, VirtioBlkConf, VirtioConsole,
+    VirtioDeviceClass, VirtioNet, VirtioNetConf, VirtioRng, VirtioRngConf, VirtioScsi,
+    VirtioScsiConf,
 };
 use ruvm_machine_x86::board::X86_BOARDS;
 use ruvm_machine_x86::debugcon::{
@@ -62,6 +64,7 @@ use ruvm_qapi::types::{
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
 
+use crate::net::{Network, NicPort};
 use crate::vl::Vm;
 
 /// Whether `target` is one the x86 boards exist for.
@@ -104,7 +107,7 @@ impl Located {
         Located(loc.clone(), Error::generic(msg.into()))
     }
 
-    fn bare(msg: impl Into<String>) -> Located {
+    pub(crate) fn bare(msg: impl Into<String>) -> Located {
         Located(None, Error::generic(msg.into()))
     }
 
@@ -130,6 +133,8 @@ pub(crate) struct Cmdline {
     pub drives: Vec<(String, Option<Location>)>,
     /// `-device`.
     pub devices: Vec<(String, Option<Location>)>,
+    /// `-netdev`.
+    pub netdevs: Vec<(String, Option<Location>)>,
     /// `-nographic`.
     pub nographic: bool,
     /// `default_serial`: no `-serial` and no `-nodefaults`.
@@ -155,6 +160,7 @@ impl Default for Cmdline {
             serials: Vec::new(),
             drives: Vec::new(),
             devices: Vec::new(),
+            netdevs: Vec::new(),
             nographic: false,
             default_serial: true,
             default_monitor: true,
@@ -664,6 +670,9 @@ pub(crate) enum VirtioModel {
     Blk,
     Rng,
     Serial,
+    Net,
+    Scsi,
+    Balloon,
 }
 
 /// How a virtio device reaches the guest.
@@ -683,13 +692,29 @@ const DEVICE_TYPES: &[(&str, VirtioModel, Transport)] = &[
     ("virtio-rng-pci", VirtioModel::Rng, Transport::Pci),
     ("virtio-serial-device", VirtioModel::Serial, Transport::Mmio),
     ("virtio-serial-pci", VirtioModel::Serial, Transport::Pci),
+    ("virtio-net-device", VirtioModel::Net, Transport::Mmio),
+    ("virtio-net-pci", VirtioModel::Net, Transport::Pci),
+    ("virtio-scsi-device", VirtioModel::Scsi, Transport::Mmio),
+    ("virtio-scsi-pci", VirtioModel::Scsi, Transport::Pci),
+    ("virtio-balloon-device", VirtioModel::Balloon, Transport::Mmio),
+    ("virtio-balloon-pci", VirtioModel::Balloon, Transport::Pci),
 ];
+
+/// `TYPE_SCSI_DISK`'s hard disk flavour, the one SCSI device `-device` knows.
+const TYPE_SCSI_HD: &str = "scsi-hd";
+/// The console port of a virtio-serial bus. ruvm's virtio-serial always has its one port as the
+/// console, so this only checks that there is a bus for it; it is accepted so the command line
+/// of a QEMU with `max_ports=1` and a `virtconsole` port, the shape ruvm has, works for both.
+const TYPE_VIRTCONSOLE: &str = "virtconsole";
 
 /// `qdev_alias_table[]` for x86, where the default virtio transport is PCI.
 const DEVICE_ALIASES: &[(&str, &str)] = &[
     ("virtio-blk", "virtio-blk-pci"),
     ("virtio-rng", "virtio-rng-pci"),
     ("virtio-serial", "virtio-serial-pci"),
+    ("virtio-net", "virtio-net-pci"),
+    ("virtio-scsi", "virtio-scsi-pci"),
+    ("virtio-balloon", "virtio-balloon-pci"),
 ];
 
 /// A virtio device to plug.
@@ -701,8 +726,31 @@ pub(crate) struct Plug {
     pub transport: Transport,
     /// Index into the drives, for virtio-blk.
     pub drive: Option<usize>,
-    /// virtio-blk `serial`.
+    /// virtio-blk and scsi-hd `serial`.
     pub serial: Option<String>,
+    /// virtio-net `netdev`.
+    pub netdev: Option<String>,
+    /// virtio-net `mac`.
+    pub mac: Option<[u8; 6]>,
+    /// The `scsi-hd` devices on a virtio-scsi controller.
+    pub disks: Vec<ScsiPlug>,
+    /// The PCI option ROM file, `romfile`: `efi-virtio.rom` for virtio-net-pci by default.
+    pub romfile: Option<String>,
+    /// The `id`, which names a NIC's net client.
+    pub id: Option<String>,
+    pub loc: Option<Location>,
+}
+
+/// A `scsi-hd` to plug into a virtio-scsi controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScsiPlug {
+    /// Index into the drives.
+    pub drive: usize,
+    pub channel: u32,
+    pub scsi_id: Option<u32>,
+    pub lun: Option<u32>,
+    pub serial: Option<String>,
+    pub id: Option<String>,
     pub loc: Option<Location>,
 }
 
@@ -742,6 +790,8 @@ pub(crate) struct Plan {
 enum Planned {
     Virtio(Plug),
     Isa(IsaPlug),
+    ScsiDisk(ScsiPlug),
+    Console,
 }
 
 /// The drives of the q35 system flashes: `-machine pflashN=` names a drive by id, and
@@ -826,10 +876,36 @@ pub(crate) fn plan(
     for d in drives.iter().filter(|d| d.iface == DriveIf::Virtio) {
         queue.push((format!("virtio-blk,drive={}", d.id), d.loc.clone()));
     }
+    let mut console = false;
     for (arg, loc) in &queue {
         match plan_device(kind, drives, &mut used, arg, loc).map_err(|e| vec![e])? {
             Planned::Virtio(plug) => p.virtio.push(plug),
             Planned::Isa(plug) => p.isa.push(plug),
+            Planned::Console => {
+                if !p.virtio.iter().any(|v| v.model == VirtioModel::Serial) {
+                    return Err(vec![Located::new(
+                        loc,
+                        format!("No 'virtio-serial-bus' bus found for device '{TYPE_VIRTCONSOLE}'"),
+                    )]);
+                }
+                if console {
+                    return Err(vec![Located::new(
+                        loc,
+                        "ruvm's virtio-serial has a single port, which is the console",
+                    )]);
+                }
+                console = true;
+            }
+            // qbus_find_recursive() takes the first SCSI bus.
+            Planned::ScsiDisk(disk) => {
+                let Some(ctrl) = p.virtio.iter_mut().find(|v| v.model == VirtioModel::Scsi) else {
+                    return Err(vec![Located::new(
+                        loc,
+                        format!("No 'SCSI' bus found for device '{TYPE_SCSI_HD}'"),
+                    )]);
+                };
+                ctrl.disks.push(disk);
+            }
         }
     }
 
@@ -875,6 +951,15 @@ fn plan_device(
     if driver == TYPE_ISA_DEBUGCON || driver == TYPE_ISA_DEBUG_EXIT {
         return plan_isa_device(kind, driver, opts, loc).map(Planned::Isa);
     }
+    if driver == TYPE_SCSI_HD {
+        return plan_scsi_hd(drives, used, opts, loc).map(Planned::ScsiDisk);
+    }
+    if driver == TYPE_VIRTCONSOLE {
+        if let Some((k, _)) = opts.iter().find(|(k, _)| !matches!(*k, "driver" | "id" | "bus")) {
+            return Err(Located::new(loc, format!("Property '{TYPE_VIRTCONSOLE}.{k}' not found")));
+        }
+        return Ok(Planned::Console);
+    }
     let alias = DEVICE_ALIASES.iter().find(|(a, _)| *a == driver).map(|(_, t)| *t);
     let name = alias.unwrap_or(driver);
     let Some(&(typename, model, transport)) = DEVICE_TYPES.iter().find(|(t, ..)| *t == name) else {
@@ -883,10 +968,21 @@ fn plan_device(
     let mut drive = None;
     let mut serial = None;
     let mut bus = None;
+    let mut netdev = None;
+    let mut mac = None;
+    // virtio_net_pci_class_init() sets the romfile; an empty one means none.
+    let mut romfile = (model == VirtioModel::Net && transport == Transport::Pci)
+        .then(|| "efi-virtio.rom".to_string());
     for (k, v) in opts.iter() {
         match k {
-            "driver" => {}
+            "driver" | "id" => {}
             "bus" => bus = Some(v.to_string()),
+            "netdev" if model == VirtioModel::Net => netdev = Some(v.to_string()),
+            "mac" if model == VirtioModel::Net => {
+                mac = Some(parse_mac(v).ok_or_else(|| {
+                    Located::new(loc, format!("Property '{typename}.mac' doesn't take value '{v}'"))
+                })?);
+            }
             "drive" if model == VirtioModel::Blk => {
                 let Some(i) = drives.iter().position(|d| d.id == v) else {
                     return Err(Located::new(
@@ -897,6 +993,18 @@ fn plan_device(
                 drive = Some(i);
             }
             "serial" if model == VirtioModel::Blk => serial = Some(v.to_string()),
+            "romfile" if transport == Transport::Pci => {
+                romfile = (!v.is_empty()).then(|| v.to_string());
+            }
+            // The one port ruvm's virtio-serial has.
+            "max_ports" if model == VirtioModel::Serial => {
+                if v != "1" {
+                    return Err(Located::new(
+                        loc,
+                        format!("Property '{typename}.max_ports' must be 1 in ruvm"),
+                    ));
+                }
+            }
             _ => {
                 return Err(Located::new(loc, format!("Property '{typename}.{k}' not found")));
             }
@@ -945,7 +1053,87 @@ fn plan_device(
             return Err(Located::new(loc, "Device needs media, but drive is empty"));
         }
     }
-    Ok(Planned::Virtio(Plug { typename, model, transport, drive, serial, loc: loc.clone() }))
+    Ok(Planned::Virtio(Plug {
+        typename,
+        model,
+        transport,
+        drive,
+        serial,
+        netdev,
+        mac,
+        disks: Vec::new(),
+        romfile,
+        id: opts.id().map(str::to_string),
+        loc: loc.clone(),
+    }))
+}
+
+/// `mac`, six hex bytes joined by colons.
+fn parse_mac(v: &str) -> Option<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    let mut parts = v.split(':');
+    for b in &mut mac {
+        let p = parts.next()?;
+        if p.len() != 2 {
+            return None;
+        }
+        *b = u8::from_str_radix(p, 16).ok()?;
+    }
+    parts.next().is_none().then_some(mac)
+}
+
+/// A `scsi-hd` with its `drive`, `channel`, `scsi-id`, `lun`, `serial` and `id`.
+fn plan_scsi_hd(
+    drives: &[Drive],
+    used: &mut HashSet<usize>,
+    opts: &ruvm_qapi::opts::QemuOpts,
+    loc: &Option<Location>,
+) -> std::result::Result<ScsiPlug, Located> {
+    let mut disk = ScsiPlug {
+        drive: usize::MAX,
+        channel: 0,
+        scsi_id: None,
+        lun: None,
+        serial: None,
+        id: opts.id().map(str::to_string),
+        loc: loc.clone(),
+    };
+    let num = |k: &str, v: &str| prop_u32(k, v).map_err(|e| Located(loc.clone(), e));
+    for (k, v) in opts.iter() {
+        match k {
+            "driver" | "bus" => {}
+            "drive" => {
+                let Some(i) = drives.iter().position(|d| d.id == v) else {
+                    return Err(Located::new(
+                        loc,
+                        format!("Property '{TYPE_SCSI_HD}.drive' can't find value '{v}'"),
+                    ));
+                };
+                disk.drive = i;
+            }
+            "channel" => disk.channel = num(k, v)?,
+            "scsi-id" => disk.scsi_id = Some(num(k, v)?),
+            "lun" => disk.lun = Some(num(k, v)?),
+            "serial" => disk.serial = Some(v.to_string()),
+            _ => {
+                return Err(Located::new(loc, format!("Property '{TYPE_SCSI_HD}.{k}' not found")));
+            }
+        }
+    }
+    if disk.drive == usize::MAX {
+        return Err(Located::new(loc, "drive property not set"));
+    }
+    if !used.insert(disk.drive) {
+        let d = &drives[disk.drive];
+        return Err(Located::new(
+            loc,
+            format!("Drive '{}' is already in use by another device", d.id),
+        ));
+    }
+    if drives[disk.drive].file.is_none() {
+        return Err(Located::new(loc, "Device needs media, but drive is empty"));
+    }
+    Ok(disk)
 }
 
 /// A `uint32` qdev property from its command line string, with QEMU's errors.
@@ -1133,19 +1321,88 @@ impl Frontend for DebugconFrontend {
     }
 }
 
+/// What the device models of `-device` need from the rest of the command line.
+struct ClassEnv<'a> {
+    drives: &'a [Drive],
+    net: &'a Network,
+    ram_size: u64,
+}
+
+/// Opens drive `d` for a device.
+fn open_drive(d: &Drive) -> std::result::Result<FileBackend, String> {
+    let file = d.file.as_deref().expect("planned with media");
+    let backend = FileBackend::open(file, d.read_only)?;
+    if d.probed && !d.read_only {
+        eprint!("{}", probe_warning(file));
+    }
+    Ok(backend)
+}
+
+/// A balloon that leaves the RAM it is given alone.
+#[derive(Debug)]
+struct KeepRam;
+
+impl BalloonBackend for KeepRam {
+    fn discard(&mut self, _gpa: u64, _len: u64) {}
+    fn populate(&mut self, _gpa: u64, _len: u64) {}
+}
+
+/// The device model of `plug`, and for a NIC the port to connect once it is plugged.
 fn virtio_class(
+    plug: &Plug,
+    env: &ClassEnv<'_>,
+) -> std::result::Result<(Box<dyn VirtioDeviceClass>, Option<NicPort>), Located> {
+    let drive = plug.drive.map(|i| &env.drives[i]);
+    let at = |e: String| Located::new(drive.map_or(&plug.loc, |d| &d.loc), e);
+    let serial = plug.serial.clone();
+    let class: Box<dyn VirtioDeviceClass> = match plug.model {
+        VirtioModel::Net => {
+            let mut mac = plug.mac.unwrap_or_default();
+            let (peer, port) = env
+                .net
+                .new_nic(plug.typename, plug.id.as_deref(), plug.netdev.as_deref(), &mut mac)
+                .map_err(|e| Located::new(&plug.loc, e))?;
+            let conf = VirtioNetConf { mac, ..VirtioNetConf::default() };
+            return Ok((Box::new(VirtioNet::new(conf, Some(peer))), Some(port)));
+        }
+        VirtioModel::Scsi => {
+            let mut scsi = VirtioScsi::new(VirtioScsiConf::default());
+            for disk in &plug.disks {
+                let d = &env.drives[disk.drive];
+                let blk = open_drive(d).map_err(|e| Located::new(&d.loc, e))?;
+                let conf = ScsiDiskConf {
+                    kind: ScsiDiskKind::Hd,
+                    drive: Some(Arc::new(blk)),
+                    drive_name: Some(d.id.clone()),
+                    id: disk.id.clone(),
+                    channel: disk.channel,
+                    scsi_id: disk.scsi_id,
+                    lun: disk.lun,
+                    serial: disk.serial.clone(),
+                    ..ScsiDiskConf::default()
+                };
+                scsi.bus_mut()
+                    .attach(conf)
+                    .map_err(|e| Located(disk.loc.clone(), Error::generic(e.to_string())))?;
+            }
+            Box::new(scsi)
+        }
+        VirtioModel::Balloon => Box::new(VirtioBalloon::new(env.ram_size, Box::new(KeepRam))),
+        VirtioModel::Blk | VirtioModel::Rng | VirtioModel::Serial => {
+            simple_virtio_class(plug.model, drive, serial).map_err(at)?
+        }
+    };
+    Ok((class, None))
+}
+
+fn simple_virtio_class(
     plug_model: VirtioModel,
     drive: Option<&Drive>,
     serial: Option<String>,
 ) -> std::result::Result<Box<dyn VirtioDeviceClass>, String> {
     Ok(match plug_model {
         VirtioModel::Blk => {
-            let d = drive.expect("planned with a drive");
-            let file = d.file.as_deref().expect("planned with media");
-            let backend = FileBackend::open(file, d.read_only)?;
-            if d.probed && !d.read_only {
-                eprint!("{}", probe_warning(file));
-            }
+            let backend = open_drive(drive.expect("planned with a drive"))?;
             let conf = VirtioBlkConf { serial, ..VirtioBlkConf::default() };
             Box::new(VirtioBlk::new(Box::new(backend), conf))
         }
@@ -1153,6 +1410,9 @@ fn virtio_class(
             Box::new(VirtioRng::new(Box::<RandomFile>::default(), VirtioRngConf::default()))
         }
         VirtioModel::Serial => Box::new(VirtioConsole::new(None)),
+        VirtioModel::Net | VirtioModel::Scsi | VirtioModel::Balloon => {
+            unreachable!("built by virtio_class()")
+        }
     })
 }
 
@@ -1184,6 +1444,8 @@ struct Built {
     board: X86Board,
     clocks: Vec<Arc<Clock>>,
     attachments: Vec<Attachment>,
+    /// The netdevs, which follow the run state.
+    net: Arc<Network>,
 }
 
 /// `qemu_init_board()` and `qemu_create_cli_devices()` for an x86 board: builds the board,
@@ -1254,11 +1516,11 @@ fn build(
     if let Some(port) = p.default_cdrom {
         attach_ide(&board, port, DriveConfig::cdrom(), None).map_err(|e| one(Located::bare(e)))?;
     }
+    let net = Arc::new(Network::new(&cmd.netdevs, &clock).map_err(one)?);
+    let env = ClassEnv { drives, net: &net, ram_size: board.ram_size() };
     for plug in p.virtio {
-        let drive = plug.drive.map(|i| &drives[i]);
-        let class = virtio_class(plug.model, drive, plug.serial)
-            .map_err(|e| one(Located::new(drive.map_or(&plug.loc, |d| &d.loc), e)))?;
-        board.attach_virtio(class).map_err(|e| {
+        let (class, nic) = virtio_class(&plug, &env).map_err(one)?;
+        let handle = board.attach_virtio(class).map_err(|e| {
             let msg = if e.starts_with("No 'virtio-bus' bus found for device") {
                 format!("No 'virtio-bus' bus found for device '{}'", plug.typename)
             } else {
@@ -1266,6 +1528,20 @@ fn build(
             };
             one(Located::new(&plug.loc, msg))
         })?;
+        // pci_add_option_rom()
+        if let Some(name) = &plug.romfile {
+            let rom = |e: String| one(Located::new(&plug.loc, e));
+            let Some(data) = cmd.firmware().load(name) else {
+                return Err(rom(format!("failed to find romfile \"{name}\"")));
+            };
+            if data.is_empty() {
+                return Err(rom(format!("romfile \"{name}\" is empty")));
+            }
+            board.add_option_rom(&handle, plug.typename, &data).map_err(rom)?;
+        }
+        if let Some(nic) = nic {
+            nic.connect(handle);
+        }
     }
     let mut attachments = Vec::new();
     for plug in &p.isa {
@@ -1280,7 +1556,8 @@ fn build(
         board.set_serial_backend(index, Some(fe.clone()));
         attachments.push(chr.attach(fe).map_err(|e| vec![Located(None, e)])?);
     }
-    Ok(Built { board, clocks: vec![clock, rtc_clock], attachments })
+    net.check_clients();
+    Ok(Built { board, clocks: vec![clock, rtc_clock], attachments, net })
 }
 
 /// Realizes one ISA device of `-device` on `board`.
@@ -1370,9 +1647,12 @@ fn event_handler(vm: &Arc<Vm>) -> EventHandler {
 }
 
 /// Lets the runstate start and stop the vCPUs, through `start` and `pause` on `machine`.
+/// The netdevs are told first when the VM starts and last when it stops, as
+/// `vm_state_notify()` runs before `resume_all_vcpus()` and after `pause_all_vcpus()`.
 fn set_cpu_hook<M: Send + Sync + 'static>(
     vm: &Arc<Vm>,
     machine: &Arc<M>,
+    net: Arc<Network>,
     start: fn(&M),
     pause: fn(&M),
 ) {
@@ -1380,9 +1660,11 @@ fn set_cpu_hook<M: Send + Sync + 'static>(
     vm.runstate.set_cpu_hook(Some(Arc::new(move |run| {
         if let Some(m) = weak.upgrade() {
             if run {
+                net.vm_state_change(true);
                 start(&m);
             } else {
                 pause(&m);
+                net.vm_state_change(false);
             }
         }
     })));
@@ -1417,11 +1699,12 @@ pub(crate) fn start_board_tcg(
     let cfg = TcgRunConfig { no_reboot: cmd.no_reboot, tcg, backend: None };
     let (machine, warnings) =
         TcgMachine::new(built.board, &cpu, built.clocks, &cfg, event_handler(vm)).map_err(one)?;
+    let net = built.net;
     for w in &warnings {
         warn_report(w);
     }
     let machine = Arc::new(machine);
-    set_cpu_hook(vm, &machine, TcgMachine::start, TcgMachine::pause);
+    set_cpu_hook(vm, &machine, net, TcgMachine::start, TcgMachine::pause);
     init_migration(vm, &machine, machine_type, cmd.uuid).map_err(one)?;
     Ok(Running { machine: RunningMachine::Tcg(machine), _attachments: built.attachments })
 }
@@ -1523,7 +1806,7 @@ mod kvm {
             KvmMachine::new(accel, built.board, &cpu, built.clocks, &cfg, event_handler(vm))
                 .map_err(one)?;
         let machine = Arc::new(machine);
-        set_cpu_hook(vm, &machine, KvmMachine::start, KvmMachine::pause);
+        set_cpu_hook(vm, &machine, built.net, KvmMachine::start, KvmMachine::pause);
         Ok(Running { machine: RunningMachine::Kvm(machine), _attachments: built.attachments })
     }
 }
@@ -1769,6 +2052,66 @@ mod tests {
             ]
         );
         assert_eq!(p.virtio[0].serial.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn net_scsi_and_balloon_are_planned() {
+        let k = Some(BoardKind::Q35);
+        let d = drives(k, &["id=d0,file=a.img,if=none,format=raw"]).unwrap();
+        let p = plan(
+            k,
+            &d,
+            &devices(&[
+                "virtio-net-pci,netdev=h0,mac=52:54:00:aa:bb:0c",
+                "virtio-scsi",
+                "scsi-hd,drive=d0,scsi-id=1,lun=0,serial=x,id=s0",
+                "virtio-balloon-pci",
+                "virtio-net,netdev=h1",
+            ]),
+            true,
+        )
+        .unwrap();
+        let got: Vec<_> = p.virtio.iter().map(|v| (v.typename, v.model)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("virtio-net-pci", VirtioModel::Net),
+                ("virtio-scsi-pci", VirtioModel::Scsi),
+                ("virtio-balloon-pci", VirtioModel::Balloon),
+                ("virtio-net-pci", VirtioModel::Net),
+            ]
+        );
+        assert_eq!(p.virtio[0].netdev.as_deref(), Some("h0"));
+        assert_eq!(p.virtio[0].mac, Some([0x52, 0x54, 0, 0xaa, 0xbb, 0x0c]));
+        assert_eq!(p.virtio[3].mac, None);
+        let disk = &p.virtio[1].disks[0];
+        assert_eq!((disk.drive, disk.scsi_id, disk.lun), (0, Some(1), Some(0)));
+        assert_eq!(disk.serial.as_deref(), Some("x"));
+        assert_eq!(disk.id.as_deref(), Some("s0"));
+
+        let err = |args: &[&str]| plan(k, &d, &devices(args), true).unwrap_err()[0].1.to_string();
+        assert_eq!(err(&["scsi-hd,drive=d0"]), "No 'SCSI' bus found for device 'scsi-hd'");
+        assert_eq!(
+            err(&["virtio-net,mac=1:2"]),
+            "Property 'virtio-net-pci.mac' doesn't take value '1:2'"
+        );
+        assert_eq!(err(&["virtio-scsi", "scsi-hd"]), "drive property not set");
+
+        let p = plan(k, &d, &devices(&["virtio-serial,max_ports=1", "virtconsole,id=c"]), true);
+        assert_eq!(p.unwrap().virtio.len(), 1);
+        assert_eq!(
+            err(&["virtio-serial,max_ports=2"]),
+            "Property 'virtio-serial-pci.max_ports' must be 1 in ruvm"
+        );
+        assert_eq!(
+            err(&["virtconsole"]),
+            "No 'virtio-serial-bus' bus found for device 'virtconsole'"
+        );
+        assert!(err(&["virtio-serial", "virtconsole", "virtconsole"]).contains("single port"));
+        assert_eq!(
+            err(&["virtio-serial", "virtconsole,chardev=x"]),
+            "Property 'virtconsole.chardev' not found"
+        );
     }
 
     #[test]

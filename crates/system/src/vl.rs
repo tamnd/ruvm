@@ -490,6 +490,7 @@ fn parse_options(
                 }
                 cfg.x86.devices.push((arg.to_string(), current_location()));
             }
+            Opt::Netdev => cfg.x86.netdevs.push((arg.to_string(), current_location())),
             Opt::NoReboot => cfg.x86.no_reboot = true,
             Opt::Uuid => cfg.x86.set_uuid(arg).map_err(|e| fail_msg(&e))?,
             Opt::Smbios => cfg.x86.add_smbios(arg).map_err(|e| fail_msg(&e))?,

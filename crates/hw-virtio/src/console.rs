@@ -22,8 +22,8 @@
 //! than pretending to consume it, and `VIRTIO_CONSOLE_F_SIZE` is not offered.
 //!
 //! Not ported: multiport and the control message protocol, more than one port, generic
-//! `virtserialport` ports, port names, guest open and close events, VMState, trace points and
-//! QOM registration.
+//! `virtserialport` ports, port names, guest open and close events, trace points and QOM
+//! registration. Migration state is in the `vmstate` submodule, [`VirtioConsoleVmState`].
 
 use std::any::Any;
 use std::fmt;
@@ -32,6 +32,10 @@ use std::sync::Arc;
 use ruvm_base::Result;
 
 use crate::virtio::{VIRTIO_CONFIG_S_DRIVER_OK, VirtIODevice, VirtioDeviceClass, feature};
+
+mod vmstate;
+
+pub use vmstate::{VirtioConsolePortVmState, VirtioConsoleVmState};
 
 /// `TYPE_VIRTIO_SERIAL`.
 pub const TYPE_VIRTIO_SERIAL: &str = "virtio-serial-device";

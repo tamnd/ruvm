@@ -25,7 +25,10 @@
 //!   `virtqueue_pop()`. The messages are not word for word the same.
 //! - The in use counter counts chains, not descriptors, for packed rings as well.
 //!
-//! Not ported: VMState, trace points, QOM registration, ioeventfd and irqfd, host notifiers
+//! Migration state is in the `vmstate` submodule: [`VirtioVmState`] and
+//! [`VirtioBackend::vmstate_load`].
+//!
+//! Not ported: trace points, QOM registration, ioeventfd and irqfd, host notifiers
 //! (vhost has its own notifiers, see the `vhost` module), the IOMMU and memory listener integration, per-queue vectors beyond storing them,
 //! `VIRTIO_F_NOTIFICATION_DATA` and `VIRTIO_F_IN_ORDER` handling, and queue reset through the
 //! transport (the per-queue reset bit is still offered by default as QEMU does, but the MMIO
@@ -40,6 +43,10 @@ use ruvm_virtio_queue::{
     DescriptorChain, GuestMemory, PackedQueue, QueueError, RingAddresses, SplitQueue,
     VIRTIO_F_EVENT_IDX, VIRTIO_F_INDIRECT_DESC, VIRTIO_F_RING_PACKED,
 };
+
+mod vmstate;
+
+pub use vmstate::{VIRTIO_DEVICE_ENDIAN_LITTLE, VirtQueueVmState, VirtioVmState};
 
 /// Guest memory shared between the device, its queues and whoever set it up.
 pub type SharedGuestMemory = Arc<dyn GuestMemory + Send + Sync>;
@@ -219,7 +226,7 @@ impl VirtQueue {
         VirtQueue {
             num: size,
             num_default: size,
-            align: 0,
+            align: crate::pci::VIRTIO_PCI_VRING_ALIGN,
             desc: 0,
             avail: 0,
             used: 0,
@@ -415,11 +422,9 @@ impl VirtIODevice {
                 self.name
             )));
         }
-        let mut q = VirtQueue::new(size);
-        // A queue added after the transport set the legacy alignment, which virtio-net does when
-        // the driver turns multiqueue on, gets the same alignment as the first one.
-        q.align = self.vqs.first().map_or(0, |first| first.align);
-        self.vqs.push(q);
+        // QEMU starts every queue with the legacy PCI alignment, which a virtio-mmio driver
+        // may change. SeaBIOS never does.
+        self.vqs.push(VirtQueue::new(size));
         Ok((self.vqs.len() - 1) as u16)
     }
 
@@ -1018,6 +1023,18 @@ pub trait VirtioDeviceClass: Any + Send + fmt::Debug {
     /// `legacy_features`. virtio-net adds `VIRTIO_NET_F_GSO` to the common set.
     fn legacy_features(&self) -> u64 {
         VIRTIO_LEGACY_FEATURES
+    }
+
+    /// `pre_load_queues`: an incoming migration has `n` queues, make the device have as many
+    /// before their registers are loaded.
+    fn pre_load_queues(&mut self, _vdev: &mut VirtIODevice, _n: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// `post_load`: the last step of loading migrated state, after the features and the rings
+    /// are back.
+    fn post_load(&mut self, _vdev: &mut VirtIODevice) -> Result<()> {
+        Ok(())
     }
 
     /// For downcasting to the concrete model.

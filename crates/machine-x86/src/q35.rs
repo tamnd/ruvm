@@ -618,6 +618,8 @@ pub struct Q35 {
     ram: RegionId,
     /// `pc.rom`, the option ROM area.
     option_rom: RegionId,
+    /// The PCI devices' option ROMs, `DEVICE/TYPE.rom`.
+    device_roms: Vec<RegionId>,
     memory_as: Arc<AddressSpace>,
     io_as: Arc<AddressSpace>,
     smm_root: Option<RegionId>,
@@ -1197,6 +1199,7 @@ impl Q35 {
             pci,
             ram,
             option_rom: option_rom_mr,
+            device_roms: Vec::new(),
             memory_as,
             io_as,
             smm_root,
@@ -1529,8 +1532,19 @@ impl Q35 {
         let mut ids = vec![self.ram];
         ids.extend(self.bios.as_ref().map(|b| b.0));
         ids.push(self.option_rom);
+        ids.extend(self.device_roms.iter().copied());
         ids.extend(self.flashes.iter().map(|f| f.region()));
         ids.into_iter().filter_map(|id| self.mem.ram_block(id)).collect()
+    }
+
+    /// `pci_add_option_rom()`: makes the option ROM `name`, `DEVICE/TYPE.rom`, from `data`,
+    /// in a RAM block of the next power of two size so it migrates. The device maps it with
+    /// its ROM BAR.
+    pub fn add_device_rom(&mut self, name: &str, data: &[u8]) -> Result<RegionId, String> {
+        let rom = self.mem.new_rom(name, (data.len() as u64).next_power_of_two()).map_err(err)?;
+        self.mem.ram_block(rom).ok_or("option ROM has no RAM")?.write(0, data).map_err(err)?;
+        self.device_roms.push(rom);
+        Ok(rom)
     }
 
     /// The firmware region, `pc.bios`, or `None` when the firmware is in pflash.

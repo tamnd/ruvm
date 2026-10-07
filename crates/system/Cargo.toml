@@ -32,6 +32,7 @@ ruvm-machine-x86.workspace = true
 ruvm-mem.workspace = true
 ruvm-migration.workspace = true
 ruvm-monitor.workspace = true
+ruvm-net.workspace = true
 ruvm-qapi.workspace = true
 ruvm-qom.workspace = true
 ruvm-target-arm.workspace = true

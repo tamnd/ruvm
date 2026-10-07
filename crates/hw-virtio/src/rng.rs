@@ -18,7 +18,9 @@
 //!   default `max-bytes` the quota never runs out, so nothing needs to call it.
 //! - There is no VM run state, so the device always behaves as if the VM is running.
 //!
-//! Not ported: VMState, trace points, QOM registration and the `rng` link property.
+//! Migration: the device has no state beyond the core's.
+//!
+//! Not ported: trace points, QOM registration and the `rng` link property.
 
 use std::any::Any;
 use std::fmt;

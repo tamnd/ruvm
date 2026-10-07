@@ -1049,6 +1049,7 @@ dependencies = [
  "ruvm-mem",
  "ruvm-migration",
  "ruvm-monitor",
+ "ruvm-net",
  "ruvm-qapi",
  "ruvm-qapi-gen",
  "ruvm-qom",
