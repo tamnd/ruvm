@@ -1,23 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The control and status registers, a port of QEMU's `target/riscv/csr.c` (with the
-//! trigger CSRs of `debug.c` and the counters of `pmu.c`) for the CSRs of QEMU's default
-//! `rv64` CPU.
+//! trigger CSRs of `debug.c`) for the CSRs of the extensions this port has.
 //!
-//! The CSRs are `fflags`, `frm` and `fcsr`; `cycle`, `time`, `instret` and
-//! `hpmcounter3` to `hpmcounter31`; the machine information registers; `mstatus`,
-//! `misa`, `medeleg`, `mideleg`, `mie`, `mtvec`, `mcounteren`, `menvcfg`,
-//! `mcountinhibit`, `mhpmevent3` to `mhpmevent31`, `mscratch`, `mepc`, `mcause`,
-//! `mtval`, `mip`, `mcycle`, `minstret` and `mhpmcounter3` to `mhpmcounter31`; `sstatus`,
-//! `sie`, `stvec`, `scounteren`, `senvcfg`, `sscratch`, `sepc`, `scause`, `stval`, `sip`,
-//! `stimecmp` and `satp`; the even `pmpcfg` registers up to `pmpcfg14` and `pmpaddr0` to
-//! `pmpaddr63`; `tselect`, `tdata1` to `tdata3`, `tinfo` and `mcontext`; the vector CSRs
-//! with Zve32x; and with H, `hstatus`, `hedeleg`, `hideleg`, `hie`, `htimedelta`,
+//! The CSRs are `fflags`, `frm` and `fcsr`; `cycle`, `time`, `instret` and `hpmcounter3` to
+//! `hpmcounter31`; the machine information registers; `mstatus`, `misa`, `medeleg`, `mideleg`,
+//! `mie`, `mtvec`, `mcounteren`, `menvcfg`, `mcountinhibit`, `mhpmevent3` to `mhpmevent31`,
+//! `mscratch`, `mepc`, `mcause`, `mtval`, `mip`, `mcycle`, `minstret` and `mhpmcounter3` to
+//! `mhpmcounter31`; `sstatus`, `sie`, `stvec`, `scounteren`, `senvcfg`, `sscratch`, `sepc`,
+//! `scause`, `stval`, `sip`, `stimecmp` and `satp`; the even `pmpcfg` registers up to `pmpcfg14`
+//! and `pmpaddr0` to `pmpaddr63`; `tselect`, `tdata1` to `tdata3`, `tinfo` and `mcontext`; the
+//! vector CSRs with Zve32x; and with H, `hstatus`, `hedeleg`, `hideleg`, `hie`, `htimedelta`,
 //! `hcounteren`, `hgeie`, `henvcfg`, `htval`, `hip`, `hvip`, `htinst`, `hgatp`, `hgeip`,
-//! `vsstatus`, `vsie`, `vstvec`, `vsscratch`, `vsepc`, `vscause`, `vstval`, `vsip`,
-//! `vstimecmp`, `vsatp`, `mtval2` and `mtinst`. Every other CSR raises an illegal
-//! instruction exception, as the extensions behind them (AIA, Smstateen, Sscofpmf, Zkr,
-//! Smepmp, Smrnmi, Smctr, control flow integrity, pointer masking) are not in the model.
+//! `vsstatus`, `vsie`, `vstvec`, `vsscratch`, `vsepc`, `vscause`, `vstval`, `vsip`, `vstimecmp`,
+//! `vsatp`, `mtval2` and `mtinst`; `seed` with Zkr; `mseccfg` with Smepmp, Zkr or Smmpm; and
+//! `mstateen0` to `mstateen3`, `hstateen0` to `hstateen3` and `sstateen0` to `sstateen3` with
+//! Smstateen; `scountovf` with Sscofpmf; and `mcyclecfg` and `minstretcfg` with Smcntrpmf;
+//! `miselect`, `mireg` to `mireg6`, `siselect`, `sireg` to `sireg6`, `vsiselect` and `vsireg` to
+//! `vsireg6` with Smcsrind and Sscsrind, which reach the counters delegated with Smcdeleg and
+//! Ssccfg; and `scountinhibit` with Ssccfg. Every other CSR raises an illegal instruction
+//! exception, as the extensions behind them (AIA, Smrnmi, Smctr, control flow integrity) are not in
+//! the model, and so do the AIA ranges of the indirect registers. The counters themselves are in
+//! [`super::pmu`]. The PMM fields of `menvcfg`, `senvcfg`, `henvcfg`, `hstatus` and `mseccfg` take
+//! the pointer masking modes of Smnpm, Ssnpm and Smmpm, which [`super::pm`] applies.
 //!
 //! In VS and VU mode the S mode CSRs reach the VS registers, which the trap and return
 //! paths swap into the S mode slots (`riscv_cpu_swap_hypervisor_regs()`), while `sie`,
@@ -33,8 +38,6 @@
 //!   "QEMU does not support big endian guests." and "CSR_VSTVEC: reserved mode not
 //!   supported" for such `hstatus` and `vstvec` writes; this crate has no logging and
 //!   stays silent, with the same effect on the registers.
-//! - `hpmcounter3` to `hpmcounter18` and their machine mode aliases hold the value
-//!   written but never count, whatever event `mhpmevent` selects.
 //! - A `csrw` (rd = x0) reads the old value before the write, where QEMU skips the read.
 //!   No read in this model has a side effect or can fail when the write would succeed,
 //!   so the result is the same.
@@ -45,7 +48,9 @@
 
 use ruvm_jit::{Cpu, CpuShared, cputlb};
 
-use super::{CpuLines, Riscv, SstcTimer, pmp};
+use super::pm::PMM_FIELD_RESERVED;
+use super::{CpuLines, Riscv, SstcTimer, pmp, pmu};
+use crate::cfg::PrivVer;
 use crate::cpu::{
     COUNTEREN_CY, COUNTEREN_IR, COUNTEREN_TM, CpuRiscvState, EXCP_BREAKPOINT, EXCP_ILLEGAL_INST,
     EXCP_INST_ACCESS_FAULT, EXCP_INST_ADDR_MIS, EXCP_INST_GUEST_PAGE_FAULT, EXCP_INST_PAGE_FAULT,
@@ -54,15 +59,26 @@ use crate::cpu::{
     EXCP_STORE_GUEST_AMO_ACCESS_FAULT, EXCP_STORE_PAGE_FAULT, EXCP_U_ECALL,
     EXCP_VIRT_INSTRUCTION_FAULT, EXCP_VS_ECALL, FFLAGS_MASK, HS_MODE_INTERRUPTS, HSTATUS_HUKTE,
     HSTATUS_HUPMM, HSTATUS_VSBE, HSTATUS_VSXL, HSTATUS_VTVM, M_MODE_INTERRUPTS, MENVCFG_ADUE,
-    MENVCFG_CBCFE, MENVCFG_CBIE, MENVCFG_CBZE, MENVCFG_DTE, MENVCFG_FIOM, MENVCFG_PBMTE,
-    MENVCFG_STCE, MIP_LCOFIP, MIP_SEIP, MIP_SGEIP, MIP_SSIP, MIP_STIP, MIP_VSEIP, MIP_VSSIP,
-    MIP_VSTIP, MSTATUS_FS, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV, MSTATUS_MXR,
-    MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_SUM, MSTATUS_TSR, MSTATUS_TVM, MSTATUS_TW,
-    MSTATUS64_UXL, NUM_TRIGGERS, PMU_AVAIL_CTRS, PRV_M, PRV_S, PRV_U, S_MODE_INTERRUPTS,
-    SATP64_ASID, SATP64_MODE, SATP64_PPN, SSTATUS_MASK, VM_MBARE, VM_SV39, VM_SV48, VM_SV57,
-    VS_MODE_INTERRUPTS, VSSTATUS64_UXL, add_status_sd, get_field, set_field,
+    MENVCFG_CBCFE, MENVCFG_CBIE, MENVCFG_CBZE, MENVCFG_CDE, MENVCFG_DTE, MENVCFG_FIOM,
+    MENVCFG_PBMTE, MENVCFG_STCE, MIP_LCOFIP, MIP_SEIP, MIP_SGEIP, MIP_SSIP, MIP_STIP, MIP_VSEIP,
+    MIP_VSSIP, MIP_VSTIP, MSTATUS_FS, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV,
+    MSTATUS_MXR, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_SUM, MSTATUS_TSR, MSTATUS_TVM,
+    MSTATUS_TW, MSTATUS64_UXL, NUM_TRIGGERS, PRV_M, PRV_S, PRV_U, RVF, RVS, RVU, S_MODE_INTERRUPTS,
+    SATP64_ASID, SATP64_MODE, SATP64_PPN, SSTATUS_MASK, VS_MODE_INTERRUPTS, VSSTATUS64_UXL,
+    add_status_sd, get_field, set_field,
 };
-use crate::cpu::{MSTATUS_VS, RiscvCfg};
+use crate::cpu::{MENVCFG_PMM, MSTATUS_VS, RiscvCfg};
+
+/// `ISELECT_*`: the `xiselect` values of Smcdeleg's counters, and the bits `xiselect`
+/// holds with Smcsrind or Sscsrind, or with AIA alone.
+const ISELECT_IPRIO0: u64 = 0x30;
+const ISELECT_IPRIO15: u64 = 0x3f;
+const ISELECT_CD_FIRST: u64 = 0x40;
+const ISELECT_CD_LAST: u64 = 0x5f;
+const ISELECT_IMSIC_FIRST: u64 = 0x70;
+const ISELECT_IMSIC_LAST: u64 = 0xff;
+const ISELECT_MASK_AIA: u64 = 0x1ff;
+const ISELECT_MASK_SXCSRIND: u64 = 0xfff;
 
 // The CSR numbers, from `cpu_bits.h`.
 const CSR_FFLAGS: u32 = 0x001;
@@ -83,6 +99,24 @@ const CSR_SSTATUS: u32 = 0x100;
 const CSR_SIE: u32 = 0x104;
 const CSR_STVEC: u32 = 0x105;
 const CSR_SCOUNTEREN: u32 = 0x106;
+const CSR_SCOUNTOVF: u32 = 0xda0;
+const CSR_SCOUNTINHIBIT: u32 = 0x120;
+const CSR_SISELECT: u32 = 0x150;
+const CSR_SIREG: u32 = 0x151;
+const CSR_SIREG2: u32 = 0x152;
+const CSR_SIREG4: u32 = 0x155;
+const CSR_SIREG5: u32 = 0x156;
+const CSR_SIREG6: u32 = 0x157;
+const CSR_VSISELECT: u32 = 0x250;
+const CSR_VSIREG: u32 = 0x251;
+const CSR_VSIREG2: u32 = 0x252;
+const CSR_VSIREG4: u32 = 0x255;
+const CSR_VSIREG6: u32 = 0x257;
+const CSR_MISELECT: u32 = 0x350;
+const CSR_MIREG: u32 = 0x351;
+const CSR_MIREG2: u32 = 0x352;
+const CSR_MIREG4: u32 = 0x355;
+const CSR_MIREG6: u32 = 0x357;
 const CSR_SENVCFG: u32 = 0x10a;
 const CSR_SSCRATCH: u32 = 0x140;
 const CSR_SEPC: u32 = 0x141;
@@ -124,6 +158,8 @@ const CSR_MTVEC: u32 = 0x305;
 const CSR_MCOUNTEREN: u32 = 0x306;
 const CSR_MENVCFG: u32 = 0x30a;
 const CSR_MCOUNTINHIBIT: u32 = 0x320;
+const CSR_MCYCLECFG: u32 = 0x321;
+const CSR_MINSTRETCFG: u32 = 0x322;
 const CSR_MHPMEVENT3: u32 = 0x323;
 const CSR_MHPMEVENT31: u32 = 0x33f;
 const CSR_MSCRATCH: u32 = 0x340;
@@ -134,8 +170,11 @@ const CSR_MIP: u32 = 0x344;
 const CSR_MTINST: u32 = 0x34a;
 const CSR_MTVAL2: u32 = 0x34b;
 const CSR_PMPCFG0: u32 = 0x3a0;
+const CSR_PMPCFG3: u32 = 0x3a3;
+const CSR_PMPCFG4: u32 = 0x3a4;
 const CSR_PMPCFG15: u32 = 0x3af;
 const CSR_PMPADDR0: u32 = 0x3b0;
+const CSR_PMPADDR16: u32 = 0x3c0;
 const CSR_PMPADDR63: u32 = 0x3ef;
 const CSR_TSELECT: u32 = 0x7a0;
 const CSR_TDATA1: u32 = 0x7a1;
@@ -152,9 +191,29 @@ const CSR_MARCHID: u32 = 0xf12;
 const CSR_MIMPID: u32 = 0xf13;
 const CSR_MHARTID: u32 = 0xf14;
 const CSR_MCONFIGPTR: u32 = 0xf15;
+/// `seed`, the entropy source of Zkr.
+pub(crate) const CSR_SEED: u32 = 0x015;
+const CSR_MSECCFG: u32 = 0x747;
+const CSR_MSTATEEN0: u32 = 0x30c;
+const CSR_MSTATEEN3: u32 = 0x30f;
+const CSR_HSTATEEN0: u32 = 0x60c;
+const CSR_HSTATEEN3: u32 = 0x60f;
+const CSR_SSTATEEN0: u32 = 0x10c;
+const CSR_SSTATEEN3: u32 = 0x10f;
 
-/// `RISCV_CPU_MARCHID`.
-const MARCHID: u64 = 42;
+// The Smstateen bits, `SMSTATEEN0_*`.
+const SMSTATEEN0_FCSR: u64 = 1 << 1;
+const SMSTATEEN0_CTR: u64 = 1 << 54;
+const SMSTATEEN0_P1P13: u64 = 1 << 56;
+const SMSTATEEN0_IMSIC: u64 = 1 << 58;
+const SMSTATEEN0_AIA: u64 = 1 << 59;
+const SMSTATEEN0_SVSLCT: u64 = 1 << 60;
+const SMSTATEEN0_HSENVCFG: u64 = 1 << 62;
+const SMSTATEEN_STATEEN: u64 = 1 << 63;
+
+/// `SEED_OPST_ES16`: `seed` holds 16 bits of entropy. QEMU's macro is a C `int`, so on
+/// RV64 the value read is sign extended from bit 31 and bits 63 to 31 are all set.
+const SEED_OPST_ES16: u64 = 0xffff_ffff_8000_0000;
 
 /// `LOCAL_INTERRUPTS`: interrupts 16 and up.
 const LOCAL_INTERRUPTS: u64 = !0xffff;
@@ -210,8 +269,8 @@ const VS_DELEGABLE_EXCPS: u64 = DELEGABLE_EXCPS
         | (1 << EXCP_VIRT_INSTRUCTION_FAULT)
         | (1 << EXCP_STORE_GUEST_AMO_ACCESS_FAULT));
 
-/// The `mstatus` bits a write changes: `write_mstatus()` with F and without Smdbltrp,
-/// Ssdbltrp or Zicfilp. VS is added when Zve32x is on.
+/// The `mstatus` bits a write changes: `write_mstatus()` without Smdbltrp, Ssdbltrp or
+/// Zicfilp. FS is added with F and VS with Zve32x.
 const MSTATUS_WRITE_MASK: u64 = MSTATUS_SIE
     | MSTATUS_SPIE
     | MSTATUS_MIE
@@ -223,27 +282,23 @@ const MSTATUS_WRITE_MASK: u64 = MSTATUS_SIE
     | MSTATUS_MXR
     | MSTATUS_TVM
     | MSTATUS_TSR
-    | MSTATUS_TW
-    | MSTATUS_FS;
+    | MSTATUS_TW;
 
-/// The `menvcfg` bits a write changes: Sstc and Svadu are present, Svpbmt, Smcdeleg and
-/// Ssdbltrp are not.
-const MENVCFG_WRITE_MASK: u64 =
-    MENVCFG_FIOM | MENVCFG_CBIE | MENVCFG_CBCFE | MENVCFG_CBZE | MENVCFG_STCE | MENVCFG_ADUE;
 /// The `senvcfg` bits a write changes, and the `henvcfg` bits that do not follow
 /// `menvcfg`.
 const SENVCFG_WRITE_MASK: u64 = MENVCFG_FIOM | MENVCFG_CBIE | MENVCFG_CBCFE | MENVCFG_CBZE;
 /// The `henvcfg` bits that read as zero and cannot be set while the same `menvcfg` bit is
 /// clear.
 const HENVCFG_FOLLOWS_M: u64 = MENVCFG_PBMTE | MENVCFG_STCE | MENVCFG_ADUE | MENVCFG_DTE;
+
+/// The PMM field of an `envcfg` write of `val`, if the hart has the extension `ext` that
+/// makes it writable and `val` does not hold the reserved value 1.
+fn pmm_mask(ext: bool, val: u64) -> u64 {
+    if ext && get_field(val, MENVCFG_PMM) != PMM_FIELD_RESERVED { MENVCFG_PMM } else { 0 }
+}
+
 /// `SSTATUS_SDT`.
 const SSTATUS_SDT: u64 = 1 << 24;
-
-/// The counters `mcounteren` and `scounteren` can enable.
-const COUNTEREN_MASK: u64 = PMU_AVAIL_CTRS | COUNTEREN_CY | COUNTEREN_TM | COUNTEREN_IR;
-
-/// `MHPMEVENT_BIT_VSINH` and `MHPMEVENT_BIT_VUINH`, which are writable with H only.
-const MHPMEVENT_VINH: u64 = (1 << 59) | (1 << 58);
 
 /// `MCONTEXT64`.
 const MCONTEXT64: u64 = 0x1fff;
@@ -289,10 +344,11 @@ trait Hw {
     /// `riscv_timer_stce_changed()`: the STCE bit of `menvcfg` (`is_m`) or `henvcfg`
     /// flipped to `enable`.
     fn stce_changed(&self, st: &CpuRiscvState, is_m: bool, enable: bool);
-    /// The extensions of the CPU.
-    fn cfg(&self) -> RiscvCfg {
-        RiscvCfg::default()
-    }
+    /// `timer_mod_anticipate_ns()` of the PMU timer: fire it in `delay_ns` nanoseconds, or
+    /// earlier if it is already set for an earlier time.
+    fn pmu_timer(&self, delay_ns: u64);
+    /// The configuration of the CPU.
+    fn cfg(&self) -> &RiscvCfg;
 }
 
 /// The [`Hw`] of a vCPU.
@@ -322,8 +378,12 @@ impl Hw for CpuHw<'_> {
         self.rv.stce_changed(self.shared, st, is_m, enable);
     }
 
-    fn cfg(&self) -> RiscvCfg {
-        *self.rv.cfg()
+    fn pmu_timer(&self, delay_ns: u64) {
+        self.rv.pmu_timer(self.shared, delay_ns);
+    }
+
+    fn cfg(&self) -> &RiscvCfg {
+        self.rv.cfg()
     }
 }
 
@@ -372,21 +432,58 @@ fn ctr_index(csrno: u32) -> usize {
     (csrno & 0x1f) as usize
 }
 
+/// `riscv_new_csr_seed()`: 16 random bits, `qemu_guest_getrandom()` without `-seed`.
+fn seed_value() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(0);
+    (h.finish() & 0xffff) | SEED_OPST_ES16
+}
+
 /// `legalize_mpp()`: keep the old MPP if the new one is not a privilege level the hart
-/// has (2 is reserved).
-fn legalize_mpp(old_mpp: u64, val: u64) -> u64 {
-    match get_field(val, MSTATUS_MPP) {
-        PRV_M | PRV_S | PRV_U => val,
-        _ => set_field(val, MSTATUS_MPP, old_mpp),
-    }
+/// with extensions `misa` has (2 is reserved).
+fn legalize_mpp(misa: u64, old_mpp: u64, val: u64) -> u64 {
+    let valid = match get_field(val, MSTATUS_MPP) {
+        PRV_M => true,
+        PRV_S => misa & RVS != 0,
+        PRV_U => misa & RVU != 0,
+        _ => false,
+    };
+    if valid { val } else { set_field(val, MSTATUS_MPP, old_mpp) }
 }
 
 /// `legalize_xatp()` without the flush: the new `satp`, or `None` to keep the old one.
-fn legalize_satp(old: u64, val: u64) -> Option<u64> {
-    let vm = get_field(val, SATP64_MODE);
-    let valid = matches!(vm, VM_MBARE | VM_SV39 | VM_SV48 | VM_SV57);
+fn legalize_satp(cfg: &RiscvCfg, old: u64, val: u64) -> Option<u64> {
+    let valid = cfg.satp_mode_ok(get_field(val, SATP64_MODE));
     let changed = (val ^ old) & (SATP64_MODE | SATP64_ASID | SATP64_PPN) != 0;
     (valid && changed).then_some(val)
+}
+
+/// `csr_ops[csrno].min_priv_ver`: the oldest privileged version that has CSR `csrno`.
+fn min_priv_ver(csrno: u32) -> PrivVer {
+    match csrno {
+        CSR_MCOUNTINHIBIT | CSR_MSECCFG => PrivVer::V1_11,
+        CSR_HSTATUS | CSR_HEDELEG | CSR_HIDELEG | CSR_HIE | CSR_HTIMEDELTA | CSR_HCOUNTEREN
+        | CSR_HGEIE | CSR_HENVCFG | CSR_HTVAL | CSR_HIP | CSR_HVIP | CSR_HTINST | CSR_HGATP
+        | CSR_HGEIP | CSR_VSSTATUS | CSR_VSIE | CSR_VSTVEC | CSR_VSSCRATCH | CSR_VSEPC
+        | CSR_VSCAUSE | CSR_VSTVAL | CSR_VSIP | CSR_VSATP | CSR_MTVAL2 | CSR_MTINST
+        | CSR_MENVCFG | CSR_SENVCFG | CSR_STIMECMP | CSR_VSTIMECMP | CSR_MCONFIGPTR => {
+            PrivVer::V1_12
+        }
+        CSR_PMPCFG4..=CSR_PMPCFG15 | CSR_PMPADDR16..=CSR_PMPADDR63 => PrivVer::V1_12,
+        CSR_MSTATEEN0..=CSR_MSTATEEN3
+        | CSR_HSTATEEN0..=CSR_HSTATEEN3
+        | CSR_SSTATEEN0..=CSR_SSTATEEN3
+        | CSR_MCYCLECFG
+        | CSR_MINSTRETCFG
+        | CSR_SCOUNTOVF
+        | CSR_SCOUNTINHIBIT => PrivVer::V1_12,
+        // The aliases mireg2 to mireg6 and the like, but not mireg itself.
+        CSR_MIREG2..=CSR_MIREG6 | CSR_SIREG2..=CSR_SIREG6 | CSR_VSIREG2..=CSR_VSIREG6 => {
+            PrivVer::V1_12
+        }
+        _ => PrivVer::V1_10,
+    }
 }
 
 /// Move the VS level interrupt bits of a `vsie` or `vsip` value up from their S level
@@ -476,6 +573,14 @@ impl Csrs<'_> {
             }
             CSR_VSIE => return Ok(self.rmw_vsie(new, mask)),
             CSR_VSIP => return Ok(self.rmw_vsip(new, mask)),
+            CSR_SEED => return Ok(seed_value()),
+            CSR_MISELECT | CSR_SISELECT | CSR_VSISELECT => {
+                return self.rmw_xiselect(csrno, new, mask);
+            }
+            CSR_MIREG | CSR_SIREG | CSR_VSIREG => return self.rmw_xireg(csrno, new, mask),
+            CSR_MIREG2..=CSR_MIREG6 | CSR_SIREG2..=CSR_SIREG6 | CSR_VSIREG2..=CSR_VSIREG6 => {
+                return self.rmw_xiregi(csrno, new, mask);
+            }
             _ => {}
         }
         let old = self.read(csrno)?;
@@ -487,7 +592,10 @@ impl Csrs<'_> {
 
     /// `riscv_csrrw_check()`: whether the CSR exists and the hart may access it.
     fn check(&self, csrno: u32, write: bool) -> Result<(), i32> {
-        if csrno > 0xfff {
+        // A CSR without an entry in csr_ops fails in predicate(), which gives the same
+        // exception as QEMU's earlier check for the entry.
+        let cfg = self.hw.cfg();
+        if csrno > 0xfff || !cfg.ext_zicsr || !cfg.priv_at_least(min_priv_ver(csrno)) {
             return Err(EXCP_ILLEGAL_INST);
         }
         let read_only = (csrno >> 10) & 3 == 3;
@@ -515,21 +623,34 @@ impl Csrs<'_> {
     /// The `predicate` of `csr_ops[csrno]`: whether the CSR exists and the current state
     /// allows the access, or the exception to raise. CSRs without an entry do not exist.
     fn predicate(&self, csrno: u32) -> Result<(), i32> {
+        let cfg = self.hw.cfg();
+        let smode = self.st.misa & RVS != 0;
+        let umode = self.st.misa & RVU != 0;
         let ok = match csrno {
-            CSR_FFLAGS | CSR_FRM | CSR_FCSR => self.fs(),
+            // fs(): with Zfinx and FS off the FP CSRs depend on sstateen0.FCSR.
+            CSR_FFLAGS | CSR_FRM | CSR_FCSR => {
+                if !self.fs_enabled() && cfg.ext_zfinx {
+                    return self.stateen_ok(0, SMSTATEEN0_FCSR);
+                }
+                self.fs_enabled()
+            }
             CSR_VSTART | CSR_VXSAT | CSR_VXRM | CSR_VCSR | CSR_VL | CSR_VTYPE | CSR_VLENB => {
                 self.vs()
             }
             CSR_CYCLE..=CSR_HPMCOUNTER31 => return self.ctr(csrno),
             CSR_MCYCLE | CSR_MINSTRET => true,
-            CSR_MHPMCOUNTER3..=CSR_MHPMCOUNTER31 => PMU_AVAIL_CTRS & (1 << ctr_index(csrno)) != 0,
+            // mctr().
+            CSR_MHPMCOUNTER3..=CSR_MHPMCOUNTER31 => {
+                u64::from(cfg.pmu_mask) & (1 << ctr_index(csrno)) != 0
+            }
             CSR_MVENDORID..=CSR_MCONFIGPTR => true,
-            CSR_MSTATUS | CSR_MISA | CSR_MEDELEG | CSR_MIDELEG | CSR_MIE | CSR_MTVEC
-            | CSR_MCOUNTEREN | CSR_MENVCFG | CSR_MCOUNTINHIBIT => true,
+            CSR_MSTATUS | CSR_MISA | CSR_MIE | CSR_MTVEC | CSR_MCOUNTINHIBIT => true,
+            CSR_MEDELEG | CSR_MIDELEG => smode,
+            CSR_MCOUNTEREN | CSR_MENVCFG => umode,
             CSR_MHPMEVENT3..=CSR_MHPMEVENT31 => true,
             CSR_MSCRATCH | CSR_MEPC | CSR_MCAUSE | CSR_MTVAL | CSR_MIP => true,
             CSR_SSTATUS | CSR_SIE | CSR_STVEC | CSR_SCOUNTEREN | CSR_SENVCFG | CSR_SSCRATCH
-            | CSR_SEPC | CSR_SCAUSE | CSR_STVAL | CSR_SIP => true,
+            | CSR_SEPC | CSR_SCAUSE | CSR_STVAL | CSR_SIP => smode,
             CSR_STIMECMP => return self.sstc(false),
             CSR_VSTIMECMP => return self.sstc(true),
             // satp(): S mode with mstatus.TVM set may not touch satp, nor VS mode with
@@ -542,7 +663,7 @@ impl Csrs<'_> {
                 if s && self.st.virt() && self.st.hstatus & HSTATUS_VTVM != 0 {
                     return Err(EXCP_VIRT_INSTRUCTION_FAULT);
                 }
-                true
+                smode
             }
             // hgatp(): HS mode with mstatus.TVM set may not touch hgatp.
             CSR_HGATP => {
@@ -556,19 +677,137 @@ impl Csrs<'_> {
             CSR_HSTATUS | CSR_HEDELEG | CSR_HIDELEG | CSR_HIE | CSR_HTIMEDELTA | CSR_HCOUNTEREN
             | CSR_HGEIE | CSR_HENVCFG | CSR_HTVAL | CSR_HIP | CSR_HVIP | CSR_HTINST | CSR_HGEIP
             | CSR_VSSTATUS | CSR_VSIE | CSR_VSTVEC | CSR_VSSCRATCH | CSR_VSEPC | CSR_VSCAUSE
-            | CSR_VSTVAL | CSR_VSIP | CSR_VSATP | CSR_MTVAL2 | CSR_MTINST => self.st.has_h(),
-            // pmp(): the odd pmpcfg registers do not exist on RV64.
-            CSR_PMPCFG0..=CSR_PMPCFG15 => (csrno - CSR_PMPCFG0) & 1 == 0,
-            CSR_PMPADDR0..=CSR_PMPADDR63 => true,
-            CSR_TSELECT | CSR_TDATA1 | CSR_TDATA2 | CSR_TDATA3 | CSR_TINFO | CSR_MCONTEXT => true,
+            | CSR_VSTVAL | CSR_VSIP | CSR_VSATP | CSR_MTINST => self.st.has_h(),
+            // dbltrp_hmode().
+            CSR_MTVAL2 => cfg.ext_ssdbltrp || self.st.has_h(),
+            // pmp(): the odd pmpcfg registers do not exist on RV64. Before 1.12 the
+            // registers past pmpcfg3 fail the version check instead.
+            CSR_PMPCFG0..=CSR_PMPCFG15 => {
+                let max =
+                    if cfg.priv_at_least(PrivVer::V1_12) { CSR_PMPCFG15 } else { CSR_PMPCFG3 };
+                cfg.pmp && (csrno > max || (csrno - CSR_PMPCFG0) & 1 == 0)
+            }
+            CSR_PMPADDR0..=CSR_PMPADDR63 => cfg.pmp,
+            // debug().
+            CSR_TSELECT | CSR_TDATA1 | CSR_TDATA2 | CSR_TDATA3 | CSR_TINFO | CSR_MCONTEXT => {
+                cfg.debug
+            }
+            CSR_SEED => return self.seed(),
+            // have_mseccfg().
+            CSR_MSECCFG => cfg.ext_smepmp || cfg.ext_zkr || cfg.ext_smmpm || cfg.ext_zicfilp,
+            // mstateen().
+            CSR_MSTATEEN0..=CSR_MSTATEEN3 => cfg.ext_smstateen,
+            CSR_MCYCLECFG | CSR_MINSTRETCFG => cfg.ext_smcntrpmf,
+            CSR_SCOUNTOVF => cfg.ext_sscofpmf,
+            // scountinhibit_pred().
+            CSR_SCOUNTINHIBIT => {
+                if !cfg.ext_ssccfg || !cfg.ext_smcdeleg || self.st.menvcfg & MENVCFG_CDE == 0 {
+                    return Err(EXCP_ILLEGAL_INST);
+                }
+                if self.st.virt() {
+                    return Err(EXCP_VIRT_INSTRUCTION_FAULT);
+                }
+                smode
+            }
+            // csrind_or_aia_any(), csrind_or_aia_smode() and csrind_or_aia_hmode().
+            CSR_MISELECT | CSR_MIREG => cfg.ext_smaia || cfg.ext_smcsrind,
+            CSR_SISELECT | CSR_SIREG => {
+                (cfg.ext_smcsrind || cfg.ext_sscsrind || cfg.ext_smaia || cfg.ext_ssaia) && smode
+            }
+            CSR_VSISELECT | CSR_VSIREG => {
+                (cfg.ext_smcsrind || cfg.ext_sscsrind || cfg.ext_smaia || cfg.ext_ssaia)
+                    && self.st.has_h()
+            }
+            // csrind_any(), csrind_smode() and csrind_hmode(): mireg2, mireg3 and mireg4 to
+            // mireg6 (0x354 is not a CSR), and the same for sireg and vsireg.
+            CSR_MIREG2..=CSR_MIREG6 => csrno != CSR_MIREG4 - 1 && cfg.ext_smcsrind,
+            CSR_SIREG2..=CSR_SIREG6 => {
+                csrno != CSR_SIREG4 - 1 && (cfg.ext_smcsrind || cfg.ext_sscsrind) && smode
+            }
+            CSR_VSIREG2..=CSR_VSIREG6 => {
+                csrno != CSR_VSIREG4 - 1
+                    && (cfg.ext_smcsrind || cfg.ext_sscsrind)
+                    && self.st.has_h()
+            }
+            // hstateen(): below M mode, mstateen.SE0 must be set too.
+            CSR_HSTATEEN0..=CSR_HSTATEEN3 => {
+                let i = (csrno - CSR_HSTATEEN0) as usize;
+                if !cfg.ext_smstateen || !self.st.has_h() {
+                    return Err(EXCP_ILLEGAL_INST);
+                }
+                self.st.priv_lvl == PRV_M || self.st.mstateen[i] & SMSTATEEN_STATEEN != 0
+            }
+            CSR_SSTATEEN0..=CSR_SSTATEEN3 => return self.sstateen(csrno),
             _ => false,
         };
         if ok { Ok(()) } else { Err(EXCP_ILLEGAL_INST) }
     }
 
-    /// `fs()`: the FP CSRs need `mstatus.FS` on, and in VS or VU mode the HS level FS
-    /// too (`riscv_cpu_fp_enabled()`).
-    fn fs(&self) -> bool {
+    /// `smstateen_acc_ok()`: whether bit `bit` of the `index`th `mstateen`, and in VS,
+    /// VU and U mode of `hstateen` and `sstateen`, lets the hart reach what it guards.
+    fn stateen_ok(&self, index: usize, bit: u64) -> Result<(), i32> {
+        let st = &self.st;
+        if st.priv_lvl == PRV_M || !self.hw.cfg().ext_smstateen {
+            return Ok(());
+        }
+        if st.mstateen[index] & bit == 0 {
+            return Err(EXCP_ILLEGAL_INST);
+        }
+        if st.virt() {
+            if st.hstateen[index] & bit == 0 {
+                return Err(EXCP_VIRT_INSTRUCTION_FAULT);
+            }
+            if st.priv_lvl == PRV_U && st.sstateen[index] & bit == 0 {
+                return Err(EXCP_VIRT_INSTRUCTION_FAULT);
+            }
+        }
+        if st.priv_lvl == PRV_U && st.misa & RVS != 0 && st.sstateen[index] & bit == 0 {
+            return Err(EXCP_ILLEGAL_INST);
+        }
+        Ok(())
+    }
+
+    /// `sstateen()`: S mode and Smstateen, and below M mode the SE0 bit of `mstateen` and
+    /// in VS mode of `hstateen`.
+    fn sstateen(&self, csrno: u32) -> Result<(), i32> {
+        let i = (csrno - CSR_SSTATEEN0) as usize;
+        if !self.hw.cfg().ext_smstateen || self.st.misa & RVS == 0 {
+            return Err(EXCP_ILLEGAL_INST);
+        }
+        if self.st.priv_lvl < PRV_M {
+            if self.st.mstateen[i] & SMSTATEEN_STATEEN == 0 {
+                return Err(EXCP_ILLEGAL_INST);
+            }
+            if self.st.virt() && self.st.hstateen[i] & SMSTATEEN_STATEEN == 0 {
+                return Err(EXCP_VIRT_INSTRUCTION_FAULT);
+            }
+        }
+        Ok(())
+    }
+
+    /// `seed()`: Zkr, and below M mode `mseccfg.SSEED` or `mseccfg.USEED`. VS and VU mode
+    /// never reach `seed`.
+    fn seed(&self) -> Result<(), i32> {
+        if !self.hw.cfg().ext_zkr {
+            return Err(EXCP_ILLEGAL_INST);
+        }
+        let st = &self.st;
+        let sseed = st.mseccfg & pmp::MSECCFG_SSEED != 0;
+        let useed = st.mseccfg & pmp::MSECCFG_USEED != 0;
+        if st.priv_lvl == PRV_M {
+            Ok(())
+        } else if st.virt() {
+            Err(if sseed { EXCP_VIRT_INSTRUCTION_FAULT } else { EXCP_ILLEGAL_INST })
+        } else if (st.priv_lvl == PRV_S && sseed) || (st.priv_lvl == PRV_U && useed) {
+            Ok(())
+        } else {
+            Err(EXCP_ILLEGAL_INST)
+        }
+    }
+
+    /// `riscv_cpu_fp_enabled()`: `mstatus.FS` is on, and in VS or VU mode the HS level FS
+    /// too. The FP CSRs need it, or Zfinx (`fs()`).
+    fn fs_enabled(&self) -> bool {
         let hs = !self.st.virt() || self.st.mstatus_hs & MSTATUS_FS != 0;
         self.st.mstatus & MSTATUS_FS != 0 && hs
     }
@@ -585,7 +824,12 @@ impl Csrs<'_> {
     fn ctr(&self, csrno: u32) -> Result<(), i32> {
         let bit = 1u64 << ctr_index(csrno);
         // cycle, time and instret come with Zicntr, the others with the PMU.
-        if csrno > CSR_INSTRET && PMU_AVAIL_CTRS & bit == 0 {
+        let present = if csrno <= CSR_INSTRET {
+            self.hw.cfg().ext_zicntr
+        } else {
+            u64::from(self.hw.cfg().pmu_mask) & bit != 0
+        };
+        if !present {
             return Err(EXCP_ILLEGAL_INST);
         }
         if self.st.priv_lvl < PRV_M && self.st.mcounteren & bit == 0 {
@@ -603,7 +847,8 @@ impl Csrs<'_> {
 
     /// `sstc()` for `stimecmp`, or for `vstimecmp` (which needs H) when `vs`.
     fn sstc(&self, vs: bool) -> Result<(), i32> {
-        if vs && !self.st.has_h() {
+        let mode = if vs { self.st.has_h() } else { self.st.misa & RVS != 0 };
+        if !self.hw.cfg().ext_sstc || !mode {
             return Err(EXCP_ILLEGAL_INST);
         }
         if self.hw.rdtime().is_none() {
@@ -644,8 +889,10 @@ impl Csrs<'_> {
             CSR_CYCLE..=CSR_HPMCOUNTER31 | CSR_MCYCLE..=CSR_MHPMCOUNTER31 => {
                 self.read_ctr(ctr_index(csrno))
             }
-            CSR_MVENDORID | CSR_MIMPID | CSR_MCONFIGPTR => 0,
-            CSR_MARCHID => MARCHID,
+            CSR_MVENDORID => u64::from(self.hw.cfg().mvendorid),
+            CSR_MARCHID => self.hw.cfg().marchid,
+            CSR_MIMPID => self.hw.cfg().mimpid,
+            CSR_MCONFIGPTR => 0,
             CSR_MHARTID => st.mhartid,
             CSR_MSTATUS => add_status_sd(st.mstatus),
             CSR_MISA => st.misa,
@@ -655,16 +902,32 @@ impl Csrs<'_> {
             CSR_MENVCFG => st.menvcfg,
             CSR_MCOUNTINHIBIT => st.mcountinhibit,
             CSR_MHPMEVENT3..=CSR_MHPMEVENT31 => st.mhpmevent[ctr_index(csrno)],
+            CSR_MCYCLECFG => st.mcyclecfg,
+            CSR_MINSTRETCFG => st.minstretcfg,
+            CSR_SCOUNTOVF => {
+                // Counter delegation keeps scountovf from VS mode.
+                let cfg = self.hw.cfg();
+                if cfg.ext_sscofpmf && cfg.ext_ssccfg && st.menvcfg & MENVCFG_CDE != 0 && st.virt()
+                {
+                    return Err(EXCP_VIRT_INSTRUCTION_FAULT);
+                }
+                pmu::scountovf(st)
+            }
+            // read_scountinhibit(): the bits delegated by mcounteren.
+            CSR_SCOUNTINHIBIT => st.mcountinhibit & st.mcounteren,
             CSR_MSCRATCH => st.mscratch,
-            CSR_MEPC => st.mepc & !1,
+            CSR_MEPC => st.mepc & self.hw.cfg().xepc_mask(),
             CSR_MCAUSE => st.mcause,
             CSR_MTVAL => st.mtval,
             CSR_SSTATUS => add_status_sd(st.mstatus & (SSTATUS_MASK | MSTATUS64_UXL)),
             CSR_STVEC => st.stvec,
             CSR_SCOUNTEREN => st.scounteren,
-            CSR_SENVCFG => st.senvcfg,
+            CSR_SENVCFG => {
+                self.stateen_ok(0, SMSTATEEN0_HSENVCFG)?;
+                st.senvcfg
+            }
             CSR_SSCRATCH => st.sscratch,
-            CSR_SEPC => st.sepc & !1,
+            CSR_SEPC => st.sepc & self.hw.cfg().xepc_mask(),
             CSR_SCAUSE => st.scause,
             CSR_STVAL => st.stval,
             CSR_STIMECMP if st.virt() => st.vstimecmp,
@@ -681,7 +944,10 @@ impl Csrs<'_> {
             }
             CSR_HCOUNTEREN => st.hcounteren,
             CSR_HGEIE => st.hgeie,
-            CSR_HENVCFG => st.henvcfg & (!HENVCFG_FOLLOWS_M | st.menvcfg),
+            CSR_HENVCFG => {
+                self.stateen_ok(0, SMSTATEEN0_HSENVCFG)?;
+                st.henvcfg & (!HENVCFG_FOLLOWS_M | st.menvcfg)
+            }
             CSR_HTVAL => st.htval,
             CSR_HTINST => st.htinst,
             CSR_HGATP => st.hgatp,
@@ -695,9 +961,13 @@ impl Csrs<'_> {
             CSR_VSTVAL => st.vstval,
             CSR_VSTIMECMP => st.vstimecmp,
             CSR_VSATP => st.vsatp,
-            CSR_PMPCFG0..=CSR_PMPCFG15 => pmp::pmpcfg_csr_read(st, (csrno - CSR_PMPCFG0) as usize),
+            CSR_PMPCFG0..=CSR_PMPCFG15 => {
+                let n = usize::from(self.hw.cfg().pmp_regions);
+                pmp::pmpcfg_csr_read(st, n, (csrno - CSR_PMPCFG0) as usize)
+            }
             CSR_PMPADDR0..=CSR_PMPADDR63 => {
-                pmp::pmpaddr_csr_read(st, (csrno - CSR_PMPADDR0) as usize) & PMPADDR_MASK
+                let n = usize::from(self.hw.cfg().pmp_regions);
+                pmp::pmpaddr_csr_read(st, n, (csrno - CSR_PMPADDR0) as usize) & PMPADDR_MASK
             }
             CSR_TSELECT => st.tselect,
             CSR_TDATA1 | CSR_TDATA2 | CSR_TDATA3 => {
@@ -706,6 +976,17 @@ impl Csrs<'_> {
             // tinfo_csr_read(): every trigger can be a type 2 or a type 6 trigger.
             CSR_TINFO => (1 << TRIGGER_TYPE_AD_MATCH) | (1 << TRIGGER_TYPE_AD_MATCH6),
             CSR_MCONTEXT => st.mcontext,
+            CSR_MSECCFG => st.mseccfg,
+            CSR_MSTATEEN0..=CSR_MSTATEEN3 => st.mstateen[(csrno - CSR_MSTATEEN0) as usize],
+            CSR_HSTATEEN0..=CSR_HSTATEEN3 => {
+                let i = (csrno - CSR_HSTATEEN0) as usize;
+                st.hstateen[i] & st.mstateen[i]
+            }
+            CSR_SSTATEEN0..=CSR_SSTATEEN3 => {
+                let i = (csrno - CSR_SSTATEEN0) as usize;
+                let h = if st.virt() { st.hstateen[i] } else { !0 };
+                st.sstateen[i] & st.mstateen[i] & h
+            }
             _ => return Err(EXCP_ILLEGAL_INST),
         })
     }
@@ -758,15 +1039,20 @@ impl Csrs<'_> {
                     self.st.mtvec = val;
                 }
             }
-            CSR_MCOUNTEREN => self.st.mcounteren = val & COUNTEREN_MASK,
+            CSR_MCOUNTEREN => self.st.mcounteren = val & self.counteren_mask(),
             CSR_MENVCFG => self.write_menvcfg(val),
             CSR_MCOUNTINHIBIT => self.write_mcountinhibit(val),
             CSR_MHPMEVENT3..=CSR_MHPMEVENT31 => {
-                let mask = if self.st.has_h() { !0 } else { !MHPMEVENT_VINH };
-                self.st.mhpmevent[ctr_index(csrno)] = val & mask;
+                let idx = ctr_index(csrno);
+                let v = val & pmu::inh_avail_mask(&self.st);
+                self.st.mhpmevent[idx] = v;
+                pmu::update_event_map(&mut self.st, self.hw.cfg(), v, idx);
             }
+            CSR_MCYCLECFG => self.st.mcyclecfg = val & pmu::inh_avail_mask(&self.st),
+            CSR_MINSTRETCFG => self.st.minstretcfg = val & pmu::inh_avail_mask(&self.st),
+            CSR_SCOUNTINHIBIT => self.write_mcountinhibit(val & self.st.mcounteren),
             CSR_MSCRATCH => self.st.mscratch = val,
-            CSR_MEPC => self.st.mepc = val & !1,
+            CSR_MEPC => self.st.mepc = val & self.hw.cfg().xepc_mask(),
             CSR_MCAUSE => self.st.mcause = val,
             CSR_MTVAL => self.st.mtval = val,
             CSR_SSTATUS => {
@@ -778,13 +1064,14 @@ impl Csrs<'_> {
                     self.st.stvec = val;
                 }
             }
-            CSR_SCOUNTEREN => self.st.scounteren = val & COUNTEREN_MASK,
+            CSR_SCOUNTEREN => self.st.scounteren = val & self.counteren_mask(),
             CSR_SENVCFG => {
-                let m = SENVCFG_WRITE_MASK;
+                self.stateen_ok(0, SMSTATEEN0_HSENVCFG)?;
+                let m = SENVCFG_WRITE_MASK | pmm_mask(self.hw.cfg().ext_ssnpm, val);
                 self.st.senvcfg = (self.st.senvcfg & !m) | (val & m);
             }
             CSR_SSCRATCH => self.st.sscratch = val,
-            CSR_SEPC => self.st.sepc = val & !1,
+            CSR_SEPC => self.st.sepc = val & self.hw.cfg().xepc_mask(),
             CSR_SCAUSE => self.st.scause = val,
             CSR_STVAL => self.st.stval = val,
             CSR_STIMECMP | CSR_VSTIMECMP if csrno == CSR_VSTIMECMP || self.st.virt() => {
@@ -795,12 +1082,21 @@ impl Csrs<'_> {
                 self.st.stimecmp = val;
                 self.hw.write_timecmp(&self.st, SstcTimer::S);
             }
-            CSR_SATP => self.st.satp = self.legalize_xatp(self.st.satp, val),
+            // write_satp(): without an MMU the write is ignored.
+            CSR_SATP => {
+                if self.hw.cfg().mmu {
+                    self.st.satp = self.legalize_xatp(self.st.satp, val);
+                }
+            }
             CSR_MTVAL2 => self.st.mtval2 = val,
             CSR_MTINST => self.st.mtinst = val,
             CSR_HSTATUS => {
-                // Neither Svukte nor Ssnpm is there.
-                let mask = !(HSTATUS_HUKTE | HSTATUS_HUPMM);
+                // Svukte is not there; HUPMM needs Ssnpm and keeps its value when the
+                // reserved 1 is written.
+                let mut mask = !HSTATUS_HUKTE;
+                if !self.hw.cfg().ext_ssnpm || get_field(val, HSTATUS_HUPMM) == PMM_FIELD_RESERVED {
+                    mask &= !HSTATUS_HUPMM;
+                }
                 self.st.hstatus = (self.st.hstatus & !mask) | (val & mask);
                 // QEMU logs "QEMU does not support mixed HSXLEN options." for a VSXL other
                 // than 2 and "QEMU does not support big endian guests." for VSBE set.
@@ -811,7 +1107,7 @@ impl Csrs<'_> {
                 self.st.htimedelta = val;
                 self.hw.write_timecmp(&self.st, SstcTimer::Vs);
             }
-            CSR_HCOUNTEREN => self.st.hcounteren = val & COUNTEREN_MASK,
+            CSR_HCOUNTEREN => self.st.hcounteren = val & self.counteren_mask(),
             CSR_HGEIE => {
                 // Only bits 1 to GEILEN exist, and GEILEN is 0; mip.SGEIP follows
                 // hgeie & hgeip, which is 0.
@@ -821,7 +1117,10 @@ impl Csrs<'_> {
                     0
                 });
             }
-            CSR_HENVCFG => self.write_henvcfg(val),
+            CSR_HENVCFG => {
+                self.stateen_ok(0, SMSTATEEN0_HSENVCFG)?;
+                self.write_henvcfg(val);
+            }
             CSR_HTVAL => self.st.htval = val,
             // htinst writes are ignored.
             CSR_HTINST => {}
@@ -846,11 +1145,14 @@ impl Csrs<'_> {
             CSR_VSATP => self.st.vsatp = self.legalize_xatp(self.st.vsatp, val),
             CSR_PMPCFG0..=CSR_PMPCFG15 => {
                 let i = (csrno - CSR_PMPCFG0) as usize;
-                self.flush |= pmp::pmpcfg_csr_write(&mut self.st, i, val);
+                let cfg = self.hw.cfg();
+                let n = usize::from(cfg.pmp_regions);
+                self.flush |= pmp::pmpcfg_csr_write(&mut self.st, n, cfg.ext_smpmpmt, i, val);
             }
             CSR_PMPADDR0..=CSR_PMPADDR63 => {
                 let i = (csrno - CSR_PMPADDR0) as usize;
-                self.flush |= pmp::pmpaddr_csr_write(&mut self.st, i, val);
+                let n = usize::from(self.hw.cfg().pmp_regions);
+                self.flush |= pmp::pmpaddr_csr_write(&mut self.st, n, i, val);
             }
             // tselect_csr_write(): a trigger that does not exist cannot be selected.
             CSR_TSELECT => {
@@ -862,21 +1164,94 @@ impl Csrs<'_> {
                 self.write_tdata((csrno - CSR_TDATA1) as usize, val)?;
             }
             CSR_MCONTEXT => self.st.mcontext = val & MCONTEXT64,
+            CSR_MSECCFG => {
+                let n = usize::from(self.hw.cfg().pmp_regions);
+                let (smepmp, smmpm) = (self.hw.cfg().ext_smepmp, self.hw.cfg().ext_smmpm);
+                self.flush |= pmp::mseccfg_csr_write(&mut self.st, n, smepmp, smmpm, val);
+            }
+            CSR_MSTATEEN0..=CSR_MSTATEEN3 => {
+                let i = (csrno - CSR_MSTATEEN0) as usize;
+                let m = if i == 0 { self.mstateen0_mask() } else { SMSTATEEN_STATEEN };
+                self.st.mstateen[i] = (self.st.mstateen[i] & !m) | (val & m);
+            }
+            CSR_HSTATEEN0..=CSR_HSTATEEN3 => {
+                let i = (csrno - CSR_HSTATEEN0) as usize;
+                let m = if i == 0 { self.hstateen0_mask() } else { SMSTATEEN_STATEEN };
+                let m = m & self.st.mstateen[i];
+                self.st.hstateen[i] = (self.st.hstateen[i] & !m) | (val & m);
+            }
+            CSR_SSTATEEN0..=CSR_SSTATEEN3 => {
+                let i = (csrno - CSR_SSTATEEN0) as usize;
+                let mut m = if i == 0 {
+                    if self.st.misa & RVF == 0 { SMSTATEEN0_FCSR } else { 0 }
+                } else {
+                    SMSTATEEN_STATEEN
+                };
+                m &= self.st.mstateen[i];
+                if self.st.virt() {
+                    m &= self.st.hstateen[i];
+                }
+                self.st.sstateen[i] = (self.st.sstateen[i] & !m) | (val & m);
+            }
             // The read only CSRs, and tinfo whose writes are ignored.
             _ => {}
         }
         Ok(())
     }
 
+    /// The writable bits of `mstateen0`, `write_mstateen0()`.
+    fn mstateen0_mask(&self) -> u64 {
+        let cfg = self.hw.cfg();
+        let mut m = SMSTATEEN_STATEEN | SMSTATEEN0_HSENVCFG;
+        if self.st.misa & RVF == 0 {
+            m |= SMSTATEEN0_FCSR;
+        }
+        if cfg.priv_at_least(PrivVer::V1_13) {
+            m |= SMSTATEEN0_P1P13;
+        }
+        if cfg.ext_smaia || cfg.ext_smcsrind {
+            m |= SMSTATEEN0_SVSLCT;
+        }
+        if cfg.ext_smaia {
+            m |= SMSTATEEN0_AIA | SMSTATEEN0_IMSIC;
+        }
+        if cfg.ext_ssctr {
+            m |= SMSTATEEN0_CTR;
+        }
+        m
+    }
+
+    /// The bits of `hstateen0` that `mstateen0` lets through, `write_hstateen0()`.
+    fn hstateen0_mask(&self) -> u64 {
+        let cfg = self.hw.cfg();
+        let mut m = SMSTATEEN_STATEEN | SMSTATEEN0_HSENVCFG;
+        if self.st.misa & RVF == 0 {
+            m |= SMSTATEEN0_FCSR;
+        }
+        if cfg.ext_ssaia || cfg.ext_sscsrind {
+            m |= SMSTATEEN0_SVSLCT;
+        }
+        if cfg.ext_ssaia {
+            m |= SMSTATEEN0_AIA | SMSTATEEN0_IMSIC;
+        }
+        if cfg.ext_ssctr {
+            m |= SMSTATEEN0_CTR;
+        }
+        m
+    }
+
     /// `write_mstatus()`.
     fn write_mstatus(&mut self, val: u64) {
         let mstatus = self.st.mstatus;
-        let val = legalize_mpp(get_field(mstatus, MSTATUS_MPP), val);
+        let val = legalize_mpp(self.st.misa, get_field(mstatus, MSTATUS_MPP), val);
         // MXR changes what a page permits; MPRV and SUM select another MMU index.
         if (val ^ mstatus) & MSTATUS_MXR != 0 {
             self.flush = true;
         }
         let mut mask = MSTATUS_WRITE_MASK;
+        if self.st.misa & RVF != 0 {
+            mask |= MSTATUS_FS;
+        }
         if self.hw.cfg().ext_zve32x {
             mask |= MSTATUS_VS;
         }
@@ -886,7 +1261,7 @@ impl Csrs<'_> {
     /// `legalize_xatp()` for `satp`, `vsatp` and `hgatp`: the new value, flushing the
     /// TLB, or the old one if the mode is not supported or nothing changed.
     fn legalize_xatp(&mut self, old: u64, val: u64) -> u64 {
-        match legalize_satp(old, val) {
+        match legalize_satp(self.hw.cfg(), old, val) {
             Some(v) => {
                 self.flush = true;
                 v
@@ -895,11 +1270,30 @@ impl Csrs<'_> {
         }
     }
 
+    /// The counters `mcounteren`, `scounteren` and `hcounteren` can enable.
+    fn counteren_mask(&self) -> u64 {
+        u64::from(self.hw.cfg().pmu_mask) | COUNTEREN_CY | COUNTEREN_TM | COUNTEREN_IR
+    }
+
     /// `write_menvcfg()`, with `riscv_timer_stce_changed()` when STCE flips, then
     /// `write_henvcfg()` to drop the `henvcfg` bits that follow `menvcfg`.
     fn write_menvcfg(&mut self, val: u64) {
-        let m = MENVCFG_WRITE_MASK;
-        let stce_changed = (self.st.menvcfg ^ val) & MENVCFG_STCE != 0;
+        let cfg = self.hw.cfg();
+        let mut m = SENVCFG_WRITE_MASK;
+        if cfg.ext_svpbmt {
+            m |= MENVCFG_PBMTE;
+        }
+        if cfg.ext_sstc {
+            m |= MENVCFG_STCE;
+        }
+        if cfg.ext_svadu {
+            m |= MENVCFG_ADUE;
+        }
+        if cfg.ext_smcdeleg {
+            m |= MENVCFG_CDE;
+        }
+        m |= pmm_mask(cfg.ext_smnpm, val);
+        let stce_changed = cfg.ext_sstc && (self.st.menvcfg ^ val) & MENVCFG_STCE != 0;
         self.st.menvcfg = (self.st.menvcfg & !m) | (val & m);
         if stce_changed {
             self.hw.stce_changed(&self.st, true, val & MENVCFG_STCE != 0);
@@ -908,10 +1302,12 @@ impl Csrs<'_> {
     }
 
     /// `write_henvcfg()`: PBMTE, STCE, ADUE and DTE can only be set when `menvcfg` has
-    /// them.
+    /// them. PMM needs Ssnpm, and the reserved value 1 clears it, as in QEMU.
     fn write_henvcfg(&mut self, val: u64) {
-        let mask = SENVCFG_WRITE_MASK | (self.st.menvcfg & HENVCFG_FOLLOWS_M);
-        let stce_changed = (self.st.henvcfg ^ val) & MENVCFG_STCE != 0;
+        let mask = SENVCFG_WRITE_MASK
+            | (self.st.menvcfg & HENVCFG_FOLLOWS_M)
+            | pmm_mask(self.hw.cfg().ext_ssnpm, val);
+        let stce_changed = self.hw.cfg().ext_sstc && (self.st.henvcfg ^ val) & MENVCFG_STCE != 0;
         self.st.henvcfg = val & mask;
         if self.st.henvcfg & MENVCFG_DTE == 0 {
             self.st.vsstatus &= !SSTATUS_SDT;
@@ -921,50 +1317,168 @@ impl Csrs<'_> {
         }
     }
 
-    /// Whether counter `idx` follows the clock: `riscv_pmu_ctr_monitor_cycles()` and
-    /// `riscv_pmu_ctr_monitor_instructions()`, true only for `mcycle` and `minstret`.
-    fn ctr_counts(idx: usize) -> bool {
-        idx == 0 || idx == 2
-    }
-
     /// `riscv_pmu_read_ctr()`.
     fn read_ctr(&self, idx: usize) -> u64 {
-        let val = self.st.mhpmcounter_val[idx];
-        if self.st.mcountinhibit & (1 << idx) != 0 || !Self::ctr_counts(idx) {
-            return val;
-        }
-        self.hw.host_ticks().wrapping_sub(self.st.mhpmcounter_prev[idx]).wrapping_add(val)
+        pmu::read_ctr(&self.st, self.hw.host_ticks(), idx)
     }
 
     /// `riscv_pmu_write_ctr()`.
     fn write_ctr(&mut self, idx: usize, val: u64) {
-        self.st.mhpmcounter_val[idx] = val;
-        self.st.mhpmcounter_prev[idx] =
-            if self.st.mcountinhibit & (1 << idx) == 0 && Self::ctr_counts(idx) {
-                self.hw.host_ticks()
-            } else {
-                val
-            };
+        let hw = self.hw;
+        pmu::write_ctr(&mut self.st, hw.cfg(), hw.host_ticks(), idx, val, &mut |d| hw.pmu_timer(d));
     }
 
-    /// `write_mcountinhibit()`: stopping a counter folds the time it ran into its value;
-    /// starting it again restarts the count from now.
+    /// `write_mcountinhibit()`.
     fn write_mcountinhibit(&mut self, val: u64) {
-        let present = PMU_AVAIL_CTRS | COUNTEREN_CY | COUNTEREN_IR;
-        let updated = (self.st.mcountinhibit ^ val) & present;
-        self.st.mcountinhibit = val & present;
-        for idx in [0, 2] {
-            if updated & (1 << idx) == 0 {
-                continue;
+        let hw = self.hw;
+        pmu::write_mcountinhibit(&mut self.st, hw.cfg(), hw.host_ticks(), val, &mut |d| {
+            hw.pmu_timer(d)
+        });
+    }
+
+    /// `csrind_xlate_vs_csrno()`: in VS mode `siselect` and `sireg` to `sireg6` reach the
+    /// VS registers.
+    fn csrind_xlate_vs(&self, csrno: u32) -> u32 {
+        if !self.st.virt() {
+            return csrno;
+        }
+        match csrno {
+            CSR_SISELECT => CSR_VSISELECT,
+            CSR_SIREG..=CSR_SIREG6 => CSR_VSIREG + (csrno - CSR_SIREG),
+            _ => csrno,
+        }
+    }
+
+    /// `rmw_xiselect()`.
+    fn rmw_xiselect(&mut self, csrno: u32, new: u64, mask: u64) -> Result<u64, i32> {
+        self.stateen_ok(0, SMSTATEEN0_SVSLCT)?;
+        let cfg = self.hw.cfg();
+        let held = if cfg.ext_smcsrind || cfg.ext_sscsrind {
+            ISELECT_MASK_SXCSRIND
+        } else {
+            ISELECT_MASK_AIA
+        };
+        let iselect = match self.csrind_xlate_vs(csrno) {
+            CSR_MISELECT => &mut self.st.miselect,
+            CSR_SISELECT => &mut self.st.siselect,
+            CSR_VSISELECT => &mut self.st.vsiselect,
+            _ => return Err(EXCP_ILLEGAL_INST),
+        };
+        let old = *iselect;
+        let mask = mask & held;
+        *iselect = (old & !mask) | (new & mask);
+        Ok(old)
+    }
+
+    /// `rmw_xireg()`: `mireg`, `sireg` and `vsireg`.
+    fn rmw_xireg(&mut self, csrno: u32, new: u64, mask: u64) -> Result<u64, i32> {
+        self.stateen_ok(0, SMSTATEEN0_SVSLCT)?;
+        let csrno = self.csrind_xlate_vs(csrno);
+        let isel = match csrno {
+            CSR_MIREG => self.st.miselect,
+            CSR_SIREG => self.st.siselect,
+            CSR_VSIREG => self.st.vsiselect,
+            _ => return Err(EXCP_ILLEGAL_INST),
+        };
+        let aia = (ISELECT_IPRIO0..=ISELECT_IPRIO15).contains(&isel)
+            || (ISELECT_IMSIC_FIRST..=ISELECT_IMSIC_LAST).contains(&isel);
+        let cfg = self.hw.cfg();
+        if aia {
+            // rmw_xireg_aia() without Smaia and Ssaia.
+            return Err(EXCP_ILLEGAL_INST);
+        }
+        if cfg.ext_smcsrind || cfg.ext_sscsrind {
+            return self.rmw_xireg_csrind(csrno, isel, new, mask);
+        }
+        Err(EXCP_ILLEGAL_INST)
+    }
+
+    /// `rmw_xiregi()`: the aliases `mireg2` to `mireg6` and the like.
+    fn rmw_xiregi(&mut self, csrno: u32, new: u64, mask: u64) -> Result<u64, i32> {
+        self.stateen_ok(0, SMSTATEEN0_SVSLCT)?;
+        let csrno = self.csrind_xlate_vs(csrno);
+        let isel = match csrno {
+            CSR_MIREG..=CSR_MIREG6 => self.st.miselect,
+            CSR_SIREG..=CSR_SIREG6 => self.st.siselect,
+            CSR_VSIREG..=CSR_VSIREG6 => self.st.vsiselect,
+            _ => return Err(EXCP_ILLEGAL_INST),
+        };
+        self.rmw_xireg_csrind(csrno, isel, new, mask)
+    }
+
+    /// `rmw_xireg_csrind()`: the counters of Smcdeleg are the only registers behind the
+    /// indirect CSRs (Smctr's are not in the model).
+    fn rmw_xireg_csrind(&mut self, csrno: u32, isel: u64, new: u64, mask: u64) -> Result<u64, i32> {
+        if !(ISELECT_CD_FIRST..=ISELECT_CD_LAST).contains(&isel) {
+            return Err(EXCP_ILLEGAL_INST);
+        }
+        // Only vsireg itself, not its aliases, gives the virtual instruction exception.
+        self.rmw_xireg_cd(csrno, isel, new, mask).ok_or(if self.st.virt() && csrno == CSR_VSIREG {
+            EXCP_VIRT_INSTRUCTION_FAULT
+        } else {
+            EXCP_ILLEGAL_INST
+        })
+    }
+
+    /// `rmw_xireg_cd()`: Smcdeleg's view of counter `isel - 0x40` through `sireg` (the
+    /// counter) and `sireg2` (its event or configuration), or `None` for an exception. The
+    /// translated CSR number of VS mode never matches, as in QEMU.
+    fn rmw_xireg_cd(&mut self, csrno: u32, isel: u64, new: u64, mask: u64) -> Option<u64> {
+        let cfg = self.hw.cfg();
+        let idx = (isel - ISELECT_CD_FIRST) as usize;
+        if !cfg.ext_smcdeleg || !cfg.ext_ssccfg || idx == 1 {
+            return None;
+        }
+        // sireg4 and sireg5 hold the upper halves on RV32 only.
+        if csrno == CSR_SIREG4 || csrno == CSR_SIREG5 {
+            return None;
+        }
+        if !cfg.ext_smcntrpmf && csrno == CSR_SIREG2 && idx < 3 {
+            return None;
+        }
+        if self.st.mcounteren & (1 << idx) == 0 || self.st.menvcfg & MENVCFG_CDE == 0 {
+            return None;
+        }
+        // The counter and event views take whole register writes only.
+        let whole = mask == 0 || mask == u64::MAX;
+        match csrno {
+            CSR_SIREG if whole => {
+                // rmw_cd_mhpmcounter().
+                if mask == 0 {
+                    return Some(self.read_ctr(idx));
+                }
+                self.write_ctr(idx, new);
+                Some(0)
             }
-            let now = self.hw.host_ticks();
-            if self.st.mcountinhibit & (1 << idx) == 0 {
-                self.st.mhpmcounter_prev[idx] = now;
-            } else {
-                let prev = self.st.mhpmcounter_prev[idx];
-                let v = self.st.mhpmcounter_val[idx];
-                self.st.mhpmcounter_val[idx] = now.wrapping_sub(prev).wrapping_add(v);
+            CSR_SIREG2 if idx <= 2 => Some(self.rmw_cd_ctr_cfg(idx, new, mask)),
+            CSR_SIREG2 if whole => {
+                // rmw_cd_mhpmevent(): S mode cannot see or set MINH.
+                let ev = self.st.mhpmevent[idx];
+                if mask == 0 {
+                    let minh = if cfg.ext_sscofpmf { pmu::MHPMEVENT_MINH } else { 0 };
+                    return Some(ev & !minh);
+                }
+                let m = mask & !pmu::MHPMEVENT_MINH;
+                let v = (new & m) | (ev & !m);
+                self.st.mhpmevent[idx] = v;
+                pmu::update_event_map(&mut self.st, cfg, v, idx);
+                Some(0)
             }
+            _ => None,
+        }
+    }
+
+    /// `rmw_cd_ctr_cfg()`: `mcyclecfg` (counter 0) or `minstretcfg` (counter 2) without
+    /// MINH. Like QEMU, a read clears MINH in the register itself.
+    fn rmw_cd_ctr_cfg(&mut self, idx: usize, new: u64, mask: u64) -> u64 {
+        let reg = if idx == 0 { &mut self.st.mcyclecfg } else { &mut self.st.minstretcfg };
+        if mask != 0 {
+            let m = mask & !pmu::MHPMEVENT_MINH;
+            *reg = (new & m) | (*reg & !m);
+            0
+        } else {
+            *reg &= !pmu::MHPMEVENT_MINH;
+            *reg
         }
     }
 
@@ -1140,7 +1654,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
-    use crate::cpu::{MIP_MEIP, MIP_MSIP, MIP_MTIP, MSTATUS_UBE, MSTATUS64_SD};
+    use crate::cpu::{MIP_MEIP, MIP_MSIP, MIP_MTIP, MSTATUS_UBE, MSTATUS64_SD, VM_SV39, VM_SV48};
 
     #[derive(Default)]
     struct FakeHw {
@@ -1151,6 +1665,8 @@ mod tests {
         timecmp: RefCell<Vec<(SstcTimer, u64)>>,
         /// The `is_m` and `enable` of each `stce_changed()`.
         stce: RefCell<Vec<(bool, bool)>>,
+        /// The delay of each `pmu_timer()`.
+        pmu_timer: RefCell<Vec<u64>>,
         cfg: RiscvCfg,
     }
 
@@ -1176,8 +1692,12 @@ mod tests {
             self.stce.borrow_mut().push((is_m, enable));
         }
 
-        fn cfg(&self) -> RiscvCfg {
-            self.cfg
+        fn pmu_timer(&self, delay_ns: u64) {
+            self.pmu_timer.borrow_mut().push(delay_ns);
+        }
+
+        fn cfg(&self) -> &RiscvCfg {
+            &self.cfg
         }
     }
 
@@ -1202,9 +1722,11 @@ mod tests {
         let old = r(&mut c, CSR_MSTATUS).unwrap();
         assert_eq!(old, (2 << 34) | (2 << 32));
         w(&mut c, CSR_MSTATUS, u64::MAX).unwrap();
-        // UXL and SXL stay at 2; VS, XS, UBE and SD are not writable; FS dirty sets SD.
+        // UXL and SXL stay at 2; FS is writable with F, VS only with V; XS, UBE and SD are
+        // not writable; FS dirty sets SD.
         let v = r(&mut c, CSR_MSTATUS).unwrap();
-        assert_eq!(v, MSTATUS_WRITE_MASK | (2 << 34) | (2 << 32) | MSTATUS64_SD);
+        let want = MSTATUS_WRITE_MASK | MSTATUS_FS | (2 << 34) | (2 << 32) | MSTATUS64_SD;
+        assert_eq!(v, want);
         assert_eq!(v & MSTATUS_UBE, 0);
         assert!(c.flush, "MXR changed");
     }
@@ -1351,7 +1873,7 @@ mod tests {
         assert_eq!(c.st.mhpmevent[3], u64::MAX, "VSINH and VUINH exist with H");
         c.st.misa &= !crate::cpu::RVH;
         w(&mut c, CSR_MHPMEVENT3, u64::MAX).unwrap();
-        assert_eq!(c.st.mhpmevent[3], !MHPMEVENT_VINH);
+        assert_eq!(c.st.mhpmevent[3], !(pmu::MHPMEVENT_VSINH | pmu::MHPMEVENT_VUINH));
         w(&mut c, CSR_MCONTEXT, u64::MAX).unwrap();
         assert_eq!(c.st.mcontext, 0x1fff);
     }
@@ -1383,7 +1905,7 @@ mod tests {
         assert_eq!(c.rw(CSR_MHARTID, true, 0, 0), ILL);
         assert_eq!(r(&mut c, CSR_MARCHID), Ok(42));
         // Unknown and absent CSRs.
-        assert_eq!(r(&mut c, 0x747), ILL, "mseccfg needs Smepmp");
+        assert_eq!(r(&mut c, 0x747), ILL, "mseccfg needs Smepmp, Zkr, Smmpm or Zicfilp");
         assert_eq!(r(&mut c, 0x3a1), ILL, "odd pmpcfg on RV64");
         assert_eq!(r(&mut c, 0xb01), ILL);
         assert_eq!(r(&mut c, 0xb13), ILL, "mhpmcounter19 is not implemented");
@@ -1402,6 +1924,71 @@ mod tests {
         c.st.priv_lvl = PRV_U;
         assert_eq!(r(&mut c, CSR_SSCRATCH), ILL);
         assert_eq!(r(&mut c, CSR_FFLAGS), Ok(0x1f));
+    }
+
+    #[test]
+    fn seed_and_mseccfg() {
+        let hw = FakeHw { cfg: RiscvCfg::max(), ..FakeHw::default() };
+        let mut c = csrs(&hw);
+        // M mode reads 16 bits of entropy with the ES16 status.
+        let v = c.rw(CSR_SEED, true, 0, 0).unwrap();
+        assert_eq!(v & !0xffff, SEED_OPST_ES16);
+        // Below M mode seed needs mseccfg.SSEED or USEED; VS mode never reaches it.
+        c.st.priv_lvl = PRV_S;
+        assert_eq!(c.rw(CSR_SEED, true, 0, 0), ILL);
+        c.st.mseccfg = pmp::MSECCFG_SSEED;
+        assert!(c.rw(CSR_SEED, true, 0, 0).is_ok());
+        c.st.virt_enabled = 1;
+        assert_eq!(c.rw(CSR_SEED, true, 0, 0), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        c.st.virt_enabled = 0;
+        c.st.priv_lvl = PRV_U;
+        assert_eq!(c.rw(CSR_SEED, true, 0, 0), ILL);
+        c.st.mseccfg = pmp::MSECCFG_USEED;
+        assert!(c.rw(CSR_SEED, true, 0, 0).is_ok());
+        // mseccfg: with Smepmp, MML and MMWP are sticky and flush the TLB.
+        c.st.priv_lvl = PRV_M;
+        w(&mut c, CSR_MSECCFG, pmp::MSECCFG_MML).unwrap();
+        assert!(c.flush);
+        w(&mut c, CSR_MSECCFG, 0).unwrap();
+        assert_eq!(r(&mut c, CSR_MSECCFG), Ok(pmp::MSECCFG_MML));
+    }
+
+    #[test]
+    fn smstateen() {
+        let hw = FakeHw { cfg: RiscvCfg::max(), ..FakeHw::default() };
+        let mut c = csrs(&hw);
+        // The defaults have F, so FCSR is not writable.
+        w(&mut c, CSR_MSTATEEN0, u64::MAX).unwrap();
+        let m = c.st.mstateen[0];
+        assert_eq!(
+            m & (SMSTATEEN_STATEEN | SMSTATEEN0_HSENVCFG),
+            SMSTATEEN_STATEEN | SMSTATEEN0_HSENVCFG
+        );
+        assert_eq!(m & SMSTATEEN0_FCSR, 0);
+        w(&mut c, CSR_MSTATEEN0 + 1, u64::MAX).unwrap();
+        assert_eq!(c.st.mstateen[1], SMSTATEEN_STATEEN);
+        // hstateen only gets the bits mstateen has.
+        w(&mut c, CSR_MSTATEEN0, SMSTATEEN0_HSENVCFG).unwrap();
+        w(&mut c, CSR_HSTATEEN0, u64::MAX).unwrap();
+        assert_eq!(r(&mut c, CSR_HSTATEEN0), Ok(SMSTATEEN0_HSENVCFG));
+        // Below M mode, senvcfg follows mstateen0.ENVCFG and in VS mode hstateen0.ENVCFG.
+        c.st.priv_lvl = PRV_S;
+        assert_eq!(r(&mut c, CSR_SENVCFG), Ok(0));
+        assert_eq!(r(&mut c, CSR_HSTATEEN0), ILL, "mstateen0.SE0 is clear");
+        assert_eq!(r(&mut c, CSR_SSTATEEN0), ILL, "mstateen0.SE0 is clear");
+        c.st.virt_enabled = 1;
+        c.st.hstateen[0] = 0;
+        assert_eq!(r(&mut c, CSR_SENVCFG), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        c.st.virt_enabled = 0;
+        c.st.mstateen[0] = 0;
+        assert_eq!(r(&mut c, CSR_SENVCFG), ILL);
+        assert_eq!(w(&mut c, CSR_HENVCFG, 0), ILL);
+        // Without Smstateen the registers do not exist.
+        let hw = FakeHw::default();
+        let mut c = csrs(&hw);
+        for csrno in [CSR_MSTATEEN0, CSR_HSTATEEN0, CSR_SSTATEEN0] {
+            assert_eq!(r(&mut c, csrno), ILL, "{csrno:#x}");
+        }
     }
 
     #[test]
@@ -1435,7 +2022,7 @@ mod tests {
         assert_eq!(r(&mut c, CSR_MCYCLE), Ok(35));
         // Inhibiting folds the elapsed count into the value.
         w(&mut c, CSR_MCOUNTINHIBIT, u64::MAX).unwrap();
-        assert_eq!(c.st.mcountinhibit, PMU_AVAIL_CTRS | COUNTEREN_CY | COUNTEREN_IR);
+        assert_eq!(c.st.mcountinhibit, 0x7fff8 | COUNTEREN_CY | COUNTEREN_IR);
         hw.ticks.set(1000);
         assert_eq!(r(&mut c, CSR_MCYCLE), Ok(35));
         w(&mut c, CSR_MCOUNTINHIBIT, 0).unwrap();
@@ -1446,6 +2033,124 @@ mod tests {
         hw.ticks.set(5000);
         assert_eq!(r(&mut c, CSR_MHPMCOUNTER3), Ok(77));
         assert_eq!(r(&mut c, 0xc03), Ok(77));
+        // An hpm counter given the cycle event counts ticks.
+        w(&mut c, CSR_MHPMEVENT3 + 1, pmu::EVENT_HW_CPU_CYCLES).unwrap();
+        w(&mut c, CSR_MHPMCOUNTER3 + 1, 10).unwrap();
+        hw.ticks.set(5007);
+        assert_eq!(r(&mut c, CSR_MHPMCOUNTER3 + 1), Ok(17));
+        assert!(hw.pmu_timer.borrow().is_empty(), "no overflow timer without Sscofpmf");
+        assert_eq!(r(&mut c, CSR_SCOUNTOVF), ILL);
+        assert_eq!(r(&mut c, CSR_MCYCLECFG), ILL);
+    }
+
+    #[test]
+    fn sscofpmf_and_smcntrpmf() {
+        let hw = FakeHw { cfg: RiscvCfg::max(), ..FakeHw::default() };
+        let mut c = csrs(&hw);
+        w(&mut c, CSR_MHPMEVENT3, pmu::EVENT_HW_CPU_CYCLES).unwrap();
+        hw.ticks.set(100);
+        w(&mut c, CSR_MHPMCOUNTER3, u64::MAX - 49).unwrap();
+        assert_eq!(*hw.pmu_timer.borrow(), [50]);
+        // Inhibiting and starting it again arms the timer for the rest.
+        w(&mut c, CSR_MCOUNTINHIBIT, 1 << 3).unwrap();
+        hw.ticks.set(120);
+        w(&mut c, CSR_MCOUNTINHIBIT, 0).unwrap();
+        assert_eq!(*hw.pmu_timer.borrow(), [50, 50]);
+        c.st.mhpmevent[3] |= pmu::MHPMEVENT_OF;
+        c.st.mhpmevent[5] |= pmu::MHPMEVENT_OF;
+        assert_eq!(r(&mut c, CSR_SCOUNTOVF), Ok((1 << 3) | (1 << 5)));
+        c.st.priv_lvl = PRV_S;
+        c.st.mcounteren = 1 << 5;
+        assert_eq!(r(&mut c, CSR_SCOUNTOVF), Ok(1 << 5));
+        c.st.priv_lvl = PRV_M;
+        // mcyclecfg keeps the inhibit bits of the modes the hart has.
+        w(&mut c, CSR_MCYCLECFG, u64::MAX).unwrap();
+        assert_eq!(r(&mut c, CSR_MCYCLECFG), Ok(u64::MAX));
+        c.st.misa &= !crate::cpu::RVH;
+        w(&mut c, CSR_MINSTRETCFG, u64::MAX).unwrap();
+        assert_eq!(c.st.minstretcfg, !(pmu::MHPMEVENT_VSINH | pmu::MHPMEVENT_VUINH));
+        // With M mode inhibited mcycle only counts the ticks below M mode.
+        c.st.misa |= crate::cpu::RVH;
+        w(&mut c, CSR_MCYCLECFG, pmu::MHPMEVENT_MINH).unwrap();
+        w(&mut c, CSR_MCYCLE, 0).unwrap();
+        hw.ticks.set(500);
+        assert_eq!(r(&mut c, CSR_MCYCLE), Ok(0));
+        pmu::update_fixed_ctrs(&mut c.st, 500, PRV_S, false);
+        c.st.priv_lvl = PRV_S;
+        hw.ticks.set(530);
+        pmu::update_fixed_ctrs(&mut c.st, 530, PRV_M, false);
+        c.st.priv_lvl = PRV_M;
+        hw.ticks.set(900);
+        assert_eq!(r(&mut c, CSR_MCYCLE), Ok(30));
+    }
+
+    #[test]
+    fn indirect_csrs_and_counter_delegation() {
+        let hw = FakeHw { cfg: RiscvCfg::max(), ..FakeHw::default() };
+        let mut c = csrs(&hw);
+        // With Smcsrind the select registers hold 12 bits; 0x354 is not an alias.
+        assert_eq!(w(&mut c, CSR_MISELECT, u64::MAX), Ok(0));
+        assert_eq!(r(&mut c, CSR_MISELECT), Ok(0xfff));
+        assert_eq!(r(&mut c, CSR_MIREG4 - 1), ILL);
+        // Unimplemented and AIA ranges raise illegal instruction exceptions.
+        assert_eq!(r(&mut c, CSR_MIREG), ILL);
+        w(&mut c, CSR_SISELECT, ISELECT_IPRIO0).unwrap();
+        assert_eq!(r(&mut c, CSR_SIREG), ILL);
+        // The counters need menvcfg.CDE and their mcounteren bit.
+        w(&mut c, CSR_SISELECT, ISELECT_CD_FIRST + 3).unwrap();
+        assert_eq!(r(&mut c, CSR_SIREG), ILL);
+        assert_eq!(r(&mut c, CSR_SCOUNTINHIBIT), ILL);
+        w(&mut c, CSR_MENVCFG, MENVCFG_CDE).unwrap();
+        assert_eq!(r(&mut c, CSR_MENVCFG), Ok(MENVCFG_CDE));
+        assert_eq!(r(&mut c, CSR_SIREG), ILL);
+        w(&mut c, CSR_MCOUNTEREN, u64::MAX).unwrap();
+        w(&mut c, CSR_MCOUNTINHIBIT, u64::MAX).unwrap();
+        c.st.priv_lvl = PRV_S;
+        // Below M mode mstateen0.SVSLCT guards the indirect registers.
+        assert_eq!(r(&mut c, CSR_SIREG), ILL);
+        c.st.mstateen[0] = u64::MAX;
+        c.st.hstateen[0] = u64::MAX;
+        assert_eq!(w(&mut c, CSR_SIREG, 77), Ok(0));
+        assert_eq!(r(&mut c, CSR_SIREG), Ok(77));
+        assert_eq!(c.st.mhpmcounter_val[3], 77);
+        // Only whole register writes reach the counter.
+        assert_eq!(c.rw(CSR_SIREG, true, u64::MAX, 0xff), ILL);
+        // sireg2 is the event, without MINH; sireg3 to sireg6 are not.
+        assert_eq!(w(&mut c, CSR_SIREG2, u64::MAX), Ok(0));
+        assert_eq!(c.st.mhpmevent[3], !pmu::MHPMEVENT_MINH);
+        c.st.mhpmevent[3] |= pmu::MHPMEVENT_MINH;
+        assert_eq!(r(&mut c, CSR_SIREG2), Ok(!pmu::MHPMEVENT_MINH));
+        for csrno in [CSR_SIREG2 + 1, CSR_SIREG4, CSR_SIREG5, CSR_SIREG6] {
+            assert_eq!(r(&mut c, csrno), ILL, "{csrno:#x}");
+        }
+        // For mcycle sireg2 is mcyclecfg, whose MINH a read clears; time has nothing.
+        c.st.mcyclecfg = u64::MAX;
+        w(&mut c, CSR_SISELECT, ISELECT_CD_FIRST).unwrap();
+        assert_eq!(r(&mut c, CSR_SIREG2), Ok(!pmu::MHPMEVENT_MINH));
+        assert_eq!(c.st.mcyclecfg, !pmu::MHPMEVENT_MINH);
+        w(&mut c, CSR_SISELECT, ISELECT_CD_FIRST + 1).unwrap();
+        assert_eq!(r(&mut c, CSR_SIREG), ILL);
+        // scountinhibit is the delegated part of mcountinhibit.
+        c.st.mcounteren = 0b1101;
+        assert_eq!(r(&mut c, CSR_SCOUNTINHIBIT), Ok(0b1101));
+        w(&mut c, CSR_SCOUNTINHIBIT, 0b1000).unwrap();
+        assert_eq!(c.st.mcountinhibit, 0b1000);
+        // In VS mode sireg is vsireg, which never reaches a counter, and siselect is
+        // vsiselect; scountinhibit and scountovf are virtual instruction faults.
+        c.st.virt_enabled = 1;
+        c.st.mcounteren = u64::MAX;
+        w(&mut c, CSR_SISELECT, ISELECT_CD_FIRST + 3).unwrap();
+        assert_eq!(c.st.vsiselect, ISELECT_CD_FIRST + 3);
+        assert_eq!(r(&mut c, CSR_SIREG), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        assert_eq!(r(&mut c, CSR_SIREG2), ILL);
+        assert_eq!(r(&mut c, CSR_SCOUNTINHIBIT), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        assert_eq!(r(&mut c, CSR_SCOUNTOVF), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        // Without the extensions the registers do not exist.
+        let hw = FakeHw::default();
+        let mut c = csrs(&hw);
+        for csrno in [CSR_MISELECT, CSR_MIREG, CSR_SIREG2, CSR_VSIREG, CSR_SCOUNTINHIBIT] {
+            assert_eq!(r(&mut c, csrno), ILL, "{csrno:#x}");
+        }
     }
 
     #[test]
@@ -1565,7 +2270,7 @@ mod tests {
         assert_eq!(r(&mut c, CSR_HIDELEG), Ok(c.st.hideleg));
         // hcounteren like mcounteren.
         w(&mut c, CSR_HCOUNTEREN, u64::MAX).unwrap();
-        assert_eq!(c.st.hcounteren, COUNTEREN_MASK);
+        assert_eq!(c.st.hcounteren, 0x7fff8 | COUNTEREN_CY | COUNTEREN_TM | COUNTEREN_IR);
         // GEILEN is 0.
         w(&mut c, CSR_HGEIE, u64::MAX).unwrap();
         assert_eq!(r(&mut c, CSR_HGEIE), Ok(0));

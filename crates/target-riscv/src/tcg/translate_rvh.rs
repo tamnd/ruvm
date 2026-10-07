@@ -24,7 +24,7 @@ impl S<'_, '_> {
         d: &Def,
         ext: Option<fn(&mut Func, TempI64, TempI64)>,
     ) -> bool {
-        if !self.d.cfg.ext_h {
+        if !self.d.cfg.ext_h() {
             return false;
         }
         let addr = self.gpr(rs1);
@@ -41,7 +41,7 @@ impl S<'_, '_> {
 
     /// `do_hsv()`: `helper(rs1, rs2)`.
     pub(super) fn hsv(&mut self, rs1: i32, rs2: i32, d: &Def) -> bool {
-        if !self.d.cfg.ext_h {
+        if !self.d.cfg.ext_h() {
             return false;
         }
         let addr = self.gpr(rs1);
@@ -54,7 +54,7 @@ impl S<'_, '_> {
 
     /// `trans_hfence_gvma()` and `trans_hfence_vvma()`.
     pub(super) fn hfence(&mut self, gvma: bool) -> bool {
-        if !self.d.cfg.ext_h {
+        if !self.d.cfg.ext_h() {
             return false;
         }
         self.decode_save_opc(0);

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The floating point helpers, a port of QEMU's `target/riscv/tcg/fpu_helper.c` for the F,
-//! D and Zfa instructions and the conversions of Zfhmin and Zfbfmin, with `fclass_s()` and
-//! `fclass_d()` from `vector_helper.c`.
+//! D, Zfh and Zfa instructions and the conversions of Zfhmin and Zfbfmin, with
+//! `fclass_h()`, `fclass_s()` and `fclass_d()` from `vector_helper.c`.
 //!
 //! QEMU keeps a `float_status` in `env`. Here every helper builds one from `env`: the
 //! rounding mode comes from `fp_round`, which `set_rounding_mode` leaves there as a RISC-V
@@ -13,8 +13,8 @@
 //!
 //! The model is QEMU's `rv64` with `priv_spec` 1.12, so `fmin` and `fmax` are IEEE 754-2019
 //! minimumNumber and maximumNumber, and Zfinx and Zdinx are off, so single and half
-//! precision values are always NaN boxed. Of the half precision instructions only the
-//! conversions of Zfhmin and Zfbfmin are here; the arithmetic of Zfh is not modelled.
+//! precision values are always NaN boxed. The half precision helpers are those of Zfh,
+//! Zfhmin and Zfbfmin.
 //!
 //! Deliberate differences from QEMU:
 //!
@@ -555,6 +555,132 @@ fn fcvt_s_bf16(x: u64, s: &mut FloatStatus) -> u64 {
     nanbox_s(unbox_bf16(x).to_float32(s))
 }
 
+// Half precision (Zfh).
+
+macro_rules! h_fma {
+    ($($f:ident => $fl:expr),* $(,)?) => {
+        $(
+            fn $f(x: u64, y: u64, z: u64, s: &mut FloatStatus) -> u64 {
+                nanbox_h(unbox_h(x).muladd(unbox_h(y), unbox_h(z), $fl, s).0)
+            }
+        )*
+    };
+}
+
+h_fma! {
+    fmadd_h => 0,
+    fmsub_h => muladd::NEGATE_C,
+    fnmsub_h => muladd::NEGATE_PRODUCT,
+    fnmadd_h => muladd::NEGATE_C | muladd::NEGATE_PRODUCT,
+}
+
+macro_rules! h_bin {
+    ($($f:ident => $m:ident),* $(,)?) => {
+        $(
+            fn $f(x: u64, y: u64, s: &mut FloatStatus) -> u64 {
+                nanbox_h(unbox_h(x).$m(unbox_h(y), s).0)
+            }
+        )*
+    };
+}
+
+h_bin! {
+    fadd_h => add,
+    fsub_h => sub,
+    fmul_h => mul,
+    fdiv_h => div,
+    fmin_h => minimum_number,
+    fminm_h => min,
+    fmax_h => maximum_number,
+    fmaxm_h => max,
+}
+
+macro_rules! h_cmp {
+    ($($f:ident => $m:ident),* $(,)?) => {
+        $(
+            fn $f(x: u64, y: u64, s: &mut FloatStatus) -> u64 {
+                u64::from(unbox_h(x).$m(unbox_h(y), s))
+            }
+        )*
+    };
+}
+
+h_cmp! {
+    fle_h => le,
+    fleq_h => le_quiet,
+    flt_h => lt,
+    fltq_h => lt_quiet,
+    feq_h => eq_quiet,
+}
+
+fn fsqrt_h(x: u64, s: &mut FloatStatus) -> u64 {
+    nanbox_h(unbox_h(x).sqrt(s).0)
+}
+
+/// `fcvt.w.h`: the result is sign extended.
+fn fcvt_w_h(x: u64, s: &mut FloatStatus) -> u64 {
+    i64::from(unbox_h(x).to_i32(s)) as u64
+}
+
+/// `fcvt.wu.h`: the result is sign extended too.
+fn fcvt_wu_h(x: u64, s: &mut FloatStatus) -> u64 {
+    i64::from(unbox_h(x).to_u32(s) as i32) as u64
+}
+
+fn fcvt_l_h(x: u64, s: &mut FloatStatus) -> u64 {
+    unbox_h(x).to_i64(s) as u64
+}
+
+fn fcvt_lu_h(x: u64, s: &mut FloatStatus) -> u64 {
+    unbox_h(x).to_u64(s)
+}
+
+fn fcvt_h_w(x: u64, s: &mut FloatStatus) -> u64 {
+    nanbox_h(Float16::from_i32(x as i32, s).0)
+}
+
+fn fcvt_h_wu(x: u64, s: &mut FloatStatus) -> u64 {
+    nanbox_h(Float16::from_u32(x as u32, s).0)
+}
+
+fn fcvt_h_l(x: u64, s: &mut FloatStatus) -> u64 {
+    nanbox_h(Float16::from_i64(x as i64, s).0)
+}
+
+fn fcvt_h_lu(x: u64, s: &mut FloatStatus) -> u64 {
+    nanbox_h(Float16::from_u64(x, s).0)
+}
+
+/// `HELPER(fclass_h)`, `fclass_h()` of the NaN unboxed value: raises no flags.
+fn fclass_h_op(x: u64, _s: &mut FloatStatus) -> u64 {
+    let f = unbox_h(x);
+    let sign = f.is_neg();
+    if f.is_infinity() {
+        if sign { 1 << 0 } else { 1 << 7 }
+    } else if f.is_zero() {
+        if sign { 1 << 3 } else { 1 << 4 }
+    } else if f.is_zero_or_denormal() {
+        if sign { 1 << 2 } else { 1 << 5 }
+    } else if f.is_any_nan() {
+        if f.is_quiet_nan(&FloatStatus::default()) { 1 << 9 } else { 1 << 8 }
+    } else if sign {
+        1 << 1
+    } else {
+        1 << 6
+    }
+}
+
+/// `fround.h`: the inexact flag stays as it was.
+fn fround_h(x: u64, s: &mut FloatStatus) -> u64 {
+    let r = unbox_h(x).round_to_int(s);
+    s.exception_flags &= !flags::INEXACT;
+    nanbox_h(r.0)
+}
+
+fn froundnx_h(x: u64, s: &mut FloatStatus) -> u64 {
+    nanbox_h(unbox_h(x).round_to_int(s).0)
+}
+
 fp_def!(FMADD_S, "fmadd_s", NO_RWG, accrue, fmadd_s, 3);
 fp_def!(FMSUB_S, "fmsub_s", NO_RWG, accrue, fmsub_s, 3);
 fp_def!(FNMSUB_S, "fnmsub_s", NO_RWG, accrue, fnmsub_s, 3);
@@ -624,6 +750,36 @@ fp_def!(FCVT_H_D, "fcvt_h_d", NO_RWG, accrue, fcvt_h_d, 1);
 fp_def!(FCVT_D_H, "fcvt_d_h", NO_RWG, accrue, fcvt_d_h, 1);
 fp_def!(FCVT_BF16_S, "fcvt_bf16_s", NO_RWG, accrue, fcvt_bf16_s, 1);
 fp_def!(FCVT_S_BF16, "fcvt_s_bf16", NO_RWG, accrue, fcvt_s_bf16, 1);
+
+fp_def!(FMADD_H, "fmadd_h", NO_RWG, accrue, fmadd_h, 3);
+fp_def!(FMSUB_H, "fmsub_h", NO_RWG, accrue, fmsub_h, 3);
+fp_def!(FNMSUB_H, "fnmsub_h", NO_RWG, accrue, fnmsub_h, 3);
+fp_def!(FNMADD_H, "fnmadd_h", NO_RWG, accrue, fnmadd_h, 3);
+fp_def!(FADD_H, "fadd_h", NO_RWG, accrue, fadd_h, 2);
+fp_def!(FSUB_H, "fsub_h", NO_RWG, accrue, fsub_h, 2);
+fp_def!(FMUL_H, "fmul_h", NO_RWG, accrue, fmul_h, 2);
+fp_def!(FDIV_H, "fdiv_h", NO_RWG, accrue, fdiv_h, 2);
+fp_def!(FMIN_H, "fmin_h", NO_RWG, accrue, fmin_h, 2);
+fp_def!(FMINM_H, "fminm_h", NO_RWG, accrue, fminm_h, 2);
+fp_def!(FMAX_H, "fmax_h", NO_RWG, accrue, fmax_h, 2);
+fp_def!(FMAXM_H, "fmaxm_h", NO_RWG, accrue, fmaxm_h, 2);
+fp_def!(FSQRT_H, "fsqrt_h", NO_RWG, accrue, fsqrt_h, 1);
+fp_def!(FLE_H, "fle_h", NO_RWG, accrue_check, fle_h, 2);
+fp_def!(FLEQ_H, "fleq_h", NO_RWG, accrue_check, fleq_h, 2);
+fp_def!(FLT_H, "flt_h", NO_RWG, accrue_check, flt_h, 2);
+fp_def!(FLTQ_H, "fltq_h", NO_RWG, accrue_check, fltq_h, 2);
+fp_def!(FEQ_H, "feq_h", NO_RWG, accrue_check, feq_h, 2);
+fp_def!(FCVT_W_H, "fcvt_w_h", NO_RWG, accrue_check, fcvt_w_h, 1);
+fp_def!(FCVT_WU_H, "fcvt_wu_h", NO_RWG, accrue_check, fcvt_wu_h, 1);
+fp_def!(FCVT_L_H, "fcvt_l_h", NO_RWG, accrue_check, fcvt_l_h, 1);
+fp_def!(FCVT_LU_H, "fcvt_lu_h", NO_RWG, accrue_check, fcvt_lu_h, 1);
+fp_def!(FCVT_H_W, "fcvt_h_w", NO_RWG, accrue, fcvt_h_w, 1);
+fp_def!(FCVT_H_WU, "fcvt_h_wu", NO_RWG, accrue, fcvt_h_wu, 1);
+fp_def!(FCVT_H_L, "fcvt_h_l", NO_RWG, accrue, fcvt_h_l, 1);
+fp_def!(FCVT_H_LU, "fcvt_h_lu", NO_RWG, accrue, fcvt_h_lu, 1);
+fp_def!(FCLASS_H, "fclass_h", NO_RWG_SE, accrue, fclass_h_op, 1);
+fp_def!(FROUND_H, "fround_h", NO_RWG_SE, accrue, fround_h, 1);
+fp_def!(FROUNDNX_H, "froundnx_h", NO_RWG_SE, accrue, froundnx_h, 1);
 
 /// The helpers of this module.
 pub(crate) const ALL: &[Def] = &[
@@ -696,6 +852,35 @@ pub(crate) const ALL: &[Def] = &[
     FCVT_D_H,
     FCVT_BF16_S,
     FCVT_S_BF16,
+    FMADD_H,
+    FMSUB_H,
+    FNMSUB_H,
+    FNMADD_H,
+    FADD_H,
+    FSUB_H,
+    FMUL_H,
+    FDIV_H,
+    FMIN_H,
+    FMINM_H,
+    FMAX_H,
+    FMAXM_H,
+    FSQRT_H,
+    FLE_H,
+    FLEQ_H,
+    FLT_H,
+    FLTQ_H,
+    FEQ_H,
+    FCVT_W_H,
+    FCVT_WU_H,
+    FCVT_L_H,
+    FCVT_LU_H,
+    FCVT_H_W,
+    FCVT_H_WU,
+    FCVT_H_L,
+    FCVT_H_LU,
+    FCLASS_H,
+    FROUND_H,
+    FROUNDNX_H,
 ];
 
 #[cfg(test)]

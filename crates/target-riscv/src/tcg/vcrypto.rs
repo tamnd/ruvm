@@ -290,7 +290,7 @@ fn gmul(mut a: u8, mut b: u8) -> u8 {
 }
 
 /// SubBytes and ShiftRows.
-fn aes_sb_sr(st: &[u8; 16]) -> [u8; 16] {
+pub(super) fn aes_sb_sr(st: &[u8; 16]) -> [u8; 16] {
     let mut t = [0u8; 16];
     for (k, x) in t.iter_mut().enumerate() {
         *x = AES_SBOX[st[aes_sh(k)] as usize];
@@ -299,7 +299,7 @@ fn aes_sb_sr(st: &[u8; 16]) -> [u8; 16] {
 }
 
 /// InvSubBytes and InvShiftRows.
-fn aes_isb_isr(st: &[u8; 16]) -> [u8; 16] {
+pub(super) fn aes_isb_isr(st: &[u8; 16]) -> [u8; 16] {
     let mut t = [0u8; 16];
     for (k, x) in t.iter_mut().enumerate() {
         *x = AES_ISBOX[st[aes_ish(k)] as usize];
@@ -308,7 +308,7 @@ fn aes_isb_isr(st: &[u8; 16]) -> [u8; 16] {
 }
 
 /// MixColumns.
-fn aes_mc(st: &mut [u8; 16]) {
+pub(super) fn aes_mc(st: &mut [u8; 16]) {
     for c in st.chunks_exact_mut(4) {
         let [a0, a1, a2, a3] = [c[0], c[1], c[2], c[3]];
         c[0] = xtime(a0) ^ xtime(a1) ^ a1 ^ a2 ^ a3;
@@ -319,7 +319,7 @@ fn aes_mc(st: &mut [u8; 16]) {
 }
 
 /// InvMixColumns.
-fn aes_imc(st: &mut [u8; 16]) {
+pub(super) fn aes_imc(st: &mut [u8; 16]) {
     for c in st.chunks_exact_mut(4) {
         let [a0, a1, a2, a3] = [c[0], c[1], c[2], c[3]];
         c[0] = gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9);
@@ -391,10 +391,10 @@ group_def!(VAESKF1_VI, "vaeskf1_vi", 4, aeskf1);
 group_def!(VAESKF2_VI, "vaeskf2_vi", 4, aeskf2);
 
 /// The AES round constants of the key schedules.
-const AES_RCON: [u32; 10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
+pub(super) const AES_RCON: [u32; 10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
 
 /// SubWord of the AES key schedule.
-fn aes_subword(w: u32) -> u32 {
+pub(super) fn aes_subword(w: u32) -> u32 {
     u32::from_le_bytes(w.to_le_bytes().map(|b| AES_SBOX[b as usize]))
 }
 
@@ -715,7 +715,7 @@ group_def!(VGMUL_VV, "vgmul_vv", 4, gmul_group);
 // SM4.
 
 /// `sm4_sbox`.
-const SM4_SBOX: [u8; 256] = [
+pub(super) const SM4_SBOX: [u8; 256] = [
     0xd6, 0x90, 0xe9, 0xfe, 0xcc, 0xe1, 0x3d, 0xb7, 0x16, 0xb6, 0x14, 0xc2, 0x28, 0xfb, 0x2c, 0x05,
     0x2b, 0x67, 0x9a, 0x76, 0x2a, 0xbe, 0x04, 0xc3, 0xaa, 0x44, 0x13, 0x26, 0x49, 0x86, 0x06, 0x99,
     0x9c, 0x42, 0x50, 0xf4, 0x91, 0xef, 0x98, 0x7a, 0x33, 0x54, 0x0b, 0x43, 0xed, 0xcf, 0xac, 0x62,

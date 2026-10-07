@@ -3,12 +3,13 @@
 //! The virt device tree: `create_fdt()` and `finalize_fdt()` of hw/riscv/virt.c, the helpers of
 //! hw/riscv/fdt-common.c they call, `riscv_isa_write_fdt()` of target/riscv/cpu.c,
 //! `riscv_pmu_generate_fdt_node()` and `platform_bus_add_all_fdt_nodes()`. Each function makes
-//! the same libfdt calls in the same order as its QEMU namesake, so with the same ISA strings
-//! and `rng-seed` the packed blob is byte for byte what `-M virt,dumpdtb=` writes (see the test
-//! against `tests/data/virt.dtb`).
+//! the same libfdt calls in the same order as its QEMU namesake, so with the same CPU
+//! configuration and `rng-seed` the packed blob is byte for byte what `-M virt,dumpdtb=`
+//! writes (see the test against `tests/data/virt.dtb`).
 
 use ruvm_hw_misc::sifive_test::{FINISHER_PASS, FINISHER_RESET};
 use ruvm_machine_arm::fdt::{Fdt, sized_cells};
+use ruvm_target_riscv::cfg::RiscvCfg;
 use ruvm_target_riscv::cpu::{IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT};
 
 use super::{
@@ -32,11 +33,6 @@ const FDT_PCI_RANGE_MMIO: u32 = 0x0200_0000;
 const FDT_PCI_RANGE_MMIO_64BIT: u32 = 0x0300_0000;
 /// `PCI_NUM_PINS`.
 const PCI_NUM_PINS: u32 = 4;
-/// The `pmu-mask` of the default CPU, `MAKE_64BIT_MASK(3, 16)`: mhpmcounter3 to 18.
-const PMU_MASK: u32 = 0x0007_fff8;
-/// The block size of the cache block management instructions, `cbom_blocksize`,
-/// `cboz_blocksize` and `cbop_blocksize`.
-const CBO_BLOCK_SIZE: u32 = 64;
 
 /// The `riscv,isa` string QEMU 11.1 writes for its default `rv64` CPU.
 pub const QEMU_RV64_ISA: &str = "rv64imafdch_zic64b_zicbom_zicbop_zicboz_ziccamoa_ziccif_\
@@ -45,19 +41,6 @@ pub const QEMU_RV64_ISA: &str = "rv64imafdch_zic64b_zicbom_zicbop_zicboz_ziccamo
                                  zbs_sdtrig_shcounterenw_shgatpa_shtvala_shvsatpa_shvstvala_\
                                  shvstvecd_ssccptr_sscounterenw_ssstrict_sstc_sstvala_sstvecd_\
                                  ssu64xl_svadu_svvptc";
-
-/// The `riscv,isa` string of the default CPU here, the same as QEMU's: H is on by default.
-pub const RUVM_RV64_ISA: &str = QEMU_RV64_ISA;
-
-/// `riscv,isa-extensions` for a `riscv,isa` string, as `riscv_isa_write_fdt()` builds both
-/// from the same list: each single letter extension after `rv64`, then each multi-letter one.
-pub fn isa_extensions(isa: &str) -> Vec<String> {
-    let rest = isa.strip_prefix("rv64").or_else(|| isa.strip_prefix("rv32")).unwrap_or(isa);
-    let mut parts = rest.split('_');
-    let mut out: Vec<String> = parts.next().unwrap_or("").chars().map(|c| c.to_string()).collect();
-    out.extend(parts.filter(|p| !p.is_empty()).map(str::to_string));
-    out
-}
 
 /// A string list property, `qemu_fdt_setprop_string_array()`.
 fn string_array<S: AsRef<str>>(items: &[S]) -> Vec<u8> {
@@ -79,7 +62,12 @@ fn be_cells(values: &[u32]) -> Vec<u8> {
 
 /// `create_board_device_tree()` and the rest of `create_fdt()`: the root, `/soc`, the empty
 /// PCIe node, `/chosen` with `rng-seed`, `/aliases`, the flash, fw_cfg and PMU nodes.
-pub(crate) fn create_fdt(fdt: &mut Fdt, rng_seed: &[u8; 32]) -> Result<(), String> {
+/// `pmu_avail_ctrs` is the `pmu_avail_ctrs` of hart 0.
+pub(crate) fn create_fdt(
+    fdt: &mut Fdt,
+    rng_seed: &[u8; 32],
+    pmu_avail_ctrs: u32,
+) -> Result<(), String> {
     fdt.setprop_string("/", "model", "riscv-virtio,qemu")?;
     fdt.setprop_string("/", "compatible", "riscv-virtio")?;
     fdt.setprop_cell("/", "#size-cells", 0x2)?;
@@ -101,7 +89,7 @@ pub(crate) fn create_fdt(fdt: &mut Fdt, rng_seed: &[u8; 32]) -> Result<(), Strin
 
     create_fdt_flash(fdt)?;
     create_fdt_fw_cfg(fdt)?;
-    create_fdt_pmu(fdt)
+    create_fdt_pmu(fdt, pmu_avail_ctrs)
 }
 
 /// `create_fdt_flash()`.
@@ -130,11 +118,10 @@ fn create_fdt_fw_cfg(fdt: &mut Fdt) -> Result<(), String> {
 /// `create_fdt_pmu()` and `riscv_pmu_generate_fdt_node()`: the SBI PMU event map, with the
 /// cycle and instret events on their fixed counters and the TLB miss events on the
 /// programmable ones.
-fn create_fdt_pmu(fdt: &mut Fdt) -> Result<(), String> {
+fn create_fdt_pmu(fdt: &mut Fdt, cmask: u32) -> Result<(), String> {
     let name = "/pmu";
     fdt.add_subnode(name)?;
     fdt.setprop_string(name, "compatible", "riscv,pmu")?;
-    let cmask = PMU_MASK;
     let map: [u32; 15] = [
         // SBI_PMU_HW_CPU_CYCLES: 0x01 : 0x01 : 0x00001
         0x1,
@@ -167,8 +154,8 @@ pub(crate) struct FinalizeArgs<'a> {
     pub(crate) smp: usize,
     /// The RAM size.
     pub(crate) ram_size: u64,
-    /// The `riscv,isa` string of the harts.
-    pub(crate) isa: &'a str,
+    /// The configuration of the harts.
+    pub(crate) cpu: &'a RiscvCfg,
 }
 
 /// `finalize_fdt()`: the CPU, memory, CLINT, PLIC, platform bus, virtio, PCIe, reset, UART
@@ -232,20 +219,34 @@ fn create_fdt_socket_cpus(
     phandle: &mut u32,
 ) -> Result<Vec<u32>, String> {
     let mut intc_phandles = vec![0u32; args.smp];
-    let extensions = isa_extensions(args.isa);
+    let cfg = args.cpu;
+    let isa = cfg.isa_string();
+    let extensions = cfg.isa_extensions();
+    let mmu_type = cfg.mmu_type();
     for cpu in (0..args.smp).rev() {
         let cpu_phandle = *phandle;
         *phandle += 1;
         let cpu_name = format!("/cpus/cpu@{cpu}");
         fdt.add_subnode(&cpu_name)?;
-        fdt.setprop_string(&cpu_name, "mmu-type", "riscv,sv57")?;
+        if let Some(mmu_type) = &mmu_type {
+            fdt.setprop_string(&cpu_name, "mmu-type", mmu_type)?;
+        }
         // riscv_isa_write_fdt().
-        fdt.setprop_string(&cpu_name, "riscv,isa", args.isa)?;
+        fdt.setprop_string(&cpu_name, "riscv,isa", &isa)?;
         fdt.setprop_string(&cpu_name, "riscv,isa-base", "rv64i")?;
         fdt.setprop(&cpu_name, "riscv,isa-extensions", &string_array(&extensions))?;
-        fdt.setprop_cell(&cpu_name, "riscv,cbom-block-size", CBO_BLOCK_SIZE)?;
-        fdt.setprop_cell(&cpu_name, "riscv,cboz-block-size", CBO_BLOCK_SIZE)?;
-        fdt.setprop_cell(&cpu_name, "riscv,cbop-block-size", CBO_BLOCK_SIZE)?;
+        if cfg.ext_zicbom {
+            let size = u32::from(cfg.cbom_blocksize);
+            fdt.setprop_cell(&cpu_name, "riscv,cbom-block-size", size)?;
+        }
+        if cfg.ext_zicboz {
+            let size = u32::from(cfg.cboz_blocksize);
+            fdt.setprop_cell(&cpu_name, "riscv,cboz-block-size", size)?;
+        }
+        if cfg.ext_zicbop {
+            let size = u32::from(cfg.cbop_blocksize);
+            fdt.setprop_cell(&cpu_name, "riscv,cbop-block-size", size)?;
+        }
         fdt.setprop_string(&cpu_name, "compatible", "riscv")?;
         fdt.setprop_string(&cpu_name, "status", "okay")?;
         fdt.setprop_cell(&cpu_name, "reg", cpu as u32)?;
@@ -515,32 +516,45 @@ mod tests {
         s
     }
 
-    fn build(isa: &str, smp: usize, ram_size: u64) -> Fdt {
+    fn build(cpu: &RiscvCfg, smp: usize, ram_size: u64) -> Fdt {
         let mut fdt = Fdt::new();
-        create_fdt(&mut fdt, &seed()).unwrap();
-        finalize_fdt(&mut fdt, FinalizeArgs { smp, ram_size, isa }).unwrap();
+        create_fdt(&mut fdt, &seed(), cpu.pmu_mask).unwrap();
+        finalize_fdt(&mut fdt, FinalizeArgs { smp, ram_size, cpu }).unwrap();
         fdt_pack(&fdt).unwrap()
     }
 
     #[test]
     fn matches_qemu_byte_for_byte() {
-        let fdt = build(QEMU_RV64_ISA, 1, 128 << 20);
+        let fdt = build(&RiscvCfg::default(), 1, 128 << 20);
         assert_eq!(fdt.as_bytes().len(), QEMU_VIRT_DTB.len());
         assert!(fdt.as_bytes() == QEMU_VIRT_DTB, "the tree differs from QEMU's");
     }
 
     #[test]
     fn isa_extension_list() {
-        let ext = isa_extensions(QEMU_RV64_ISA);
+        let cfg = RiscvCfg::default();
+        assert_eq!(cfg.isa_string(), QEMU_RV64_ISA);
+        let ext = cfg.isa_extensions();
         assert_eq!(&ext[..8], ["i", "m", "a", "f", "d", "c", "h", "zic64b"]);
         assert_eq!(ext.last().unwrap(), "svvptc");
         assert_eq!(ext.len(), 49);
-        assert_eq!(isa_extensions(RUVM_RV64_ISA), ext);
+    }
+
+    #[test]
+    fn cpu_node_follows_the_model() {
+        let cpu = RiscvCfg::model("sifive-u54");
+        let fdt = build(&cpu, 1, 128 << 20);
+        let get = |p: &str| fdt.getprop("/cpus/cpu@0", p);
+        assert_eq!(get("mmu-type").unwrap(), b"riscv,sv39\0");
+        assert_eq!(get("riscv,isa").unwrap(), b"rv64imafdc_zicntr_zicsr_zifencei_zihpm_sdtrig\0");
+        assert!(get("riscv,cbom-block-size").is_err());
+        let pmu = fdt.getprop("/pmu", "riscv,event-to-mhpmcounters").unwrap();
+        assert_eq!(&pmu[8..12], &(0x0007_fff8u32 | 1).to_be_bytes());
     }
 
     #[test]
     fn two_harts_phandles() {
-        let fdt = build(RUVM_RV64_ISA, 2, 256 << 20);
+        let fdt = build(&RiscvCfg::default(), 2, 256 << 20);
         // The harts are made from the last down: cpu@1 then its controller, then cpu@0.
         assert_eq!(fdt.get_phandle("/cpus/cpu@1").unwrap(), 1);
         assert_eq!(fdt.get_phandle("/cpus/cpu@1/interrupt-controller").unwrap(), 2);

@@ -6,10 +6,8 @@
 //! `trans_xlrbr`. The floating point instructions are in `translate_fp` and the hypervisor
 //! ones in `translate_rvh`.
 //!
-//! The front end is RV64 only, with C always present, so the misaligned jump checks of
-//! QEMU's `gen_jal()` and `trans_jalr()` never fire and are not here. Conditional branches
-//! may continue the block with their fall-through path (a superblock, not in QEMU), the
-//! same way as the arm front end.
+//! The front end is RV64 only. Conditional branches may continue the block with their
+//! fall-through path (a superblock, not in QEMU), the same way as the arm front end.
 
 use ruvm_jit::cputlb::cpu_ld_code;
 use ruvm_jit::{Cpu, CpuLoopExit, DisasContextBase, DisasJumpType, Ra, TranslatorOps, cf};
@@ -19,7 +17,9 @@ use ruvm_jit_core::types::{Cond, mo};
 use ruvm_jit_core::{Func, Label, MemOp, Temp};
 use ruvm_mem::Endian;
 
+use super::crypto;
 use super::helpers::{self, Def};
+use super::pm::PointerMask;
 use super::translate_rvv::Ldst;
 use super::{
     TB_FS_SHIFT, TB_LMUL_SHIFT, TB_MEM_IDX_MASK, TB_PRIV_SHIFT, TB_SEW_SHIFT, TB_VILL, TB_VIRT,
@@ -30,11 +30,11 @@ use super::{
     translate_rvv_perm, translate_rvvk,
 };
 use crate::cpu::{
-    BADADDR, BINS, EXCP_BREAKPOINT, EXCP_ILLEGAL_INST, EXCP_SEMIHOST, EXCP_U_ECALL,
-    EXT_STATUS_DIRTY, LOAD_RES, LOAD_VAL, MSTATUS, MSTATUS_FS, MSTATUS_HS, MSTATUS_VS, PC, PRV_U,
-    RiscvCfg, UW2_ALWAYS_STORE_AMO, fpr_off, gpr_off,
+    BADADDR, BINS, EXCP_BREAKPOINT, EXCP_ILLEGAL_INST, EXCP_INST_ADDR_MIS, EXCP_SEMIHOST,
+    EXCP_U_ECALL, EXT_STATUS_DIRTY, LOAD_RES, LOAD_VAL, MSTATUS, MSTATUS_FS, MSTATUS_HS,
+    MSTATUS_VS, PC, PRV_U, RVA, RVC, RVM, RVS, RiscvCfg, UW2_ALWAYS_STORE_AMO, fpr_off, gpr_off,
 };
-use crate::decode::insn16::{DecodeInsn16, decode16};
+use crate::decode::insn16::{DecodeInsn16, arg_c_mop_n, decode16};
 use crate::decode::insn32::*;
 use crate::decode::xlrbr::{self, DecodeXlrbr};
 
@@ -112,6 +112,8 @@ pub(crate) struct DisasContext {
     pub(super) virt_enabled: bool,
     /// The MMU index of data accesses.
     pub(super) mem_idx: u32,
+    /// The pointer mask of data accesses, `addr_xl` and `addr_signed`.
+    pm: PointerMask,
     /// `mstatus.FS` as the block found it, updated by `mark_fs_dirty()`.
     pub(super) mstatus_fs: u64,
     /// The rounding mode `gen_set_rm()` last set in this block, or -1.
@@ -149,6 +151,7 @@ impl DisasContext {
             priv_lvl: 0,
             virt_enabled: false,
             mem_idx: 0,
+            pm: PointerMask::default(),
             mstatus_fs: 0,
             frm: -1,
             frm_valid: false,
@@ -263,11 +266,21 @@ impl S<'_, '_> {
         self.g().f[r as usize]
     }
 
-    /// `get_address()`: `rs1 + imm` in a fresh temp.
+    /// `get_address()`: `rs1 + imm` in a fresh temp, with the high bits pointer masking
+    /// ignores sign or zero extended from the rest.
     pub(super) fn address(&mut self, rs1: i32, imm: i64) -> TempI64 {
         let s = self.gpr(rs1);
         let t = self.new64();
         self.f().gen_addi_i64(t, s, imm);
+        let pm = self.d.pm;
+        let pmlen = pm.pmlen();
+        if pmlen != 0 {
+            if pm.signext {
+                self.f().gen_sextract_i64(t, t, 0, 64 - pmlen);
+            } else {
+                self.f().gen_extract_i64(t, t, 0, 64 - pmlen);
+            }
+        }
         t
     }
 
@@ -295,6 +308,13 @@ impl S<'_, '_> {
         let e = self.c32(excp);
         self.call(&helpers::RAISE_EXCEPTION, None, &[env.into(), e.into()]);
         self.b.is_jmp = DisasJumpType::NoReturn;
+    }
+
+    /// `gen_exception_inst_addr_mis()`: a misaligned jump to `target`.
+    fn gen_exception_inst_addr_mis(&mut self, target: TempI64) {
+        let env = self.env();
+        self.f().gen_st_i64(target, env, BADADDR as i64);
+        self.generate_exception(EXCP_INST_ADDR_MIS);
     }
 
     /// `gen_exception_illegal()`.
@@ -544,22 +564,36 @@ impl S<'_, '_> {
         true
     }
 
+    /// The atomicity Zama16b gives the loads and stores that are not AMOs: atomic when
+    /// the access does not cross a 16-byte boundary.
+    pub(super) fn zama16b(&self) -> MemOp {
+        if self.d.cfg.ext_zama16b { MemOp::ATOM_WITHIN16 } else { MemOp::ATOM_IFALIGN }
+    }
+
     /// `gen_load()`.
     fn load(&mut self, a: &arg_i, memop: MemOp) -> bool {
+        let memop = memop | self.zama16b();
         self.decode_save_opc(0);
         let addr = self.address(a.rs1, i64::from(a.imm));
         let d = self.new64();
         let idx = self.d.mem_idx;
         self.f().gen_qemu_ld_i64(d, addr, idx, memop);
         self.set_gpr(a.rd, d);
+        if self.d.cfg.ext_ztso {
+            self.f().gen_mb(mo::ALL | mo::BAR_LDAQ);
+        }
         true
     }
 
     /// `gen_store()`.
     fn store(&mut self, a: &arg_s, memop: MemOp) -> bool {
+        let memop = memop | self.zama16b();
         self.decode_save_opc(0);
         let addr = self.address(a.rs1, i64::from(a.imm));
         let v = self.gpr(a.rs2);
+        if self.d.cfg.ext_ztso {
+            self.f().gen_mb(mo::ALL | mo::BAR_STRL);
+        }
         let idx = self.d.mem_idx;
         self.f().gen_qemu_st_i64(v, addr, idx, memop);
         true
@@ -571,6 +605,15 @@ impl S<'_, '_> {
         let s2 = self.gpr(a.rs2);
         let l = self.f().new_label();
         self.f().gen_brcond_i64(cond, s1, s2, l);
+        if !self.d.cfg.allow_16bit_insn() && a.imm & 3 != 0 {
+            // The taken path is a misaligned jump, as in QEMU the block ends here.
+            self.gen_goto_tb(1, self.d.cur_insn_len as i64);
+            self.f().gen_set_label(l);
+            let dest = self.d.pc_curr.wrapping_add(i64::from(a.imm) as u64);
+            let t = self.c64(dest as i64);
+            self.gen_exception_inst_addr_mis(t);
+            return true;
+        }
         self.branch_to(l, i64::from(a.imm));
         true
     }
@@ -730,7 +773,9 @@ impl S<'_, '_> {
         let (load_val, load_res) = (self.g().load_val, self.g().load_res);
         let idx = self.d.mem_idx;
         self.f().gen_qemu_ld_i64(load_val, src1, idx, mop);
-        if a.aq != 0 {
+        // TSO defines AMOs as acquire+release-RCsc, but does not define LR/SC as AMOs.
+        // Instead treat them like loads.
+        if a.aq != 0 || self.d.cfg.ext_ztso {
             self.f().gen_mb(mo::ALL | mo::BAR_LDAQ);
         }
         // Put addr in load_res, data in load_val.
@@ -762,10 +807,10 @@ impl S<'_, '_> {
 
         self.f().gen_set_label(l1);
         // Address comparison failure. However, we still need to provide the memory barrier
-        // implied by AQ/RL.
+        // implied by AQ/RL/TSO.
         let bar = mo::ALL
             | if a.aq != 0 { mo::BAR_LDAQ } else { 0 }
-            | if a.rl != 0 { mo::BAR_STRL } else { 0 };
+            | if a.rl != 0 || self.d.cfg.ext_ztso { mo::BAR_STRL } else { 0 };
         self.f().gen_mb(bar);
         // "For the purposes of memory protection, a failed SC.W may be treated like a
         // store." so let's check the write access permissions.
@@ -782,9 +827,13 @@ impl S<'_, '_> {
         true
     }
 
-    /// `gen_amo()`.
+    /// `gen_amo()`. With Zama16b a word or doubleword AMO only has to stay within 16 bytes.
     fn amo(&mut self, a: &arg_atomic, op: AtomicOp, mop: MemOp) -> bool {
-        let mop = mop | MemOp::ALIGN;
+        let mop = if self.d.cfg.ext_zama16b && mop.size() >= 2 {
+            mop | MemOp::ATOM_WITHIN16
+        } else {
+            mop | MemOp::ALIGN
+        };
         let s2 = self.gpr(a.rs2);
         self.decode_save_opc(UW2_ALWAYS_STORE_AMO);
         let src1 = self.address(a.rs1, 0);
@@ -792,6 +841,193 @@ impl S<'_, '_> {
         let idx = self.d.mem_idx;
         self.f().gen_atomic_op_i64(op, d, src1, s2, idx, mop);
         self.set_gpr(a.rd, d);
+        true
+    }
+
+    /// `gen_cmpxchg()` of Zacas and Zabha: compare `rd` with memory at `rs1` and store `rs2`
+    /// if they are equal, `rd` getting the old value either way.
+    fn cmpxchg(&mut self, a: &arg_atomic, mop: MemOp) -> bool {
+        let cmpv = self.gpr(a.rd);
+        let src1 = self.address(a.rs1, 0);
+        let s2 = self.gpr(a.rs2);
+        self.decode_save_opc(UW2_ALWAYS_STORE_AMO);
+        let d = self.new64();
+        let idx = self.d.mem_idx;
+        self.f().gen_atomic_cmpxchg_i64(d, src1, cmpv, s2, idx, mop);
+        self.set_gpr(a.rd, d);
+        true
+    }
+
+    /// `trans_amocas_q()`: a 128-bit compare and swap on the register pairs `rd` and `rs2`.
+    fn cmpxchg_q(&mut self, a: &arg_atomic) -> bool {
+        // Encodings with odd numbered registers specified in rs2 and rd are reserved.
+        if (a.rs2 | a.rd) & 1 != 0 {
+            return false;
+        }
+        let src1 = self.address(a.rs1, 0);
+        let s2l = self.gpr(a.rs2);
+        let s2h = self.gpr(if a.rs2 == 0 { 0 } else { a.rs2 + 1 });
+        let dl = self.gpr(a.rd);
+        let dh = self.gpr(if a.rd == 0 { 0 } else { a.rd + 1 });
+        let f = self.f();
+        let dest = f.temp_new_i128();
+        let src2 = f.temp_new_i128();
+        f.gen_concat_i64_i128(src2, s2l, s2h);
+        f.gen_concat_i64_i128(dest, dl, dh);
+        self.decode_save_opc(UW2_ALWAYS_STORE_AMO);
+        let idx = self.d.mem_idx;
+        let rl = self.new64();
+        let rh = self.new64();
+        let f = self.f();
+        f.gen_atomic_cmpxchg_i128(dest, src1, dest, src2, idx, MemOp::ALIGN | MemOp::LEUO);
+        f.gen_extr_i128_i64(rl, rh, dest);
+        if a.rd != 0 {
+            self.set_gpr(a.rd, rl);
+            self.set_gpr(a.rd + 1, rh);
+        }
+        true
+    }
+
+    /// `gen_load_acquire()` of Zalasr.
+    fn load_acquire(&mut self, a: &arg_atomic, memop: MemOp) -> bool {
+        // Check that AQ is set, as this is mandatory.
+        if a.aq == 0 {
+            return false;
+        }
+        self.decode_save_opc(0);
+        let addr = self.address(a.rs1, 0);
+        let memop = memop | MemOp::ALIGN | self.zama16b();
+        let d = self.new64();
+        let idx = self.d.mem_idx;
+        self.f().gen_qemu_ld_i64(d, addr, idx, memop);
+        self.set_gpr(a.rd, d);
+        // Add a memory barrier implied by AQ (mandatory) and RL (optional).
+        let bar = if a.rl != 0 { mo::BAR_STRL } else { 0 };
+        self.f().gen_mb(mo::ALL | mo::BAR_LDAQ | bar);
+        true
+    }
+
+    /// `gen_store_release()` of Zalasr.
+    fn store_release(&mut self, a: &arg_atomic, memop: MemOp) -> bool {
+        // Check that RL is set, as this is mandatory.
+        if a.rl == 0 {
+            return false;
+        }
+        self.decode_save_opc(0);
+        let addr = self.address(a.rs1, 0);
+        let data = self.gpr(a.rs2);
+        let memop = memop | MemOp::ALIGN | self.zama16b();
+        // Add a memory barrier implied by RL (mandatory) and AQ (optional).
+        let bar = if a.aq != 0 { mo::BAR_LDAQ } else { 0 };
+        self.f().gen_mb(mo::ALL | mo::BAR_STRL | bar);
+        let idx = self.d.mem_idx;
+        self.f().gen_qemu_st_i64(data, addr, idx, memop);
+        true
+    }
+
+    /// `gen_czero()` of Zicond: `rd = rs2 cond 0 ? 0 : rs1`.
+    fn czero(&mut self, a: &arg_r, cond: Cond) -> bool {
+        let s1 = self.gpr(a.rs1);
+        let s2 = self.gpr(a.rs2);
+        let zero = self.c64(0);
+        let d = self.new64();
+        self.f().gen_movcond_i64(cond, d, s2, zero, zero, s1);
+        self.set_gpr(a.rd, d);
+        true
+    }
+
+    /// `gen_sha256()`: two rotations and `op` of the low 32 bits, XORed and sign extended.
+    fn sha256(
+        &mut self,
+        a: &arg_r2,
+        op: fn(&mut Func, TempI32, TempI32, i32),
+        n: [i32; 3],
+    ) -> bool {
+        let s1 = self.gpr(a.rs1);
+        let t0 = self.new32();
+        let t1 = self.new32();
+        let t2 = self.new32();
+        let d = self.new64();
+        let f = self.f();
+        f.gen_extrl_i64_i32(t0, s1);
+        f.gen_rotri_i32(t1, t0, n[0]);
+        f.gen_rotri_i32(t2, t0, n[1]);
+        f.gen_xor_i32(t1, t1, t2);
+        op(f, t2, t0, n[2]);
+        f.gen_xor_i32(t1, t1, t2);
+        f.gen_ext_i32_i64(d, t1);
+        self.set_gpr(a.rd, d);
+        true
+    }
+
+    /// `gen_sha512_rv64()`: two rotations and `op` of `rs1`, XORed.
+    fn sha512(
+        &mut self,
+        a: &arg_r2,
+        op: fn(&mut Func, TempI64, TempI64, i64),
+        n: [i64; 3],
+    ) -> bool {
+        let s1 = self.gpr(a.rs1);
+        let t1 = self.new64();
+        let t2 = self.new64();
+        let f = self.f();
+        f.gen_rotri_i64(t1, s1, n[0]);
+        f.gen_rotri_i64(t2, s1, n[1]);
+        f.gen_xor_i64(t1, t1, t2);
+        op(f, t2, s1, n[2]);
+        f.gen_xor_i64(t1, t1, t2);
+        self.set_gpr(a.rd, t1);
+        true
+    }
+
+    /// `gen_sm3()`: `x ^ rol(x, b) ^ rol(x, c)` of the low 32 bits, sign extended.
+    fn sm3(&mut self, a: &arg_r2, b: i32, c: i32) -> bool {
+        let s1 = self.gpr(a.rs1);
+        let t0 = self.new32();
+        let t1 = self.new32();
+        let d = self.new64();
+        let f = self.f();
+        f.gen_extrl_i64_i32(t0, s1);
+        f.gen_rotli_i32(t1, t0, b);
+        f.gen_xor_i32(t1, t0, t1);
+        f.gen_rotli_i32(t0, t0, c);
+        f.gen_xor_i32(t1, t1, t0);
+        f.gen_ext_i32_i64(d, t1);
+        self.set_gpr(a.rd, d);
+        true
+    }
+
+    /// A helper `rd = f(rs1)` without `env`.
+    fn helper_r2(&mut self, a: &arg_r2, d: &Def) -> bool {
+        let s1 = self.gpr(a.rs1);
+        let dst = self.new64();
+        self.call(d, Some(dst.into()), &[s1.into()]);
+        self.set_gpr(a.rd, dst);
+        true
+    }
+
+    /// A helper `rd = f(rs1, rs2, imm)` without `env`, `gen_aes32_sm4()`.
+    fn helper_rri(&mut self, rd: i32, rs1: i32, rs2: i32, imm: i64, d: &Def) -> bool {
+        let s1 = self.gpr(rs1);
+        let s2 = self.gpr(rs2);
+        let c = self.c64(imm);
+        let dst = self.new64();
+        self.call(d, Some(dst.into()), &[s1.into(), s2.into(), c.into()]);
+        self.set_gpr(rd, dst);
+        true
+    }
+
+    /// `sinval.vma`, `hinval.vvma` and `hinval.gvma` of Svinval: the TLB flush `d` when the
+    /// extension `ext` (S or H) is present and the hart is not in U mode.
+    fn svinval(&mut self, ext: bool, d: Option<&Def>) -> bool {
+        if !self.d.cfg.ext_svinval || !ext || self.d.priv_lvl == PRV_U {
+            return false;
+        }
+        if let Some(d) = d {
+            self.decode_save_opc(0);
+            let env = self.env();
+            self.call(d, None, &[env.into()]);
+        }
         true
     }
 
@@ -1000,6 +1236,12 @@ impl DecodeInsn32 for S<'_, '_> {
     }
 
     fn trans_jal(&mut self, a: &mut arg_jal) -> bool {
+        if !self.d.cfg.allow_16bit_insn() && a.imm & 3 != 0 {
+            let dest = self.d.pc_curr.wrapping_add(i64::from(a.imm) as u64);
+            let t = self.c64(dest as i64);
+            self.gen_exception_inst_addr_mis(t);
+            return true;
+        }
         let succ = self.d.pc_curr.wrapping_add(self.d.cur_insn_len);
         self.set_gpri(a.rd, succ as i64);
         self.gen_goto_tb(0, i64::from(a.imm));
@@ -1007,13 +1249,28 @@ impl DecodeInsn32 for S<'_, '_> {
     }
 
     fn trans_jalr(&mut self, a: &mut arg_jalr) -> bool {
-        let target = self.address(a.rs1, i64::from(a.imm));
+        // A plain add: pointer masking does not apply to the jump target.
+        let rs1 = self.gpr(a.rs1);
+        let target = self.new64();
+        self.f().gen_addi_i64(target, rs1, i64::from(a.imm));
         self.f().gen_andi_i64(target, target, -2);
+        let mut misaligned = None;
+        if !self.d.cfg.allow_16bit_insn() {
+            let l = self.f().new_label();
+            let t0 = self.new64();
+            self.f().gen_andi_i64(t0, target, 2);
+            self.f().gen_brcondi_i64(Cond::Ne, t0, 0, l);
+            misaligned = Some(l);
+        }
         let succ = self.d.pc_curr.wrapping_add(self.d.cur_insn_len);
         self.set_gpri(a.rd, succ as i64);
         let pc = self.g().pc;
         self.f().gen_mov_i64(pc, target);
         self.lookup_and_goto_ptr();
+        if let Some(l) = misaligned {
+            self.f().gen_set_label(l);
+            self.gen_exception_inst_addr_mis(target);
+        }
         true
     }
 
@@ -1205,6 +1462,9 @@ impl DecodeInsn32 for S<'_, '_> {
     }
 
     fn trans_pause(&mut self, _a: &mut arg_pause) -> bool {
+        if !self.d.cfg.ext_zihintpause {
+            return false;
+        }
         // PAUSE is a no-op in QEMU, end the TB and return to main loop.
         self.end_tb_next();
         true
@@ -1217,6 +1477,9 @@ impl DecodeInsn32 for S<'_, '_> {
     }
 
     fn trans_fence_i(&mut self, _a: &mut arg_fence_i) -> bool {
+        if !self.d.cfg.ext_zifencei {
+            return false;
+        }
         // FENCE_I is a no-op in QEMU, however we need to end the translation block.
         self.end_tb_next();
         true
@@ -1305,6 +1568,9 @@ impl DecodeInsn32 for S<'_, '_> {
     }
 
     fn trans_sret(&mut self, _a: &mut arg_sret) -> bool {
+        if !self.d.cfg.has(RVS) {
+            return false;
+        }
         self.decode_save_opc(0);
         self.update_pc(0);
         let pc = self.g().pc;
@@ -1343,150 +1609,258 @@ impl DecodeInsn32 for S<'_, '_> {
     // M.
 
     fn trans_mul(&mut self, a: &mut arg_mul) -> bool {
+        if !(self.d.cfg.ext_zmmul || self.d.cfg.has(RVM)) {
+            return false;
+        }
         self.arith(a, Func::gen_mul_i64)
     }
 
     fn trans_mulh(&mut self, a: &mut arg_mulh) -> bool {
+        if !(self.d.cfg.ext_zmmul || self.d.cfg.has(RVM)) {
+            return false;
+        }
         self.arith(a, gen_mulh)
     }
 
     fn trans_mulhsu(&mut self, a: &mut arg_mulhsu) -> bool {
+        if !(self.d.cfg.ext_zmmul || self.d.cfg.has(RVM)) {
+            return false;
+        }
         self.arith(a, gen_mulhsu)
     }
 
     fn trans_mulhu(&mut self, a: &mut arg_mulhu) -> bool {
+        if !(self.d.cfg.ext_zmmul || self.d.cfg.has(RVM)) {
+            return false;
+        }
         self.arith(a, gen_mulhu)
     }
 
     fn trans_div(&mut self, a: &mut arg_div) -> bool {
+        if !self.d.cfg.has(RVM) {
+            return false;
+        }
         self.div_op(a, true, false, false)
     }
 
     fn trans_divu(&mut self, a: &mut arg_divu) -> bool {
+        if !self.d.cfg.has(RVM) {
+            return false;
+        }
         self.div_op(a, false, false, false)
     }
 
     fn trans_rem(&mut self, a: &mut arg_rem) -> bool {
+        if !self.d.cfg.has(RVM) {
+            return false;
+        }
         self.div_op(a, true, true, false)
     }
 
     fn trans_remu(&mut self, a: &mut arg_remu) -> bool {
+        if !self.d.cfg.has(RVM) {
+            return false;
+        }
         self.div_op(a, false, true, false)
     }
 
     fn trans_mulw(&mut self, a: &mut arg_mulw) -> bool {
+        if !(self.d.cfg.ext_zmmul || self.d.cfg.has(RVM)) {
+            return false;
+        }
         self.arith_w(a, Func::gen_mul_i64)
     }
 
     fn trans_divw(&mut self, a: &mut arg_divw) -> bool {
+        if !self.d.cfg.has(RVM) {
+            return false;
+        }
         self.div_op(a, true, false, true)
     }
 
     fn trans_divuw(&mut self, a: &mut arg_divuw) -> bool {
+        if !self.d.cfg.has(RVM) {
+            return false;
+        }
         self.div_op(a, false, false, true)
     }
 
     fn trans_remw(&mut self, a: &mut arg_remw) -> bool {
+        if !self.d.cfg.has(RVM) {
+            return false;
+        }
         self.div_op(a, true, true, true)
     }
 
     fn trans_remuw(&mut self, a: &mut arg_remuw) -> bool {
+        if !self.d.cfg.has(RVM) {
+            return false;
+        }
         self.div_op(a, false, true, true)
     }
 
     // A.
 
     fn trans_lr_w(&mut self, a: &mut arg_lr_w) -> bool {
+        if !(self.d.cfg.ext_zalrsc || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.lr(a, MemOp::LESL)
     }
 
     fn trans_sc_w(&mut self, a: &mut arg_sc_w) -> bool {
+        if !(self.d.cfg.ext_zalrsc || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.sc(a, MemOp::LESL)
     }
 
     fn trans_lr_d(&mut self, a: &mut arg_lr_d) -> bool {
+        if !(self.d.cfg.ext_zalrsc || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.lr(a, MemOp::LEUQ)
     }
 
     fn trans_sc_d(&mut self, a: &mut arg_sc_d) -> bool {
+        if !(self.d.cfg.ext_zalrsc || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.sc(a, MemOp::LEUQ)
     }
 
     fn trans_amoswap_w(&mut self, a: &mut arg_amoswap_w) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::Xchg, MemOp::LESL)
     }
 
     fn trans_amoadd_w(&mut self, a: &mut arg_amoadd_w) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchAdd, MemOp::LESL)
     }
 
     fn trans_amoxor_w(&mut self, a: &mut arg_amoxor_w) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchXor, MemOp::LESL)
     }
 
     fn trans_amoand_w(&mut self, a: &mut arg_amoand_w) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchAnd, MemOp::LESL)
     }
 
     fn trans_amoor_w(&mut self, a: &mut arg_amoor_w) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchOr, MemOp::LESL)
     }
 
     fn trans_amomin_w(&mut self, a: &mut arg_amomin_w) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchSmin, MemOp::LESL)
     }
 
     fn trans_amomax_w(&mut self, a: &mut arg_amomax_w) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchSmax, MemOp::LESL)
     }
 
     fn trans_amominu_w(&mut self, a: &mut arg_amominu_w) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchUmin, MemOp::LESL)
     }
 
     fn trans_amomaxu_w(&mut self, a: &mut arg_amomaxu_w) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchUmax, MemOp::LESL)
     }
 
     fn trans_amoswap_d(&mut self, a: &mut arg_amoswap_d) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::Xchg, MemOp::LEUQ)
     }
 
     fn trans_amoadd_d(&mut self, a: &mut arg_amoadd_d) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchAdd, MemOp::LEUQ)
     }
 
     fn trans_amoxor_d(&mut self, a: &mut arg_amoxor_d) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchXor, MemOp::LEUQ)
     }
 
     fn trans_amoand_d(&mut self, a: &mut arg_amoand_d) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchAnd, MemOp::LEUQ)
     }
 
     fn trans_amoor_d(&mut self, a: &mut arg_amoor_d) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchOr, MemOp::LEUQ)
     }
 
     fn trans_amomin_d(&mut self, a: &mut arg_amomin_d) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchSmin, MemOp::LEUQ)
     }
 
     fn trans_amomax_d(&mut self, a: &mut arg_amomax_d) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchSmax, MemOp::LEUQ)
     }
 
     fn trans_amominu_d(&mut self, a: &mut arg_amominu_d) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchUmin, MemOp::LEUQ)
     }
 
     fn trans_amomaxu_d(&mut self, a: &mut arg_amomaxu_d) -> bool {
+        if !(self.d.cfg.ext_zaamo || self.d.cfg.has(RVA)) {
+            return false;
+        }
         self.amo(a, AtomicOp::FetchUmax, MemOp::LEUQ)
     }
 
     // Zawrs.
 
     fn trans_wrs_nto(&mut self, _a: &mut arg_wrs_nto) -> bool {
+        if !self.d.cfg.ext_zawrs {
+            return false;
+        }
         // We only get here when wrs.nto is not reached by an interrupt; it may still be
         // illegal for the privilege level.
         self.decode_save_opc(0);
@@ -1496,58 +1870,97 @@ impl DecodeInsn32 for S<'_, '_> {
     }
 
     fn trans_wrs_sto(&mut self, _a: &mut arg_wrs_sto) -> bool {
+        if !self.d.cfg.ext_zawrs {
+            return false;
+        }
         self.wrs()
     }
 
     // Zicbom and Zicboz.
 
     fn trans_cbo_clean(&mut self, a: &mut arg_cbo_clean) -> bool {
+        if !self.d.cfg.ext_zicbom {
+            return false;
+        }
         self.cbo(a, &helpers::CBO_CLEAN_FLUSH)
     }
 
     fn trans_cbo_flush(&mut self, a: &mut arg_cbo_flush) -> bool {
+        if !self.d.cfg.ext_zicbom {
+            return false;
+        }
         self.cbo(a, &helpers::CBO_CLEAN_FLUSH)
     }
 
     fn trans_cbo_inval(&mut self, a: &mut arg_cbo_inval) -> bool {
+        if !self.d.cfg.ext_zicbom {
+            return false;
+        }
         self.cbo(a, &helpers::CBO_INVAL)
     }
 
     fn trans_cbo_zero(&mut self, a: &mut arg_cbo_zero) -> bool {
+        if !self.d.cfg.ext_zicboz {
+            return false;
+        }
         self.cbo(a, &helpers::CBO_ZERO)
     }
 
     // Zba.
 
     fn trans_sh1add(&mut self, a: &mut arg_sh1add) -> bool {
+        if !self.d.cfg.ext_zba {
+            return false;
+        }
         self.shadd(a, 1, false)
     }
 
     fn trans_sh2add(&mut self, a: &mut arg_sh2add) -> bool {
+        if !self.d.cfg.ext_zba {
+            return false;
+        }
         self.shadd(a, 2, false)
     }
 
     fn trans_sh3add(&mut self, a: &mut arg_sh3add) -> bool {
+        if !self.d.cfg.ext_zba {
+            return false;
+        }
         self.shadd(a, 3, false)
     }
 
     fn trans_add_uw(&mut self, a: &mut arg_add_uw) -> bool {
+        if !self.d.cfg.ext_zba {
+            return false;
+        }
         self.shadd(a, 0, true)
     }
 
     fn trans_sh1add_uw(&mut self, a: &mut arg_sh1add_uw) -> bool {
+        if !self.d.cfg.ext_zba {
+            return false;
+        }
         self.shadd(a, 1, true)
     }
 
     fn trans_sh2add_uw(&mut self, a: &mut arg_sh2add_uw) -> bool {
+        if !self.d.cfg.ext_zba {
+            return false;
+        }
         self.shadd(a, 2, true)
     }
 
     fn trans_sh3add_uw(&mut self, a: &mut arg_sh3add_uw) -> bool {
+        if !self.d.cfg.ext_zba {
+            return false;
+        }
         self.shadd(a, 3, true)
     }
 
     fn trans_slli_uw(&mut self, a: &mut arg_slli_uw) -> bool {
+        if !self.d.cfg.ext_zba {
+            return false;
+        }
         if a.shamt >= 64 {
             return false;
         }
@@ -1566,100 +1979,172 @@ impl DecodeInsn32 for S<'_, '_> {
     // Zbb.
 
     fn trans_andn(&mut self, a: &mut arg_andn) -> bool {
+        if !(self.d.cfg.ext_zbb || self.d.cfg.ext_zbkb) {
+            return false;
+        }
         self.arith(a, Func::gen_andc_i64)
     }
 
     fn trans_orn(&mut self, a: &mut arg_orn) -> bool {
+        if !(self.d.cfg.ext_zbb || self.d.cfg.ext_zbkb) {
+            return false;
+        }
         self.arith(a, Func::gen_orc_i64)
     }
 
     fn trans_xnor(&mut self, a: &mut arg_xnor) -> bool {
+        if !(self.d.cfg.ext_zbb || self.d.cfg.ext_zbkb) {
+            return false;
+        }
         self.arith(a, Func::gen_eqv_i64)
     }
 
     fn trans_clz(&mut self, a: &mut arg_clz) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.unary(a, gen_clz)
     }
 
     fn trans_ctz(&mut self, a: &mut arg_ctz) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.unary(a, gen_ctz)
     }
 
     fn trans_cpop(&mut self, a: &mut arg_cpop) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.unary(a, Func::gen_ctpop_i64)
     }
 
     fn trans_clzw(&mut self, a: &mut arg_clzw) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.unary(a, gen_clzw)
     }
 
     fn trans_ctzw(&mut self, a: &mut arg_ctzw) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.unary(a, gen_ctzw)
     }
 
     fn trans_cpopw(&mut self, a: &mut arg_cpopw) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.unary(a, gen_cpopw)
     }
 
     fn trans_max(&mut self, a: &mut arg_max) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.arith(a, Func::gen_smax_i64)
     }
 
     fn trans_maxu(&mut self, a: &mut arg_maxu) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.arith(a, Func::gen_umax_i64)
     }
 
     fn trans_min(&mut self, a: &mut arg_min) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.arith(a, Func::gen_smin_i64)
     }
 
     fn trans_minu(&mut self, a: &mut arg_minu) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.arith(a, Func::gen_umin_i64)
     }
 
     fn trans_sext_b(&mut self, a: &mut arg_sext_b) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.unary(a, Func::gen_ext8s_i64)
     }
 
     fn trans_sext_h(&mut self, a: &mut arg_sext_h) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.unary(a, Func::gen_ext16s_i64)
     }
 
     fn trans_zext_h_64(&mut self, a: &mut arg_zext_h_64) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.unary(a, Func::gen_ext16u_i64)
     }
 
     fn trans_rev8_64(&mut self, a: &mut arg_rev8_64) -> bool {
+        if !(self.d.cfg.ext_zbb || self.d.cfg.ext_zbkb) {
+            return false;
+        }
         self.unary(a, Func::gen_bswap64_i64)
     }
 
     fn trans_orc_b(&mut self, a: &mut arg_orc_b) -> bool {
+        if !self.d.cfg.ext_zbb {
+            return false;
+        }
         self.unary(a, gen_orc_b)
     }
 
     fn trans_rol(&mut self, a: &mut arg_rol) -> bool {
+        if !(self.d.cfg.ext_zbb || self.d.cfg.ext_zbkb) {
+            return false;
+        }
         self.shift(a, Func::gen_rotl_i64)
     }
 
     fn trans_ror(&mut self, a: &mut arg_ror) -> bool {
+        if !(self.d.cfg.ext_zbb || self.d.cfg.ext_zbkb) {
+            return false;
+        }
         self.shift(a, Func::gen_rotr_i64)
     }
 
     fn trans_rori(&mut self, a: &mut arg_rori) -> bool {
+        if !(self.d.cfg.ext_zbb || self.d.cfg.ext_zbkb) {
+            return false;
+        }
         self.shift_imm(a, Func::gen_rotri_i64)
     }
 
     fn trans_rolw(&mut self, a: &mut arg_rolw) -> bool {
+        if !(self.d.cfg.ext_zbb || self.d.cfg.ext_zbkb) {
+            return false;
+        }
         let amt = self.gpr(a.rs2);
         self.rot_w(a.rd, a.rs1, amt, true)
     }
 
     fn trans_rorw(&mut self, a: &mut arg_rorw) -> bool {
+        if !(self.d.cfg.ext_zbb || self.d.cfg.ext_zbkb) {
+            return false;
+        }
         let amt = self.gpr(a.rs2);
         self.rot_w(a.rd, a.rs1, amt, false)
     }
 
     fn trans_roriw(&mut self, a: &mut arg_roriw) -> bool {
+        if !(self.d.cfg.ext_zbb || self.d.cfg.ext_zbkb) {
+            return false;
+        }
         if a.shamt >= 32 {
             return false;
         }
@@ -1670,10 +2155,16 @@ impl DecodeInsn32 for S<'_, '_> {
     // Zbc.
 
     fn trans_clmul(&mut self, a: &mut arg_clmul) -> bool {
+        if !(self.d.cfg.ext_zbc || self.d.cfg.ext_zbkc) {
+            return false;
+        }
         self.helper_rr(a, &helpers::CLMUL)
     }
 
     fn trans_clmulh(&mut self, a: &mut arg_clmulh) -> bool {
+        if !(self.d.cfg.ext_zbc || self.d.cfg.ext_zbkc) {
+            return false;
+        }
         // clmulh is clmulr shifted right by one.
         let s1 = self.gpr(a.rs1);
         let s2 = self.gpr(a.rs2);
@@ -1685,41 +2176,476 @@ impl DecodeInsn32 for S<'_, '_> {
     }
 
     fn trans_clmulr(&mut self, a: &mut arg_clmulr) -> bool {
+        if !self.d.cfg.ext_zbc {
+            return false;
+        }
         self.helper_rr(a, &helpers::CLMULR)
     }
 
     // Zbs.
 
     fn trans_bclr(&mut self, a: &mut arg_bclr) -> bool {
+        if !self.d.cfg.ext_zbs {
+            return false;
+        }
         self.bit_op(a, BitOp::Clr)
     }
 
     fn trans_bclri(&mut self, a: &mut arg_bclri) -> bool {
+        if !self.d.cfg.ext_zbs {
+            return false;
+        }
         self.bit_op_imm(a, BitOp::Clr)
     }
 
     fn trans_bext(&mut self, a: &mut arg_bext) -> bool {
+        if !self.d.cfg.ext_zbs {
+            return false;
+        }
         self.bit_op(a, BitOp::Ext)
     }
 
     fn trans_bexti(&mut self, a: &mut arg_bexti) -> bool {
+        if !self.d.cfg.ext_zbs {
+            return false;
+        }
         self.bit_op_imm(a, BitOp::Ext)
     }
 
     fn trans_binv(&mut self, a: &mut arg_binv) -> bool {
+        if !self.d.cfg.ext_zbs {
+            return false;
+        }
         self.bit_op(a, BitOp::Inv)
     }
 
     fn trans_binvi(&mut self, a: &mut arg_binvi) -> bool {
+        if !self.d.cfg.ext_zbs {
+            return false;
+        }
         self.bit_op_imm(a, BitOp::Inv)
     }
 
     fn trans_bset(&mut self, a: &mut arg_bset) -> bool {
+        if !self.d.cfg.ext_zbs {
+            return false;
+        }
         self.bit_op(a, BitOp::Set)
     }
 
     fn trans_bseti(&mut self, a: &mut arg_bseti) -> bool {
+        if !self.d.cfg.ext_zbs {
+            return false;
+        }
         self.bit_op_imm(a, BitOp::Set)
+    }
+
+    // Zbkb.
+
+    fn trans_pack(&mut self, a: &mut arg_pack) -> bool {
+        if !self.d.cfg.ext_zbkb {
+            return false;
+        }
+        self.arith(a, |f, d, a, b| f.gen_deposit_i64(d, a, b, 32, 32))
+    }
+
+    fn trans_packh(&mut self, a: &mut arg_packh) -> bool {
+        if !self.d.cfg.ext_zbkb {
+            return false;
+        }
+        self.arith(a, |f, d, a, b| {
+            let t = f.temp_new_i64();
+            f.gen_ext8u_i64(t, b);
+            f.gen_deposit_i64(d, a, t, 8, 56);
+        })
+    }
+
+    fn trans_packw(&mut self, a: &mut arg_packw) -> bool {
+        if !self.d.cfg.ext_zbkb {
+            return false;
+        }
+        self.arith(a, |f, d, a, b| {
+            let t = f.temp_new_i64();
+            f.gen_ext16s_i64(t, b);
+            f.gen_deposit_i64(d, a, t, 16, 48);
+        })
+    }
+
+    fn trans_brev8(&mut self, a: &mut arg_brev8) -> bool {
+        if !self.d.cfg.ext_zbkb {
+            return false;
+        }
+        self.helper_r2(a, &helpers::BREV8)
+    }
+
+    // Zbkx.
+
+    fn trans_xperm4(&mut self, a: &mut arg_xperm4) -> bool {
+        if !self.d.cfg.ext_zbkx {
+            return false;
+        }
+        self.helper_rr(a, &helpers::XPERM4)
+    }
+
+    fn trans_xperm8(&mut self, a: &mut arg_xperm8) -> bool {
+        if !self.d.cfg.ext_zbkx {
+            return false;
+        }
+        self.helper_rr(a, &helpers::XPERM8)
+    }
+
+    // Zknd, Zkne, Zknh, Zksed and Zksh. The RV32 only instructions keep the default.
+
+    fn trans_aes64es(&mut self, a: &mut arg_aes64es) -> bool {
+        if !self.d.cfg.ext_zkne {
+            return false;
+        }
+        self.helper_rr(a, &crypto::AES64ES)
+    }
+
+    fn trans_aes64esm(&mut self, a: &mut arg_aes64esm) -> bool {
+        if !self.d.cfg.ext_zkne {
+            return false;
+        }
+        self.helper_rr(a, &crypto::AES64ESM)
+    }
+
+    fn trans_aes64ds(&mut self, a: &mut arg_aes64ds) -> bool {
+        if !self.d.cfg.ext_zknd {
+            return false;
+        }
+        self.helper_rr(a, &crypto::AES64DS)
+    }
+
+    fn trans_aes64dsm(&mut self, a: &mut arg_aes64dsm) -> bool {
+        if !self.d.cfg.ext_zknd {
+            return false;
+        }
+        self.helper_rr(a, &crypto::AES64DSM)
+    }
+
+    fn trans_aes64ks2(&mut self, a: &mut arg_aes64ks2) -> bool {
+        if !(self.d.cfg.ext_zknd || self.d.cfg.ext_zkne) {
+            return false;
+        }
+        self.helper_rr(a, &crypto::AES64KS2)
+    }
+
+    fn trans_aes64ks1i(&mut self, a: &mut arg_aes64ks1i) -> bool {
+        if !(self.d.cfg.ext_zknd || self.d.cfg.ext_zkne) {
+            return false;
+        }
+        if a.imm > 0xa {
+            return false;
+        }
+        let s1 = self.gpr(a.rs1);
+        let c = self.c64(i64::from(a.imm));
+        let dst = self.new64();
+        self.call(&crypto::AES64KS1I, Some(dst.into()), &[s1.into(), c.into()]);
+        self.set_gpr(a.rd, dst);
+        true
+    }
+
+    fn trans_aes64im(&mut self, a: &mut arg_aes64im) -> bool {
+        if !self.d.cfg.ext_zknd {
+            return false;
+        }
+        self.helper_r2(a, &crypto::AES64IM)
+    }
+
+    fn trans_sha256sig0(&mut self, a: &mut arg_sha256sig0) -> bool {
+        if !self.d.cfg.ext_zknh {
+            return false;
+        }
+        self.sha256(a, Func::gen_shri_i32, [7, 18, 3])
+    }
+
+    fn trans_sha256sig1(&mut self, a: &mut arg_sha256sig1) -> bool {
+        if !self.d.cfg.ext_zknh {
+            return false;
+        }
+        self.sha256(a, Func::gen_shri_i32, [17, 19, 10])
+    }
+
+    fn trans_sha256sum0(&mut self, a: &mut arg_sha256sum0) -> bool {
+        if !self.d.cfg.ext_zknh {
+            return false;
+        }
+        self.sha256(a, Func::gen_rotri_i32, [2, 13, 22])
+    }
+
+    fn trans_sha256sum1(&mut self, a: &mut arg_sha256sum1) -> bool {
+        if !self.d.cfg.ext_zknh {
+            return false;
+        }
+        self.sha256(a, Func::gen_rotri_i32, [6, 11, 25])
+    }
+
+    fn trans_sha512sig0(&mut self, a: &mut arg_sha512sig0) -> bool {
+        if !self.d.cfg.ext_zknh {
+            return false;
+        }
+        self.sha512(a, Func::gen_shri_i64, [1, 8, 7])
+    }
+
+    fn trans_sha512sig1(&mut self, a: &mut arg_sha512sig1) -> bool {
+        if !self.d.cfg.ext_zknh {
+            return false;
+        }
+        self.sha512(a, Func::gen_shri_i64, [19, 61, 6])
+    }
+
+    fn trans_sha512sum0(&mut self, a: &mut arg_sha512sum0) -> bool {
+        if !self.d.cfg.ext_zknh {
+            return false;
+        }
+        self.sha512(a, Func::gen_rotri_i64, [28, 34, 39])
+    }
+
+    fn trans_sha512sum1(&mut self, a: &mut arg_sha512sum1) -> bool {
+        if !self.d.cfg.ext_zknh {
+            return false;
+        }
+        self.sha512(a, Func::gen_rotri_i64, [14, 18, 41])
+    }
+
+    fn trans_sm3p0(&mut self, a: &mut arg_sm3p0) -> bool {
+        if !self.d.cfg.ext_zksh {
+            return false;
+        }
+        self.sm3(a, 9, 17)
+    }
+
+    fn trans_sm3p1(&mut self, a: &mut arg_sm3p1) -> bool {
+        if !self.d.cfg.ext_zksh {
+            return false;
+        }
+        self.sm3(a, 15, 23)
+    }
+
+    fn trans_sm4ed(&mut self, a: &mut arg_sm4ed) -> bool {
+        if !self.d.cfg.ext_zksed {
+            return false;
+        }
+        self.helper_rri(a.rd, a.rs1, a.rs2, i64::from(a.shamt), &crypto::SM4ED)
+    }
+
+    fn trans_sm4ks(&mut self, a: &mut arg_sm4ks) -> bool {
+        if !self.d.cfg.ext_zksed {
+            return false;
+        }
+        self.helper_rri(a.rd, a.rs1, a.rs2, i64::from(a.shamt), &crypto::SM4KS)
+    }
+
+    // Zicond.
+
+    fn trans_czero_eqz(&mut self, a: &mut arg_czero_eqz) -> bool {
+        if !self.d.cfg.ext_zicond {
+            return false;
+        }
+        self.czero(a, Cond::Eq)
+    }
+
+    fn trans_czero_nez(&mut self, a: &mut arg_czero_nez) -> bool {
+        if !self.d.cfg.ext_zicond {
+            return false;
+        }
+        self.czero(a, Cond::Ne)
+    }
+
+    // Zimop.
+
+    fn trans_mop_r_n(&mut self, a: &mut arg_mop_r_n) -> bool {
+        if !self.d.cfg.ext_zimop {
+            return false;
+        }
+        self.set_gpri(a.rd, 0);
+        true
+    }
+
+    fn trans_mop_rr_n(&mut self, a: &mut arg_mop_rr_n) -> bool {
+        if !self.d.cfg.ext_zimop {
+            return false;
+        }
+        self.set_gpri(a.rd, 0);
+        true
+    }
+
+    // Svinval.
+
+    fn trans_sinval_vma(&mut self, _a: &mut arg_sinval_vma) -> bool {
+        // Do the same as sfence.vma currently.
+        let rvs = self.d.cfg.has(RVS);
+        self.svinval(rvs, Some(&helpers::TLB_FLUSH))
+    }
+
+    fn trans_sfence_w_inval(&mut self, _a: &mut arg_sfence_w_inval) -> bool {
+        // Do nothing currently.
+        let rvs = self.d.cfg.has(RVS);
+        self.svinval(rvs, None)
+    }
+
+    fn trans_sfence_inval_ir(&mut self, _a: &mut arg_sfence_inval_ir) -> bool {
+        // Do nothing currently.
+        let rvs = self.d.cfg.has(RVS);
+        self.svinval(rvs, None)
+    }
+
+    fn trans_hinval_vvma(&mut self, _a: &mut arg_hinval_vvma) -> bool {
+        // Do the same as hfence.vvma currently.
+        let rvh = self.d.cfg.ext_h();
+        self.svinval(rvh, Some(&helpers::HYP_TLB_FLUSH))
+    }
+
+    fn trans_hinval_gvma(&mut self, _a: &mut arg_hinval_gvma) -> bool {
+        // Do the same as hfence.gvma currently.
+        let rvh = self.d.cfg.ext_h();
+        self.svinval(rvh, Some(&helpers::HYP_GVMA_TLB_FLUSH))
+    }
+
+    // Zacas.
+
+    fn trans_amocas_w(&mut self, a: &mut arg_amocas_w) -> bool {
+        if !self.d.cfg.ext_zacas {
+            return false;
+        }
+        self.cmpxchg(a, MemOp::ALIGN | MemOp::LESL)
+    }
+
+    fn trans_amocas_d(&mut self, a: &mut arg_amocas_d) -> bool {
+        if !self.d.cfg.ext_zacas {
+            return false;
+        }
+        self.cmpxchg(a, MemOp::ALIGN | MemOp::LEUQ)
+    }
+
+    fn trans_amocas_q(&mut self, a: &mut arg_amocas_q) -> bool {
+        if !self.d.cfg.ext_zacas {
+            return false;
+        }
+        self.cmpxchg_q(a)
+    }
+
+    // Zabha.
+
+    fn trans_amoswap_b(&mut self, a: &mut arg_amoswap_b) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::Xchg, MemOp::SB)
+    }
+
+    fn trans_amoadd_b(&mut self, a: &mut arg_amoadd_b) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchAdd, MemOp::SB)
+    }
+
+    fn trans_amoxor_b(&mut self, a: &mut arg_amoxor_b) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchXor, MemOp::SB)
+    }
+
+    fn trans_amoand_b(&mut self, a: &mut arg_amoand_b) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchAnd, MemOp::SB)
+    }
+
+    fn trans_amoor_b(&mut self, a: &mut arg_amoor_b) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchOr, MemOp::SB)
+    }
+
+    fn trans_amomin_b(&mut self, a: &mut arg_amomin_b) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchSmin, MemOp::SB)
+    }
+
+    fn trans_amomax_b(&mut self, a: &mut arg_amomax_b) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchSmax, MemOp::SB)
+    }
+
+    fn trans_amominu_b(&mut self, a: &mut arg_amominu_b) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchUmin, MemOp::SB)
+    }
+
+    fn trans_amomaxu_b(&mut self, a: &mut arg_amomaxu_b) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchUmax, MemOp::SB)
+    }
+
+    fn trans_amoswap_h(&mut self, a: &mut arg_amoswap_h) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::Xchg, MemOp::LESW)
+    }
+
+    fn trans_amoadd_h(&mut self, a: &mut arg_amoadd_h) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchAdd, MemOp::LESW)
+    }
+
+    fn trans_amoxor_h(&mut self, a: &mut arg_amoxor_h) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchXor, MemOp::LESW)
+    }
+
+    fn trans_amoand_h(&mut self, a: &mut arg_amoand_h) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchAnd, MemOp::LESW)
+    }
+
+    fn trans_amoor_h(&mut self, a: &mut arg_amoor_h) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchOr, MemOp::LESW)
+    }
+
+    fn trans_amomin_h(&mut self, a: &mut arg_amomin_h) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchSmin, MemOp::LESW)
+    }
+
+    fn trans_amomax_h(&mut self, a: &mut arg_amomax_h) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchSmax, MemOp::LESW)
+    }
+
+    fn trans_amominu_h(&mut self, a: &mut arg_amominu_h) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchUmin, MemOp::LESW)
+    }
+
+    fn trans_amomaxu_h(&mut self, a: &mut arg_amomaxu_h) -> bool {
+        self.d.cfg.ext_zabha && self.amo(a, AtomicOp::FetchUmax, MemOp::LESW)
+    }
+
+    fn trans_amocas_b(&mut self, a: &mut arg_amocas_b) -> bool {
+        if !(self.d.cfg.ext_zacas && self.d.cfg.ext_zabha) {
+            return false;
+        }
+        self.cmpxchg(a, MemOp::SB)
+    }
+
+    fn trans_amocas_h(&mut self, a: &mut arg_amocas_h) -> bool {
+        if !(self.d.cfg.ext_zacas && self.d.cfg.ext_zabha) {
+            return false;
+        }
+        self.cmpxchg(a, MemOp::ALIGN | MemOp::LESW)
+    }
+
+    // Zalasr.
+
+    fn trans_lb_aqrl(&mut self, a: &mut arg_lb_aqrl) -> bool {
+        self.d.cfg.ext_zalasr && self.load_acquire(a, MemOp::SB)
+    }
+
+    fn trans_lh_aqrl(&mut self, a: &mut arg_lh_aqrl) -> bool {
+        self.d.cfg.ext_zalasr && self.load_acquire(a, MemOp::LESW)
+    }
+
+    fn trans_lw_aqrl(&mut self, a: &mut arg_lw_aqrl) -> bool {
+        self.d.cfg.ext_zalasr && self.load_acquire(a, MemOp::LESL)
+    }
+
+    fn trans_ld_aqrl(&mut self, a: &mut arg_ld_aqrl) -> bool {
+        self.d.cfg.ext_zalasr && self.load_acquire(a, MemOp::LEUQ)
+    }
+
+    fn trans_sb_aqrl(&mut self, a: &mut arg_sb_aqrl) -> bool {
+        self.d.cfg.ext_zalasr && self.store_release(a, MemOp::SB)
+    }
+
+    fn trans_sh_aqrl(&mut self, a: &mut arg_sh_aqrl) -> bool {
+        self.d.cfg.ext_zalasr && self.store_release(a, MemOp::LESW)
+    }
+
+    fn trans_sw_aqrl(&mut self, a: &mut arg_sw_aqrl) -> bool {
+        self.d.cfg.ext_zalasr && self.store_release(a, MemOp::LESL)
+    }
+
+    fn trans_sd_aqrl(&mut self, a: &mut arg_sd_aqrl) -> bool {
+        self.d.cfg.ext_zalasr && self.store_release(a, MemOp::LEUQ)
     }
 
     translate_fp::fp_trans32!();
@@ -1765,6 +2691,64 @@ impl DecodeInsn16 for S<'_, '_> {
     fn trans_c64_illegal(&mut self, _a: &mut arg_empty) -> bool {
         self.gen_exception_illegal();
         true
+    }
+
+    // Zcmop.
+
+    fn trans_c_mop_n(&mut self, _a: &mut arg_c_mop_n) -> bool {
+        self.d.cfg.ext_zcmop
+    }
+
+    // Zcb.
+
+    fn trans_c_zext_b(&mut self, a: &mut arg_r2) -> bool {
+        self.d.cfg.ext_zcb && self.unary(a, Func::gen_ext8u_i64)
+    }
+
+    fn trans_c_zext_h(&mut self, a: &mut arg_r2) -> bool {
+        self.d.cfg.ext_zcb && self.d.cfg.ext_zbb && self.unary(a, Func::gen_ext16u_i64)
+    }
+
+    fn trans_c_sext_b(&mut self, a: &mut arg_r2) -> bool {
+        self.d.cfg.ext_zcb && self.d.cfg.ext_zbb && self.unary(a, Func::gen_ext8s_i64)
+    }
+
+    fn trans_c_sext_h(&mut self, a: &mut arg_r2) -> bool {
+        self.d.cfg.ext_zcb && self.d.cfg.ext_zbb && self.unary(a, Func::gen_ext16s_i64)
+    }
+
+    fn trans_c_zext_w(&mut self, a: &mut arg_r2) -> bool {
+        self.d.cfg.ext_zcb && self.d.cfg.ext_zba && self.unary(a, Func::gen_ext32u_i64)
+    }
+
+    fn trans_c_not(&mut self, a: &mut arg_r2) -> bool {
+        self.d.cfg.ext_zcb && self.unary(a, Func::gen_not_i64)
+    }
+
+    fn trans_c_mul(&mut self, a: &mut arg_r) -> bool {
+        self.d.cfg.ext_zcb
+            && (self.d.cfg.has(RVM) || self.d.cfg.ext_zmmul)
+            && self.arith(a, Func::gen_mul_i64)
+    }
+
+    fn trans_c_lbu(&mut self, a: &mut arg_i) -> bool {
+        self.d.cfg.ext_zcb && self.load(a, MemOp::UB)
+    }
+
+    fn trans_c_lhu(&mut self, a: &mut arg_i) -> bool {
+        self.d.cfg.ext_zcb && self.load(a, MemOp::LEUW)
+    }
+
+    fn trans_c_lh(&mut self, a: &mut arg_i) -> bool {
+        self.d.cfg.ext_zcb && self.load(a, MemOp::LESW)
+    }
+
+    fn trans_c_sb(&mut self, a: &mut arg_s) -> bool {
+        self.d.cfg.ext_zcb && self.store(a, MemOp::UB)
+    }
+
+    fn trans_c_sh(&mut self, a: &mut arg_s) -> bool {
+        self.d.cfg.ext_zcb && self.store(a, MemOp::LEUW)
     }
 
     translate_fp::fp_trans16!();
@@ -1849,6 +2833,7 @@ impl TranslatorOps for DisasContext {
         self.mem_idx = flags & TB_MEM_IDX_MASK;
         self.priv_lvl = u64::from((flags >> TB_PRIV_SHIFT) & 3);
         self.virt_enabled = flags & TB_VIRT != 0;
+        self.pm = PointerMask::from_tb_flags(flags);
         self.mstatus_fs = u64::from((flags >> TB_FS_SHIFT) & 3);
         self.mstatus_vs = u64::from((flags >> TB_VS_SHIFT) & 3);
         self.vill = flags & TB_VILL != 0;
@@ -1882,8 +2867,10 @@ impl TranslatorOps for DisasContext {
         if self.cur_insn_len == 2 {
             self.opcode = u64::from(opcode16);
             self.semihost_seq = false;
+            // Zca is the C extension without the floating point loads and stores.
+            let c = self.cfg.has(RVC) || self.cfg.ext_zca;
             let mut s = S { d: self, b: db };
-            if !decode16(&mut s, opcode16) {
+            if !(c && decode16(&mut s, opcode16)) {
                 s.gen_exception_illegal();
             }
         } else {

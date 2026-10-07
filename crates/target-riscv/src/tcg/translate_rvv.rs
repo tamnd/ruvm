@@ -17,6 +17,7 @@
 //!   register loads and stores swap the bytes of each 64-bit chunk on a big endian host.
 
 use ruvm_jit_core::ir::TempI64;
+use ruvm_jit_core::types::mo;
 use ruvm_jit_core::{MemOp, Temp};
 
 use super::helpers::Def;
@@ -455,19 +456,20 @@ impl S<'_, '_> {
         } else {
             self.gpr(rs1)
         };
-        let x0 = self.c64(i64::from(rd == 0 && rs1 == 0));
+        let x0 = if rd == 0 && rs1 == 0 { vector::VSETVL_X0 } else { 0 };
         self.gen_vsetvl(rd, s1, s2, x0)
     }
 
     /// The rest of `do_vsetvl()` and `do_vsetivli()`: `vsetvl` changes the translation
     /// state, so the block ends.
-    fn gen_vsetvl(&mut self, rd: i32, s1: TempI64, s2: TempI64, x0: TempI64) -> bool {
+    fn gen_vsetvl(&mut self, rd: i32, s1: TempI64, s2: TempI64, x0: u64) -> bool {
+        let flags = self.c64((vector::vsetvl_flags(&self.d.cfg) | x0) as i64);
         let dst = self.new64();
         let env = self.env();
         self.call(
             &vector::VSETVL,
             Some(dst.into()),
-            &[env.into(), s1.into(), s2.into(), x0.into()],
+            &[env.into(), s1.into(), s2.into(), flags.into()],
         );
         self.set_gpr(rd, dst);
         self.finalize_rvv_inst();
@@ -495,8 +497,7 @@ impl S<'_, '_> {
         }
         let s1 = self.c64(i64::from(uimm));
         let s2 = self.c64(i64::from(zimm));
-        let x0 = self.c64(0);
-        self.gen_vsetvl(rd, s1, s2, x0)
+        self.gen_vsetvl(rd, s1, s2, 0)
     }
 }
 
@@ -528,15 +529,31 @@ impl S<'_, '_> {
         }
     }
 
-    /// `ldst_us_trans()`, `ldst_stride_trans()` and `ldst_index_trans()`.
-    fn ldst_trans(&mut self, h: &Def, desc: Desc, rs1: i32, stride: Option<i32>) -> bool {
+    /// `ldst_us_trans()`, `ldst_stride_trans()` and `ldst_index_trans()`. `tso` is the
+    /// direction of a unit-stride access, which with Ztso follows RVTSO at the instruction
+    /// level: barriers around the loop, none inside it.
+    fn ldst_trans(
+        &mut self,
+        h: &Def,
+        desc: Desc,
+        rs1: i32,
+        stride: Option<i32>,
+        tso: Option<Ldst>,
+    ) -> bool {
         let base = self.gpr(rs1);
         let mut args: Vec<Temp> = vec![base.into()];
         if let Some(rs2) = stride {
             args.push(self.gpr(rs2).into());
         }
+        let tso = if self.d.cfg.ext_ztso { tso } else { None };
+        if tso == Some(Ldst::Store) {
+            self.f().gen_mb(mo::ALL | mo::BAR_STRL);
+        }
         self.mark_vs_dirty();
         self.vcall(h, None, desc, &args);
+        if tso == Some(Ldst::Load) {
+            self.f().gen_mb(mo::ALL | mo::BAR_LDAQ);
+        }
         self.finalize_rvv_inst();
         true
     }
@@ -571,7 +588,7 @@ impl S<'_, '_> {
         let emul = self.vext_get_emul(eew);
         let desc = self.ldst_desc(rd, vm, nf, emul, eew, k);
         let h = if k == Ldst::Load { &vector::VLE } else { &vector::VSE };
-        self.ldst_trans(h, desc, rs1, None)
+        self.ldst_trans(h, desc, rs1, None, Some(k))
     }
 
     /// `trans_vlm_v()` and `trans_vsm_v()`.
@@ -588,7 +605,7 @@ impl S<'_, '_> {
         } else {
             &vector::VSM
         };
-        self.ldst_trans(h, desc, rs1, None)
+        self.ldst_trans(h, desc, rs1, None, Some(k))
     }
 
     /// `trans_vlse*_v()` and `trans_vsse*_v()`.
@@ -604,7 +621,7 @@ impl S<'_, '_> {
         let emul = self.vext_get_emul(eew);
         let desc = self.ldst_desc(rd, vm, nf, emul, eew, k);
         let h = if k == Ldst::Load { &vector::VLSE } else { &vector::VSSE };
-        self.ldst_trans(h, desc, rs1, Some(rs2))
+        self.ldst_trans(h, desc, rs1, Some(rs2), None)
     }
 
     /// `trans_vlxei*_v()` and `trans_vsxei*_v()`: `eew` is the index EEW, the data
@@ -631,7 +648,7 @@ impl S<'_, '_> {
         desc.vs2 = rs2 as u32;
         desc.x = eew as u32;
         let h = if k == Ldst::Load { &vector::VLXEI } else { &vector::VSXEI };
-        self.ldst_trans(h, desc, rs1, None)
+        self.ldst_trans(h, desc, rs1, None, None)
     }
 
     /// `trans_vle*ff_v()`: `ldff_op()` and `ldff_trans()`. The load may change `vl`, so
