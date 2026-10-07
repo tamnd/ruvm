@@ -902,7 +902,9 @@ impl PciDeviceOps for PciOps {
     }
 }
 
-/// A virtio PCI function, `VirtIOPCIProxy` with its device plugged in.
+/// A virtio PCI function, `VirtIOPCIProxy` with its device plugged in. A clone is another
+/// handle to the same function.
+#[derive(Clone)]
 pub struct VirtioPci {
     pci: Arc<PciDevice>,
     inner: Arc<Inner>,

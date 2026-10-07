@@ -20,6 +20,7 @@ ruvm-hw-char.workspace = true
 ruvm-hw-core.workspace = true
 ruvm-hw-intc.workspace = true
 ruvm-hw-misc.workspace = true
+ruvm-hw-pci.workspace = true
 ruvm-hw-timer.workspace = true
 ruvm-hw-virtio.workspace = true
 ruvm-jit.workspace = true
