@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.4.2
+
+This patch moves M5 and M6 forward. A q35 or microvm guest now carries its device state across a migration hop, and the RISC-V guest has the vector extension and the H extension.
+
+For M5: the q35 and microvm devices now save and load their real state instead of being read and dropped, matched field by field to QEMU 11.1 (#160). On q35 that is the APIC, PIC, IOAPIC, RTC, PIT, HPET, the ICH9 LPC, PM, SMBus and SATA devices, fw_cfg, the serial ports, the TSC, mch, the PCI host and bus, the keyboard controller, port92 and the rest of QEMU's sections, in QEMU's order. microvm also gained the acpi-ged section. A guest driven by timer interrupts survived every hop chain between QEMU and ruvm on q35 and microvm with no bad output. The pc-q35-11.0 and pc-q35-10.2 machine types are in too. Virtio devices don't migrate yet.
+
+For M6: the riscv guest has V, the Zve subsets, Zvfh and the bf16 vector extensions, and the full vector crypto set (#161). V is off by default as in QEMU 11.1 and `-cpu rv64,v=on` turns it on. The H extension is on by default, with two-stage translation, the hypervisor CSRs, HLV, HLVX and HSV, virtual instruction faults and VS interrupt routing. A bare metal H test prints the same 251 lines on ruvm and QEMU, and Linux reports `rv64imafdch`. Guest external interrupts and AIA are not in yet.
+
 ## 0.4.1
 
 This patch starts M5 and M6. ruvm can live migrate a guest to and from QEMU 11.1, and it has a RISC-V guest that boots Linux.
