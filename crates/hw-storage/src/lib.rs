@@ -42,10 +42,17 @@
 //!   DVD STRUCTURE, MECHANISM STATUS and the rest) are rejected with ILLEGAL REQUEST, and there
 //!   is no media change or tray model. The CD audio control mode page is all zeros.
 //!
+//! - VMState: [`Ich9Ahci::vmstate_save`] and [`Ich9Ahci::vmstate_load`] have QEMU's
+//!   `ich9_ahci` layout, but only an idle controller loads: a stream with an NCQ tag in use, a
+//!   command in progress, a PIO transfer (`ide_drive/pio_state`), a request waiting for retry
+//!   (`ide_bus/error`) or an open tray is refused. The media change flags (`cdrom_changed`,
+//!   `ide_drive/atapi/gesn_state`) are dropped on load and sent as 0, and free NCQ tags are
+//!   sent as zeros where QEMU keeps the last command's fields.
+//!
 //! # Not ported
 //!
-//! VMState (migration), trace points, QOM properties and the `rerror` and `werror` error
-//! policies. Every backend error is reported to the guest, QEMU's "report" policy.
+//! Trace points, QOM properties and the `rerror` and `werror` error policies. Every backend
+//! error is reported to the guest, QEMU's "report" policy.
 
 #![forbid(unsafe_code)]
 
@@ -56,10 +63,10 @@ mod ich;
 mod ide;
 pub mod scsi;
 
-pub use ahci::DmaMemory;
+pub use ahci::{AhciPortVmState, AhciVmState, DmaMemory, NcqVmState};
 pub use block::{BlockBackend, VecBackend};
 pub use ich::{
-    ICH9_AHCI_PORTS, Ich9Ahci, PCI_CLASS_STORAGE_SATA, PCI_DEVICE_ID_INTEL_82801IR,
-    PCI_VENDOR_ID_INTEL,
+    ICH9_AHCI_PORTS, Ich9Ahci, Ich9AhciVmState, PCI_CLASS_STORAGE_SATA,
+    PCI_DEVICE_ID_INTEL_82801IR, PCI_VENDOR_ID_INTEL,
 };
-pub use ide::{DriveConfig, DriveKind};
+pub use ide::{DriveConfig, DriveKind, IDE_IO_BUFFER_TOTAL_LEN, IdeBusVmState, IdeDriveVmState};

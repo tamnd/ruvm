@@ -43,9 +43,9 @@ use ruvm_machine_x86::debugcon::{
     DEBUGCON_DEFAULT_IOBASE, DEBUGCON_DEFAULT_READBACK, DebugconConfig, IsaDebugcon,
     TYPE_ISA_DEBUGCON,
 };
-use ruvm_machine_x86::migration::q35_savevm;
+use ruvm_machine_x86::migration::x86_savevm;
 use ruvm_machine_x86::pflash::raw_block_length;
-use ruvm_machine_x86::q35::{CpuIdent, PflashDrive, Q35_MACHINE_NAME};
+use ruvm_machine_x86::q35::{CpuIdent, PflashDrive};
 use ruvm_machine_x86::run_event::{EventHandler, GuestEvent, ShutdownReason};
 use ruvm_machine_x86::tcg_run::{TCG_SMM_AVAILABLE, TcgCpuModel, TcgMachine, TcgRunConfig};
 use ruvm_machine_x86::{
@@ -72,13 +72,24 @@ pub(crate) fn is_x86(target: &str) -> bool {
 /// The `-machine help` lines of the x86 boards, as (sort key, line) pairs. An alias gets its
 /// own line right before the machine, as `machine_help_func()` prints it.
 pub(crate) fn machine_help_lines() -> Vec<(String, String)> {
-    let mut out = Vec::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut last_desc = "";
     for &(name, alias, desc) in X86_BOARDS {
+        let line = format!("{name:<20} {desc}\n");
+        // The older versions of a machine follow it in `X86_BOARDS`, newest first, and keep
+        // that order: `machine_class_cmp()` sorts a family by name, descending.
+        if alias.is_none() && desc == last_desc {
+            if let Some((_, text)) = out.last_mut() {
+                text.push_str(&line);
+                continue;
+            }
+        }
+        last_desc = desc;
         let mut text = String::new();
         if let Some(alias) = alias {
             text.push_str(&format!("{alias:<20} {desc} (alias of {name})\n"));
         }
-        text.push_str(&format!("{name:<20} {desc}\n"));
+        text.push_str(&line);
         out.push((name.to_string(), text));
     }
     out
@@ -211,6 +222,8 @@ pub(crate) struct BoardOptions {
     pub topology: Option<SmbiosTopology>,
     /// Everything else, for the board, in command line order.
     pub props: Vec<(String, String)>,
+    /// The machine type name, `pc-q35-11.0` say, with an alias resolved.
+    pub machine_type: &'static str,
 }
 
 /// The largest `-smp maxcpus` of each board, `mc->max_cpus`.
@@ -1192,6 +1205,7 @@ fn build(
     let pflash = pflash_drives(kind, &opts, drives).map_err(one)?;
     let spec = BoardSpec {
         kind,
+        machine_type: opts.machine_type,
         props: opts.props,
         ram_size: opts.ram_size,
         cpus: opts.cpus,
@@ -1398,6 +1412,7 @@ pub(crate) fn start_board_tcg(
         phys_bits: cpu.phys_bits(),
         cpu: cpu.ident(),
     };
+    let machine_type = opts.machine_type;
     let built = build(vm, accel, kind, opts, cmd, drives, serial_hds)?;
     let cfg = TcgRunConfig { no_reboot: cmd.no_reboot, tcg, backend: None };
     let (machine, warnings) =
@@ -1407,20 +1422,19 @@ pub(crate) fn start_board_tcg(
     }
     let machine = Arc::new(machine);
     set_cpu_hook(vm, &machine, TcgMachine::start, TcgMachine::pause);
-    if kind == BoardKind::Q35 {
-        init_migration(vm, &machine, cmd.uuid).map_err(one)?;
-    }
+    init_migration(vm, &machine, machine_type, cmd.uuid).map_err(one)?;
     Ok(Running { machine: RunningMachine::Tcg(machine), _attachments: built.attachments })
 }
 
 /// `migration_object_init()` and the `register_savevm_live()` and `vmstate_register()` calls of
-/// a q35 board on TCG, the one machine ruvm migrates so far.
+/// an x86 board (q35 or microvm) on TCG.
 fn init_migration(
     vm: &Arc<Vm>,
     machine: &TcgMachine,
+    machine_type: &str,
     uuid: Option<[u8; 16]>,
 ) -> std::result::Result<(), String> {
-    let q = q35_savevm(machine, Q35_MACHINE_NAME, uuid)?;
+    let q = x86_savevm(machine, machine_type, uuid)?;
     let host = crate::migration::Host::new(
         vm.runstate.clone(),
         vm.qmp.clone(),
@@ -1532,6 +1546,9 @@ mod tests {
         assert!(it.next().unwrap().starts_with("pc-q35-11.1          "));
         assert!(q35.1.contains("(alias of pc-q35-11.1)"));
         assert!(lines.iter().any(|(n, l)| n == "microvm" && l.starts_with("microvm     ")));
+        assert!(it.next().unwrap().starts_with("pc-q35-11.0          "));
+        assert!(it.next().unwrap().starts_with("pc-q35-10.2          "));
+        assert!(it.next().is_none());
     }
 
     #[test]

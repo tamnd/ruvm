@@ -167,6 +167,19 @@ fn fw_cfg_basics() {
 }
 
 #[test]
+fn older_machine_version_is_the_smbios_version() {
+    let has = |t: &[u8], s: &[u8]| t.windows(s.len()).any(|w| w == s);
+    let m = machine(config(""));
+    assert_eq!(m.machine_name(), "pc-q35-11.1");
+    let t = fw_cfg_file(&m, "etc/smbios/smbios-tables").unwrap();
+    assert!(has(&t, b"pc-q35-11.1\0"));
+    let m = machine(Q35MachineConfig { machine_name: "pc-q35-10.2", ..config("") });
+    assert_eq!(m.machine_name(), "pc-q35-10.2");
+    let t = fw_cfg_file(&m, "etc/smbios/smbios-tables").unwrap();
+    assert!(has(&t, b"pc-q35-10.2\0") && !has(&t, b"pc-q35-11.1"));
+}
+
+#[test]
 fn e820_1g() {
     let m = machine(Q35MachineConfig { ram_size: GIB, ..config("") });
     assert_eq!(e820(&m), [(0, GIB, 1)]);

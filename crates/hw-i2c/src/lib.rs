@@ -18,10 +18,10 @@ pub mod smbus_eeprom;
 pub mod smbus_ich9;
 
 pub use i2c::{I2C_BROADCAST, I2cBus, I2cEvent, I2cNak, I2cSlave};
-pub use pm_smbus::{PmSmbus, PmSmbusIrqFn, PmSmbusRegs};
+pub use pm_smbus::{PmSmbus, PmSmbusIrqFn, PmSmbusRegs, PmSmbusVmState};
 pub use smbus::{SmbusDevice, SmbusMode, SmbusSlave};
 pub use smbus_eeprom::{
     SdramType, SmbusEeprom, SmbusEepromSlave, smbus_eeprom_init, smbus_eeprom_init_one,
     spd_data_generate,
 };
-pub use smbus_ich9::{Ich9Smbus, ich9_smbus_q35_init};
+pub use smbus_ich9::{Ich9Smbus, Ich9SmbusVmState, ich9_smbus_q35_init};

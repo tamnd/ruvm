@@ -349,9 +349,12 @@ impl IdeDrive {
         if self.kind == DriveKind::Cd {
             self.lcyl = 0x14;
             self.hcyl = 0xeb;
-        } else {
+        } else if self.blk.is_some() {
             self.lcyl = 0;
             self.hcyl = 0;
+        } else {
+            self.lcyl = 0xff;
+            self.hcyl = 0xff;
         }
     }
 
@@ -1010,5 +1013,215 @@ impl IdeDrive {
         self.transfer_start(h, 0, 12);
         self.atapi_cmd(h);
         false
+    }
+}
+
+/// The length of an IDE I/O buffer, `io_buffer_total_len`, which is how many bytes the
+/// `ide_drive/pio_state` subsection carries.
+pub const IDE_IO_BUFFER_TOTAL_LEN: usize = IDE_DMA_BUF_SECTORS * SECTOR_SIZE as usize + 4;
+
+/// `ide_transfer_stop`'s index in QEMU's `transfer_end_table`.
+const END_TRANSFER_STOP_IDX: u8 = 2;
+
+/// `vmstate_ide_bus` (version 1) with its `ide_bus/error` subsection.
+///
+/// The one-drive bus of an AHCI port has no state of its own here: `cmd` and `unit` stay 0 on
+/// AHCI, and with the "report" error policy no request ever waits to be retried.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdeBusVmState {
+    pub cmd: u8,
+    pub unit: u8,
+    /// `ide_bus/error`, sent when not 0.
+    pub error_status: i32,
+    /// `ide_bus/error`, version 2.
+    pub retry_sector_num: i64,
+    /// `ide_bus/error`, version 2.
+    pub retry_nsector: u32,
+    /// `ide_bus/error`, version 2.
+    pub retry_unit: u8,
+}
+
+/// `vmstate_ide_drive` (version 3) with its subsections.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdeDriveVmState {
+    pub mult_sectors: i32,
+    pub identify_set: i32,
+    /// 512 bytes, sent only when `identify_set` is not 0.
+    pub identify_data: Vec<u8>,
+    pub feature: u8,
+    pub error: u8,
+    pub nsector: u32,
+    pub sector: u8,
+    pub lcyl: u8,
+    pub hcyl: u8,
+    pub hob_feature: u8,
+    pub hob_sector: u8,
+    pub hob_nsector: u8,
+    pub hob_lcyl: u8,
+    pub hob_hcyl: u8,
+    pub select: u8,
+    pub status: u8,
+    pub lba48: u8,
+    pub sense_key: u8,
+    pub asc: u8,
+    /// Version 3. There is no media change model here, so it is sent as 0 and dropped on load.
+    pub cdrom_changed: u8,
+
+    /// `ide_drive/pio_state`, sent while DRQ is set.
+    pub req_nb_sectors: i32,
+    /// `ide_drive/pio_state`: [`IDE_IO_BUFFER_TOTAL_LEN`] bytes.
+    pub io_buffer: Vec<u8>,
+    /// `ide_drive/pio_state`.
+    pub cur_io_buffer_offset: i32,
+    /// `ide_drive/pio_state`.
+    pub cur_io_buffer_len: i32,
+    /// `ide_drive/pio_state`.
+    pub end_transfer_fn_idx: u8,
+    /// `ide_drive/pio_state`.
+    pub elementary_transfer_size: i32,
+    /// `ide_drive/pio_state`.
+    pub packet_transfer_size: i32,
+
+    /// `ide_drive/tray_state`, sent when the tray is open or locked.
+    pub tray_open: bool,
+    /// `ide_drive/tray_state`.
+    pub tray_locked: bool,
+
+    /// `ide_drive/atapi/gesn_state` (`events.new_media`), sent when either flag is set.
+    pub new_media: bool,
+    /// `ide_drive/atapi/gesn_state` (`events.eject_request`).
+    pub eject_request: bool,
+}
+
+impl Default for IdeDriveVmState {
+    fn default() -> Self {
+        IdeDriveVmState {
+            mult_sectors: 0,
+            identify_set: 0,
+            identify_data: vec![0; 512],
+            feature: 0,
+            error: 0,
+            nsector: 0,
+            sector: 0,
+            lcyl: 0,
+            hcyl: 0,
+            hob_feature: 0,
+            hob_sector: 0,
+            hob_nsector: 0,
+            hob_lcyl: 0,
+            hob_hcyl: 0,
+            select: 0,
+            status: 0,
+            lba48: 0,
+            sense_key: 0,
+            asc: 0,
+            cdrom_changed: 0,
+            req_nb_sectors: 0,
+            io_buffer: Vec::new(),
+            cur_io_buffer_offset: 0,
+            cur_io_buffer_len: 0,
+            end_transfer_fn_idx: 0,
+            elementary_transfer_size: 0,
+            packet_transfer_size: 0,
+            tray_open: false,
+            tray_locked: false,
+            new_media: false,
+            eject_request: false,
+        }
+    }
+}
+
+impl IdeDriveVmState {
+    /// Whether the drive is in a state [`IdeDrive::vmstate_load`] takes: no PIO transfer in
+    /// progress and the tray closed.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if self.status & DRQ_STAT != 0 {
+            return Err("ide: a PIO transfer in progress (ide_drive/pio_state) is not supported"
+                .to_string());
+        }
+        if self.tray_open {
+            return Err("ide: an open tray is not supported".to_string());
+        }
+        if self.identify_set != 0 && self.identify_data.len() != 512 {
+            return Err(format!("ide: {} bytes of identify data", self.identify_data.len()));
+        }
+        Ok(())
+    }
+}
+
+impl IdeDrive {
+    /// The drive's part of the stream. `ide_drive_pio_pre_save()` runs only if DRQ is set,
+    /// which a synchronous transfer never leaves behind; the buffer position is then unknown
+    /// and goes out as the start, with `ide_transfer_stop` as the end transfer function.
+    pub(crate) fn vmstate_save(&self) -> IdeDriveVmState {
+        let mut v = IdeDriveVmState {
+            mult_sectors: self.mult_sectors as i32,
+            identify_set: i32::from(self.identify_set),
+            identify_data: self.identify_data.to_vec(),
+            feature: self.feature,
+            error: self.error,
+            nsector: self.nsector,
+            sector: self.sector,
+            lcyl: self.lcyl,
+            hcyl: self.hcyl,
+            hob_feature: self.hob_feature,
+            hob_sector: self.hob_sector,
+            hob_nsector: self.hob_nsector,
+            hob_lcyl: self.hob_lcyl,
+            hob_hcyl: self.hob_hcyl,
+            select: self.select,
+            status: self.status,
+            lba48: u8::from(self.lba48),
+            sense_key: self.sense_key,
+            asc: self.asc,
+            tray_locked: self.tray_locked,
+            ..IdeDriveVmState::default()
+        };
+        if self.status & DRQ_STAT != 0 {
+            let mut buf = self.io_buffer.clone();
+            buf.resize(IDE_IO_BUFFER_TOTAL_LEN, 0);
+            v.req_nb_sectors = self.req_nb_sectors as i32;
+            v.io_buffer = buf;
+            v.end_transfer_fn_idx = END_TRANSFER_STOP_IDX;
+            v.elementary_transfer_size = self.elementary_transfer_size as i32;
+            v.packet_transfer_size = self.packet_transfer_size as i32;
+        }
+        v
+    }
+
+    /// Loads the drive's part of the stream, then `ide_drive_post_load()`. Fails, changing
+    /// nothing, for the states [`IdeDriveVmState::check`] refuses. The media change events
+    /// (`cdrom_changed` and the GESN flags) are dropped.
+    pub(crate) fn vmstate_load(&mut self, v: &IdeDriveVmState) -> Result<(), String> {
+        v.check()?;
+        self.mult_sectors = v.mult_sectors as u32;
+        self.identify_set = v.identify_set != 0;
+        if self.identify_set {
+            self.identify_data.copy_from_slice(&v.identify_data);
+        }
+        self.feature = v.feature;
+        self.error = v.error;
+        self.nsector = v.nsector;
+        self.sector = v.sector;
+        self.lcyl = v.lcyl;
+        self.hcyl = v.hcyl;
+        self.hob_feature = v.hob_feature;
+        self.hob_sector = v.hob_sector;
+        self.hob_nsector = v.hob_nsector;
+        self.hob_lcyl = v.hob_lcyl;
+        self.hob_hcyl = v.hob_hcyl;
+        self.select = v.select;
+        self.status = v.status;
+        self.lba48 = v.lba48 != 0;
+        self.sense_key = v.sense_key;
+        self.asc = v.asc;
+        self.tray_locked = v.tray_locked;
+        // ide_drive_post_load(): the write cache follows IDENTIFY word 85 bit 5. QEMU tests
+        // byte 85 of the buffer instead; this reads the word.
+        if self.blk.is_some() && self.identify_set {
+            let w85 = u16::from_le_bytes([self.identify_data[170], self.identify_data[171]]);
+            self.write_cache = w85 & (1 << 5) != 0;
+        }
+        Ok(())
     }
 }

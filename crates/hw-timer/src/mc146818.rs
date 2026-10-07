@@ -7,15 +7,16 @@
 //! drive the interrupts: the periodic timer (with the lost tick slew policy) and the update
 //! ended timer, which also handles the alarm.
 //!
-//! Not ported yet: VMState, trace points, QOM registration, the coalesced PIO index subregion and
-//! the ACPI `_CRS` hook.
+//! [`Mc146818VmState`] is the device as QEMU's `mc146818rtc` VMState section carries it. Not
+//! ported yet: trace points, QOM registration, the coalesced PIO index subregion and the ACPI
+//! `_CRS` hook.
 
 use std::fmt;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ruvm_base::{Error, Result};
+use ruvm_base::{ClockType, Error, Result};
 use ruvm_hw_core::irq::{IrqLine, IrqPin};
 use ruvm_hw_core::timer::{Clock, NANOSECONDS_PER_SECOND, Timer, muldiv64};
 use ruvm_mem::{AccessConstraints, AccessCtx, AccessSize, MemResult, MmioOps};
@@ -73,6 +74,10 @@ const SEC_PER_MIN: i32 = 60;
 const MIN_PER_HOUR: i32 = 60;
 const HOUR_PER_DAY: i32 = 24;
 const SEC_PER_DAY: i32 = 86400;
+
+/// `get_max_clock_jump()`: how far the RTC clock may have moved past the next periodic
+/// interrupt before `rtc_post_load()` reprograms the periodic timer.
+const MAX_CLOCK_JUMP: u64 = 60 * NANOSECONDS_PER_SECOND as u64;
 
 const NS_U32: u32 = NANOSECONDS_PER_SECOND as u32;
 const NS_U64: u64 = NANOSECONDS_PER_SECOND as u64;
@@ -203,6 +208,53 @@ fn unix_seconds(t: SystemTime) -> i64 {
 }
 
 type Hook<T> = Arc<dyn Fn(T) + Send + Sync>;
+
+/// The `mc146818rtc` VMState section, version 3. The timers and times are on the RTC clock
+/// (`-rtc clock=`, the host clock by default), in nanoseconds; a timer is -1 when not armed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mc146818VmState {
+    pub cmos_data: [u8; 128],
+    pub cmos_index: u8,
+    pub periodic_timer: i64,
+    pub next_periodic_time: i64,
+    pub irq_coalesced: u32,
+    pub period: u32,
+    pub base_rtc: u64,
+    pub last_update: u64,
+    pub offset: i64,
+    pub update_timer: i64,
+    pub next_alarm_time: u64,
+    /// Subsection `mc146818rtc/irq_reinject_on_ack_count`, sent when it is not 0.
+    pub irq_reinject_on_ack_count: u16,
+}
+
+impl Default for Mc146818VmState {
+    fn default() -> Self {
+        Mc146818VmState {
+            cmos_data: [0; 128],
+            cmos_index: 0,
+            periodic_timer: -1,
+            next_periodic_time: 0,
+            irq_coalesced: 0,
+            period: 0,
+            base_rtc: 0,
+            last_update: 0,
+            offset: 0,
+            update_timer: -1,
+            next_alarm_time: 0,
+            irq_reinject_on_ack_count: 0,
+        }
+    }
+}
+
+/// `timer_put()`: arms `timer` for `expire`, or deletes it for -1.
+fn timer_put(timer: &Timer, expire: i64) {
+    if expire == -1 {
+        timer.del();
+    } else {
+        timer.modify(expire);
+    }
+}
 
 /// `MC146818RtcState`.
 struct RtcState {
@@ -990,6 +1042,65 @@ impl Mc146818Rtc {
     pub fn set_date(&self, host_date: SystemTime) {
         self.lock().set_date_from_host(unix_seconds(host_date));
     }
+
+    /// `rtc_pre_save()`, which brings the CMOS time registers up to date, and the section's
+    /// fields.
+    pub fn vmstate_save(&self) -> Mc146818VmState {
+        let mut s = self.lock();
+        s.update_time();
+        Mc146818VmState {
+            cmos_data: s.cmos_data,
+            cmos_index: s.cmos_index as u8,
+            periodic_timer: s.periodic_timer.expire_time().unwrap_or(-1),
+            next_periodic_time: s.next_periodic_time,
+            irq_coalesced: s.irq_coalesced,
+            period: s.period,
+            base_rtc: s.base_rtc,
+            last_update: s.last_update,
+            offset: s.offset,
+            update_timer: s.update_timer.expire_time().unwrap_or(-1),
+            next_alarm_time: s.next_alarm_time,
+            irq_reinject_on_ack_count: s.irq_reinject_on_ack_count,
+        }
+    }
+
+    /// Takes over a loaded `mc146818rtc` section, version 3: the registers, the two timers
+    /// armed for their loaded expiry, and then `rtc_post_load()`. On the realtime clock the
+    /// date is taken from the CMOS registers again; the periodic timer is reprogrammed when the
+    /// clock is before the next periodic interrupt or more than a minute past it; the slew
+    /// policy's coalesced timer is restarted. The IRQ output is left alone, as in QEMU.
+    pub fn vmstate_load(&self, v: &Mc146818VmState) {
+        let mut s = self.lock();
+        s.cmos_data = v.cmos_data;
+        // cmos_index is a uint8_t in QEMU too; only the low 7 bits select a register.
+        s.cmos_index = usize::from(v.cmos_index) & 0x7f;
+        timer_put(&s.periodic_timer, v.periodic_timer);
+        s.next_periodic_time = v.next_periodic_time;
+        s.irq_coalesced = v.irq_coalesced;
+        s.period = v.period;
+        s.base_rtc = v.base_rtc;
+        s.last_update = v.last_update;
+        s.offset = v.offset;
+        timer_put(&s.update_timer, v.update_timer);
+        s.next_alarm_time = v.next_alarm_time;
+        s.irq_reinject_on_ack_count = v.irq_reinject_on_ack_count;
+
+        if s.clock.kind() == ClockType::Realtime {
+            s.set_time();
+            s.offset = 0;
+            s.check_update_timer();
+        }
+        s.period = s.periodic_clock_ticks();
+        let now = s.now() as u64;
+        let next = s.next_periodic_time as u64;
+        if now < next || now > next.wrapping_add(MAX_CLOCK_JUMP) {
+            let period = s.period;
+            s.periodic_timer_update(now as i64, period, false);
+        }
+        if s.lost_tick_policy == LostTickPolicy::Slew {
+            s.coalesced_timer_update();
+        }
+    }
 }
 
 /// `cmos_ops`.
@@ -1029,5 +1140,52 @@ mod tests {
         assert_eq!(periodic_period_to_clock(3), 4);
         assert_eq!(periodic_period_to_clock(15), 16384);
         assert_eq!(periodic_clock_to_ns(32768), NANOSECONDS_PER_SECOND);
+    }
+
+    fn rtc_at(now: i64) -> (Arc<Clock>, Mc146818Rtc) {
+        let clock = Clock::manual(ClockType::Host);
+        clock.advance_to(now);
+        let date = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let rtc = Mc146818Rtc::new(Mc146818Props::default(), clock.clone(), date).unwrap();
+        (clock, rtc)
+    }
+
+    #[test]
+    fn vmstate_round_trip_keeps_the_timers() {
+        let (clock, src) = rtc_at(3 * NANOSECONDS_PER_SECOND + 1234);
+        // Periodic interrupts at the default 1024 Hz rate.
+        src.ioport_write(0, RTC_REG_B as u8);
+        src.ioport_write(1, REG_B_24H | REG_B_PIE);
+        clock.advance_to(3 * NANOSECONDS_PER_SECOND + 500_000);
+        let saved = src.vmstate_save();
+        assert_eq!(saved.period, 32);
+        assert_eq!(saved.periodic_timer, saved.next_periodic_time);
+        assert!(saved.periodic_timer > 3 * NANOSECONDS_PER_SECOND + 500_000);
+        assert_ne!(saved.update_timer, -1);
+        assert_eq!(saved.cmos_index, RTC_REG_B as u8);
+
+        // Just past the next periodic interrupt the loaded deadline stands, as in QEMU.
+        let now = saved.next_periodic_time + 10;
+        let (_clock2, dst) = rtc_at(now);
+        dst.vmstate_load(&saved);
+        assert_eq!(dst.vmstate_save(), saved);
+        assert_eq!(dst.date(), src.date());
+
+        // A periodic deadline ahead of the clock is reprogrammed from the current time.
+        let mut ahead = saved.clone();
+        ahead.next_periodic_time = now + 10 * NANOSECONDS_PER_SECOND;
+        ahead.periodic_timer = ahead.next_periodic_time;
+        dst.vmstate_load(&ahead);
+        let again = dst.vmstate_save();
+        assert!(again.next_periodic_time > now);
+        assert!(again.next_periodic_time <= now + periodic_clock_to_ns(32) + 2);
+        assert_eq!(again.periodic_timer, again.next_periodic_time);
+
+        // With PIE clear, a reprogrammed periodic timer goes away.
+        let mut off = ahead.clone();
+        off.cmos_data[RTC_REG_B] = REG_B_24H;
+        dst.vmstate_load(&off);
+        let off = dst.vmstate_save();
+        assert_eq!((off.period, off.periodic_timer), (0, -1));
     }
 }

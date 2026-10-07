@@ -10,9 +10,15 @@
 //! [`Ich9Pm::map`] has put the window in an I/O space the region is moved and shown or hidden
 //! there. The SCI is [`Ich9Pm::sci`]; the LPC routes it to the GSI [`ich9_lpc_sci_irq`] picks.
 //!
+//! VMState: [`Ich9Pm::vmstate_save`] and [`Ich9Pm::vmstate_load`] carry the `ich9_pm` section
+//! and its `memhp`, `tco`, `cpuhp` and `pcihp` subsections. The TCO watchdog and the three
+//! hotplug register blocks are not emulated, so their state is only kept for the stream: it
+//! starts at QEMU's initial values, comes back unchanged and survives reset (except the pending
+//! PCI ejects, which `acpi_pcihp_reset()` carries out).
+//!
 //! Not ported: the TCO watchdog (`enable_tco`, TCO_EN locking in SMI_EN), the SWSMI and periodic
 //! SMI timers from hw/acpi/ich9_timer.c, ACPI PCI hotplug, CPU hotplug and memory hotplug.
-//! VMState, trace points and QOM properties are not ported either.
+//! Trace points and QOM properties are not ported either.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -129,6 +135,154 @@ struct SmiState {
     pm_io_base: u32,
 }
 
+/// `ACPI_PCIHP_MAX_HOTPLUG_BUS`.
+pub const ACPI_PCIHP_MAX_HOTPLUG_BUS: usize = 256;
+
+/// `TCOIORegs`, the `tco io device status` section. The timers are expire times on the virtual
+/// clock in nanoseconds, -1 when not armed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TcoVmState {
+    pub rld: u16,
+    pub din: u8,
+    pub dout: u8,
+    pub sts1: u16,
+    pub sts2: u16,
+    pub cnt1: u16,
+    pub cnt2: u16,
+    pub msg1: u8,
+    pub msg2: u8,
+    pub wdcnt: u8,
+    pub tmr: u16,
+    pub sw_irq_gen: u8,
+    pub tco_timer: i64,
+    pub expire_time: i64,
+    pub timeouts_no: u8,
+}
+
+impl Default for TcoVmState {
+    /// What `acpi_pm_tco_init()` sets.
+    fn default() -> Self {
+        TcoVmState {
+            rld: 0,
+            din: 0,
+            dout: 0,
+            sts1: 0,
+            sts2: 0,
+            cnt1: 0,
+            cnt2: 0x0008,
+            msg1: 0,
+            msg2: 0,
+            wdcnt: 0,
+            tmr: 0x0004,
+            sw_irq_gen: 0x03,
+            tco_timer: -1,
+            expire_time: -1,
+            timeouts_no: 0,
+        }
+    }
+}
+
+/// `MemStatus`, the `memory hotplug device state` section.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemHotplugDevVmState {
+    pub is_enabled: bool,
+    pub is_inserting: bool,
+    pub ost_event: u32,
+    pub ost_status: u32,
+}
+
+/// `MemHotplugState`, the `memory hotplug state` section. `devs` has one entry per memory slot,
+/// none on a machine without `slots=`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemHotplugVmState {
+    pub selector: u32,
+    pub devs: Vec<MemHotplugDevVmState>,
+}
+
+/// `AcpiCpuStatus`, the `CPU hotplug device state` section.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpuHotplugDevVmState {
+    pub is_inserting: bool,
+    pub is_removing: bool,
+    pub ost_event: u32,
+    pub ost_status: u32,
+}
+
+/// `CPUHotplugState`, the `CPU hotplug state` section. `devs` has one entry per possible CPU;
+/// the count is not in the stream, both sides must agree on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpuHotplugVmState {
+    pub selector: u32,
+    pub command: u8,
+    pub devs: Vec<CpuHotplugDevVmState>,
+}
+
+/// `AcpiPciHpPciStatus`, the `acpi_pcihp_pci_status` section.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AcpiPcihpPciStatusVmState {
+    pub up: u32,
+    pub down: u32,
+}
+
+/// The migrated part of `AcpiPciHpState`, `VMSTATE_PCI_HOTPLUG()`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PciHotplugVmState {
+    pub hotplug_select: u32,
+    /// [`ACPI_PCIHP_MAX_HOTPLUG_BUS`] entries.
+    pub acpi_pcihp_pci_status: Vec<AcpiPcihpPciStatusVmState>,
+    pub acpi_index: u32,
+}
+
+impl Default for PciHotplugVmState {
+    fn default() -> Self {
+        PciHotplugVmState {
+            hotplug_select: 0,
+            acpi_pcihp_pci_status: vec![
+                AcpiPcihpPciStatusVmState::default();
+                ACPI_PCIHP_MAX_HOTPLUG_BUS
+            ],
+            acpi_index: 0,
+        }
+    }
+}
+
+/// The `ich9_pm` section of `ICH9LPCPMRegs` with its subsections. The field names are the last
+/// parts of QEMU's (`acpi_regs.pm1.evt.sts` is `pm1_evt_sts`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ich9PmVmState {
+    pub pm1_evt_sts: u16,
+    pub pm1_evt_en: u16,
+    pub pm1_cnt_cnt: u16,
+    /// `acpi_regs.tmr.timer`: the overflow timer's expire time in virtual nanoseconds, -1 when
+    /// not armed.
+    pub tmr_timer: i64,
+    /// `acpi_regs.tmr.overflow_time`, in PM timer ticks.
+    pub tmr_overflow_time: i64,
+    /// `acpi_regs.gpe.sts`, all [`ICH9_PMIO_GPE0_LEN`] bytes although only the first half is
+    /// used.
+    pub gpe_sts: [u8; ICH9_PMIO_GPE0_LEN as usize],
+    pub gpe_en: [u8; ICH9_PMIO_GPE0_LEN as usize],
+    pub smi_en: u32,
+    pub smi_sts: u32,
+    /// `ich9_pm/memhp`, always sent.
+    pub acpi_memory_hotplug: MemHotplugVmState,
+    /// `ich9_pm/tco`, sent when `enable_tco` is set, which it always is on q35.
+    pub tco_regs: TcoVmState,
+    /// `ich9_pm/cpuhp`, sent when the machine has hotpluggable CPUs, as q35 does.
+    pub cpuhp_state: CpuHotplugVmState,
+    /// `ich9_pm/pcihp`, sent when `acpi-pci-hotplug-with-bridge-support` is on, the default.
+    pub acpi_pci_hotplug: PciHotplugVmState,
+}
+
+/// The state of the parts that are only carried for migration, see the module docs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CarriedState {
+    memhp: MemHotplugVmState,
+    tco: TcoVmState,
+    cpuhp: CpuHotplugVmState,
+    pcihp: PciHotplugVmState,
+}
+
 /// Where [`Ich9Pm::map`] put the window.
 struct Mapping {
     mem: Weak<MemorySystem>,
@@ -140,6 +294,7 @@ pub struct Ich9Pm {
     acpi: Arc<AcpiPm>,
     props: Ich9PmProps,
     state: Mutex<SmiState>,
+    carried: Mutex<CarriedState>,
     mapping: Mutex<Option<Mapping>>,
 }
 
@@ -170,6 +325,7 @@ impl Ich9Pm {
             acpi: AcpiPm::new(clock, cfg),
             props,
             state: Mutex::new(SmiState::default()),
+            carried: Mutex::new(CarriedState::default()),
             mapping: Mutex::new(None),
         });
         pm.reset();
@@ -317,7 +473,80 @@ impl Ich9Pm {
             }
             s.smi_en_wmask = !0;
         }
+        // acpi_pcihp_reset() carries out the pending ejects.
+        for st in &mut lock(&self.carried).pcihp.acpi_pcihp_pci_status {
+            st.down = 0;
+        }
         self.acpi.update_sci();
+    }
+
+    /// The number of CPU hotplug slots, `possible_cpus` in QEMU, which the `ich9_pm/cpuhp`
+    /// subsection has one entry for each. Starts at 0; the board sets it once.
+    pub fn set_cpu_hotplug_slots(&self, n: usize) {
+        lock(&self.carried).cpuhp.devs.resize(n, CpuHotplugDevVmState::default());
+    }
+
+    /// The `ich9_pm` section.
+    pub fn vmstate_save(&self) -> Ich9PmVmState {
+        let r = self.acpi.regs();
+        let mut gpe_sts = [0; ICH9_PMIO_GPE0_LEN as usize];
+        let mut gpe_en = [0; ICH9_PMIO_GPE0_LEN as usize];
+        for (d, s) in gpe_sts.iter_mut().zip(&r.gpe_sts) {
+            *d = *s;
+        }
+        for (d, s) in gpe_en.iter_mut().zip(&r.gpe_en) {
+            *d = *s;
+        }
+        let smi = *lock(&self.state);
+        let c = lock(&self.carried).clone();
+        Ich9PmVmState {
+            pm1_evt_sts: r.pm1_sts,
+            pm1_evt_en: r.pm1_en,
+            pm1_cnt_cnt: r.pm1_cnt,
+            tmr_timer: self.acpi.tmr_timer_expire(),
+            tmr_overflow_time: r.overflow_time,
+            gpe_sts,
+            gpe_en,
+            smi_en: smi.smi_en,
+            smi_sts: smi.smi_sts,
+            acpi_memory_hotplug: c.memhp,
+            tco_regs: c.tco,
+            cpuhp_state: c.cpuhp,
+            acpi_pci_hotplug: c.pcihp,
+        }
+    }
+
+    /// Loads the `ich9_pm` section. The SCI is not recomputed; `ich9_pm_post_load()` only maps
+    /// the window again at the current `pm_io_base`, and the LPC moves it from its config.
+    pub fn vmstate_load(&self, v: &Ich9PmVmState) {
+        self.acpi.vmstate_load(
+            |r| {
+                r.pm1_sts = v.pm1_evt_sts;
+                r.pm1_en = v.pm1_evt_en;
+                r.pm1_cnt = v.pm1_cnt_cnt;
+                r.overflow_time = v.tmr_overflow_time;
+                for (d, s) in r.gpe_sts.iter_mut().zip(&v.gpe_sts) {
+                    *d = *s;
+                }
+                for (d, s) in r.gpe_en.iter_mut().zip(&v.gpe_en) {
+                    *d = *s;
+                }
+            },
+            v.tmr_timer,
+        );
+        let pm_io_base = {
+            let mut s = lock(&self.state);
+            s.smi_en = v.smi_en;
+            s.smi_sts = v.smi_sts;
+            s.pm_io_base
+        };
+        *lock(&self.carried) = CarriedState {
+            memhp: v.acpi_memory_hotplug.clone(),
+            tco: v.tco_regs.clone(),
+            cpuhp: v.cpuhp_state.clone(),
+            pcihp: v.acpi_pci_hotplug.clone(),
+        };
+        self.iospace_update(pm_io_base);
     }
 
     /// `pm_powerdown_req()`.

@@ -29,7 +29,11 @@
 //! and the generic root port with native hotplug is [`PcieRootPort`]. AER is only a register
 //! stub there.
 //!
-//! Not ported: VMState, trace points, QOM registration and properties, SHPC and ACPI hotplug,
+//! VMState: [`PciDeviceVmState`] is the `PCIDevice` section, [`PciBusVmState`] the `PCIBUS`
+//! one, [`PciHostVmState`] `PCIHost` and [`MchVmState`] the Q35 `mch`. The descriptions
+//! themselves live with the machine.
+//!
+//! Not ported: trace points, QOM registration and properties, SHPC and ACPI hotplug,
 //! error injection, SR-IOV, ATS, IOMMU and bus master address spaces, VGA
 //! registration and bridge VGA windows, option ROM files, `pci_route_intx_to_irq()`, the MSI-X
 //! vector notifiers and the Xen paths.
@@ -50,13 +54,14 @@ pub mod q35;
 pub mod regs;
 
 pub use bridge::{PciBridge, PciBridgeWindow, pci_bridge_get_base, pci_bridge_get_limit};
-pub use bus::{PciBus, PciMapIrqFn, PciSetIrqFn, pci_swizzle_map_irq_fn};
+pub use bus::{PciBus, PciBusVmState, PciMapIrqFn, PciSetIrqFn, pci_swizzle_map_irq_fn};
 pub use device::{
     MsiMessage, MsiTrigger, PciBarInfo, PciConfigMut, PciDevice, PciDeviceInfo, PciDeviceOps,
+    PciDeviceVmState,
 };
 pub use host::{
-    PCI_HOST_CONFIG_ADDR_PORT, PCI_HOST_CONFIG_DATA_PORT, PciHostState, pci_data_read,
-    pci_data_write, pci_host_config_read_common, pci_host_config_write_common,
+    PCI_HOST_CONFIG_ADDR_PORT, PCI_HOST_CONFIG_DATA_PORT, PciHostState, PciHostVmState,
+    pci_data_read, pci_data_write, pci_host_config_read_common, pci_host_config_write_common,
 };
 pub use msi::PCI_MSI_VECTORS_MAX;
 pub use msix::MsixLayout;
@@ -77,4 +82,4 @@ pub use pcie_root_port::{
     REDHAT_PCI_CAP_RES_RESERVE_SIZEOF, REDHAT_PCI_CAP_RESOURCE_RESERVE, REDHAT_PCI_CAP_TYPE_OFFSET,
     pci_bridge_qemu_reserve_cap_init, pci_bridge_ssvid_init, pcie_port_init_reg,
 };
-pub use q35::{Mch, Q35Config, Q35PciHost, pci_bus_get_w64_range};
+pub use q35::{Mch, MchVmState, Q35Config, Q35PciHost, pci_bus_get_w64_range};

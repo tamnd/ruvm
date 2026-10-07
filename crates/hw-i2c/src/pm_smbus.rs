@@ -88,6 +88,9 @@ pub struct PmSmbusRegs {
     pub start_transaction_on_status_read: bool,
 }
 
+/// The `pmsmb` section is exactly the registers.
+pub type PmSmbusVmState = PmSmbusRegs;
+
 /// A PM SMBus host controller, `PMSMBus`.
 ///
 /// With HST_CNT.INTREN clear, START does not run the transaction. It sets HOST_BUSY and the
@@ -144,6 +147,17 @@ impl PmSmbus {
     /// A copy of the registers.
     pub fn regs(&self) -> PmSmbusRegs {
         self.lock().clone()
+    }
+
+    /// The `pmsmb` section.
+    pub fn vmstate_save(&self) -> PmSmbusVmState {
+        self.regs()
+    }
+
+    /// Loads the `pmsmb` section. `pmsmb` has no `post_load`; the interrupt level is the
+    /// host's to restore.
+    pub fn vmstate_load(&self, v: &PmSmbusVmState) {
+        *self.lock() = v.clone();
     }
 
     /// `pm_smbus_reset()`: ends any block transfer and clears the status. The other registers

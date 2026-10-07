@@ -11,7 +11,8 @@
 //! The counter is read without taking the device lock, using the same seqlock scheme as QEMU
 //! built from atomics. Everything else runs under one mutex.
 //!
-//! VMState, trace points and QOM registration are not ported.
+//! [`HpetVmState`] is the device as QEMU's `hpet` VMState section carries it. Trace points and
+//! QOM registration are not ported.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -190,6 +191,47 @@ impl HpetTimer {
     fn enabled(&self) -> bool {
         self.config & HPET_TN_ENABLE != 0
     }
+}
+
+/// One `hpet_timer` of the `hpet` section.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HpetTimerVmState {
+    /// Timer number.
+    pub tn: u8,
+    /// Configuration and capabilities.
+    pub config: u64,
+    /// Comparator.
+    pub cmp: u64,
+    /// FSB route.
+    pub fsb: u64,
+    /// Last value written to the comparator.
+    pub period: u64,
+    /// The next pop is the one shot 32 bit wrap interrupt.
+    pub wrap_flag: u8,
+    /// The comparator's `QEMUTimer`: its expiry on the virtual clock, -1 when not armed.
+    pub qemu_timer: i64,
+}
+
+/// The `hpet` VMState section, version 2.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HpetVmState {
+    pub config: u64,
+    /// Interrupt status register.
+    pub isr: u64,
+    /// The main counter, latched by `hpet_pre_save()` while the HPET is enabled.
+    pub hpet_counter: u64,
+    /// The number of timers the stream carries, which must match [`num_timers`](Self::num_timers).
+    pub num_timers_save: u8,
+    /// The first `num_timers_save` timers.
+    pub timer: Vec<HpetTimerVmState>,
+    /// Subsection `hpet/rtc_irq_level`, sent when it is not 0.
+    pub rtc_irq_level: u8,
+    /// Subsection `hpet/offset`, sent while the HPET is enabled: the counter minus the virtual
+    /// clock, in nanoseconds.
+    pub hpet_offset: u64,
+    /// Not in the stream: the `timers` property of this device, for the
+    /// `"num_timers must match"` check.
+    pub num_timers: u8,
 }
 
 /// The part of `HPETState` behind `s->lock`.
@@ -797,12 +839,86 @@ impl Hpet {
     /// restored.
     pub fn post_load(&self) {
         let mut s = self.state();
+        let n = usize::from(self.num_timers);
         let counter = self.hpet_counter.load(Ordering::SeqCst);
-        let last = self.now_ns().wrapping_sub(NANOSECONDS_PER_SECOND as u64);
-        for t in s.timer.iter_mut().take(usize::from(self.num_timers)) {
+        Self::post_load_timers(&mut s.timer[..n], counter, self.now_ns());
+    }
+
+    fn post_load_timers(timers: &mut [HpetTimer], counter: u64, now: u64) {
+        let last = now.wrapping_sub(NANOSECONDS_PER_SECOND as u64);
+        for t in timers {
             t.cmp64 = hpet_calculate_cmp64(t, counter, t.cmp);
             t.last = last;
         }
+    }
+
+    /// `hpet_pre_save()` and the `hpet` section's fields: the counter is latched while the
+    /// HPET is enabled, and `num_timers_save` is set to the configured count.
+    pub fn vmstate_save(&self) -> HpetVmState {
+        self.pre_save();
+        let s = self.state();
+        let n = usize::from(self.num_timers);
+        let timer = s.timer[..n]
+            .iter()
+            .zip(&self.qemu_timers)
+            .map(|(t, qt)| HpetTimerVmState {
+                tn: t.tn,
+                config: t.config,
+                cmp: t.cmp,
+                fsb: t.fsb,
+                period: t.period,
+                wrap_flag: t.wrap_flag,
+                qemu_timer: qt.expire_time().unwrap_or(-1),
+            })
+            .collect();
+        HpetVmState {
+            config: self.config.load(Ordering::SeqCst),
+            isr: s.isr,
+            hpet_counter: self.hpet_counter.load(Ordering::SeqCst),
+            num_timers_save: self.num_timers,
+            timer,
+            rtc_irq_level: self.rtc_irq_level.load(Ordering::SeqCst),
+            hpet_offset: self.hpet_offset.load(Ordering::SeqCst),
+            num_timers: self.num_timers,
+        }
+    }
+
+    /// Takes over a loaded `hpet` section: the registers, each comparator timer armed for its
+    /// loaded expiry (deleted for -1), and then `hpet_post_load()`. Fails, changing nothing, when
+    /// the stream has another number of timers than this device. The IRQ outputs are left
+    /// alone, as in QEMU.
+    pub fn vmstate_load(&self, v: &HpetVmState) -> Result<(), String> {
+        let n = usize::from(self.num_timers);
+        if v.num_timers_save != self.num_timers || v.timer.len() != n {
+            return Err(format!(
+                "hpet: the stream has {} timers, this HPET has {}",
+                v.num_timers_save, self.num_timers
+            ));
+        }
+        let mut guard = self.state();
+        let s = &mut *guard;
+        s.isr = v.isr;
+        for ((t, vt), qt) in s.timer.iter_mut().zip(&v.timer).zip(&self.qemu_timers) {
+            t.tn = vt.tn;
+            t.config = vt.config;
+            t.cmp = vt.cmp;
+            t.fsb = vt.fsb;
+            t.period = vt.period;
+            t.wrap_flag = vt.wrap_flag;
+            if vt.qemu_timer == -1 {
+                qt.del();
+            } else {
+                qt.modify(vt.qemu_timer);
+            }
+        }
+        self.seqlock_write_begin();
+        self.config.store(v.config, Ordering::SeqCst);
+        self.hpet_counter.store(v.hpet_counter, Ordering::SeqCst);
+        self.hpet_offset.store(v.hpet_offset, Ordering::SeqCst);
+        self.seqlock_write_end();
+        self.rtc_irq_level.store(v.rtc_irq_level, Ordering::SeqCst);
+        Self::post_load_timers(&mut s.timer[..n], v.hpet_counter, self.now_ns());
+        Ok(())
     }
 }
 
@@ -857,5 +973,42 @@ mod tests {
         assert_eq!(b.len(), HpetFwConfig::PACKED_SIZE);
         assert_eq!(&b[..5], &[1, 0x01, 0xa2, 0x86, 0x80]);
         assert_eq!(&b[5..13], &HPET_BASE.to_le_bytes());
+    }
+
+    fn hpet_at(now: i64) -> (Arc<Clock>, Arc<Hpet>) {
+        let clock = Clock::manual(ruvm_base::ClockType::Virtual);
+        clock.advance_to(now);
+        let props = HpetProperties { intcap: 0x00ff_ffff, ..HpetProperties::default() };
+        let h = Hpet::realize(&clock, props, &mut HpetFwConfig::new(), HPET_BASE).unwrap();
+        (clock, h)
+    }
+
+    #[test]
+    fn vmstate_round_trip_keeps_the_counter_and_deadlines() {
+        let (clock, src) = hpet_at(5_000_000);
+        // Timer 2: one shot, enabled, route 2, comparator 1000 ticks (10 us) ahead.
+        src.mmio_write(0x100 + 2 * 0x20, 8, HPET_TN_ENABLE | (2 << HPET_TN_INT_ROUTE_SHIFT));
+        src.mmio_write(0x108 + 2 * 0x20, 8, 1000);
+        src.mmio_write(HPET_CFG, 8, HPET_CFG_ENABLE);
+        clock.advance_to(5_004_000);
+        let saved = src.vmstate_save();
+        assert_eq!(saved.num_timers_save, HPET_MIN_TIMERS);
+        assert_eq!(saved.timer.len(), usize::from(HPET_MIN_TIMERS));
+        assert_eq!(saved.hpet_counter, 400);
+        assert_eq!(saved.timer[2].qemu_timer, 5_010_000);
+        assert_eq!(saved.timer[0].qemu_timer, -1);
+
+        // The destination's clock reads the same, as the "timer" section sees to.
+        let (_clock2, dst) = hpet_at(5_004_000);
+        dst.vmstate_load(&saved).unwrap();
+        assert_eq!(dst.mmio_read(HPET_COUNTER, 8), 400);
+        assert_eq!(dst.qemu_timers[2].expire_time(), Some(5_010_000));
+        assert_eq!(dst.qemu_timers[0].expire_time(), None);
+        assert_eq!(dst.state().timer[2].cmp64, 1000);
+        assert_eq!(dst.vmstate_save(), saved);
+
+        let mut bad = saved.clone();
+        bad.num_timers_save = 4;
+        assert!(dst.vmstate_load(&bad).is_err());
     }
 }

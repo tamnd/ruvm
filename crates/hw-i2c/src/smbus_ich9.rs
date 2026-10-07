@@ -12,11 +12,11 @@ use std::sync::{Arc, Weak};
 
 use ruvm_base::Error;
 use ruvm_hw_pci::regs::{PCI_BASE_ADDRESS_SPACE_IO, PCI_INTERRUPT_PIN};
-use ruvm_hw_pci::{PciBus, PciDevice, PciDeviceInfo, PciDeviceOps};
+use ruvm_hw_pci::{PciBus, PciDevice, PciDeviceInfo, PciDeviceOps, PciDeviceVmState};
 use ruvm_mem::{MemorySystem, RegionId};
 
 use crate::i2c::I2cBus;
-use crate::pm_smbus::{PM_SMBUS_IO_SIZE, PmSmbus};
+use crate::pm_smbus::{PM_SMBUS_IO_SIZE, PmSmbus, PmSmbusVmState};
 use crate::smbus_eeprom::{SmbusEepromSlave, smbus_eeprom_init};
 
 /// `TYPE_ICH9_SMB_DEVICE`.
@@ -44,6 +44,14 @@ pub const ICH9_SMB_HOSTC_SSRESET: u8 = 1 << 3;
 pub const ICH9_SMB_HOSTC_I2C_EN: u8 = 1 << 2;
 pub const ICH9_SMB_HOSTC_SMB_SMI_EN: u8 = 1 << 1;
 pub const ICH9_SMB_HOSTC_HST_EN: u8 = 1 << 0;
+
+/// The `ich9_smb` section.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ich9SmbusVmState {
+    pub dev: PciDeviceVmState,
+    pub irq_enabled: bool,
+    pub smb: PmSmbusVmState,
+}
 
 /// `ICH9SMBState`.
 pub struct Ich9Smbus {
@@ -152,7 +160,29 @@ impl Ich9Smbus {
         self.io
     }
 
-    /// The level last driven on INTA.
+    /// The `ich9_smb` section.
+    pub fn vmstate_save(&self) -> Ich9SmbusVmState {
+        Ich9SmbusVmState {
+            dev: self.dev.vmstate_save(),
+            irq_enabled: self.irq_enabled.load(Ordering::SeqCst),
+            smb: self.smb.vmstate_save(),
+        }
+    }
+
+    /// Loads the `ich9_smb` section. QEMU has no `post_load` here and leaves the `pm-smbus`
+    /// region as the destination had it; this also shows or hides it from HOSTC.HST_EN, as
+    /// the last config write did on the source. INTA is not driven: its level is in the
+    /// `PCIDevice` part and the bus counts.
+    pub fn vmstate_load(&self, v: &Ich9SmbusVmState) -> Result<(), String> {
+        self.dev.vmstate_load(&v.dev)?;
+        self.irq_enabled.store(v.irq_enabled, Ordering::SeqCst);
+        self.smb.vmstate_load(&v.smb);
+        let hostc = v.dev.config[ICH9_SMB_HOSTC];
+        let _ = self.memory.set_enabled(self.io, hostc & ICH9_SMB_HOSTC_HST_EN != 0);
+        Ok(())
+    }
+
+    /// The level last driven on INTA.    /// The level last driven on INTA.
     pub fn irq_enabled(&self) -> bool {
         self.irq_enabled.load(Ordering::SeqCst)
     }

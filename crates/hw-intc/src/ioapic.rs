@@ -13,8 +13,9 @@
 //! Messages are delivered after the device lock is released, so the handler may call back into
 //! the IOAPIC.
 //!
-//! VMState, trace points, QOM registration, the KVM in-kernel ioapic and the split irqchip KVM
-//! route updates are not ported.
+//! Trace points, QOM registration, the KVM in-kernel ioapic and the split irqchip KVM route
+//! updates are not ported. The VMState registers go in and out through
+//! [`IoApic::vmstate_save`] and [`IoApic::vmstate_load`].
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -191,6 +192,16 @@ struct IoApicState {
     irq_count: [u64; IOAPIC_NUM_PINS],
     irq_level: [i32; IOAPIC_NUM_PINS],
     irq_eoi: [i32; IOAPIC_NUM_PINS],
+}
+
+/// What `vmstate_ioapic_common` (`"ioapic"`, version 3) carries, with QEMU's field names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IoApicVmState {
+    pub id: u8,
+    pub ioregsel: u8,
+    /// Since version 2.
+    pub irr: u32,
+    pub ioredtbl: [u64; IOAPIC_NUM_PINS],
 }
 
 /// Messages collected by `ioapic_service()` and sent once the lock is dropped.
@@ -527,6 +538,24 @@ impl IoApic {
             _ => {}
         }
         self.deliver(out);
+    }
+
+    /// The registers `vmstate_ioapic_common` saves. Its `pre_save` only matters to the KVM
+    /// IOAPIC.
+    pub fn vmstate_save(&self) -> IoApicVmState {
+        let s = self.lock();
+        IoApicVmState { id: s.id, ioregsel: s.ioregsel, irr: s.irr, ioredtbl: s.ioredtbl }
+    }
+
+    /// Loads the registers of `vmstate_ioapic_common`. Its `post_load`,
+    /// `ioapic_update_kvm_routes()`, only matters to a split irqchip under KVM. The input levels
+    /// and statistics are not migrated, as in QEMU.
+    pub fn vmstate_load(&self, v: &IoApicVmState) {
+        let mut s = self.lock();
+        s.id = v.id;
+        s.ioregsel = v.ioregsel;
+        s.irr = v.irr;
+        s.ioredtbl = v.ioredtbl;
     }
 
     /// `ioapic_reset_common()`.

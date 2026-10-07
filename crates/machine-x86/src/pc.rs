@@ -326,6 +326,12 @@ pub struct Port92 {
     reset: ResetRequest,
 }
 
+/// `vmstate_port92` (version 1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Port92VmState {
+    pub outport: u8,
+}
+
 impl fmt::Debug for Port92 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Port92").field("outport", &self.outport()).finish_non_exhaustive()
@@ -346,6 +352,17 @@ impl Port92 {
     /// The register.
     pub fn outport(&self) -> u8 {
         *self.outport.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The `outport` field of `vmstate_port92`.
+    pub fn vmstate_save(&self) -> Port92VmState {
+        Port92VmState { outport: self.outport() }
+    }
+
+    /// Loads `vmstate_port92`, which has no `post_load`: the A20 line and the reset request are
+    /// left alone.
+    pub fn vmstate_load(&self, v: &Port92VmState) {
+        *self.outport.lock().unwrap_or_else(PoisonError::into_inner) = v.outport;
     }
 
     /// `port92_reset()`: only the reset bit goes back to 0.
@@ -396,10 +413,32 @@ impl fmt::Debug for PcSpeaker {
     }
 }
 
+/// The `pcspk` VMState section.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PcSpkVmState {
+    /// The speaker data bit, bit 1 of port 0x61.
+    pub data_on: u8,
+    /// The refresh toggle, bit 4 of port 0x61.
+    pub dummy_refresh_clock: u8,
+}
+
 impl PcSpeaker {
     /// `pcspk_realizefn()` with the `pit` link set.
     pub fn new(pit: Arc<I8254>) -> Arc<PcSpeaker> {
         Arc::new(PcSpeaker { pit, state: Mutex::new((0, 0)) })
+    }
+
+    /// The migration state.
+    pub fn vmstate_save(&self) -> PcSpkVmState {
+        let (data_on, dummy_refresh_clock) =
+            *self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        PcSpkVmState { data_on, dummy_refresh_clock }
+    }
+
+    /// Takes over loaded state. The channel 2 gate is the PIT's and travels with it.
+    pub fn vmstate_load(&self, v: &PcSpkVmState) {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) =
+            (v.data_on, v.dummy_refresh_clock);
     }
 }
 

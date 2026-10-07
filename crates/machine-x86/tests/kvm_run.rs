@@ -91,6 +91,7 @@ fn run(
     let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
     let spec = BoardSpec {
         kind,
+        machine_type: if kind == BoardKind::Q35 { "pc-q35-11.1" } else { "microvm" },
         props: Vec::new(),
         ram_size: Some(256 << 20),
         cpus: 1,
@@ -178,6 +179,7 @@ fn irqchip_off_is_refused() {
     let cpu = CpuModel::new(&accel, None).unwrap();
     let spec = BoardSpec {
         kind: BoardKind::Q35,
+        machine_type: "pc-q35-11.1",
         props: Vec::new(),
         ram_size: None,
         cpus: 1,

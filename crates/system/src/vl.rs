@@ -30,7 +30,7 @@ use ruvm_chardev::{Chardev, Chardevs};
 use ruvm_hostmem::region::RegionObjects;
 use ruvm_hw_core::machine::{MACHINES, machine_type_name};
 use ruvm_hw_core::{Machine, create_machine};
-use ruvm_machine_x86::BoardKind;
+use ruvm_machine_x86::{BoardKind, canonical_machine_name};
 use ruvm_mem::MemorySystem;
 use ruvm_migration::Migration;
 use ruvm_monitor::Qmp;
@@ -755,8 +755,8 @@ fn create_objects(vm: &Vm, cfg: &mut Config, pick: fn(&str) -> bool) -> Flow<()>
 enum MachineChoice {
     /// A machine type in the QOM registry, by type name.
     Qom(String),
-    /// One of the x86 boards.
-    X86(BoardKind),
+    /// One of the x86 boards, and its machine type name with an alias resolved.
+    X86(BoardKind, &'static str),
     /// The Arm virt board.
     ArmVirt,
     /// The RISC-V virt board.
@@ -775,8 +775,9 @@ fn select_machine(target: &str, cfg: &mut Config) -> Flow<MachineChoice> {
     };
     cfg.machine.remove("type");
     if x86::is_x86(target) {
-        if let Some(kind) = BoardKind::from_name(&ty) {
-            return Ok(MachineChoice::X86(kind));
+        if let Some(name) = canonical_machine_name(&ty) {
+            let kind = BoardKind::from_name(name).expect("an x86 board name");
+            return Ok(MachineChoice::X86(kind, name));
         }
     }
     if arm::is_arm(target) && arm::is_virt(&ty) {
@@ -988,8 +989,12 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     let choice = select_machine(p.target, &mut cfg)?;
     let rv_virt = matches!(choice, MachineChoice::RiscvVirt);
     let virt = matches!(choice, MachineChoice::ArmVirt) || rv_virt;
+    let mut machine_type = "";
     let (kind, machine) = match choice {
-        MachineChoice::X86(kind) => (Some(kind), None),
+        MachineChoice::X86(kind, name) => {
+            machine_type = name;
+            (Some(kind), None)
+        }
         MachineChoice::ArmVirt | MachineChoice::RiscvVirt => (None, None),
         MachineChoice::Qom(typename) => {
             let machine =
@@ -1044,7 +1049,9 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             if memdev.is_some() {
                 return Err(fail_msg("memory-backend is not supported by ruvm yet"));
             }
-            Some(x86::take_board_options(kind, &cfg.machine).map_err(|e| fail(&e))?)
+            let mut opts = x86::take_board_options(kind, &cfg.machine).map_err(|e| fail(&e))?;
+            opts.machine_type = machine_type;
+            Some(opts)
         }
         (None, Some(machine)) => {
             machine.object.set_props_from_keyval(&cfg.machine, false).map_err(|e| fail(&e))?;

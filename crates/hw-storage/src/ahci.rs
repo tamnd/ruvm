@@ -17,8 +17,8 @@ use std::sync::Arc;
 use ruvm_mem::{AddressSpace, MemTxAttrs};
 
 use crate::ide::{
-    BUSY_STAT, DRQ_STAT, DriveConfig, DriveKind, ERR_STAT, IdeDrive, IdeHost, READY_STAT,
-    SEEK_STAT, SgList, WRERR_STAT,
+    BUSY_STAT, DRQ_STAT, DriveConfig, DriveKind, ERR_STAT, IdeBusVmState, IdeDrive,
+    IdeDriveVmState, IdeHost, READY_STAT, SEEK_STAT, SgList, WRERR_STAT,
 };
 
 /// Guest memory as the controller sees it for DMA.
@@ -210,6 +210,68 @@ impl fmt::Debug for AhciState {
             .field("ports", &self.ports)
             .finish_non_exhaustive()
     }
+}
+
+/// `vmstate_ncq_tfs`, one NCQ tag of a port.
+///
+/// Every NCQ command finishes inside the register write that issued it, so a saved tag is
+/// always free and all zeros. QEMU keeps the fields of the last command in a free tag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NcqVmState {
+    pub sector_count: u32,
+    pub lba: u64,
+    pub tag: u8,
+    pub cmd: u8,
+    pub slot: u8,
+    pub used: bool,
+    pub halt: bool,
+}
+
+/// `vmstate_ahci_device`, one port and its drive.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AhciPortVmState {
+    pub port: IdeBusVmState,
+    /// `port.ifs[0]`.
+    pub ifs0: IdeDriveVmState,
+    /// `STATE_RUN` (0) or `STATE_RESET` (1).
+    pub port_state: u32,
+    pub finished: u32,
+    pub lst_addr: u32,
+    pub lst_addr_hi: u32,
+    pub fis_addr: u32,
+    pub fis_addr_hi: u32,
+    pub irq_stat: u32,
+    pub irq_mask: u32,
+    pub cmd: u32,
+    pub tfdata: u32,
+    pub sig: u32,
+    /// QEMU only ever stores 0 here; reads of PxSSTS are computed.
+    pub scr_stat: u32,
+    pub scr_ctl: u32,
+    pub scr_err: u32,
+    pub scr_act: u32,
+    pub cmd_issue: u32,
+    pub done_first_drq: bool,
+    /// The slot of the command in progress, -1 for none.
+    pub busy_slot: i32,
+    pub init_d2h_sent: bool,
+    pub ncq_tfs: [NcqVmState; AHCI_MAX_CMDS as usize],
+}
+
+/// `vmstate_ahci`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AhciVmState {
+    /// One per port, `ports` of them. The count is not in the stream.
+    pub dev: Vec<AhciPortVmState>,
+    pub cap: u32,
+    pub ghc: u32,
+    pub irqstatus: u32,
+    /// `control_regs.impl`.
+    pub impl_: u32,
+    pub version: u32,
+    pub idp_index: u32,
+    /// `VMSTATE_UINT32_EQUAL`.
+    pub ports: u32,
 }
 
 fn le16(b: &[u8]) -> u16 {
@@ -1025,6 +1087,156 @@ impl AhciState {
             self.ports[port].finished |= 1 << tag;
         }
         self.write_fis_sdb(port);
+    }
+}
+
+impl AhciPort {
+    fn vmstate_save(&self) -> AhciPortVmState {
+        let r = &self.regs;
+        AhciPortVmState {
+            port: IdeBusVmState::default(),
+            ifs0: self.drive.as_ref().expect("drive is in use").vmstate_save(),
+            port_state: match self.port_state {
+                PortState::Run => 0,
+                PortState::Reset => 1,
+            },
+            finished: self.finished,
+            lst_addr: r.lst_addr,
+            lst_addr_hi: r.lst_addr_hi,
+            fis_addr: r.fis_addr,
+            fis_addr_hi: r.fis_addr_hi,
+            irq_stat: r.irq_stat,
+            irq_mask: r.irq_mask,
+            cmd: r.cmd,
+            tfdata: r.tfdata,
+            sig: r.sig,
+            scr_stat: 0,
+            scr_ctl: r.scr_ctl,
+            scr_err: r.scr_err,
+            scr_act: r.scr_act,
+            cmd_issue: r.cmd_issue,
+            done_first_drq: self.done_first_drq,
+            busy_slot: self.busy_slot.map_or(-1, i32::from),
+            init_d2h_sent: self.init_d2h_sent,
+            ncq_tfs: [NcqVmState::default(); AHCI_MAX_CMDS as usize],
+        }
+    }
+}
+
+/// Why `v` cannot be loaded into a port: what `ahci_state_post_load()` refuses, and the busy
+/// states this model has no place for.
+fn port_vmstate_check(i: usize, v: &AhciPortVmState) -> Result<(), String> {
+    if v.cmd & PORT_CMD_START == 0 && v.cmd & PORT_CMD_LIST_ON != 0 {
+        return Err(format!("ahci: port {i}: the DMA engine is off but still running"));
+    }
+    if v.cmd & PORT_CMD_FIS_RX == 0 && v.cmd & PORT_CMD_FIS_ON != 0 {
+        return Err(format!("ahci: port {i}: the FIS RX engine is off but still running"));
+    }
+    if v.ncq_tfs.iter().any(|t| t.used != t.halt) {
+        return Err(format!("ahci: port {i}: NCQ commands in flight are not supported"));
+    }
+    if v.ncq_tfs.iter().any(|t| t.halt) {
+        return Err(format!("ahci: port {i}: halted NCQ commands are not supported"));
+    }
+    if v.busy_slot != -1 {
+        let slot = v.busy_slot;
+        return Err(format!(
+            "ahci: port {i}: a command in progress (slot {slot}) is not supported"
+        ));
+    }
+    if v.port.error_status != 0 {
+        return Err(format!("ahci: port {i}: a request waiting to be retried is not supported"));
+    }
+    if v.port.unit != 0 {
+        return Err(format!("ahci: port {i}: unit {} on a one-drive bus", v.port.unit));
+    }
+    if v.port_state > 1 {
+        return Err(format!("ahci: port {i}: bad port state {}", v.port_state));
+    }
+    v.ifs0.check().map_err(|e| format!("ahci: port {i}: {e}"))
+}
+
+impl AhciState {
+    /// The `ahci` part of the stream.
+    pub(crate) fn vmstate_save(&self) -> AhciVmState {
+        AhciVmState {
+            dev: self.ports.iter().map(AhciPort::vmstate_save).collect(),
+            cap: self.cap,
+            ghc: self.ghc,
+            irqstatus: self.irqstatus,
+            impl_: self.impl_,
+            version: self.version,
+            idp_index: self.idp_index,
+            ports: self.ports.len() as u32,
+        }
+    }
+
+    /// Loads the `ahci` part of the stream, then `ahci_state_post_load()`: the engines that
+    /// were running are restarted, which fails if their buffers are no longer in guest memory,
+    /// and the command list of every port is checked again.
+    ///
+    /// Only an idle controller loads: no NCQ tag in use, no command in progress, no PIO
+    /// transfer, no request waiting to be retried. Anything else fails before the state
+    /// changes.
+    pub(crate) fn vmstate_load(&mut self, v: &AhciVmState) -> Result<(), String> {
+        if v.ports as usize != self.ports.len() || v.dev.len() != self.ports.len() {
+            let (n, here) = (v.dev.len(), self.ports.len());
+            return Err(format!("ahci: {n} ports in the stream, {here} here"));
+        }
+        for (i, p) in v.dev.iter().enumerate() {
+            port_vmstate_check(i, p)?;
+        }
+
+        self.cap = v.cap;
+        self.ghc = v.ghc;
+        self.irqstatus = v.irqstatus;
+        self.impl_ = v.impl_;
+        self.version = v.version;
+        self.idp_index = v.idp_index;
+        for (i, s) in v.dev.iter().enumerate() {
+            let p = &mut self.ports[i];
+            p.regs = PortRegs {
+                lst_addr: s.lst_addr,
+                lst_addr_hi: s.lst_addr_hi,
+                fis_addr: s.fis_addr,
+                fis_addr_hi: s.fis_addr_hi,
+                irq_stat: s.irq_stat,
+                irq_mask: s.irq_mask,
+                // After a migration the engines are off and are restarted below.
+                cmd: s.cmd & !(PORT_CMD_LIST_ON | PORT_CMD_FIS_ON),
+                tfdata: s.tfdata,
+                sig: s.sig,
+                scr_ctl: s.scr_ctl,
+                scr_err: s.scr_err,
+                scr_act: s.scr_act,
+                cmd_issue: s.cmd_issue,
+            };
+            p.lst = None;
+            p.res_fis = None;
+            p.port_state = if s.port_state == 0 { PortState::Run } else { PortState::Reset };
+            p.finished = s.finished;
+            p.done_first_drq = s.done_first_drq;
+            p.busy_slot = None;
+            p.init_d2h_sent = s.init_d2h_sent;
+            p.cur_slot = None;
+            p.check_pending = false;
+            p.drive.as_mut().expect("drive is in use").vmstate_load(&s.ifs0)?;
+
+            // ahci_cond_start_engines(), where a failure fails the load.
+            let cmd = self.ports[i].regs.cmd;
+            if cmd & PORT_CMD_START != 0 && !self.map_clb_address(i) {
+                self.ports[i].regs.cmd &= !PORT_CMD_START;
+                return Err(format!("ahci: port {i}: bad command list buffer address"));
+            }
+            if cmd & PORT_CMD_FIS_RX != 0 && !self.map_fis_address(i) {
+                self.ports[i].regs.cmd &= !PORT_CMD_FIS_RX;
+                return Err(format!("ahci: port {i}: bad FIS receive buffer address"));
+            }
+            // busy_slot is -1: look for commands that were issued but not started.
+            self.check_cmd(i);
+        }
+        self.run_pending_checks();
+        Ok(())
     }
 }
 

@@ -6,8 +6,9 @@
 //! the master's output goes to the CPU, which acknowledges with [`I8259::pic_read_irq`]. Each
 //! chip also has a PIIX style ELCR port that switches single lines to level triggering.
 //!
-//! VMState, trace points, QOM registration, the interrupt statistics and the KVM in-kernel
-//! `kvm-i8259` are not ported.
+//! Trace points, QOM registration, the interrupt statistics and the KVM in-kernel `kvm-i8259`
+//! are not ported. The VMState registers are [`PicCommonState`], read with [`I8259::state`] and
+//! loaded with [`I8259::vmstate_load`].
 //!
 //! Each chip keeps its registers behind a mutex. The output line is set after the lock is
 //! dropped, so the slave can drive the master and the master can read the slave while
@@ -347,6 +348,18 @@ impl I8259 {
         let mut s = self.lock().clone();
         s.update = false;
         s
+    }
+
+    /// Loads the registers `vmstate_pic_common` carries (`"i8259"`, version 1, with the
+    /// `i8259/ltim` subsection, which goes out when `ltim` is not 0); [`state`](Self::state)
+    /// gives what it saves. `master` stays this chip's own. QEMU's TCG 8259 has no `post_load`:
+    /// the output line is not driven, the CPU's interrupt request comes with the CPU.
+    pub fn vmstate_load(&self, v: &PicCommonState) {
+        let mut s = self.lock();
+        let master = s.master;
+        *s = v.clone();
+        s.master = master;
+        s.update = false;
     }
 
     /// The slave, once [`i8259_init`] has wired it.

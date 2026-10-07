@@ -1038,6 +1038,11 @@ impl Microvm {
         self.mem.ram_block(self.ram)
     }
 
+    /// The RAM blocks a migration carries, `microvm.ram` and `pc.bios`, in QEMU's order.
+    pub fn migratable_ram_blocks(&self) -> Vec<Arc<RamBlock>> {
+        [self.ram, self.bios].into_iter().filter_map(|id| self.mem.ram_block(id)).collect()
+    }
+
     /// The firmware region, `pc.bios`.
     pub fn bios_region(&self) -> RegionId {
         self.bios

@@ -97,6 +97,11 @@ pub use props::{Q35Props, SmbiosEntryPointType};
 pub const Q35_MACHINE_NAME: &str = "pc-q35-11.1";
 /// `mc->alias`.
 pub const Q35_MACHINE_ALIAS: &str = "q35";
+/// The older q35 machine versions ruvm also builds, newest first. Their compat properties,
+/// `hw_compat_11_0` and `hw_compat_10_2` (`pc_compat_11_0` and `pc_compat_10_2` are empty),
+/// touch none of the devices ruvm has, so each is [`Q35_MACHINE_NAME`] under another name: the
+/// name shows only in `-machine help` and in the configuration section of a migration stream.
+pub const Q35_OLDER_MACHINE_NAMES: [&str; 2] = ["pc-q35-11.0", "pc-q35-10.2"];
 /// `mc->desc`.
 pub const Q35_DESC: &str = "Standard PC (Q35 + ICH9, 2009)";
 /// `mc->max_cpus`.
@@ -199,6 +204,9 @@ pub struct PflashDrive {
 
 /// Everything [`Q35::new`] needs: the command line after parsing, with files already read.
 pub struct Q35MachineConfig {
+    /// `mc->name`: [`Q35_MACHINE_NAME`] or one of [`Q35_OLDER_MACHINE_NAMES`]. It is the
+    /// version string of the SMBIOS system table.
+    pub machine_name: &'static str,
     /// `-m`.
     pub ram_size: u64,
     /// `-smp cpus=`.
@@ -262,6 +270,7 @@ pub struct Q35MachineConfig {
 impl fmt::Debug for Q35MachineConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Q35MachineConfig")
+            .field("machine_name", &self.machine_name)
             .field("ram_size", &self.ram_size)
             .field("cpus", &self.cpus)
             .field("max_cpus", &self.max_cpus)
@@ -282,6 +291,7 @@ impl Default for Q35MachineConfig {
     /// when stepped.
     fn default() -> Self {
         Q35MachineConfig {
+            machine_name: Q35_MACHINE_NAME,
             ram_size: Q35_DEFAULT_RAM_SIZE,
             cpus: 1,
             max_cpus: 0,
@@ -584,6 +594,7 @@ struct PluggedDrive {
 
 /// A q35 board.
 pub struct Q35 {
+    machine_name: &'static str,
     ram_size: u64,
     below_4g_mem_size: u64,
     above_4g_mem_size: u64,
@@ -673,6 +684,7 @@ impl Q35 {
     /// and creates the devices. Errors carry QEMU's message.
     pub fn new(cfg: Q35MachineConfig) -> Result<Q35, String> {
         let Q35MachineConfig {
+            machine_name,
             ram_size,
             cpus,
             max_cpus,
@@ -711,7 +723,7 @@ impl Q35 {
         if max_cpus > Q35_MAX_CPUS {
             return Err(format!(
                 "Invalid SMP CPUs {max_cpus}. The max CPUs supported by machine \
-                 '{Q35_MACHINE_NAME}' is {Q35_MAX_CPUS}"
+                 '{machine_name}' is {Q35_MAX_CPUS}"
             ));
         }
         if props.usb {
@@ -1139,7 +1151,10 @@ impl Q35 {
         let ahci = if props.sata {
             let dma: Arc<dyn ruvm_hw_storage::DmaMemory> =
                 Arc::new(WeakAhciDma(Arc::downgrade(&memory_as)));
-            Some(Ich9Ahci::new(host.bus(), dma, Some(ICH9_SATA1_DEVFN)).map_err(err)?)
+            Some(
+                Ich9Ahci::new_multifunction(host.bus(), dma, Some(ICH9_SATA1_DEVFN))
+                    .map_err(err)?,
+            )
         } else {
             None
         };
@@ -1160,6 +1175,7 @@ impl Q35 {
         });
 
         Ok(Q35 {
+            machine_name,
             ram_size,
             below_4g_mem_size,
             above_4g_mem_size,
@@ -1316,6 +1332,9 @@ impl Q35 {
     /// install.
     fn build_smbios(&self) -> Result<(), String> {
         let mut cfg = SmbiosConfig::q35();
+        if let Some(d) = cfg.defaults.as_mut() {
+            d.version = self.machine_name.to_string();
+        }
         cfg.uuid = self.uuid;
         cfg.ep_type = match self.props.smbios_entry_point_type {
             SmbiosEntryPointType::Ep32 => SmbiosEp::Ep32,
@@ -1593,6 +1612,11 @@ impl Q35 {
         self.vmport
     }
 
+    /// The machine type name, `pc-q35-11.1` or an older version.
+    pub fn machine_name(&self) -> &'static str {
+        self.machine_name
+    }
+
     /// The properties the machine was built with.
     pub fn props(&self) -> &Q35Props {
         &self.props
@@ -1736,5 +1760,16 @@ impl Q35 {
     /// Port 0x92, which comes with the i8042.
     pub fn port92(&self) -> Option<&Arc<Port92>> {
         self.port92.as_ref()
+    }
+
+    /// `AcpiBuildState.patched` for the `acpi_build` section: a getter and a setter.
+    pub(crate) fn acpi_patched(
+        &self,
+    ) -> (impl FnMut() -> bool + Send + 'static, impl FnMut(bool) + Send + 'static) {
+        let (get, set) = (Arc::clone(&self.acpi_cache), Arc::clone(&self.acpi_cache));
+        (
+            move || get.lock().unwrap_or_else(PoisonError::into_inner).patched,
+            move |p| set.lock().unwrap_or_else(PoisonError::into_inner).patched = p,
+        )
     }
 }

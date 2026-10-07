@@ -20,7 +20,9 @@
 //! code asks [`AcpiPm::wakeup_enabled`] instead, which reads the same bits of PM1_EN. The
 //! `etc/system-states` fw_cfg file is built by [`system_states`] for the board to add.
 //!
-//! VMState, trace points and QOM registration are not ported.
+//! The chipsets' VMState sections reach the registers through [`AcpiPm::regs`],
+//! [`AcpiPm::tmr_timer_expire`] and [`AcpiPm::vmstate_load`]. Trace points and QOM registration
+//! are not ported.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -459,6 +461,24 @@ impl AcpiPm {
     /// The overflow timer's deadline, if armed.
     pub fn overflow_timer_deadline(&self) -> Option<i64> {
         self.timer.expire_time()
+    }
+
+    /// `acpi_regs.tmr.timer` as `VMSTATE_TIMER_PTR` writes it: the overflow timer's expire
+    /// time in virtual nanoseconds, -1 when it is not armed.
+    pub fn tmr_timer_expire(&self) -> i64 {
+        self.timer.expire_time().unwrap_or(-1)
+    }
+
+    /// Loads the registers and the overflow timer from a migration stream. `f` sets the
+    /// registers. Unlike [`AcpiPm::with_regs`] the SCI is left alone, as QEMU does on load:
+    /// the chipset restores its level from its own section.
+    pub fn vmstate_load(&self, f: impl FnOnce(&mut AcpiRegs), tmr_expire: i64) {
+        f(&mut lock(&self.regs));
+        if tmr_expire == -1 {
+            self.timer.del();
+        } else {
+            self.timer.modify(tmr_expire);
+        }
     }
 
     /// `acpi_update_sci()`.

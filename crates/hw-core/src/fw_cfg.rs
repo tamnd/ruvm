@@ -14,8 +14,12 @@
 //! Select and write callbacks run with the device lock held, so they must not call back into
 //! the same device.
 //!
-//! VMState, trace points, QOM registration, the ACPI MR sizes kept for migration and the machine
-//! wiring are left out; the `fw_cfg_init_*` constructors only build the device and its ops.
+//! [`FwCfgState::vmstate_save`] and [`FwCfgState::vmstate_load`] move what the `fw_cfg` VMState
+//! carries. The ACPI MR sizes are only kept so that a stream from QEMU can be sent on again;
+//! there are no resizable ACPI ROM regions here to resize.
+//!
+//! Trace points, QOM registration and the machine wiring are left out; the `fw_cfg_init_*`
+//! constructors only build the device and its ops.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -298,6 +302,42 @@ struct FwCfgInner {
     cur_entry: u16,
     cur_offset: u32,
     dma_addr: u64,
+    // `table_mr_size`, `linker_mr_size` and `rsdp_mr_size`, as the `fw_cfg/acpi_mr` subsection
+    // last brought them.
+    acpi_mr_sizes: [u64; 3],
+}
+
+/// The page size `fw_cfg_acpi_mr_restore()` checks the ACPI MR sizes against,
+/// `qemu_real_host_page_size()` on the x86 Linux hosts QEMU migrates with.
+pub const FW_CFG_ACPI_MR_PAGE_SIZE: u64 = 4096;
+
+/// The fields of `vmstate_fw_cfg` (version 2) and its subsections, named as in QEMU.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FwCfgVmState {
+    pub cur_entry: u16,
+    pub cur_offset: u32,
+    /// `fw_cfg/dma`.
+    pub dma_addr: u64,
+    /// `fw_cfg/acpi_mr`.
+    pub table_mr_size: u64,
+    pub linker_mr_size: u64,
+    pub rsdp_mr_size: u64,
+    /// `fw_cfg_dma_enabled()`, not on the wire.
+    pub dma_enabled: bool,
+}
+
+impl FwCfgVmState {
+    /// `fw_cfg_dma_enabled()`, the `needed` of `fw_cfg/dma`.
+    pub fn dma_needed(&self) -> bool {
+        self.dma_enabled
+    }
+
+    /// `fw_cfg_acpi_mr_restore()`: the sizes go out when one of them is not page aligned.
+    pub fn acpi_mr_needed(&self) -> bool {
+        [self.table_mr_size, self.linker_mr_size, self.rsdp_mr_size]
+            .iter()
+            .any(|&n| n % FW_CFG_ACPI_MR_PAGE_SIZE != 0)
+    }
 }
 
 fn arch(key: u16) -> usize {
@@ -568,6 +608,7 @@ impl FwCfgState {
                 cur_entry: 0,
                 cur_offset: 0,
                 dma_addr: 0,
+                acpi_mr_sizes: [0; 3],
             }),
             dma_enabled: props.dma_enabled,
             dma_as: if props.dma_enabled { dma_as } else { None },
@@ -596,6 +637,31 @@ impl FwCfgState {
     /// The read offset into the selected entry.
     pub fn cur_offset(&self) -> u32 {
         self.lock().cur_offset
+    }
+
+    /// The state `vmstate_fw_cfg` sends.
+    pub fn vmstate_save(&self) -> FwCfgVmState {
+        let s = self.lock();
+        let [table_mr_size, linker_mr_size, rsdp_mr_size] = s.acpi_mr_sizes;
+        FwCfgVmState {
+            cur_entry: s.cur_entry,
+            cur_offset: s.cur_offset,
+            dma_addr: s.dma_addr,
+            table_mr_size,
+            linker_mr_size,
+            rsdp_mr_size,
+            dma_enabled: self.dma_enabled,
+        }
+    }
+
+    /// Loads what `vmstate_fw_cfg` carried. QEMU has no `post_load` for the main section; the
+    /// `fw_cfg/acpi_mr` one resizes the ACPI ROM regions, which only keeps the sizes here.
+    pub fn vmstate_load(&self, v: &FwCfgVmState) {
+        let mut s = self.lock();
+        s.cur_entry = v.cur_entry;
+        s.cur_offset = v.cur_offset;
+        s.dma_addr = v.dma_addr;
+        s.acpi_mr_sizes = [v.table_mr_size, v.linker_mr_size, v.rsdp_mr_size];
     }
 
     /// `fw_cfg_common_realize()`: the signature, UUID, graphics and boot entries and `FW_CFG_ID`.

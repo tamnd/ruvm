@@ -44,7 +44,7 @@ use ruvm_mem::{AccessCtx, AccessSize, MemError, MemResult, MemorySystem, MmioOps
 
 use crate::bridge::{pci_bridge_get_base, pci_bridge_get_limit};
 use crate::bus::PciBus;
-use crate::device::{PciDevice, PciDeviceInfo, PciDeviceOps};
+use crate::device::{PciDevice, PciDeviceInfo, PciDeviceOps, PciDeviceVmState};
 use crate::host::PciHostState;
 use crate::pam::{
     PAM_BIOS_BASE, PAM_BIOS_SIZE, PAM_EXPAN_BASE, PAM_EXPAN_SIZE, PAM_REGIONS_COUNT,
@@ -709,6 +709,13 @@ impl PciDeviceOps for Mch {
     }
 }
 
+/// `vmstate_mch` (version 1): the MCH's config space. A byte that used to be `smm_enabled`
+/// follows it on the wire.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MchVmState {
+    pub parent_obj: PciDeviceVmState,
+}
+
 /// The Q35 PCI Express host bridge, `Q35PCIHost`, with its MCH.
 pub struct Q35PciHost {
     host: Arc<PciHostState>,
@@ -800,6 +807,19 @@ impl Q35PciHost {
     /// The MCH function, 00:00.0.
     pub fn mch_device(&self) -> &Arc<PciDevice> {
         &self.mch_dev
+    }
+
+    /// The MCH's `mch` section.
+    pub fn mch_vmstate_save(&self) -> MchVmState {
+        MchVmState { parent_obj: self.mch_dev.vmstate_save() }
+    }
+
+    /// Loads the MCH's `mch` section, then `mch_post_load()`: PAM, SMRAM and MMCONFIG follow the
+    /// loaded config space.
+    pub fn mch_vmstate_load(&self, v: &MchVmState) -> Result<(), String> {
+        self.mch_dev.vmstate_load(&v.parent_obj)?;
+        self.mch.update(&self.mch_dev);
+        Ok(())
     }
 
     /// The "pci-conf-idx" and "pci-conf-data" I/O regions.

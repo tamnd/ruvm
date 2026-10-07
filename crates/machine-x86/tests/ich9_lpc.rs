@@ -652,3 +652,42 @@ fn machine_ready_reports_legacy_devices() {
     m.lpc.machine_ready();
     assert_eq!(m.lpc_readb(0x82), 0x09);
 }
+
+#[test]
+fn vmstate_round_trip() {
+    let src = Machine::new();
+    src.enable_pm_and_rcba();
+    src.lpc_writeb(ICH9_LPC_ACPI_CTRL as usize, 0x81);
+    src.raise_sci(PM_IO_BASE_ADDR);
+    src.lpc.cc_write(ICH9_CC_D31IR as u64, 0x4567, 2);
+    src.outb(0xb3, 0x5a);
+    src.outb(0xcf9, 0x02);
+    let saved = src.lpc.vmstate_save();
+    assert_eq!(saved.d.config.len(), 256);
+    assert_eq!(saved.chip_config.len(), ICH9_CC_SIZE);
+    assert_eq!((saved.sci_level, saved.rst_cnt, saved.apm.apms), (1, 0x02, 0x5a));
+
+    let dst = Machine::new();
+    let n = dst.notifications.load(Ordering::SeqCst);
+    dst.lpc.vmstate_load(&saved).unwrap();
+    assert_eq!(dst.lpc.vmstate_save(), saved);
+    assert_eq!(dst.notifications.load(Ordering::SeqCst), n + 1);
+    // The PM window, the SCI line, the RCRB and the PIRQ table follow the loaded state.
+    assert_eq!(dst.lpc.pm().pm_io_base(), PM_IO_BASE_ADDR as u32);
+    assert!(dst.io_as.load(PM_IO_BASE_ADDR + 8, 4, Endian::Little, ATTRS).1.is_ok());
+    assert_eq!(dst.lpc.sci_gsi(), 10);
+    assert_eq!(dst.readl(RCBA_BASE_ADDR + ICH9_CC_D31IR as u64) & 0xffff, 0x4567);
+    assert_eq!([0, 1, 2, 3].map(|p| dst.lpc.map_irq(pci_devfn(31, 0), p)), [7, 6, 5, 4]);
+    assert_eq!(dst.lpc.apm(), (0, 0x5a));
+
+    // Loading again over a mapped RCRB moves it instead of mapping it twice.
+    let mut moved = saved.clone();
+    moved.d.config[ICH9_LPC_RCBA + 2] = 0xd2;
+    dst.lpc.vmstate_load(&moved).unwrap();
+    assert_eq!(dst.readl(0xfed2_c000 + ICH9_CC_D31IR as u64) & 0xffff, 0x4567);
+    assert!(!dst.mem_as.load(RCBA_BASE_ADDR, 4, Endian::Little, ATTRS).1.is_ok());
+
+    let mut bad = saved;
+    bad.chip_config.pop();
+    assert!(dst.lpc.vmstate_load(&bad).is_err());
+}

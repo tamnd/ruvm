@@ -37,6 +37,17 @@ pub struct MsiMessage {
     pub data: u32,
 }
 
+/// The `PCIDevice` VMState section (version 2) of one function.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PciDeviceVmState {
+    /// `version_id`, an `INT32_POSITIVE_LE` field. QEMU always sends 2.
+    pub version_id: i32,
+    /// The whole config space, 256 bytes or 4096 for PCI Express.
+    pub config: Vec<u8>,
+    /// `irq_state` as the four big endian words `put_pci_irq_state()` writes, 0 or 1 each.
+    pub irq_state: [i32; PCI_NUM_PINS],
+}
+
 /// Per model hooks, the `config_read`, `config_write` and reset callbacks of `PCIDeviceClass`.
 ///
 /// The defaults are the generic behaviour. A model that overrides a config callback normally
@@ -955,6 +966,55 @@ impl PciDevice {
             s.bus_master = s.word(PCI_COMMAND) & PCI_COMMAND_MASTER != 0 && s.enabled;
         }
         self.reset();
+    }
+
+    /// What `put_pci_config_device()` and `put_pci_irq_state()` write.
+    pub fn vmstate_save(&self) -> PciDeviceVmState {
+        let s = self.lock();
+        let mut irq_state = [0; PCI_NUM_PINS];
+        for (pin, v) in irq_state.iter_mut().enumerate() {
+            *v = s.irq_pin_state(pin);
+        }
+        PciDeviceVmState { version_id: 2, config: s.config.clone(), irq_state }
+    }
+
+    /// `get_pci_config_device()` and `get_pci_irq_state()`: refuses config data that differs
+    /// in a bit that is checked and not guest writable, then takes the config space, remaps the
+    /// BARs, sets bus mastering from the command register and restores the pin levels without
+    /// propagating them. The bus counts come from the bus's own section.
+    ///
+    /// A bridge's windows are not remapped here; the bridge model calls
+    /// [`crate::PciBridge::update_mappings`] after this, as `pci_bridge_update_mappings()`.
+    pub fn vmstate_load(&self, v: &PciDeviceVmState) -> Result<(), String> {
+        let mut s = self.lock();
+        if v.config.len() != s.config.len() {
+            return Err(format!(
+                "{}: config space is {} bytes, the stream has {}",
+                self.name,
+                s.config.len(),
+                v.config.len()
+            ));
+        }
+        for i in 0..v.config.len() {
+            if (v.config[i] ^ s.config[i]) & s.cmask[i] & !s.wmask[i] & !s.w1cmask[i] != 0 {
+                return Err(format!(
+                    "{}: Bad config data: i=0x{i:x} read: {:x} device: {:x} cmask: {:x} \
+                     wmask: {:x} w1cmask:{:x}",
+                    self.name, v.config[i], s.config[i], s.cmask[i], s.wmask[i], s.w1cmask[i]
+                ));
+            }
+        }
+        if let Some(l) = v.irq_state.iter().find(|&&l| l != 0 && l != 1) {
+            return Err(format!("{}: irq state {l}: must be 0 or 1.", self.name));
+        }
+        s.config.copy_from_slice(&v.config);
+        self.update_mappings_locked(&mut s);
+        s.bus_master = s.word(PCI_COMMAND) & PCI_COMMAND_MASTER != 0 && s.enabled;
+        s.irq_state = 0;
+        for (pin, &l) in v.irq_state.iter().enumerate() {
+            s.irq_state |= (l as u8) << pin;
+        }
+        Ok(())
     }
 
     /// `pci_device_reset()`: the model's reset, then the generic one.

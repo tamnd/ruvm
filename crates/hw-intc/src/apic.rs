@@ -26,8 +26,9 @@
 //!
 //! - The VAPIC (kvmvapic option ROM support, `apic_sync_vapic()`) is not ported, so TPR
 //!   access reporting does nothing and CR8 updates always reach the TPR.
-//! - VMState, trace points, QOM registration and the KVM, Xen, WHPX and MSHV APICs are not
-//!   ported.
+//! - Trace points, QOM registration and the KVM, Xen, WHPX and MSHV APICs are not ported.
+//!   The VMState registers go in and out through [`Apic::vmstate_save`] and
+//!   [`Apic::vmstate_load`]; the stream layout lives with the machine.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -142,6 +143,36 @@ struct ApicState {
     sipi_vector: u8,
     wait_for_sipi: bool,
     extended_log_dest: u32,
+}
+
+/// What `vmstate_apic_common` (`"apic"`, version 3, and its `apic_sipi` subsection) carries,
+/// with QEMU's field names and wire types. `timer_expiry` is the deadline of the APIC timer on
+/// the virtual clock in nanoseconds, -1 when it is not armed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApicVmState {
+    pub apicbase: u32,
+    pub id: u8,
+    pub arb_id: u8,
+    pub tpr: u8,
+    pub spurious_vec: u32,
+    pub log_dest: u8,
+    pub dest_mode: u8,
+    pub isr: [u32; 8],
+    pub tmr: [u32; 8],
+    pub irr: [u32; 8],
+    pub lvt: [u32; APIC_LVT_NB],
+    pub esr: u32,
+    pub icr: [u32; 2],
+    pub divide_conf: u32,
+    pub count_shift: i32,
+    pub initial_count: u32,
+    pub initial_count_load_time: i64,
+    pub next_time: i64,
+    pub timer_expiry: i64,
+    /// `apic_sipi`.
+    pub sipi_vector: i32,
+    /// `apic_sipi`: the subsection goes out when this is not 0.
+    pub wait_for_sipi: i32,
 }
 
 impl ApicState {
@@ -565,6 +596,79 @@ impl Apic {
         s.id = self.initial_apic_id as u8;
         Self::init_reset_locked(&mut s);
         self.timer.del();
+    }
+
+    /// The `pre_save` of `vmstate_apic_common` and the registers it saves. QEMU syncs the
+    /// kvmvapic TPR first; ruvm has no kvmvapic, so the TPR is already current.
+    pub fn vmstate_save(&self) -> ApicVmState {
+        let s = self.lock();
+        ApicVmState {
+            // QEMU keeps the APIC base in 32 bits.
+            apicbase: s.apicbase as u32,
+            id: s.id,
+            arb_id: s.arb_id,
+            tpr: s.tpr,
+            spurious_vec: s.spurious_vec,
+            log_dest: s.log_dest,
+            dest_mode: s.dest_mode,
+            isr: s.isr,
+            tmr: s.tmr,
+            irr: s.irr,
+            lvt: s.lvt,
+            esr: s.esr,
+            icr: s.icr,
+            divide_conf: s.divide_conf,
+            count_shift: s.count_shift as i32,
+            initial_count: s.initial_count,
+            initial_count_load_time: s.initial_count_load_time,
+            next_time: s.next_time,
+            timer_expiry: s.timer_expiry,
+            sipi_vector: i32::from(s.sipi_vector),
+            wait_for_sipi: i32::from(s.wait_for_sipi),
+        }
+    }
+
+    /// Loads the registers of `vmstate_apic_common` and does its `post_load`, `apic_post_load()`:
+    /// the timer is armed at `timer_expiry`, or stopped when that is -1. The CPU is then asked
+    /// to poll the APIC, so its interrupt request follows the loaded registers.
+    ///
+    /// QEMU takes `count_shift` as it comes; a shift outside 0 to 7, which `divide_conf` can
+    /// never produce, is refused here because the timer arithmetic would overflow on it.
+    pub fn vmstate_load(&self, v: &ApicVmState) -> Result<(), String> {
+        let count_shift = match u32::try_from(v.count_shift) {
+            Ok(n) if n <= 7 => n,
+            _ => return Err(format!("apic: invalid count_shift {}", v.count_shift)),
+        };
+        self.with(|a, s, acts| {
+            s.apicbase = u64::from(v.apicbase);
+            s.id = v.id;
+            s.arb_id = v.arb_id;
+            s.tpr = v.tpr;
+            s.spurious_vec = v.spurious_vec;
+            s.log_dest = v.log_dest;
+            s.dest_mode = v.dest_mode;
+            s.isr = v.isr;
+            s.tmr = v.tmr;
+            s.irr = v.irr;
+            s.lvt = v.lvt;
+            s.esr = v.esr;
+            s.icr = v.icr;
+            s.divide_conf = v.divide_conf;
+            s.count_shift = count_shift;
+            s.initial_count = v.initial_count;
+            s.initial_count_load_time = v.initial_count_load_time;
+            s.next_time = v.next_time;
+            s.timer_expiry = v.timer_expiry;
+            s.sipi_vector = v.sipi_vector as u8;
+            s.wait_for_sipi = v.wait_for_sipi != 0;
+            if s.timer_expiry != -1 {
+                a.timer.modify(s.timer_expiry);
+            } else {
+                a.timer.del();
+            }
+            a.update_irq(s, acts);
+        });
+        Ok(())
     }
 
     /// `cpu_get_apic_base()`.

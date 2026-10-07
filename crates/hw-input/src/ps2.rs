@@ -14,8 +14,11 @@
 //! scancode, and the mouse has [`Ps2Mouse::rel_event`], [`Ps2Mouse::button_event`] and
 //! [`Ps2Mouse::sync`].
 //!
-//! Not ported: VMState, trace points, QOM registration, the wakeup requests and the LED
-//! notification to the UI (the LED state is readable with [`Ps2Kbd::ledstate`]).
+//! `vmstate_save` and `vmstate_load` on both devices move what the `ps2kbd` and `ps2mouse`
+//! VMStates carry, as [`Ps2KbdVmState`] and [`Ps2MouseVmState`].
+//!
+//! Not ported: trace points, QOM registration, the wakeup requests and the LED notification to
+//! the UI (the LED state is readable with [`Ps2Kbd::ledstate`]).
 
 use crate::keymap::{LINUX_TO_ATSET1, LINUX_TO_ATSET2, LINUX_TO_ATSET3};
 
@@ -205,6 +208,94 @@ impl Ps2Queue {
     }
 }
 
+/// `vmstate_ps2_common` (version 3): the fields of `PS2State`, named as in QEMU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ps2CommonVmState {
+    pub write_cmd: i32,
+    /// `queue.rptr`.
+    pub rptr: i32,
+    /// `queue.wptr`.
+    pub wptr: i32,
+    /// `queue.count`.
+    pub count: i32,
+    /// `queue.data`.
+    pub data: [u8; PS2_BUFFER_SIZE as usize],
+    /// `queue.cwptr`. Only the keyboard sends it, in `ps2kbd/command_reply_queue`; the mouse
+    /// keeps the destination's.
+    pub cwptr: i32,
+}
+
+impl Default for Ps2CommonVmState {
+    fn default() -> Self {
+        Ps2CommonVmState {
+            write_cmd: -1,
+            rptr: 0,
+            wptr: 0,
+            count: 0,
+            data: [0; PS2_BUFFER_SIZE as usize],
+            cwptr: -1,
+        }
+    }
+}
+
+/// `vmstate_ps2_keyboard` (version 3) and its subsections, named as in QEMU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ps2KbdVmState {
+    pub parent_obj: Ps2CommonVmState,
+    pub scan_enabled: i32,
+    pub translate: i32,
+    pub scancode_set: i32,
+    /// `ps2kbd/ledstate`.
+    pub ledstate: i32,
+    /// `ps2kbd/need_high_bit`.
+    pub need_high_bit: bool,
+}
+
+impl Default for Ps2KbdVmState {
+    fn default() -> Self {
+        Ps2Kbd::new().vmstate_save()
+    }
+}
+
+impl Ps2KbdVmState {
+    /// `ps2_keyboard_ledstate_needed()`.
+    pub fn ledstate_needed(&self) -> bool {
+        self.ledstate != 0
+    }
+
+    /// `ps2_keyboard_need_high_bit_needed()`.
+    pub fn need_high_bit_needed(&self) -> bool {
+        self.need_high_bit
+    }
+
+    /// `ps2_keyboard_cqueue_needed()`.
+    pub fn cqueue_needed(&self) -> bool {
+        self.parent_obj.cwptr != -1
+    }
+}
+
+/// `vmstate_ps2_mouse` (version 2), named as in QEMU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ps2MouseVmState {
+    pub parent_obj: Ps2CommonVmState,
+    pub mouse_status: u8,
+    pub mouse_resolution: u8,
+    pub mouse_sample_rate: u8,
+    pub mouse_wrap: u8,
+    pub mouse_type: u8,
+    pub mouse_detect_state: u8,
+    pub mouse_dx: i32,
+    pub mouse_dy: i32,
+    pub mouse_dz: i32,
+    pub mouse_buttons: u8,
+}
+
+impl Default for Ps2MouseVmState {
+    fn default() -> Self {
+        Ps2Mouse::new().vmstate_save()
+    }
+}
+
 /// `PS2State`, the part the keyboard and the mouse share: the queue and the argument byte
 /// the device is waiting for.
 #[derive(Clone, Debug)]
@@ -221,6 +312,45 @@ impl Default for Ps2State {
 }
 
 impl Ps2State {
+    fn vmstate_save(&self) -> Ps2CommonVmState {
+        let q = &self.queue;
+        Ps2CommonVmState {
+            write_cmd: self.write_cmd,
+            rptr: q.rptr,
+            wptr: q.wptr,
+            count: q.count,
+            data: q.data,
+            cwptr: q.cwptr,
+        }
+    }
+
+    /// Loads the common fields, then `ps2_common_post_load()` bounds the queue.
+    fn vmstate_load(&mut self, v: &Ps2CommonVmState) {
+        self.write_cmd = v.write_cmd;
+        let q = &mut self.queue;
+        q.data = v.data;
+        q.rptr = v.rptr;
+        q.count = v.count;
+
+        // Limit the number of queued command replies to PS2_QUEUE_HEADROOM.
+        let mut ccount = 0;
+        if v.cwptr != -1 {
+            ccount = (v.cwptr.wrapping_sub(q.rptr) & (PS2_BUFFER_SIZE - 1)).min(PS2_QUEUE_HEADROOM);
+        }
+
+        // Limit the scancode queue size to PS2_QUEUE_SIZE.
+        if q.count < ccount {
+            q.count = ccount;
+        } else if q.count > ccount + PS2_QUEUE_SIZE {
+            q.count = ccount + PS2_QUEUE_SIZE;
+        }
+
+        // Sanitize rptr and recalculate wptr and cwptr.
+        q.rptr &= PS2_BUFFER_SIZE - 1;
+        q.wptr = (q.rptr + q.count) & (PS2_BUFFER_SIZE - 1);
+        q.cwptr = if ccount != 0 { (q.rptr + ccount) & (PS2_BUFFER_SIZE - 1) } else { -1 };
+    }
+
     /// `ps2_reset_queue()`.
     fn reset_queue(&mut self) {
         let q = &mut self.queue;
@@ -384,6 +514,30 @@ impl Ps2Kbd {
     pub fn reset(&mut self, irq: &mut dyn FnMut(bool)) {
         self.reset_hold();
         irq(false);
+    }
+
+    /// The state `vmstate_ps2_keyboard` sends.
+    pub fn vmstate_save(&self) -> Ps2KbdVmState {
+        Ps2KbdVmState {
+            parent_obj: self.common.vmstate_save(),
+            scan_enabled: i32::from(self.scan_enabled),
+            translate: i32::from(self.translate),
+            scancode_set: self.scancode_set,
+            ledstate: i32::from(self.ledstate),
+            need_high_bit: self.need_high_bit,
+        }
+    }
+
+    /// Loads what `vmstate_ps2_keyboard` carried, then the queue part of
+    /// `ps2_kbd_post_load()`. The caller has already set `scancode_set` to 2 for version 2
+    /// streams. The IRQ output is left alone; the controller's pending bits carry it.
+    pub fn vmstate_load(&mut self, v: &Ps2KbdVmState) {
+        self.common.vmstate_load(&v.parent_obj);
+        self.scan_enabled = v.scan_enabled != 0;
+        self.translate = v.translate != 0;
+        self.scancode_set = v.scancode_set;
+        self.ledstate = v.ledstate as u8;
+        self.need_high_bit = v.need_high_bit;
     }
 
     /// Whether the keyboard sends scancodes, cleared by [`KBD_CMD_RESET_DISABLE`].
@@ -773,6 +927,39 @@ impl Ps2Mouse {
     pub fn reset(&mut self, irq: &mut dyn FnMut(bool)) {
         self.reset_hold();
         irq(false);
+    }
+
+    /// The state `vmstate_ps2_mouse` sends.
+    pub fn vmstate_save(&self) -> Ps2MouseVmState {
+        Ps2MouseVmState {
+            parent_obj: self.common.vmstate_save(),
+            mouse_status: self.mouse_status,
+            mouse_resolution: self.mouse_resolution,
+            mouse_sample_rate: self.mouse_sample_rate,
+            mouse_wrap: u8::from(self.mouse_wrap),
+            mouse_type: self.mouse_type,
+            mouse_detect_state: self.mouse_detect_state,
+            mouse_dx: self.mouse_dx,
+            mouse_dy: self.mouse_dy,
+            mouse_dz: self.mouse_dz,
+            mouse_buttons: self.mouse_buttons,
+        }
+    }
+
+    /// Loads what `vmstate_ps2_mouse` carried, then `ps2_mouse_post_load()`. The IRQ output is
+    /// left alone; the controller's pending bits carry it.
+    pub fn vmstate_load(&mut self, v: &Ps2MouseVmState) {
+        self.common.vmstate_load(&v.parent_obj);
+        self.mouse_status = v.mouse_status;
+        self.mouse_resolution = v.mouse_resolution;
+        self.mouse_sample_rate = v.mouse_sample_rate;
+        self.mouse_wrap = v.mouse_wrap != 0;
+        self.mouse_type = v.mouse_type;
+        self.mouse_detect_state = v.mouse_detect_state;
+        self.mouse_dx = v.mouse_dx;
+        self.mouse_dy = v.mouse_dy;
+        self.mouse_dz = v.mouse_dz;
+        self.mouse_buttons = v.mouse_buttons;
     }
 
     /// The status byte: `MOUSE_STATUS_*` plus the button bits.
