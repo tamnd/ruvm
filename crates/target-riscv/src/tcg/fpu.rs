@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The floating point helpers, a port of QEMU's `target/riscv/tcg/fpu_helper.c` for the F,
-//! D and Zfa instructions, with `fclass_s()` and `fclass_d()` from `vector_helper.c`.
+//! D and Zfa instructions and the conversions of Zfhmin and Zfbfmin, with `fclass_s()` and
+//! `fclass_d()` from `vector_helper.c`.
 //!
 //! QEMU keeps a `float_status` in `env`. Here every helper builds one from `env`: the
 //! rounding mode comes from `fp_round`, which `set_rounding_mode` leaves there as a RISC-V
@@ -11,8 +12,9 @@
 //! `riscv_cpu_get_fflags()` would read back.
 //!
 //! The model is QEMU's `rv64` with `priv_spec` 1.12, so `fmin` and `fmax` are IEEE 754-2019
-//! minimumNumber and maximumNumber, and Zfinx, Zdinx, Zfh, Zfhmin and Zfbfmin are off, so
-//! single precision values are always NaN boxed.
+//! minimumNumber and maximumNumber, and Zfinx and Zdinx are off, so single and half
+//! precision values are always NaN boxed. Of the half precision instructions only the
+//! conversions of Zfhmin and Zfbfmin are here; the arithmetic of Zfh is not modelled.
 //!
 //! Deliberate differences from QEMU:
 //!
@@ -26,7 +28,7 @@ use ruvm_jit::Ra;
 use ruvm_jit_core::HelperType::{I32, I64, Ptr, Void};
 use ruvm_jit_core::types::call_flags::{NO_RWG, NO_RWG_SE, NO_WG};
 use ruvm_jit_interp::{HelperEnv, Unwind};
-use ruvm_softfloat::{Float32, Float64, FloatStatus, RoundMode, flags, muladd};
+use ruvm_softfloat::{BFloat16, Float16, Float32, Float64, FloatStatus, RoundMode, flags, muladd};
 
 use super::helpers::{Def, run};
 use super::{ld64, st64};
@@ -100,7 +102,7 @@ fn round_mode(rm: u64) -> RoundMode {
 }
 
 /// The `fp_status` of RISC-V with rounding mode `rm` and no flags.
-fn status_rm(rm: u64) -> FloatStatus {
+pub(super) fn status_rm(rm: u64) -> FloatStatus {
     FloatStatus {
         rounding_mode: round_mode(rm),
         default_nan_mode: true,
@@ -110,12 +112,12 @@ fn status_rm(rm: u64) -> FloatStatus {
 }
 
 /// The `fp_status` of `env` with no flags.
-fn status(env: &[u8]) -> FloatStatus {
+pub(super) fn status(env: &[u8]) -> FloatStatus {
     status_rm(ld64(env, FP_ROUND))
 }
 
 /// `riscv_cpu_get_fflags()`: softfloat flags `soft` in the RISC-V order.
-fn riscv_flags(soft: u16) -> u64 {
+pub(super) fn riscv_flags(soft: u16) -> u64 {
     let mut hard = 0;
     if soft & flags::INEXACT != 0 {
         hard |= FPEXC_NX;
@@ -147,19 +149,25 @@ fn accrue(e: &mut HelperEnv<'_>, f: impl FnOnce(&mut FloatStatus) -> u64) -> HR 
     Ok(u128::from(r))
 }
 
+/// Accrue the flags of `s` into `fflags` with `riscv_cpu_check_fflags()`: `mstatus.FS`
+/// becomes dirty when a flag is new.
+pub(super) fn check_fflags(env: &mut [u8], s: &FloatStatus) {
+    let new = riscv_flags(s.flags());
+    let old = ld64(env, FFLAGS);
+    if new & !(old & FFLAGS_MASK) != 0 {
+        st64(env, FFLAGS, old | new);
+        let ms = ld64(env, MSTATUS);
+        st64(env, MSTATUS, ms | MSTATUS_FS);
+    }
+}
+
 /// [`accrue`] for the helpers that write an integer register, with
 /// `riscv_cpu_check_fflags()`: `mstatus.FS` becomes dirty when a flag is new, as the
 /// translator does not mark it.
 fn accrue_check(e: &mut HelperEnv<'_>, f: impl FnOnce(&mut FloatStatus) -> u64) -> HR {
     let mut s = status(e.env);
     let r = f(&mut s);
-    let new = riscv_flags(s.flags());
-    let old = ld64(e.env, FFLAGS);
-    if new & !(old & FFLAGS_MASK) != 0 {
-        st64(e.env, FFLAGS, old | new);
-        let ms = ld64(e.env, MSTATUS);
-        st64(e.env, MSTATUS, ms | MSTATUS_FS);
-    }
+    check_fflags(e.env, &s);
     Ok(u128::from(r))
 }
 
@@ -171,14 +179,33 @@ const DEFAULT_NAN_S: u32 = 0x7fc0_0000;
 const NANBOX_S: u64 = 0xffff_ffff_0000_0000;
 
 /// `nanbox_s()`.
-fn nanbox_s(f: Float32) -> u64 {
+pub(super) fn nanbox_s(f: Float32) -> u64 {
     u64::from(f.0) | NANBOX_S
 }
 
 /// `check_nanbox_s()`: a single precision value that is not NaN boxed reads as the
 /// canonical NaN.
-fn unbox_s(f: u64) -> Float32 {
+pub(super) fn unbox_s(f: u64) -> Float32 {
     if f & NANBOX_S == NANBOX_S { Float32(f as u32) } else { Float32(DEFAULT_NAN_S) }
+}
+
+/// The upper bits of a NaN boxed half precision or bf16 value.
+const NANBOX_H: u64 = 0xffff_ffff_ffff_0000;
+
+/// `nanbox_h()`.
+fn nanbox_h(f: u16) -> u64 {
+    u64::from(f) | NANBOX_H
+}
+
+/// `check_nanbox_h()`: a half precision value that is not NaN boxed reads as the canonical
+/// NaN.
+fn unbox_h(f: u64) -> Float16 {
+    if f & NANBOX_H == NANBOX_H { Float16(f as u16) } else { Float16(0x7e00) }
+}
+
+/// `check_nanbox_bf16()`: a bf16 value that is not NaN boxed reads as the canonical NaN.
+fn unbox_bf16(f: u64) -> BFloat16 {
+    if f & NANBOX_H == NANBOX_H { BFloat16(f as u16) } else { BFloat16(0x7fc0) }
 }
 
 // The rounding mode.
@@ -193,6 +220,34 @@ fn h_set_rounding_mode(e: &mut HelperEnv<'_>, a: &[u64]) -> HR {
         rm = ld64(e.env, FRM);
     }
     if rm > RISCV_FRM_RMM {
+        return run(e, |cpu| Err(cpu.raise_exception(EXCP_ILLEGAL_INST, Ra::Tb)));
+    }
+    st64(e.env, FP_ROUND, rm);
+    Ok(0)
+}
+
+def!(
+    SET_ROUNDING_MODE_CHKFRM,
+    "set_rounding_mode_chkfrm",
+    NO_WG,
+    Void,
+    [Ptr, I32],
+    h_set_rounding_mode_chkfrm
+);
+
+/// `HELPER(set_rounding_mode_chkfrm)`: [`SET_ROUNDING_MODE`] for the vector conversions
+/// with a static rounding mode, which may be round to odd. `frm` is checked even when it
+/// is not used.
+fn h_set_rounding_mode_chkfrm(e: &mut HelperEnv<'_>, a: &[u64]) -> HR {
+    let mut rm = u64::from(a[1] as u32);
+    let frm = ld64(e.env, FRM);
+    if frm >= 5 {
+        return run(e, |cpu| Err(cpu.raise_exception(EXCP_ILLEGAL_INST, Ra::Tb)));
+    }
+    if rm == RISCV_FRM_DYN {
+        rm = frm;
+    }
+    if rm > RISCV_FRM_RMM && rm != RISCV_FRM_ROD {
         return run(e, |cpu| Err(cpu.raise_exception(EXCP_ILLEGAL_INST, Ra::Tb)));
     }
     st64(e.env, FP_ROUND, rm);
@@ -474,6 +529,32 @@ fn froundnx_d(x: u64, s: &mut FloatStatus) -> u64 {
 
 // The declarations, with the flags of QEMU's `helper.h`.
 
+// Zfhmin and Zfbfmin.
+
+fn fcvt_h_s(x: u64, s: &mut FloatStatus) -> u64 {
+    nanbox_h(unbox_s(x).to_float16(true, s).0)
+}
+
+fn fcvt_s_h(x: u64, s: &mut FloatStatus) -> u64 {
+    nanbox_s(unbox_h(x).to_float32(true, s))
+}
+
+fn fcvt_h_d(x: u64, s: &mut FloatStatus) -> u64 {
+    nanbox_h(Float64(x).to_float16(true, s).0)
+}
+
+fn fcvt_d_h(x: u64, s: &mut FloatStatus) -> u64 {
+    unbox_h(x).to_float64(true, s).0
+}
+
+fn fcvt_bf16_s(x: u64, s: &mut FloatStatus) -> u64 {
+    nanbox_h(unbox_s(x).to_bfloat16(s).0)
+}
+
+fn fcvt_s_bf16(x: u64, s: &mut FloatStatus) -> u64 {
+    nanbox_s(unbox_bf16(x).to_float32(s))
+}
+
 fp_def!(FMADD_S, "fmadd_s", NO_RWG, accrue, fmadd_s, 3);
 fp_def!(FMSUB_S, "fmsub_s", NO_RWG, accrue, fmsub_s, 3);
 fp_def!(FNMSUB_S, "fnmsub_s", NO_RWG, accrue, fnmsub_s, 3);
@@ -537,9 +618,17 @@ def!(FCLASS_D, "fclass_d", NO_RWG_SE, I64, [I64], h_fclass_d);
 fp_def!(FROUND_D, "fround_d", NO_RWG_SE, accrue, fround_d, 1);
 fp_def!(FROUNDNX_D, "froundnx_d", NO_RWG_SE, accrue, froundnx_d, 1);
 
+fp_def!(FCVT_H_S, "fcvt_h_s", NO_RWG, accrue, fcvt_h_s, 1);
+fp_def!(FCVT_S_H, "fcvt_s_h", NO_RWG, accrue, fcvt_s_h, 1);
+fp_def!(FCVT_H_D, "fcvt_h_d", NO_RWG, accrue, fcvt_h_d, 1);
+fp_def!(FCVT_D_H, "fcvt_d_h", NO_RWG, accrue, fcvt_d_h, 1);
+fp_def!(FCVT_BF16_S, "fcvt_bf16_s", NO_RWG, accrue, fcvt_bf16_s, 1);
+fp_def!(FCVT_S_BF16, "fcvt_s_bf16", NO_RWG, accrue, fcvt_s_bf16, 1);
+
 /// The helpers of this module.
 pub(crate) const ALL: &[Def] = &[
     SET_ROUNDING_MODE,
+    SET_ROUNDING_MODE_CHKFRM,
     FMADD_S,
     FMSUB_S,
     FNMSUB_S,
@@ -601,6 +690,12 @@ pub(crate) const ALL: &[Def] = &[
     FCLASS_D,
     FROUND_D,
     FROUNDNX_D,
+    FCVT_H_S,
+    FCVT_S_H,
+    FCVT_H_D,
+    FCVT_D_H,
+    FCVT_BF16_S,
+    FCVT_S_BF16,
 ];
 
 #[cfg(test)]
@@ -780,9 +875,47 @@ mod tests {
     }
 
     #[test]
+    fn half_conversions_nan_box() {
+        let mut s = rne();
+        // 1.0 in half precision and bf16.
+        assert_eq!(fcvt_h_s(S_ONE, &mut s), NANBOX_H | 0x3c00);
+        assert_eq!(fcvt_s_h(NANBOX_H | 0x3c00, &mut s), S_ONE);
+        assert_eq!(fcvt_d_h(NANBOX_H | 0x3c00, &mut s), D_ONE);
+        assert_eq!(fcvt_h_d(D_ONE, &mut s), NANBOX_H | 0x3c00);
+        assert_eq!(fcvt_bf16_s(S_ONE, &mut s), NANBOX_H | 0x3f80);
+        assert_eq!(fcvt_s_bf16(NANBOX_H | 0x3f80, &mut s), S_ONE);
+        assert_eq!(s.flags(), 0);
+        // A half precision value that is not NaN boxed is the canonical NaN, which
+        // converts quietly.
+        assert_eq!(fcvt_s_h(0x0000_ffff_0000_3c00, &mut s), S_QNAN);
+        assert_eq!(fcvt_d_h(0x3c00, &mut s), D_QNAN);
+        assert_eq!(fcvt_s_bf16(0x3f80, &mut s), S_QNAN);
+        // A single precision value that is not NaN boxed narrows to the canonical NaN.
+        assert_eq!(fcvt_h_s(0x3f80_0000, &mut s), NANBOX_H | 0x7e00);
+        assert_eq!(fcvt_bf16_s(0x3f80_0000, &mut s), NANBOX_H | 0x7fc0);
+        assert_eq!(s.flags(), 0);
+        // A signalling NaN is invalid and gives the canonical NaN.
+        assert_eq!(fcvt_h_s(S_SNAN, &mut s), NANBOX_H | 0x7e00);
+        assert_eq!(riscv_flags(s.flags()), FPEXC_NV);
+        // 65520 overflows half precision; 1 + 2^-11 is a tie that rounds to even.
+        let mut s = rne();
+        assert_eq!(fcvt_h_s(NANBOX_S | 0x477f_f000, &mut s), NANBOX_H | 0x7c00);
+        assert_eq!(riscv_flags(s.flags()), FPEXC_OF | FPEXC_NX);
+        let mut s = rne();
+        assert_eq!(fcvt_h_d(0x3ff0_0200_0000_0000, &mut s), NANBOX_H | 0x3c00);
+        assert_eq!(riscv_flags(s.flags()), FPEXC_NX);
+        let mut s = status_rm(RISCV_FRM_RUP);
+        assert_eq!(fcvt_h_d(0x3ff0_0200_0000_0000, &mut s), NANBOX_H | 0x3c01);
+    }
+
+    #[test]
     fn helper_signatures() {
         for d in ALL {
-            assert!(d.name.starts_with('f') || d.name == "set_rounding_mode", "{}", d.name);
+            assert!(
+                d.name.starts_with('f') || d.name.starts_with("set_rounding_mode"),
+                "{}",
+                d.name
+            );
             let env = d.args.first().copied() == Some(Ptr);
             assert_eq!(env, d.name != "fclass_d", "{}", d.name);
         }

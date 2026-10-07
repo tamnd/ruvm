@@ -15,8 +15,9 @@
 //! 0x40000000 (and the high one above RAM) and RAM (`riscv_virt_board.ram`) at 0x80000000.
 //!
 //! Each hart's MSIP, MTIP, M external and S external lines go to `Riscv::set_irq` as
-//! interrupts 3, 7, 11 and 9. The `time` CSR reads the MTIMER, and the Sstc `stimecmp`
-//! deadline is a timer on the board clock that calls `Riscv::stimer_expired`.
+//! interrupts 3, 7, 11 and 9. The `time` CSR reads the MTIMER, and the Sstc `stimecmp` and
+//! `vstimecmp` deadlines are timers on the board clock that call `Riscv::stimer_expired`
+//! and `Riscv::vstimer_expired`.
 //!
 //! Booting is hw/riscv/boot.c: `-bios` (OpenSBI's `fw_dynamic` build by default, `none`
 //! for no firmware, or a file; ELF or raw at 0x80000000) is loaded first, then `-kernel`
@@ -56,10 +57,6 @@
 //!
 //! # Differences from QEMU
 //!
-//! - The `riscv,isa` and `riscv,isa-extensions` of the harts are [`RUVM_RV64_ISA`] (plus
-//!   `_xlrbr` with `-cpu rv64,xlrbr=true`) where QEMU's default `rv64` CPU writes
-//!   [`QEMU_RV64_ISA`]: there is no hypervisor extension, so `h` and the `sh*` extensions
-//!   are left out. Everything else in the tree is QEMU's.
 //! - `rng-seed` is not replaced with a new one at every reset
 //!   (`qemu_fdt_randomize_seeds()`); the guest sees the same seed after a reboot.
 //! - A guest write to `mtime` does not re-arm the Sstc timers of the harts
@@ -107,7 +104,9 @@ use ruvm_mem::{
     AccessConstraints, AccessCtx, AccessSize, AddressSpace, Endian, MemResult, MemTxAttrs,
     MemorySystem, MmioOps, RegionId, RegionType,
 };
-use ruvm_target_riscv::cpu::{CpuRiscvState, IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT};
+use ruvm_target_riscv::cpu::{
+    CpuRiscvState, IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, RiscvCfg,
+};
 use ruvm_target_riscv::tcg::{Riscv, SemihostingHost, create_vcpu};
 use ruvm_virtio_queue::{GuestMemory, MemoryError};
 
@@ -259,6 +258,10 @@ pub struct VirtConfig {
     pub semihosting_userspace: bool,
     /// `-cpu rv64,xlrbr=true`.
     pub xlrbr: bool,
+    /// The vector extensions of the harts, `-cpu rv64,v=true` and the `zv*` properties,
+    /// with the extensions they imply already applied. All off by default, as in QEMU's
+    /// `rv64`.
+    pub vector: RiscvCfg,
     /// The `-device loader` devices, in command line order.
     pub loaders: Vec<GenericLoader>,
     /// The clock the ACLINT and the Sstc timers run on. The default follows the host's
@@ -287,6 +290,7 @@ impl fmt::Debug for VirtConfig {
             .field("semihosting", &self.semihosting.is_some())
             .field("semihosting_userspace", &self.semihosting_userspace)
             .field("xlrbr", &self.xlrbr)
+            .field("vector", &self.vector)
             .field("loaders", &self.loaders)
             .finish_non_exhaustive()
     }
@@ -308,6 +312,7 @@ impl Default for VirtConfig {
             semihosting: None,
             semihosting_userspace: false,
             xlrbr: false,
+            vector: RiscvCfg::default(),
             loaders: Vec::new(),
             clock: None,
             rtc_clock: None,
@@ -475,9 +480,60 @@ fn random_seed() -> [u8; 32] {
     seed
 }
 
-/// The `riscv,isa` string of the harts.
-pub fn riscv_isa(xlrbr: bool) -> String {
+/// The `riscv,isa` string of the harts, `riscv_isa_string()`: the extensions of `vector`
+/// go where `riscv_single_letter_exts` and `isa_edata_arr` put them. With the default CPU
+/// this is [`QEMU_RV64_ISA`], H included.
+pub fn riscv_isa(xlrbr: bool, vector: &RiscvCfg) -> String {
     let mut isa = RUVM_RV64_ISA.to_string();
+    // V and H come after C in "IEMAFDQCBPVH". The sh* extensions only need priv 1.12,
+    // so they stay without H, as in QEMU.
+    let letters = format!(
+        "rv64imafdc{}{}_",
+        if vector.ext_v { "v" } else { "" },
+        if vector.ext_h { "h" } else { "" }
+    );
+    isa = isa.replacen("rv64imafdch_", &letters, 1);
+    // isa_edata_arr has zfbfmin and zfhmin after zfa, before zca.
+    let fp: String = [("zfbfmin", vector.ext_zfbfmin), ("zfhmin", vector.ext_zfhmin)]
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(n, _)| format!("_{n}"))
+        .collect();
+    isa = isa.replacen("_zfa_", &format!("_zfa{fp}_"), 1);
+    // ... and the vector extensions after zbs, before sdtrig.
+    let v = vector;
+    let vec: String = [
+        ("zvbb", v.ext_zvbb),
+        ("zvbc", v.ext_zvbc),
+        ("zve32f", v.ext_zve32f),
+        ("zve32x", v.ext_zve32x),
+        ("zve64f", v.ext_zve64f),
+        ("zve64d", v.ext_zve64d),
+        ("zve64x", v.ext_zve64x),
+        ("zvfbfmin", v.ext_zvfbfmin),
+        ("zvfbfwma", v.ext_zvfbfwma),
+        ("zvfh", v.ext_zvfh),
+        ("zvfhmin", v.ext_zvfhmin),
+        ("zvkb", v.ext_zvkb),
+        ("zvkg", v.ext_zvkg),
+        ("zvkn", v.ext_zvkn),
+        ("zvknc", v.ext_zvknc),
+        ("zvkned", v.ext_zvkned),
+        ("zvkng", v.ext_zvkng),
+        ("zvknha", v.ext_zvknha),
+        ("zvknhb", v.ext_zvknhb),
+        ("zvks", v.ext_zvks),
+        ("zvksc", v.ext_zvksc),
+        ("zvksed", v.ext_zvksed),
+        ("zvksg", v.ext_zvksg),
+        ("zvksh", v.ext_zvksh),
+        ("zvkt", v.ext_zvkt),
+    ]
+    .iter()
+    .filter(|(_, on)| *on)
+    .map(|(n, _)| format!("_{n}"))
+    .collect();
+    isa = isa.replacen("_zbs_", &format!("_zbs{vec}_"), 1);
     // isa_edata_arr has xlrbr after svvptc, the last extension of the default CPU.
     if xlrbr {
         isa.push_str("_xlrbr");
@@ -614,7 +670,8 @@ impl VirtMachine {
         // The harts.
         let hub = Arc::new(CpuHub::new(mtimer.clone(), smp, clock.clone()));
         let heap = Arc::new(Mutex::new((0, 0)));
-        let mut riscv = Riscv::new().with_xlrbr(cfg.xlrbr);
+        cfg.vector.validate()?;
+        let mut riscv = Riscv::new().with_xlrbr(cfg.xlrbr).with_cfg(cfg.vector);
         if let Some(host) = cfg.semihosting {
             let semi = VirtSemihost {
                 host,
@@ -743,7 +800,7 @@ impl VirtMachine {
             dtb_filename: cfg.dtb,
             firmware: cfg.firmware,
             pflash0_given,
-            isa: riscv_isa(cfg.xlrbr),
+            isa: riscv_isa(cfg.xlrbr, &cfg.vector),
             mem,
             system,
             memory_as,
@@ -968,7 +1025,7 @@ impl VirtMachine {
         }
         let mut vcpus = Vec::with_capacity(self.smp);
         for i in 0..self.smp {
-            let st = CpuRiscvState::reset(i as u64, DEFAULT_RSTVEC);
+            let st = CpuRiscvState::reset_cfg(i as u64, DEFAULT_RSTVEC, self.riscv.cfg());
             let mut v = create_vcpu(jit, self.riscv.clone(), self.memory_as.clone(), &st);
             let shared = v.shared().clone();
             if shared.cpu_index != i {
@@ -979,6 +1036,10 @@ impl VirtMachine {
             self.reset_cpu(&mut v.cpu());
             vcpus.push(v);
         }
+        // QEMU wires the harts before the first qemu_system_reset(), whose MTIMER reset
+        // raises MTIP at once (every mtimecmp is 0). Here the lines did not exist yet at
+        // machine_done, so reset the MTIMER again to drive them.
+        self.mtimer.reset();
         Ok(vcpus)
     }
 
@@ -1007,7 +1068,7 @@ impl VirtMachine {
     pub fn reset_cpu(&self, cpu: &mut Cpu<'_>) {
         let shared = cpu.core.shared().clone();
         let idx = shared.cpu_index;
-        let mut st = CpuRiscvState::reset(idx as u64, DEFAULT_RSTVEC);
+        let mut st = CpuRiscvState::reset_cfg(idx as u64, DEFAULT_RSTVEC, self.riscv.cfg());
         for l in self.loaders.iter().filter(|l| l.set_pc && l.cpu == idx) {
             st.pc = l.addr;
         }
@@ -1177,6 +1238,20 @@ mod tests {
         assert_eq!(names, ["mrom.reset", "mrom.finfo", "fdt"]);
         let isa = m.fdt().getprop("/cpus/cpu@0", "riscv,isa").unwrap();
         assert_eq!(isa, format!("{RUVM_RV64_ISA}\0").as_bytes());
+    }
+
+    #[test]
+    fn isa_string_follows_h_and_v() {
+        let mut cfg = RiscvCfg::default();
+        assert!(cfg.ext_h, "H is on by default, as in QEMU");
+        assert_eq!(riscv_isa(false, &cfg), QEMU_RV64_ISA);
+        cfg.ext_h = false;
+        let isa = riscv_isa(false, &cfg);
+        assert!(isa.starts_with("rv64imafdc_zic64b_"));
+        assert!(isa.contains("_shcounterenw_"));
+        cfg.ext_h = true;
+        cfg.ext_v = true;
+        assert!(riscv_isa(false, &cfg).starts_with("rv64imafdcvh_"));
     }
 
     #[test]

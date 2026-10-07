@@ -3,9 +3,10 @@
 //! The riscv guest: a port of QEMU's `target/riscv` TCG front end for RV64.
 //!
 //! It covers RV64GC (I, M, A, F, D, C with Zicsr and Zifencei), the machine, supervisor and
-//! user privilege levels with Sv39, Sv48 and Sv57 paging and PMP, and the Zba, Zbb, Zbc,
-//! Zbs, Zfa, Zicbom, Zicboz, Zawrs and Sstc extensions of QEMU's default `rv64` CPU. The
-//! vector and hypervisor extensions are not there yet.
+//! user privilege levels with Sv39, Sv48 and Sv57 paging and PMP, the hypervisor extension
+//! (VS and VU modes with two stage translation), and the Zba, Zbb, Zbc, Zbs, Zfa, Zicbom,
+//! Zicboz, Zawrs and Sstc extensions of QEMU's default `rv64` CPU, with the vector
+//! extensions as options.
 //!
 //! - [`cpu`]: `CPURISCVState` as a struct the generated code addresses by offset, and the
 //!   architectural constants.

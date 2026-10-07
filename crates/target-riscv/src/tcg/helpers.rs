@@ -10,21 +10,29 @@
 //! The translator records the instruction with `decode_save_opc()` before calling a helper
 //! that can fault, so those helpers raise with [`Ra::Tb`] as QEMU's `GETPC()` callers do;
 //! `raise_exception` runs after the PC is written and raises with [`Ra::None`].
+//!
+//! The hypervisor helpers (`hfence.vvma`, `hfence.gvma` and the HLV, HLVX and HSV
+//! accesses) are here too. QEMU's `adjust_addr()` is the identity, as there is no pointer
+//! masking.
 
 use std::sync::atomic::Ordering;
 
-use ruvm_jit::cputlb::{self, cpu_st_mmu, probe_access, probe_access_nonfault};
+use ruvm_jit::cputlb::{
+    self, cpu_ld_code, cpu_ld_mmu, cpu_st_mmu, probe_access, probe_access_nonfault,
+};
 use ruvm_jit::{Cpu, CpuLoopExit, MmuAccessType, Ra, excp};
 use ruvm_jit_core::types::call_flags::NO_RWG_SE;
 use ruvm_jit_core::{HelperInfo, HelperType, MemOp, MemOpIdx};
 use ruvm_jit_interp::{HelperEnv, HelperRegistry, Unwind};
 
-use super::{csr, mmu_index, set_mode};
+use super::{csr, mmu_index, set_mode, swap_hypervisor_regs};
 use crate::cpu::{
     BADADDR, CpuRiscvState, EXCP_ILLEGAL_INST, EXCP_INST_ACCESS_FAULT, EXCP_STORE_AMO_ADDR_MIS,
-    MENVCFG_CBCFE, MENVCFG_CBIE, MENVCFG_CBZE, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP,
-    MSTATUS_MPRV, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_TSR, MSTATUS_TVM, MSTATUS_TW,
-    PRV_M, PRV_S, PRV_U, get_field, set_field,
+    EXCP_VIRT_INSTRUCTION_FAULT, HSTATUS_HU, HSTATUS_SPV, HSTATUS_SPVP, HSTATUS_VTSR, HSTATUS_VTVM,
+    HSTATUS_VTW, MENVCFG_CBCFE, MENVCFG_CBIE, MENVCFG_CBZE, MMU_2STAGE_BIT, MMU_IDX_S_SUM,
+    MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV, MSTATUS_MPV, MSTATUS_SIE, MSTATUS_SPIE,
+    MSTATUS_SPP, MSTATUS_SUM, MSTATUS_TSR, MSTATUS_TVM, MSTATUS_TW, PRV_M, PRV_S, PRV_U, RVS,
+    get_field, set_field,
 };
 
 type R<T> = Result<T, CpuLoopExit>;
@@ -75,6 +83,11 @@ fn illegal(cpu: &mut Cpu<'_>) -> CpuLoopExit {
     cpu.raise_exception(EXCP_ILLEGAL_INST, Ra::Tb)
 }
 
+/// `riscv_raise_exception(env, RISCV_EXCP_VIRT_INSTRUCTION_FAULT, GETPC())`.
+fn virt_fault(cpu: &mut Cpu<'_>) -> CpuLoopExit {
+    cpu.raise_exception(EXCP_VIRT_INSTRUCTION_FAULT, Ra::Tb)
+}
+
 def!(RAISE_EXCEPTION, "raise_exception", 0, Void, [Ptr, I32], h_raise_exception);
 def!(CSRR, "csrr", 0, I64, [Ptr, I32], h_csrr);
 def!(CSRW, "csrw", 0, Void, [Ptr, I32, I64], h_csrw);
@@ -88,6 +101,18 @@ def!(CBO_ZERO, "cbo_zero", 0, Void, [Ptr, I64], h_cbo_zero);
 def!(CBO_CLEAN_FLUSH, "cbo_clean_flush", 0, Void, [Ptr, I64], h_cbo_clean_flush);
 def!(CBO_INVAL, "cbo_inval", 0, Void, [Ptr, I64], h_cbo_inval);
 def!(WRS_NTO, "wrs_nto", 0, Void, [Ptr], h_wrs_nto);
+def!(HYP_TLB_FLUSH, "hyp_tlb_flush", 0, Void, [Ptr], h_hyp_tlb_flush);
+def!(HYP_GVMA_TLB_FLUSH, "hyp_gvma_tlb_flush", 0, Void, [Ptr], h_hyp_gvma_tlb_flush);
+def!(HYP_HLV_BU, "hyp_hlv_bu", 0, I64, [Ptr, I64], h_hyp_hlv_bu);
+def!(HYP_HLV_HU, "hyp_hlv_hu", 0, I64, [Ptr, I64], h_hyp_hlv_hu);
+def!(HYP_HLV_WU, "hyp_hlv_wu", 0, I64, [Ptr, I64], h_hyp_hlv_wu);
+def!(HYP_HLV_D, "hyp_hlv_d", 0, I64, [Ptr, I64], h_hyp_hlv_d);
+def!(HYP_HLVX_HU, "hyp_hlvx_hu", 0, I64, [Ptr, I64], h_hyp_hlvx_hu);
+def!(HYP_HLVX_WU, "hyp_hlvx_wu", 0, I64, [Ptr, I64], h_hyp_hlvx_wu);
+def!(HYP_HSV_B, "hyp_hsv_b", 0, Void, [Ptr, I64, I64], h_hyp_hsv_b);
+def!(HYP_HSV_H, "hyp_hsv_h", 0, Void, [Ptr, I64, I64], h_hyp_hsv_h);
+def!(HYP_HSV_W, "hyp_hsv_w", 0, Void, [Ptr, I64, I64], h_hyp_hsv_w);
+def!(HYP_HSV_D, "hyp_hsv_d", 0, Void, [Ptr, I64, I64], h_hyp_hsv_d);
 def!(CLMUL, "clmul", NO_RWG_SE, I64, [I64, I64], h_clmul);
 def!(CLMULR, "clmulr", NO_RWG_SE, I64, [I64, I64], h_clmulr);
 def!(CRC32, "crc32", NO_RWG_SE, I64, [I64, I32], h_crc32);
@@ -108,6 +133,18 @@ pub(crate) const ALL: &[Def] = &[
     CBO_CLEAN_FLUSH,
     CBO_INVAL,
     WRS_NTO,
+    HYP_TLB_FLUSH,
+    HYP_GVMA_TLB_FLUSH,
+    HYP_HLV_BU,
+    HYP_HLV_HU,
+    HYP_HLV_WU,
+    HYP_HLV_D,
+    HYP_HLVX_HU,
+    HYP_HLVX_WU,
+    HYP_HSV_B,
+    HYP_HSV_H,
+    HYP_HSV_W,
+    HYP_HSV_D,
     CLMUL,
     CLMULR,
     CRC32,
@@ -116,7 +153,19 @@ pub(crate) const ALL: &[Def] = &[
 
 /// Register every helper of the riscv front end.
 pub(crate) fn register(r: &mut HelperRegistry) {
-    for d in [ALL, super::fpu::ALL].iter().copied().flatten() {
+    for d in [
+        ALL,
+        super::fpu::ALL,
+        super::vector::ALL,
+        super::vector_int::ALL,
+        super::vector_fp::ALL,
+        super::vector_perm::ALL,
+        super::vcrypto::ALL,
+    ]
+    .iter()
+    .copied()
+    .flatten()
+    {
         r.register_info(&d.info(), d.f);
     }
 }
@@ -159,6 +208,10 @@ fn h_sret(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
         if get_field(st.mstatus, MSTATUS_TSR) != 0 && st.priv_lvl < PRV_M {
             return Err(illegal(cpu));
         }
+        if st.virt() && get_field(st.hstatus, HSTATUS_VTSR) != 0 {
+            return Err(virt_fault(cpu));
+        }
+        let mut prev_virt = st.virt();
         let mut mstatus = st.mstatus;
         let prev_priv = get_field(mstatus, MSTATUS_SPP);
         mstatus = set_field(mstatus, MSTATUS_SIE, get_field(mstatus, MSTATUS_SPIE));
@@ -166,8 +219,19 @@ fn h_sret(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
         mstatus = set_field(mstatus, MSTATUS_SPP, PRV_U);
         mstatus = set_field(mstatus, MSTATUS_MPRV, 0);
         st.mstatus = mstatus;
-        set_mode(&mut st, prev_priv);
+        if st.has_h() && !st.virt() {
+            // We support Hypervisor extensions and virtualisation is disabled.
+            prev_virt = get_field(st.hstatus, HSTATUS_SPV) != 0;
+            st.hstatus = set_field(st.hstatus, HSTATUS_SPV, 0);
+            if prev_virt {
+                swap_hypervisor_regs(&mut st);
+            }
+        }
+        let flush = set_mode(&mut st, prev_priv, prev_virt);
         st.store(cpu.env);
+        if flush {
+            cputlb::tlb_flush(cpu);
+        }
         Ok(retpc)
     })
 }
@@ -185,15 +249,23 @@ fn h_mret(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
         if st.pmp_num_rules == 0 && prev_priv != PRV_M {
             return Err(cpu.raise_exception(EXCP_INST_ACCESS_FAULT, Ra::Tb));
         }
+        let prev_virt = get_field(mstatus, MSTATUS_MPV) != 0 && prev_priv != PRV_M;
         mstatus = set_field(mstatus, MSTATUS_MIE, get_field(mstatus, MSTATUS_MPIE));
         mstatus = set_field(mstatus, MSTATUS_MPIE, 1);
         mstatus = set_field(mstatus, MSTATUS_MPP, PRV_U);
+        mstatus = set_field(mstatus, MSTATUS_MPV, 0);
         if prev_priv != PRV_M {
             mstatus = set_field(mstatus, MSTATUS_MPRV, 0);
         }
         st.mstatus = mstatus;
-        set_mode(&mut st, prev_priv);
+        if st.has_h() && prev_virt {
+            swap_hypervisor_regs(&mut st);
+        }
+        let flush = set_mode(&mut st, prev_priv, prev_virt);
         st.store(cpu.env);
+        if flush {
+            cputlb::tlb_flush(cpu);
+        }
         Ok(retpc)
     })
 }
@@ -202,9 +274,15 @@ fn h_mret(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
 fn h_wfi(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
         let st = CpuRiscvState::load(cpu.env);
+        let rvs = st.misa & RVS != 0;
+        let prv_u = st.priv_lvl == PRV_U;
+        let prv_s = st.priv_lvl == PRV_S;
         let tw = get_field(st.mstatus, MSTATUS_TW) != 0;
-        if (st.priv_lvl == PRV_S && tw) || st.priv_lvl == PRV_U {
+        if ((prv_s || (!rvs && prv_u)) && tw) || (rvs && prv_u && !st.virt()) {
             return Err(illegal(cpu));
+        }
+        if st.virt() && (prv_u || (prv_s && get_field(st.hstatus, HSTATUS_VTW) != 0)) {
+            return Err(virt_fault(cpu));
         }
         cpu.core.exception_index = excp::HLT;
         cpu.shared().halted.store(1, Ordering::Release);
@@ -216,19 +294,146 @@ fn h_wfi(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
 fn h_tlb_flush(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
         let st = CpuRiscvState::load(cpu.env);
-        if st.priv_lvl == PRV_U || (st.priv_lvl == PRV_S && get_field(st.mstatus, MSTATUS_TVM) != 0)
-        {
+        let tvm = get_field(st.mstatus, MSTATUS_TVM) != 0;
+        if !st.virt() && (st.priv_lvl == PRV_U || (st.priv_lvl == PRV_S && tvm)) {
             return Err(illegal(cpu));
+        }
+        if st.virt() && (st.priv_lvl == PRV_U || get_field(st.hstatus, HSTATUS_VTVM) != 0) {
+            return Err(virt_fault(cpu));
         }
         cputlb::tlb_flush(cpu);
         Ok(0)
     })
 }
 
+/// `helper_hyp_tlb_flush()`, for `hfence.vvma`.
+fn hyp_tlb_flush(cpu: &mut Cpu<'_>) -> R<u64> {
+    let st = CpuRiscvState::load(cpu.env);
+    if st.virt() {
+        return Err(virt_fault(cpu));
+    }
+    if st.priv_lvl == PRV_M || (st.priv_lvl == PRV_S && !st.virt()) {
+        cputlb::tlb_flush(cpu);
+        return Ok(0);
+    }
+    Err(illegal(cpu))
+}
+
+/// `HELPER(hyp_tlb_flush)`.
+fn h_hyp_tlb_flush(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
+    run(h, hyp_tlb_flush)
+}
+
+/// `HELPER(hyp_gvma_tlb_flush)`.
+fn h_hyp_gvma_tlb_flush(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
+    run(h, |cpu| {
+        let st = CpuRiscvState::load(cpu.env);
+        if st.priv_lvl == PRV_S && !st.virt() && get_field(st.mstatus, MSTATUS_TVM) != 0 {
+            return Err(illegal(cpu));
+        }
+        hyp_tlb_flush(cpu)
+    })
+}
+
+/// `check_access_hlsv()`: the MMU index of a hypervisor load or store, which always goes
+/// through both stages with the privilege level of `hstatus.SPVP`. `x` is for HLVX, which
+/// ignores `vsstatus.SUM`.
+fn check_access_hlsv(cpu: &mut Cpu<'_>, x: bool) -> R<usize> {
+    let st = CpuRiscvState::load(cpu.env);
+    if st.priv_lvl == PRV_M {
+        // Always allowed.
+    } else if st.virt() {
+        return Err(virt_fault(cpu));
+    } else if st.priv_lvl == PRV_U && get_field(st.hstatus, HSTATUS_HU) == 0 {
+        return Err(illegal(cpu));
+    }
+    let mut mode = get_field(st.hstatus, HSTATUS_SPVP) as usize;
+    if !x && mode == PRV_S as usize && get_field(st.vsstatus, MSTATUS_SUM) != 0 {
+        mode = MMU_IDX_S_SUM;
+    }
+    Ok(mode | MMU_2STAGE_BIT)
+}
+
+/// `helper_hyp_hlv_*()`: an HLV load of `mop`, zero extended.
+fn hlv(h: &mut HelperEnv<'_>, addr: u64, mop: MemOp) -> Result<u128, Unwind> {
+    run(h, |cpu| {
+        let idx = check_access_hlsv(cpu, false)?;
+        cpu_ld_mmu(cpu, addr, MemOpIdx::new(mop, idx as u32), Ra::Tb)
+    })
+}
+
+/// `helper_hyp_hlvx_*()`: an HLVX load of `n` bytes, which needs execute permission.
+fn hlvx(h: &mut HelperEnv<'_>, addr: u64, n: usize) -> Result<u128, Unwind> {
+    run(h, |cpu| {
+        let idx = check_access_hlsv(cpu, true)?;
+        let mut b = [0u8; 8];
+        cpu_ld_code(cpu, addr, &mut b[..n], idx, Ra::Tb)?;
+        Ok(u64::from_le_bytes(b))
+    })
+}
+
+/// `helper_hyp_hsv_*()`: an HSV store of `mop`.
+fn hsv(h: &mut HelperEnv<'_>, addr: u64, val: u64, mop: MemOp) -> Result<u128, Unwind> {
+    run(h, |cpu| {
+        let idx = check_access_hlsv(cpu, false)?;
+        cpu_st_mmu(cpu, addr, val, MemOpIdx::new(mop, idx as u32), Ra::Tb)?;
+        Ok(0)
+    })
+}
+
+/// `HELPER(hyp_hlv_bu)`.
+fn h_hyp_hlv_bu(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    hlv(h, a[1], MemOp::UB)
+}
+
+/// `HELPER(hyp_hlv_hu)`.
+fn h_hyp_hlv_hu(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    hlv(h, a[1], MemOp::LEUW)
+}
+
+/// `HELPER(hyp_hlv_wu)`.
+fn h_hyp_hlv_wu(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    hlv(h, a[1], MemOp::LEUL)
+}
+
+/// `HELPER(hyp_hlv_d)`.
+fn h_hyp_hlv_d(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    hlv(h, a[1], MemOp::LEUQ)
+}
+
+/// `HELPER(hyp_hlvx_hu)`.
+fn h_hyp_hlvx_hu(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    hlvx(h, a[1], 2)
+}
+
+/// `HELPER(hyp_hlvx_wu)`.
+fn h_hyp_hlvx_wu(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    hlvx(h, a[1], 4)
+}
+
+/// `HELPER(hyp_hsv_b)`.
+fn h_hyp_hsv_b(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    hsv(h, a[1], a[2], MemOp::UB)
+}
+
+/// `HELPER(hyp_hsv_h)`.
+fn h_hyp_hsv_h(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    hsv(h, a[1], a[2], MemOp::LEUW)
+}
+
+/// `HELPER(hyp_hsv_w)`.
+fn h_hyp_hsv_w(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    hsv(h, a[1], a[2], MemOp::LEUL)
+}
+
+/// `HELPER(hyp_hsv_d)`.
+fn h_hyp_hsv_d(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    hsv(h, a[1], a[2], MemOp::LEUQ)
+}
+
 /// The data MMU index of the vCPU, `riscv_env_mmu_index(env, false)`.
 fn data_mmu_idx(cpu: &Cpu<'_>) -> usize {
-    let st = CpuRiscvState::load(cpu.env);
-    mmu_index(st.priv_lvl, st.mstatus, false)
+    mmu_index(cpu.env, false)
 }
 
 /// `HELPER(sc_probe_write)`: a failed SC still checks that it could have stored.
@@ -253,6 +458,12 @@ fn check_zicbo_envcfg(cpu: &mut Cpu<'_>, envbits: u64) -> R<()> {
     let st = CpuRiscvState::load(cpu.env);
     if st.priv_lvl < PRV_M && get_field(st.menvcfg, envbits) == 0 {
         return Err(illegal(cpu));
+    }
+    if st.virt()
+        && ((st.priv_lvl <= PRV_S && get_field(st.henvcfg, envbits) == 0)
+            || (st.priv_lvl < PRV_S && get_field(st.senvcfg, envbits) == 0))
+    {
+        return Err(virt_fault(cpu));
     }
     if st.priv_lvl < PRV_S && get_field(st.senvcfg, envbits) == 0 {
         return Err(illegal(cpu));
@@ -317,7 +528,15 @@ fn h_cbo_inval(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
 fn h_wrs_nto(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
         let st = CpuRiscvState::load(cpu.env);
-        if st.priv_lvl != PRV_M && get_field(st.mstatus, MSTATUS_TW) != 0 {
+        let tw = get_field(st.mstatus, MSTATUS_TW) != 0;
+        if st.virt()
+            && (st.priv_lvl == PRV_S || st.priv_lvl == PRV_U)
+            && get_field(st.hstatus, HSTATUS_VTW) != 0
+            && !tw
+        {
+            return Err(virt_fault(cpu));
+        }
+        if st.priv_lvl != PRV_M && tw {
             return Err(illegal(cpu));
         }
         Ok(0)

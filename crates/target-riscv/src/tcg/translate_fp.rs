@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The F, D and Zfa instructions and the compressed floating point loads and stores, a port
-//! of QEMU's `trans_rvf.c.inc`, `trans_rvd.c.inc` and `trans_rvzfa.c.inc` with the floating
-//! point parts of `translate.c` (`gen_set_rm()`, `gen_nanbox_s()`, `gen_check_nanbox_s()`).
+//! The F, D and Zfa instructions, the Zfhmin and Zfbfmin instructions and the compressed
+//! floating point loads and stores, a port of QEMU's `trans_rvf.c.inc`, `trans_rvd.c.inc`,
+//! `trans_rvzfa.c.inc`, the Zfhmin parts of `trans_rvzfh.c.inc` and the scalar parts of
+//! `trans_rvbf16.c.inc`, with the floating point parts of `translate.c` (`gen_set_rm()`,
+//! `gen_nanbox_s()`, `gen_check_nanbox_s()`, `gen_nanbox_h()`).
 //!
-//! The model is RV64 with F, D, C and Zfa and without Zfinx, Zdinx, Zfh, Zfhmin, Zfbfmin,
-//! Zcf or Zama16b, so the register of an operand is always the `cpu_fpr` global, single
-//! precision values are NaN boxed, and the `_h` and bf16 instructions, `fmvh.x.d` and
-//! `fmvp.d.x` (RV32 only) keep the default `trans_*` that returns false. `c.flw` and
+//! The model is RV64 with F, D, C and Zfa and without Zfinx, Zdinx, Zhinx, Zhinxmin, Zcf or
+//! Zama16b, so the register of an operand is always the `cpu_fpr` global, single and half
+//! precision values are NaN boxed, and the Zfh arithmetic, `fmvh.x.d` and `fmvp.d.x` (RV32
+//! only) keep the default `trans_*` that returns false. `flh`, `fsh`, `fmv.x.h`, `fmv.h.x`
+//! and the conversions check `cfg.ext_zfhmin` and `cfg.ext_zfbfmin`. `c.flw` and
 //! `c.fsw` share their encodings with `c.ld` and `c.sd`, which come first in their decode
 //! groups on RV64, so they are never reached and keep the default as well.
 //!
@@ -28,6 +31,8 @@ use crate::decode::insn32::{arg_i, arg_s};
 const NANBOX_S: u64 = 0xffff_ffff_0000_0000;
 /// The canonical single precision NaN, NaN boxed.
 const NANBOXED_NAN_S: u64 = 0xffff_ffff_7fc0_0000;
+/// The upper bits of a NaN boxed half precision or bf16 value, `gen_nanbox_h()`.
+const NANBOX_H: u64 = 0xffff_ffff_ffff_0000;
 /// The sign bit of a single precision value.
 const SIGN_S: i64 = 1 << 31;
 
@@ -117,13 +122,13 @@ pub(super) enum Sgnj {
 impl S<'_, '_> {
     /// `REQUIRE_FPU`: whether `mstatus.FS` is off, which makes every floating point
     /// instruction illegal.
-    fn fpu_off(&self) -> bool {
+    pub(super) fn fpu_off(&self) -> bool {
         self.d.mstatus_fs == EXT_STATUS_DISABLED
     }
 
     /// `gen_set_rm()`: make `rm` the rounding mode of the helpers that follow, unless the
     /// block already did.
-    fn gen_set_rm(&mut self, rm: i32) {
+    pub(super) fn gen_set_rm(&mut self, rm: i32) {
         if self.d.frm == rm {
             return;
         }
@@ -137,6 +142,21 @@ impl S<'_, '_> {
         let env = self.env();
         let c = self.c32(rm);
         self.call(&fpu::SET_ROUNDING_MODE, None, &[env.into(), c.into()]);
+    }
+
+    /// `gen_set_rm_chkfrm()`: [`S::gen_set_rm`] for a static rounding mode that also
+    /// checks `frm`.
+    pub(super) fn gen_set_rm_chkfrm(&mut self, rm: i32) {
+        if self.d.frm == rm && self.d.frm_valid {
+            return;
+        }
+        self.d.frm = rm;
+        self.d.frm_valid = true;
+        // The helper may raise an illegal instruction exception.
+        self.decode_save_opc(0);
+        let env = self.env();
+        let c = self.c32(rm);
+        self.call(&fpu::SET_ROUNDING_MODE_CHKFRM, None, &[env.into(), c.into()]);
     }
 
     /// `gen_set_fpr_hs()` and `gen_set_fpr_d()` without Zfinx: `rd = v`.
@@ -424,6 +444,76 @@ impl S<'_, '_> {
         self.f().gen_movi_i64(dest, table[rs1 as usize] as i64);
         self.mark_fs_dirty();
         true
+    }
+}
+
+// Zfhmin and Zfbfmin.
+impl S<'_, '_> {
+    /// `REQUIRE_ZFHMIN_OR_ZFBFMIN`.
+    fn zfhmin_or_zfbfmin(&self) -> bool {
+        self.d.cfg.ext_zfhmin || self.d.cfg.ext_zfbfmin
+    }
+
+    /// `flh`: load 2 bytes and NaN box them.
+    pub(super) fn fp_load_h(&mut self, a: &arg_i) -> bool {
+        if self.fpu_off() || !self.zfhmin_or_zfbfmin() {
+            return false;
+        }
+        self.decode_save_opc(0);
+        let addr = self.address(a.rs1, i64::from(a.imm));
+        let dest = self.fpr(a.rd);
+        let idx = self.d.mem_idx;
+        self.f().gen_qemu_ld_i64(dest, addr, idx, MemOp::LEUW);
+        self.f().gen_ori_i64(dest, dest, NANBOX_H as i64);
+        self.mark_fs_dirty();
+        true
+    }
+
+    /// `fsh`.
+    pub(super) fn fp_store_h(&mut self, a: &arg_s) -> bool {
+        if self.fpu_off() || !self.zfhmin_or_zfbfmin() {
+            return false;
+        }
+        self.decode_save_opc(0);
+        let addr = self.address(a.rs1, i64::from(a.imm));
+        let src = self.fpr(a.rs2);
+        let idx = self.d.mem_idx;
+        self.f().gen_qemu_st_i64(src, addr, idx, MemOp::LEUW);
+        true
+    }
+
+    /// `fmv.x.h`: the low 16 bits, sign extended.
+    pub(super) fn fp_fmv_x_h(&mut self, rd: i32, rs1: i32) -> bool {
+        if self.fpu_off() || !self.zfhmin_or_zfbfmin() {
+            return false;
+        }
+        let src = self.fpr(rs1);
+        let dest = self.new64();
+        self.f().gen_ext16s_i64(dest, src);
+        self.set_gpr(rd, dest);
+        true
+    }
+
+    /// `fmv.h.x`: the low 16 bits, NaN boxed.
+    pub(super) fn fp_fmv_h_x(&mut self, rd: i32, rs1: i32) -> bool {
+        if self.fpu_off() || !self.zfhmin_or_zfbfmin() {
+            return false;
+        }
+        let src = self.gpr(rs1);
+        let dest = self.new64();
+        self.f().gen_ori_i64(dest, src, NANBOX_H as i64);
+        self.set_fpr(rd, dest);
+        self.mark_fs_dirty();
+        true
+    }
+
+    /// The conversions of Zfhmin (`bf16` false) and Zfbfmin (`bf16` true) with helper `h`.
+    pub(super) fn fp_fcvt_h(&mut self, rd: i32, rs1: i32, rm: i32, bf16: bool, h: &Def) -> bool {
+        let ext = if bf16 { self.d.cfg.ext_zfbfmin } else { self.d.cfg.ext_zfhmin };
+        if self.fpu_off() || !ext {
+            return false;
+        }
+        self.fp_ff(rd, [rs1], Some(rm), h)
     }
 }
 
@@ -742,6 +832,48 @@ macro_rules! fp_trans32 {
 
         fn trans_fltq_d(&mut self, a: &mut arg_fltq_d) -> bool {
             self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLTQ_D)
+        }
+
+        // Zfhmin and Zfbfmin.
+
+        fn trans_flh(&mut self, a: &mut arg_flh) -> bool {
+            self.fp_load_h(a)
+        }
+
+        fn trans_fsh(&mut self, a: &mut arg_fsh) -> bool {
+            self.fp_store_h(a)
+        }
+
+        fn trans_fmv_x_h(&mut self, a: &mut arg_fmv_x_h) -> bool {
+            self.fp_fmv_x_h(a.rd, a.rs1)
+        }
+
+        fn trans_fmv_h_x(&mut self, a: &mut arg_fmv_h_x) -> bool {
+            self.fp_fmv_h_x(a.rd, a.rs1)
+        }
+
+        fn trans_fcvt_s_h(&mut self, a: &mut arg_fcvt_s_h) -> bool {
+            self.fp_fcvt_h(a.rd, a.rs1, a.rm, false, &$crate::tcg::fpu::FCVT_S_H)
+        }
+
+        fn trans_fcvt_h_s(&mut self, a: &mut arg_fcvt_h_s) -> bool {
+            self.fp_fcvt_h(a.rd, a.rs1, a.rm, false, &$crate::tcg::fpu::FCVT_H_S)
+        }
+
+        fn trans_fcvt_d_h(&mut self, a: &mut arg_fcvt_d_h) -> bool {
+            self.fp_fcvt_h(a.rd, a.rs1, a.rm, false, &$crate::tcg::fpu::FCVT_D_H)
+        }
+
+        fn trans_fcvt_h_d(&mut self, a: &mut arg_fcvt_h_d) -> bool {
+            self.fp_fcvt_h(a.rd, a.rs1, a.rm, false, &$crate::tcg::fpu::FCVT_H_D)
+        }
+
+        fn trans_fcvt_bf16_s(&mut self, a: &mut arg_fcvt_bf16_s) -> bool {
+            self.fp_fcvt_h(a.rd, a.rs1, a.rm, true, &$crate::tcg::fpu::FCVT_BF16_S)
+        }
+
+        fn trans_fcvt_s_bf16(&mut self, a: &mut arg_fcvt_s_bf16) -> bool {
+            self.fp_fcvt_h(a.rd, a.rs1, a.rm, true, &$crate::tcg::fpu::FCVT_S_BF16)
         }
     };
 }
