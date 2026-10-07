@@ -3,7 +3,8 @@
 //! The RV64 translator: QEMU's `target/riscv/tcg/translate.c` with the integer parts of
 //! `insn_trans/` (`trans_rvi`, `trans_rvm`, `trans_rva`, `trans_rvzicsr`, `trans_privileged`,
 //! `trans_rvb`, `trans_rvzicbo`, `trans_rvzawrs`, `trans_rvzicond` is not on by default) and
-//! `trans_xlrbr`. The floating point instructions are in `translate_fp`.
+//! `trans_xlrbr`. The floating point instructions are in `translate_fp` and the hypervisor
+//! ones in `translate_rvh`.
 //!
 //! The front end is RV64 only, with C always present, so the misaligned jump checks of
 //! QEMU's `gen_jal()` and `trans_jalr()` never fire and are not here. Conditional branches
@@ -19,12 +20,19 @@ use ruvm_jit_core::{Func, Label, MemOp, Temp};
 use ruvm_mem::Endian;
 
 use super::helpers::{self, Def};
-use super::translate_fp;
-use super::{TB_FS_SHIFT, TB_MEM_IDX_MASK, TB_PRIV_SHIFT};
+use super::translate_rvv::Ldst;
+use super::{
+    TB_FS_SHIFT, TB_LMUL_SHIFT, TB_MEM_IDX_MASK, TB_PRIV_SHIFT, TB_SEW_SHIFT, TB_VILL, TB_VIRT,
+    TB_VMA, TB_VS_SHIFT, TB_VSTART_EQ_ZERO, TB_VTA,
+};
+use super::{
+    translate_fp, translate_rvh, translate_rvv, translate_rvv_fp, translate_rvv_int,
+    translate_rvv_perm, translate_rvvk,
+};
 use crate::cpu::{
     BADADDR, BINS, EXCP_BREAKPOINT, EXCP_ILLEGAL_INST, EXCP_SEMIHOST, EXCP_U_ECALL,
-    EXT_STATUS_DIRTY, LOAD_RES, LOAD_VAL, MSTATUS, MSTATUS_FS, PC, PRV_U, UW2_ALWAYS_STORE_AMO,
-    fpr_off, gpr_off,
+    EXT_STATUS_DIRTY, LOAD_RES, LOAD_VAL, MSTATUS, MSTATUS_FS, MSTATUS_HS, MSTATUS_VS, PC, PRV_U,
+    RiscvCfg, UW2_ALWAYS_STORE_AMO, fpr_off, gpr_off,
 };
 use crate::decode::insn16::{DecodeInsn16, decode16};
 use crate::decode::insn32::*;
@@ -80,8 +88,28 @@ pub(crate) struct DisasContext {
     semihosting: Option<bool>,
     /// Whether the XLRBR vendor extension is on.
     xlrbr: bool,
+    /// The extensions of the CPU, `cfg_ptr`.
+    pub(super) cfg: RiscvCfg,
+    /// `mstatus.VS` as the block found it, updated by `mark_vs_dirty()`.
+    pub(super) mstatus_vs: u64,
+    /// `vill`.
+    pub(super) vill: bool,
+    /// `vtype.vsew`: log2 of SEW / 8.
+    pub(super) sew: i32,
+    /// `vtype.vlmul` sign extended: log2 of LMUL, from -3 to 3 (-4 is reserved).
+    pub(super) lmul: i32,
+    /// `vtype.vta && cfg.rvv_ta_all_1s`.
+    pub(super) vta: bool,
+    /// `vtype.vma && cfg.rvv_ma_all_1s`.
+    pub(super) vma: bool,
+    /// `cfg.rvv_ta_all_1s`.
+    pub(super) cfg_vta_all_1s: bool,
+    /// Whether `vstart` is 0, updated by `finalize_rvv_inst()`.
+    pub(super) vstart_eq_zero: bool,
     /// The privilege level of the block.
     pub(super) priv_lvl: u64,
+    /// Whether the block runs with V=1, `virt_enabled`.
+    pub(super) virt_enabled: bool,
     /// The MMU index of data accesses.
     pub(super) mem_idx: u32,
     /// `mstatus.FS` as the block found it, updated by `mark_fs_dirty()`.
@@ -105,11 +133,21 @@ pub(crate) struct DisasContext {
 }
 
 impl DisasContext {
-    pub(crate) fn new(semihosting: Option<bool>, xlrbr: bool) -> DisasContext {
+    pub(crate) fn new(semihosting: Option<bool>, xlrbr: bool, cfg: RiscvCfg) -> DisasContext {
         DisasContext {
             semihosting,
             xlrbr,
+            cfg,
+            mstatus_vs: 0,
+            vill: true,
+            sew: 0,
+            lmul: 0,
+            vta: false,
+            vma: false,
+            cfg_vta_all_1s: false,
+            vstart_eq_zero: true,
             priv_lvl: 0,
+            virt_enabled: false,
             mem_idx: 0,
             mstatus_fs: 0,
             frm: -1,
@@ -359,7 +397,7 @@ impl S<'_, '_> {
     }
 
     /// `lookup_and_goto_ptr()` once `pc` holds the target.
-    fn lookup_and_goto_ptr(&mut self) {
+    pub(super) fn lookup_and_goto_ptr(&mut self) {
         let pc = self.g().pc;
         self.f().gen_lookup_and_goto_ptr_ic(pc);
         self.b.is_jmp = DisasJumpType::NoReturn;
@@ -376,7 +414,39 @@ impl S<'_, '_> {
             f.gen_ld_i64(t, env, MSTATUS as i64);
             f.gen_ori_i64(t, t, MSTATUS_FS as i64);
             f.gen_st_i64(t, env, MSTATUS as i64);
+            if self.d.virt_enabled {
+                let f = self.f();
+                f.gen_ld_i64(t, env, MSTATUS_HS as i64);
+                f.gen_ori_i64(t, t, MSTATUS_FS as i64);
+                f.gen_st_i64(t, env, MSTATUS_HS as i64);
+            }
         }
+    }
+
+    /// `mark_vs_dirty()`.
+    pub(super) fn mark_vs_dirty(&mut self) {
+        if self.d.mstatus_vs != EXT_STATUS_DIRTY {
+            // Remember the state change for the rest of the TB.
+            self.d.mstatus_vs = EXT_STATUS_DIRTY;
+            let env = self.env();
+            let t = self.new64();
+            let f = self.f();
+            f.gen_ld_i64(t, env, MSTATUS as i64);
+            f.gen_ori_i64(t, t, MSTATUS_VS as i64);
+            f.gen_st_i64(t, env, MSTATUS as i64);
+            if self.d.virt_enabled {
+                let f = self.f();
+                f.gen_ld_i64(t, env, MSTATUS_HS as i64);
+                f.gen_ori_i64(t, t, MSTATUS_VS as i64);
+                f.gen_st_i64(t, env, MSTATUS_HS as i64);
+            }
+        }
+    }
+
+    /// `finalize_rvv_inst()`: a vector instruction leaves the state dirty and `vstart` 0.
+    pub(super) fn finalize_rvv_inst(&mut self) {
+        self.mark_vs_dirty();
+        self.d.vstart_eq_zero = true;
     }
 
     // Integer operations.
@@ -1653,6 +1723,12 @@ impl DecodeInsn32 for S<'_, '_> {
     }
 
     translate_fp::fp_trans32!();
+    translate_rvv::rvv_trans32!();
+    translate_rvh::rvh_trans32!();
+    translate_rvv_int::rvv_int_trans32!();
+    translate_rvv_fp::rvv_fp_trans32!();
+    translate_rvv_perm::rvv_perm_trans32!();
+    translate_rvvk::rvvk_trans32!();
 }
 
 impl DecodeInsn16 for S<'_, '_> {
@@ -1772,7 +1848,17 @@ impl TranslatorOps for DisasContext {
         let flags = db.tb.flags;
         self.mem_idx = flags & TB_MEM_IDX_MASK;
         self.priv_lvl = u64::from((flags >> TB_PRIV_SHIFT) & 3);
+        self.virt_enabled = flags & TB_VIRT != 0;
         self.mstatus_fs = u64::from((flags >> TB_FS_SHIFT) & 3);
+        self.mstatus_vs = u64::from((flags >> TB_VS_SHIFT) & 3);
+        self.vill = flags & TB_VILL != 0;
+        self.sew = ((flags >> TB_SEW_SHIFT) & 7) as i32;
+        // sextract32(lmul, 0, 3).
+        self.lmul = ((((flags >> TB_LMUL_SHIFT) & 7) as i32) << 29) >> 29;
+        self.vta = flags & TB_VTA != 0 && self.cfg.rvv_ta_all_1s;
+        self.vma = flags & TB_VMA != 0 && self.cfg.rvv_ma_all_1s;
+        self.cfg_vta_all_1s = self.cfg.rvv_ta_all_1s;
+        self.vstart_eq_zero = flags & TB_VSTART_EQ_ZERO != 0;
         self.frm = -1;
         self.frm_valid = false;
     }

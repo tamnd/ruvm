@@ -38,7 +38,7 @@ use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ruvm_jit::{Cpu, MmuAccessType, interrupt};
+use ruvm_jit::{Cpu, interrupt};
 use ruvm_mem::{MemTxAttrs, MemTxResult};
 
 use super::{Riscv, ptw};
@@ -257,10 +257,7 @@ impl Guest<'_, '_> {
     fn translate(&mut self, va: u64) -> Result<u64, Fault> {
         let st = CpuRiscvState::load(self.cpu.env);
         let as_ = self.cpu.core.address_space().clone();
-        let t =
-            ptw::get_physical_address(&st, &as_, va, MmuAccessType::DataLoad, self.mmu_idx, true)
-                .map_err(|_| Fault)?;
-        Ok(t.pa)
+        ptw::translate_debug(&st, &as_, va, self.mmu_idx).ok_or(Fault)
     }
 
     fn read(&mut self, va: u64, len: usize) -> Result<Vec<u8>, Fault> {
@@ -350,7 +347,7 @@ impl Guest<'_, '_> {
 /// steps over the `ebreak`.
 pub(crate) fn handle(_rv: &Riscv, sh: &Semihosting, cpu: &mut Cpu<'_>) {
     let st = CpuRiscvState::load(cpu.env);
-    let mmu_idx = super::mmu_index(st.priv_lvl, st.mstatus, false);
+    let mmu_idx = super::mmu_index_st(&st, false);
     let nr = st.gpr[10] as u32;
     let args = st.gpr[11];
     let sp = st.gpr[2];

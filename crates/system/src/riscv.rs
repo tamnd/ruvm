@@ -15,9 +15,9 @@
 //!
 //! Deliberate differences from QEMU:
 //!
-//! - The only CPU model is `rv64`, QEMU's default, with one property, `xlrbr`. The other
-//!   models fail with "... is not supported by ruvm yet", and so do the other CPU
-//!   properties.
+//! - The only CPU model is `rv64`, QEMU's default, with the `xlrbr`, `h` and vector
+//!   extension properties. The other models fail with "... is not supported by ruvm yet",
+//!   and so do the other CPU properties.
 //! - The machine properties are taken only where their value describes the board that
 //!   exists: `aclint=off`, `aia=none`, `aia-guests=0`, `acpi=off` or `auto` (there are no
 //!   ACPI tables either way) and `iommu-sys=off` or `auto`. Other values fail with "... is not
@@ -57,6 +57,7 @@ use ruvm_qapi::types::{
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
+use ruvm_target_riscv::cpu::RiscvCfg;
 use ruvm_target_riscv::tcg::SemihostingHost;
 
 use crate::arm::{Semihosting, SemihostingTarget};
@@ -359,7 +360,19 @@ const OTHER_RISCV_CPUS: &[&str] = &[
 
 /// `-cpu model,prop=value,...` for virt (`rv64` without one). Gives whether the `xlrbr`
 /// extension is on.
-pub(crate) fn parse_cpu(arg: Option<&str>) -> Result<bool> {
+/// The CPU options of `-cpu rv64,...`: the XLRBR vendor extension and the vector
+/// extension set.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CpuChoice {
+    pub(crate) xlrbr: bool,
+    pub(crate) vector: RiscvCfg,
+}
+
+/// `-cpu`: the `rv64` model and its boolean extension properties. The vector extension
+/// properties take QEMU's names; the implied extension rules then turn on what they need,
+/// except that a property the user set keeps the user's value, as
+/// `cpu_cfg_ext_auto_update()` does.
+pub(crate) fn parse_cpu(arg: Option<&str>) -> Result<CpuChoice> {
     let arg = arg.unwrap_or("rv64");
     let mut parts = arg.split(',');
     let name = parts.next().unwrap_or_default();
@@ -370,12 +383,19 @@ pub(crate) fn parse_cpu(arg: Option<&str>) -> Result<bool> {
         return Err(Error::generic(format!("unable to find CPU model '{name}'")));
     }
     let mut xlrbr = false;
+    let mut vector = RiscvCfg::default();
+    let mut user: Vec<(&str, bool)> = Vec::new();
     for feat in parts.filter(|f| !f.is_empty()) {
         let Some((prop, value)) = feat.split_once('=') else {
             return Err(Error::generic(format!("Expected key=value format, found {feat}")));
         };
         match prop {
             "xlrbr" => xlrbr = prop_bool(prop, value)?,
+            _ if RiscvCfg::default().set_prop(prop, false) => {
+                let on = prop_bool(prop, value)?;
+                vector.set_prop(prop, on);
+                user.push((prop, on));
+            }
             _ => {
                 return Err(Error::generic(format!(
                     "CPU property {prop}={value} is not supported by ruvm yet"
@@ -383,7 +403,11 @@ pub(crate) fn parse_cpu(arg: Option<&str>) -> Result<bool> {
             }
         }
     }
-    Ok(xlrbr)
+    vector.apply_implied();
+    for (prop, on) in user {
+        vector.set_prop(prop, on);
+    }
+    Ok(CpuChoice { xlrbr, vector })
 }
 
 /// `-device loader,...`, the properties of hw/core/generic-loader.c. The checks that need
@@ -719,7 +743,7 @@ pub(crate) fn start_board_tcg(
             "semihosting-config target=gdb is not supported by ruvm yet",
         )));
     }
-    let xlrbr = parse_cpu(args.cpu).map_err(one)?;
+    let cpu = parse_cpu(args.cpu).map_err(one)?;
     let loaders = parse_devices(args.devices).map_err(|e| vec![e])?;
     let find = |name: &str| args.firmware.find(name).map(|p| p.to_string_lossy().into_owned());
     let firmware =
@@ -745,7 +769,8 @@ pub(crate) fn start_board_tcg(
     cfg.append = opts.append;
     cfg.dtb = opts.dtb;
     cfg.firmware = firmware;
-    cfg.xlrbr = xlrbr;
+    cfg.xlrbr = cpu.xlrbr;
+    cfg.vector = cpu.vector;
     cfg.loaders = loaders;
     cfg.semihosting = console.clone().map(|c| c as Arc<dyn SemihostingHost>);
     cfg.semihosting_userspace = semi.userspace;
@@ -820,17 +845,28 @@ mod tests {
 
     #[test]
     fn cpu_models() {
-        assert!(!parse_cpu(None).unwrap());
-        assert!(parse_cpu(Some("rv64,xlrbr=true")).unwrap());
-        assert!(!parse_cpu(Some("rv64,xlrbr=off")).unwrap());
+        assert!(!parse_cpu(None).unwrap().xlrbr);
+        assert!(parse_cpu(Some("rv64,xlrbr=true")).unwrap().xlrbr);
+        assert!(!parse_cpu(Some("rv64,xlrbr=off")).unwrap().xlrbr);
+        let c = parse_cpu(Some("rv64,v=true")).unwrap();
+        assert!(c.vector.ext_v && c.vector.ext_zve64d && c.vector.ext_zve32x);
+        assert!(c.vector.validate().is_ok());
+        assert!(!parse_cpu(None).unwrap().vector.ext_v);
+        // A property the user turned off stays off; the board then rejects the set.
+        let c = parse_cpu(Some("rv64,v=on,zve64d=off")).unwrap();
+        assert!(c.vector.ext_v && !c.vector.ext_zve64d);
         assert_eq!(
             parse_cpu(Some("sifive-u54")).unwrap_err().message(),
             "CPU model 'sifive-u54' is not supported by ruvm yet"
         );
         assert_eq!(parse_cpu(Some("foo")).unwrap_err().message(), "unable to find CPU model 'foo'");
+        // H is on by default, as in QEMU, and can be turned off.
+        assert!(parse_cpu(None).unwrap().vector.ext_h);
+        assert!(parse_cpu(Some("rv64,h=true")).unwrap().vector.ext_h);
+        assert!(!parse_cpu(Some("rv64,h=false")).unwrap().vector.ext_h);
         assert_eq!(
-            parse_cpu(Some("rv64,h=true")).unwrap_err().message(),
-            "CPU property h=true is not supported by ruvm yet"
+            parse_cpu(Some("rv64,zvfoo=true")).unwrap_err().message(),
+            "CPU property zvfoo=true is not supported by ruvm yet"
         );
     }
 

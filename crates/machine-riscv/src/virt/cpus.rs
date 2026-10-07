@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! How the virt board meets its harts: the ACLINT `mtime` the `time` CSR reads and the Sstc
-//! timers behind `stimecmp` ([`CpuHub`], the board side of `RiscvBoard`), the shutdown and
+//! timers behind `stimecmp` and `vstimecmp` ([`CpuHub`], the board side of `RiscvBoard`), the shutdown and
 //! reset requests of the SiFive test device, and semihosting ([`VirtSemihost`]).
 
 use std::fmt;
@@ -25,6 +25,8 @@ struct CpuSlot {
     shared: Weak<CpuShared>,
     /// `env->stimer`: the timer that raises STIP at the `stimecmp` deadline.
     stimer: Option<Timer>,
+    /// `env->vstimer`: the timer that raises VSTIP at the `vstimecmp` deadline.
+    vstimer: Option<Timer>,
 }
 
 /// The board side of every hart: `rdtime_fn` on the ACLINT timer, the Sstc timers on the
@@ -50,7 +52,9 @@ impl fmt::Debug for CpuHub {
 
 impl CpuHub {
     pub(crate) fn new(mtimer: Arc<RiscvAclintMtimer>, harts: usize, clock: Arc<Clock>) -> CpuHub {
-        let slots = (0..harts).map(|_| CpuSlot { shared: Weak::new(), stimer: None }).collect();
+        let slots = (0..harts)
+            .map(|_| CpuSlot { shared: Weak::new(), stimer: None, vstimer: None })
+            .collect();
         CpuHub {
             mtimer,
             clock,
@@ -72,10 +76,49 @@ impl CpuHub {
         }
     }
 
-    /// Stop the Sstc timer of hart `cpu`, as a CPU reset leaves `env->stimer` idle.
+    /// Stop the Sstc timers of hart `cpu`, as a CPU reset leaves `env->stimer` and
+    /// `env->vstimer` idle.
     pub(crate) fn reset_timer(&self, cpu: usize) {
-        if let Some(t) = lock(&self.slots).get(cpu).and_then(|s| s.stimer.as_ref()) {
-            t.del();
+        if let Some(s) = lock(&self.slots).get(cpu) {
+            for t in [&s.stimer, &s.vstimer].into_iter().flatten() {
+                t.del();
+            }
+        }
+    }
+
+    /// Arm (or with `None` stop) the S mode Sstc timer of `shared`, or the VS mode one
+    /// with `vs`.
+    fn timer_update(&self, shared: &CpuShared, deadline: Option<Instant>, vs: bool) {
+        let mut slots = lock(&self.slots);
+        let Some(slot) = slots.get_mut(shared.cpu_index) else {
+            return;
+        };
+        let weak_cpu = slot.shared.clone();
+        let timer = if vs { &mut slot.vstimer } else { &mut slot.stimer };
+        match deadline {
+            Some(d) => {
+                let wait = d.saturating_duration_since(Instant::now());
+                let ns = i64::try_from(wait.as_nanos()).unwrap_or(i64::MAX);
+                let when = self.clock.get_ns().saturating_add(ns);
+                let weak_riscv = self.riscv.get().cloned().unwrap_or_default();
+                let t = timer.get_or_insert_with(|| {
+                    self.clock.new_timer(move || {
+                        if let (Some(s), Some(r)) = (weak_cpu.upgrade(), weak_riscv.upgrade()) {
+                            if vs {
+                                r.vstimer_expired(&s);
+                            } else {
+                                r.stimer_expired(&s);
+                            }
+                        }
+                    })
+                });
+                t.modify(when);
+            }
+            None => {
+                if let Some(t) = timer {
+                    t.del();
+                }
+            }
         }
     }
 
@@ -117,32 +160,11 @@ impl RiscvBoard for CpuHub {
     }
 
     fn stimer_update(&self, shared: &CpuShared, deadline: Option<Instant>) {
-        let mut slots = lock(&self.slots);
-        let Some(slot) = slots.get_mut(shared.cpu_index) else {
-            return;
-        };
-        match deadline {
-            Some(d) => {
-                let wait = d.saturating_duration_since(Instant::now());
-                let ns = i64::try_from(wait.as_nanos()).unwrap_or(i64::MAX);
-                let when = self.clock.get_ns().saturating_add(ns);
-                let weak_cpu = slot.shared.clone();
-                let weak_riscv = self.riscv.get().cloned().unwrap_or_default();
-                let t = slot.stimer.get_or_insert_with(|| {
-                    self.clock.new_timer(move || {
-                        if let (Some(s), Some(r)) = (weak_cpu.upgrade(), weak_riscv.upgrade()) {
-                            r.stimer_expired(&s);
-                        }
-                    })
-                });
-                t.modify(when);
-            }
-            None => {
-                if let Some(t) = &slot.stimer {
-                    t.del();
-                }
-            }
-        }
+        self.timer_update(shared, deadline, false);
+    }
+
+    fn vstimer_update(&self, shared: &CpuShared, deadline: Option<Instant>) {
+        self.timer_update(shared, deadline, true);
     }
 }
 

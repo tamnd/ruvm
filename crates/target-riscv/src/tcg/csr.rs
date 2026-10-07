@@ -2,7 +2,7 @@
 
 //! The control and status registers, a port of QEMU's `target/riscv/csr.c` (with the
 //! trigger CSRs of `debug.c` and the counters of `pmu.c`) for the CSRs of QEMU's default
-//! `rv64` CPU without the H and V extensions.
+//! `rv64` CPU.
 //!
 //! The CSRs are `fflags`, `frm` and `fcsr`; `cycle`, `time`, `instret` and
 //! `hpmcounter3` to `hpmcounter31`; the machine information registers; `mstatus`,
@@ -11,14 +11,28 @@
 //! `mtval`, `mip`, `mcycle`, `minstret` and `mhpmcounter3` to `mhpmcounter31`; `sstatus`,
 //! `sie`, `stvec`, `scounteren`, `senvcfg`, `sscratch`, `sepc`, `scause`, `stval`, `sip`,
 //! `stimecmp` and `satp`; the even `pmpcfg` registers up to `pmpcfg14` and `pmpaddr0` to
-//! `pmpaddr63`; and `tselect`, `tdata1` to `tdata3`, `tinfo` and `mcontext`. Every
-//! other CSR raises an illegal instruction exception, as the extensions behind them
-//! (H, V, AIA, Smstateen, Sscofpmf, Zkr, Smepmp, Smrnmi, Smctr, control flow integrity,
-//! pointer masking) are not in the model.
+//! `pmpaddr63`; `tselect`, `tdata1` to `tdata3`, `tinfo` and `mcontext`; the vector CSRs
+//! with Zve32x; and with H, `hstatus`, `hedeleg`, `hideleg`, `hie`, `htimedelta`,
+//! `hcounteren`, `hgeie`, `henvcfg`, `htval`, `hip`, `hvip`, `htinst`, `hgatp`, `hgeip`,
+//! `vsstatus`, `vsie`, `vstvec`, `vsscratch`, `vsepc`, `vscause`, `vstval`, `vsip`,
+//! `vstimecmp`, `vsatp`, `mtval2` and `mtinst`. Every other CSR raises an illegal
+//! instruction exception, as the extensions behind them (AIA, Smstateen, Sscofpmf, Zkr,
+//! Smepmp, Smrnmi, Smctr, control flow integrity, pointer masking) are not in the model.
+//!
+//! In VS and VU mode the S mode CSRs reach the VS registers, which the trap and return
+//! paths swap into the S mode slots (`riscv_cpu_swap_hypervisor_regs()`), while `sie`,
+//! `sip` and `stimecmp` redirect to `vsie`, `vsip` and `vstimecmp` like QEMU's. GEILEN is
+//! 0, so `hgeie` and `hgeip` read as zero, and without AIA `hvien` is zero, so `hvip`
+//! only holds the VS level bits of `mip`.
 //!
 //! Differences from QEMU:
 //!
-//! - `mstatus.UXL` cannot be written (QEMU lets M and S mode switch U mode to RV32).
+//! - `mstatus.UXL` and `vsstatus.UXL` cannot be written (QEMU lets them switch U and VU
+//!   mode to RV32), and `hstatus.VSXL` reads as 2 like QEMU's.
+//! - QEMU logs the `LOG_UNIMP` messages "QEMU does not support mixed HSXLEN options.",
+//!   "QEMU does not support big endian guests." and "CSR_VSTVEC: reserved mode not
+//!   supported" for such `hstatus` and `vstvec` writes; this crate has no logging and
+//!   stays silent, with the same effect on the registers.
 //! - `hpmcounter3` to `hpmcounter18` and their machine mode aliases hold the value
 //!   written but never count, whatever event `mhpmevent` selects.
 //! - A `csrw` (rd = x0) reads the old value before the write, where QEMU skips the read.
@@ -31,24 +45,36 @@
 
 use ruvm_jit::{Cpu, CpuShared, cputlb};
 
-use super::{CpuLines, Riscv, pmp};
+use super::{CpuLines, Riscv, SstcTimer, pmp};
 use crate::cpu::{
     COUNTEREN_CY, COUNTEREN_IR, COUNTEREN_TM, CpuRiscvState, EXCP_BREAKPOINT, EXCP_ILLEGAL_INST,
-    EXCP_INST_ACCESS_FAULT, EXCP_INST_ADDR_MIS, EXCP_INST_PAGE_FAULT, EXCP_LOAD_ACCESS_FAULT,
-    EXCP_LOAD_ADDR_MIS, EXCP_LOAD_PAGE_FAULT, EXCP_S_ECALL, EXCP_STORE_AMO_ACCESS_FAULT,
-    EXCP_STORE_AMO_ADDR_MIS, EXCP_STORE_PAGE_FAULT, EXCP_U_ECALL, FFLAGS_MASK, M_MODE_INTERRUPTS,
-    MENVCFG_ADUE, MENVCFG_CBCFE, MENVCFG_CBIE, MENVCFG_CBZE, MENVCFG_FIOM, MENVCFG_STCE,
-    MIP_LCOFIP, MIP_SEIP, MIP_SGEIP, MIP_SSIP, MIP_STIP, MIP_VS_BITS, MSTATUS_FS, MSTATUS_MIE,
-    MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV, MSTATUS_MXR, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP,
-    MSTATUS_SUM, MSTATUS_TSR, MSTATUS_TVM, MSTATUS_TW, MSTATUS64_UXL, NUM_TRIGGERS, PMU_AVAIL_CTRS,
-    PRV_M, PRV_S, PRV_U, S_MODE_INTERRUPTS, SATP64_ASID, SATP64_MODE, SATP64_PPN, SSTATUS_MASK,
-    VM_MBARE, VM_SV39, VM_SV48, VM_SV57, add_status_sd, get_field, set_field,
+    EXCP_INST_ACCESS_FAULT, EXCP_INST_ADDR_MIS, EXCP_INST_GUEST_PAGE_FAULT, EXCP_INST_PAGE_FAULT,
+    EXCP_LOAD_ACCESS_FAULT, EXCP_LOAD_ADDR_MIS, EXCP_LOAD_GUEST_ACCESS_FAULT, EXCP_LOAD_PAGE_FAULT,
+    EXCP_M_ECALL, EXCP_S_ECALL, EXCP_STORE_AMO_ACCESS_FAULT, EXCP_STORE_AMO_ADDR_MIS,
+    EXCP_STORE_GUEST_AMO_ACCESS_FAULT, EXCP_STORE_PAGE_FAULT, EXCP_U_ECALL,
+    EXCP_VIRT_INSTRUCTION_FAULT, EXCP_VS_ECALL, FFLAGS_MASK, HS_MODE_INTERRUPTS, HSTATUS_HUKTE,
+    HSTATUS_HUPMM, HSTATUS_VSBE, HSTATUS_VSXL, HSTATUS_VTVM, M_MODE_INTERRUPTS, MENVCFG_ADUE,
+    MENVCFG_CBCFE, MENVCFG_CBIE, MENVCFG_CBZE, MENVCFG_DTE, MENVCFG_FIOM, MENVCFG_PBMTE,
+    MENVCFG_STCE, MIP_LCOFIP, MIP_SEIP, MIP_SGEIP, MIP_SSIP, MIP_STIP, MIP_VSEIP, MIP_VSSIP,
+    MIP_VSTIP, MSTATUS_FS, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV, MSTATUS_MXR,
+    MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_SUM, MSTATUS_TSR, MSTATUS_TVM, MSTATUS_TW,
+    MSTATUS64_UXL, NUM_TRIGGERS, PMU_AVAIL_CTRS, PRV_M, PRV_S, PRV_U, S_MODE_INTERRUPTS,
+    SATP64_ASID, SATP64_MODE, SATP64_PPN, SSTATUS_MASK, VM_MBARE, VM_SV39, VM_SV48, VM_SV57,
+    VS_MODE_INTERRUPTS, VSSTATUS64_UXL, add_status_sd, get_field, set_field,
 };
+use crate::cpu::{MSTATUS_VS, RiscvCfg};
 
 // The CSR numbers, from `cpu_bits.h`.
 const CSR_FFLAGS: u32 = 0x001;
 const CSR_FRM: u32 = 0x002;
 const CSR_FCSR: u32 = 0x003;
+const CSR_VSTART: u32 = 0x008;
+const CSR_VXSAT: u32 = 0x009;
+const CSR_VXRM: u32 = 0x00a;
+const CSR_VCSR: u32 = 0x00f;
+const CSR_VL: u32 = 0xc20;
+const CSR_VTYPE: u32 = 0xc21;
+const CSR_VLENB: u32 = 0xc22;
 const CSR_CYCLE: u32 = 0xc00;
 const CSR_TIME: u32 = 0xc01;
 const CSR_INSTRET: u32 = 0xc02;
@@ -65,6 +91,30 @@ const CSR_STVAL: u32 = 0x143;
 const CSR_SIP: u32 = 0x144;
 const CSR_STIMECMP: u32 = 0x14d;
 const CSR_SATP: u32 = 0x180;
+const CSR_VSSTATUS: u32 = 0x200;
+const CSR_VSIE: u32 = 0x204;
+const CSR_VSTVEC: u32 = 0x205;
+const CSR_VSSCRATCH: u32 = 0x240;
+const CSR_VSEPC: u32 = 0x241;
+const CSR_VSCAUSE: u32 = 0x242;
+const CSR_VSTVAL: u32 = 0x243;
+const CSR_VSIP: u32 = 0x244;
+const CSR_VSTIMECMP: u32 = 0x24d;
+const CSR_VSATP: u32 = 0x280;
+const CSR_HSTATUS: u32 = 0x600;
+const CSR_HEDELEG: u32 = 0x602;
+const CSR_HIDELEG: u32 = 0x603;
+const CSR_HIE: u32 = 0x604;
+const CSR_HTIMEDELTA: u32 = 0x605;
+const CSR_HCOUNTEREN: u32 = 0x606;
+const CSR_HGEIE: u32 = 0x607;
+const CSR_HENVCFG: u32 = 0x60a;
+const CSR_HTVAL: u32 = 0x643;
+const CSR_HIP: u32 = 0x644;
+const CSR_HVIP: u32 = 0x645;
+const CSR_HTINST: u32 = 0x64a;
+const CSR_HGATP: u32 = 0x680;
+const CSR_HGEIP: u32 = 0xe12;
 const CSR_MSTATUS: u32 = 0x300;
 const CSR_MISA: u32 = 0x301;
 const CSR_MEDELEG: u32 = 0x302;
@@ -81,6 +131,8 @@ const CSR_MEPC: u32 = 0x341;
 const CSR_MCAUSE: u32 = 0x342;
 const CSR_MTVAL: u32 = 0x343;
 const CSR_MIP: u32 = 0x344;
+const CSR_MTINST: u32 = 0x34a;
+const CSR_MTVAL2: u32 = 0x34b;
 const CSR_PMPCFG0: u32 = 0x3a0;
 const CSR_PMPCFG15: u32 = 0x3af;
 const CSR_PMPADDR0: u32 = 0x3b0;
@@ -106,29 +158,25 @@ const MARCHID: u64 = 42;
 
 /// `LOCAL_INTERRUPTS`: interrupts 16 and up.
 const LOCAL_INTERRUPTS: u64 = !0xffff;
-/// `HS_MODE_INTERRUPTS`.
-const HS_MODE_INTERRUPTS: u64 = MIP_SGEIP | MIP_VS_BITS;
 /// `delegable_ints`.
-const DELEGABLE_INTS: u64 = S_MODE_INTERRUPTS | MIP_VS_BITS | MIP_LCOFIP;
+const DELEGABLE_INTS: u64 = S_MODE_INTERRUPTS | VS_MODE_INTERRUPTS | MIP_LCOFIP;
+/// `vs_delegable_ints`.
+const VS_DELEGABLE_INTS: u64 = (VS_MODE_INTERRUPTS | LOCAL_INTERRUPTS) & !MIP_LCOFIP;
 /// `all_ints`.
 const ALL_INTS: u64 = M_MODE_INTERRUPTS | S_MODE_INTERRUPTS | HS_MODE_INTERRUPTS | LOCAL_INTERRUPTS;
 /// `mvip_writable_mask`.
 const MVIP_WRITABLE_MASK: u64 = MIP_SSIP | MIP_STIP | MIP_SEIP | LOCAL_INTERRUPTS;
 /// `sip_writable_mask`.
 const SIP_WRITABLE_MASK: u64 = MIP_SSIP | LOCAL_INTERRUPTS;
+/// `hip_writable_mask`.
+const HIP_WRITABLE_MASK: u64 = MIP_VSSIP;
+/// `hvip_writable_mask`.
+const HVIP_WRITABLE_MASK: u64 = MIP_VSSIP | MIP_VSTIP | MIP_VSEIP | LOCAL_INTERRUPTS;
+/// `vsip_writable_mask`.
+const VSIP_WRITABLE_MASK: u64 = MIP_VSSIP | LOCAL_INTERRUPTS;
 
-/// `RISCV_EXCP_VS_ECALL`.
-const EXCP_VS_ECALL: i32 = 10;
 /// `RISCV_EXCP_SW_CHECK`.
 const EXCP_SW_CHECK: i32 = 18;
-/// `RISCV_EXCP_INST_GUEST_PAGE_FAULT`.
-const EXCP_INST_GUEST_PAGE_FAULT: i32 = 20;
-/// `RISCV_EXCP_LOAD_GUEST_ACCESS_FAULT`.
-const EXCP_LOAD_GUEST_ACCESS_FAULT: i32 = 21;
-/// `RISCV_EXCP_VIRT_INSTRUCTION_FAULT`.
-const EXCP_VIRT_INSTRUCTION_FAULT: i32 = 22;
-/// `RISCV_EXCP_STORE_GUEST_AMO_ACCESS_FAULT`.
-const EXCP_STORE_GUEST_AMO_ACCESS_FAULT: i32 = 23;
 
 /// `DELEGABLE_EXCPS`: the `medeleg` bits that can be set. QEMU keeps the hypervisor
 /// causes writable even without H.
@@ -152,8 +200,18 @@ const DELEGABLE_EXCPS: u64 = (1 << EXCP_INST_ADDR_MIS)
     | (1 << EXCP_VIRT_INSTRUCTION_FAULT)
     | (1 << EXCP_STORE_GUEST_AMO_ACCESS_FAULT);
 
-/// The `mstatus` bits a write changes: `write_mstatus()` with F and without V, Smdbltrp,
-/// Ssdbltrp or Zicfilp.
+/// `vs_delegable_excps`: the `hedeleg` bits that can be set.
+const VS_DELEGABLE_EXCPS: u64 = DELEGABLE_EXCPS
+    & !((1 << EXCP_S_ECALL)
+        | (1 << EXCP_VS_ECALL)
+        | (1 << EXCP_M_ECALL)
+        | (1 << EXCP_INST_GUEST_PAGE_FAULT)
+        | (1 << EXCP_LOAD_GUEST_ACCESS_FAULT)
+        | (1 << EXCP_VIRT_INSTRUCTION_FAULT)
+        | (1 << EXCP_STORE_GUEST_AMO_ACCESS_FAULT));
+
+/// The `mstatus` bits a write changes: `write_mstatus()` with F and without Smdbltrp,
+/// Ssdbltrp or Zicfilp. VS is added when Zve32x is on.
 const MSTATUS_WRITE_MASK: u64 = MSTATUS_SIE
     | MSTATUS_SPIE
     | MSTATUS_MIE
@@ -172,13 +230,19 @@ const MSTATUS_WRITE_MASK: u64 = MSTATUS_SIE
 /// Ssdbltrp are not.
 const MENVCFG_WRITE_MASK: u64 =
     MENVCFG_FIOM | MENVCFG_CBIE | MENVCFG_CBCFE | MENVCFG_CBZE | MENVCFG_STCE | MENVCFG_ADUE;
-/// The `senvcfg` bits a write changes.
+/// The `senvcfg` bits a write changes, and the `henvcfg` bits that do not follow
+/// `menvcfg`.
 const SENVCFG_WRITE_MASK: u64 = MENVCFG_FIOM | MENVCFG_CBIE | MENVCFG_CBCFE | MENVCFG_CBZE;
+/// The `henvcfg` bits that read as zero and cannot be set while the same `menvcfg` bit is
+/// clear.
+const HENVCFG_FOLLOWS_M: u64 = MENVCFG_PBMTE | MENVCFG_STCE | MENVCFG_ADUE | MENVCFG_DTE;
+/// `SSTATUS_SDT`.
+const SSTATUS_SDT: u64 = 1 << 24;
 
 /// The counters `mcounteren` and `scounteren` can enable.
 const COUNTEREN_MASK: u64 = PMU_AVAIL_CTRS | COUNTEREN_CY | COUNTEREN_TM | COUNTEREN_IR;
 
-/// `MHPMEVENT_BIT_VSINH` and `MHPMEVENT_BIT_VUINH`, which need H.
+/// `MHPMEVENT_BIT_VSINH` and `MHPMEVENT_BIT_VUINH`, which are writable with H only.
 const MHPMEVENT_VINH: u64 = (1 << 59) | (1 << 58);
 
 /// `MCONTEXT64`.
@@ -220,10 +284,15 @@ trait Hw {
     /// Run `f` on the interrupt lines with their lock held, then update the interrupt
     /// request from `mip`.
     fn with_lines(&self, f: &mut dyn FnMut(&mut CpuLines) -> u64) -> u64;
-    /// `riscv_timer_write_timecmp()` for `stimecmp`.
-    fn write_timecmp(&self, menvcfg: u64, timecmp: u64);
-    /// `riscv_timer_disable_timecmp()` for `stimecmp`.
-    fn disable_timecmp(&self);
+    /// `riscv_timer_write_timecmp()` for `stimecmp` or `vstimecmp`, with the CSRs of `st`.
+    fn write_timecmp(&self, st: &CpuRiscvState, timer: SstcTimer);
+    /// `riscv_timer_stce_changed()`: the STCE bit of `menvcfg` (`is_m`) or `henvcfg`
+    /// flipped to `enable`.
+    fn stce_changed(&self, st: &CpuRiscvState, is_m: bool, enable: bool);
+    /// The extensions of the CPU.
+    fn cfg(&self) -> RiscvCfg {
+        RiscvCfg::default()
+    }
 }
 
 /// The [`Hw`] of a vCPU.
@@ -245,12 +314,16 @@ impl Hw for CpuHw<'_> {
         self.rv.with_lines(self.shared, f)
     }
 
-    fn write_timecmp(&self, menvcfg: u64, timecmp: u64) {
-        self.rv.write_timecmp(self.shared, menvcfg, timecmp);
+    fn write_timecmp(&self, st: &CpuRiscvState, timer: SstcTimer) {
+        self.rv.write_timecmp(self.shared, st, timer);
     }
 
-    fn disable_timecmp(&self) {
-        self.rv.disable_timecmp(self.shared);
+    fn stce_changed(&self, st: &CpuRiscvState, is_m: bool, enable: bool) {
+        self.rv.stce_changed(self.shared, st, is_m, enable);
+    }
+
+    fn cfg(&self) -> RiscvCfg {
+        *self.rv.cfg()
     }
 }
 
@@ -316,6 +389,20 @@ fn legalize_satp(old: u64, val: u64) -> Option<u64> {
     (valid && changed).then_some(val)
 }
 
+/// Move the VS level interrupt bits of a `vsie` or `vsip` value up from their S level
+/// positions to their `mie` or `mip` positions.
+fn vs_bits_up(v: u64) -> u64 {
+    let vsbits = v & (VS_MODE_INTERRUPTS >> 1);
+    (v & !(VS_MODE_INTERRUPTS >> 1)) | (vsbits << 1)
+}
+
+/// Move the VS level interrupt bits of an `mie` or `mip` value down to their S level
+/// positions in `vsie` or `vsip`.
+fn vs_bits_down(v: u64) -> u64 {
+    let vsbits = v & VS_MODE_INTERRUPTS;
+    (v & !VS_MODE_INTERRUPTS) | (vsbits >> 1)
+}
+
 /// `access_size[size] != -1`: the trigger access sizes QEMU supports (any, 1, 2, 4 and
 /// 8 bytes).
 fn trigger_size_ok(size: u64) -> bool {
@@ -377,6 +464,18 @@ impl Csrs<'_> {
             CSR_MIP => return Ok(self.rmw_mip(new, mask)),
             CSR_SIE => return Ok(self.rmw_sie(new, mask)),
             CSR_SIP => return Ok(self.rmw_sip(new, mask)),
+            CSR_HIDELEG => return Ok(self.rmw_hideleg(new, mask)),
+            CSR_HVIP => return Ok(self.rmw_hvip(CSR_HVIP, new, mask)),
+            CSR_HIP => {
+                let old = self.rmw_mip64(CSR_HIP, new, mask & HIP_WRITABLE_MASK);
+                return Ok(old & HS_MODE_INTERRUPTS);
+            }
+            CSR_HIE => {
+                let old = self.rmw_mie(new, mask & HS_MODE_INTERRUPTS);
+                return Ok(old & HS_MODE_INTERRUPTS);
+            }
+            CSR_VSIE => return Ok(self.rmw_vsie(new, mask)),
+            CSR_VSIP => return Ok(self.rmw_vsip(new, mask)),
             _ => {}
         }
         let old = self.read(csrno)?;
@@ -395,22 +494,33 @@ impl Csrs<'_> {
         if write && read_only {
             return Err(EXCP_ILLEGAL_INST);
         }
-        if !self.predicate(csrno) {
-            return Err(EXCP_ILLEGAL_INST);
+        // The predicate may raise a virtual instruction exception, so it comes after the
+        // read only check.
+        self.predicate(csrno)?;
+        let mut effective_priv = self.st.priv_lvl;
+        if self.st.has_h() && self.st.priv_lvl == PRV_S && !self.st.virt() {
+            // HS mode reaches the hypervisor CSRs.
+            effective_priv += 1;
         }
         let csr_priv = u64::from((csrno >> 8) & 3);
-        if self.st.priv_lvl < csr_priv {
+        if effective_priv < csr_priv {
+            if csr_priv <= PRV_S + 1 && self.st.virt() {
+                return Err(EXCP_VIRT_INSTRUCTION_FAULT);
+            }
             return Err(EXCP_ILLEGAL_INST);
         }
         Ok(())
     }
 
     /// The `predicate` of `csr_ops[csrno]`: whether the CSR exists and the current state
-    /// allows the access. CSRs without an entry do not exist.
-    fn predicate(&self, csrno: u32) -> bool {
-        match csrno {
+    /// allows the access, or the exception to raise. CSRs without an entry do not exist.
+    fn predicate(&self, csrno: u32) -> Result<(), i32> {
+        let ok = match csrno {
             CSR_FFLAGS | CSR_FRM | CSR_FCSR => self.fs(),
-            CSR_CYCLE..=CSR_HPMCOUNTER31 => self.ctr(csrno),
+            CSR_VSTART | CSR_VXSAT | CSR_VXRM | CSR_VCSR | CSR_VL | CSR_VTYPE | CSR_VLENB => {
+                self.vs()
+            }
+            CSR_CYCLE..=CSR_HPMCOUNTER31 => return self.ctr(csrno),
             CSR_MCYCLE | CSR_MINSTRET => true,
             CSR_MHPMCOUNTER3..=CSR_MHPMCOUNTER31 => PMU_AVAIL_CTRS & (1 << ctr_index(csrno)) != 0,
             CSR_MVENDORID..=CSR_MCONFIGPTR => true,
@@ -420,44 +530,97 @@ impl Csrs<'_> {
             CSR_MSCRATCH | CSR_MEPC | CSR_MCAUSE | CSR_MTVAL | CSR_MIP => true,
             CSR_SSTATUS | CSR_SIE | CSR_STVEC | CSR_SCOUNTEREN | CSR_SENVCFG | CSR_SSCRATCH
             | CSR_SEPC | CSR_SCAUSE | CSR_STVAL | CSR_SIP => true,
-            CSR_STIMECMP => self.sstc(),
-            // satp(): S mode with mstatus.TVM set may not touch satp.
-            CSR_SATP => !(self.st.priv_lvl == PRV_S && self.st.mstatus & MSTATUS_TVM != 0),
+            CSR_STIMECMP => return self.sstc(false),
+            CSR_VSTIMECMP => return self.sstc(true),
+            // satp(): S mode with mstatus.TVM set may not touch satp, nor VS mode with
+            // hstatus.VTVM.
+            CSR_SATP => {
+                let s = self.st.priv_lvl == PRV_S;
+                if s && !self.st.virt() && self.st.mstatus & MSTATUS_TVM != 0 {
+                    return Err(EXCP_ILLEGAL_INST);
+                }
+                if s && self.st.virt() && self.st.hstatus & HSTATUS_VTVM != 0 {
+                    return Err(EXCP_VIRT_INSTRUCTION_FAULT);
+                }
+                true
+            }
+            // hgatp(): HS mode with mstatus.TVM set may not touch hgatp.
+            CSR_HGATP => {
+                let s = self.st.priv_lvl == PRV_S;
+                if s && !self.st.virt() && self.st.mstatus & MSTATUS_TVM != 0 {
+                    return Err(EXCP_ILLEGAL_INST);
+                }
+                self.st.has_h()
+            }
+            // hmode().
+            CSR_HSTATUS | CSR_HEDELEG | CSR_HIDELEG | CSR_HIE | CSR_HTIMEDELTA | CSR_HCOUNTEREN
+            | CSR_HGEIE | CSR_HENVCFG | CSR_HTVAL | CSR_HIP | CSR_HVIP | CSR_HTINST | CSR_HGEIP
+            | CSR_VSSTATUS | CSR_VSIE | CSR_VSTVEC | CSR_VSSCRATCH | CSR_VSEPC | CSR_VSCAUSE
+            | CSR_VSTVAL | CSR_VSIP | CSR_VSATP | CSR_MTVAL2 | CSR_MTINST => self.st.has_h(),
             // pmp(): the odd pmpcfg registers do not exist on RV64.
             CSR_PMPCFG0..=CSR_PMPCFG15 => (csrno - CSR_PMPCFG0) & 1 == 0,
             CSR_PMPADDR0..=CSR_PMPADDR63 => true,
             CSR_TSELECT | CSR_TDATA1 | CSR_TDATA2 | CSR_TDATA3 | CSR_TINFO | CSR_MCONTEXT => true,
             _ => false,
-        }
+        };
+        if ok { Ok(()) } else { Err(EXCP_ILLEGAL_INST) }
     }
 
-    /// `fs()`: the FP CSRs need `mstatus.FS` on.
+    /// `fs()`: the FP CSRs need `mstatus.FS` on, and in VS or VU mode the HS level FS
+    /// too (`riscv_cpu_fp_enabled()`).
     fn fs(&self) -> bool {
-        self.st.mstatus & MSTATUS_FS != 0
+        let hs = !self.st.virt() || self.st.mstatus_hs & MSTATUS_FS != 0;
+        self.st.mstatus & MSTATUS_FS != 0 && hs
     }
 
-    /// `ctr()`: the unprivileged counters, enabled by `mcounteren` and `scounteren`.
-    fn ctr(&self, csrno: u32) -> bool {
+    /// `vs()`: the vector CSRs need Zve32x and `mstatus.VS` on, and in VS or VU mode the
+    /// HS level VS too (`riscv_cpu_vector_enabled()`).
+    fn vs(&self) -> bool {
+        let hs = !self.st.virt() || self.st.mstatus_hs & MSTATUS_VS != 0;
+        self.hw.cfg().ext_zve32x && self.st.mstatus & MSTATUS_VS != 0 && hs
+    }
+
+    /// `ctr()`: the unprivileged counters, enabled by `mcounteren`, `hcounteren` and
+    /// `scounteren`.
+    fn ctr(&self, csrno: u32) -> Result<(), i32> {
         let bit = 1u64 << ctr_index(csrno);
         // cycle, time and instret come with Zicntr, the others with the PMU.
         if csrno > CSR_INSTRET && PMU_AVAIL_CTRS & bit == 0 {
-            return false;
+            return Err(EXCP_ILLEGAL_INST);
         }
         if self.st.priv_lvl < PRV_M && self.st.mcounteren & bit == 0 {
-            return false;
+            return Err(EXCP_ILLEGAL_INST);
         }
-        !(self.st.priv_lvl == PRV_U && self.st.scounteren & bit == 0)
+        let s_off = self.st.priv_lvl == PRV_U && self.st.scounteren & bit == 0;
+        if self.st.virt() && (self.st.hcounteren & bit == 0 || s_off) {
+            return Err(EXCP_VIRT_INSTRUCTION_FAULT);
+        }
+        if s_off {
+            return Err(EXCP_ILLEGAL_INST);
+        }
+        Ok(())
     }
 
-    /// `sstc()` for `stimecmp`.
-    fn sstc(&self) -> bool {
+    /// `sstc()` for `stimecmp`, or for `vstimecmp` (which needs H) when `vs`.
+    fn sstc(&self, vs: bool) -> Result<(), i32> {
+        if vs && !self.st.has_h() {
+            return Err(EXCP_ILLEGAL_INST);
+        }
         if self.hw.rdtime().is_none() {
-            return false;
+            return Err(EXCP_ILLEGAL_INST);
         }
         if self.st.priv_lvl == PRV_M {
-            return true;
+            return Ok(());
         }
-        self.st.mcounteren & COUNTEREN_TM != 0 && self.st.menvcfg & MENVCFG_STCE != 0
+        if self.st.mcounteren & COUNTEREN_TM == 0 || self.st.menvcfg & MENVCFG_STCE == 0 {
+            return Err(EXCP_ILLEGAL_INST);
+        }
+        if self.st.virt()
+            && (self.st.hcounteren & COUNTEREN_TM == 0 || self.st.henvcfg & MENVCFG_STCE == 0)
+        {
+            return Err(EXCP_VIRT_INSTRUCTION_FAULT);
+        }
+        Ok(())
     }
 
     /// The `read` operation of `csr_ops[csrno]`.
@@ -467,7 +630,17 @@ impl Csrs<'_> {
             CSR_FFLAGS => st.fflags & FFLAGS_MASK,
             CSR_FRM => st.frm,
             CSR_FCSR => (st.fflags & FFLAGS_MASK) | (st.frm << 5),
-            CSR_TIME => self.hw.rdtime().ok_or(EXCP_ILLEGAL_INST)?,
+            CSR_VSTART => st.vstart,
+            CSR_VXSAT => st.vxsat & 1,
+            CSR_VXRM => st.vxrm,
+            CSR_VCSR => (st.vxrm << 1) | st.vxsat,
+            CSR_VL => st.vl,
+            CSR_VTYPE => (st.vill << 63) | st.vtype,
+            CSR_VLENB => u64::from(self.hw.cfg().vlenb),
+            CSR_TIME => {
+                let delta = if st.virt() { st.htimedelta } else { 0 };
+                self.hw.rdtime().ok_or(EXCP_ILLEGAL_INST)?.wrapping_add(delta)
+            }
             CSR_CYCLE..=CSR_HPMCOUNTER31 | CSR_MCYCLE..=CSR_MHPMCOUNTER31 => {
                 self.read_ctr(ctr_index(csrno))
             }
@@ -494,8 +667,34 @@ impl Csrs<'_> {
             CSR_SEPC => st.sepc & !1,
             CSR_SCAUSE => st.scause,
             CSR_STVAL => st.stval,
+            CSR_STIMECMP if st.virt() => st.vstimecmp,
             CSR_STIMECMP => st.stimecmp,
             CSR_SATP => st.satp,
+            CSR_MTVAL2 => st.mtval2,
+            CSR_MTINST => st.mtinst,
+            // hstatus: only a 64 bit, little endian VS mode.
+            CSR_HSTATUS => set_field(set_field(st.hstatus, HSTATUS_VSXL, 2), HSTATUS_VSBE, 0),
+            CSR_HEDELEG => st.hedeleg,
+            CSR_HTIMEDELTA => {
+                self.hw.rdtime().ok_or(EXCP_ILLEGAL_INST)?;
+                st.htimedelta
+            }
+            CSR_HCOUNTEREN => st.hcounteren,
+            CSR_HGEIE => st.hgeie,
+            CSR_HENVCFG => st.henvcfg & (!HENVCFG_FOLLOWS_M | st.menvcfg),
+            CSR_HTVAL => st.htval,
+            CSR_HTINST => st.htinst,
+            CSR_HGATP => st.hgatp,
+            // GEILEN is 0: no guest external interrupt is ever pending.
+            CSR_HGEIP => 0,
+            CSR_VSSTATUS => st.vsstatus,
+            CSR_VSTVEC => st.vstvec,
+            CSR_VSSCRATCH => st.vsscratch,
+            CSR_VSEPC => st.vsepc,
+            CSR_VSCAUSE => st.vscause,
+            CSR_VSTVAL => st.vstval,
+            CSR_VSTIMECMP => st.vstimecmp,
+            CSR_VSATP => st.vsatp,
             CSR_PMPCFG0..=CSR_PMPCFG15 => pmp::pmpcfg_csr_read(st, (csrno - CSR_PMPCFG0) as usize),
             CSR_PMPADDR0..=CSR_PMPADDR63 => {
                 pmp::pmpaddr_csr_read(st, (csrno - CSR_PMPADDR0) as usize) & PMPADDR_MASK
@@ -527,6 +726,25 @@ impl Csrs<'_> {
                 self.st.frm = (val >> 5) & 7;
                 self.st.fflags = val & FFLAGS_MASK;
             }
+            CSR_VSTART => {
+                self.st.mstatus |= MSTATUS_VS;
+                // Only enough bits to hold the largest element index, lg2(VLEN).
+                let bits = (u64::from(self.hw.cfg().vlenb) << 3).trailing_zeros();
+                self.st.vstart = val & !(!0u64 << bits);
+            }
+            CSR_VXSAT => {
+                self.st.mstatus |= MSTATUS_VS;
+                self.st.vxsat = val & 1;
+            }
+            CSR_VXRM => {
+                self.st.mstatus |= MSTATUS_VS;
+                self.st.vxrm = val & 3;
+            }
+            CSR_VCSR => {
+                self.st.mstatus |= MSTATUS_VS;
+                self.st.vxrm = (val >> 1) & 3;
+                self.st.vxsat = val & 1;
+            }
             CSR_MCYCLE..=CSR_MHPMCOUNTER31 => self.write_ctr(ctr_index(csrno), val),
             CSR_MSTATUS => self.write_mstatus(val),
             // misa is not writable.
@@ -544,7 +762,8 @@ impl Csrs<'_> {
             CSR_MENVCFG => self.write_menvcfg(val),
             CSR_MCOUNTINHIBIT => self.write_mcountinhibit(val),
             CSR_MHPMEVENT3..=CSR_MHPMEVENT31 => {
-                self.st.mhpmevent[ctr_index(csrno)] = val & !MHPMEVENT_VINH;
+                let mask = if self.st.has_h() { !0 } else { !MHPMEVENT_VINH };
+                self.st.mhpmevent[ctr_index(csrno)] = val & mask;
             }
             CSR_MSCRATCH => self.st.mscratch = val,
             CSR_MEPC => self.st.mepc = val & !1,
@@ -568,16 +787,63 @@ impl Csrs<'_> {
             CSR_SEPC => self.st.sepc = val & !1,
             CSR_SCAUSE => self.st.scause = val,
             CSR_STVAL => self.st.stval = val,
+            CSR_STIMECMP | CSR_VSTIMECMP if csrno == CSR_VSTIMECMP || self.st.virt() => {
+                self.st.vstimecmp = val;
+                self.hw.write_timecmp(&self.st, SstcTimer::Vs);
+            }
             CSR_STIMECMP => {
                 self.st.stimecmp = val;
-                self.hw.write_timecmp(self.st.menvcfg, val);
+                self.hw.write_timecmp(&self.st, SstcTimer::S);
             }
-            CSR_SATP => {
-                if let Some(v) = legalize_satp(self.st.satp, val) {
-                    self.flush = true;
-                    self.st.satp = v;
+            CSR_SATP => self.st.satp = self.legalize_xatp(self.st.satp, val),
+            CSR_MTVAL2 => self.st.mtval2 = val,
+            CSR_MTINST => self.st.mtinst = val,
+            CSR_HSTATUS => {
+                // Neither Svukte nor Ssnpm is there.
+                let mask = !(HSTATUS_HUKTE | HSTATUS_HUPMM);
+                self.st.hstatus = (self.st.hstatus & !mask) | (val & mask);
+                // QEMU logs "QEMU does not support mixed HSXLEN options." for a VSXL other
+                // than 2 and "QEMU does not support big endian guests." for VSBE set.
+            }
+            CSR_HEDELEG => self.st.hedeleg = val & VS_DELEGABLE_EXCPS,
+            CSR_HTIMEDELTA => {
+                self.hw.rdtime().ok_or(EXCP_ILLEGAL_INST)?;
+                self.st.htimedelta = val;
+                self.hw.write_timecmp(&self.st, SstcTimer::Vs);
+            }
+            CSR_HCOUNTEREN => self.st.hcounteren = val & COUNTEREN_MASK,
+            CSR_HGEIE => {
+                // Only bits 1 to GEILEN exist, and GEILEN is 0; mip.SGEIP follows
+                // hgeie & hgeip, which is 0.
+                self.st.hgeie = 0;
+                self.hw.with_lines(&mut |l| {
+                    l.mip &= !MIP_SGEIP;
+                    0
+                });
+            }
+            CSR_HENVCFG => self.write_henvcfg(val),
+            CSR_HTVAL => self.st.htval = val,
+            // htinst writes are ignored.
+            CSR_HTINST => {}
+            CSR_HGATP => self.st.hgatp = self.legalize_xatp(self.st.hgatp, val),
+            CSR_VSSTATUS => {
+                // UXL stays 64 bit; SDT needs Ssdbltrp (henvcfg.DTE).
+                let val = set_field(val, VSSTATUS64_UXL, 2);
+                self.st.vsstatus =
+                    if self.st.henvcfg & MENVCFG_DTE != 0 { val } else { val & !SSTATUS_SDT };
+            }
+            CSR_VSTVEC => {
+                // Modes 2 and 3 are reserved; QEMU logs "CSR_VSTVEC: reserved mode not
+                // supported" and drops the write.
+                if val & 3 < 2 {
+                    self.st.vstvec = val;
                 }
             }
+            CSR_VSSCRATCH => self.st.vsscratch = val,
+            CSR_VSEPC => self.st.vsepc = val,
+            CSR_VSCAUSE => self.st.vscause = val,
+            CSR_VSTVAL => self.st.vstval = val,
+            CSR_VSATP => self.st.vsatp = self.legalize_xatp(self.st.vsatp, val),
             CSR_PMPCFG0..=CSR_PMPCFG15 => {
                 let i = (csrno - CSR_PMPCFG0) as usize;
                 self.flush |= pmp::pmpcfg_csr_write(&mut self.st, i, val);
@@ -610,20 +876,48 @@ impl Csrs<'_> {
         if (val ^ mstatus) & MSTATUS_MXR != 0 {
             self.flush = true;
         }
-        self.st.mstatus = (mstatus & !MSTATUS_WRITE_MASK) | (val & MSTATUS_WRITE_MASK);
+        let mut mask = MSTATUS_WRITE_MASK;
+        if self.hw.cfg().ext_zve32x {
+            mask |= MSTATUS_VS;
+        }
+        self.st.mstatus = (mstatus & !mask) | (val & mask);
     }
 
-    /// `write_menvcfg()`, with `riscv_timer_stce_changed()` when STCE flips.
+    /// `legalize_xatp()` for `satp`, `vsatp` and `hgatp`: the new value, flushing the
+    /// TLB, or the old one if the mode is not supported or nothing changed.
+    fn legalize_xatp(&mut self, old: u64, val: u64) -> u64 {
+        match legalize_satp(old, val) {
+            Some(v) => {
+                self.flush = true;
+                v
+            }
+            None => old,
+        }
+    }
+
+    /// `write_menvcfg()`, with `riscv_timer_stce_changed()` when STCE flips, then
+    /// `write_henvcfg()` to drop the `henvcfg` bits that follow `menvcfg`.
     fn write_menvcfg(&mut self, val: u64) {
         let m = MENVCFG_WRITE_MASK;
         let stce_changed = (self.st.menvcfg ^ val) & MENVCFG_STCE != 0;
         self.st.menvcfg = (self.st.menvcfg & !m) | (val & m);
         if stce_changed {
-            if val & MENVCFG_STCE != 0 {
-                self.hw.write_timecmp(self.st.menvcfg, self.st.stimecmp);
-            } else {
-                self.hw.disable_timecmp();
-            }
+            self.hw.stce_changed(&self.st, true, val & MENVCFG_STCE != 0);
+        }
+        self.write_henvcfg(self.st.henvcfg);
+    }
+
+    /// `write_henvcfg()`: PBMTE, STCE, ADUE and DTE can only be set when `menvcfg` has
+    /// them.
+    fn write_henvcfg(&mut self, val: u64) {
+        let mask = SENVCFG_WRITE_MASK | (self.st.menvcfg & HENVCFG_FOLLOWS_M);
+        let stce_changed = (self.st.henvcfg ^ val) & MENVCFG_STCE != 0;
+        self.st.henvcfg = val & mask;
+        if self.st.henvcfg & MENVCFG_DTE == 0 {
+            self.st.vsstatus &= !SSTATUS_SDT;
+        }
+        if stce_changed {
+            self.hw.stce_changed(&self.st, false, val & MENVCFG_STCE != 0);
         }
     }
 
@@ -674,11 +968,15 @@ impl Csrs<'_> {
         }
     }
 
-    /// `rmw_mideleg64()`.
+    /// `rmw_mideleg64()`: with H the VS level and guest external interrupts are always
+    /// delegated.
     fn rmw_mideleg(&mut self, new: u64, wr_mask: u64) -> u64 {
         let m = wr_mask & DELEGABLE_INTS;
         let old = self.st.mideleg;
         self.st.mideleg = (old & !m) | (new & m);
+        if self.st.has_h() {
+            self.st.mideleg |= HS_MODE_INTERRUPTS;
+        }
         old
     }
 
@@ -686,14 +984,36 @@ impl Csrs<'_> {
     fn rmw_mie(&mut self, new: u64, wr_mask: u64) -> u64 {
         let m = wr_mask & ALL_INTS;
         let old = self.st.mie;
-        self.st.mie = ((old & !m) | (new & m)) & !HS_MODE_INTERRUPTS;
+        self.st.mie = (old & !m) | (new & m);
+        if !self.st.has_h() {
+            self.st.mie &= !HS_MODE_INTERRUPTS;
+        }
         old
     }
 
-    /// `rmw_sie64()`: `sie` shows the delegated bits of `mie`.
+    /// `rmw_sie64()`: `sie` shows the delegated bits of `mie`, or of `vsie` in VS mode.
     fn rmw_sie(&mut self, new: u64, wr_mask: u64) -> u64 {
         let alias = (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS) & self.st.mideleg;
+        if self.st.virt() {
+            return self.rmw_vsie(new, wr_mask) & alias;
+        }
         self.rmw_mie(new, wr_mask & alias) & alias
+    }
+
+    /// `rmw_vsie64()`: the bits of `mie` delegated to VS mode, with the VS level bits at
+    /// their S level positions.
+    fn rmw_vsie(&mut self, new: u64, wr_mask: u64) -> u64 {
+        let alias = (LOCAL_INTERRUPTS | VS_MODE_INTERRUPTS) & self.st.hideleg;
+        let old = self.rmw_mie(vs_bits_up(new), vs_bits_up(wr_mask) & alias);
+        vs_bits_down(old & alias)
+    }
+
+    /// `rmw_hideleg64()`.
+    fn rmw_hideleg(&mut self, new: u64, wr_mask: u64) -> u64 {
+        let m = wr_mask & VS_DELEGABLE_INTS;
+        let old = self.st.hideleg & VS_DELEGABLE_INTS;
+        self.st.hideleg = (self.st.hideleg & !m) | (new & m);
+        old
     }
 
     /// Whether STIP is driven by `stimecmp` alone for this access: Sstc with
@@ -702,12 +1022,22 @@ impl Csrs<'_> {
         self.st.priv_lvl == PRV_M && self.st.menvcfg & MENVCFG_STCE != 0
     }
 
-    /// `rmw_mip64()`: the SEIP bit software writes is kept apart from the interrupt
-    /// controller's input, and STIP belongs to Sstc when it is on.
+    /// `rmw_mip()`.
     fn rmw_mip(&mut self, new: u64, wr_mask: u64) -> u64 {
+        self.rmw_mip64(CSR_MIP, new, wr_mask)
+    }
+
+    /// `rmw_mip64()` for `csrno`: the SEIP bit software writes is kept apart from the
+    /// interrupt controller's input, STIP (and VSTIP with `henvcfg.STCE`) belong to Sstc
+    /// when it is on, and the old value shows VSTIP while the VS timer has fired, except
+    /// for `hvip`.
+    fn rmw_mip64(&mut self, csrno: u32, new: u64, wr_mask: u64) -> u64 {
         let mut m = wr_mask & DELEGABLE_INTS;
         if self.stip_from_sstc() {
             m &= !MIP_STIP;
+            if self.st.henvcfg & MENVCFG_STCE != 0 {
+                m &= !MIP_VSTIP;
+            }
         }
         self.hw.with_lines(&mut |l| {
             let mut new = new;
@@ -717,17 +1047,44 @@ impl Csrs<'_> {
                     new |= MIP_SEIP;
                 }
             }
-            let old = l.mip;
+            let mut old = l.mip;
+            // riscv_cpu_update_mip(): VSTIP is left alone while the VS timer drives it.
+            let m = if m == MIP_VSTIP && l.vstime_irq { 0 } else { m };
             if m != 0 {
                 l.mip = (old & !m) | (new & m);
+            }
+            if csrno != CSR_HVIP && l.vstime_irq {
+                old |= MIP_VSTIP;
             }
             old
         })
     }
 
+    /// `rmw_hvip64()` for `hvip`, or for `vsip` as `csrno`. Without AIA `hvien` is zero,
+    /// so every bit aliases `mip`; for `vsip` only the bits delegated by `hideleg`. Like
+    /// QEMU, reading `hvip` gives all of `mip`.
+    fn rmw_hvip(&mut self, csrno: u32, new: u64, wr_mask: u64) -> u64 {
+        let alias = if csrno == CSR_VSIP { self.st.hideleg } else { !0 };
+        let old = self.rmw_mip64(csrno, new, wr_mask & alias & HVIP_WRITABLE_MASK);
+        old & alias
+    }
+
+    /// `rmw_vsip64()`: the bits of `mip` delegated to VS mode, with the VS level bits at
+    /// their S level positions; VSSIP is writable.
+    fn rmw_vsip(&mut self, new: u64, wr_mask: u64) -> u64 {
+        let mask = self.st.hideleg & VS_MODE_INTERRUPTS;
+        let wr_mask = vs_bits_up(wr_mask) & mask & VSIP_WRITABLE_MASK;
+        let old = self.rmw_hvip(CSR_VSIP, vs_bits_up(new), wr_mask);
+        vs_bits_down(old & mask)
+    }
+
     /// `rmw_sip64()` and `rmw_mvip64()` for `sip`: the delegated bits of `mip`, of which
-    /// SSIP and the local interrupts are writable.
+    /// SSIP and the local interrupts are writable; in VS mode `vsip`.
     fn rmw_sip(&mut self, new: u64, wr_mask: u64) -> u64 {
+        if self.st.virt() {
+            let old = self.rmw_vsip(new, wr_mask);
+            return old & self.st.mideleg & (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS);
+        }
         let wr_mask = wr_mask & self.st.mideleg & SIP_WRITABLE_MASK;
         let mut alias = (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS | MIP_STIP) & self.st.mideleg;
         if self.stip_from_sstc() {
@@ -790,8 +1147,11 @@ mod tests {
         lines: RefCell<CpuLines>,
         time: Option<u64>,
         ticks: Cell<u64>,
-        timecmp: RefCell<Vec<(u64, u64)>>,
-        disabled: Cell<u32>,
+        /// The timer and its compare value at each `write_timecmp()`.
+        timecmp: RefCell<Vec<(SstcTimer, u64)>>,
+        /// The `is_m` and `enable` of each `stce_changed()`.
+        stce: RefCell<Vec<(bool, bool)>>,
+        cfg: RiscvCfg,
     }
 
     impl Hw for FakeHw {
@@ -807,12 +1167,17 @@ mod tests {
             f(&mut self.lines.borrow_mut())
         }
 
-        fn write_timecmp(&self, menvcfg: u64, timecmp: u64) {
-            self.timecmp.borrow_mut().push((menvcfg, timecmp));
+        fn write_timecmp(&self, st: &CpuRiscvState, timer: SstcTimer) {
+            let v = if timer == SstcTimer::S { st.stimecmp } else { st.vstimecmp };
+            self.timecmp.borrow_mut().push((timer, v));
         }
 
-        fn disable_timecmp(&self) {
-            self.disabled.set(self.disabled.get() + 1);
+        fn stce_changed(&self, _st: &CpuRiscvState, is_m: bool, enable: bool) {
+            self.stce.borrow_mut().push((is_m, enable));
+        }
+
+        fn cfg(&self) -> RiscvCfg {
+            self.cfg
         }
     }
 
@@ -888,11 +1253,26 @@ mod tests {
         w(&mut c, CSR_MEDELEG, u64::MAX).unwrap();
         assert_eq!(c.st.medeleg, DELEGABLE_EXCPS);
         assert_eq!(c.st.medeleg & (1 << 11), 0, "M mode ecall cannot be delegated");
+        // With H the VS level and guest external interrupts are always delegated.
+        assert_eq!(c.st.mideleg, HS_MODE_INTERRUPTS);
+        w(&mut c, CSR_MIDELEG, 0).unwrap();
+        assert_eq!(c.st.mideleg, HS_MODE_INTERRUPTS);
         w(&mut c, CSR_MIDELEG, u64::MAX).unwrap();
         assert_eq!(
             c.st.mideleg,
-            (1 << 1) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 9) | (1 << 10) | (1 << 13)
+            (1 << 1)
+                | (1 << 2)
+                | (1 << 5)
+                | (1 << 6)
+                | (1 << 9)
+                | (1 << 10)
+                | (1 << 12)
+                | (1 << 13)
         );
+        w(&mut c, CSR_MIE, u64::MAX).unwrap();
+        assert_eq!(c.st.mie, ALL_INTS);
+        // Without H the hypervisor interrupt enables stay clear.
+        c.st.misa &= !crate::cpu::RVH;
         w(&mut c, CSR_MIE, u64::MAX).unwrap();
         assert_eq!(c.st.mie, M_MODE_INTERRUPTS | S_MODE_INTERRUPTS | LOCAL_INTERRUPTS);
         // sie shows and writes only the delegated S mode and local bits.
@@ -933,13 +1313,23 @@ mod tests {
         let hw = FakeHw { time: Some(0), ..FakeHw::default() };
         let mut c = csrs(&hw);
         w(&mut c, CSR_MENVCFG, MENVCFG_STCE).unwrap();
-        assert_eq!(hw.timecmp.borrow().as_slice(), &[(MENVCFG_STCE, 0)]);
+        assert_eq!(hw.stce.borrow().as_slice(), &[(true, true)]);
         w(&mut c, CSR_MIP, MIP_STIP).unwrap();
         assert_eq!(hw.lines.borrow().mip & MIP_STIP, 0);
         w(&mut c, CSR_STIMECMP, 1234).unwrap();
-        assert_eq!(hw.timecmp.borrow().last(), Some(&(MENVCFG_STCE, 1234)));
+        assert_eq!(hw.timecmp.borrow().last(), Some(&(SstcTimer::S, 1234)));
+        // VSTIP is writable in mip until henvcfg.STCE is set too.
+        w(&mut c, CSR_MIP, MIP_VSTIP).unwrap();
+        assert_eq!(hw.lines.borrow().mip & MIP_VSTIP, MIP_VSTIP);
+        w(&mut c, CSR_HENVCFG, MENVCFG_STCE).unwrap();
+        assert_eq!(hw.stce.borrow().last(), Some(&(false, true)));
+        w(&mut c, CSR_MIP, 0).unwrap();
+        assert_eq!(hw.lines.borrow().mip & MIP_VSTIP, MIP_VSTIP);
         w(&mut c, CSR_MENVCFG, 0).unwrap();
-        assert_eq!(hw.disabled.get(), 1);
+        // Clearing menvcfg.STCE clears henvcfg.STCE too, but as in QEMU only the S
+        // timer hears about it: write_henvcfg() compares the old henvcfg with itself.
+        assert_eq!(hw.stce.borrow().as_slice(), &[(true, true), (false, true), (true, false)]);
+        assert_eq!(c.st.henvcfg, 0);
         // ADUE was cleared by the write too.
         assert_eq!(c.st.menvcfg, 0);
     }
@@ -957,6 +1347,9 @@ mod tests {
         assert_eq!(r(&mut c, CSR_MEPC), Ok(0x1002));
         w(&mut c, CSR_MCOUNTEREN, u64::MAX).unwrap();
         assert_eq!(c.st.mcounteren, 0x7ffff);
+        w(&mut c, CSR_MHPMEVENT3, u64::MAX).unwrap();
+        assert_eq!(c.st.mhpmevent[3], u64::MAX, "VSINH and VUINH exist with H");
+        c.st.misa &= !crate::cpu::RVH;
         w(&mut c, CSR_MHPMEVENT3, u64::MAX).unwrap();
         assert_eq!(c.st.mhpmevent[3], !MHPMEVENT_VINH);
         w(&mut c, CSR_MCONTEXT, u64::MAX).unwrap();
@@ -1106,5 +1499,186 @@ mod tests {
         w(&mut c, CSR_PMPADDR0 + 20, 5).unwrap();
         assert!(!c.flush);
         assert_eq!(r(&mut c, CSR_PMPADDR0 + 20), Ok(0));
+    }
+
+    #[test]
+    fn vector_csrs() {
+        // Without Zve32x the vector CSRs do not exist and mstatus.VS is read only zero.
+        let hw = FakeHw::default();
+        let mut c = csrs(&hw);
+        assert_eq!(r(&mut c, CSR_VLENB), ILL);
+        w(&mut c, CSR_MSTATUS, MSTATUS_VS).unwrap();
+        assert_eq!(c.st.mstatus & MSTATUS_VS, 0);
+
+        let hw = FakeHw { cfg: RiscvCfg::max(), ..FakeHw::default() };
+        let mut c = csrs(&hw);
+        // mstatus.VS starts off, so the CSRs are illegal.
+        assert_eq!(r(&mut c, CSR_VL), ILL);
+        w(&mut c, CSR_MSTATUS, 1 << 9).unwrap();
+        assert_eq!(c.st.mstatus & MSTATUS_VS, 1 << 9);
+        assert_eq!(r(&mut c, CSR_VLENB), Ok(16));
+        assert_eq!(r(&mut c, CSR_VTYPE), Ok(1 << 63), "vill is set at reset");
+        assert_eq!(c.rw(CSR_VL, true, 0, 0), ILL, "vl is read only");
+        w(&mut c, CSR_VSTART, u64::MAX).unwrap();
+        assert_eq!(c.st.vstart, 0x7f);
+        // Any write makes the vector state dirty, and SD follows.
+        assert_eq!(c.st.mstatus & MSTATUS_VS, MSTATUS_VS);
+        assert_ne!(r(&mut c, CSR_MSTATUS).unwrap() & MSTATUS64_SD, 0);
+        w(&mut c, CSR_VCSR, 0x7).unwrap();
+        assert_eq!((c.st.vxrm, c.st.vxsat), (3, 1));
+        w(&mut c, CSR_VXRM, 0x6).unwrap();
+        assert_eq!(r(&mut c, CSR_VCSR), Ok(0x5));
+        w(&mut c, CSR_VXSAT, 0x2).unwrap();
+        assert_eq!(r(&mut c, CSR_VXSAT), Ok(0));
+        // sstatus.VS is writable too.
+        w(&mut c, CSR_SSTATUS, 0).unwrap();
+        assert_eq!(c.st.mstatus & MSTATUS_VS, 0);
+    }
+
+    #[test]
+    fn hypervisor_csrs_need_h() {
+        let hw = FakeHw::default();
+        let mut c = csrs(&hw);
+        c.st.misa &= !crate::cpu::RVH;
+        for csrno in [CSR_HSTATUS, CSR_HGATP, CSR_VSSTATUS, CSR_VSATP, CSR_MTVAL2, CSR_HGEIP] {
+            assert_eq!(r(&mut c, csrno), ILL, "{csrno:#x}");
+        }
+    }
+
+    #[test]
+    fn hypervisor_csr_masks() {
+        let hw = FakeHw::default();
+        let mut c = csrs(&hw);
+        // hstatus: VSXL reads as 2 and VSBE as 0; HUKTE and HUPMM are not writable.
+        w(&mut c, CSR_HSTATUS, u64::MAX).unwrap();
+        assert_eq!(c.st.hstatus, !(HSTATUS_HUKTE | HSTATUS_HUPMM));
+        let h = r(&mut c, CSR_HSTATUS).unwrap();
+        assert_eq!(get_field(h, HSTATUS_VSXL), 2);
+        assert_eq!(h & HSTATUS_VSBE, 0);
+        // hedeleg: no ecalls from S, VS or M mode, and no guest faults.
+        w(&mut c, CSR_HEDELEG, u64::MAX).unwrap();
+        assert_eq!(c.st.hedeleg, VS_DELEGABLE_EXCPS);
+        assert_eq!(c.st.hedeleg & ((0xf << 20) | (7 << 9)), 0);
+        // hideleg: only the VS level interrupts.
+        assert_eq!(w(&mut c, CSR_HIDELEG, u64::MAX), Ok(0));
+        assert_eq!(c.st.hideleg, VS_MODE_INTERRUPTS | (LOCAL_INTERRUPTS & !MIP_LCOFIP));
+        assert_eq!(r(&mut c, CSR_HIDELEG), Ok(c.st.hideleg));
+        // hcounteren like mcounteren.
+        w(&mut c, CSR_HCOUNTEREN, u64::MAX).unwrap();
+        assert_eq!(c.st.hcounteren, COUNTEREN_MASK);
+        // GEILEN is 0.
+        w(&mut c, CSR_HGEIE, u64::MAX).unwrap();
+        assert_eq!(r(&mut c, CSR_HGEIE), Ok(0));
+        assert_eq!(r(&mut c, CSR_HGEIP), Ok(0));
+        assert_eq!(c.rw(CSR_HGEIP, true, 0, 0), ILL, "hgeip is read only");
+        // htinst ignores writes; mtinst and mtval2 hold them.
+        w(&mut c, CSR_HTINST, 0x1234).unwrap();
+        assert_eq!(r(&mut c, CSR_HTINST), Ok(0));
+        w(&mut c, CSR_MTINST, 0x1234).unwrap();
+        w(&mut c, CSR_MTVAL2, 0x5678).unwrap();
+        assert_eq!((c.st.mtinst, c.st.mtval2), (0x1234, 0x5678));
+        // hgatp and vsatp take the supported modes and flush.
+        w(&mut c, CSR_HGATP, (VM_SV48 << 60) | 0x80000).unwrap();
+        assert_eq!(c.st.hgatp, (VM_SV48 << 60) | 0x80000);
+        assert!(c.flush);
+        c.flush = false;
+        w(&mut c, CSR_VSATP, 7 << 60).unwrap();
+        assert_eq!(c.st.vsatp, 0);
+        assert!(!c.flush);
+        // vstvec drops reserved modes.
+        w(&mut c, CSR_VSTVEC, 0x8000_0001).unwrap();
+        w(&mut c, CSR_VSTVEC, 0x8000_0002).unwrap();
+        assert_eq!(c.st.vstvec, 0x8000_0001);
+        // vsstatus is stored as written, with UXL 64 bit and no SDT.
+        w(&mut c, CSR_VSSTATUS, u64::MAX).unwrap();
+        assert_eq!(c.st.vsstatus, set_field(!SSTATUS_SDT, VSSTATUS64_UXL, 2));
+        // henvcfg: STCE and ADUE follow menvcfg, which has ADUE set at reset.
+        w(&mut c, CSR_MENVCFG, 0).unwrap();
+        w(&mut c, CSR_HENVCFG, u64::MAX).unwrap();
+        assert_eq!(c.st.henvcfg, SENVCFG_WRITE_MASK);
+        w(&mut c, CSR_MENVCFG, MENVCFG_ADUE).unwrap();
+        w(&mut c, CSR_HENVCFG, u64::MAX).unwrap();
+        assert_eq!(r(&mut c, CSR_HENVCFG), Ok(SENVCFG_WRITE_MASK | MENVCFG_ADUE));
+    }
+
+    #[test]
+    fn hypervisor_interrupt_csrs() {
+        let hw = FakeHw::default();
+        let mut c = csrs(&hw);
+        // hvip writes the VS level bits of mip; hip only VSSIP.
+        w(&mut c, CSR_HVIP, u64::MAX).unwrap();
+        assert_eq!(hw.lines.borrow().mip, VS_MODE_INTERRUPTS);
+        w(&mut c, CSR_HIP, 0).unwrap();
+        assert_eq!(hw.lines.borrow().mip, MIP_VSTIP | MIP_VSEIP);
+        assert_eq!(r(&mut c, CSR_HIP), Ok(MIP_VSTIP | MIP_VSEIP));
+        // hie: the HS mode bits of mie.
+        assert_eq!(w(&mut c, CSR_HIE, u64::MAX), Ok(0));
+        assert_eq!(c.st.mie, HS_MODE_INTERRUPTS);
+        // vsie and vsip show the delegated VS bits at their S level positions.
+        assert_eq!(r(&mut c, CSR_VSIE), Ok(0));
+        c.st.hideleg = MIP_VSTIP | MIP_VSSIP;
+        assert_eq!(r(&mut c, CSR_VSIE), Ok(MIP_STIP | MIP_SSIP));
+        assert_eq!(r(&mut c, CSR_VSIP), Ok(MIP_STIP));
+        w(&mut c, CSR_VSIP, MIP_SSIP).unwrap();
+        assert_eq!(hw.lines.borrow().mip, MIP_VSSIP | MIP_VSTIP | MIP_VSEIP);
+        // The fired VS timer shows in vsip and hip but not in hvip.
+        hw.lines.borrow_mut().mip = 0;
+        hw.lines.borrow_mut().vstime_irq = true;
+        assert_eq!(r(&mut c, CSR_VSIP), Ok(MIP_STIP));
+        assert_eq!(r(&mut c, CSR_HIP), Ok(MIP_VSTIP));
+        assert_eq!(r(&mut c, CSR_HVIP), Ok(0));
+        // In VS mode sie and sip are vsie and vsip, within mideleg.
+        c.st.virt_enabled = 1;
+        c.st.priv_lvl = PRV_S;
+        c.st.mideleg |= S_MODE_INTERRUPTS;
+        assert_eq!(r(&mut c, CSR_SIP), Ok(MIP_STIP));
+        assert_eq!(w(&mut c, CSR_SIE, 0), Ok(MIP_STIP | MIP_SSIP));
+        assert_eq!(c.st.mie, MIP_SGEIP | MIP_VSEIP);
+    }
+
+    #[test]
+    fn virtual_instruction_faults() {
+        let hw = FakeHw { time: Some(100), ..FakeHw::default() };
+        let mut c = csrs(&hw);
+        c.st.htimedelta = 5;
+        // HS mode reaches the hypervisor CSRs; VS mode faults on them.
+        c.st.priv_lvl = PRV_S;
+        assert_eq!(r(&mut c, CSR_HSTATUS), Ok(2 << 32));
+        assert_eq!(r(&mut c, CSR_MSTATUS), ILL);
+        c.st.virt_enabled = 1;
+        assert_eq!(r(&mut c, CSR_HSTATUS), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        assert_eq!(r(&mut c, CSR_VSSTATUS), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        assert_eq!(r(&mut c, CSR_MSTATUS), ILL);
+        // VU mode faults on S mode CSRs too.
+        c.st.priv_lvl = PRV_U;
+        assert_eq!(r(&mut c, CSR_SSCRATCH), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        // satp with hstatus.VTVM.
+        c.st.priv_lvl = PRV_S;
+        c.st.hstatus = HSTATUS_VTVM;
+        assert_eq!(r(&mut c, CSR_SATP), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        // Counters: mcounteren gives illegal, hcounteren virtual instruction.
+        assert_eq!(r(&mut c, CSR_TIME), ILL);
+        c.st.mcounteren = COUNTEREN_TM;
+        assert_eq!(r(&mut c, CSR_TIME), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        c.st.hcounteren = COUNTEREN_TM;
+        assert_eq!(r(&mut c, CSR_TIME), Ok(105), "time adds htimedelta in VS mode");
+        c.st.priv_lvl = PRV_U;
+        assert_eq!(r(&mut c, CSR_TIME), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        // stimecmp needs hcounteren.TM and henvcfg.STCE in VS mode.
+        c.st.priv_lvl = PRV_S;
+        c.st.menvcfg = MENVCFG_STCE;
+        c.st.hcounteren = 0;
+        assert_eq!(r(&mut c, CSR_STIMECMP), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        c.st.hcounteren = COUNTEREN_TM;
+        c.st.henvcfg = MENVCFG_STCE;
+        // ... and is vstimecmp there.
+        w(&mut c, CSR_STIMECMP, 77).unwrap();
+        assert_eq!((c.st.stimecmp, c.st.vstimecmp), (0, 77));
+        assert_eq!(hw.timecmp.borrow().last(), Some(&(SstcTimer::Vs, 77)));
+        // HS mode with TVM may not touch hgatp.
+        c.st.virt_enabled = 0;
+        c.st.mstatus |= MSTATUS_TVM;
+        assert_eq!(r(&mut c, CSR_HGATP), ILL);
+        assert_eq!(r(&mut c, CSR_VSATP), Ok(0));
     }
 }

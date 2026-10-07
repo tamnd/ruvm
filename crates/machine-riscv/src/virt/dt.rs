@@ -46,13 +46,8 @@ pub const QEMU_RV64_ISA: &str = "rv64imafdch_zic64b_zicbom_zicbop_zicboz_ziccamo
                                  shvstvecd_ssccptr_sscounterenw_ssstrict_sstc_sstvala_sstvecd_\
                                  ssu64xl_svadu_svvptc";
 
-/// The `riscv,isa` string of the CPU here: QEMU's without the hypervisor extension (`h`) and
-/// the `sh*` extensions that come with it.
-pub const RUVM_RV64_ISA: &str = "rv64imafdc_zic64b_zicbom_zicbop_zicboz_ziccamoa_ziccif_\
-                                 zicclsm_ziccrse_zicntr_zicsr_zifencei_zihintntl_zihintpause_\
-                                 zihpm_zmmul_za64rs_zaamo_zalrsc_zawrs_zfa_zca_zcd_zba_zbb_zbc_\
-                                 zbs_sdtrig_ssccptr_sscounterenw_ssstrict_sstc_sstvala_sstvecd_\
-                                 ssu64xl_svadu_svvptc";
+/// The `riscv,isa` string of the default CPU here, the same as QEMU's: H is on by default.
+pub const RUVM_RV64_ISA: &str = QEMU_RV64_ISA;
 
 /// `riscv,isa-extensions` for a `riscv,isa` string, as `riscv_isa_write_fdt()` builds both
 /// from the same list: each single letter extension after `rv64`, then each multi-letter one.
@@ -540,13 +535,7 @@ mod tests {
         assert_eq!(&ext[..8], ["i", "m", "a", "f", "d", "c", "h", "zic64b"]);
         assert_eq!(ext.last().unwrap(), "svvptc");
         assert_eq!(ext.len(), 49);
-        let ours = isa_extensions(RUVM_RV64_ISA);
-        assert!(!ours.iter().any(|e| e == "h" || e.starts_with("sh")));
-        assert_eq!(ours.len(), ext.len() - 7);
-        // The rest is the same list in the same order.
-        let qemu_rest: Vec<_> =
-            ext.iter().filter(|e| *e != "h" && !e.starts_with("sh")).cloned().collect();
-        assert_eq!(ours, qemu_rest);
+        assert_eq!(isa_extensions(RUVM_RV64_ISA), ext);
     }
 
     #[test]

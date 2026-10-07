@@ -113,6 +113,45 @@ const SEMIHOSTING_EXIT_3: &[u32] = &[
     0x0000_006f, // j      .
 ];
 
+/// Turns on mstatus.VS and runs vsetvli. The default rv64 CPU has no vector extension,
+/// as in QEMU 11.1, so VS stays Off and vsetvli raises an illegal instruction exception.
+/// Exits through semihosting with mcause (or 1 if nothing trapped), plus 16 times the VS
+/// field read back and 64 times misa.V.
+const VECTOR_OFF_PROBE: &[u32] = &[
+    0x0000_0297, // auipc  t0, 0
+    0x0382_8293, // addi   t0, t0, 0x38 (handler)
+    0x3052_9073, // csrw   mtvec, t0
+    0x6000_0293, // li     t0, 0x600
+    0x3002_a073, // csrs   mstatus, t0
+    0x3000_24f3, // csrr   s1, mstatus
+    0x0094_d493, // srli   s1, s1, 9
+    0x0034_f493, // andi   s1, s1, 3
+    0x3010_2973, // csrr   s2, misa
+    0x0159_5913, // srli   s2, s2, 21
+    0x0019_7913, // andi   s2, s2, 1
+    0x0d00_7357, // vsetvli t1, zero, e32, m1, ta, ma
+    0x0010_0613, // li     a2, 1
+    0x0080_006f, // j      exit
+    0x3420_2673, // handler: csrr a2, mcause
+    0x0044_9493, // exit: slli s1, s1, 4
+    0x0096_6633, // or     a2, a2, s1
+    0x0069_1913, // slli   s2, s2, 6
+    0x0126_6633, // or     a2, a2, s2
+    0x0000_1597, // auipc  a1, 1
+    0x0002_02b7, // lui    t0, 0x20
+    0x0262_829b, // addiw  t0, t0, 0x26
+    0x0055_b023, // sd     t0, 0(a1)
+    0x00c5_b423, // sd     a2, 8(a1)
+    0x0200_0513, // li     a0, 0x20
+    0x0000_0013, // nop
+    0x0000_0013, // nop
+    0x0000_0013, // nop, so the sequence below is 16-byte aligned
+    0x01f0_1013, // slli   zero, zero, 0x1f
+    0x0010_0073, // ebreak
+    0x4070_5013, // srai   zero, zero, 7
+    0x0000_006f, // j      .
+];
+
 /// Reads the first word of the boot ROM, runs the reset vector again, and checks the
 /// registers it hands over: a2 points at fw_dynamic_info at 0x1028 and a1 at the FDT.
 /// Exits through the SiFive test device with code 7 when all holds, 9, 11 or 13 if not.
@@ -211,6 +250,20 @@ fn semihosting_exit_code_is_the_exit_status() {
     assert_eq!(code, 3, "{err}");
     let (code, _, err) = run_guest("semi-smp", SEMIHOSTING_EXIT_3, &["-smp", "2"]);
     assert_eq!(code, 3, "{err}");
+}
+
+#[test]
+fn vector_is_off_on_the_default_cpu() {
+    let (code, _, err) = run_guest("vector-off", VECTOR_OFF_PROBE, &[]);
+    assert_eq!(code, 2, "{err}");
+}
+
+/// With `-cpu rv64,v=true` the same probe finds VS writable (it reads back Dirty), misa.V
+/// set and vsetvli executing: 1 | 3 << 4 | 1 << 6.
+#[test]
+fn vector_is_on_with_v_true() {
+    let (code, _, err) = run_guest("vector-on", VECTOR_OFF_PROBE, &["-cpu", "rv64,v=true"]);
+    assert_eq!(code, 113, "{err}");
 }
 
 /// Boots Linux on `-M virt -nographic` through the default OpenSBI firmware to a busybox
