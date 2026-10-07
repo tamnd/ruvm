@@ -10,6 +10,7 @@ mod migration;
 pub mod options;
 mod qmp_cmds;
 pub mod qtest;
+mod riscv;
 pub mod runstate;
 pub mod vl;
 mod x86;
