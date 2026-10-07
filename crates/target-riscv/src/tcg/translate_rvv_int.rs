@@ -66,7 +66,7 @@ impl S<'_, '_> {
         let (rd, rs1, rs2, vm) = (a.rd, a.rs1, a.rs2, a.vm);
         let sew = self.d.sew;
         // Zve64* has no vmulh* and vsmul for EEW 64.
-        let mulh_ok = self.d.cfg.ext_v || sew != 3;
+        let mulh_ok = self.d.cfg.ext_v() || sew != 3;
         match c {
             Chk::Vv => self.vext_check_sss(rd, rs1, rs2, vm),
             Chk::Vx => self.vext_check_ss(rd, rs2, vm),

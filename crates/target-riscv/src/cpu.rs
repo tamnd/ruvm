@@ -259,6 +259,35 @@ riscv_state! {
         /// `guest_phys_fault_addr`: the guest physical address of a guest page fault,
         /// shifted right by 2.
         pub guest_phys_fault_addr: u64,
+        /// `mseccfg`.
+        pub mseccfg: u64,
+        /// `mstateen0` to `mstateen3`.
+        pub mstateen: [u64; 4],
+        /// `hstateen0` to `hstateen3`.
+        pub hstateen: [u64; 4],
+        /// `sstateen0` to `sstateen3`.
+        pub sstateen: [u64; 4],
+        /// `mcyclecfg`.
+        pub mcyclecfg: u64,
+        /// `minstretcfg`.
+        pub minstretcfg: u64,
+        /// `pmu_fixed_ctrs[].counter`: the ticks counted in each privilege level with V=0.
+        pub pmu_counter: [u64; 4],
+        /// `pmu_fixed_ctrs[].counter_prev`: the ticks when each level was last entered.
+        pub pmu_counter_prev: [u64; 4],
+        /// `pmu_fixed_ctrs[].counter_virt`: the same for VU and VS mode.
+        pub pmu_counter_virt: [u64; 2],
+        /// `pmu_fixed_ctrs[].counter_virt_prev`.
+        pub pmu_counter_virt_prev: [u64; 2],
+        /// `pmu_event_ctr_map`: the counter each PMU event counts in, 0 for none, in the
+        /// order of `tcg::pmu::EVENTS`.
+        pub pmu_event_ctr: [u64; 5],
+        /// `miselect`, the register `mireg` to `mireg6` reach.
+        pub miselect: u64,
+        /// `siselect`.
+        pub siselect: u64,
+        /// `vsiselect`.
+        pub vsiselect: u64,
     }
 }
 
@@ -346,6 +375,18 @@ pub const TWO_STAGE_INDIRECT_LOOKUP: usize =
     env_off(offset_of!(CpuRiscvState, two_stage_indirect_lookup));
 /// `guest_phys_fault_addr`.
 pub const GUEST_PHYS_FAULT_ADDR: usize = env_off(offset_of!(CpuRiscvState, guest_phys_fault_addr));
+/// `vsatp`.
+pub const VSATP: usize = env_off(offset_of!(CpuRiscvState, vsatp));
+/// `hstatus`.
+pub const HSTATUS: usize = env_off(offset_of!(CpuRiscvState, hstatus));
+/// `menvcfg`.
+pub const MENVCFG: usize = env_off(offset_of!(CpuRiscvState, menvcfg));
+/// `senvcfg`.
+pub const SENVCFG: usize = env_off(offset_of!(CpuRiscvState, senvcfg));
+/// `henvcfg`.
+pub const HENVCFG: usize = env_off(offset_of!(CpuRiscvState, henvcfg));
+/// `mseccfg`.
+pub const MSECCFG: usize = env_off(offset_of!(CpuRiscvState, mseccfg));
 
 // Privilege levels.
 
@@ -403,9 +444,6 @@ pub const RVS: u64 = rvx(b'S');
 pub const RVU: u64 = rvx(b'U');
 /// RVV.
 pub const RVV: u64 = rvx(b'V');
-
-/// The extensions of the model in `misa` that cannot be turned off.
-pub const MISA_EXT: u64 = RVI | RVM | RVA | RVF | RVD | RVC | RVS | RVU;
 
 // mstatus.
 
@@ -648,6 +686,10 @@ pub const MENVCFG_DTE: u64 = 1 << 59;
 pub const MENVCFG_ADUE: u64 = 1 << 61;
 /// STCE.
 pub const MENVCFG_STCE: u64 = 1 << 63;
+/// CDE, Smcdeleg's counter delegation enable.
+pub const MENVCFG_CDE: u64 = 1 << 60;
+/// PMM, the pointer masking mode (also in `senvcfg` and `henvcfg`).
+pub const MENVCFG_PMM: u64 = 3 << 32;
 
 // Page table entries.
 
@@ -671,8 +713,10 @@ pub const PTE_D: u64 = 0x080;
 pub const PTE_PBMT: u64 = 0x6000_0000_0000_0000;
 /// NAPOT translation.
 pub const PTE_N: u64 = 0x8000_0000_0000_0000;
-/// The reserved bits, `PTE_RESERVED(false)` (the model has no Svrsw60t59b).
+/// The reserved bits, `PTE_RESERVED(false)`.
 pub const PTE_RESERVED: u64 = 0x1FC0_0000_0000_0000;
+/// The reserved bits with Svrsw60t59b, `PTE_RESERVED(true)`.
+pub const PTE_RESERVED_SVRSW60T59B: u64 = 0x07C0_0000_0000_0000;
 /// All attribute bits.
 pub const PTE_ATTR: u64 = PTE_N | PTE_PBMT;
 /// The shift of the PPN.
@@ -682,8 +726,6 @@ pub const PTE_PPN_MASK: u64 = 0x003F_FFFF_FFFF_FC00;
 
 // Counters.
 
-/// The counters the PMU has besides cycle, time and instret (`pmu-mask`, 3 to 18).
-pub const PMU_AVAIL_CTRS: u64 = 0x7fff8;
 /// CY in the counter enable registers.
 pub const COUNTEREN_CY: u64 = 1;
 /// TM.
@@ -723,354 +765,17 @@ pub const VTYPE_VMA: u64 = 0x80;
 /// `R_VTYPE_ALTFMT_MASK`.
 pub const VTYPE_ALTFMT: u64 = 0x100;
 
-/// The CPU configuration: QEMU's `RISCVCPUConfig` cut down to the switches that are not
-/// fixed in this port. The default is QEMU's `rv64`, which has H on (`MISA_CFG(RVH, true)`
-/// in `target/riscv/tcg/tcg-cpu.c`) and V and every vector extension off
-/// (`MISA_CFG(RVV, false)`, and none of the `Zv*` are in the `rv64` defaults of
-/// `riscv_cpu_extensions[]` in `cpu.c`).
-///
-/// [`RiscvCfg::max`] is what `-cpu max` enables of the vector extensions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct RiscvCfg {
-    /// `misa.H`.
-    pub ext_h: bool,
-    /// `misa.V`.
-    pub ext_v: bool,
-    /// Zve32x.
-    pub ext_zve32x: bool,
-    /// Zve32f.
-    pub ext_zve32f: bool,
-    /// Zve64x.
-    pub ext_zve64x: bool,
-    /// Zve64f.
-    pub ext_zve64f: bool,
-    /// Zve64d.
-    pub ext_zve64d: bool,
-    /// Zvfh.
-    pub ext_zvfh: bool,
-    /// Zvfhmin.
-    pub ext_zvfhmin: bool,
-    /// Zfhmin, implied by Zvfh.
-    pub ext_zfhmin: bool,
-    /// Zfbfmin, implied by Zvfbfwma.
-    pub ext_zfbfmin: bool,
-    /// Zvfbfmin.
-    pub ext_zvfbfmin: bool,
-    /// Zvfbfwma.
-    pub ext_zvfbfwma: bool,
-    /// Zvbb.
-    pub ext_zvbb: bool,
-    /// Zvbc.
-    pub ext_zvbc: bool,
-    /// Zvkb.
-    pub ext_zvkb: bool,
-    /// Zvkg.
-    pub ext_zvkg: bool,
-    /// Zvkned.
-    pub ext_zvkned: bool,
-    /// Zvknha.
-    pub ext_zvknha: bool,
-    /// Zvknhb.
-    pub ext_zvknhb: bool,
-    /// Zvksed.
-    pub ext_zvksed: bool,
-    /// Zvksh.
-    pub ext_zvksh: bool,
-    /// Zvkt.
-    pub ext_zvkt: bool,
-    /// Zvkn, a name for Zvkned, Zvknhb, Zvkb and Zvkt.
-    pub ext_zvkn: bool,
-    /// Zvknc, a name for Zvkn and Zvbc.
-    pub ext_zvknc: bool,
-    /// Zvkng, a name for Zvkn and Zvkg.
-    pub ext_zvkng: bool,
-    /// Zvks, a name for Zvksed, Zvksh, Zvkb and Zvkt.
-    pub ext_zvks: bool,
-    /// Zvksc, a name for Zvks and Zvbc.
-    pub ext_zvksc: bool,
-    /// Zvksg, a name for Zvks and Zvkg.
-    pub ext_zvksg: bool,
-    /// `vlenb`. Only 16 is supported.
-    pub vlenb: u32,
-    /// `elen`.
-    pub elen: u32,
-    /// `rvv_ta_all_1s`: tail agnostic elements are set to all ones.
-    pub rvv_ta_all_1s: bool,
-    /// `rvv_ma_all_1s`: mask agnostic elements are set to all ones.
-    pub rvv_ma_all_1s: bool,
-    /// `rvv_vl_half_avl`.
-    pub rvv_vl_half_avl: bool,
-    /// `rvv_vsetvl_x0_vill`.
-    pub rvv_vsetvl_x0_vill: bool,
-}
-
-impl Default for RiscvCfg {
-    fn default() -> RiscvCfg {
-        RiscvCfg {
-            ext_h: true,
-            ext_v: false,
-            ext_zve32x: false,
-            ext_zve32f: false,
-            ext_zve64x: false,
-            ext_zve64f: false,
-            ext_zve64d: false,
-            ext_zvfh: false,
-            ext_zvfhmin: false,
-            ext_zfhmin: false,
-            ext_zfbfmin: false,
-            ext_zvfbfmin: false,
-            ext_zvfbfwma: false,
-            ext_zvbb: false,
-            ext_zvbc: false,
-            ext_zvkb: false,
-            ext_zvkg: false,
-            ext_zvkned: false,
-            ext_zvknha: false,
-            ext_zvknhb: false,
-            ext_zvksed: false,
-            ext_zvksh: false,
-            ext_zvkt: false,
-            ext_zvkn: false,
-            ext_zvknc: false,
-            ext_zvkng: false,
-            ext_zvks: false,
-            ext_zvksc: false,
-            ext_zvksg: false,
-            vlenb: VLENB as u32,
-            elen: 64,
-            rvv_ta_all_1s: false,
-            rvv_ma_all_1s: false,
-            rvv_vl_half_avl: false,
-            rvv_vsetvl_x0_vill: false,
-        }
-    }
-}
-
-impl RiscvCfg {
-    /// The vector extensions of `-cpu max` (`riscv_init_max_cpu_extensions()`): V and every
-    /// `Zv*` extension this port has, with what they imply.
-    pub fn max() -> RiscvCfg {
-        let mut c = RiscvCfg {
-            ext_v: true,
-            ext_zvfh: true,
-            ext_zvfbfmin: true,
-            ext_zvfbfwma: true,
-            ext_zvbb: true,
-            ext_zvbc: true,
-            ext_zvkb: true,
-            ext_zvkg: true,
-            ext_zvkned: true,
-            ext_zvknha: true,
-            ext_zvknhb: true,
-            ext_zvksed: true,
-            ext_zvksh: true,
-            ext_zvkt: true,
-            ext_zvkn: true,
-            ext_zvknc: true,
-            ext_zvkng: true,
-            ext_zvks: true,
-            ext_zvksc: true,
-            ext_zvksg: true,
-            ..RiscvCfg::default()
-        };
-        c.apply_implied();
-        c
-    }
-
-    /// Sets the boolean `-cpu` property `name` (`v`, `zve32x`, `zvfh`, ...), as QEMU's
-    /// `riscv_cpu_extensions[]`, `riscv_cpu_named_features[]` and `riscv_cpu_options[]`
-    /// spell them. Gives false when `name` is not a property of this configuration.
-    pub fn set_prop(&mut self, name: &str, value: bool) -> bool {
-        let field = match name {
-            "h" => &mut self.ext_h,
-            "v" => &mut self.ext_v,
-            "zve32x" => &mut self.ext_zve32x,
-            "zve32f" => &mut self.ext_zve32f,
-            "zve64x" => &mut self.ext_zve64x,
-            "zve64f" => &mut self.ext_zve64f,
-            "zve64d" => &mut self.ext_zve64d,
-            "zvfh" => &mut self.ext_zvfh,
-            "zvfhmin" => &mut self.ext_zvfhmin,
-            "zfhmin" => &mut self.ext_zfhmin,
-            "zfbfmin" => &mut self.ext_zfbfmin,
-            "zvfbfmin" => &mut self.ext_zvfbfmin,
-            "zvfbfwma" => &mut self.ext_zvfbfwma,
-            "zvbb" => &mut self.ext_zvbb,
-            "zvbc" => &mut self.ext_zvbc,
-            "zvkb" => &mut self.ext_zvkb,
-            "zvkg" => &mut self.ext_zvkg,
-            "zvkned" => &mut self.ext_zvkned,
-            "zvknha" => &mut self.ext_zvknha,
-            "zvknhb" => &mut self.ext_zvknhb,
-            "zvksed" => &mut self.ext_zvksed,
-            "zvksh" => &mut self.ext_zvksh,
-            "zvkt" => &mut self.ext_zvkt,
-            "zvkn" => &mut self.ext_zvkn,
-            "zvknc" => &mut self.ext_zvknc,
-            "zvkng" => &mut self.ext_zvkng,
-            "zvks" => &mut self.ext_zvks,
-            "zvksc" => &mut self.ext_zvksc,
-            "zvksg" => &mut self.ext_zvksg,
-            "rvv_ta_all_1s" => &mut self.rvv_ta_all_1s,
-            "rvv_ma_all_1s" => &mut self.rvv_ma_all_1s,
-            "rvv_vl_half_avl" => &mut self.rvv_vl_half_avl,
-            "rvv_vsetvl_x0_vill" => &mut self.rvv_vsetvl_x0_vill,
-            _ => return false,
-        };
-        *field = value;
-        true
-    }
-
-    /// `riscv_cpu_enable_implied_rules()` for the vector extensions, applied until nothing
-    /// changes: V implies Zve64d; Zve64d implies Zve64f; Zve64f implies Zve32f and Zve64x;
-    /// Zve32f and Zve64x imply Zve32x; Zvfh implies Zvfhmin and Zfhmin; Zvfhmin and Zvfbfmin
-    /// imply Zve32f; Zvfbfwma implies Zvfbfmin and Zfbfmin; Zvbb implies Zvkb; Zvknhb
-    /// implies Zve64x and Zvknha; Zvkn, Zvks and the names made of them imply their parts.
-    pub fn apply_implied(&mut self) {
-        loop {
-            let before = *self;
-            if self.ext_v {
-                self.ext_zve64d = true;
-            }
-            if self.ext_zve64d {
-                self.ext_zve64f = true;
-            }
-            if self.ext_zve64f {
-                self.ext_zve32f = true;
-                self.ext_zve64x = true;
-            }
-            if self.ext_zve32f || self.ext_zve64x {
-                self.ext_zve32x = true;
-            }
-            if self.ext_zvfh {
-                self.ext_zvfhmin = true;
-                self.ext_zfhmin = true;
-            }
-            if self.ext_zvfhmin || self.ext_zvfbfmin {
-                self.ext_zve32f = true;
-            }
-            if self.ext_zvfbfwma {
-                self.ext_zvfbfmin = true;
-                self.ext_zfbfmin = true;
-            }
-            if self.ext_zvbb {
-                self.ext_zvkb = true;
-            }
-            if self.ext_zvknhb {
-                self.ext_zve64x = true;
-                self.ext_zvknha = true;
-            }
-            if self.ext_zvknc || self.ext_zvkng {
-                self.ext_zvkn = true;
-            }
-            if self.ext_zvksc || self.ext_zvksg {
-                self.ext_zvks = true;
-            }
-            if self.ext_zvknc || self.ext_zvksc {
-                self.ext_zvbc = true;
-            }
-            if self.ext_zvkng || self.ext_zvksg {
-                self.ext_zvkg = true;
-            }
-            if self.ext_zvkn {
-                self.ext_zvkned = true;
-                self.ext_zvknhb = true;
-                self.ext_zvkb = true;
-                self.ext_zvkt = true;
-            }
-            if self.ext_zvks {
-                self.ext_zvksed = true;
-                self.ext_zvksh = true;
-                self.ext_zvkb = true;
-                self.ext_zvkt = true;
-            }
-            if *self == before {
-                break;
-            }
-        }
-    }
-
-    /// The checks of `riscv_cpu_validate_set_extensions()` and `riscv_cpu_validate_v()`
-    /// for the vector extensions, with QEMU's messages. The model always has F and D.
-    pub fn validate(&self) -> Result<(), String> {
-        // riscv_cpu_validate_v().
-        let min_vlen = if self.ext_v {
-            128
-        } else if self.ext_zve64x {
-            64
-        } else if self.ext_zve32x {
-            32
-        } else {
-            0
-        };
-        if min_vlen != 0 {
-            let vlen = self.vlenb << 3;
-            // Only VLEN=128 is supported by this port: VLENB is a constant.
-            if vlen != VLENB as u32 * 8 || vlen < min_vlen {
-                return Err(format!(
-                    "Vector extension implementation only supports VLEN in the range [{min_vlen}, {}]",
-                    VLENB * 8
-                ));
-            }
-            if self.elen > 64 || self.elen < 8 {
-                return Err(
-                    "Vector extension implementation only supports ELEN in the range [8, 64]"
-                        .into(),
-                );
-            }
-        }
-        if (self.ext_zvfh || self.ext_zvfhmin) && !self.ext_zve32f {
-            return Err("Zvfh/Zvfhmin extensions require Zve32f extension".into());
-        }
-        if self.ext_zvfh && !self.ext_zfhmin {
-            return Err("Zvfh extensions requires Zfhmin extension".into());
-        }
-        if self.ext_zvfbfmin && !self.ext_zve32f {
-            return Err("Zvfbfmin extension depends on Zve32f extension".into());
-        }
-        if self.ext_zvfbfwma && !self.ext_zvfbfmin {
-            return Err("Zvfbfwma extension depends on Zvfbfmin extension".into());
-        }
-        if (self.ext_zvbb
-            || self.ext_zvkb
-            || self.ext_zvkg
-            || self.ext_zvkned
-            || self.ext_zvknha
-            || self.ext_zvksed
-            || self.ext_zvksh)
-            && !self.ext_zve32x
-        {
-            return Err("Vector crypto extensions require V or Zve* extensions".into());
-        }
-        if (self.ext_zvbc || self.ext_zvknhb) && !self.ext_zve64x {
-            return Err("Zvbc and Zvknhb extensions require V or Zve64x extensions".into());
-        }
-        Ok(())
-    }
-
-    /// The `misa` extension bits: [`MISA_EXT`], with H and V when they are on.
-    pub fn misa_ext(&self) -> u64 {
-        let mut ext = MISA_EXT;
-        if self.ext_h {
-            ext |= RVH;
-        }
-        if self.ext_v {
-            ext |= RVV;
-        }
-        ext
-    }
-}
+pub use crate::cfg::RiscvCfg;
 
 impl CpuRiscvState {
     /// The state after `riscv_cpu_reset_hold()` for hart `hartid` with reset vector
-    /// `resetvec`, for the default CPU (with H, without V).
+    /// `resetvec`, for the default CPU, `rv64`.
     pub fn reset(hartid: u64, resetvec: u64) -> CpuRiscvState {
         CpuRiscvState::reset_cfg(hartid, resetvec, &RiscvCfg::default())
     }
 
-    /// [`CpuRiscvState::reset`] for a CPU with the extensions of `cfg`: `misa` has H and V
-    /// when `cfg` has them.
+    /// [`CpuRiscvState::reset`] for a CPU with the configuration `cfg`: `misa` has the
+    /// letters of `cfg`.
     pub fn reset_cfg(hartid: u64, resetvec: u64, cfg: &RiscvCfg) -> CpuRiscvState {
         let mut s = CpuRiscvState {
             misa: MISA_MXL_RV64 | cfg.misa_ext(),
@@ -1083,14 +788,19 @@ impl CpuRiscvState {
         };
         // mstatus: MIE and MPRV clear, SXL and UXL fixed at RV64.
         s.mstatus = (2 << 34) | (2 << 32);
-        // The model has Svadu without Svade, so ADUE starts set.
-        s.menvcfg = MENVCFG_ADUE;
+        // PBMTE starts set with Svpbmt, and ADUE with Svadu and without Svade.
+        if cfg.ext_svpbmt {
+            s.menvcfg |= MENVCFG_PBMTE;
+        }
+        if cfg.ext_svadu && !cfg.ext_svade {
+            s.menvcfg |= MENVCFG_ADUE;
+        }
         // Debug triggers: every trigger is a disabled type 2 match control.
         for i in 0..NUM_TRIGGERS {
             s.tdata1[i] = 2 << 60;
         }
         s.vill = 1;
-        if cfg.ext_h {
+        if cfg.ext_h() {
             s.vsstatus = (2 << 34) | (2 << 32);
             s.mstatus_hs = (2 << 34) | (2 << 32);
             // Bits 10, 6, 2 and 12 of mideleg are read only 1 with the H extension.

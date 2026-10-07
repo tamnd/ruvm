@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! How the virt board meets its harts: the ACLINT `mtime` the `time` CSR reads and the Sstc
-//! timers behind `stimecmp` and `vstimecmp` ([`CpuHub`], the board side of `RiscvBoard`), the shutdown and
-//! reset requests of the SiFive test device, and semihosting ([`VirtSemihost`]).
+//! How the virt board meets its harts: the ACLINT `mtime` the `time` CSR reads, the Sstc
+//! timers behind `stimecmp` and `vstimecmp` and the Sscofpmf overflow timer ([`CpuHub`], the
+//! board side of `RiscvBoard`), the shutdown and reset requests of the SiFive test device,
+//! and semihosting ([`VirtSemihost`]).
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
@@ -27,6 +28,8 @@ struct CpuSlot {
     stimer: Option<Timer>,
     /// `env->vstimer`: the timer that raises VSTIP at the `vstimecmp` deadline.
     vstimer: Option<Timer>,
+    /// `pmu_timer`: the Sscofpmf timer for the overflow of a counter.
+    pmu_timer: Option<Timer>,
 }
 
 /// The board side of every hart: `rdtime_fn` on the ACLINT timer, the Sstc timers on the
@@ -53,7 +56,7 @@ impl fmt::Debug for CpuHub {
 impl CpuHub {
     pub(crate) fn new(mtimer: Arc<RiscvAclintMtimer>, harts: usize, clock: Arc<Clock>) -> CpuHub {
         let slots = (0..harts)
-            .map(|_| CpuSlot { shared: Weak::new(), stimer: None, vstimer: None })
+            .map(|_| CpuSlot { shared: Weak::new(), stimer: None, vstimer: None, pmu_timer: None })
             .collect();
         CpuHub {
             mtimer,
@@ -76,11 +79,11 @@ impl CpuHub {
         }
     }
 
-    /// Stop the Sstc timers of hart `cpu`, as a CPU reset leaves `env->stimer` and
-    /// `env->vstimer` idle.
+    /// Stop the Sstc and PMU timers of hart `cpu`, as a CPU reset leaves `env->stimer`,
+    /// `env->vstimer` and `pmu_timer` idle.
     pub(crate) fn reset_timer(&self, cpu: usize) {
         if let Some(s) = lock(&self.slots).get(cpu) {
-            for t in [&s.stimer, &s.vstimer].into_iter().flatten() {
+            for t in [&s.stimer, &s.vstimer, &s.pmu_timer].into_iter().flatten() {
                 t.del();
             }
         }
@@ -165,6 +168,26 @@ impl RiscvBoard for CpuHub {
 
     fn vstimer_update(&self, shared: &CpuShared, deadline: Option<Instant>) {
         self.timer_update(shared, deadline, true);
+    }
+
+    fn pmu_timer_anticipate(&self, shared: &CpuShared, delay_ns: u64) {
+        let mut slots = lock(&self.slots);
+        let Some(slot) = slots.get_mut(shared.cpu_index) else {
+            return;
+        };
+        let weak_cpu = slot.shared.clone();
+        let weak_riscv = self.riscv.get().cloned().unwrap_or_default();
+        // A deadline past the end of the clock never comes; see the PMU module of
+        // ruvm-target-riscv.
+        let when = self.clock.get_ns().saturating_add(i64::try_from(delay_ns).unwrap_or(i64::MAX));
+        let t = slot.pmu_timer.get_or_insert_with(|| {
+            self.clock.new_timer(move || {
+                if let (Some(s), Some(r)) = (weak_cpu.upgrade(), weak_riscv.upgrade()) {
+                    r.pmu_timer_expired(&s);
+                }
+            })
+        });
+        t.modify_anticipate(when);
     }
 }
 

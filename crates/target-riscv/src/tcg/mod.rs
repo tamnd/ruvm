@@ -12,19 +12,18 @@
 //!
 //! - Only RV64. `misa` and the `mstatus` UXL and SXL fields are read only, so the XLEN
 //!   never changes.
-//! - The H extension is on by default, as in QEMU (`MISA_CFG(RVH, true)` in
-//!   `tcg-cpu.c`), and turned off with `h=false`. There are no guest external interrupts
-//!   (GEILEN is 0), so `hgeie` and `hgeip` read as zero, and no AIA virtual interrupts
-//!   (`hvien`, `hvictl`).
+//! - The extensions come from the CPU model and its properties ([`crate::cfg`]), as in
+//!   QEMU. Extensions this port does not have yet cannot be turned on, and CPU models
+//!   that need them are refused. VLEN is fixed at 128 bits, QEMU's default, so other `vlen`
+//!   values are refused too.
+//! - With H there are no guest external interrupts (GEILEN is 0), so `hgeie` and `hgeip`
+//!   read as zero, and no AIA virtual interrupts (`hvien`, `hvictl`).
 //! - `vsstatus` keeps every bit a write gives it, as in QEMU, but only the bits that
 //!   `riscv_cpu_swap_hypervisor_regs()` swaps reach `mstatus` when V becomes 1; QEMU ORs
 //!   the whole of `vsstatus` into `mstatus`.
-//! - The vector extensions (V, Zve*, Zvfh, Zvfhmin, Zvfbfmin, Zvfbfwma and the vector
-//!   crypto extensions, see [`translate_rvv`]) have VLEN fixed at 128 bits. They are off by
-//!   default, as in QEMU's `rv64`, and turned on with [`Riscv::with_cfg`].
 //! - `mcycle` and `minstret` both count host time in nanoseconds since the CPU was made,
-//!   where QEMU reads `cpu_get_host_ticks()`; the `mhpmcounter` registers hold their value
-//!   but do not count.
+//!   where QEMU reads `cpu_get_host_ticks()`, and so do the `mhpmcounter` registers whose
+//!   `mhpmevent` selects the cycle or instruction event ([`pmu`]).
 //! - The page walk updates the A and D bits of a PTE with a plain store, where QEMU uses a
 //!   compare and swap on RAM and restarts the walk if the PTE changed under it.
 //! - There is no AIA, no Smrnmi, Smdbltrp, Ssdbltrp, Smctr or control flow integrity, no
@@ -34,10 +33,13 @@
 //!   with the taken edge emitted out of line at the end of the block; QEMU ends the block
 //!   at every branch.
 
+mod crypto;
 mod csr;
 mod fpu;
 mod helpers;
+mod pm;
 mod pmp;
+mod pmu;
 mod ptw;
 mod semihost;
 mod translate;
@@ -74,8 +76,8 @@ use crate::cpu::{
     EXCP_M_ECALL, EXCP_S_ECALL, EXCP_SEMIHOST, EXCP_STORE_AMO_ACCESS_FAULT,
     EXCP_STORE_AMO_ADDR_MIS, EXCP_STORE_GUEST_AMO_ACCESS_FAULT, EXCP_STORE_PAGE_FAULT,
     EXCP_U_ECALL, EXCP_VIRT_INSTRUCTION_FAULT, EXCP_VS_ECALL, HSTATUS_GVA, HSTATUS_SPV,
-    HSTATUS_SPVP, IRQ_S_EXT, IRQ_VS_EXT, IRQ_VS_SOFT, IRQ_VS_TIMER, MENVCFG_STCE, MIP_SEIP,
-    MIP_STIP, MIP_VSTIP, MMU_2STAGE_BIT, MMU_IDX_S_SUM, MSTATUS, MSTATUS_FS, MSTATUS_GVA,
+    HSTATUS_SPVP, IRQ_S_EXT, IRQ_VS_EXT, IRQ_VS_SOFT, IRQ_VS_TIMER, MENVCFG_STCE, MIP_LCOFIP,
+    MIP_SEIP, MIP_STIP, MIP_VSTIP, MMU_2STAGE_BIT, MMU_IDX_S_SUM, MSTATUS, MSTATUS_FS, MSTATUS_GVA,
     MSTATUS_HS, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV, MSTATUS_MPV, MSTATUS_MXR,
     MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_SUM, MSTATUS_VS, MSTATUS64_UXL, NB_MMU_MODES,
     PC, PRIV, PRV_M, PRV_S, RVF, RiscvCfg, UW2_ALWAYS_STORE_AMO, VILL, VIRT_ENABLED,
@@ -107,6 +109,10 @@ pub const TB_VTA: u32 = 1 << 17;
 pub const TB_VMA: u32 = 1 << 18;
 /// The TB flags: `virt_enabled` in bit 19.
 pub const TB_VIRT: u32 = 1 << 19;
+/// The shift of the 2 bit `PM_PMM` field: the PMM of data accesses, 0 if none.
+pub const TB_PM_PMM_SHIFT: u32 = 20;
+/// `PM_SIGNEXTEND`: masked data addresses are sign extended.
+pub const TB_PM_SIGNEXTEND: u32 = 1 << 22;
 
 /// The board side of a RISC-V CPU: the ACLINT timer the `time` CSR and Sstc read, and the
 /// timer behind `stimecmp`.
@@ -123,6 +129,13 @@ pub trait RiscvBoard: Send + Sync {
     /// passes, the board calls [`Riscv::stimer_expired`].
     fn stimer_update(&self, shared: &CpuShared, deadline: Option<Instant>) {
         let _ = (shared, deadline);
+    }
+
+    /// `timer_mod_anticipate_ns()` on the PMU timer of the vCPU `shared` (`pmu_timer`):
+    /// fire it in `delay_ns` nanoseconds of the virtual clock, or keep it if it is armed
+    /// for an earlier time. When it fires, the board calls [`Riscv::pmu_timer_expired`].
+    fn pmu_timer_anticipate(&self, shared: &CpuShared, delay_ns: u64) {
+        let _ = (shared, delay_ns);
     }
 
     /// Arm the VS mode Sstc timer of the vCPU `shared` (`env->vstimer`) for `deadline`,
@@ -153,6 +166,9 @@ pub(crate) struct CpuLines {
     pub(crate) software_seip: bool,
     /// `vstime_irq`: the VS mode Sstc timer has fired, which shows as VSTIP.
     pub(crate) vstime_irq: bool,
+    /// The PMU timer has fired and the vCPU has not yet run `riscv_pmu_timer_cb()`, which
+    /// needs `env`.
+    pub(crate) pmu_timer: bool,
 }
 
 /// The RV64 CPU: the [`CpuOps`] of vCPUs translated by the RISC-V front end.
@@ -160,7 +176,6 @@ pub struct Riscv {
     start: Instant,
     board: OnceLock<Arc<dyn RiscvBoard>>,
     semihost: Option<semihost::Semihosting>,
-    xlrbr: bool,
     cfg: RiscvCfg,
     lines: Mutex<Vec<CpuLines>>,
 }
@@ -169,7 +184,6 @@ impl fmt::Debug for Riscv {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Riscv")
             .field("semihosting", &self.semihost.is_some())
-            .field("xlrbr", &self.xlrbr)
             .field("cfg", &self.cfg)
             .finish_non_exhaustive()
     }
@@ -188,7 +202,6 @@ impl Riscv {
             start: Instant::now(),
             board: OnceLock::new(),
             semihost: None,
-            xlrbr: false,
             cfg: RiscvCfg::default(),
             lines: Mutex::new(Vec::new()),
         }
@@ -203,21 +216,26 @@ impl Riscv {
     }
 
     /// The same CPU with the XLRBR vendor extension (`-cpu rv64,xlrbr=true`): the CRC32
-    /// instructions.
+    /// instructions, and X in `misa`.
     pub fn with_xlrbr(mut self, on: bool) -> Riscv {
-        self.xlrbr = on;
+        self.cfg.ext_xlrbr = on;
+        if on {
+            self.cfg.misa_ext |= crate::cfg::RVX;
+        } else {
+            self.cfg.misa_ext &= !crate::cfg::RVX;
+        }
         self
     }
 
-    /// The same CPU with the extensions of `cfg` (the vector extensions), which must have
-    /// passed [`RiscvCfg::validate`]. The `misa` of the harts must come from
-    /// [`CpuRiscvState::reset_cfg`] with the same `cfg`.
+    /// The same CPU with the configuration `cfg`, as [`crate::cfg::CpuBuilder::finalize`]
+    /// gives it. The `misa` of the harts must come from [`CpuRiscvState::reset_cfg`] with
+    /// the same `cfg`.
     pub fn with_cfg(mut self, cfg: RiscvCfg) -> Riscv {
         self.cfg = cfg;
         self
     }
 
-    /// The extensions of the CPU.
+    /// The configuration of the CPU.
     pub fn cfg(&self) -> &RiscvCfg {
         &self.cfg
     }
@@ -239,7 +257,7 @@ impl Riscv {
 
     /// Whether the XLRBR extension is on.
     pub(crate) fn xlrbr(&self) -> bool {
-        self.xlrbr
+        self.cfg.ext_xlrbr
     }
 
     fn lines(&self, cpu_index: usize) -> (MutexGuard<'_, Vec<CpuLines>>, usize) {
@@ -262,7 +280,7 @@ impl Riscv {
         let r = f(&mut g[i]);
         // riscv_cpu_interrupt(). The request bit follows mip under the lock, so a racing
         // update can never leave it clear while an interrupt is pending.
-        let raise = g[i].mip != 0 || g[i].vstime_irq;
+        let raise = g[i].mip != 0 || g[i].vstime_irq || g[i].pmu_timer;
         if raise {
             shared.set_interrupt(interrupt::HARD);
         } else {
@@ -421,6 +439,33 @@ impl Riscv {
             } else {
                 self.disable_timecmp(shared, st, SstcTimer::S);
             }
+        }
+    }
+
+    /// `timer_mod_anticipate_ns()` on the PMU timer of the vCPU `shared`: fire it in
+    /// `delay_ns`, or earlier if it is already armed for an earlier time.
+    pub(crate) fn pmu_timer(&self, shared: &CpuShared, delay_ns: u64) {
+        if let Some(board) = self.board() {
+            board.pmu_timer_anticipate(shared, delay_ns);
+        }
+    }
+
+    /// The PMU timer the board was given by [`RiscvBoard::pmu_timer_anticipate`] fired.
+    /// The vCPU runs `riscv_pmu_timer_cb()` before it next looks for interrupts.
+    pub fn pmu_timer_expired(&self, shared: &CpuShared) {
+        self.with_lines(shared, |l| l.pmu_timer = true);
+    }
+
+    /// `riscv_pmu_timer_cb()` on the vCPU thread: mark the counters that overflowed and
+    /// raise LCOFIP, or arm the timer again for those that have not yet.
+    fn pmu_timer_cb(&self, cpu: &mut Cpu<'_>, shared: &CpuShared) {
+        let mut st = CpuRiscvState::load(cpu.env);
+        let raise = pmu::timer_cb(&mut st, &self.cfg, self.host_ticks(), &mut |d| {
+            self.pmu_timer(shared, d);
+        });
+        st.store(cpu.env);
+        if raise {
+            self.update_mip(shared, MIP_LCOFIP, MIP_LCOFIP);
         }
     }
 
@@ -596,7 +641,7 @@ impl Riscv {
             st.htinst = tinst;
             let vec = if is_async && st.stvec & 3 == 1 { cause * 4 } else { 0 };
             st.pc = (st.stvec >> 2 << 2).wrapping_add(vec);
-            flush = set_mode(&mut st, PRV_S, virt);
+            flush = set_mode(&mut st, PRV_S, virt, self.host_ticks());
         } else {
             // Handle the trap in M mode.
             if st.has_h() {
@@ -623,7 +668,7 @@ impl Riscv {
             st.mtinst = tinst;
             let vec = if is_async && st.mtvec & 3 == 1 { cause * 4 } else { 0 };
             st.pc = (st.mtvec >> 2 << 2).wrapping_add(vec);
-            flush |= set_mode(&mut st, PRV_M, virt);
+            flush |= set_mode(&mut st, PRV_M, virt, self.host_ticks());
         }
         // The fault information is used up: a later trap without a two stage lookup must
         // not see it.
@@ -773,12 +818,16 @@ pub(crate) fn swap_hypervisor_regs(st: &mut CpuRiscvState) {
     }
 }
 
-/// `riscv_cpu_set_mode()`: change the privilege level and, with H, the virtualization
-/// mode. The load reservation is dropped, so that a reservation placed in one context
-/// cannot make an SC in another succeed. Gives whether V changed, in which case the
-/// caller must flush the TLB as QEMU does.
+/// `riscv_cpu_set_mode()`: change the privilege level and, with H, the virtualization mode, at host
+/// tick `now` for the per mode counts of the PMU. The load reservation is dropped, so that a
+/// reservation placed in one context cannot make an SC in another succeed. Gives whether V changed,
+/// in which case the caller must flush the TLB as QEMU does.
 #[must_use]
-pub(crate) fn set_mode(st: &mut CpuRiscvState, newpriv: u64, virt: bool) -> bool {
+pub(crate) fn set_mode(st: &mut CpuRiscvState, newpriv: u64, virt: bool, now: u64) -> bool {
+    let virt = virt && st.has_h();
+    if newpriv != st.priv_lvl || virt != st.virt() {
+        pmu::update_fixed_ctrs(st, now, newpriv, virt);
+    }
     st.priv_lvl = newpriv;
     st.load_res = u64::MAX;
     if !st.has_h() {
@@ -858,8 +907,9 @@ pub(crate) fn mmu_index_st(st: &CpuRiscvState, ifetch: bool) -> usize {
 
 /// The TB flags of a vCPU, `riscv_get_tb_cpu_state()` cut down to what this front end
 /// reads: the data MMU index, the privilege level, `mstatus.FS` and `mstatus.VS` (the
-/// lower of the guest's and the hypervisor's under V=1), the vector state and V. There is
-/// no `VL_EQ_VLMAX`, which QEMU only reads to use gvec.
+/// lower of the guest's and the hypervisor's under V=1), the vector state, V and the
+/// pointer mask of data accesses. There is no `VL_EQ_VLMAX`, which QEMU only reads to use
+/// gvec.
 pub(crate) fn tb_flags(cfg: &RiscvCfg, env: &[u8]) -> u32 {
     let priv_lvl = ld64(env, PRIV);
     let mstatus = ld64(env, MSTATUS);
@@ -896,6 +946,9 @@ pub(crate) fn tb_flags(cfg: &RiscvCfg, env: &[u8]) -> u32 {
     } else {
         flags |= TB_VILL;
     }
+    if pm::any(cfg) {
+        flags |= pm::data_mask(cfg, &pm::PmState::from_env(env)).tb_flags();
+    }
     flags
 }
 
@@ -930,8 +983,22 @@ impl CpuOps for Riscv {
         if interrupt_request & interrupt::HARD == 0 {
             return false;
         }
+        let shared = Arc::clone(cpu.core.shared());
+        // Not with_lines(): that kicks the vCPU whenever mip is nonzero, and a kick from
+        // here would bring the vCPU straight back without running a single instruction.
+        let fired = {
+            let (mut g, i) = self.lines(shared.cpu_index);
+            let fired = std::mem::take(&mut g[i].pmu_timer);
+            if fired && g[i].mip == 0 && !g[i].vstime_irq {
+                shared.reset_interrupt(interrupt::HARD);
+            }
+            fired
+        };
+        if fired {
+            self.pmu_timer_cb(cpu, &shared);
+        }
         let st = CpuRiscvState::load(cpu.env);
-        let cpu_index = cpu.core.shared().cpu_index;
+        let cpu_index = shared.cpu_index;
         match self.local_irq_pending(cpu_index, &st) {
             Some(irq) => {
                 cpu.core.exception_index = EXCP_INT_FLAG | irq as i32;
@@ -950,7 +1017,9 @@ impl CpuOps for Riscv {
         // riscv_cpu_has_work(): WFI ignores the privilege level and the delegation, but
         // respects the individual enables.
         let mie = ld64(cpu.env, crate::cpu::MIE);
-        self.all_pending(cpu.core.shared().cpu_index, mie) != 0
+        let i = cpu.core.shared().cpu_index;
+        // A fired PMU timer wakes the vCPU to run its callback, which may raise LCOFIP.
+        self.all_pending(i, mie) != 0 || self.lines(i).0[i].pmu_timer
     }
 
     fn tlb_fill(

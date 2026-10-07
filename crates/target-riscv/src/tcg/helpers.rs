@@ -27,12 +27,12 @@ use ruvm_jit_interp::{HelperEnv, HelperRegistry, Unwind};
 
 use super::{csr, mmu_index, set_mode, swap_hypervisor_regs};
 use crate::cpu::{
-    BADADDR, CpuRiscvState, EXCP_ILLEGAL_INST, EXCP_INST_ACCESS_FAULT, EXCP_STORE_AMO_ADDR_MIS,
-    EXCP_VIRT_INSTRUCTION_FAULT, HSTATUS_HU, HSTATUS_SPV, HSTATUS_SPVP, HSTATUS_VTSR, HSTATUS_VTVM,
-    HSTATUS_VTW, MENVCFG_CBCFE, MENVCFG_CBIE, MENVCFG_CBZE, MMU_2STAGE_BIT, MMU_IDX_S_SUM,
-    MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV, MSTATUS_MPV, MSTATUS_SIE, MSTATUS_SPIE,
-    MSTATUS_SPP, MSTATUS_SUM, MSTATUS_TSR, MSTATUS_TVM, MSTATUS_TW, PRV_M, PRV_S, PRV_U, RVS,
-    get_field, set_field,
+    BADADDR, CpuRiscvState, EXCP_ILLEGAL_INST, EXCP_INST_ACCESS_FAULT, EXCP_INST_ADDR_MIS,
+    EXCP_STORE_AMO_ADDR_MIS, EXCP_VIRT_INSTRUCTION_FAULT, HSTATUS_HU, HSTATUS_SPV, HSTATUS_SPVP,
+    HSTATUS_VTSR, HSTATUS_VTVM, HSTATUS_VTW, MENVCFG_CBCFE, MENVCFG_CBIE, MENVCFG_CBZE,
+    MMU_2STAGE_BIT, MMU_IDX_S_SUM, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV,
+    MSTATUS_MPV, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_SUM, MSTATUS_TSR, MSTATUS_TVM,
+    MSTATUS_TW, PRV_M, PRV_S, PRV_U, RVS, RVU, RiscvCfg, get_field, set_field,
 };
 
 type R<T> = Result<T, CpuLoopExit>;
@@ -117,6 +117,9 @@ def!(CLMUL, "clmul", NO_RWG_SE, I64, [I64, I64], h_clmul);
 def!(CLMULR, "clmulr", NO_RWG_SE, I64, [I64, I64], h_clmulr);
 def!(CRC32, "crc32", NO_RWG_SE, I64, [I64, I32], h_crc32);
 def!(CRC32C, "crc32c", NO_RWG_SE, I64, [I64, I32], h_crc32c);
+def!(BREV8, "brev8", NO_RWG_SE, I64, [I64], h_brev8);
+def!(XPERM4, "xperm4", NO_RWG_SE, I64, [I64, I64], h_xperm4);
+def!(XPERM8, "xperm8", NO_RWG_SE, I64, [I64, I64], h_xperm8);
 
 /// The helpers of this module.
 pub(crate) const ALL: &[Def] = &[
@@ -149,6 +152,9 @@ pub(crate) const ALL: &[Def] = &[
     CLMULR,
     CRC32,
     CRC32C,
+    BREV8,
+    XPERM4,
+    XPERM8,
 ];
 
 /// Register every helper of the riscv front end.
@@ -161,6 +167,7 @@ pub(crate) fn register(r: &mut HelperRegistry) {
         super::vector_fp::ALL,
         super::vector_perm::ALL,
         super::vcrypto::ALL,
+        super::crypto::ALL,
     ]
     .iter()
     .copied()
@@ -177,7 +184,14 @@ fn h_raise_exception(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
 
 /// `HELPER(csrr)`.
 fn h_csrr(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
-    run(h, |cpu| csr::csrr(cpu, a[1] as u32).map_err(|e| cpu.raise_exception(e, Ra::Tb)))
+    run(h, |cpu| {
+        // seed must be accessed with a read-write instruction; csrrs and csrrc with x0,
+        // and csrrsi and csrrci with 0, raise an illegal instruction exception.
+        if a[1] as u32 == csr::CSR_SEED {
+            return Err(illegal(cpu));
+        }
+        csr::csrr(cpu, a[1] as u32).map_err(|e| cpu.raise_exception(e, Ra::Tb))
+    })
 }
 
 /// `HELPER(csrw)`.
@@ -203,8 +217,11 @@ fn h_sret(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
         if st.priv_lvl < PRV_S {
             return Err(illegal(cpu));
         }
-        // With C, only bit 0 of sepc is masked.
-        let retpc = st.sepc & !1;
+        let cfg = riscv_cfg(cpu);
+        let retpc = st.sepc & cfg.xepc_mask();
+        if !cfg.allow_16bit_insn() && retpc & 3 != 0 {
+            return Err(cpu.raise_exception(EXCP_INST_ADDR_MIS, Ra::Tb));
+        }
         if get_field(st.mstatus, MSTATUS_TSR) != 0 && st.priv_lvl < PRV_M {
             return Err(illegal(cpu));
         }
@@ -227,7 +244,7 @@ fn h_sret(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
                 swap_hypervisor_regs(&mut st);
             }
         }
-        let flush = set_mode(&mut st, prev_priv, prev_virt);
+        let flush = set_mode(&mut st, prev_priv, prev_virt, host_ticks(cpu));
         st.store(cpu.env);
         if flush {
             cputlb::tlb_flush(cpu);
@@ -243,16 +260,21 @@ fn h_mret(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
         if st.priv_lvl < PRV_M {
             return Err(illegal(cpu));
         }
-        let retpc = st.mepc & !1;
+        let cfg = riscv_cfg(cpu);
+        let retpc = st.mepc & cfg.xepc_mask();
         let mut mstatus = st.mstatus;
         let prev_priv = get_field(mstatus, MSTATUS_MPP);
-        if st.pmp_num_rules == 0 && prev_priv != PRV_M {
+        if !cfg.allow_16bit_insn() && retpc & 3 != 0 {
+            return Err(cpu.raise_exception(EXCP_INST_ADDR_MIS, Ra::Tb));
+        }
+        if cfg.pmp && st.pmp_num_rules == 0 && prev_priv != PRV_M {
             return Err(cpu.raise_exception(EXCP_INST_ACCESS_FAULT, Ra::Tb));
         }
         let prev_virt = get_field(mstatus, MSTATUS_MPV) != 0 && prev_priv != PRV_M;
         mstatus = set_field(mstatus, MSTATUS_MIE, get_field(mstatus, MSTATUS_MPIE));
         mstatus = set_field(mstatus, MSTATUS_MPIE, 1);
-        mstatus = set_field(mstatus, MSTATUS_MPP, PRV_U);
+        let mpp = if st.misa & RVU != 0 { PRV_U } else { PRV_M };
+        mstatus = set_field(mstatus, MSTATUS_MPP, mpp);
         mstatus = set_field(mstatus, MSTATUS_MPV, 0);
         if prev_priv != PRV_M {
             mstatus = set_field(mstatus, MSTATUS_MPRV, 0);
@@ -261,7 +283,7 @@ fn h_mret(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
         if st.has_h() && prev_virt {
             swap_hypervisor_regs(&mut st);
         }
-        let flush = set_mode(&mut st, prev_priv, prev_virt);
+        let flush = set_mode(&mut st, prev_priv, prev_virt, host_ticks(cpu));
         st.store(cpu.env);
         if flush {
             cputlb::tlb_flush(cpu);
@@ -354,15 +376,18 @@ fn check_access_hlsv(cpu: &mut Cpu<'_>, x: bool) -> R<usize> {
     Ok(mode | MMU_2STAGE_BIT)
 }
 
-/// `helper_hyp_hlv_*()`: an HLV load of `mop`, zero extended.
+/// `helper_hyp_hlv_*()`: an HLV load of `mop`, zero extended, at `addr` masked with the
+/// pointer mask of the guest, `adjust_addr_virt()`.
 fn hlv(h: &mut HelperEnv<'_>, addr: u64, mop: MemOp) -> Result<u128, Unwind> {
     run(h, |cpu| {
         let idx = check_access_hlsv(cpu, false)?;
+        let addr = super::pm::cpu_vm_ldst_mask(cpu).adjust(addr);
         cpu_ld_mmu(cpu, addr, MemOpIdx::new(mop, idx as u32), Ra::Tb)
     })
 }
 
-/// `helper_hyp_hlvx_*()`: an HLVX load of `n` bytes, which needs execute permission.
+/// `helper_hyp_hlvx_*()`: an HLVX load of `n` bytes, which needs execute permission. QEMU
+/// does not mask its address.
 fn hlvx(h: &mut HelperEnv<'_>, addr: u64, n: usize) -> Result<u128, Unwind> {
     run(h, |cpu| {
         let idx = check_access_hlsv(cpu, true)?;
@@ -372,10 +397,11 @@ fn hlvx(h: &mut HelperEnv<'_>, addr: u64, n: usize) -> Result<u128, Unwind> {
     })
 }
 
-/// `helper_hyp_hsv_*()`: an HSV store of `mop`.
+/// `helper_hyp_hsv_*()`: an HSV store of `mop`, at `addr` masked as [`hlv`] does.
 fn hsv(h: &mut HelperEnv<'_>, addr: u64, val: u64, mop: MemOp) -> Result<u128, Unwind> {
     run(h, |cpu| {
         let idx = check_access_hlsv(cpu, false)?;
+        let addr = super::pm::cpu_vm_ldst_mask(cpu).adjust(addr);
         cpu_st_mmu(cpu, addr, val, MemOpIdx::new(mop, idx as u32), Ra::Tb)?;
         Ok(0)
     })
@@ -450,8 +476,24 @@ fn h_sc_probe_write(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     })
 }
 
-/// The cache block size of Zicbom and Zicboz, `cbom_blocksize` and `cboz_blocksize`.
-const CBO_BLOCK: u64 = 64;
+/// `cfg.cbom_blocksize` and `cfg.cboz_blocksize` of the vCPU. The properties take a power
+/// of 2 from 8 to 4096 only, so a block is whole 8 byte words in one page.
+fn cbo_blocksizes(cpu: &Cpu<'_>) -> (u64, u64) {
+    let cfg = riscv_cfg(cpu);
+    (u64::from(cfg.cbom_blocksize), u64::from(cfg.cboz_blocksize))
+}
+
+/// The configuration of the hart, `riscv_cpu_cfg()`.
+fn riscv_cfg(cpu: &Cpu<'_>) -> RiscvCfg {
+    let ops = cpu.ops();
+    *super::riscv_of(&ops).cfg()
+}
+
+/// `cpu_get_host_ticks()`, for the per mode counts of the PMU.
+fn host_ticks(cpu: &Cpu<'_>) -> u64 {
+    let ops = cpu.ops();
+    super::riscv_of(&ops).host_ticks()
+}
 
 /// `check_zicbo_envcfg()`.
 fn check_zicbo_envcfg(cpu: &mut Cpu<'_>, envbits: u64) -> R<()> {
@@ -475,14 +517,15 @@ fn check_zicbo_envcfg(cpu: &mut Cpu<'_>, envbits: u64) -> R<()> {
 fn h_cbo_zero(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
         check_zicbo_envcfg(cpu, MENVCFG_CBZE)?;
+        let cbozlen = cbo_blocksizes(cpu).1;
         // Mask off low-bits to align-down to the cache-block.
-        let address = a[1] & !(CBO_BLOCK - 1);
+        let address = a[1] & !(cbozlen - 1);
         let idx = data_mmu_idx(cpu);
         // cbo.zero requires MMU_DATA_STORE access. Do a probe_write() to raise any
         // exceptions, including PMP.
-        probe_access(cpu, address, CBO_BLOCK as usize, MmuAccessType::DataStore, idx, Ra::Tb)?;
+        probe_access(cpu, address, cbozlen as usize, MmuAccessType::DataStore, idx, Ra::Tb)?;
         let oi = MemOpIdx::new(MemOp::LEUQ, idx as u32);
-        for i in (0..CBO_BLOCK).step_by(8) {
+        for i in (0..cbozlen).step_by(8) {
             cpu_st_mmu(cpu, address + i, 0, oi, Ra::Tb)?;
         }
         Ok(0)
@@ -491,8 +534,9 @@ fn h_cbo_zero(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
 
 /// `check_zicbom_access()`: the block must be loadable or storable.
 fn check_zicbom_access(cpu: &mut Cpu<'_>, address: u64) -> R<()> {
+    let cbomlen = cbo_blocksizes(cpu).0;
     // Mask off low-bits to align-down to the cache-block.
-    let address = address & !(CBO_BLOCK - 1);
+    let address = address & !(cbomlen - 1);
     let idx = data_mmu_idx(cpu);
     // A cache-block management instruction is permitted to access the specified cache
     // block whenever a load instruction or store instruction is permitted to access the
@@ -500,7 +544,7 @@ fn check_zicbom_access(cpu: &mut Cpu<'_>, address: u64) -> R<()> {
     if probe_access_nonfault(cpu, address, MmuAccessType::DataLoad, idx, Ra::Tb)?.is_some() {
         return Ok(());
     }
-    probe_access(cpu, address, CBO_BLOCK as usize, MmuAccessType::DataStore, idx, Ra::Tb)?;
+    probe_access(cpu, address, cbomlen as usize, MmuAccessType::DataStore, idx, Ra::Tb)?;
     Ok(())
 }
 
@@ -559,6 +603,36 @@ fn h_clmul(_h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
 
 fn h_clmulr(_h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     Ok(u128::from(clmulr(a[0], a[1])))
+}
+
+/// `HELPER(brev8)`: reverse the bits of every byte.
+fn h_brev8(_h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    Ok(u128::from(super::vcrypto::brev8(a[0])))
+}
+
+/// `do_xperm()`: look up the `1 << sz_log2` bit elements of `rs2` as indices into `rs1`,
+/// an index out of range giving 0.
+fn xperm(rs1: u64, rs2: u64, sz_log2: u32) -> u64 {
+    let sz = 1u32 << sz_log2;
+    let mask = (1u64 << sz) - 1;
+    let mut r = 0;
+    for i in (0..64).step_by(sz as usize) {
+        let pos = ((rs2 >> i) & mask) << sz_log2;
+        if pos < 64 {
+            r |= ((rs1 >> pos) & mask) << i;
+        }
+    }
+    r
+}
+
+/// `HELPER(xperm4)`.
+fn h_xperm4(_h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    Ok(u128::from(xperm(a[0], a[1], 2)))
+}
+
+/// `HELPER(xperm8)`.
+fn h_xperm8(_h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
+    Ok(u128::from(xperm(a[0], a[1], 3)))
 }
 
 /// The XLRBR CRC step over the low `sz` bytes of `val`: the reflected table update

@@ -37,7 +37,9 @@ use ruvm_jit_core::{MemOp, MemOpIdx};
 use ruvm_jit_interp::{HelperEnv, Unwind};
 
 use super::helpers::{Def, run};
+use super::pm::{self, PointerMask};
 use super::{ld64, mmu_index, st64};
+use crate::cfg::RiscvCfg;
 use crate::cpu::{
     VILL, VL, VLENB, VREG, VSTART, VTYPE, VTYPE_ALTFMT, VTYPE_VLMUL, VTYPE_VSEW, get_field,
 };
@@ -368,27 +370,42 @@ pub(super) fn get_vlmax(vsew: u32, lmul: i32) -> u64 {
     vlen >> (vsew as i32 + 3 - lmul)
 }
 
-/// `HELPER(vsetvl)`: `vl` and `vtype` from AVL `s1` and the new `vtype` `s2`; `x0` says
-/// that both `rd` and `rs1` are `x0`. The helper has the default configuration, ELEN 64
-/// without `rvv_vl_half_avl` and `rvv_vsetvl_x0_vill`, the only one a machine can ask for.
-fn h_vsetvl(h: &mut HelperEnv<'_>, a: &[u64]) -> HR {
-    Ok(u128::from(vsetvl(h.env, a[1], a[2], a[3] != 0, &crate::cpu::RiscvCfg::default())))
+/// The `vsetvl` flag that says both `rd` and `rs1` are `x0`.
+pub(super) const VSETVL_X0: u64 = 1;
+/// The `vsetvl` flag for the `rvv_vl_half_avl` property.
+const VSETVL_HALF_AVL: u64 = 2;
+/// The `vsetvl` flag for the `rvv_vsetvl_x0_vill` property.
+const VSETVL_X0_VILL: u64 = 4;
+/// The shift of ELEN in the `vsetvl` flags.
+const VSETVL_ELEN_SHIFT: u32 = 8;
+
+/// The `vsetvl` flags of configuration `cfg`, without [`VSETVL_X0`]. The helper has no
+/// CPU, so the translator passes the parts of the configuration it needs as a constant.
+pub(super) fn vsetvl_flags(cfg: &RiscvCfg) -> u64 {
+    let mut f = u64::from(cfg.elen) << VSETVL_ELEN_SHIFT;
+    if cfg.rvv_vl_half_avl {
+        f |= VSETVL_HALF_AVL;
+    }
+    if cfg.rvv_vsetvl_x0_vill {
+        f |= VSETVL_X0_VILL;
+    }
+    f
 }
 
-/// `HELPER(vsetvl)` for configuration `cfg`.
-pub(super) fn vsetvl(
-    env: &mut [u8],
-    s1: u64,
-    s2: u64,
-    x0: bool,
-    cfg: &crate::cpu::RiscvCfg,
-) -> u64 {
+/// `HELPER(vsetvl)`: `vl` and `vtype` from AVL `s1` and the new `vtype` `s2`. The fourth
+/// argument has the flags of [`vsetvl_flags`] and [`VSETVL_X0`].
+fn h_vsetvl(h: &mut HelperEnv<'_>, a: &[u64]) -> HR {
+    Ok(u128::from(vsetvl(h.env, a[1], a[2], a[3])))
+}
+
+/// `HELPER(vsetvl)` with the flags `flags`.
+pub(super) fn vsetvl(env: &mut [u8], s1: u64, s2: u64, flags: u64) -> u64 {
     let vlmul = s2 & VTYPE_VLMUL;
     let vsew = get_field(s2, VTYPE_VSEW) as u32;
     let sew = 8u64 << vsew;
     let altfmt = s2 & VTYPE_ALTFMT != 0;
     let mut vill = s2 >> 63 != 0;
-    let elen = u64::from(cfg.elen);
+    let elen = flags >> VSETVL_ELEN_SHIFT;
 
     if vlmul & 4 != 0 {
         // Fractional LMUL: ELEN * LMUL >= SEW.
@@ -411,13 +428,13 @@ pub(super) fn vsetvl(
     let vlmax = get_vlmax(vsew, lmul);
     let vl = if s1 <= vlmax {
         s1
-    } else if s1 < 2 * vlmax && cfg.rvv_vl_half_avl {
+    } else if s1 < 2 * vlmax && flags & VSETVL_HALF_AVL != 0 {
         (s1 + 1) >> 1
     } else {
         vlmax
     };
 
-    if cfg.rvv_vsetvl_x0_vill && x0 && ld64(env, VL) != vl {
+    if flags & VSETVL_X0_VILL != 0 && flags & VSETVL_X0 != 0 && ld64(env, VL) != vl {
         reset_ill_vtype(env);
         return 0;
     }
@@ -505,6 +522,7 @@ fn ldst(
     let log2 = d.esz;
     let max = max_elems(d, log2);
     let mmu_idx = data_mmu_idx(cpu.env);
+    let pm = pm::cpu_data_mask(cpu);
     let start = vstart(cpu.env);
     if start >= evl {
         set_vstart(cpu.env, 0);
@@ -526,7 +544,7 @@ fn ldst(
                     base.wrapping_add(vget(cpu.env, vs2, i, ilog2)).wrapping_add((k as u64) << log2)
                 }
             };
-            ldst_elem(cpu, store, addr, d.vd, i + k * max, log2, mmu_idx)?;
+            ldst_elem(cpu, store, pm.adjust(addr), d.vd, i + k * max, log2, mmu_idx)?;
         }
         set_vstart(cpu.env, i + 1);
     }
@@ -605,6 +623,7 @@ fn h_ldff(h: &mut HelperEnv<'_>, a: &[u64]) -> HR {
         let log2 = d.esz;
         let msize = (nf as u64) << log2;
         let mmu_idx = data_mmu_idx(cpu.env);
+        let pm = pm::cpu_data_mask(cpu);
         let env_vl = vl(cpu.env);
         let start = vstart(cpu.env);
         if start >= env_vl {
@@ -616,11 +635,11 @@ fn h_ldff(h: &mut HelperEnv<'_>, a: &[u64]) -> HR {
             if !d.vm && !vmask(cpu.env, 0, i) {
                 continue;
             }
-            let addr = base.wrapping_add(i as u64 * msize);
+            let addr = pm.adjust(base.wrapping_add(i as u64 * msize));
             if i == 0 {
                 // Allow a fault on the first element.
-                probe_pages(cpu, addr, msize, mmu_idx)?;
-            } else if !probe_pages_nonfault(cpu, addr, msize, mmu_idx)? {
+                probe_pages(cpu, addr, msize, mmu_idx, pm)?;
+            } else if !probe_pages_nonfault(cpu, addr, msize, mmu_idx, pm)? {
                 // Stop at an element that is not mapped or is not RAM.
                 new_vl = i;
                 break;
@@ -645,21 +664,29 @@ fn h_ldff(h: &mut HelperEnv<'_>, a: &[u64]) -> HR {
 const PAGE_SIZE: u64 = 4096;
 
 /// `probe_pages()` without flags: fault if `len` bytes at `addr`, on at most two pages,
-/// cannot be loaded.
-fn probe_pages(cpu: &mut Cpu<'_>, addr: u64, len: u64, mmu_idx: usize) -> R<()> {
+/// cannot be loaded. The address of each page is masked with `pm`.
+fn probe_pages(cpu: &mut Cpu<'_>, addr: u64, len: u64, mmu_idx: usize, pm: PointerMask) -> R<()> {
     let pagelen = PAGE_SIZE - (addr & (PAGE_SIZE - 1));
     let cur = pagelen.min(len);
-    probe_access(cpu, addr, cur as usize, MmuAccessType::DataLoad, mmu_idx, Ra::Tb)?;
+    let first = pm.adjust(addr);
+    probe_access(cpu, first, cur as usize, MmuAccessType::DataLoad, mmu_idx, Ra::Tb)?;
     if len > cur {
-        let addr = addr.wrapping_add(cur);
+        let addr = pm.adjust(addr.wrapping_add(cur));
         probe_access(cpu, addr, (len - cur) as usize, MmuAccessType::DataLoad, mmu_idx, Ra::Tb)?;
     }
     Ok(())
 }
 
 /// The non faulting probe of `vext_ldff()` for an element after the first: whether every
-/// page of `len` bytes at `addr` is mapped RAM.
-fn probe_pages_nonfault(cpu: &mut Cpu<'_>, addr: u64, len: u64, mmu_idx: usize) -> R<bool> {
+/// page of `len` bytes at `addr` is mapped RAM. The address of each next page is masked with
+/// `pm`.
+fn probe_pages_nonfault(
+    cpu: &mut Cpu<'_>,
+    addr: u64,
+    len: u64,
+    mmu_idx: usize,
+    pm: PointerMask,
+) -> R<bool> {
     let mut addr = addr;
     let mut remain = len;
     loop {
@@ -672,7 +699,7 @@ fn probe_pages_nonfault(cpu: &mut Cpu<'_>, addr: u64, len: u64, mmu_idx: usize) 
             return Ok(true);
         }
         remain -= offset;
-        addr = addr.wrapping_add(offset);
+        addr = pm.adjust(addr.wrapping_add(offset));
     }
 }
 
@@ -685,9 +712,10 @@ fn h_ldst_whole<const STORE: bool>(h: &mut HelperEnv<'_>, a: &[u64]) -> HR {
         let log2 = d.esz;
         let evl = (d.nf as usize * VLENB) >> log2;
         let mmu_idx = data_mmu_idx(cpu.env);
+        let pm = pm::cpu_data_mask(cpu);
         let start = vstart(cpu.env);
         for i in start..evl {
-            let addr = base.wrapping_add((i as u64) << log2);
+            let addr = pm.adjust(base.wrapping_add((i as u64) << log2));
             ldst_elem(cpu, STORE, addr, d.vd, i, log2, mmu_idx)?;
             set_vstart(cpu.env, i + 1);
         }
@@ -743,33 +771,33 @@ mod tests {
 
     #[test]
     fn vsetvl_rules() {
-        let cfg = RiscvCfg::max();
+        let cfg = vsetvl_flags(&RiscvCfg::max());
         let mut env = vec![0u8; ENV_SIZE];
         // e32, m1: VLMAX 4.
-        assert_eq!(vsetvl(&mut env, 10, 0x10, false, &cfg), 4);
+        assert_eq!(vsetvl(&mut env, 10, 0x10, cfg), 4);
         assert_eq!(ld64(&env, VTYPE), 0x10);
         assert_eq!(ld64(&env, VILL), 0);
-        assert_eq!(vsetvl(&mut env, 3, 0x10, false, &cfg), 3);
+        assert_eq!(vsetvl(&mut env, 3, 0x10, cfg), 3);
         // e8, m8: VLMAX 128.
-        assert_eq!(vsetvl(&mut env, RV_VLEN_MAX, 0x03, false, &cfg), 128);
+        assert_eq!(vsetvl(&mut env, RV_VLEN_MAX, 0x03, cfg), 128);
         // e64, mf2 needs ELEN 128.
-        assert_eq!(vsetvl(&mut env, 1, 0x1f, false, &cfg), 0);
+        assert_eq!(vsetvl(&mut env, 1, 0x1f, cfg), 0);
         assert_eq!(ld64(&env, VILL), 1);
         assert_eq!(ld64(&env, VTYPE), 0);
         assert_eq!(ld64(&env, VL), 0);
         // e8, mf8: VLMAX 2.
-        assert_eq!(vsetvl(&mut env, 7, 0x05, false, &cfg), 2);
+        assert_eq!(vsetvl(&mut env, 7, 0x05, cfg), 2);
         // vlmul 4 is reserved.
-        assert_eq!(vsetvl(&mut env, 7, 0x04, false, &cfg), 0);
+        assert_eq!(vsetvl(&mut env, 7, 0x04, cfg), 0);
         // SEW 128 is above ELEN.
-        assert_eq!(vsetvl(&mut env, 7, 0x20, false, &cfg), 0);
+        assert_eq!(vsetvl(&mut env, 7, 0x20, cfg), 0);
         // altfmt and the other reserved bits.
-        assert_eq!(vsetvl(&mut env, 7, 0x100, false, &cfg), 0);
-        assert_eq!(vsetvl(&mut env, 7, 1 << 62, false, &cfg), 0);
+        assert_eq!(vsetvl(&mut env, 7, 0x100, cfg), 0);
+        assert_eq!(vsetvl(&mut env, 7, 1 << 62, cfg), 0);
         // vill set in the new vtype.
-        assert_eq!(vsetvl(&mut env, 7, 1 << 63, false, &cfg), 0);
+        assert_eq!(vsetvl(&mut env, 7, 1 << 63, cfg), 0);
         // vta and vma are kept.
-        assert_eq!(vsetvl(&mut env, 1, 0xc0, false, &cfg), 1);
+        assert_eq!(vsetvl(&mut env, 1, 0xc0, cfg), 1);
         assert_eq!(ld64(&env, VTYPE), 0xc0);
         assert_eq!(get_vlmax(0, 3), 128);
         assert_eq!(get_vlmax(3, -1), 1);

@@ -4,22 +4,24 @@
 //! `get_physical_address_pmp()`, `riscv_cpu_tlb_fill()` and `raise_mmu_exception()` of
 //! QEMU's `target/riscv/tcg/cpu_helper.c`, for Sv39, Sv48 or Sv57 translation with Svadu
 //! and, with the H extension, the two stage translation of VS and VU mode: the VS stage
-//! through `vsatp` and the G stage through `hgatp` (Sv39x4, Sv48x4 or Sv57x4). The model
-//! has no Svpbmt, Svnapot or shadow stacks, so PTEs using them are invalid.
+//! through `vsatp` and the G stage through `hgatp` (Sv39x4, Sv48x4 or Sv57x4), with
+//! Svpbmt, Svnapot and Svrsw60t59b. The memory types of Svpbmt are checked but have no
+//! effect, as in QEMU. This port has no shadow stacks yet, so write-only PTEs are invalid.
 
 use ruvm_jit::{Cpu, CpuLoopExit, MmuAccessType, Ra, page};
 use ruvm_mem::{AddressSpace, Endian, MemTxAttrs, RegionType};
 
-use super::{pmp, st64};
+use super::{pmp, pmu, st64};
+use crate::cfg::RiscvCfg;
 use crate::cpu::{
     BADADDR, CpuRiscvState, EXCP_INST_ACCESS_FAULT, EXCP_INST_GUEST_PAGE_FAULT,
     EXCP_INST_PAGE_FAULT, EXCP_LOAD_ACCESS_FAULT, EXCP_LOAD_GUEST_ACCESS_FAULT,
     EXCP_LOAD_PAGE_FAULT, EXCP_STORE_AMO_ACCESS_FAULT, EXCP_STORE_GUEST_AMO_ACCESS_FAULT,
     EXCP_STORE_PAGE_FAULT, GUEST_PHYS_FAULT_ADDR, HGATP64_MODE, HGATP64_PPN, MENVCFG_ADUE,
-    MMU_2STAGE_BIT, MMU_IDX_S_SUM, MMU_IDX_U, MSTATUS_MXR, PRV_M, PRV_S, PRV_U, PTE_A, PTE_ATTR,
-    PTE_D, PTE_N, PTE_PBMT, PTE_PPN_MASK, PTE_PPN_SHIFT, PTE_R, PTE_RESERVED, PTE_U, PTE_V, PTE_W,
-    PTE_X, SATP64_MODE, SATP64_PPN, TWO_STAGE_INDIRECT_LOOKUP, TWO_STAGE_LOOKUP, VM_MBARE, VM_SV39,
-    VM_SV48, VM_SV57, get_field,
+    MENVCFG_PBMTE, MIP_LCOFIP, MMU_2STAGE_BIT, MMU_IDX_S_SUM, MMU_IDX_U, MSTATUS_MXR, PRV_M, PRV_S,
+    PRV_U, PTE_A, PTE_ATTR, PTE_D, PTE_N, PTE_PBMT, PTE_PPN_MASK, PTE_PPN_SHIFT, PTE_R,
+    PTE_RESERVED, PTE_RESERVED_SVRSW60T59B, PTE_U, PTE_V, PTE_W, PTE_X, SATP64_MODE, SATP64_PPN,
+    TWO_STAGE_INDIRECT_LOOKUP, TWO_STAGE_LOOKUP, VM_MBARE, VM_SV39, VM_SV48, VM_SV57, get_field,
 };
 
 const PGSHIFT: u32 = 12;
@@ -60,14 +62,18 @@ pub(crate) fn mmuidx_2stage(mmu_idx: usize) -> bool {
 }
 
 /// `get_physical_address_pmp()`: the PMP check of `size` bytes at `addr` for `access` in
-/// privilege `mode`, giving the protection PMP allows.
+/// privilege `mode`, giving the protection PMP allows. A CPU without PMP allows all.
 pub(crate) fn pmp_check(
     st: &CpuRiscvState,
+    cfg: &RiscvCfg,
     addr: u64,
     size: u64,
     access: MmuAccessType,
     mode: u64,
 ) -> Result<u32, Fail> {
+    if !cfg.pmp {
+        return Ok(page::READ | page::WRITE | page::EXEC);
+    }
     let privs = 1u32 << access as u32;
     pmp::hart_has_privs(st, addr, size, privs, mode).ok_or(Fail::Access)
 }
@@ -86,6 +92,7 @@ fn is_ram(as_: &AddressSpace, addr: u64) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_physical_address(
     st: &CpuRiscvState,
+    cfg: &RiscvCfg,
     as_: &AddressSpace,
     addr: u64,
     access: MmuAccessType,
@@ -100,7 +107,7 @@ pub(crate) fn get_physical_address(
     // The background registers serve a two stage translation forced on from HS or M mode
     // (MPRV with MPV, or a hypervisor load or store).
     let use_background = !st.virt() && two_stage;
-    if mode == PRV_M {
+    if mode == PRV_M || !cfg.mmu {
         return Ok(Translation { pa: addr, prot: rwx });
     }
     let (base_root, vm, widened) = if first_stage {
@@ -129,10 +136,14 @@ pub(crate) fn get_physical_address(
         // A guest physical address has no bits above the widened size.
         return Err(Fail::Page);
     }
-    let mut adue = st.menvcfg & MENVCFG_ADUE != 0;
+    let mut pbmte = st.menvcfg & MENVCFG_PBMTE != 0;
+    let mut adue = if cfg.ext_svadu { st.menvcfg & MENVCFG_ADUE != 0 } else { !cfg.ext_svade };
     if first_stage && two_stage && st.virt() {
+        pbmte = pbmte && st.henvcfg & MENVCFG_PBMTE != 0;
         adue = adue && st.henvcfg & MENVCFG_ADUE != 0;
     }
+    // `PTE_RESERVED(svrsw60t59b)`: Svrsw60t59b gives bits 60 and 59 to software.
+    let reserved = if cfg.ext_svrsw60t59b { PTE_RESERVED_SVRSW60T59B } else { PTE_RESERVED };
     let mut fault_pte_addr = fault_pte_addr;
 
     'restart: loop {
@@ -146,6 +157,7 @@ pub(crate) fn get_physical_address(
                 // Do the G stage translation of the page table address.
                 let g = get_physical_address(
                     st,
+                    cfg,
                     as_,
                     base,
                     MmuAccessType::DataLoad,
@@ -167,16 +179,21 @@ pub(crate) fn get_physical_address(
             } else {
                 base + idx * 8
             };
-            pmp_check(st, pte_addr, 8, MmuAccessType::DataLoad, PRV_S)?;
+            pmp_check(st, cfg, pte_addr, 8, MmuAccessType::DataLoad, PRV_S)?;
             let (pte, res) = as_.load(pte_addr, 8, Endian::Little, MemTxAttrs::default());
             if !res.is_ok() {
                 return Err(Fail::Access);
             }
-            if pte & PTE_RESERVED != 0 {
+            if pte & reserved != 0 {
                 return Err(Fail::Page);
             }
-            // Neither Svpbmt nor Svnapot is there.
-            if pte & (PTE_PBMT | PTE_N) != 0 {
+            // The memory type is reserved without Svpbmt (or with PBMTE clear), and so is
+            // the value 3. QEMU faults on it in non-leaf PTEs too.
+            if (!pbmte && pte & PTE_PBMT != 0) || pte & PTE_PBMT == PTE_PBMT {
+                return Err(Fail::Page);
+            }
+            // N is reserved without Svnapot.
+            if !cfg.ext_svnapot && pte & PTE_N != 0 {
                 return Err(Fail::Page);
             }
             let ppn = (pte & PTE_PPN_MASK) >> PTE_PPN_SHIFT;
@@ -184,7 +201,7 @@ pub(crate) fn get_physical_address(
                 return Err(Fail::Page);
             }
             if pte & (PTE_R | PTE_W | PTE_X) != 0 {
-                leaf = Some((pte, pte_addr, ppn, ptshift));
+                leaf = Some((pte, pte_addr, ppn, ptshift, i));
                 break;
             }
             // D, A and U are reserved in non-leaf PTEs, and so are the attribute bits.
@@ -195,7 +212,9 @@ pub(crate) fn get_physical_address(
             ptshift = ptshift.wrapping_sub(ptidxbits);
         }
         // Ran out of levels without a leaf.
-        let Some((mut pte, pte_addr, ppn, ptshift)) = leaf else { return Err(Fail::Page) };
+        let Some((mut pte, pte_addr, ppn, ptshift, level)) = leaf else {
+            return Err(Fail::Page);
+        };
 
         // A misaligned superpage.
         if ppn & ((1u64 << ptshift) - 1) != 0 {
@@ -251,7 +270,7 @@ pub(crate) fn get_physical_address(
             return Err(Fail::Page);
         }
         if updated_pte != pte && !debug {
-            pmp_check(st, pte_addr, 8, MmuAccessType::DataStore, PRV_S)?;
+            pmp_check(st, cfg, pte_addr, 8, MmuAccessType::DataStore, PRV_S)?;
             // QEMU swaps the PTE in RAM with a compare and swap and restarts the walk if it
             // changed; see the module doc of `tcg`. A PTE outside RAM fails the walk.
             let (now, res) = as_.load(pte_addr, 8, Endian::Little, MemTxAttrs::default());
@@ -268,9 +287,21 @@ pub(crate) fn get_physical_address(
             pte = updated_pte;
         }
 
-        // For superpages, the low bits of the PPN come from the virtual address.
+        // For superpages, the low bits of the PPN come from the virtual address. A NAPOT
+        // PTE of Svnapot is only allowed as a 4 KiB leaf of a 64 KiB range, whose low four
+        // PPN bits come from the virtual address too.
         let vpn = addr >> PGSHIFT;
-        let pa = ((ppn | (vpn & ((1u64 << ptshift) - 1))) << PGSHIFT) | (addr & 0xfff);
+        let mut napot_bits = 0;
+        if cfg.ext_svnapot && pte & PTE_N != 0 {
+            napot_bits = ppn.trailing_zeros() + 1;
+            if level != levels - 1 || napot_bits != 4 {
+                return Err(Fail::Page);
+            }
+        }
+        let napot_mask = (1u64 << napot_bits) - 1;
+        let pa = (((ppn & !napot_mask) | (vpn & napot_mask) | (vpn & ((1u64 << ptshift) - 1)))
+            << PGSHIFT)
+            | (addr & 0xfff);
         // Mark the page writable only after a store, so that the first store sets D.
         if access != MmuAccessType::DataStore && pte & PTE_D == 0 {
             prot &= !page::WRITE;
@@ -283,15 +314,16 @@ pub(crate) fn get_physical_address(
 /// and semihosting, through both stages under V=1, without PTE updates.
 pub(crate) fn translate_debug(
     st: &CpuRiscvState,
+    cfg: &RiscvCfg,
     as_: &AddressSpace,
     addr: u64,
     mmu_idx: usize,
 ) -> Option<u64> {
     let load = MmuAccessType::DataLoad;
-    let t = get_physical_address(st, as_, addr, load, mmu_idx, true, st.virt(), true, None);
+    let t = get_physical_address(st, cfg, as_, addr, load, mmu_idx, true, st.virt(), true, None);
     let mut pa = t.ok()?.pa;
     if st.virt() {
-        let g = get_physical_address(st, as_, pa, load, MMU_IDX_U, false, true, true, None);
+        let g = get_physical_address(st, cfg, as_, pa, load, MMU_IDX_U, false, true, true, None);
         pa = g.ok()?.pa;
     }
     Some(pa)
@@ -307,8 +339,23 @@ pub(crate) fn tlb_fill(
     probe: bool,
     ra: Ra,
 ) -> Result<bool, CpuLoopExit> {
-    let st = CpuRiscvState::load(cpu.env);
+    let mut st = CpuRiscvState::load(cpu.env);
     let as_ = cpu.core.address_space().clone();
+    let ops = cpu.ops();
+    let rv = super::riscv_of(&ops);
+    let cfg = rv.cfg();
+    // pmu_tlb_fill_incr_ctr().
+    let event = match access {
+        MmuAccessType::InstFetch => pmu::EVENT_CACHE_ITLB_PREFETCH_MISS,
+        MmuAccessType::DataLoad => pmu::EVENT_CACHE_DTLB_READ_MISS,
+        MmuAccessType::DataStore => pmu::EVENT_CACHE_DTLB_WRITE_MISS,
+    };
+    if let Some(overflow) = pmu::incr_ctr(&mut st, cfg, event) {
+        st.store(cpu.env);
+        if overflow {
+            rv.update_mip(&cpu.shared(), MIP_LCOFIP, MIP_LCOFIP);
+        }
+    }
     let mode = mmuidx_priv(mmu_idx);
     let two_stage = mmuidx_2stage(mmu_idx);
     let mut tlb_size = 4096;
@@ -319,6 +366,7 @@ pub(crate) fn tlb_fill(
         // The VS stage.
         let r = get_physical_address(
             &st,
+            cfg,
             &as_,
             address,
             access,
@@ -340,12 +388,14 @@ pub(crate) fn tlb_fill(
                 // The G stage.
                 let im = t.pa;
                 match get_physical_address(
-                    &st, &as_, im, access, MMU_IDX_U, false, true, false, None,
+                    &st, cfg, &as_, im, access, MMU_IDX_U, false, true, false, None,
                 ) {
-                    Ok(t2) => pmp_check(&st, t2.pa, size as u64, access, mode).map(|prot_pmp| {
-                        tlb_size = pmp::get_tlb_size(&st, t2.pa);
-                        Translation { pa: t2.pa, prot: t.prot & t2.prot & prot_pmp }
-                    }),
+                    Ok(t2) => {
+                        pmp_check(&st, cfg, t2.pa, size as u64, access, mode).map(|prot_pmp| {
+                            tlb_size = pmp::get_tlb_size(&st, t2.pa);
+                            Translation { pa: t2.pa, prot: t.prot & t2.prot & prot_pmp }
+                        })
+                    }
                     Err(fail) => {
                         // A guest physical address translation fault, an HS level
                         // exception.
@@ -359,9 +409,9 @@ pub(crate) fn tlb_fill(
             }
         }
     } else {
-        get_physical_address(&st, &as_, address, access, mmu_idx, true, false, false, None)
+        get_physical_address(&st, cfg, &as_, address, access, mmu_idx, true, false, false, None)
             .and_then(|t| {
-                let prot_pmp = pmp_check(&st, t.pa, size as u64, access, mode)?;
+                let prot_pmp = pmp_check(&st, cfg, t.pa, size as u64, access, mode)?;
                 tlb_size = pmp::get_tlb_size(&st, t.pa);
                 Ok(Translation { pa: t.pa, prot: t.prot & prot_pmp })
             })
@@ -479,7 +529,18 @@ mod tests {
     ) -> Result<Translation, Fail> {
         let idx = if first_stage { MMU_IDX_S | MMU_2STAGE_BIT } else { MMU_IDX_U };
         let load = MmuAccessType::DataLoad;
-        get_physical_address(st, as_, addr, load, idx, first_stage, true, true, fault)
+        get_physical_address(
+            st,
+            &RiscvCfg::default(),
+            as_,
+            addr,
+            load,
+            idx,
+            first_stage,
+            true,
+            true,
+            fault,
+        )
     }
 
     #[test]
@@ -532,15 +593,36 @@ mod tests {
         // through the G stage.
         let t = walk(&st, &as_, 0x4000_0abc, true, None).unwrap();
         assert_eq!(t.pa, 0x30_0abc);
-        let pa = translate_debug(&st, &as_, 0x4000_0abc, MMU_IDX_S | MMU_2STAGE_BIT);
+        let pa = translate_debug(
+            &st,
+            &RiscvCfg::default(),
+            &as_,
+            0x4000_0abc,
+            MMU_IDX_S | MMU_2STAGE_BIT,
+        );
         assert_eq!(pa, Some(RAM + 0x30_0abc));
         // A VS stage gigapage.
-        let pa = translate_debug(&st, &as_, 0x8000_1234, MMU_IDX_S | MMU_2STAGE_BIT);
+        let pa = translate_debug(
+            &st,
+            &RiscvCfg::default(),
+            &as_,
+            0x8000_1234,
+            MMU_IDX_S | MMU_2STAGE_BIT,
+        );
         assert_eq!(pa, Some(RAM + 0x1234));
         // The guest physical page 0x4000_0000 has no G stage mapping.
         let t = walk(&st, &as_, 0x4000_1000, true, None).unwrap();
         assert_eq!(t.pa, 0x4000_0000);
-        assert_eq!(translate_debug(&st, &as_, 0x4000_1000, MMU_IDX_S | MMU_2STAGE_BIT), None);
+        assert_eq!(
+            translate_debug(
+                &st,
+                &RiscvCfg::default(),
+                &as_,
+                0x4000_1000,
+                MMU_IDX_S | MMU_2STAGE_BIT
+            ),
+            None
+        );
     }
 
     #[test]
@@ -564,7 +646,18 @@ mod tests {
         st.satp = 0;
         let idx = MMU_IDX_S | MMU_2STAGE_BIT;
         let load = MmuAccessType::DataLoad;
-        let t = get_physical_address(&st, &as_, 0x4000_0abc, load, idx, true, true, true, None);
+        let t = get_physical_address(
+            &st,
+            &RiscvCfg::default(),
+            &as_,
+            0x4000_0abc,
+            load,
+            idx,
+            true,
+            true,
+            true,
+            None,
+        );
         assert_eq!(t.unwrap().pa, 0x30_0abc);
     }
 

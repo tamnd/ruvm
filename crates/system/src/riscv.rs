@@ -17,9 +17,11 @@
 //!
 //! Deliberate differences from QEMU:
 //!
-//! - The only CPU model is `rv64`, QEMU's default, with the `xlrbr`, `h` and vector
-//!   extension properties. The other models fail with "... is not supported by ruvm yet",
-//!   and so do the other CPU properties.
+//! - The CPU models are `rv64` (the default), `max`, `rv64i`, `rv64e`, the RVA22 and RVA23
+//!   profile CPUs, `sifive-e51`, `sifive-u54` and `shakti-c`, with QEMU's properties (see
+//!   `ruvm_target_riscv::cfg`). `max` leaves out the extensions this port does not have.
+//!   The other models, a profile CPU that needs such an extension, and a property that turns
+//!   one on fail with "... is not supported by ruvm yet".
 //! - The machine properties are taken only where their value describes the board that
 //!   exists: `aclint=off`, `aia=none`, `aia-guests=0`, `acpi=off` or `auto` (there are no
 //!   ACPI tables either way) and `iommu-sys=off` or `auto`. Other values fail with "... is not
@@ -59,7 +61,9 @@ use ruvm_qapi::types::{
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
-use ruvm_target_riscv::cpu::RiscvCfg;
+use ruvm_target_riscv::cfg::{
+    CPU_MODELS, CpuBuilder, OTHER_CPU_MODELS, PropError, RiscvCfg, model_missing,
+};
 use ruvm_target_riscv::tcg::SemihostingHost;
 
 use crate::arm::{Semihosting, SemihostingTarget};
@@ -332,88 +336,63 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
     Ok(o)
 }
 
-/// The CPU models qemu-system-riscv64 has that are not modelled here.
-const OTHER_RISCV_CPUS: &[&str] = &[
-    "max",
-    "max32",
-    "rv32",
-    "x-rv128",
-    "rv32i",
-    "rv32e",
-    "rv64i",
-    "rv64e",
-    "rva22u64",
-    "rva22s64",
-    "rva23u64",
-    "rva23s64",
-    "lowrisc-ibex",
-    "shakti-c",
-    "sifive-e31",
-    "sifive-e34",
-    "sifive-e51",
-    "sifive-u34",
-    "sifive-u54",
-    "thead-c906",
-    "thead-c908",
-    "thead-c908v",
-    "veyron-v1",
-    "tt-ascalon",
-    "xiangshan-nanhu",
-    "xiangshan-kunminghu",
-    "mips-p8700",
-    "host",
-];
-
-/// `-cpu model,prop=value,...` for virt (`rv64` without one). Gives whether the `xlrbr`
-/// extension is on.
-/// The CPU options of `-cpu rv64,...`: the XLRBR vendor extension and the vector
-/// extension set.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct CpuChoice {
-    pub(crate) xlrbr: bool,
-    pub(crate) vector: RiscvCfg,
-}
-
-/// `-cpu`: the `rv64` model and its boolean extension properties. The vector extension
-/// properties take QEMU's names; the implied extension rules then turn on what they need,
-/// except that a property the user set keeps the user's value, as
-/// `cpu_cfg_ext_auto_update()` does.
-pub(crate) fn parse_cpu(arg: Option<&str>) -> Result<CpuChoice> {
+/// `-cpu model,prop=value,...` for virt (`rv64` without one): the model with its properties
+/// set, as `cpu_parse_cpu_model()` and the global properties of the CPU type leave it. The
+/// harts finalize it with [`finalize_cpu`].
+pub(crate) fn parse_cpu(arg: Option<&str>) -> Result<CpuBuilder> {
     let arg = arg.unwrap_or("rv64");
     let mut parts = arg.split(',');
     let name = parts.next().unwrap_or_default();
-    if name != "rv64" {
-        if OTHER_RISCV_CPUS.contains(&name) {
+    let builder = if model_missing(name).is_empty() { CpuBuilder::new(name) } else { None };
+    let Some(mut builder) = builder else {
+        if CPU_MODELS.contains(&name) || OTHER_CPU_MODELS.contains(&name) {
             return Err(Error::generic(format!("CPU model '{name}' is not supported by ruvm yet")));
         }
         return Err(Error::generic(format!("unable to find CPU model '{name}'")));
-    }
-    let mut xlrbr = false;
-    let mut vector = RiscvCfg::default();
-    let mut user: Vec<(&str, bool)> = Vec::new();
+    };
     for feat in parts.filter(|f| !f.is_empty()) {
         let Some((prop, value)) = feat.split_once('=') else {
-            return Err(Error::generic(format!("Expected key=value format, found {feat}")));
+            return Err(Error::generic(format!("Expected key=value format, found {feat}.")));
         };
-        match prop {
-            "xlrbr" => xlrbr = prop_bool(prop, value)?,
-            _ if RiscvCfg::default().set_prop(prop, false) => {
-                let on = prop_bool(prop, value)?;
-                vector.set_prop(prop, on);
-                user.push((prop, on));
+        let global = format!("{name}-riscv-cpu.{prop}");
+        let err = match builder.set(prop, value) {
+            Ok(()) => continue,
+            Err(PropError::NotFound) => Error::generic(format!(
+                "can't apply global {global}={value}: Property '{global}' not found"
+            )),
+            Err(PropError::Invalid(msg)) => {
+                Error::generic(format!("can't apply global {global}={value}: {msg}"))
             }
-            _ => {
-                return Err(Error::generic(format!(
-                    "CPU property {prop}={value} is not supported by ruvm yet"
-                )));
+            Err(PropError::Hinted(msg, hint)) => {
+                Error::generic(format!("can't apply global {global}={value}: {msg}")).hint(hint)
             }
+            Err(PropError::Unsupported) => {
+                Error::generic(format!("CPU property {prop}={value} is not supported by ruvm yet"))
+            }
+        };
+        // The first hart prints the warnings of the properties set before this one.
+        for w in builder.prop_warnings() {
+            warn_report(w);
         }
+        return Err(err);
     }
-    vector.apply_implied();
-    for (prop, on) in user {
-        vector.set_prop(prop, on);
+    Ok(builder)
+}
+
+/// `riscv_cpu_finalize_features()` for each of the `smp` harts: the configuration they run
+/// with (the same for every hart). The warnings go to `warn` in the order QEMU prints them,
+/// the ones before a failure included.
+pub(crate) fn finalize_cpu(
+    cpu: &CpuBuilder,
+    smp: usize,
+    warn: &mut Vec<String>,
+) -> Result<RiscvCfg> {
+    let mut first = None;
+    for hart in 0..smp.max(1) {
+        let cfg = cpu.clone().finalize(hart as u64, warn).map_err(Error::generic)?;
+        first.get_or_insert(cfg);
     }
-    Ok(CpuChoice { xlrbr, vector })
+    Ok(first.unwrap_or_default())
 }
 
 /// `-device loader,...`, the properties of hw/core/generic-loader.c. The checks that need
@@ -726,6 +705,12 @@ pub(crate) fn start_board_tcg(
         )));
     }
     let cpu = parse_cpu(args.cpu).map_err(one)?;
+    let mut cpu_warnings = Vec::new();
+    let cpu = finalize_cpu(&cpu, opts.cpus as usize, &mut cpu_warnings);
+    for w in &cpu_warnings {
+        warn_report(w);
+    }
+    let cpu = cpu.map_err(one)?;
     let plan = devices::plan(args.drives, args.devices)?;
     let find = |name: &str| args.firmware.find(name).map(|p| p.to_string_lossy().into_owned());
     let firmware =
@@ -751,8 +736,7 @@ pub(crate) fn start_board_tcg(
     cfg.append = opts.append;
     cfg.dtb = opts.dtb;
     cfg.firmware = firmware;
-    cfg.xlrbr = cpu.xlrbr;
-    cfg.vector = cpu.vector;
+    cfg.cpu = cpu;
     cfg.loaders = plan.loaders;
     cfg.semihosting = console.clone().map(|c| c as Arc<dyn SemihostingHost>);
     cfg.semihosting_userspace = semi.userspace;
@@ -826,31 +810,40 @@ mod tests {
         assert_eq!(e.message(), "-smp sockets=2 is not supported by ruvm yet");
     }
 
+    fn cpu(arg: &str) -> RiscvCfg {
+        finalize_cpu(&parse_cpu(Some(arg)).unwrap(), 1, &mut Vec::new()).unwrap()
+    }
+
+    fn cpu_err(arg: &str) -> String {
+        match parse_cpu(Some(arg)) {
+            Ok(b) => finalize_cpu(&b, 1, &mut Vec::new()).unwrap_err().message().to_string(),
+            Err(e) => e.message().to_string(),
+        }
+    }
+
     #[test]
     fn cpu_models() {
-        assert!(!parse_cpu(None).unwrap().xlrbr);
-        assert!(parse_cpu(Some("rv64,xlrbr=true")).unwrap().xlrbr);
-        assert!(!parse_cpu(Some("rv64,xlrbr=off")).unwrap().xlrbr);
-        let c = parse_cpu(Some("rv64,v=true")).unwrap();
-        assert!(c.vector.ext_v && c.vector.ext_zve64d && c.vector.ext_zve32x);
-        assert!(c.vector.validate().is_ok());
-        assert!(!parse_cpu(None).unwrap().vector.ext_v);
-        // A property the user turned off stays off; the board then rejects the set.
-        let c = parse_cpu(Some("rv64,v=on,zve64d=off")).unwrap();
-        assert!(c.vector.ext_v && !c.vector.ext_zve64d);
+        let rv64 = finalize_cpu(&parse_cpu(None).unwrap(), 1, &mut Vec::new()).unwrap();
+        assert_eq!(rv64, RiscvCfg::default());
+        assert!(!rv64.ext_xlrbr && rv64.ext_h() && !rv64.ext_v());
+        assert!(cpu("rv64,xlrbr=true").ext_xlrbr);
+        assert!(!cpu("rv64,xlrbr=off").ext_xlrbr);
+        let c = cpu("rv64,v=true");
+        assert!(c.ext_v() && c.ext_zve64d && c.ext_zve32x);
+        assert!(!cpu("rv64,h=false").ext_h());
+        assert!(cpu("max").ext_v());
+        assert_eq!(cpu("sifive-u54").mmu_type().as_deref(), Some("riscv,sv39"));
+        assert_eq!(cpu_err("sifive-e31"), "CPU model 'sifive-e31' is not supported by ruvm yet");
+        assert_eq!(cpu_err("foo"), "unable to find CPU model 'foo'");
         assert_eq!(
-            parse_cpu(Some("sifive-u54")).unwrap_err().message(),
-            "CPU model 'sifive-u54' is not supported by ruvm yet"
+            cpu_err("rv64,zvfoo=true"),
+            "can't apply global rv64-riscv-cpu.zvfoo=true: Property 'rv64-riscv-cpu.zvfoo' not \
+             found"
         );
-        assert_eq!(parse_cpu(Some("foo")).unwrap_err().message(), "unable to find CPU model 'foo'");
-        // H is on by default, as in QEMU, and can be turned off.
-        assert!(parse_cpu(None).unwrap().vector.ext_h);
-        assert!(parse_cpu(Some("rv64,h=true")).unwrap().vector.ext_h);
-        assert!(!parse_cpu(Some("rv64,h=false")).unwrap().vector.ext_h);
-        assert_eq!(
-            parse_cpu(Some("rv64,zvfoo=true")).unwrap_err().message(),
-            "CPU property zvfoo=true is not supported by ruvm yet"
-        );
+        assert_eq!(cpu_err("rv64,v"), "Expected key=value format, found v.");
+        assert_eq!(cpu_err("rv64,pmu-mask=7"), "\"pmu-mask\" contains invalid bits (0-2) set");
+        // QEMU takes this set too.
+        assert!(cpu("rv64,v=on,zve64d=off").ext_v());
     }
 
     #[test]

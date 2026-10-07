@@ -8,10 +8,13 @@
 //! Zicboz, Zawrs and Sstc extensions of QEMU's default `rv64` CPU, with the vector
 //! extensions as options.
 //!
+//! - [`cfg`]: the CPU models and their `-cpu` properties, and the configuration a hart runs
+//!   with.
 //! - [`cpu`]: `CPURISCVState` as a struct the generated code addresses by offset, and the
 //!   architectural constants.
 //! - [`tcg`]: the translator, the helpers, the page walk and the `CpuOps` glue.
 
+pub mod cfg;
 pub mod cpu;
 pub mod tcg;
 

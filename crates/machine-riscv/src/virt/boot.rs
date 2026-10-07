@@ -225,7 +225,8 @@ pub(crate) fn largest_gap(roms: &[Rom], base: u64, size: u64) -> (u64, u64) {
     let mut count = 0;
     for (b, se) in secs {
         if count == 0 && count + se == 1 {
-            let gap = b - gapstart;
+            // A blob that starts below `base` makes this wrap, as the `size_t` does in QEMU.
+            let gap = b.wrapping_sub(gapstart);
             if gap > best_size {
                 best_base = gapstart;
                 best_size = gap;
@@ -235,7 +236,7 @@ pub(crate) fn largest_gap(roms: &[Rom], base: u64, size: u64) -> (u64, u64) {
         }
         count += se;
     }
-    (best_base, best_base + best_size)
+    (best_base, best_base.wrapping_add(best_size))
 }
 
 /// `RISCVBootInfo` after `virt_machine_done()`, and the addresses the reset vector uses.
@@ -940,6 +941,16 @@ mod tests {
              a (addresses 0x0000000000001000 - 0x0000000000001100)\n  \
              b (addresses 0x0000000000001080 - 0x0000000000001090)\n"
         ));
+    }
+
+    #[test]
+    fn largest_gap_with_a_blob_below_the_base() {
+        let roms = [rom("elf", 0x7fff_f000, 0x2000, AS_MEMORY)];
+        // QEMU's size_t gap wraps, so the whole space from the base up wins.
+        let (lo, hi) = largest_gap(&roms, 0x8000_0000, 0x800_0000);
+        assert_eq!((lo, hi), (0x8000_0000, 0x7fff_f000));
+        let roms = [rom("fw", 0x8000_0000, 0x4_0000, AS_MEMORY)];
+        assert_eq!(largest_gap(&roms, 0x8000_0000, 0x800_0000), (0x8004_0000, 0x8800_0000));
     }
 
     #[test]

@@ -257,7 +257,9 @@ impl Guest<'_, '_> {
     fn translate(&mut self, va: u64) -> Result<u64, Fault> {
         let st = CpuRiscvState::load(self.cpu.env);
         let as_ = self.cpu.core.address_space().clone();
-        ptw::translate_debug(&st, &as_, va, self.mmu_idx).ok_or(Fault)
+        let ops = self.cpu.ops();
+        let cfg = super::riscv_of(&ops).cfg();
+        ptw::translate_debug(&st, cfg, &as_, va, self.mmu_idx).ok_or(Fault)
     }
 
     fn read(&mut self, va: u64, len: usize) -> Result<Vec<u8>, Fault> {

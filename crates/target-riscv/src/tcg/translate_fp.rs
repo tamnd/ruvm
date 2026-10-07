@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The F, D and Zfa instructions, the Zfhmin and Zfbfmin instructions and the compressed
-//! floating point loads and stores, a port of QEMU's `trans_rvf.c.inc`, `trans_rvd.c.inc`,
-//! `trans_rvzfa.c.inc`, the Zfhmin parts of `trans_rvzfh.c.inc` and the scalar parts of
+//! The F, D, Zfh and Zfa instructions, the Zfhmin and Zfbfmin instructions and the
+//! compressed floating point loads and stores, a port of QEMU's `trans_rvf.c.inc`,
+//! `trans_rvd.c.inc`, `trans_rvzfa.c.inc`, `trans_rvzfh.c.inc` and the scalar parts of
 //! `trans_rvbf16.c.inc`, with the floating point parts of `translate.c` (`gen_set_rm()`,
-//! `gen_nanbox_s()`, `gen_check_nanbox_s()`, `gen_nanbox_h()`).
+//! `gen_nanbox_s()`, `gen_check_nanbox_s()`, `gen_nanbox_h()`, `gen_check_nanbox_h()`).
 //!
-//! The model is RV64 with F, D, C and Zfa and without Zfinx, Zdinx, Zhinx, Zhinxmin, Zcf or
-//! Zama16b, so the register of an operand is always the `cpu_fpr` global, single and half
-//! precision values are NaN boxed, and the Zfh arithmetic, `fmvh.x.d` and `fmvp.d.x` (RV32
-//! only) keep the default `trans_*` that returns false. `flh`, `fsh`, `fmv.x.h`, `fmv.h.x`
-//! and the conversions check `cfg.ext_zfhmin` and `cfg.ext_zfbfmin`. `c.flw` and
+//! The model is RV64 without Zfinx, Zdinx, Zhinx, Zhinxmin or Zcf, so the register of an
+//! operand is always the `cpu_fpr` global, single and half precision values are NaN boxed,
+//! and `fmvh.x.d` and `fmvp.d.x` (RV32 only) keep the default `trans_*` that returns false.
+//! Each instruction checks F, D, Zfh and Zfa as QEMU does, and `flh`, `fsh`, `fmv.x.h`,
+//! `fmv.h.x` and the conversions check `cfg.ext_zfhmin` and `cfg.ext_zfbfmin`. `c.flw` and
 //! `c.fsw` share their encodings with `c.ld` and `c.sd`, which come first in their decode
 //! groups on RV64, so they are never reached and keep the default as well.
 //!
@@ -24,7 +24,7 @@ use ruvm_jit_core::{MemOp, Temp};
 use super::fpu;
 use super::helpers::Def;
 use super::translate::S;
-use crate::cpu::{EXT_STATUS_DISABLED, RISCV_FRM_DYN, RISCV_FRM_RTZ};
+use crate::cpu::{EXT_STATUS_DISABLED, RISCV_FRM_DYN, RISCV_FRM_RTZ, RVC, RVD, RVF};
 use crate::decode::insn32::{arg_i, arg_s};
 
 /// The upper half of a NaN boxed single precision value.
@@ -33,8 +33,12 @@ const NANBOX_S: u64 = 0xffff_ffff_0000_0000;
 const NANBOXED_NAN_S: u64 = 0xffff_ffff_7fc0_0000;
 /// The upper bits of a NaN boxed half precision or bf16 value, `gen_nanbox_h()`.
 const NANBOX_H: u64 = 0xffff_ffff_ffff_0000;
+/// The canonical half precision NaN, NaN boxed.
+const NANBOXED_NAN_H: u64 = 0xffff_ffff_ffff_7e00;
 /// The sign bit of a single precision value.
 const SIGN_S: i64 = 1 << 31;
+/// The sign bit of a half precision value.
+const SIGN_H: i64 = 1 << 15;
 
 /// The `fli.s` values, NaN boxed, indexed by the `rs1` field.
 pub(super) const FLI_S: [u64; 32] = [
@@ -70,6 +74,42 @@ pub(super) const FLI_S: [u64; 32] = [
     0xffffffff47800000, // 2^16
     0xffffffff7f800000, // +inf
     0xffffffff7fc00000, // canonical NaN
+];
+
+/// The `fli.h` values, NaN boxed, indexed by the `rs1` field. 2^16 does not fit and is +inf.
+pub(super) const FLI_H: [u64; 32] = [
+    0xffffffffffffbc00, // -1.0
+    0xffffffffffff0400, // minimum positive normal
+    0xffffffffffff0100, // 1.0 * 2^-16
+    0xffffffffffff0200, // 1.0 * 2^-15
+    0xffffffffffff1c00, // 1.0 * 2^-8
+    0xffffffffffff2000, // 1.0 * 2^-7
+    0xffffffffffff2c00, // 1.0 * 2^-4
+    0xffffffffffff3000, // 1.0 * 2^-3
+    0xffffffffffff3400, // 0.25
+    0xffffffffffff3500, // 0.3125
+    0xffffffffffff3600, // 0.375
+    0xffffffffffff3700, // 0.4375
+    0xffffffffffff3800, // 0.5
+    0xffffffffffff3900, // 0.625
+    0xffffffffffff3a00, // 0.75
+    0xffffffffffff3b00, // 0.875
+    0xffffffffffff3c00, // 1.0
+    0xffffffffffff3d00, // 1.25
+    0xffffffffffff3e00, // 1.5
+    0xffffffffffff3f00, // 1.75
+    0xffffffffffff4000, // 2.0
+    0xffffffffffff4100, // 2.5
+    0xffffffffffff4200, // 3
+    0xffffffffffff4400, // 4
+    0xffffffffffff4800, // 8
+    0xffffffffffff4c00, // 16
+    0xffffffffffff5800, // 2^7
+    0xffffffffffff5c00, // 2^8
+    0xffffffffffff7800, // 2^15
+    0xffffffffffff7c00, // 2^16
+    0xffffffffffff7c00, // +inf
+    0xffffffffffff7e00, // canonical NaN
 ];
 
 /// The `fli.d` values, indexed by the `rs1` field.
@@ -126,6 +166,20 @@ impl S<'_, '_> {
         self.d.mstatus_fs == EXT_STATUS_DISABLED
     }
 
+    /// `REQUIRE_ZFINX_OR_F` (`double` false) or `REQUIRE_ZDINX_OR_D` (`double` true), and
+    /// `REQUIRE_ZFA` when `zfa`. Zfinx and Zdinx cannot be turned on in this port, so this
+    /// is the F or D bit of misa.
+    pub(super) fn fp_ext(&self, double: bool, zfa: bool) -> bool {
+        let cfg = &self.d.cfg;
+        cfg.has(if double { RVD } else { RVF }) && (!zfa || cfg.ext_zfa)
+    }
+
+    /// `REQUIRE_ZCD_OR_DC`: `c.fld` and `c.fsd` need Zcd, or both D and C.
+    pub(super) fn zcd_or_dc(&self) -> bool {
+        let cfg = &self.d.cfg;
+        cfg.ext_zcd || (cfg.has(RVD) && cfg.has(RVC))
+    }
+
     /// `gen_set_rm()`: make `rm` the rounding mode of the helpers that follow, unless the
     /// block already did.
     pub(super) fn gen_set_rm(&mut self, rm: i32) {
@@ -175,6 +229,22 @@ impl S<'_, '_> {
         let t_max = self.c64(NANBOX_S as i64);
         let t_nan = self.c64(NANBOXED_NAN_S as i64);
         self.f().gen_movcond_i64(Cond::Geu, out, v, t_max, v, t_nan);
+    }
+
+    /// `gen_check_nanbox_h()`, the half precision [`S::gen_check_nanbox_s`].
+    fn gen_check_nanbox_h(&mut self, out: TempI64, v: TempI64) {
+        let t_max = self.c64(NANBOX_H as i64);
+        let t_nan = self.c64(NANBOXED_NAN_H as i64);
+        self.f().gen_movcond_i64(Cond::Geu, out, v, t_max, v, t_nan);
+    }
+
+    /// [`S::gen_check_nanbox_h`] (`half`) or [`S::gen_check_nanbox_s`].
+    fn gen_check_nanbox_hs(&mut self, out: TempI64, v: TempI64, half: bool) {
+        if half {
+            self.gen_check_nanbox_h(out, v);
+        } else {
+            self.gen_check_nanbox_s(out, v);
+        }
     }
 
     /// Call helper `h` with `env` and `srcs`, the result in a fresh temp.
@@ -268,12 +338,13 @@ impl S<'_, '_> {
     }
 
     /// `flw` and `fld`: `fld` loads 8 bytes, `flw` loads 4 and NaN boxes them. QEMU's
-    /// `MO_ATOM_IFALIGN` is the default atomicity of `MemOp`, so it needs no flag.
+    /// `MO_ATOM_IFALIGN` is the default atomicity of `MemOp`; Zama16b makes it
+    /// `MO_ATOM_WITHIN16`.
     pub(super) fn fp_load(&mut self, a: &arg_i, double: bool) -> bool {
         if self.fpu_off() {
             return false;
         }
-        let memop = if double { MemOp::LEUQ } else { MemOp::LEUL };
+        let memop = (if double { MemOp::LEUQ } else { MemOp::LEUL }) | self.zama16b();
         self.decode_save_opc(0);
         let addr = self.address(a.rs1, i64::from(a.imm));
         let dest = self.fpr(a.rd);
@@ -291,7 +362,7 @@ impl S<'_, '_> {
         if self.fpu_off() {
             return false;
         }
-        let memop = if double { MemOp::LEUQ } else { MemOp::LEUL };
+        let memop = (if double { MemOp::LEUQ } else { MemOp::LEUL }) | self.zama16b();
         self.decode_save_opc(0);
         let addr = self.address(a.rs1, i64::from(a.imm));
         let src = self.fpr(a.rs2);
@@ -300,38 +371,39 @@ impl S<'_, '_> {
         true
     }
 
-    /// `fsgnj.s`, `fsgnjn.s` and `fsgnjx.s`, the operands checked to be NaN boxed. The
-    /// result keeps the NaN boxing of an operand.
-    pub(super) fn fp_sgnj_s(&mut self, rd: i32, rs1: i32, rs2: i32, op: Sgnj) -> bool {
+    /// `fsgnj.s`, `fsgnjn.s` and `fsgnjx.s`, or with `half` those of Zfh, the operands
+    /// checked to be NaN boxed. The result keeps the NaN boxing of an operand.
+    pub(super) fn fp_sgnj_hs(&mut self, rd: i32, rs1: i32, rs2: i32, op: Sgnj, half: bool) -> bool {
         if self.fpu_off() {
             return false;
         }
+        let (sign, len) = if half { (SIGN_H, 15) } else { (SIGN_S, 31) };
         let src1 = self.fpr(rs1);
         let dest = self.new64();
         if op == Sgnj::Copy && rs1 == rs2 {
-            // fmv.s
-            self.gen_check_nanbox_s(dest, src1);
+            // fmv.s or fmv.h
+            self.gen_check_nanbox_hs(dest, src1, half);
         } else {
             let r1 = self.new64();
-            self.gen_check_nanbox_s(r1, src1);
+            self.gen_check_nanbox_hs(r1, src1, half);
             if rs1 == rs2 {
                 if op == Sgnj::Neg {
-                    // fneg.s
-                    self.f().gen_xori_i64(dest, r1, SIGN_S);
+                    // fneg
+                    self.f().gen_xori_i64(dest, r1, sign);
                 } else {
-                    // fabs.s
-                    self.f().gen_andi_i64(dest, r1, !SIGN_S);
+                    // fabs
+                    self.f().gen_andi_i64(dest, r1, !sign);
                 }
             } else {
                 let src2 = self.fpr(rs2);
                 let r2 = self.new64();
-                self.gen_check_nanbox_s(r2, src2);
+                self.gen_check_nanbox_hs(r2, src2, half);
                 match op {
                     // Keeps the NaN boxing of rs2.
-                    Sgnj::Copy => self.f().gen_deposit_i64(dest, r2, r1, 0, 31),
+                    Sgnj::Copy => self.f().gen_deposit_i64(dest, r2, r1, 0, len),
                     Sgnj::Neg => {
-                        // Replace bit 31 of rs1 with the inverse of that of rs2.
-                        let mask = self.c64(!SIGN_S);
+                        // Replace the sign bit of rs1 with the inverse of that of rs2.
+                        let mask = self.c64(!sign);
                         let f = self.f();
                         f.gen_nor_i64(r2, r2, mask);
                         f.gen_and_i64(dest, mask, r1);
@@ -339,7 +411,7 @@ impl S<'_, '_> {
                     }
                     Sgnj::Xor => {
                         let f = self.f();
-                        f.gen_andi_i64(dest, r2, SIGN_S);
+                        f.gen_andi_i64(dest, r2, sign);
                         f.gen_xor_i64(dest, r1, dest);
                     }
                 }
@@ -434,12 +506,11 @@ impl S<'_, '_> {
         true
     }
 
-    /// `fli.s` and `fli.d`: the constant `rs1` of the table.
-    pub(super) fn fp_fli(&mut self, rd: i32, rs1: i32, double: bool) -> bool {
+    /// `fli.h`, `fli.s` and `fli.d`: the constant `rs1` of `table`.
+    pub(super) fn fp_fli(&mut self, rd: i32, rs1: i32, table: &[u64; 32]) -> bool {
         if self.fpu_off() {
             return false;
         }
-        let table = if double { &FLI_D } else { &FLI_S };
         let dest = self.fpr(rd);
         self.f().gen_movi_i64(dest, table[rs1 as usize] as i64);
         self.mark_fs_dirty();
@@ -523,314 +594,545 @@ macro_rules! fp_trans32 {
         // F.
 
         fn trans_flw(&mut self, a: &mut arg_flw) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_load(a, false)
         }
 
         fn trans_fsw(&mut self, a: &mut arg_fsw) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_store(a, false)
         }
 
         fn trans_fmadd_s(&mut self, a: &mut arg_fmadd_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FMADD_S)
         }
 
         fn trans_fmsub_s(&mut self, a: &mut arg_fmsub_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FMSUB_S)
         }
 
         fn trans_fnmsub_s(&mut self, a: &mut arg_fnmsub_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FNMSUB_S)
         }
 
         fn trans_fnmadd_s(&mut self, a: &mut arg_fnmadd_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FNMADD_S)
         }
 
         fn trans_fadd_s(&mut self, a: &mut arg_fadd_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FADD_S)
         }
 
         fn trans_fsub_s(&mut self, a: &mut arg_fsub_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FSUB_S)
         }
 
         fn trans_fmul_s(&mut self, a: &mut arg_fmul_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FMUL_S)
         }
 
         fn trans_fdiv_s(&mut self, a: &mut arg_fdiv_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FDIV_S)
         }
 
         fn trans_fsqrt_s(&mut self, a: &mut arg_fsqrt_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FSQRT_S)
         }
 
         fn trans_fsgnj_s(&mut self, a: &mut arg_fsgnj_s) -> bool {
-            self.fp_sgnj_s(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Copy)
+            if !self.fp_ext(false, false) {
+                return false;
+            }
+            self.fp_sgnj_hs(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Copy, false)
         }
 
         fn trans_fsgnjn_s(&mut self, a: &mut arg_fsgnjn_s) -> bool {
-            self.fp_sgnj_s(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Neg)
+            if !self.fp_ext(false, false) {
+                return false;
+            }
+            self.fp_sgnj_hs(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Neg, false)
         }
 
         fn trans_fsgnjx_s(&mut self, a: &mut arg_fsgnjx_s) -> bool {
-            self.fp_sgnj_s(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Xor)
+            if !self.fp_ext(false, false) {
+                return false;
+            }
+            self.fp_sgnj_hs(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Xor, false)
         }
 
         fn trans_fmin_s(&mut self, a: &mut arg_fmin_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMIN_S)
         }
 
         fn trans_fmax_s(&mut self, a: &mut arg_fmax_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMAX_S)
         }
 
         fn trans_fcvt_w_s(&mut self, a: &mut arg_fcvt_w_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_W_S)
         }
 
         fn trans_fcvt_wu_s(&mut self, a: &mut arg_fcvt_wu_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_WU_S)
         }
 
         fn trans_fmv_x_w(&mut self, a: &mut arg_fmv_x_w) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_fmv_x_w(a.rd, a.rs1)
         }
 
         fn trans_feq_s(&mut self, a: &mut arg_feq_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FEQ_S)
         }
 
         fn trans_flt_s(&mut self, a: &mut arg_flt_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLT_S)
         }
 
         fn trans_fle_s(&mut self, a: &mut arg_fle_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLE_S)
         }
 
         fn trans_fclass_s(&mut self, a: &mut arg_fclass_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1], None, &$crate::tcg::fpu::FCLASS_S)
         }
 
         fn trans_fcvt_s_w(&mut self, a: &mut arg_fcvt_s_w) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_S_W)
         }
 
         fn trans_fcvt_s_wu(&mut self, a: &mut arg_fcvt_s_wu) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_S_WU)
         }
 
         fn trans_fmv_w_x(&mut self, a: &mut arg_fmv_w_x) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_fmv_w_x(a.rd, a.rs1)
         }
 
         fn trans_fcvt_l_s(&mut self, a: &mut arg_fcvt_l_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_L_S)
         }
 
         fn trans_fcvt_lu_s(&mut self, a: &mut arg_fcvt_lu_s) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_LU_S)
         }
 
         fn trans_fcvt_s_l(&mut self, a: &mut arg_fcvt_s_l) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_S_L)
         }
 
         fn trans_fcvt_s_lu(&mut self, a: &mut arg_fcvt_s_lu) -> bool {
+            if !self.fp_ext(false, false) {
+                return false;
+            }
             self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_S_LU)
         }
 
         // D.
 
         fn trans_fld(&mut self, a: &mut arg_fld) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_load(a, true)
         }
 
         fn trans_fsd(&mut self, a: &mut arg_fsd) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_store(a, true)
         }
 
         fn trans_fmadd_d(&mut self, a: &mut arg_fmadd_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FMADD_D)
         }
 
         fn trans_fmsub_d(&mut self, a: &mut arg_fmsub_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FMSUB_D)
         }
 
         fn trans_fnmsub_d(&mut self, a: &mut arg_fnmsub_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FNMSUB_D)
         }
 
         fn trans_fnmadd_d(&mut self, a: &mut arg_fnmadd_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FNMADD_D)
         }
 
         fn trans_fadd_d(&mut self, a: &mut arg_fadd_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FADD_D)
         }
 
         fn trans_fsub_d(&mut self, a: &mut arg_fsub_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FSUB_D)
         }
 
         fn trans_fmul_d(&mut self, a: &mut arg_fmul_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FMUL_D)
         }
 
         fn trans_fdiv_d(&mut self, a: &mut arg_fdiv_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FDIV_D)
         }
 
         fn trans_fsqrt_d(&mut self, a: &mut arg_fsqrt_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FSQRT_D)
         }
 
         fn trans_fsgnj_d(&mut self, a: &mut arg_fsgnj_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_sgnj_d(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Copy)
         }
 
         fn trans_fsgnjn_d(&mut self, a: &mut arg_fsgnjn_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_sgnj_d(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Neg)
         }
 
         fn trans_fsgnjx_d(&mut self, a: &mut arg_fsgnjx_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_sgnj_d(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Xor)
         }
 
         fn trans_fmin_d(&mut self, a: &mut arg_fmin_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMIN_D)
         }
 
         fn trans_fmax_d(&mut self, a: &mut arg_fmax_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMAX_D)
         }
 
         fn trans_fcvt_s_d(&mut self, a: &mut arg_fcvt_s_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_S_D)
         }
 
         fn trans_fcvt_d_s(&mut self, a: &mut arg_fcvt_d_s) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_D_S)
         }
 
         fn trans_feq_d(&mut self, a: &mut arg_feq_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FEQ_D)
         }
 
         fn trans_flt_d(&mut self, a: &mut arg_flt_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLT_D)
         }
 
         fn trans_fle_d(&mut self, a: &mut arg_fle_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLE_D)
         }
 
         fn trans_fclass_d(&mut self, a: &mut arg_fclass_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_fclass_d(a.rd, a.rs1)
         }
 
         fn trans_fcvt_w_d(&mut self, a: &mut arg_fcvt_w_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_W_D)
         }
 
         fn trans_fcvt_wu_d(&mut self, a: &mut arg_fcvt_wu_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_WU_D)
         }
 
         fn trans_fcvt_d_w(&mut self, a: &mut arg_fcvt_d_w) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_D_W)
         }
 
         fn trans_fcvt_d_wu(&mut self, a: &mut arg_fcvt_d_wu) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_D_WU)
         }
 
         fn trans_fcvt_l_d(&mut self, a: &mut arg_fcvt_l_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_L_D)
         }
 
         fn trans_fcvt_lu_d(&mut self, a: &mut arg_fcvt_lu_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_LU_D)
         }
 
         fn trans_fmv_x_d(&mut self, a: &mut arg_fmv_x_d) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_fmv_x_d(a.rd, a.rs1)
         }
 
         fn trans_fcvt_d_l(&mut self, a: &mut arg_fcvt_d_l) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_D_L)
         }
 
         fn trans_fcvt_d_lu(&mut self, a: &mut arg_fcvt_d_lu) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_D_LU)
         }
 
         fn trans_fmv_d_x(&mut self, a: &mut arg_fmv_d_x) -> bool {
+            if !self.fp_ext(true, false) {
+                return false;
+            }
             self.fp_fmv_d_x(a.rd, a.rs1)
         }
 
         // Zfa.
 
         fn trans_fli_s(&mut self, a: &mut arg_fli_s) -> bool {
-            self.fp_fli(a.rd, a.rs1, false)
+            if !self.fp_ext(false, true) {
+                return false;
+            }
+            self.fp_fli(a.rd, a.rs1, &$crate::tcg::translate_fp::FLI_S)
         }
 
         fn trans_fli_d(&mut self, a: &mut arg_fli_d) -> bool {
-            self.fp_fli(a.rd, a.rs1, true)
+            if !self.fp_ext(true, true) {
+                return false;
+            }
+            self.fp_fli(a.rd, a.rs1, &$crate::tcg::translate_fp::FLI_D)
         }
 
         fn trans_fminm_s(&mut self, a: &mut arg_fminm_s) -> bool {
+            if !self.fp_ext(false, true) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMINM_S)
         }
 
         fn trans_fmaxm_s(&mut self, a: &mut arg_fmaxm_s) -> bool {
+            if !self.fp_ext(false, true) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMAXM_S)
         }
 
         fn trans_fminm_d(&mut self, a: &mut arg_fminm_d) -> bool {
+            if !self.fp_ext(true, true) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMINM_D)
         }
 
         fn trans_fmaxm_d(&mut self, a: &mut arg_fmaxm_d) -> bool {
+            if !self.fp_ext(true, true) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMAXM_D)
         }
 
         fn trans_fround_s(&mut self, a: &mut arg_fround_s) -> bool {
+            if !self.fp_ext(false, true) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FROUND_S)
         }
 
         fn trans_froundnx_s(&mut self, a: &mut arg_froundnx_s) -> bool {
+            if !self.fp_ext(false, true) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FROUNDNX_S)
         }
 
         fn trans_fround_d(&mut self, a: &mut arg_fround_d) -> bool {
+            if !self.fp_ext(true, true) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FROUND_D)
         }
 
         fn trans_froundnx_d(&mut self, a: &mut arg_froundnx_d) -> bool {
+            if !self.fp_ext(true, true) {
+                return false;
+            }
             self.fp_ff(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FROUNDNX_D)
         }
 
         fn trans_fcvtmod_w_d(&mut self, a: &mut arg_fcvtmod_w_d) -> bool {
+            if !self.fp_ext(true, true) {
+                return false;
+            }
             self.fp_fcvtmod_w_d(a.rd, a.rs1)
         }
 
         fn trans_fleq_s(&mut self, a: &mut arg_fleq_s) -> bool {
+            if !self.fp_ext(false, true) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLEQ_S)
         }
 
         fn trans_fltq_s(&mut self, a: &mut arg_fltq_s) -> bool {
+            if !self.fp_ext(false, true) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLTQ_S)
         }
 
         fn trans_fleq_d(&mut self, a: &mut arg_fleq_d) -> bool {
+            if !self.fp_ext(true, true) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLEQ_D)
         }
 
         fn trans_fltq_d(&mut self, a: &mut arg_fltq_d) -> bool {
+            if !self.fp_ext(true, true) {
+                return false;
+            }
             self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLTQ_D)
         }
 
@@ -861,10 +1163,16 @@ macro_rules! fp_trans32 {
         }
 
         fn trans_fcvt_d_h(&mut self, a: &mut arg_fcvt_d_h) -> bool {
+            if !self.d.cfg.has($crate::cpu::RVD) {
+                return false;
+            }
             self.fp_fcvt_h(a.rd, a.rs1, a.rm, false, &$crate::tcg::fpu::FCVT_D_H)
         }
 
         fn trans_fcvt_h_d(&mut self, a: &mut arg_fcvt_h_d) -> bool {
+            if !self.d.cfg.has($crate::cpu::RVD) {
+                return false;
+            }
             self.fp_fcvt_h(a.rd, a.rs1, a.rm, false, &$crate::tcg::fpu::FCVT_H_D)
         }
 
@@ -875,6 +1183,239 @@ macro_rules! fp_trans32 {
         fn trans_fcvt_s_bf16(&mut self, a: &mut arg_fcvt_s_bf16) -> bool {
             self.fp_fcvt_h(a.rd, a.rs1, a.rm, true, &$crate::tcg::fpu::FCVT_S_BF16)
         }
+
+        // Zfh, and the Zfh parts of Zfa.
+
+        fn trans_fmadd_h(&mut self, a: &mut arg_fmadd_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FMADD_H)
+        }
+
+        fn trans_fmsub_h(&mut self, a: &mut arg_fmsub_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FMSUB_H)
+        }
+
+        fn trans_fnmsub_h(&mut self, a: &mut arg_fnmsub_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FNMSUB_H)
+        }
+
+        fn trans_fnmadd_h(&mut self, a: &mut arg_fnmadd_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2, a.rs3], Some(a.rm), &$crate::tcg::fpu::FNMADD_H)
+        }
+
+        fn trans_fadd_h(&mut self, a: &mut arg_fadd_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FADD_H)
+        }
+
+        fn trans_fsub_h(&mut self, a: &mut arg_fsub_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FSUB_H)
+        }
+
+        fn trans_fmul_h(&mut self, a: &mut arg_fmul_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FMUL_H)
+        }
+
+        fn trans_fdiv_h(&mut self, a: &mut arg_fdiv_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2], Some(a.rm), &$crate::tcg::fpu::FDIV_H)
+        }
+
+        fn trans_fsqrt_h(&mut self, a: &mut arg_fsqrt_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FSQRT_H)
+        }
+
+        fn trans_fsgnj_h(&mut self, a: &mut arg_fsgnj_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_sgnj_hs(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Copy, true)
+        }
+
+        fn trans_fsgnjn_h(&mut self, a: &mut arg_fsgnjn_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_sgnj_hs(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Neg, true)
+        }
+
+        fn trans_fsgnjx_h(&mut self, a: &mut arg_fsgnjx_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_sgnj_hs(a.rd, a.rs1, a.rs2, $crate::tcg::translate_fp::Sgnj::Xor, true)
+        }
+
+        fn trans_fmin_h(&mut self, a: &mut arg_fmin_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMIN_H)
+        }
+
+        fn trans_fmax_h(&mut self, a: &mut arg_fmax_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMAX_H)
+        }
+
+        fn trans_feq_h(&mut self, a: &mut arg_feq_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FEQ_H)
+        }
+
+        fn trans_flt_h(&mut self, a: &mut arg_flt_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLT_H)
+        }
+
+        fn trans_fle_h(&mut self, a: &mut arg_fle_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLE_H)
+        }
+
+        fn trans_fclass_h(&mut self, a: &mut arg_fclass_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_xf(a.rd, [a.rs1], None, &$crate::tcg::fpu::FCLASS_H)
+        }
+
+        fn trans_fcvt_w_h(&mut self, a: &mut arg_fcvt_w_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_W_H)
+        }
+
+        fn trans_fcvt_wu_h(&mut self, a: &mut arg_fcvt_wu_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_WU_H)
+        }
+
+        fn trans_fcvt_l_h(&mut self, a: &mut arg_fcvt_l_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_L_H)
+        }
+
+        fn trans_fcvt_lu_h(&mut self, a: &mut arg_fcvt_lu_h) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_xf(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FCVT_LU_H)
+        }
+
+        fn trans_fcvt_h_w(&mut self, a: &mut arg_fcvt_h_w) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_H_W)
+        }
+
+        fn trans_fcvt_h_wu(&mut self, a: &mut arg_fcvt_h_wu) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_H_WU)
+        }
+
+        fn trans_fcvt_h_l(&mut self, a: &mut arg_fcvt_h_l) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_H_L)
+        }
+
+        fn trans_fcvt_h_lu(&mut self, a: &mut arg_fcvt_h_lu) -> bool {
+            if !self.d.cfg.ext_zfh {
+                return false;
+            }
+            self.fp_fx(a.rd, a.rs1, a.rm, &$crate::tcg::fpu::FCVT_H_LU)
+        }
+
+        fn trans_fli_h(&mut self, a: &mut arg_fli_h) -> bool {
+            if !(self.d.cfg.ext_zfa && self.d.cfg.ext_zfh) {
+                return false;
+            }
+            self.fp_fli(a.rd, a.rs1, &$crate::tcg::translate_fp::FLI_H)
+        }
+
+        fn trans_fminm_h(&mut self, a: &mut arg_fminm_h) -> bool {
+            if !(self.d.cfg.ext_zfa && self.d.cfg.ext_zfh) {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMINM_H)
+        }
+
+        fn trans_fmaxm_h(&mut self, a: &mut arg_fmaxm_h) -> bool {
+            if !(self.d.cfg.ext_zfa && self.d.cfg.ext_zfh) {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FMAXM_H)
+        }
+
+        fn trans_fround_h(&mut self, a: &mut arg_fround_h) -> bool {
+            if !(self.d.cfg.ext_zfa && self.d.cfg.ext_zfh) {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FROUND_H)
+        }
+
+        fn trans_froundnx_h(&mut self, a: &mut arg_froundnx_h) -> bool {
+            if !(self.d.cfg.ext_zfa && self.d.cfg.ext_zfh) {
+                return false;
+            }
+            self.fp_ff(a.rd, [a.rs1], Some(a.rm), &$crate::tcg::fpu::FROUNDNX_H)
+        }
+
+        fn trans_fleq_h(&mut self, a: &mut arg_fleq_h) -> bool {
+            if !(self.d.cfg.ext_zfa && self.d.cfg.ext_zfh) {
+                return false;
+            }
+            self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLEQ_H)
+        }
+
+        fn trans_fltq_h(&mut self, a: &mut arg_fltq_h) -> bool {
+            if !(self.d.cfg.ext_zfa && self.d.cfg.ext_zfh) {
+                return false;
+            }
+            self.fp_xf(a.rd, [a.rs1, a.rs2], None, &$crate::tcg::fpu::FLTQ_H)
+        }
     };
 }
 pub(super) use fp_trans32;
@@ -883,10 +1424,16 @@ pub(super) use fp_trans32;
 macro_rules! fp_trans16 {
     () => {
         fn trans_c_fld(&mut self, a: &mut $crate::decode::insn16::arg_c_fld) -> bool {
+            if !self.zcd_or_dc() {
+                return false;
+            }
             self.fp_load(a, true)
         }
 
         fn trans_c_fsd(&mut self, a: &mut $crate::decode::insn16::arg_c_fsd) -> bool {
+            if !self.zcd_or_dc() {
+                return false;
+            }
             self.fp_store(a, true)
         }
     };
@@ -896,7 +1443,7 @@ pub(super) use fp_trans16;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ruvm_softfloat::{Float32, Float64, FloatStatus};
+    use ruvm_softfloat::{Float16, Float32, Float64, FloatStatus};
 
     #[test]
     fn fli_tables() {
@@ -935,6 +1482,24 @@ mod tests {
         for i in 2..30 {
             assert!(f64::from_bits(FLI_D[i]) < f64::from_bits(FLI_D[i + 1]), "entry {i}");
         }
+    }
+
+    #[test]
+    fn fli_h_table() {
+        let mut st = FloatStatus::default();
+        for (i, &h) in FLI_H.iter().enumerate() {
+            assert_eq!(h >> 16, 0xffff_ffff_ffff, "fli.h {i} is NaN boxed");
+            let h = Float16(h as u16).to_float64(true, &mut st);
+            match i {
+                // 2^-14, the minimum positive normal of half precision.
+                1 => assert_eq!(h.0, 2f64.powi(-14).to_bits()),
+                // 2^16 overflows to +inf.
+                29 | 30 => assert_eq!(h.0, f64::INFINITY.to_bits()),
+                31 => assert_eq!(FLI_H[31], NANBOXED_NAN_H),
+                _ => assert_eq!(h, Float64(FLI_D[i]), "entry {i}"),
+            }
+        }
+        assert_eq!(SIGN_H, 0x8000);
     }
 
     #[test]
