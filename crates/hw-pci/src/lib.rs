@@ -21,6 +21,8 @@
 //! - Config accesses from the host are also capped at the function's own config space size.
 //! - A bridge updates its windows after reset.
 //!
+//! The generic PCIe host bridge of the virt boards is [`GpexHost`] (hw/pci-host/gpex.c).
+//!
 //! The Q35 chipset lives here too: [`Q35PciHost`] and its [`Mch`] (hw/pci-host/q35.c), the PAM
 //! segments of hw/pci-host/pam.c and the MMCONFIG window of hw/pci/pcie_host.c. The MCH
 //! register constants are in [`q35`].
@@ -43,6 +45,7 @@
 mod bridge;
 mod bus;
 mod device;
+mod gpex;
 mod host;
 mod msi;
 mod msix;
@@ -58,6 +61,10 @@ pub use bus::{PciBus, PciBusVmState, PciMapIrqFn, PciSetIrqFn, pci_swizzle_map_i
 pub use device::{
     MsiMessage, MsiTrigger, PciBarInfo, PciConfigMut, PciDevice, PciDeviceInfo, PciDeviceOps,
     PciDeviceVmState,
+};
+pub use gpex::{
+    GPEX_IOPORT_SIZE, GpexConfig, GpexHost, GpexWindow, PCI_DEVICE_ID_REDHAT_PCIE_HOST,
+    TYPE_GPEX_HOST, TYPE_GPEX_ROOT_DEVICE,
 };
 pub use host::{
     PCI_HOST_CONFIG_ADDR_PORT, PCI_HOST_CONFIG_DATA_PORT, PciHostState, PciHostVmState,

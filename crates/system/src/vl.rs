@@ -1020,13 +1020,20 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         }
     }
     // configure_blockdev(): the -drive options, which need to know the machine.
-    if virt && !cfg.x86.drives.is_empty() {
+    if virt && !rv_virt && !cfg.x86.drives.is_empty() {
         return Err(fail_msg("-drive is not supported with this machine by ruvm yet"));
     }
     if virt && !rv_virt && !cfg.x86.devices.is_empty() {
         return Err(fail_msg("-device is not supported with this machine by ruvm yet"));
     }
-    let drives = parse_drives(kind, &cfg.x86.drives)?;
+    let drives = if rv_virt {
+        riscv::parse_drives(&cfg.x86.drives).map_err(|e| {
+            e.report();
+            Exit(1)
+        })?
+    } else {
+        parse_drives(kind, &cfg.x86.drives)?
+    };
 
     // qemu_apply_legacy_machine_options() and qemu_apply_machine_options()
     let memdev = apply_legacy_machine_options(&mut cfg)?;
@@ -1113,6 +1120,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             no_reboot: cfg.x86.no_reboot,
             semihosting: &cfg.semihosting,
             devices: &cfg.x86.devices,
+            drives: &drives,
             firmware: cfg.x86.firmware(),
         };
         let running =

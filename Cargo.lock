@@ -848,6 +848,7 @@ dependencies = [
  "ruvm-hw-core",
  "ruvm-hw-intc",
  "ruvm-hw-misc",
+ "ruvm-hw-pci",
  "ruvm-hw-timer",
  "ruvm-hw-virtio",
  "ruvm-jit",

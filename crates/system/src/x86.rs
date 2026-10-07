@@ -100,7 +100,7 @@ pub(crate) fn machine_help_lines() -> Vec<(String, String)> {
 pub(crate) struct Located(pub Option<Location>, pub Error);
 
 impl Located {
-    fn new(loc: &Option<Location>, msg: impl Into<String>) -> Located {
+    pub(crate) fn new(loc: &Option<Location>, msg: impl Into<String>) -> Located {
         Located(loc.clone(), Error::generic(msg.into()))
     }
 

@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The RISC-V `virt` board from the command line: what `-machine virt`, `-m`, `-smp`, `-cpu`,
-//! `-kernel`, `-initrd`, `-append`, `-dtb`, `-bios`, `-serial`, `-device loader`,
+//! `-kernel`, `-initrd`, `-append`, `-dtb`, `-bios`, `-serial`, `-drive`, `-device`,
 //! `-semihosting` and `-semihosting-config` turn into, and the board running on TCG.
 //!
 //! `-serial` (or `-nographic`) connects `serial_hd(0)` to the 16550 UART. `-bios` names the
 //! M-mode firmware: `default` (or no `-bios`) is OpenSBI's `fw_dynamic` build, looked up in
 //! the firmware directories as `qemu_find_file()` does, and `none` runs without one.
-//! `-device loader` puts a file or a value into guest memory and can set a hart's PC.
+//! `-device loader` puts a file or a value into guest memory and can set a hart's PC, and
+//! the virtio devices of `-device` and `-drive` go on the PCIe root bus or a virtio-mmio
+//! transport (see the `devices` module).
 //! Semihosting writes its console to the `chardev` of `-semihosting-config`, or to standard
 //! error without one, as semihosting/console.c does, and SYS_EXIT ends ruvm with the
 //! guest's status. The SiFive test device's pass and fail finishers do the same with their
@@ -23,7 +25,8 @@
 //!   ACPI tables either way) and `iommu-sys=off` or `auto`. Other values fail with "... is not
 //!   supported by ruvm yet".
 //! - Every hart is in one socket: `-smp sockets=` above 1 fails.
-//! - `-device` knows only `loader`, and `-drive` does not exist for virt yet.
+//! - `-device` knows `loader` and the virtio block, RNG and serial devices only, and
+//!   `-drive if=pflash` is not wired to the flash yet.
 //! - SYS_EXIT and the SiFive test finishers ask the main loop to quit with the guest's
 //!   status (`shutdown_request` with the code) rather than calling `exit()` on the vCPU
 //!   thread, so QMP clients see a SHUTDOWN event first.
@@ -51,7 +54,6 @@ use ruvm_machine_riscv::virt::{
 };
 use ruvm_machine_x86::FirmwareSearch;
 use ruvm_qapi::events::event_reset;
-use ruvm_qapi::opts::{QemuOptsList, is_help_option};
 use ruvm_qapi::types::{
     MemorySizeConfiguration, ResetArg, RunState, SMPConfiguration, ShutdownCause,
 };
@@ -63,7 +65,11 @@ use ruvm_target_riscv::tcg::SemihostingHost;
 use crate::arm::{Semihosting, SemihostingTarget};
 use crate::runstate::Runstate;
 use crate::vl::Vm;
-use crate::x86::Located;
+use crate::x86::{Drive, Located};
+
+mod devices;
+
+pub(crate) use devices::parse_drives;
 
 /// Whether `target` is one the RISC-V boards exist for.
 pub(crate) fn is_riscv(target: &str) -> bool {
@@ -450,32 +456,6 @@ pub(crate) fn parse_loader(
     Ok(l)
 }
 
-/// The `-device` options for virt: only `loader` exists.
-pub(crate) fn parse_devices(
-    devices: &[(String, Option<Location>)],
-) -> std::result::Result<Vec<GenericLoader>, Located> {
-    let mut loaders = Vec::new();
-    for (arg, loc) in devices {
-        let mut list = QemuOptsList::new("device", &[]).with_implied_opt_name("driver");
-        let opts = list.parse(arg, true).map_err(|e| Located(loc.clone(), e))?;
-        let Some(driver) = opts.get("driver") else {
-            return Err(Located(loc.clone(), Error::generic("Parameter 'driver' is missing")));
-        };
-        if is_help_option(driver) || opts.has_help_opt() {
-            let e = Error::generic("-device help is not supported by ruvm yet");
-            return Err(Located(loc.clone(), e));
-        }
-        if driver != "loader" {
-            let e = Error::generic(format!(
-                "-device {driver} is not supported with this machine by ruvm yet"
-            ));
-            return Err(Located(loc.clone(), e));
-        }
-        loaders.push(parse_loader(opts, loc)?);
-    }
-    Ok(loaders)
-}
-
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -708,6 +688,8 @@ pub(crate) struct RiscvArgs<'a> {
     pub semihosting: &'a Semihosting,
     /// `-device`.
     pub devices: &'a [(String, Option<Location>)],
+    /// `-drive`, from [`parse_drives`].
+    pub drives: &'a [Drive],
     /// Where `qemu_find_file(QEMU_FILE_TYPE_BIOS, ...)` looks.
     pub firmware: FirmwareSearch,
 }
@@ -744,7 +726,7 @@ pub(crate) fn start_board_tcg(
         )));
     }
     let cpu = parse_cpu(args.cpu).map_err(one)?;
-    let loaders = parse_devices(args.devices).map_err(|e| vec![e])?;
+    let plan = devices::plan(args.drives, args.devices)?;
     let find = |name: &str| args.firmware.find(name).map(|p| p.to_string_lossy().into_owned());
     let firmware =
         riscv_find_firmware(opts.firmware.as_deref(), find).map_err(|e| one(Error::generic(e)))?;
@@ -771,12 +753,13 @@ pub(crate) fn start_board_tcg(
     cfg.firmware = firmware;
     cfg.xlrbr = cpu.xlrbr;
     cfg.vector = cpu.vector;
-    cfg.loaders = loaders;
+    cfg.loaders = plan.loaders;
     cfg.semihosting = console.clone().map(|c| c as Arc<dyn SemihostingHost>);
     cfg.semihosting_userspace = semi.userspace;
     cfg.clock = Some(Arc::clone(&clock));
     cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
     let mut board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
+    devices::plug(&board, &plan.virtio, args.drives).map_err(|e| vec![e])?;
 
     let mut attachments = Vec::new();
     if let Some(Some(chr)) = serial_hds.first() {
@@ -898,30 +881,6 @@ mod tests {
         assert_eq!(
             take_board_options(&m).unwrap_err().message(),
             "Property 'virt-machine.foo' not found"
-        );
-    }
-
-    #[test]
-    fn loader_devices() {
-        let devs = vec![
-            ("loader,file=/tmp/x.elf".to_string(), None),
-            ("loader,addr=0x80000000,data=0x1234,data-len=4,cpu-num=0".to_string(), None),
-        ];
-        let l = parse_devices(&devs).unwrap();
-        assert_eq!(l[0].file.as_deref(), Some("/tmp/x.elf"));
-        assert_eq!(l[1].addr, 0x8000_0000);
-        assert_eq!(l[1].data, 0x1234);
-        assert_eq!(l[1].data_len, 4);
-        assert_eq!(l[1].cpu_num, Some(0));
-        let devs = vec![("loader,foo=1".to_string(), None)];
-        assert_eq!(
-            parse_devices(&devs).unwrap_err().1.message(),
-            "Property 'loader.foo' not found"
-        );
-        let devs = vec![("virtio-net-device".to_string(), None)];
-        assert_eq!(
-            parse_devices(&devs).unwrap_err().1.message(),
-            "-device virtio-net-device is not supported with this machine by ruvm yet"
         );
     }
 }
