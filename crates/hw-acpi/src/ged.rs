@@ -154,6 +154,11 @@ impl AcpiGed {
         *lock(&self.sel)
     }
 
+    /// Sets the selector, as loading the `acpi-ged-state` section does.
+    pub fn set_sel(&self, sel: u32) {
+        *lock(&self.sel) = sel;
+    }
+
     /// `acpi_ged_send_event()`: maps `AcpiEventStatusBits` to a selector bit, sets it and
     /// pulses the IRQ. Returns false, like QEMU's warning, for events the GED cannot carry.
     pub fn send_event(&self, ev: u32) -> bool {

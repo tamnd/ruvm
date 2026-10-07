@@ -13,8 +13,11 @@
 //! lines are driven after the device lock is dropped, so their handlers may call back into
 //! the device, for example to reset it.
 //!
-//! Not ported: VMState, trace points, QOM registration, the ACPI description, the
-//! `LOG_GUEST_ERROR` message for unknown commands, and the `i8042-mmio` variant.
+//! [`I8042::vmstate_save`] and [`I8042::vmstate_load`] move what the `pckbd` VMState carries,
+//! as an [`I8042VmState`]; the `kbd_` and `mouse_` variants do the same for the PS/2 devices.
+//!
+//! Not ported: trace points, QOM registration, the ACPI description, the `LOG_GUEST_ERROR`
+//! message for unknown commands, and the `i8042-mmio` variant.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -23,7 +26,7 @@ use ruvm_base::{Result, bail, warn_report};
 use ruvm_hw_core::{Clock, IrqPin, Timer};
 use ruvm_mem::{AccessConstraints, AccessCtx, AccessSize, MemResult, MmioOps};
 
-use crate::ps2::{InputAxis, InputButton, Ps2Kbd, Ps2Mouse};
+use crate::ps2::{InputAxis, InputButton, Ps2Kbd, Ps2KbdVmState, Ps2Mouse, Ps2MouseVmState};
 
 // Controller commands, written to port 0x64.
 
@@ -128,6 +131,13 @@ const KBD_PENDING_CTRL_AUX: u8 = 0x08;
 const KBD_PENDING_KBD: u8 = KBD_MODE_DISABLE_KBD;
 const KBD_PENDING_AUX: u8 = KBD_MODE_DISABLE_MOUSE;
 
+// The `pending` bits a controller without extended state sends.
+const KBD_PENDING_KBD_COMPAT: u8 = 0x01;
+const KBD_PENDING_AUX_COMPAT: u8 = 0x02;
+
+/// `KBD_MIGR_TIMER_PENDING` in `migration_flags`: the throttle timer was armed.
+pub const KBD_MIGR_TIMER_PENDING: u32 = 0x1;
+
 const KBD_OBSRC_KBD: u8 = 0x01;
 const KBD_OBSRC_MOUSE: u8 = 0x02;
 const KBD_OBSRC_CTRL: u8 = 0x04;
@@ -203,6 +213,54 @@ pub struct I8042Regs {
     pub mode: u8,
     pub outport: u8,
     pub write_cmd: u8,
+}
+
+/// The fields of `vmstate_kbd` (version 3) and its subsections, named as in QEMU, plus the
+/// flags its hooks keep in `KBDState`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct I8042VmState {
+    pub write_cmd: u8,
+    pub status: u8,
+    pub mode: u8,
+    /// `pending`, in the compat encoding without extended state, from `kbd_pre_save()`.
+    pub pending_tmp: u8,
+    /// `pckbd_outport`.
+    pub outport: u8,
+    /// `pckbd/extended_state`.
+    pub migration_flags: u32,
+    pub obsrc: u32,
+    pub obdata: u8,
+    pub cbdata: u8,
+    /// The `extended-state` property, not on the wire.
+    pub extended_state: bool,
+    /// Set by the `pckbd_outport` post_load, cleared by `kbd_pre_load()`.
+    pub outport_present: bool,
+    /// Set by the `pckbd/extended_state` post_load, cleared by `kbd_pre_load()`.
+    pub extended_state_loaded: bool,
+}
+
+impl I8042VmState {
+    /// `kbd_outport_needed()`.
+    pub fn outport_needed(&self) -> bool {
+        self.outport != outport_default(self.status)
+    }
+
+    /// `kbd_extended_state_needed()`.
+    pub fn extended_state_needed(&self) -> bool {
+        self.extended_state
+    }
+}
+
+/// `kbd_outport_default()`.
+fn outport_default(status: u8) -> u8 {
+    let mut v = KBD_OUT_RESET | KBD_OUT_A20 | KBD_OUT_ONES;
+    if (status & KBD_STAT_OBF) != 0 {
+        v |= KBD_OUT_OBF;
+    }
+    if (status & KBD_STAT_MOUSE_OBF) != 0 {
+        v |= KBD_OUT_MOUSE_OBF;
+    }
+    v
 }
 
 /// `ISAKBDState`, the `i8042` device.
@@ -336,6 +394,107 @@ impl I8042 {
     /// A copy of the mouse state.
     pub fn mouse(&self) -> Ps2Mouse {
         self.lock().mouse.clone()
+    }
+
+    /// The state `vmstate_kbd` sends, with `kbd_pre_save()` and the `pckbd/extended_state`
+    /// pre_save applied.
+    pub fn vmstate_save(&self) -> I8042VmState {
+        let st = self.lock();
+        let s = &st.ctrl;
+        let pending_tmp = if s.extended_state {
+            s.pending
+        } else {
+            let mut p = 0;
+            if (s.pending & KBD_PENDING_KBD) != 0 {
+                p |= KBD_PENDING_KBD_COMPAT;
+            }
+            if (s.pending & KBD_PENDING_AUX) != 0 {
+                p |= KBD_PENDING_AUX_COMPAT;
+            }
+            p
+        };
+        let timer_pending = self.throttle_timer.as_ref().is_some_and(Timer::pending);
+        I8042VmState {
+            write_cmd: s.write_cmd,
+            status: s.status,
+            mode: s.mode,
+            pending_tmp,
+            outport: s.outport,
+            migration_flags: if timer_pending { KBD_MIGR_TIMER_PENDING } else { 0 },
+            obsrc: u32::from(s.obsrc),
+            obdata: s.obdata,
+            cbdata: s.cbdata,
+            extended_state: s.extended_state,
+            outport_present: false,
+            extended_state_loaded: false,
+        }
+    }
+
+    /// Loads what `vmstate_kbd` carried: the `pckbd/extended_state` post_load, then
+    /// `kbd_post_load()`.
+    ///
+    /// As in QEMU, a set `KBD_MIGR_TIMER_PENDING` runs `kbd_throttle_timeout()` before
+    /// `pending` is loaded, and the throttle timer is not armed again. The IRQ lines are not
+    /// driven otherwise; the interrupt controllers carry their levels.
+    pub fn vmstate_load(&self, v: &I8042VmState) {
+        let mut st = self.lock();
+        let s = &mut st.ctrl;
+        s.write_cmd = v.write_cmd;
+        s.status = v.status;
+        s.mode = v.mode;
+        if v.outport_present {
+            s.outport = v.outport;
+        }
+        if v.extended_state_loaded {
+            s.obsrc = v.obsrc as u8;
+            s.obdata = v.obdata;
+            s.cbdata = v.cbdata;
+            if (v.migration_flags & KBD_MIGR_TIMER_PENDING) != 0 && Self::pending(s) != 0 {
+                self.update_irq(s);
+            }
+        }
+
+        // kbd_post_load().
+        if !v.outport_present {
+            s.outport = outport_default(s.status);
+        }
+        s.pending = v.pending_tmp;
+        if !v.extended_state_loaded {
+            s.obsrc = if (s.status & KBD_STAT_OBF) != 0 {
+                if (s.status & KBD_STAT_MOUSE_OBF) != 0 { KBD_OBSRC_MOUSE } else { KBD_OBSRC_KBD }
+            } else {
+                0
+            };
+            if (s.pending & KBD_PENDING_KBD_COMPAT) != 0 {
+                s.pending |= KBD_PENDING_KBD;
+            }
+            if (s.pending & KBD_PENDING_AUX_COMPAT) != 0 {
+                s.pending |= KBD_PENDING_AUX;
+            }
+        }
+        // Clear all unused flags.
+        s.pending &=
+            KBD_PENDING_CTRL_KBD | KBD_PENDING_CTRL_AUX | KBD_PENDING_KBD | KBD_PENDING_AUX;
+    }
+
+    /// The keyboard state `vmstate_ps2_keyboard` sends.
+    pub fn kbd_vmstate_save(&self) -> Ps2KbdVmState {
+        self.lock().kbd.vmstate_save()
+    }
+
+    /// See [`Ps2Kbd::vmstate_load`].
+    pub fn kbd_vmstate_load(&self, v: &Ps2KbdVmState) {
+        self.lock().kbd.vmstate_load(v);
+    }
+
+    /// The mouse state `vmstate_ps2_mouse` sends.
+    pub fn mouse_vmstate_save(&self) -> Ps2MouseVmState {
+        self.lock().mouse.vmstate_save()
+    }
+
+    /// See [`Ps2Mouse::vmstate_load`].
+    pub fn mouse_vmstate_load(&self, v: &Ps2MouseVmState) {
+        self.lock().mouse.vmstate_load(v);
     }
 
     /// `kbd_update_irq_lines()`.

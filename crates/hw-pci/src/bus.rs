@@ -47,6 +47,15 @@ struct BusIrq {
     irq_count: Vec<i32>,
 }
 
+/// `vmstate_pcibus` (version 1): the assertion count of each interrupt line of a root bus.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PciBusVmState {
+    /// `VMSTATE_INT32_EQUAL`.
+    pub nirq: i32,
+    /// `nirq` entries.
+    pub irq_count: Vec<i32>,
+}
+
 /// A PCI bus, `PCIBus`.
 pub struct PciBus {
     name: String,
@@ -265,6 +274,46 @@ impl PciBus {
     /// The number of asserted sources on `irq_num`.
     pub fn irq_count(&self, irq_num: usize) -> i32 {
         self.irq_lock().irq_count.get(irq_num).copied().unwrap_or(0)
+    }
+
+    /// The `PCIBUS` section's `irq_count` array, one entry per `nirq`.
+    pub fn irq_counts(&self) -> Vec<i32> {
+        self.irq_lock().irq_count.clone()
+    }
+
+    /// Loads the `PCIBUS` section: overwrites the counts without driving the lines, as QEMU
+    /// does. `nirq` is an `INT32_EQUAL` field, so the length must match.
+    pub fn set_irq_counts(&self, counts: &[i32]) -> Result<(), String> {
+        let mut g = self.irq_lock();
+        if counts.len() != g.irq_count.len() {
+            return Err(format!(
+                "{}: nirq {} does not match {}",
+                self.name,
+                counts.len(),
+                g.irq_count.len()
+            ));
+        }
+        g.irq_count.copy_from_slice(counts);
+        Ok(())
+    }
+
+    /// The `PCIBUS` section.
+    pub fn vmstate_save(&self) -> PciBusVmState {
+        let irq_count = self.irq_counts();
+        PciBusVmState { nirq: irq_count.len() as i32, irq_count }
+    }
+
+    /// Loads the `PCIBUS` section, see [`Self::set_irq_counts`].
+    pub fn vmstate_load(&self, v: &PciBusVmState) -> Result<(), String> {
+        if v.nirq as usize != v.irq_count.len() {
+            return Err(format!(
+                "{}: nirq {} with {} counts",
+                self.name,
+                v.nirq,
+                v.irq_count.len()
+            ));
+        }
+        self.set_irq_counts(&v.irq_count)
     }
 
     /// Sets where MSI messages from functions below this root bus go, and marks MSI as working

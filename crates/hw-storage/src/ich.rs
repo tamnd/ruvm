@@ -12,10 +12,10 @@ use ruvm_hw_pci::regs::{
     PCI_BASE_ADDRESS_SPACE_IO, PCI_BASE_ADDRESS_SPACE_MEMORY, PCI_CAP_ID_SATA, PCI_CLASS_PROG,
     PCI_INTERRUPT_PIN, PCI_LATENCY_TIMER, pci_set_long, pci_set_word,
 };
-use ruvm_hw_pci::{PciBus, PciDevice, PciDeviceInfo, PciDeviceOps};
+use ruvm_hw_pci::{PciBus, PciDevice, PciDeviceInfo, PciDeviceOps, PciDeviceVmState};
 use ruvm_mem::{AccessCtx, AccessSize, MemResult, MmioOps};
 
-use crate::ahci::{AHCI_MEM_BAR_SIZE, AhciState, DmaMemory};
+use crate::ahci::{AHCI_MEM_BAR_SIZE, AhciState, AhciVmState, DmaMemory};
 use crate::block::BlockBackend;
 use crate::ide::{DriveConfig, DriveKind, IdeDrive};
 
@@ -153,6 +153,13 @@ impl PciDeviceOps for ResetOps {
     }
 }
 
+/// `vmstate_ich9_ahci` (version 1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ich9AhciVmState {
+    pub parent_obj: PciDeviceVmState,
+    pub ahci: AhciVmState,
+}
+
 /// The ICH9 AHCI controller, QEMU's `ich9-ahci` device, with six SATA ports.
 pub struct Ich9Ahci {
     dev: Arc<PciDevice>,
@@ -176,12 +183,32 @@ impl Ich9Ahci {
         dma: Arc<dyn DmaMemory>,
         devfn: Option<u8>,
     ) -> Result<Arc<Self>, Error> {
+        Self::create(bus, dma, devfn, false)
+    }
+
+    /// [`Ich9Ahci::new`] as a function of a multifunction device, the way q35 creates the
+    /// built-in controller at 00:1f.2 with `pci_create_simple_multifunction()`.
+    pub fn new_multifunction(
+        bus: &Arc<PciBus>,
+        dma: Arc<dyn DmaMemory>,
+        devfn: Option<u8>,
+    ) -> Result<Arc<Self>, Error> {
+        Self::create(bus, dma, devfn, true)
+    }
+
+    fn create(
+        bus: &Arc<PciBus>,
+        dma: Arc<dyn DmaMemory>,
+        devfn: Option<u8>,
+        multifunction: bool,
+    ) -> Result<Arc<Self>, Error> {
         let info = PciDeviceInfo {
             name: "ich9-ahci".to_string(),
             vendor_id: PCI_VENDOR_ID_INTEL,
             device_id: PCI_DEVICE_ID_INTEL_82801IR,
             revision: 0x02,
             class_id: PCI_CLASS_STORAGE_SATA,
+            multifunction,
             ..PciDeviceInfo::default()
         };
         let dev = bus.register_device(&info, devfn)?;
@@ -240,6 +267,25 @@ impl Ich9Ahci {
     /// The PCI function.
     pub fn pci_device(&self) -> &Arc<PciDevice> {
         &self.dev
+    }
+
+    /// The device's section.
+    pub fn vmstate_save(&self) -> Ich9AhciVmState {
+        Ich9AhciVmState {
+            parent_obj: self.dev.vmstate_save(),
+            ahci: self.shared.lock_state().vmstate_save(),
+        }
+    }
+
+    /// Loads the device's section: config space first, so that bus mastering is back before
+    /// the engines restart, then the controller. Only an idle controller loads; see
+    /// [`AhciVmState`]. The interrupt line is not recomputed, as in QEMU: the PCI part of the
+    /// stream carries its level.
+    pub fn vmstate_load(&self, v: &Ich9AhciVmState) -> Result<(), String> {
+        self.dev.vmstate_load(&v.parent_obj)?;
+        self.shared
+            .access(|st| st.vmstate_load(&v.ahci))
+            .unwrap_or_else(|| Err("ahci: busy".to_string()))
     }
 
     /// Plugs a drive into `port` (0 to 5), the `ide-hd` or `ide-cd` device with `bus=ahci.N`.

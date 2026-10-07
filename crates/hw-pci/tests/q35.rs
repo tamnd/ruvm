@@ -593,3 +593,46 @@ fn without_smm_ranges() {
     m.writeb(MCH_HOST_BRIDGE_PAM0, 0x30);
     assert_eq!(m.memb(0xf0000), 0);
 }
+
+#[test]
+fn mch_host_and_bus_vmstate_round_trip() {
+    let src = Machine::new();
+    src.ram_fill(0xa0000, 0x60000, 0x22);
+    src.writeb(MCH_HOST_BRIDGE_PAM0, 0x30);
+    src.writeb(
+        MCH_HOST_BRIDGE_SMRAM,
+        MCH_HOST_BRIDGE_SMRAM_G_SMRAME | MCH_HOST_BRIDGE_SMRAM_D_OPEN,
+    );
+    // Leaves CONFIG_ADDRESS pointing at the SMRAM register.
+    assert!(src.smram_test_bit(MCH_HOST_BRIDGE_SMRAM_D_OPEN));
+    let mch = src.q35.mch_vmstate_save();
+    let host = src.q35.host_state().vmstate_save();
+    let bus = src.q35.bus().vmstate_save();
+    assert_eq!(mch.parent_obj.config.len(), 256);
+    assert_eq!(host.config_reg, Machine::cfg_addr(0, MCH_HOST_BRIDGE_SMRAM as u32));
+    assert_eq!(bus.nirq as usize, bus.irq_count.len());
+
+    let dst = Machine::new();
+    dst.ram_fill(0xa0000, 0x60000, 0x22);
+    assert_eq!(dst.memb(0xf0000), BIOS_BYTE);
+    assert_eq!(dst.memb(0xa0000), VGA_BYTE);
+    dst.q35.mch_vmstate_load(&mch).unwrap();
+    dst.q35.host_state().vmstate_load(&host);
+    dst.q35.bus().vmstate_load(&bus).unwrap();
+    assert_eq!(dst.q35.mch_vmstate_save(), mch);
+    assert_eq!(dst.q35.host_state().vmstate_save(), host);
+    assert_eq!(dst.q35.bus().vmstate_save(), bus);
+
+    // mch_post_load() remapped PAM and SMRAM from the loaded config space.
+    assert_eq!(dst.memb(0xf0000), 0x22);
+    assert_eq!(dst.q35.mch().pam_region(0).current(), 3);
+    assert_eq!(dst.memb(0xa0000), 0x22);
+
+    let mut bad = bus.clone();
+    bad.nirq += 1;
+    bad.irq_count.push(0);
+    assert!(dst.q35.bus().vmstate_load(&bad).is_err());
+    let mut bad = bus;
+    bad.nirq += 1;
+    assert!(dst.q35.bus().vmstate_load(&bad).is_err());
+}

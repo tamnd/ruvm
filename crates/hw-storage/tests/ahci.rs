@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use ruvm_hw_pci::regs::*;
 use ruvm_hw_pci::*;
 use ruvm_hw_storage::{
-    BlockBackend, DmaMemory, DriveConfig, Ich9Ahci, PCI_CLASS_STORAGE_SATA,
+    BlockBackend, DmaMemory, DriveConfig, Ich9Ahci, Ich9AhciVmState, PCI_CLASS_STORAGE_SATA,
     PCI_DEVICE_ID_INTEL_82801IR, PCI_VENDOR_ID_INTEL, VecBackend,
 };
 use ruvm_mem::{AddressSpace, Endian, MemTxAttrs, MemorySystem};
@@ -989,4 +989,67 @@ fn empty_port_sends_no_signature() {
     env.set_px(3, PX_CI, 1);
     assert_eq!(env.px(3, PX_CI), 1);
     assert_eq!(env.px(3, PX_IS), 0);
+}
+
+#[test]
+fn vmstate_round_trip() {
+    let (src, disk) = Env::new();
+    src.start_port(0);
+    let buf = src.alloc(512, 2);
+    src.issue(0, 0, &Cmd::ata(CMD_IDENTIFY, 0, 0), buf, 512);
+    src.expect_done(0, IS_DHRS | IS_PSS);
+    let data = pattern(512, 9);
+    src.disk_write(0, CMD_WRITE_DMA, 3, &data);
+    src.expect_done(0, IS_DHRS);
+
+    let v = src.ahci.vmstate_save();
+    assert_eq!(v.parent_obj.config.len(), 256);
+    assert_eq!((v.ahci.ports, v.ahci.dev.len()), (6, 6));
+    let p = &v.ahci.dev[0];
+    assert_eq!(p.busy_slot, -1);
+    assert_eq!(p.ifs0.identify_set, 1);
+    assert_eq!(p.ifs0.identify_data.len(), 512);
+    assert_eq!(p.cmd & (CMD_ST | CMD_CR | CMD_FRE | CMD_FR), CMD_ST | CMD_CR | CMD_FRE | CMD_FR);
+    assert_eq!(p.scr_stat, 0);
+    // An empty port still has its drive's task file.
+    assert_eq!(v.ahci.dev[1].ifs0.status, 0x50);
+
+    // The destination: the same image and a copy of guest RAM, then the device.
+    let dst = Env::bare();
+    let config = DriveConfig { serial: Some("other".into()), ..DriveConfig::hd() };
+    dst.ahci.attach_drive(0, config, Some(Arc::new(disk.clone()))).unwrap();
+    dst.boot();
+    dst.memwrite(0, &src.memread(0, RAM_SIZE as usize));
+    dst.ahci.vmstate_load(&v).unwrap();
+    assert_eq!(dst.ahci.vmstate_save(), v);
+    assert_eq!(dst.cfg_readl(PCI_BASE_ADDRESS_0 as u8 + 5 * 4), ABAR as u32);
+
+    // The engines came back on the source's buffers, and the identify data with them.
+    *dst.ports.lock().unwrap() = *src.ports.lock().unwrap();
+    *dst.next.lock().unwrap() = *src.next.lock().unwrap();
+    assert_eq!(dst.px(0, PX_CMD) & (CMD_CR | CMD_FR), CMD_CR | CMD_FR);
+    assert_eq!(dst.disk_read(0, CMD_READ_DMA, 3, 1), data);
+    dst.expect_done(0, IS_DHRS);
+    let buf = dst.alloc(512, 2);
+    dst.issue(0, 0, &Cmd::ata(CMD_IDENTIFY, 0, 0), buf, 512);
+    dst.expect_done(0, IS_DHRS | IS_PSS);
+    assert_eq!(ata_string(&dst.memread(buf, 512), 10, 10), "testdisk");
+
+    // Only an idle controller loads.
+    refused(&dst, &v, |s| s.ahci.dev[1].busy_slot = 0);
+    refused(&dst, &v, |s| s.ahci.dev[0].ncq_tfs[4].used = true);
+    refused(&dst, &v, |s| {
+        s.ahci.dev[0].ncq_tfs[4].used = true;
+        s.ahci.dev[0].ncq_tfs[4].halt = true;
+    });
+    refused(&dst, &v, |s| s.ahci.dev[0].ifs0.status |= 0x08);
+    refused(&dst, &v, |s| s.ahci.dev[2].port.error_status = 1);
+    refused(&dst, &v, |s| s.ahci.dev[0].cmd &= !CMD_ST);
+    refused(&dst, &v, |s| s.ahci.ports = 4);
+}
+
+fn refused(env: &Env, v: &Ich9AhciVmState, f: impl FnOnce(&mut Ich9AhciVmState)) {
+    let mut bad = v.clone();
+    f(&mut bad);
+    assert!(env.ahci.vmstate_load(&bad).is_err());
 }

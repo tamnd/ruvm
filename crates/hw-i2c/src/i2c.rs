@@ -85,6 +85,16 @@ struct BusInner {
     /// `current_devs`: the slaves taking part in the transfer in progress.
     current: Vec<Arc<dyn I2cSlave>>,
     broadcast: bool,
+    /// `saved_address`, as the `i2c_bus` section last brought it.
+    saved_address: u8,
+}
+
+/// `vmstate_i2c_bus` (version 1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct I2cBusVmState {
+    /// The address of the transfer in progress, [`I2C_BROADCAST`] for a general call, 0xff
+    /// when the bus is idle.
+    pub saved_address: u8,
 }
 
 /// An I2C bus, `I2CBus`.
@@ -142,6 +152,31 @@ impl I2cBus {
     /// The address of each slave on the bus, newest first.
     pub fn addresses(&self) -> Vec<u8> {
         self.lock().children.iter().map(|c| c.address).collect()
+    }
+
+    /// What `vmstate_i2c_bus` sends, from `i2c_bus_pre_save()`.
+    pub fn vmstate_save(&self) -> I2cBusVmState {
+        let g = self.lock();
+        let saved_address = match g.current.first() {
+            None => 0xff,
+            Some(_) if g.broadcast => I2C_BROADCAST,
+            Some(dev) => {
+                g.children.iter().find(|c| Arc::ptr_eq(&c.dev, dev)).map_or(0xff, |c| c.address)
+            }
+        };
+        I2cBusVmState { saved_address }
+    }
+
+    /// Loads `vmstate_i2c_bus`. As in QEMU the address is only kept: the slaves' `post_load`
+    /// rejoin the transfer from it, and no slave on a q35 bus has state to migrate.
+    pub fn vmstate_load(&self, v: &I2cBusVmState) {
+        self.lock().saved_address = v.saved_address;
+    }
+
+    /// The `saved_address` the last `i2c_bus` section brought, for slaves that rejoin a
+    /// transfer after loading.
+    pub fn saved_address(&self) -> u8 {
+        self.lock().saved_address
     }
 
     /// `i2c_bus_busy()`: a transfer is in progress.

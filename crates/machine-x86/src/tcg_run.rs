@@ -585,6 +585,12 @@ pub struct TcgMachine {
     board: Arc<Mutex<X86Board>>,
     vcpus: Arc<TcgVcpus>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// `QEMU_CLOCK_VIRTUAL`, stopped while the vCPUs are.
+    vclock: Arc<Clock>,
+    /// Where `cpu_get_ticks()` counts from.
+    tsc_base: Instant,
+    /// The APIC of each vCPU, in vCPU order.
+    apics: Vec<Arc<Apic>>,
 }
 
 impl fmt::Debug for TcgMachine {
@@ -713,6 +719,9 @@ impl TcgMachine {
         let board = Arc::new(Mutex::new(board));
         let vcpus = Arc::new(TcgVcpus::start(&jit, vcpus));
 
+        // cpu_ticks_enabled is clear until vm_start().
+        vclock.stop();
+        let machine_apics = apics.clone();
         let control = {
             let s = Arc::clone(&shared);
             let v = Arc::clone(&vcpus);
@@ -729,8 +738,15 @@ impl TcgMachine {
                 .spawn(move || timer_loop(s, clocks))
                 .map_err(|e| format!("could not create thread: {e}"))?
         };
-        let machine =
-            TcgMachine { shared, board, vcpus, threads: Mutex::new(vec![control, timers]) };
+        let machine = TcgMachine {
+            shared,
+            board,
+            vcpus,
+            threads: Mutex::new(vec![control, timers]),
+            vclock,
+            tsc_base,
+            apics: machine_apics,
+        };
         Ok((machine, warnings))
     }
 
@@ -742,6 +758,23 @@ impl TcgMachine {
     /// The vCPUs.
     pub fn vcpus(&self) -> &Arc<TcgVcpus> {
         &self.vcpus
+    }
+
+    /// `QEMU_CLOCK_VIRTUAL`: it runs only between [`start`](Self::start) and
+    /// [`pause`](Self::pause).
+    pub fn virtual_clock(&self) -> &Arc<Clock> {
+        &self.vclock
+    }
+
+    /// The instant `cpu_get_ticks()` counts from in nanoseconds: what every vCPU's TSC adds
+    /// its `tsc_offset` to.
+    pub fn tsc_base(&self) -> Instant {
+        self.tsc_base
+    }
+
+    /// The APIC of each vCPU, in vCPU order.
+    pub fn apics(&self) -> &[Arc<Apic>] {
+        &self.apics
     }
 
     /// The number of vCPUs.
@@ -756,6 +789,8 @@ impl TcgMachine {
 
     /// `resume_all_vcpus()`.
     pub fn start(&self) {
+        // vm_prepare_start(): cpu_enable_ticks().
+        self.vclock.start();
         let mut c = self.shared.lock();
         c.running = true;
         if !c.reset_pending && !c.quit {
@@ -768,6 +803,8 @@ impl TcgMachine {
     pub fn pause(&self) {
         self.shared.lock().running = false;
         self.vcpus.pause_all();
+        // do_vm_stop(): cpu_disable_ticks().
+        self.vclock.stop();
     }
 
     /// `qemu_system_reset_request()` from outside the guest.

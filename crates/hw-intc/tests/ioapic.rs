@@ -346,3 +346,28 @@ fn mmio_ops_and_info() {
     );
     assert!(info.ends_with("  IRR      (none)\n  Remote IRR (none)\n"), "{info}");
 }
+
+#[test]
+fn vmstate_round_trip() {
+    let r = rig();
+    r.write_reg(IOAPIC_REG_ID, 3 << IOAPIC_ID_SHIFT);
+    // Pin 5 level triggered and delivered, so remote IRR is set and the line stays in IRR.
+    r.set_entry(5, IOAPIC_LVT_TRIGGER_MODE | 0x35);
+    r.s.set_irq(5, 1);
+    assert_eq!(r.take().len(), 1);
+    r.s.mmio_write(IOAPIC_IOREGSEL, 4, u64::from(IOAPIC_REG_REDTBL_BASE + 10));
+    let v = r.s.vmstate_save();
+    assert_eq!(v.id, 3);
+    assert_eq!(v.ioregsel, IOAPIC_REG_REDTBL_BASE + 10);
+    assert_eq!(v.irr, 1 << 5);
+    assert_eq!(v.ioredtbl[5], IOAPIC_LVT_TRIGGER_MODE | IOAPIC_LVT_REMOTE_IRR | 0x35);
+    assert_eq!(v.ioredtbl[0], IOAPIC_LVT_MASKED);
+
+    let d = rig();
+    d.s.vmstate_load(&v);
+    assert_eq!(d.s.vmstate_save(), v);
+    assert!(d.take().is_empty());
+    // The EOI for the vector clears remote IRR and, with the line still high, delivers again.
+    d.ioapics.eoi_broadcast(0x35);
+    assert_eq!(d.take().len(), 1);
+}

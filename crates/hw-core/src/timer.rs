@@ -6,6 +6,11 @@
 //! under qtest the virtual clock only moves when the test steps it, otherwise it follows the
 //! host. Callbacks run with no lock held, so they can read the clock and rearm any timer,
 //! including their own.
+//!
+//! A clock can also be stopped and set, as `cpu_disable_ticks()`, `cpu_enable_ticks()` and the
+//! `timer` migration section do to `QEMU_CLOCK_VIRTUAL`: a stopped clock reads the same value and
+//! runs no timers, and setting it moves what it reads without touching the deadlines, which are
+//! absolute times on the clock.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -31,6 +36,10 @@ type Callback = Arc<dyn Fn() + Send + Sync>;
 
 struct Inner {
     now: i64,
+    /// Added to what the source reads: `cpu_clock_offset` while the clock runs.
+    offset: i64,
+    /// The value a stopped clock reads.
+    stopped: Option<i64>,
     list: TimerList<Callback>,
 }
 
@@ -55,7 +64,7 @@ impl Clock {
         Arc::new(Clock {
             kind,
             source,
-            inner: Mutex::new(Inner { now: 0, list: TimerList::new() }),
+            inner: Mutex::new(Inner { now: 0, offset: 0, stopped: None, list: TimerList::new() }),
             notify: Mutex::new(None),
         })
     }
@@ -73,7 +82,8 @@ impl Clock {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn read(&self, inner: &Inner) -> i64 {
+    /// What the source reads, before the offset.
+    fn raw(&self, inner: &Inner) -> i64 {
         match self.source {
             TimeSource::Manual => inner.now,
             TimeSource::Monotonic(start) => start.elapsed().as_nanos() as i64,
@@ -81,6 +91,54 @@ impl Clock {
                 SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i64)
             }
         }
+    }
+
+    fn read(&self, inner: &Inner) -> i64 {
+        match inner.stopped {
+            Some(v) => v,
+            None => self.raw(inner).wrapping_add(inner.offset),
+        }
+    }
+
+    /// `cpu_disable_ticks()`: freezes the clock at what it reads now. Its timers do not run
+    /// until [`start`](Self::start). Stopping a stopped clock does nothing.
+    pub fn stop(&self) {
+        let mut inner = self.lock();
+        if inner.stopped.is_none() {
+            inner.stopped = Some(self.read(&inner));
+        }
+    }
+
+    /// `cpu_enable_ticks()`: the clock runs again from where it stopped.
+    pub fn start(&self) {
+        {
+            let mut inner = self.lock();
+            let Some(v) = inner.stopped.take() else { return };
+            inner.offset = v.wrapping_sub(self.raw(&inner));
+        }
+        self.notify();
+    }
+
+    /// Whether the clock is stopped, `!clock->enabled`.
+    pub fn is_stopped(&self) -> bool {
+        self.lock().stopped.is_some()
+    }
+
+    /// Makes the clock read `ns` from now on, from where it carries on counting if it runs. The
+    /// incoming `timer` section does this with the source's clock, so deadlines that came in
+    /// the same stream keep their distance from now.
+    pub fn set_ns(&self, ns: i64) {
+        {
+            let mut inner = self.lock();
+            if inner.stopped.is_some() {
+                inner.stopped = Some(ns);
+            } else if matches!(self.source, TimeSource::Manual) {
+                inner.now = ns;
+            } else {
+                inner.offset = ns.wrapping_sub(self.raw(&inner));
+            }
+        }
+        self.notify();
     }
 
     /// `qemu_clock_get_ns()`.
@@ -120,9 +178,12 @@ impl Clock {
     }
 
     /// `qemu_clock_deadline_ns_all()`: nanoseconds to the next timer, 0 if one is overdue, or
-    /// -1 when none is armed.
+    /// -1 when none is armed or the clock is stopped.
     pub fn deadline_ns(&self) -> i64 {
         let mut inner = self.lock();
+        if inner.stopped.is_some() {
+            return -1;
+        }
         let now = self.read(&inner);
         match inner.list.next_deadline() {
             Some(d) => (d - now).max(0),
@@ -130,8 +191,8 @@ impl Clock {
         }
     }
 
-    /// `qemu_clock_run_timers()`: fires every timer due at the current time. Returns how many
-    /// ran.
+    /// `qemu_clock_run_timers()`: fires every timer due at the current time, none while the
+    /// clock is stopped. Returns how many ran.
     pub fn run_timers(&self) -> usize {
         let mut fired = 0;
         loop {
@@ -139,6 +200,9 @@ impl Clock {
             // seen before the next one fires.
             let cb = {
                 let mut inner = self.lock();
+                if inner.stopped.is_some() {
+                    return fired;
+                }
                 let now = self.read(&inner);
                 inner.list.pop_expired(now).and_then(|id| inner.list.callback(id).cloned())
             };
@@ -321,6 +385,43 @@ mod tests {
         drop(t);
         clock.advance_to(10);
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn stopped_clock_holds_its_value_and_runs_no_timers() {
+        let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
+        clock.set_ns(1_000_000_000_000);
+        let count = Arc::new(AtomicUsize::new(0));
+        let n = count.clone();
+        let t = clock.new_timer(move || {
+            n.fetch_add(1, Ordering::SeqCst);
+        });
+        clock.stop();
+        let v = clock.get_ns();
+        assert!(v >= 1_000_000_000_000);
+        t.modify(v);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(clock.get_ns(), v);
+        assert_eq!(clock.deadline_ns(), -1);
+        assert_eq!(clock.run_timers(), 0);
+        // Loading a stream sets a stopped clock; it carries on from there.
+        clock.set_ns(5_000);
+        assert_eq!(clock.get_ns(), 5_000);
+        t.modify(5_000);
+        clock.start();
+        assert!(!clock.is_stopped());
+        let now = clock.get_ns();
+        assert!((5_000..5_000 + 1_000_000_000).contains(&now));
+        assert_eq!(clock.run_timers(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn manual_clock_can_be_set() {
+        let clock = Clock::manual(ClockType::Virtual);
+        clock.set_ns(42);
+        assert_eq!(clock.get_ns(), 42);
+        assert_eq!(clock.advance_to(50), 50);
     }
 
     #[test]

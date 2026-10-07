@@ -341,3 +341,48 @@ fn realize_needs_x2apic_for_high_ids() {
     assert!(Apic::realize(&bus, &clock, 260, false, cpu).is_ok());
     assert!(bus.apic(260).is_some());
 }
+
+#[test]
+fn vmstate_round_trip() {
+    let r = rig(2);
+    r.on(0);
+    r.enable();
+    r.write(0x80, 0x20);
+    // Divide by 1, one-shot, 100 ticks from time 10.
+    r.write(0x3e0, 0xb);
+    r.write(0x320, 0x40);
+    r.clock.advance_to(10);
+    r.write(0x380, 100);
+    r.clock.advance_to(30);
+    let v = r.apics[0].vmstate_save();
+    assert_eq!(v.apicbase, 0xfee0_0900);
+    assert_eq!((v.tpr, v.spurious_vec, v.count_shift), (0x20, APIC_SV_ENABLE | 0xff, 0));
+    assert_eq!((v.initial_count, v.initial_count_load_time), (100, 10));
+    assert_eq!((v.next_time, v.timer_expiry), (111, 111));
+    assert_eq!(v.wait_for_sipi, 0);
+    // The AP waits for its SIPI, so its apic_sipi subsection goes out.
+    assert_eq!(r.apics[1].vmstate_save().wait_for_sipi, 1);
+
+    let d = rig(2);
+    d.clock.advance_to(30);
+    d.apics[0].vmstate_load(&v).unwrap();
+    assert_eq!(d.apics[0].vmstate_save(), v);
+    // Loaded from another thread: the CPU is asked to poll its APIC.
+    assert_eq!(d.cpus[0].take(), [(true, CpuIrq::Poll)]);
+    d.on(0);
+    assert_eq!(d.read(0x390), 80);
+    d.clock.advance_to(110);
+    assert!(d.cpus[0].take().is_empty());
+    d.clock.advance_to(111);
+    assert_eq!(d.cpus[0].take(), [(true, CpuIrq::Hard)]);
+    assert_eq!(d.apics[0].get_interrupt(), 0x40);
+
+    // A stopped timer stays stopped, and a shift divide_conf cannot give is refused.
+    let mut w = v.clone();
+    w.timer_expiry = -1;
+    d.apics[0].vmstate_load(&w).unwrap();
+    d.clock.advance_to(1000);
+    assert!(d.cpus[0].take().iter().all(|(on, _)| !on));
+    w.count_shift = 40;
+    assert!(d.apics[0].vmstate_load(&w).is_err());
+}

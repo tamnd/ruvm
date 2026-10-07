@@ -145,6 +145,7 @@ fn run(
     let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
     let spec = BoardSpec {
         kind: BoardKind::Q35,
+        machine_type: "pc-q35-11.1",
         props: Vec::new(),
         ram_size: None,
         cpus: 1,
@@ -373,6 +374,7 @@ fn boot_linux(cpus: u32) {
     let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
     let spec = BoardSpec {
         kind: BoardKind::Q35,
+        machine_type: "pc-q35-11.1",
         props: Vec::new(),
         ram_size: Some(256 << 20),
         cpus,

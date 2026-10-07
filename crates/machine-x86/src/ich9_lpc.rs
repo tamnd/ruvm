@@ -42,8 +42,11 @@
 //!   of `etc/smi/features-ok`.
 //! - `memory_region_present()` in the machine-ready hook is answered from the rendered I/O space.
 //!
-//! Not ported: VMState (`ich9_lpc_post_load()` would call the three update functions), trace
-//! points, QOM registration and properties (they are fields of [`Ich9LpcConfig`]), the TCO
+//! - Loading the `ICH9LPC` section ([`Ich9Lpc::vmstate_load`]) also rebuilds the PIRQ table from
+//!   the chip config registers, which `ich9_lpc_post_load()` forgets, unmaps the RCRB if it was
+//!   mapped before the load instead of assuming it was not, and fires the INTx routing notifier.
+//!
+//! Not ported: trace points, QOM registration and properties (they are fields of [`Ich9LpcConfig`]), the TCO
 //! watchdog and `ich9_generate_smi()`, the SWSMI and periodic SMI timers, the ISA bus with its
 //! i8257 DMA and RTC children (the board creates those), hotplug handlers, ACPI device
 //! interfaces and the AML builder.
@@ -52,14 +55,14 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
 use ruvm_base::Error;
-use ruvm_hw_acpi::ich9::{ICH9_PMIO_SMI_EN_APMC_EN, Ich9Pm, Ich9PmProps};
+use ruvm_hw_acpi::ich9::{ICH9_PMIO_SMI_EN_APMC_EN, Ich9Pm, Ich9PmProps, Ich9PmVmState};
 use ruvm_hw_acpi::{SystemRequest, SystemRequestHandler};
 use ruvm_hw_core::{Clock, IrqLine};
 use ruvm_hw_pci::regs::{
     PCI_CLASS_BRIDGE_ISA, PCI_NUM_PINS, PCI_SLOT_MAX, pci_devfn, pci_get_long, pci_get_word,
     pci_set_long, pci_set_word, pci_slot,
 };
-use ruvm_hw_pci::{PciBus, PciDevice, PciDeviceInfo, PciDeviceOps};
+use ruvm_hw_pci::{PciBus, PciDevice, PciDeviceInfo, PciDeviceOps, PciDeviceVmState};
 use ruvm_mem::{
     AccessConstraints, AccessCtx, AccessSize, MemError, MemResult, MemorySystem, MmioOps, RegionId,
 };
@@ -233,6 +236,30 @@ impl Ich9LpcConfig {
                 | (1 << ICH9_LPC_SMI_F_CPU_HOT_UNPLUG_BIT),
         }
     }
+}
+
+/// `APMState`, the `APM State` section.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApmVmState {
+    pub apmc: u8,
+    pub apms: u8,
+}
+
+/// The `ICH9LPC` section with its `rst_cnt` and `smi_feat` subsections.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ich9LpcVmState {
+    pub d: PciDeviceVmState,
+    pub apm: ApmVmState,
+    pub pm: Ich9PmVmState,
+    /// [`ICH9_CC_SIZE`] bytes.
+    pub chip_config: Vec<u8>,
+    pub sci_level: u32,
+    /// `ICH9LPC/rst_cnt`, sent when nonzero.
+    pub rst_cnt: u8,
+    /// `ICH9LPC/smi_feat`, sent when these are nonzero or the features were accepted.
+    pub smi_guest_features_le: [u8; 8],
+    pub smi_features_ok: u8,
+    pub smi_negotiated_features: u64,
 }
 
 /// The mutable part of `ICH9LPCState` that is not config space.
@@ -933,6 +960,54 @@ impl Ich9Lpc {
     /// `ich9_cc_write()`.
     pub fn cc_write(&self, addr: u64, val: u64, len: u32) {
         self.inner.cc_write(addr, val, len);
+    }
+
+    /// The `ICH9LPC` section.
+    pub fn vmstate_save(&self) -> Ich9LpcVmState {
+        let d = self.dev.vmstate_save();
+        let pm = self.inner.pm.vmstate_save();
+        let s = lock(&self.inner.state);
+        Ich9LpcVmState {
+            d,
+            apm: ApmVmState { apmc: s.apmc, apms: s.apms },
+            pm,
+            chip_config: s.chip_config.clone(),
+            sci_level: u32::from(s.sci_level),
+            rst_cnt: s.rst_cnt,
+            smi_guest_features_le: s.smi_guest_features_le,
+            smi_features_ok: s.smi_features_ok,
+            smi_negotiated_features: s.smi_negotiated_features,
+        }
+    }
+
+    /// Loads the `ICH9LPC` section, then does what `ich9_lpc_post_load()` does: moves the PM
+    /// window and the SCI from PMBASE and ACPI_CNTL, maps the RCRB from RCBA and applies
+    /// SMI_LOCK. See the module docs for what it does beyond that.
+    pub fn vmstate_load(&self, v: &Ich9LpcVmState) -> Result<(), String> {
+        if v.chip_config.len() != ICH9_CC_SIZE {
+            return Err(format!("ICH9LPC: chip_config is {} bytes", v.chip_config.len()));
+        }
+        let dev = &self.dev;
+        let rcba_old = dev.with_config(|c| pci_get_long(c.config, ICH9_LPC_RCBA));
+        dev.vmstate_load(&v.d)?;
+        self.inner.pm.vmstate_load(&v.pm);
+        {
+            let mut s = lock(&self.inner.state);
+            s.apmc = v.apm.apmc;
+            s.apms = v.apm.apms;
+            s.chip_config.copy_from_slice(&v.chip_config);
+            s.cc_update();
+            s.sci_level = v.sci_level != 0;
+            s.rst_cnt = v.rst_cnt;
+            s.smi_guest_features_le = v.smi_guest_features_le;
+            s.smi_features_ok = v.smi_features_ok;
+            s.smi_negotiated_features = v.smi_negotiated_features;
+        }
+        self.inner.pmbase_sci_update(dev);
+        self.inner.rcba_update(dev, rcba_old);
+        self.inner.pmcon_update(dev);
+        self.inner.fire_intx_routing_notifier();
+        Ok(())
     }
 
     /// The "lpc-rcrb-mmio" region.

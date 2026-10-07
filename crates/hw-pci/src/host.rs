@@ -79,6 +79,12 @@ pub fn pci_data_read(bus: &PciBus, addr: u32, len: u32) -> u32 {
     pci_host_config_read_common(&dev, config_addr, PCI_CONFIG_SPACE_SIZE as u32, len)
 }
 
+/// `vmstate_pcihost` (version 1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PciHostVmState {
+    pub config_reg: u32,
+}
+
 /// A PCI host bridge's config mechanism state, the `config_reg` part of `PCIHostState`.
 pub struct PciHostState {
     bus: Arc<PciBus>,
@@ -110,6 +116,16 @@ impl PciHostState {
 
     pub fn set_config_reg(&self, v: u32) {
         self.config_reg.store(v, Ordering::Relaxed);
+    }
+
+    /// The `PCIHost` section.
+    pub fn vmstate_save(&self) -> PciHostVmState {
+        PciHostVmState { config_reg: self.config_reg() }
+    }
+
+    /// Loads the `PCIHost` section.
+    pub fn vmstate_load(&self, v: &PciHostVmState) {
+        self.set_config_reg(v.config_reg);
     }
 
     /// `pci_host_config_write()`: only aligned 32 bit writes update CONFIG_ADDRESS.

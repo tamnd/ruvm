@@ -31,13 +31,23 @@ use crate::microvm::{
 use crate::pc::{GsiHook, err};
 use crate::q35::{
     CpuIdent, KVMVAPIC_ROM, PflashDrive, Q35, Q35_BIOS_FILENAME, Q35_DESC, Q35_MACHINE_ALIAS,
-    Q35_MACHINE_NAME, Q35MachineConfig, Q35Props,
+    Q35_MACHINE_NAME, Q35_OLDER_MACHINE_NAMES, Q35MachineConfig, Q35Props,
 };
 
 /// The x86 boards the system emulator can build, as `-machine help` lists them: name, alias
 /// and description.
-pub const X86_BOARDS: &[(&str, Option<&str>, &str)] =
-    &[("microvm", None, MICROVM_DESC), (Q35_MACHINE_NAME, Some(Q35_MACHINE_ALIAS), Q35_DESC)];
+pub const X86_BOARDS: &[(&str, Option<&str>, &str)] = &[
+    ("microvm", None, MICROVM_DESC),
+    (Q35_MACHINE_NAME, Some(Q35_MACHINE_ALIAS), Q35_DESC),
+    (Q35_OLDER_MACHINE_NAMES[0], None, Q35_DESC),
+    (Q35_OLDER_MACHINE_NAMES[1], None, Q35_DESC),
+];
+
+/// The machine type a `-machine type=` value names, with an alias resolved (`q35` is
+/// `pc-q35-11.1`), if it is one of [`X86_BOARDS`].
+pub fn canonical_machine_name(name: &str) -> Option<&'static str> {
+    X86_BOARDS.iter().find(|(n, a, _)| *n == name || *a == Some(name)).map(|(n, _, _)| *n)
+}
 
 /// A microvm or q35 board.
 pub enum X86Board {
@@ -73,7 +83,7 @@ impl X86Board {
     pub fn name(&self) -> &'static str {
         match self {
             X86Board::Microvm(_) => "microvm",
-            X86Board::Q35(..) => Q35_MACHINE_NAME,
+            X86Board::Q35(m, _) => m.machine_name(),
         }
     }
 
@@ -290,17 +300,16 @@ impl X86Board {
 pub enum BoardKind {
     /// `microvm`.
     Microvm,
-    /// `pc-q35-11.1`, alias `q35`.
+    /// `pc-q35-11.1`, alias `q35`, and the older versions in [`Q35_OLDER_MACHINE_NAMES`].
     Q35,
 }
 
 impl BoardKind {
     /// The board a `-machine type=` value names, if it is one of these.
     pub fn from_name(name: &str) -> Option<BoardKind> {
-        match name {
+        match canonical_machine_name(name)? {
             "microvm" => Some(BoardKind::Microvm),
-            n if n == Q35_MACHINE_NAME || n == Q35_MACHINE_ALIAS => Some(BoardKind::Q35),
-            _ => None,
+            _ => Some(BoardKind::Q35),
         }
     }
 
@@ -324,6 +333,9 @@ pub struct KernelFiles {
 /// What [`build_board`] needs: the command line after parsing, with nothing read yet.
 pub struct BoardSpec {
     pub kind: BoardKind,
+    /// The machine type name, from [`canonical_machine_name`]: `pc-q35-11.0` builds a q35 board
+    /// that calls itself that.
+    pub machine_type: &'static str,
     /// The `-machine` properties other than `type`, `accel` and the accelerator ones, in
     /// command line order.
     pub props: Vec<(String, String)>,
@@ -370,6 +382,7 @@ impl fmt::Debug for BoardSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BoardSpec")
             .field("kind", &self.kind)
+            .field("machine_type", &self.machine_type)
             .field("props", &self.props)
             .field("ram_size", &self.ram_size)
             .field("cpus", &self.cpus)
@@ -471,6 +484,7 @@ pub fn build_board(spec: BoardSpec) -> Result<(X86Board, Vec<String>), String> {
             }
             let name = spec.bios.clone().unwrap_or_else(|| Q35_BIOS_FILENAME.to_string());
             let mut cfg = Q35MachineConfig {
+                machine_name: spec.machine_type,
                 cpus: spec.cpus,
                 max_cpus: spec.max_cpus,
                 kvm: spec.kvm,

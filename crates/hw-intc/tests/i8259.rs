@@ -440,3 +440,33 @@ fn output_follows_pic_get_output() {
     p.ack();
     assert!(!p.master().pic_get_output());
 }
+
+#[test]
+fn vmstate_round_trip() {
+    let p = pc();
+    p.master().ioport_write(1, 0x02);
+    p.master().elcr_ioport_write(0x08);
+    p.pulse(4);
+    assert_eq!(p.ack(), 0x0c);
+    p.pulse(10);
+    let (m, s) = (p.master().state(), p.slave().state());
+
+    let q = raw();
+    q.master().vmstate_load(&m);
+    q.slave().vmstate_load(&s);
+    assert_eq!(q.master().state(), m);
+    assert_eq!(q.slave().state(), s);
+    assert!(!q.slave().state().master);
+    // Loading does not drive the INT line; the CPU brings its own interrupt request.
+    assert_eq!(q.int(), 0);
+    // The loaded pair acknowledges what the old one had pending, IRQ10 through the slave.
+    assert_eq!(q.ack(), 0x72);
+    assert_eq!(isr(q.master()), 0x14);
+    assert_eq!(isr(q.slave()), 0x04);
+    assert_eq!(q.master().ioport_read(1), 0x02);
+    assert_eq!(q.master().elcr_ioport_read(), 0x08);
+
+    // A master state loaded into the slave chip keeps the slave a slave.
+    q.slave().vmstate_load(&m);
+    assert!(!q.slave().state().master);
+}

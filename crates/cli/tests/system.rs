@@ -101,7 +101,9 @@ fn help_options() {
              microvm              microvm (i386)\n\
              none                 empty machine\n\
              q35                  Standard PC (Q35 + ICH9, 2009) (alias of pc-q35-11.1)\n\
-             pc-q35-11.1          Standard PC (Q35 + ICH9, 2009)\n"
+             pc-q35-11.1          Standard PC (Q35 + ICH9, 2009)\n\
+             pc-q35-11.0          Standard PC (Q35 + ICH9, 2009)\n\
+             pc-q35-10.2          Standard PC (Q35 + ICH9, 2009)\n"
         )
     );
     let (code, out, _) = system(&["-L", "/a", "-L", "/b", "-L", "help"]);

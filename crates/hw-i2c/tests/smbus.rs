@@ -581,3 +581,35 @@ fn spd_sdr_and_ddr_and_errors() {
     // QEMU keeps the MiB count in 32 bits.
     assert!(spd_data_generate(SdramType::Sdr, 1 << 52).is_err());
 }
+
+#[test]
+fn ich9_vmstate_round_trip() {
+    let src = Env::new();
+    src.outb(SMBHSTCMD, 0x5a);
+    src.outb(SMBHSTDAT0, 0x12);
+    // An interrupt-enabled transaction to a missing device leaves INTR and INTA up.
+    assert_ne!(src.run(0x7f, false, 0, PROT_QUICK, CTL_INTREN) & STS_DEV_ERR, 0);
+    let saved = src.smb.vmstate_save();
+    assert!(saved.irq_enabled);
+    assert_eq!(saved.dev.irq_state, [1, 0, 0, 0]);
+    assert_eq!(saved.smb.smb_data0, 0x12);
+    assert_eq!(saved.smb, src.smb.pm().regs());
+    let counts = src.bus.irq_counts();
+
+    let dst = Env::bare();
+    dst.smb.vmstate_load(&saved).unwrap();
+    dst.bus.set_irq_counts(&counts).unwrap();
+    assert_eq!(dst.smb.vmstate_save(), saved);
+    // BAR 4, the command register and HOSTC come with config space.
+    assert_eq!(dst.inb(SMBHSTDAT0), 0x12);
+    // Clearing the status drops INTA through the restored count.
+    dst.outb(SMBHSTSTS, 0xff);
+    assert!(!dst.smb.irq_enabled());
+    assert_eq!(dst.bus.irq_count(0), 0);
+
+    // With HOSTC.HST_EN clear in the stream the registers are hidden.
+    let mut off = saved;
+    off.dev.config[ICH9_SMB_HOSTC] = 0;
+    dst.smb.vmstate_load(&off).unwrap();
+    assert_ne!(dst.inb(SMBHSTDAT0), 0x12);
+}

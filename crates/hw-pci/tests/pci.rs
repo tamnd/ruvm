@@ -1048,3 +1048,50 @@ fn power_management_gates_bars() {
     env.writew(devfn, pm + PCI_PM_CTRL as u8, 0);
     assert_eq!(dev.bar_addr(0), 0xfe00_0000);
 }
+
+#[test]
+fn vmstate_round_trip() {
+    let src = Env::new();
+    let dev = src.device("dev", Some(pci_devfn(4, 0)));
+    dev.with_config(|c| c.config[PCI_INTERRUPT_PIN] = 1);
+    let (mmio, _) = src.bar("bar0", 0x1000, 0xa000_0000);
+    dev.register_bar(0, PCI_BASE_ADDRESS_SPACE_MEMORY, mmio);
+    src.writel(dev.devfn(), PCI_BASE_ADDRESS_0 as u8, 0xfebf_0000);
+    src.writew(dev.devfn(), PCI_COMMAND as u8, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+    dev.set_irq(1);
+    let saved = dev.vmstate_save();
+    assert_eq!(saved.version_id, 2);
+    assert_eq!(saved.config.len(), PCI_CONFIG_SPACE_SIZE);
+    assert_eq!(saved.irq_state, [1, 0, 0, 0]);
+    let counts = src.bus.irq_counts();
+    assert_eq!(counts, vec![1, 0, 0, 0]);
+
+    let dst = Env::new();
+    let d = dst.device("dev", Some(pci_devfn(4, 0)));
+    d.with_config(|c| c.config[PCI_INTERRUPT_PIN] = 1);
+    let (mmio, _) = dst.bar("bar0", 0x1000, 0xa000_0000);
+    d.register_bar(0, PCI_BASE_ADDRESS_SPACE_MEMORY, mmio);
+    d.vmstate_load(&saved).unwrap();
+    dst.bus.set_irq_counts(&counts).unwrap();
+    assert_eq!(d.vmstate_save(), saved);
+    assert_eq!(d.bar_addr(0), 0xfebf_0000);
+    assert_eq!(dst.mem_readl(0xfebf_0010), Some(0xa000_0010));
+    assert!(d.is_bus_master());
+    assert_eq!(d.irq_state(), 1);
+    // Loading does not drive the line; lowering the pin afterwards balances the count.
+    assert_eq!(dst.levels[0].load(Ordering::SeqCst), 0);
+    d.set_irq(0);
+    assert_eq!(dst.bus.irq_count(0), 0);
+    assert!(dst.bus.set_irq_counts(&[0; 3]).is_err());
+
+    // A read-only, checked bit that differs is refused, as is a bad pin level.
+    let mut bad = saved.clone();
+    bad.config[PCI_DEVICE_ID] ^= 1;
+    assert!(d.vmstate_load(&bad).is_err());
+    let mut bad = saved.clone();
+    bad.irq_state[2] = 2;
+    assert!(d.vmstate_load(&bad).is_err());
+    let mut bad = saved;
+    bad.config.truncate(64);
+    assert!(d.vmstate_load(&bad).is_err());
+}

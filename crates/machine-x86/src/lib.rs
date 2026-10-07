@@ -26,7 +26,9 @@ pub mod q35;
 pub mod run_event;
 pub mod tcg_run;
 
-pub use board::{BoardKind, BoardSpec, KernelFiles, X86_BOARDS, X86Board, build_board};
+pub use board::{
+    BoardKind, BoardSpec, KernelFiles, X86_BOARDS, X86Board, build_board, canonical_machine_name,
+};
 pub use file_backend::FileBackend;
 pub use firmware::FirmwareSearch;
 pub use ich9_lpc::{Ich9Lpc, Ich9LpcConfig};

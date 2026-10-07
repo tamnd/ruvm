@@ -419,3 +419,49 @@ fn system_states_blob() {
     assert_eq!(env.pm.system_states(), [128, 0, 0, 129, 130, 128]);
     assert_eq!(system_states(true, true, 3), [128, 0, 0, 1, 3, 128]);
 }
+
+#[test]
+fn ich9_pm_vmstate_round_trip() {
+    let src = enabled_env();
+    let tmr = u64::from(ACPI_BITMASK_TIMER_STATUS);
+    src.outw(BASE + ICH9_PMIO_PM1_STS, tmr);
+    src.outw(BASE + ICH9_PMIO_PM1_EN, u64::from(ACPI_BITMASK_TIMER_ENABLE));
+    src.outb(BASE + ICH9_PMIO_GPE0_EN, 0x5a);
+    src.outl(BASE + ICH9_PMIO_SMI_EN, 0x21);
+    src.pm.set_cpu_hotplug_slots(2);
+    let saved = src.pm.vmstate_save();
+    assert_eq!(saved.pm1_evt_en, ACPI_BITMASK_TIMER_ENABLE);
+    assert_eq!(saved.tmr_overflow_time, 0x80_0000);
+    assert_eq!(saved.tmr_timer, deadline_ns(0x80_0000));
+    assert_eq!(saved.gpe_en[0], 0x5a);
+    assert_eq!(saved.smi_en, 0x21);
+    assert_eq!(saved.tco_regs, TcoVmState::default());
+    assert_eq!((saved.tco_regs.tmr, saved.tco_regs.tco_timer), (4, -1));
+    assert_eq!(saved.cpuhp_state.devs.len(), 2);
+    assert_eq!(saved.acpi_pci_hotplug.acpi_pcihp_pci_status.len(), ACPI_PCIHP_MAX_HOTPLUG_BUS);
+
+    // The destination maps the window from the LPC config, and loading leaves the SCI alone.
+    let dst = Env::new(Ich9PmProps::default());
+    let mut v = saved.clone();
+    v.cpuhp_state.selector = 1;
+    v.acpi_pci_hotplug.acpi_pcihp_pci_status[0] = AcpiPcihpPciStatusVmState { up: 2, down: 4 };
+    dst.pm.vmstate_load(&v);
+    assert_eq!(dst.pm.vmstate_save(), v);
+    assert_eq!(dst.pm.acpi().overflow_timer_deadline(), Some(deadline_ns(0x80_0000)));
+    assert!(!dst.sci());
+    dst.pm.lpc_config_update(BASE as u32 | ICH9_LPC_PMBASE_RTE, 0x80);
+    assert_eq!(dst.inl(BASE + ICH9_PMIO_SMI_EN), 0x21);
+    assert_eq!(dst.inb(BASE + ICH9_PMIO_GPE0_EN), 0x5a);
+
+    // The overflow timer still fires on the destination.
+    dst.clock.advance_to(ticks_ns(0x80_0000));
+    assert!(dst.sci());
+
+    // Reset clears the registers, carries out pending ejects and keeps the rest.
+    dst.pm.reset();
+    let r = dst.pm.vmstate_save();
+    assert_eq!(r.tmr_timer, -1);
+    let st = r.acpi_pci_hotplug.acpi_pcihp_pci_status[0];
+    assert_eq!((st.up, st.down), (2, 0));
+    assert_eq!(r.cpuhp_state.selector, 1);
+}

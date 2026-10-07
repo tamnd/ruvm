@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Migration of a q35 machine on TCG, in QEMU's stream format.
+//! Migration of a q35 or microvm machine on TCG, in QEMU's stream format.
 //!
-//! [`q35_savevm`] registers the sections of the machine the way QEMU 11.1 lays them out for
-//! `-M pc-q35-11.1`: the vCPUs (`cpu_common` and `cpu`), RAM, `globalstate`, and the board's
-//! devices. The vCPUs and RAM are carried for real. The device sections (APIC, PIC, IOAPIC, RTC,
-//! ICH9, fw_cfg and the rest) are parsed from an incoming stream and dropped, and not sent; a
-//! guest that relies on interrupt controller state does not survive the hop yet.
+//! [`x86_savevm`] registers the sections of the machine the way QEMU 11.1 lays them out for
+//! `-M pc-q35-11.1` (and the older q35 versions, which are the same here) or `-M microvm`, in
+//! QEMU's order so they get QEMU's section ids: the `timer` section, RAM, each vCPU with its
+//! local APIC, then the board's devices (microvm's fw_cfg comes before the vCPUs). Each device section carries the
+//! device's state field by field, as QEMU's `VMStateDescription` for it does. The 8237 DMA
+//! controllers, which ruvm does not model, and kvmvapic, which is for KVM, are parsed and
+//! dropped.
 
+mod ahci;
+mod apic;
 mod cpu;
+mod fw_cfg;
+mod ged;
+mod hpet;
+mod input;
+mod ioapic;
+mod legacy;
+mod lpc;
+mod pci;
+mod pic;
+mod pit;
+mod rtc;
+mod serial;
 mod skip;
+mod smbus;
+mod timer;
 
 use std::sync::{Arc, PoisonError, Weak};
 
@@ -19,7 +37,11 @@ use ruvm_migration::{
     EntryInfo, GlobalState, MachineConfig, RamHooks, RamSection, RamStats, SaveVm,
 };
 
+use ruvm_mem::RamBlock;
+
 use crate::board::X86Board;
+use crate::microvm::Microvm;
+use crate::q35::{MAX_ISA_SERIAL_PORTS, Q35};
 use crate::tcg_run::TcgMachine;
 
 /// The RAM hooks of a TCG machine. The dirty bitmaps are set by the TLB's not-dirty path, so
@@ -46,7 +68,7 @@ impl RamHooks for TcgHooks {
 
 /// The registered sections of a machine and the handles the migration code needs.
 #[derive(Debug)]
-pub struct Q35Migration {
+pub struct X86Migration {
     /// The sections.
     pub savevm: SaveVm,
     /// The counters of the `ram` section.
@@ -55,41 +77,50 @@ pub struct Q35Migration {
     pub global_state: Arc<GlobalState>,
 }
 
-/// Registers the sections of `machine`, a q35 board, for migration as machine type
+/// Registers the sections of `machine`, a q35 or microvm board, for migration as machine type
 /// `machine_type`.
-pub fn q35_savevm(
+pub fn x86_savevm(
     machine: &TcgMachine,
     machine_type: &str,
     uuid: Option<[u8; 16]>,
-) -> Result<Q35Migration, String> {
-    let board = machine.board().lock().unwrap_or_else(PoisonError::into_inner);
-    let X86Board::Q35(q35, _) = &*board else {
-        return Err("migration is only supported on the q35 machine".to_string());
-    };
-    let blocks = q35.migratable_ram_blocks();
-    let max_cpus = q35.max_cpus() as usize;
-    let apic_ids = board.apic_ids();
-    drop(board);
-
+) -> Result<X86Migration, String> {
     let mut savevm = SaveVm::new(MachineConfig {
         name: machine_type.to_string(),
         page_bits: 12,
         legacy_page_bits: 12,
         uuid,
     });
+    let board = machine.board().lock().unwrap_or_else(PoisonError::into_inner);
+    let ram_stats = match &*board {
+        X86Board::Q35(q35, _) => register_q35(&mut savevm, machine, q35),
+        X86Board::Microvm(m) => register_microvm(&mut savevm, machine, m),
+    };
+    drop(board);
+    let global_state = GlobalState::register(&mut savevm);
+    Ok(X86Migration { savevm, ram_stats, global_state })
+}
 
-    // The sections in the order QEMU registers them, so they get QEMU's section ids: the
-    // timers, then RAM and the dirty bitmaps from migration_object_init(), then each vCPU with
-    // its APIC (the first APIC brings kvmvapic along), then the board.
-    skip::register_timer(&mut savevm);
-    let vcpus = machine.vcpus();
-    let ram = RamSection::new(blocks, TcgHooks { vcpus: Arc::downgrade(vcpus) });
+/// The sections every board starts with, from migration_object_init() and the timers: the
+/// `timer` section, RAM and the dirty bitmaps. Gives the TSC ticks for the vCPUs and the RAM
+/// counters.
+fn register_common(
+    savevm: &mut SaveVm,
+    machine: &TcgMachine,
+    blocks: Vec<Arc<RamBlock>>,
+) -> (Arc<timer::Ticks>, Arc<RamStats>) {
+    let ticks = timer::Ticks::new(machine.tsc_base());
+    timer::register(savevm, machine.virtual_clock(), &ticks);
+    let ram = RamSection::new(blocks, TcgHooks { vcpus: Arc::downgrade(machine.vcpus()) });
     let ram_stats = ram.stats();
     savevm.register_live(EntryInfo::new("ram", 4).instance(0), ram);
     // "dirty-bitmap": ruvm has no block dirty bitmaps to migrate.
     savevm.reserve_section_id();
+    (ticks, ram_stats)
+}
 
-    for (n, shared) in vcpus.cpus().iter().enumerate() {
+/// Each vCPU with its APIC; the first APIC brings kvmvapic along.
+fn register_cpus(savevm: &mut SaveVm, machine: &TcgMachine, ticks: &Arc<timer::Ticks>) {
+    for (n, shared) in machine.vcpus().cpus().iter().enumerate() {
         let index = shared.cpu_index as u32;
         let (get, put) = (Arc::clone(shared), Arc::clone(shared));
         savevm.register_vmsd(
@@ -102,21 +133,104 @@ pub fn q35_savevm(
         let side = cpu::SideStore::default();
         let (get, put) = (Arc::clone(shared), Arc::clone(shared));
         let get_side = Arc::clone(&side);
+        let put_ticks = Arc::clone(ticks);
         savevm.register_vmsd(
             "",
             Some(index),
             &cpu::VMSTATE_X86_CPU,
             move || cpu::get_cpu(&get, &get_side),
-            move |c| cpu::put_cpu(&put, &side, c),
+            move |c| cpu::put_cpu(&put, &side, c, put_ticks.tsc_adjust()),
         );
         if n == 0 {
-            skip::register_vapic(&mut savevm);
+            skip::register_vapic(savevm);
         }
-        if let Some(&id) = apic_ids.get(n) {
-            skip::register_apic(&mut savevm, id);
+        if let Some(a) = machine.apics().get(n) {
+            apic::register(savevm, a);
         }
     }
-    skip::register_board(&mut savevm, max_cpus);
-    let global_state = GlobalState::register(&mut savevm);
-    Ok(Q35Migration { savevm, ram_stats, global_state })
+}
+
+/// The sections of a q35 board, in the order QEMU registers them so they get QEMU's section
+/// ids: the common ones, the vCPUs, then the board.
+fn register_q35(savevm: &mut SaveVm, machine: &TcgMachine, q35: &Q35) -> Arc<RamStats> {
+    let (ticks, ram_stats) = register_common(savevm, machine, q35.migratable_ram_blocks());
+    register_cpus(savevm, machine, &ticks);
+
+    // pc_q35_init(): fw_cfg, the host bridge and its bus, then the ISA bridge and the devices
+    // on it in the order pc_basic_device_init() and pc_q35_init() create them.
+    let max_cpus = q35.max_cpus() as usize;
+    fw_cfg::register(savevm, q35.fw_cfg());
+    pci::register_mch(savevm, q35.host());
+    pci::register_pci_host(savevm, q35.host().host_state());
+    pci::register_pci_bus(savevm, q35.pci_bus());
+    legacy::register_dma(savevm);
+    rtc::register(savevm, q35.rtc());
+    lpc::register(savevm, q35.lpc(), max_cpus);
+    if let Some(pic) = q35.pic() {
+        pic::register(savevm, pic);
+    }
+    ioapic::register(savevm, 0, q35.ioapic());
+    if let Some(hpet) = q35.hpet() {
+        hpet::register(savevm, hpet);
+    }
+    if let Some(pit) = q35.pit() {
+        pit::register(savevm, pit);
+    }
+    if let Some(spk) = q35.pcspk() {
+        pit::register_pcspk(savevm, spk);
+    }
+    for i in 0..MAX_ISA_SERIAL_PORTS {
+        if let Some(s) = q35.serial(i) {
+            serial::register(savevm, i as u32, s);
+        }
+    }
+    if let Some(i8042) = q35.i8042() {
+        input::register(savevm, i8042, q35.vmport());
+    }
+    if let Some(p) = q35.port92() {
+        legacy::register_port92(savevm, p);
+    }
+    if let Some(ahci) = q35.ahci() {
+        ahci::register(savevm, ahci);
+    }
+    if let Some(smb) = q35.smbus() {
+        legacy::register_i2c_bus(savevm, smb.smbus());
+        smbus::register(savevm, smb);
+        // The eight smbus-eeprom devices: registered, never sent.
+        for _ in 0..8 {
+            savevm.reserve_section_id();
+        }
+    }
+    let (get, set) = q35.acpi_patched();
+    lpc::register_acpi_build(savevm, get, set);
+    ram_stats
+}
+
+/// The sections of a microvm board, in QEMU's order: microvm_memory_init() creates fw_cfg
+/// before the vCPUs, then microvm_devices_init() adds the IOAPICs, the GED, the 8259 pair, the
+/// PIT, the RTC and the serial port. The virtio-mmio transports have no section of their own.
+fn register_microvm(savevm: &mut SaveVm, machine: &TcgMachine, m: &Microvm) -> Arc<RamStats> {
+    let (ticks, ram_stats) = register_common(savevm, machine, m.migratable_ram_blocks());
+    fw_cfg::register(savevm, m.fw_cfg());
+    register_cpus(savevm, machine, &ticks);
+    ioapic::register(savevm, 0, m.ioapic());
+    if let Some(io2) = m.ioapic2() {
+        ioapic::register(savevm, 1, io2);
+    }
+    if let Some(ged) = m.ged() {
+        ged::register(savevm, ged);
+    }
+    if let Some(pic) = m.pic() {
+        pic::register(savevm, pic);
+    }
+    if let Some(pit) = m.pit() {
+        pit::register(savevm, pit);
+    }
+    if let Some(rtc) = m.rtc() {
+        rtc::register(savevm, rtc);
+    }
+    if let Some(s) = m.serial() {
+        serial::register(savevm, 0, s);
+    }
+    ram_stats
 }

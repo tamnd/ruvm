@@ -8,8 +8,11 @@
 //! [`Serial::can_receive`] and [`Serial::receive`], the `qemu_chr_fe_set_handlers()` pair.
 //! [`IsaSerial`] is `isa-serial`, which picks the COM port base and IRQ from its index.
 //!
-//! Not ported: VMState, trace points, QOM registration, the `wakeup` property, the ACPI
-//! description of `isa-serial`, and the `serial-mm` and `serial-pci` front ends.
+//! [`Serial::vmstate_save`] and [`Serial::vmstate_load`] move the state the `serial` VMState
+//! carries, as a [`SerialVmState`] whose fields are named after QEMU's.
+//!
+//! Not ported: trace points, QOM registration, the `wakeup` property, the ACPI description of
+//! `isa-serial`, and the `serial-mm` and `serial-pci` front ends.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -227,6 +230,135 @@ impl Fifo8 {
 
     fn reset(&mut self) {
         self.0.clear();
+    }
+
+    /// The ring as `vmstate_fifo8` sends it: the bytes in order from slot 0.
+    fn to_vmstate(&self) -> Fifo8VmState {
+        let mut v = Fifo8VmState::default();
+        for (d, &b) in v.data.iter_mut().zip(self.0.iter()) {
+            *d = b;
+        }
+        v.num = self.0.len() as u32;
+        v
+    }
+
+    /// Refills the FIFO from what `vmstate_fifo8` loaded. QEMU takes `head` and `num` as they
+    /// come; out of range values are refused here rather than indexing out of the ring.
+    fn load_vmstate(&mut self, v: &Fifo8VmState, name: &str) -> Result<()> {
+        if v.head as usize >= UART_FIFO_LENGTH || v.num as usize > UART_FIFO_LENGTH {
+            return Err(Error::generic(format!(
+                "serial: {name} head {} num {} out of range",
+                v.head, v.num
+            )));
+        }
+        self.0.clear();
+        for i in 0..v.num as usize {
+            self.0.push_back(v.data[(v.head as usize + i) % UART_FIFO_LENGTH]);
+        }
+        Ok(())
+    }
+}
+
+/// `Fifo8` as `vmstate_fifo8` carries it: the whole ring, the read position and the count.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fifo8VmState {
+    /// `data`, `capacity` bytes.
+    pub data: [u8; UART_FIFO_LENGTH],
+    pub head: u32,
+    pub num: u32,
+}
+
+/// The fields of `vmstate_serial` (version 3) and its subsections, named as in QEMU.
+///
+/// `fifo_timeout_timer` and `modem_status_poll` are expiry times on the device's clock, the
+/// virtual clock, or -1 when the timer is not armed. `thr_ipending` and `poll_msl` are -1 when
+/// the stream did not carry them, what `serial_pre_load()` sets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SerialVmState {
+    pub divider: u16,
+    pub rbr: u8,
+    pub ier: u8,
+    pub iir: u8,
+    pub lcr: u8,
+    pub mcr: u8,
+    pub lsr: u8,
+    pub msr: u8,
+    pub scr: u8,
+    /// `fcr`, copied by `serial_pre_save()`.
+    pub fcr_vmstate: u8,
+    /// `serial/thr_ipending`.
+    pub thr_ipending: i32,
+    /// `serial/tsr`.
+    pub tsr_retry: u32,
+    pub thr: u8,
+    pub tsr: u8,
+    /// `serial/recv_fifo`.
+    pub recv_fifo: Fifo8VmState,
+    /// `serial/xmit_fifo`.
+    pub xmit_fifo: Fifo8VmState,
+    /// `serial/fifo_timeout_timer`.
+    pub fifo_timeout_timer: i64,
+    /// `serial/timeout_ipending`.
+    pub timeout_ipending: i32,
+    /// `serial/poll`.
+    pub poll_msl: i32,
+    pub modem_status_poll: i64,
+}
+
+impl SerialVmState {
+    /// `serial_thr_ipending_needed()`.
+    pub fn thr_ipending_needed(&self) -> bool {
+        if (self.ier & UART_IER_THRI) != 0 {
+            let expected = i32::from((self.iir & UART_IIR_ID) == UART_IIR_THRI);
+            self.thr_ipending != expected
+        } else {
+            // LSR.THRE is sampled again when the interrupt is enabled.
+            false
+        }
+    }
+
+    /// `serial_tsr_needed()`.
+    pub fn tsr_needed(&self) -> bool {
+        self.tsr_retry != 0
+    }
+
+    /// `serial_recv_fifo_needed()`.
+    pub fn recv_fifo_needed(&self) -> bool {
+        self.recv_fifo.num != 0
+    }
+
+    /// `serial_xmit_fifo_needed()`.
+    pub fn xmit_fifo_needed(&self) -> bool {
+        self.xmit_fifo.num != 0
+    }
+
+    /// `serial_fifo_timeout_timer_needed()`.
+    pub fn fifo_timeout_timer_needed(&self) -> bool {
+        self.fifo_timeout_timer != -1
+    }
+
+    /// `serial_timeout_ipending_needed()`.
+    pub fn timeout_ipending_needed(&self) -> bool {
+        self.timeout_ipending != 0
+    }
+
+    /// `serial_poll_needed()`.
+    pub fn poll_needed(&self) -> bool {
+        self.poll_msl >= 0
+    }
+}
+
+/// `timer_put()`: the expiry time, -1 when the timer is not armed.
+fn timer_vmstate(t: &Timer) -> i64 {
+    t.expire_time().unwrap_or(-1)
+}
+
+/// `timer_get()`: arms the timer at `expire`, or stops it for -1.
+fn timer_load(t: &Timer, expire: i64) {
+    if expire == -1 {
+        t.del();
+    } else {
+        t.modify(expire);
     }
 }
 
@@ -838,6 +970,96 @@ impl Serial {
             s.lsr |= UART_LSR_DR;
         }
         self.update_irq(s);
+    }
+
+    /// The state `vmstate_serial` sends, with `serial_pre_save()` applied.
+    pub fn vmstate_save(&self) -> SerialVmState {
+        let s = self.lock();
+        SerialVmState {
+            divider: s.divider,
+            rbr: s.rbr,
+            ier: s.ier,
+            iir: s.iir,
+            lcr: s.lcr,
+            mcr: s.mcr,
+            lsr: s.lsr,
+            msr: s.msr,
+            scr: s.scr,
+            fcr_vmstate: s.fcr,
+            thr_ipending: i32::from(s.thr_ipending),
+            tsr_retry: s.tsr_retry,
+            thr: s.thr,
+            tsr: s.tsr,
+            recv_fifo: s.recv_fifo.to_vmstate(),
+            xmit_fifo: s.xmit_fifo.to_vmstate(),
+            fifo_timeout_timer: timer_vmstate(&self.fifo_timeout_timer),
+            timeout_ipending: i32::from(s.timeout_ipending),
+            poll_msl: s.poll_msl,
+            modem_status_poll: timer_vmstate(&self.modem_status_poll),
+        }
+    }
+
+    /// Loads what `vmstate_serial` carried, then does `serial_post_load()`. The caller has
+    /// already reset `fcr_vmstate` for streams older than version 3.
+    ///
+    /// The timers are armed at the loaded expiry times, as `timer_get()` does. The interrupt
+    /// line is left alone, as in QEMU: the interrupt controllers carry their input levels.
+    /// QEMU adds a write watch when a byte is stuck in the transmit shift register; there is
+    /// no watch here, so the byte is retried right away, as [`Serial::set_backend`] does.
+    pub fn vmstate_load(&self, v: &SerialVmState) -> Result<()> {
+        // serial_post_load() checks these before anything changes.
+        if v.tsr_retry > 0 {
+            if (v.lsr & UART_LSR_TEMT) != 0 {
+                return Err(Error::generic(format!(
+                    "inconsistent state in serial device (tsr empty, tsr_retry={}",
+                    v.tsr_retry
+                )));
+            }
+        } else if (v.lsr & UART_LSR_TEMT) == 0 {
+            return Err(Error::generic(
+                "inconsistent state in serial device (tsr not empty, tsr_retry=0".to_string(),
+            ));
+        }
+        let mut recv_fifo = Fifo8::new();
+        recv_fifo.load_vmstate(&v.recv_fifo, "recv_fifo")?;
+        let mut xmit_fifo = Fifo8::new();
+        xmit_fifo.load_vmstate(&v.xmit_fifo, "xmit_fifo")?;
+
+        let mut guard = self.lock();
+        let s = &mut *guard;
+        s.divider = v.divider;
+        s.rbr = v.rbr;
+        s.ier = v.ier;
+        s.iir = v.iir;
+        s.lcr = v.lcr;
+        s.mcr = v.mcr;
+        s.lsr = v.lsr;
+        s.msr = v.msr;
+        s.scr = v.scr;
+        s.thr_ipending = if v.thr_ipending == -1 {
+            (s.iir & UART_IIR_ID) == UART_IIR_THRI
+        } else {
+            v.thr_ipending != 0
+        };
+        s.tsr_retry = v.tsr_retry.min(MAX_XMIT_RETRY);
+        s.thr = v.thr;
+        s.tsr = v.tsr;
+        s.recv_fifo = recv_fifo;
+        s.xmit_fifo = xmit_fifo;
+        timer_load(&self.fifo_timeout_timer, v.fifo_timeout_timer);
+        s.timeout_ipending = v.timeout_ipending != 0;
+        s.poll_msl = v.poll_msl;
+        timer_load(&self.modem_status_poll, v.modem_status_poll);
+
+        s.last_break_enable = (s.lcr & UART_LCR_SB) != 0;
+        // Initialize fcr via setter to perform essential side-effects.
+        Self::write_fcr(s, v.fcr_vmstate);
+        self.update_parameters(s);
+
+        if s.tsr_retry > 0 {
+            self.xmit(s);
+        }
+        Ok(())
     }
 
     /// `serial_reset()`.

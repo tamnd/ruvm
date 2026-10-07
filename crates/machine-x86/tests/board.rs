@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use ruvm_base::ClockType;
 use ruvm_hw_core::Clock;
-use ruvm_machine_x86::board::{BoardKind, BoardSpec, KernelFiles, build_board, load_kernel};
+use ruvm_machine_x86::board::{
+    BoardKind, BoardSpec, KernelFiles, build_board, canonical_machine_name, load_kernel,
+};
 use ruvm_machine_x86::firmware::{DEFAULT_FIRMWARE_DIRS, QEMU_BINARY, qemu_data_dir};
 use ruvm_machine_x86::{FileBackend, FirmwareSearch};
 
@@ -128,7 +130,14 @@ fn board_names() {
     assert_eq!(BoardKind::from_name("microvm"), Some(BoardKind::Microvm));
     assert_eq!(BoardKind::from_name("q35"), Some(BoardKind::Q35));
     assert_eq!(BoardKind::from_name("pc-q35-11.1"), Some(BoardKind::Q35));
+    assert_eq!(BoardKind::from_name("pc-q35-11.0"), Some(BoardKind::Q35));
+    assert_eq!(BoardKind::from_name("pc-q35-10.2"), Some(BoardKind::Q35));
+    assert_eq!(BoardKind::from_name("pc-q35-10.1"), None);
     assert_eq!(BoardKind::from_name("pc"), None);
+    assert_eq!(canonical_machine_name("q35"), Some("pc-q35-11.1"));
+    assert_eq!(canonical_machine_name("pc-q35-10.2"), Some("pc-q35-10.2"));
+    assert_eq!(canonical_machine_name("microvm"), Some("microvm"));
+    assert_eq!(canonical_machine_name("pc"), None);
     assert!(BoardKind::Microvm.default_kernel_irqchip_split());
     assert!(!BoardKind::Q35.default_kernel_irqchip_split());
 }
@@ -145,6 +154,7 @@ fn kernel_errors_are_qemus() {
 fn spec(kind: BoardKind, firmware: FirmwareSearch) -> BoardSpec {
     BoardSpec {
         kind,
+        machine_type: if kind == BoardKind::Q35 { "pc-q35-11.1" } else { "microvm" },
         props: Vec::new(),
         ram_size: Some(256 << 20),
         cpus: 1,
@@ -183,6 +193,9 @@ fn builds_boards_with_firmware_from_the_search_path() {
     let (mut q, _) = build_board(spec(BoardKind::Q35, fw.clone())).unwrap();
     assert_eq!(q.name(), "pc-q35-11.1");
     q.machine_done().unwrap();
+    let mut s = spec(BoardKind::Q35, fw.clone());
+    s.machine_type = "pc-q35-11.0";
+    assert_eq!(build_board(s).unwrap().0.name(), "pc-q35-11.0");
 
     let mut s = spec(BoardKind::Q35, FirmwareSearch::from_dirs(Vec::new()));
     s.bios = Some("nope.bin".into());

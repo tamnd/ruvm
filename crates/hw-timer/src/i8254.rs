@@ -7,7 +7,9 @@
 //! through a timer armed at each OUT transition, channel 2 is the PC speaker and its gate is set
 //! by port 0x61 through [`I8254::set_gate`].
 //!
-//! VMState, trace points, QOM registration and the KVM in-kernel `kvm-pit` are not ported.
+//! The migration state is [`PitCommonState`] itself, whose fields carry the names of QEMU's
+//! `i8254` VMState fields; [`I8254::vmstate_save`] and [`I8254::vmstate_load`] move it. Trace
+//! points, QOM registration and the KVM in-kernel `kvm-pit` are not ported.
 //!
 //! The channel state sits behind a mutex. The IRQ output is set after the lock is dropped, so
 //! whatever the line is wired to (the PIC, the HPET) may call back into the PIT.
@@ -151,6 +153,9 @@ fn pit_get_count(s: &PitChannelState, now: i64) -> i32 {
 pub struct PitCommonState {
     pub channels: [PitChannelState; 3],
 }
+
+/// What the `i8254` section carries: the channels, named as in QEMU's `vmstate_pit_common`.
+pub type I8254VmState = PitCommonState;
 
 /// The `isa-pit` device.
 #[derive(Debug)]
@@ -451,6 +456,25 @@ impl I8254 {
     pub fn irq_timer_expire_time(&self) -> Option<i64> {
         self.irq_timer.expire_time()
     }
+
+    /// The migration state. `pit_pre_save()` only exists for the KVM PIT, so this is a copy.
+    pub fn vmstate_save(&self) -> I8254VmState {
+        self.state()
+    }
+
+    /// Takes over loaded state and does `pit_post_load()`: channel 0's IRQ timer is armed for
+    /// the loaded `next_transition_time` unless it is -1 or the HPET has the IRQ disabled. The
+    /// times are on the virtual clock. The IRQ output is left alone, as in QEMU.
+    pub fn vmstate_load(&self, s: &I8254VmState) {
+        let mut pit = self.lock();
+        *pit = s.clone();
+        let sc = &pit.channels[0];
+        if sc.next_transition_time != -1 && sc.irq_disabled == 0 {
+            self.irq_timer.modify(sc.next_transition_time);
+        } else {
+            self.irq_timer.del();
+        }
+    }
 }
 
 /// `pit_ioport_ops`: four byte wide ports.
@@ -470,5 +494,45 @@ impl MmioOps for I8254 {
 
     fn endianness(&self) -> Endian {
         Endian::Little
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruvm_base::ClockType;
+
+    use super::*;
+
+    #[test]
+    fn vmstate_round_trip_rearms_the_irq_timer() {
+        let clock = Clock::manual(ClockType::Virtual);
+        clock.advance_to(1_000_000);
+        let src = I8254::new(&clock, 0x40);
+        // Channel 0, lobyte/hibyte, rate generator, count 1000.
+        src.ioport_write(3, 0x34);
+        src.ioport_write(0, 0xe8);
+        src.ioport_write(0, 0x03);
+        let saved = src.vmstate_save();
+        let deadline = saved.channels[0].next_transition_time;
+        assert_eq!(src.irq_timer_expire_time(), Some(deadline));
+        assert!(deadline > 1_000_000);
+
+        let clock2 = Clock::manual(ClockType::Virtual);
+        clock2.advance_to(1_000_000);
+        let dst = I8254::new(&clock2, 0x40);
+        dst.vmstate_load(&saved);
+        assert_eq!(dst.vmstate_save(), saved);
+        assert_eq!(dst.irq_timer_expire_time(), Some(deadline));
+        assert_eq!(dst.get_channel_info(0).initial_count, 1000);
+
+        // A disabled IRQ leaves the timer off.
+        let mut off = saved.clone();
+        off.channels[0].irq_disabled = 1;
+        dst.vmstate_load(&off);
+        assert_eq!(dst.irq_timer_expire_time(), None);
+        off.channels[0].irq_disabled = 0;
+        off.channels[0].next_transition_time = -1;
+        dst.vmstate_load(&off);
+        assert_eq!(dst.irq_timer_expire_time(), None);
     }
 }
