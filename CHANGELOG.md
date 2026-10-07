@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.4.1
+
+This patch starts M5 and M6. ruvm can live migrate a guest to and from QEMU 11.1, and it has a RISC-V guest that boots Linux.
+
+For M5: ruvm reads and writes the QEMU 11.1 migration stream and does live precopy over the tcp, unix, fd, exec and file channels, with `migrate`, `migrate-incoming`, `query-migrate` and the other migration QMP commands, plus `-incoming` (#156). A q35 TCG guest that keeps rewriting its memory migrated QEMU to ruvm, ruvm to QEMU and ruvm to ruvm with its checksum intact. Only the vCPUs and RAM move for real so far. The other device sections are read and dropped, so a guest that depends on interrupt controller state won't survive a hop yet.
+
+For M6: there is a RISC-V guest on TCG with RV64GC, M, S and U modes, Sv39/48/57 paging, PMP and the Zb* extensions, and a riscv `-M virt` board with OpenSBI loading and a device tree (#157). QEMU's five riscv64 tests/tcg system tests pass. A Debian 6.12 riscv64 kernel boots to a shell at 1, 2 and 4 vCPUs on both x86-64 and aarch64 hosts, after a fix for a lock order deadlock with more than one vCPU (#158). RVV and the H extension are not in yet.
+
 ## 0.4.0
 
 M4 is done, so this is the first 0.4 release. The JIT runs real guests, and on CoreMark it is faster than QEMU 11.1's TCG on all three host and guest pairs we measure.
