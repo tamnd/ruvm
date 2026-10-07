@@ -18,8 +18,8 @@ use ruvm_hw_core::{Clock, IrqPin};
 use ruvm_hw_intc::i8259::I8259Pair;
 use ruvm_hw_intc::ioapic::{IoApic, IoApicMsiHandler, IoApics};
 use ruvm_hw_virtio::{
-    AddressSpaceMemory, SharedGuestMemory, VirtioBackend, VirtioDeviceClass, VirtioPci,
-    VirtioPciProps,
+    AddressSpaceMemory, SharedGuestMemory, VirtIODevice, VirtioBackend, VirtioDeviceClass,
+    VirtioMmio, VirtioPci, VirtioPciProps,
 };
 use ruvm_mem::{AddressSpace, MemorySystem, RegionId};
 
@@ -47,6 +47,29 @@ pub const X86_BOARDS: &[(&str, Option<&str>, &str)] = &[
 /// `pc-q35-11.1`), if it is one of [`X86_BOARDS`].
 pub fn canonical_machine_name(name: &str) -> Option<&'static str> {
     X86_BOARDS.iter().find(|(n, a, _)| *n == name || *a == Some(name)).map(|(n, _, _)| *n)
+}
+
+/// A plugged virtio device, reached through its transport.
+#[derive(Clone, Debug)]
+pub enum VirtioHandle {
+    /// A virtio PCI function on q35.
+    Pci(VirtioPci),
+    /// A virtio-mmio transport of microvm.
+    Mmio(Arc<VirtioMmio>),
+}
+
+impl VirtioHandle {
+    /// Runs `f` on the device model as its concrete type `D`, together with the core state.
+    /// `None` if it is not a `D` or the device is busy on this thread.
+    pub fn with_device<D: VirtioDeviceClass, R>(
+        &self,
+        f: impl FnOnce(&mut VirtIODevice, &mut D) -> R,
+    ) -> Option<R> {
+        match self {
+            VirtioHandle::Pci(p) => p.with_device(f),
+            VirtioHandle::Mmio(m) => m.with_device(f),
+        }
+    }
 }
 
 /// A microvm or q35 board.
@@ -107,21 +130,59 @@ impl X86Board {
         matches!(self, X86Board::Q35(..))
     }
 
-    /// Plugs a virtio device: into a virtio-mmio transport on microvm, into a new virtio PCI
-    /// function on q35.
-    pub fn attach_virtio(&mut self, class: Box<dyn VirtioDeviceClass>) -> Result<(), String> {
+    /// The guest RAM size in bytes.
+    pub fn ram_size(&self) -> u64 {
         match self {
-            X86Board::Microvm(m) => m.attach_virtio(class).map(|_| ()),
+            X86Board::Microvm(m) => m.ram_size(),
+            X86Board::Q35(m, _) => m.ram_size(),
+        }
+    }
+
+    /// Plugs a virtio device: into a virtio-mmio transport on microvm, into a new virtio PCI
+    /// function on q35. Gives the device's handle.
+    pub fn attach_virtio(
+        &mut self,
+        class: Box<dyn VirtioDeviceClass>,
+    ) -> Result<VirtioHandle, String> {
+        match self {
+            X86Board::Microvm(m) => {
+                let i = m.attach_virtio(class)?;
+                let t = m.virtio_transport(i).ok_or("virtio-mmio transport missing")?;
+                Ok(VirtioHandle::Mmio(t))
+            }
             X86Board::Q35(m, devs) => {
                 let mem: SharedGuestMemory =
                     Arc::new(AddressSpaceMemory::new(Arc::clone(m.memory_as())));
                 let backend = VirtioBackend::new(class, mem).map_err(err)?;
                 let dev = VirtioPci::new(m.pci_bus(), None, backend, &VirtioPciProps::default())
                     .map_err(err)?;
-                devs.push(dev);
-                Ok(())
+                devs.push(dev.clone());
+                Ok(VirtioHandle::Pci(dev))
             }
         }
+    }
+
+    /// `pci_add_option_rom()`: gives the PCI function behind `dev` a ROM BAR holding `data`,
+    /// for a `romfile`. The ROM is `<typename>.rom` in the migration stream, as QEMU names
+    /// it, and is the next power of two up from the file. A virtio-mmio device has no ROM.
+    pub fn add_option_rom(
+        &mut self,
+        dev: &VirtioHandle,
+        typename: &str,
+        data: &[u8],
+    ) -> Result<(), String> {
+        let (X86Board::Q35(m, _), VirtioHandle::Pci(dev)) = (self, dev) else {
+            return Err(format!("Property '{typename}.romfile' not found"));
+        };
+        if data.is_empty() {
+            return Err(format!("romfile for '{typename}' is empty"));
+        }
+        let pdev = dev.pci_dev();
+        let devfn = pdev.devfn();
+        let name = format!("0000:00:{:02x}.{:x}/{typename}.rom", devfn >> 3, devfn & 7);
+        let rom = m.add_device_rom(&name, data)?;
+        pdev.register_bar(ruvm_hw_pci::regs::PCI_ROM_SLOT, 0, rom);
+        Ok(())
     }
 
     /// Plugs a `-drive if=ide,index=N` disk. Only q35 has an IDE (AHCI) controller.

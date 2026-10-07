@@ -17,7 +17,9 @@
 //! - A register access from inside the device's own queue processing (a DMA that lands back on
 //!   this window) is dropped, the way QEMU's memory re-entrancy guard drops it.
 //!
-//! Not ported: VMState, trace points, QOM registration and properties other than
+//! Migration state is in the `vmstate` submodule, [`VirtioMmioVmState`].
+//!
+//! Not ported: trace points, QOM registration and properties other than
 //! `force-legacy`, ioeventfd and irqfd (every notify is handled synchronously in the vCPU
 //! thread), `VIRTIO_F_NOTIFICATION_DATA` (the shadow available index in the notify value is
 //! ignored), shared memory regions (`SHM_LEN` reads as all ones, meaning no region), and the
@@ -36,6 +38,10 @@ use crate::virtio::{
     VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_F_VERSION_1, VIRTIO_QUEUE_MAX, VirtIODevice, VirtioBackend,
     VirtioDeviceClass, VirtioTransport, feature,
 };
+
+mod vmstate;
+
+pub use vmstate::{VirtioMmioQueueVmState, VirtioMmioVmState};
 
 /// `TYPE_VIRTIO_MMIO`.
 pub const TYPE_VIRTIO_MMIO: &str = "virtio-mmio";

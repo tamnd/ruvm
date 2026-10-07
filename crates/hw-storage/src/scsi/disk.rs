@@ -7,6 +7,10 @@ use std::sync::Arc;
 
 use ruvm_base::{Error, Result};
 
+mod vmstate;
+
+pub use vmstate::{SCSI_SENSE_BUF_SIZE_OLD, ScsiDiskVmState};
+
 use super::cdb::{ScsiCommand, TYPE_DISK, TYPE_ROM, XferMode, data_cdb_xfer, opcode::*};
 use super::sense::{CHECK_CONDITION, GOOD, ScsiSense};
 use crate::block::BlockBackend;

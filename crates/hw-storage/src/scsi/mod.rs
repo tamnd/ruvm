@@ -23,7 +23,8 @@
 //!
 //! # Not ported
 //!
-//! `scsi-block`, `scsi-generic`, persistent reservations, device quirks and VMState.
+//! `scsi-block`, `scsi-generic`, persistent reservations and device quirks. Migration covers
+//! the disk state, [`ScsiDiskVmState`]; there are no requests in flight to migrate.
 
 mod bus;
 mod cdb;
@@ -35,5 +36,7 @@ pub use cdb::{
     ScsiCommand, TYPE_DISK, TYPE_INACTIVE, TYPE_NO_LUN, TYPE_NOT_PRESENT, TYPE_ROM, XferMode,
     cdb_lba, cdb_length, cdb_xfer, data_cdb_xfer, opcode,
 };
-pub use disk::{QEMU_HW_VERSION, ScsiDisk, ScsiDiskConf, ScsiDiskKind};
+pub use disk::{
+    QEMU_HW_VERSION, SCSI_SENSE_BUF_SIZE_OLD, ScsiDisk, ScsiDiskConf, ScsiDiskKind, ScsiDiskVmState,
+};
 pub use sense::*;

@@ -21,9 +21,11 @@
 //!   MBR partition table and host geometry probing are not ported.
 //! - The block limits QEMU reads from the image (optimal transfer size, discard alignment) are
 //!   not known here, so only the properties set in [`VirtioBlkConf`] are reported.
+//! - Requests complete inside the queue handler, so migration never has one in flight and
+//!   the device's own part of the stream is only the end of the request list.
 //!
 //! Not ported: zoned devices, secure erase, SCSI passthrough, multiqueue with iothread mapping,
-//! DMA restart after a stop, VMState, trace points, QOM registration, block accounting and the
+//! DMA restart after a stop, trace points, QOM registration, block accounting and the
 //! `drive` property. `ruvm-block` has no I/O path yet, so the device talks to the small
 //! [`BlockBackend`] trait instead, with [`MemBlockBackend`] as an in-memory implementation.
 

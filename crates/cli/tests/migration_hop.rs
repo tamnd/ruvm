@@ -240,8 +240,18 @@ fn hop(h: &Hop<'_>) {
         assert!(start.elapsed() < Duration::from_secs(180), "migration did not finish: {r}");
         std::thread::sleep(Duration::from_millis(100));
     }
-    let r = dst.qmp.cmd(r#"{"execute":"query-status"}"#);
-    assert!(r.contains(r#""status":"running""#), "{r}");
+    // The source completes once it has sent everything, and the destination may still be
+    // loading the device state then.
+    let start = Instant::now();
+    loop {
+        let r = dst.qmp.cmd(r#"{"execute":"query-status"}"#);
+        if r.contains(r#""status":"running""#) {
+            break;
+        }
+        assert!(r.contains(r#""status":"inmigrate""#), "{r}");
+        assert!(start.elapsed() < Duration::from_secs(30), "destination did not start: {r}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let r = src.qmp.cmd(r#"{"execute":"query-status"}"#);
     assert!(r.contains(r#""status":"postmigrate""#), "{r}");
 

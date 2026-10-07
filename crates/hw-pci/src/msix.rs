@@ -544,6 +544,51 @@ impl PciDevice {
         }
     }
 
+    /// `msix_save()`: the vector table and the pending bits, `nentries * 16` and
+    /// `DIV_ROUND_UP(nentries, 8)` bytes. Both are empty without MSI-X.
+    pub fn msix_vmstate_save(&self) -> (Vec<u8>, Vec<u8>) {
+        let s = self.lock();
+        let Some(m) = s.msix.as_ref() else { return (Vec::new(), Vec::new()) };
+        let n = m.entries as usize;
+        (m.table[..n * PCI_MSIX_ENTRY_SIZE].to_vec(), m.pba[..n.div_ceil(8)].to_vec())
+    }
+
+    /// `msix_load()`: puts back what [`msix_vmstate_save`](Self::msix_vmstate_save) returned
+    /// and sends the vectors that are pending and no longer masked. The MSI-X control bits
+    /// live in config space, which must be loaded first.
+    pub fn msix_vmstate_load(&self, table: &[u8], pba: &[u8]) -> Result<(), String> {
+        let mut fx = Effects::new();
+        {
+            let mut s = self.lock();
+            let Some(m) = s.msix.as_mut() else {
+                if table.is_empty() && pba.is_empty() {
+                    return Ok(());
+                }
+                return Err("MSI-X state for a device without MSI-X".to_string());
+            };
+            let entries = m.entries;
+            let n = entries as usize;
+            if table.len() != n * PCI_MSIX_ENTRY_SIZE || pba.len() != n.div_ceil(8) {
+                return Err(format!(
+                    "MSI-X state of {} table and {} pending bytes for {n} vectors",
+                    table.len(),
+                    pba.len()
+                ));
+            }
+            for vector in 0..entries {
+                m.clr_pending(vector);
+            }
+            m.table[..table.len()].copy_from_slice(table);
+            m.pba[..pba.len()].copy_from_slice(pba);
+            s.msix_update_function_masked();
+            for vector in 0..entries {
+                s.msix_handle_mask_update(&mut fx, vector, true);
+            }
+        }
+        self.run(fx);
+        Ok(())
+    }
+
     /// The BAR index created by [`PciDevice::msix_init_exclusive_bar`], if any.
     pub fn msix_exclusive_bar(&self) -> Option<usize> {
         self.lock().msix.as_ref().and_then(|m| m.exclusive_bar.map(|(n, _)| n))

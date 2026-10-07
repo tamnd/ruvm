@@ -28,8 +28,11 @@
 //! - Hot plug is a method call ([`VirtioScsi::hotplug`] and [`VirtioScsi::hot_unplug`]) rather
 //!   than a hotplug handler.
 //!
-//! Not ported: iothreads and dataplane, T10 PI, VMState, request migration, trace points and
-//! QOM registration.
+//! Migration: the device has no state beyond the core's; the disks have theirs
+//! ([`ruvm_hw_storage::scsi::ScsiDiskVmState`]). Requests run to completion inside the queue
+//! handler, so none are ever in flight to migrate.
+//!
+//! Not ported: iothreads and dataplane, T10 PI, trace points and QOM registration.
 
 use std::any::Any;
 

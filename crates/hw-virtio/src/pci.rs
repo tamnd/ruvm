@@ -30,7 +30,9 @@
 //!   memory re-entrancy guard in QEMU does.
 //! - `virtio_pci_optimal_num_queues()` takes the vCPU count as an argument.
 //!
-//! Not ported: VMState, QOM registration and the property parser, ioeventfd and irqfd (every
+//! Migration state is in the `vmstate` submodule, [`VirtioPciVmState`].
+//!
+//! Not ported: QOM registration and the property parser, ioeventfd and irqfd (every
 //! notify is handled synchronously), KVM MSI routes, vhost vector masking, shared memory
 //! capabilities, `VIRTIO_F_NOTIFICATION_DATA`, the extended (above 64 bit) feature words,
 //! `bad_features` class hooks (a legacy driver that sets `VIRTIO_F_BAD_FEATURE` gets no
@@ -58,6 +60,10 @@ use crate::virtio::{
     VIRTIO_F_BAD_FEATURE, VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1, VIRTIO_NO_VECTOR,
     VIRTIO_QUEUE_MAX, VirtIODevice, VirtioBackend, VirtioDeviceClass, VirtioTransport, feature,
 };
+
+mod vmstate;
+
+pub use vmstate::{VirtioPciQueueVmState, VirtioPciVmState};
 
 /// `TYPE_VIRTIO_PCI`, the abstract parent of every virtio PCI device.
 pub const TYPE_VIRTIO_PCI: &str = "virtio-pci";

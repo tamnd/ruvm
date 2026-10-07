@@ -7,6 +7,7 @@
 
 mod arm;
 mod migration;
+mod net;
 pub mod options;
 mod qmp_cmds;
 pub mod qtest;
