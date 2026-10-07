@@ -7,9 +7,14 @@
 //!
 //! The loader runs without `cpu-num`, so the hart starts at the reset vector in the boot
 //! ROM at 0x1000, which jumps to the base of RAM where the ELF sits.
+//!
+//! A Linux boot to a shell needs a kernel, an initramfs and the OpenSBI firmware, which are
+//! not in the tree; see `linux_boots_to_a_shell`.
 
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn ruvm() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ruvm"))
@@ -206,4 +211,90 @@ fn semihosting_exit_code_is_the_exit_status() {
     assert_eq!(code, 3, "{err}");
     let (code, _, err) = run_guest("semi-smp", SEMIHOSTING_EXIT_3, &["-smp", "2"]);
     assert_eq!(code, 3, "{err}");
+}
+
+/// Boots Linux on `-M virt -nographic` through the default OpenSBI firmware to a busybox
+/// shell on the 16550 and runs a command there. The kernel (a flat `Image`, such as the
+/// `linux` of Debian's riscv64 netboot installer) and the initramfs come from
+/// `RUVM_TEST_RISCV64_KERNEL` and `RUVM_TEST_RISCV64_INITRD`; the initramfs holds a static
+/// busybox and an `/init` that mounts /proc, /sys and /dev and starts a shell on the console
+/// (`exec setsid cttyhack sh`), as `scripts/arm64-linux-test-image.py` makes for arm64.
+/// Without them the test says so and passes. `RUVM_TEST_FIRMWARE_DIR` is passed as `-L`, for
+/// when `opensbi-riscv64-generic-fw_dynamic.bin` is not in a default data directory.
+/// `RUVM_TEST_RISCV64_SMP` sets `-smp` (2 by default) and `RUVM_TEST_TIMEOUT_SECS` how long
+/// to wait for the prompt and then for the command.
+#[test]
+#[ignore = "needs a kernel, an initramfs and OpenSBI"]
+fn linux_boots_to_a_shell() {
+    let (Some(kernel), Some(initrd)) = (
+        std::env::var("RUVM_TEST_RISCV64_KERNEL").ok(),
+        std::env::var("RUVM_TEST_RISCV64_INITRD").ok(),
+    ) else {
+        eprintln!("skipped: RUVM_TEST_RISCV64_KERNEL and RUVM_TEST_RISCV64_INITRD are not set");
+        return;
+    };
+    let smp = std::env::var("RUVM_TEST_RISCV64_SMP").unwrap_or_else(|_| "2".to_string());
+    let fw = std::env::var("RUVM_TEST_FIRMWARE_DIR").ok();
+    let fw_args: Vec<&str> = fw.iter().flat_map(|d| ["-L", d.as_str()]).collect();
+    let mut child = Command::new(ruvm())
+        .arg("qemu-system-riscv64")
+        .args(fw_args)
+        .args(["-M", "virt", "-smp", &smp, "-m", "512", "-nographic"])
+        .args(["-kernel", &kernel, "-initrd", &initrd, "-append", "console=ttyS0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let mut log = Vec::new();
+    let mut wait_for = |needles: &[&str], limit: Duration| -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            let text = String::from_utf8_lossy(&log);
+            if needles.iter().any(|n| text.contains(n)) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            match rx.recv_timeout(deadline - now) {
+                Ok(b) => {
+                    std::io::stderr().write_all(&b).unwrap();
+                    log.extend_from_slice(&b);
+                }
+                Err(_) => return false,
+            }
+        }
+    };
+    let secs = std::env::var("RUVM_TEST_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok());
+    // Ten minutes: the boot takes 10 to 40 seconds of wall time on a busy x86-64 host.
+    let limit = Duration::from_secs(secs.unwrap_or(600));
+    // The busybox prompt shows the working directory, `/`, as `~` when it is also $HOME.
+    let booted = wait_for(&["/ # ", "~ # "], limit);
+    if booted {
+        stdin.write_all(b"echo ruvm-$((6*7)); poweroff -f\n").unwrap();
+    }
+    let ran = booted && wait_for(&["ruvm-42"], limit);
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(reader);
+    assert!(booted, "no shell prompt");
+    assert!(ran, "the command did not run");
 }
