@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.4.3
+
+This patch finishes device state for migration and fills in more of the riscv virt board.
+
+For M5: virtio devices now migrate in QEMU 11.1's layout, covering blk, net, scsi with its disks, rng, balloon and serial with the console port, over both the pci and mmio transports (#164). Dirty logging stays on for the whole migration so that device writes to guest RAM reach the other side, and option ROMs migrate as RAM blocks. The `cpu/msr_smi_count` subsection that QEMU sends on q35 is handled now. A guest that keeps virtio disks and NICs busy hopped QEMU to ruvm to QEMU on q35 and microvm, and ruvm to QEMU to ruvm on microvm, with no bad output. With this, every M2 device's VMState is matched to QEMU field by field. `-netdev` with hubs is wired up too.
+
+For M6: riscv virt has QEMU's generic PCIe host bridge at the same addresses as QEMU, and virtio blk, rng and serial work behind it as pci devices (#163). The config space of every function is byte for byte the same as QEMU's. `-cpu max` and eleven named riscv64 CPUs, including the rva22 and rva23 profiles, now come from a port of QEMU's CPU config, and their device trees match QEMU's (#165). That brought in scalar crypto, the PMU with Sscofpmf, the indirect CSRs, counter delegation and pointer masking. `-cpu max` still lacks AIA and seven other extensions.
+
 ## 0.4.2
 
 This patch moves M5 and M6 forward. A q35 or microvm guest now carries its device state across a migration hop, and the RISC-V guest has the vector extension and the H extension.
