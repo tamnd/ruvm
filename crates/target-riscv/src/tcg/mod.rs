@@ -183,11 +183,20 @@ impl Riscv {
     ) -> R {
         let (mut g, i) = self.lines(shared.cpu_index);
         let r = f(&mut g[i]);
-        // riscv_cpu_interrupt().
-        if g[i].mip != 0 {
-            shared.cpu_interrupt(interrupt::HARD);
+        // riscv_cpu_interrupt(). The request bit follows mip under the lock, so a racing
+        // update can never leave it clear while an interrupt is pending.
+        let raise = g[i].mip != 0;
+        if raise {
+            shared.set_interrupt(interrupt::HARD);
         } else {
             shared.reset_interrupt(interrupt::HARD);
+        }
+        drop(g);
+        // The kick takes the vCPU's halt lock, and a halted vCPU holds that lock while it
+        // reads mip through this one, so it happens after the lines are unlocked. Setting
+        // the bit again is harmless; if mip was cleared meanwhile the vCPU finds nothing.
+        if raise {
+            shared.cpu_interrupt(interrupt::HARD);
         }
         r
     }
