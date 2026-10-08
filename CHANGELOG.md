@@ -6,6 +6,12 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.4.6
+
+This patch is all M6 and finishes the Arm boards. arm virt gets ACPI and the SMMUv3, and there is a new sbsa-ref board.
+
+For M6: arm virt builds QEMU's ACPI tables, so EDK2 can boot Linux from pflash with tables that are byte for byte the same as QEMU 11.1's, with `acpi=`, `spcr=`, `x-oem-id` and `x-oem-table-id` (#182). On the way this fixed a hang where EDK2 put a legacy virtio I/O BAR at port 0, which QEMU allows on virt and ruvm didn't. riscv virt needed the same fix (#183). arm virt also has the SMMUv3 with `-M virt,iommu=smmuv3`, with stage 1, stage 2 and nested walks, the command and event queues and the IOTLB, and PCI DMA and MSIs go through it as on QEMU (#184). The device tree and the IORT match QEMU's. The new `-M sbsa-ref` board ports hw/arm/sbsa-ref.c with its flashes, GICv3 and ITS, SMMUv3, PCIe, sysbus AHCI, PL061 GPIO with the power button, generic watchdog and `sbsa-ec` (#185). Trusted Firmware and EDK2 boot on it, and the serial log matches QEMU's line for line apart from the Tianocore banner. The GICv3 gains its virtual CPU interface and target-arm gains the PMUv3 registers, so arm virt now has a PMU node in its device tree like QEMU (#186). There is no xHCI, e1000e or bochs-display on sbsa-ref yet, and the default CPU is neoverse-n1 because neoverse-n2 isn't modelled.
+
 ## 0.4.5
 
 This patch brings in most of M5, the migration modes beyond plain precopy, and moves M6 along with a riscv64 host backend and the ITS on arm virt.
