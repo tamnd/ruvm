@@ -64,6 +64,7 @@ mod qed;
 mod query;
 mod raw;
 mod reopen;
+mod snapshot_all;
 #[cfg(unix)]
 mod sys;
 pub mod throttle;
@@ -84,3 +85,4 @@ pub use perm::{
     BLK_PERM_ALL, BLK_PERM_CONSISTENT_READ, BLK_PERM_RESIZE, BLK_PERM_WRITE,
     BLK_PERM_WRITE_UNCHANGED, perm_names,
 };
+pub use snapshot_all::{DrainAllSection, SnapshotParams, VmStateChannel, VmStateNode};

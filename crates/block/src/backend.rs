@@ -102,6 +102,10 @@ impl ParentOps for BlkIo {
     fn set_node(&self, node: Arc<Node>) {
         *self.root.lock().unwrap() = Some(node);
     }
+
+    fn is_backend(&self) -> bool {
+        true
+    }
 }
 
 /// An in-flight reference on a backend for the length of one request.

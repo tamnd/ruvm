@@ -81,7 +81,7 @@ impl Node {
     }
 
     /// `bdrv_can_snapshot()`.
-    fn can_snapshot(&self) -> bool {
+    pub(crate) fn can_snapshot(&self) -> bool {
         if !self.is_inserted() || self.read_only() {
             return false;
         }
@@ -123,7 +123,7 @@ impl Node {
     }
 
     /// `bdrv_snapshot_goto()`.
-    fn snapshot_goto(&self, id: &str) -> Result<()> {
+    pub(crate) fn snapshot_goto(&self, id: &str) -> Result<()> {
         if let Some(r) = self.driver.snapshot_goto(self, id) {
             return r.map_err(|e| e.prepend("Failed to load snapshot: "));
         }
@@ -424,7 +424,7 @@ impl BlockGraph {
 
     /// `bdrv_get_device_or_node_name()`: the name of the block backend `bs` is the root of,
     /// or else its node name.
-    fn device_or_node_name(&self, bs: &Arc<Node>) -> String {
+    pub(crate) fn device_or_node_name(&self, bs: &Arc<Node>) -> String {
         let backends = self.backends.lock().unwrap();
         for (name, blk) in backends.iter() {
             if blk.root().is_some_and(|r| Arc::ptr_eq(&r, bs)) {

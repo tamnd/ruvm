@@ -46,7 +46,7 @@
 //! QEMU's FAT16 style boot sector, which QEMU warns about.
 
 mod commit;
-mod localtime;
+pub(crate) mod localtime;
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
