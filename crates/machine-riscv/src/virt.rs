@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The RISC-V `virt` board, hw/riscv/virt.c, with RV64 harts, the SiFive CLINT and PLIC.
+//! The RISC-V `virt` board, hw/riscv/virt.c, with RV64 harts, the SiFive CLINT and the PLIC
+//! or the AIA interrupt controllers.
 //!
 //! # What is there
 //!
@@ -21,8 +22,19 @@
 //! memory, where nothing takes it without AIA, and the device tree gives the bridge no
 //! `msi-parent`, so Linux uses INTx.
 //!
+//! `aia=aplic` replaces the PLIC with two APLIC domains in direct mode ([`Aia`]): the M level
+//! one at 0xc000000 takes the device interrupts on the same sources and can delegate them to
+//! the S level one at 0xd000000. `aia=aplic-imsic` puts both domains in MSI mode and gives
+//! each hart an M level IMSIC (at 0x24000000, a page per hart) and an S level IMSIC (at
+//! 0x28000000) with `aia-guests` guest files. The harts then have Smaia and Ssaia (and GEILEN
+//! is `aia-guests` if they have H), and the PCIe bridge gets the S level IMSICs as its
+//! `msi-parent`. The domains and PCI functions send their messages as 32 bit stores into
+//! system memory.
+//!
 //! Each hart's MSIP, MTIP, M external and S external lines go to `Riscv::set_irq` as
-//! interrupts 3, 7, 11 and 9. The `time` CSR reads the MTIMER, and the Sstc `stimecmp` and
+//! interrupts 3, 7, 11 and 9, and the outputs of its S level IMSIC's guest files to the
+//! guest external interrupt lines 64 and up. The CPU reaches the IMSIC registers through
+//! `RiscvBoard::aia_ireg_rmw`. The `time` CSR reads the MTIMER, and the Sstc `stimecmp` and
 //! `vstimecmp` deadlines are timers on the board clock that call `Riscv::stimer_expired`
 //! and `Riscv::vstimer_expired`.
 //!
@@ -45,15 +57,16 @@
 //! [`VirtMachine::attach_virtio_pci`] (a PCI function on the root bus), then call
 //! [`VirtMachine::machine_done`], which finishes the device tree, loads the firmware,
 //! kernel, device tree and boot ROM and resets the board. [`VirtMachine::create_vcpus`] then
-//! makes the vCPUs on a [`Jit`], wired to the CLINT and PLIC, and resets them. On a guest
+//! makes the vCPUs on a [`Jit`], wired to the CLINT and the interrupt controllers, and resets
+//! them. On a guest
 //! reset request ([`VirtMachine::take_request`]) the runner calls
 //! [`VirtMachine::system_reset`] and, on each vCPU's thread, [`VirtMachine::reset_cpu`]. The
 //! runner also runs the timers of [`VirtMachine::clock`].
 //!
 //! # Not modelled
 //!
-//! - AIA (`aia=aplic` and `aia=aplic-imsic`), the ACLINT SSWI (`aclint=on`) and the RISC-V
-//!   IOMMU (`iommu-sys=on`); those properties are taken only with their default values.
+//! - The ACLINT SSWI (`aclint=on`) and the RISC-V IOMMU (`iommu-sys=on`); those properties
+//!   are taken only with their default values.
 //! - ACPI and SMBIOS (`virt_build_smbios()` and `virt_acpi_setup()`).
 //! - NUMA and more than one socket: every hart is in socket 0.
 //! - uImage kernels, Intel HEX files for `-device loader`, u-boot ramdisks.
@@ -74,7 +87,11 @@
 //!   [`VirtMachine::messages`].
 //! - The address spaces of the ROM list ("memory" and "cpu-memory-0") are both views of the
 //!   one system memory; their blobs are copied in QEMU's order (all of "memory" first).
+//! - With `aia=aplic-imsic`, `aia-guests` above 0 and harts without H, QEMU aborts at the
+//!   first reset because the IMSIC drives guest external interrupt lines the hart does not
+//!   have. Here those outputs are left unconnected.
 
+mod aia;
 mod boot;
 mod cpus;
 mod dt;
@@ -98,6 +115,8 @@ use ruvm_hw_intc::riscv_aclint::{
     RISCV_ACLINT_DEFAULT_MTIMER_SIZE, RISCV_ACLINT_DEFAULT_TIMEBASE_FREQ, RISCV_ACLINT_SWI_SIZE,
     RiscvAclintMtimer, RiscvAclintSwi, TYPE_RISCV_ACLINT_MTIMER, TYPE_RISCV_ACLINT_SWI,
 };
+use ruvm_hw_intc::riscv_aplic::aplic_size;
+use ruvm_hw_intc::riscv_imsic::imsic_hart_size;
 use ruvm_hw_intc::sifive_plic::{SiFivePlic, SiFivePlicConfig, TYPE_SIFIVE_PLIC};
 use ruvm_hw_misc::sifive_test::{SiFiveTest, SiFiveTestRequest, TYPE_SIFIVE_TEST};
 use ruvm_hw_pci::regs::PCI_NUM_PINS;
@@ -113,11 +132,12 @@ use ruvm_mem::{
     MemorySystem, MmioOps, RegionId, RegionType,
 };
 use ruvm_target_riscv::cpu::{
-    CpuRiscvState, IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, RiscvCfg,
+    CpuRiscvState, IRQ_LOCAL_MAX, IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, RiscvCfg,
 };
 use ruvm_target_riscv::tcg::{Riscv, SemihostingHost, create_vcpu};
 use ruvm_virtio_queue::{GuestMemory, MemoryError};
 
+pub use aia::{Aia, imsic_num_bits};
 pub use boot::{
     AS_CPU0, AS_MEMORY, BootInfo, GenericLoader, RISCV64_BIOS_BIN, RamRange, Rom,
     riscv_find_firmware,
@@ -163,6 +183,12 @@ pub const VIRT_PLATFORM_BUS_SIZE: u64 = 0x200_0000;
 pub const VIRT_PLIC: u64 = 0xc00_0000;
 /// Its size, `VIRT_PLIC_SIZE(VIRT_CPUS_MAX * 2)`.
 pub const VIRT_PLIC_SIZE: u64 = 0x60_0000;
+/// `VIRT_APLIC_M`, the M level APLIC domain with `aia=aplic` or `aia=aplic-imsic`.
+pub const VIRT_APLIC_M: u64 = 0xc00_0000;
+/// `VIRT_APLIC_S`, the S level APLIC domain.
+pub const VIRT_APLIC_S: u64 = 0xd00_0000;
+/// Their size, `APLIC_SIZE(VIRT_CPUS_MAX)`.
+pub const VIRT_APLIC_SIZE: u64 = aplic_size(VIRT_CPUS_MAX as u32);
 /// `VIRT_UART0`.
 pub const VIRT_UART0: u64 = 0x1000_0000;
 /// Its size.
@@ -179,6 +205,12 @@ pub const VIRT_FW_CFG_SIZE: u64 = 0x18;
 pub const VIRT_FLASH: u64 = 0x2000_0000;
 /// Its size, half of it for each flash.
 pub const VIRT_FLASH_SIZE: u64 = 0x400_0000;
+/// `VIRT_IMSIC_M`, the M level IMSICs with `aia=aplic-imsic`.
+pub const VIRT_IMSIC_M: u64 = 0x2400_0000;
+/// `VIRT_IMSIC_S`, the S level IMSICs.
+pub const VIRT_IMSIC_S: u64 = 0x2800_0000;
+/// The size of each, `VIRT_IMSIC_MAX_SIZE`: `VIRT_SOCKETS_MAX` groups of 16 MiB.
+pub const VIRT_IMSIC_MAX_SIZE: u64 = 8 << 24;
 /// `VIRT_PCIE_ECAM`.
 pub const VIRT_PCIE_ECAM: u64 = 0x3000_0000;
 /// Its size.
@@ -206,6 +238,10 @@ pub const VIRT_PLATFORM_BUS_IRQ: u32 = 64;
 pub const VIRT_IRQCHIP_NUM_SOURCES: u32 = 96;
 /// `VIRT_IRQCHIP_NUM_PRIO_BITS`.
 pub const VIRT_IRQCHIP_NUM_PRIO_BITS: u32 = 3;
+/// `VIRT_IRQCHIP_NUM_MSIS`, the identities of each IMSIC file.
+pub const VIRT_IRQCHIP_NUM_MSIS: u32 = 255;
+/// `VIRT_IRQCHIP_MAX_GUESTS`, the most `aia-guests` can be.
+pub const VIRT_IRQCHIP_MAX_GUESTS: u32 = 7;
 /// `VIRT_PLIC_PRIORITY_BASE`.
 const VIRT_PLIC_PRIORITY_BASE: u32 = 0x00;
 /// `VIRT_PLIC_PENDING_BASE`.
@@ -278,6 +314,34 @@ pub struct VirtConfig {
     pub fw_cfg: FwCfgMachineConfig,
     /// The `rng-seed` of `/chosen`. The default is random, as `qemu_guest_getrandom()`.
     pub rng_seed: Option<[u8; 32]>,
+    /// `aia`: the interrupt controllers.
+    pub aia: VirtAia,
+    /// `aia-guests`: the guest files of each S level IMSIC, at most
+    /// [`VIRT_IRQCHIP_MAX_GUESTS`]. Used with [`VirtAia::AplicImsic`] only.
+    pub aia_guests: u32,
+}
+
+/// `RISCVVirtAIAType`, the `aia` property.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VirtAia {
+    /// `none`: the SiFive PLIC.
+    #[default]
+    None,
+    /// `aplic`: APLIC domains in direct mode.
+    Aplic,
+    /// `aplic-imsic`: APLIC domains in MSI mode and IMSICs.
+    AplicImsic,
+}
+
+impl VirtAia {
+    /// The property value, as `virt_get_aia()` gives it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VirtAia::None => "none",
+            VirtAia::Aplic => "aplic",
+            VirtAia::AplicImsic => "aplic-imsic",
+        }
+    }
 }
 
 impl fmt::Debug for VirtConfig {
@@ -296,6 +360,8 @@ impl fmt::Debug for VirtConfig {
             .field("semihosting_userspace", &self.semihosting_userspace)
             .field("cpu", &self.cpu)
             .field("loaders", &self.loaders)
+            .field("aia", &self.aia)
+            .field("aia_guests", &self.aia_guests)
             .finish_non_exhaustive()
     }
 }
@@ -321,6 +387,8 @@ impl Default for VirtConfig {
             rtc_clock: None,
             fw_cfg: FwCfgMachineConfig::default(),
             rng_seed: None,
+            aia: VirtAia::None,
+            aia_guests: 0,
         }
     }
 }
@@ -455,6 +523,29 @@ fn random_seed() -> [u8; 32] {
     seed
 }
 
+/// The interrupt controller of the devices, `s->irqchip[0]`.
+enum Irqchip {
+    Plic(Arc<SiFivePlic>),
+    Aia(Aia),
+}
+
+impl Irqchip {
+    /// Input `n`, an interrupt source.
+    fn input(&self, n: u32) -> IrqLine {
+        match self {
+            Irqchip::Plic(plic) => plic.input(n),
+            Irqchip::Aia(aia) => aia.input(n),
+        }
+    }
+
+    fn reset(&self) {
+        match self {
+            Irqchip::Plic(plic) => plic.reset(),
+            Irqchip::Aia(aia) => aia.reset(),
+        }
+    }
+}
+
 /// The virt board.
 pub struct VirtMachine {
     smp: usize,
@@ -472,7 +563,9 @@ pub struct VirtMachine {
     hub: Arc<CpuHub>,
     swi: Arc<RiscvAclintSwi>,
     mtimer: Arc<RiscvAclintMtimer>,
-    plic: Arc<SiFivePlic>,
+    irqchip: Irqchip,
+    aia: VirtAia,
+    aia_guests: u32,
     test: Arc<SiFiveTest>,
     uart: Arc<Serial>,
     rtc: Arc<GoldfishRtc>,
@@ -517,12 +610,12 @@ fn map_io(
 }
 
 /// `gpex_pcie_init()`: the generic PCIe host bridge with its ECAM, the low and high MMIO
-/// windows and the I/O port window, its INTx lines on PLIC sources 32 to 35.
+/// windows and the I/O port window, its INTx lines on sources 32 to 35 of the irqchip.
 fn gpex_pcie_init(
     mem: &Arc<MemorySystem>,
     system: RegionId,
     memory_as: &Arc<AddressSpace>,
-    plic: &SiFivePlic,
+    irqchip: &Irqchip,
     ram_size: u64,
 ) -> Result<GpexHost, String> {
     let high = GpexWindow { base: high_pcie_base(ram_size), size: dt::VIRT64_HIGH_PCIE_MMIO_SIZE };
@@ -547,21 +640,27 @@ fn gpex_pcie_init(
     for i in 0..PCI_NUM_PINS {
         let irq = PCIE_IRQ + i as u32;
         if let Some(pin) = gpex.irq(i) {
-            pin.connect(plic.input(irq));
+            pin.connect(irqchip.input(irq));
         }
         gpex.set_irq_num(i, irq as i32).map_err(err)?;
     }
-    // The PLIC sets msi_nonbroken in QEMU, so functions get their MSI-X capability. A message
-    // is a plain 32 bit store into system memory, msi_send_message(), which goes nowhere
-    // until something like an IMSIC is mapped at its address.
+    // The PLIC and the AIA devices set msi_nonbroken in QEMU, so functions get their MSI-X
+    // capability. A message is a plain 32 bit store into system memory, msi_send_message(),
+    // which goes nowhere unless an IMSIC is mapped at its address.
+    let msi: MsiTrigger = Arc::new(msi_store(memory_as));
+    gpex.bus().set_msi_handler(Some(msi));
+    Ok(gpex)
+}
+
+/// A message signaled interrupt as `address_space_stl_le()` into `memory_as` sends it,
+/// through a weak reference for the same reason as [`WeakDma`].
+fn msi_store(memory_as: &Arc<AddressSpace>) -> impl Fn(u64, u32) + Send + Sync + 'static {
     let weak = Arc::downgrade(memory_as);
-    let msi: MsiTrigger = Arc::new(move |address, data| {
+    move |address, data| {
         if let Some(a) = weak.upgrade() {
             let _ = a.store(address, 4, data.into(), Endian::Little, MemTxAttrs::UNSPECIFIED);
         }
-    });
-    gpex.bus().set_msi_handler(Some(msi));
-    Ok(gpex)
+    }
 }
 
 impl VirtMachine {
@@ -613,27 +712,71 @@ impl VirtMachine {
         let size = mtimer.mmio_size();
         map_io(&mem, system, TYPE_RISCV_ACLINT_MTIMER, mtimer_base, size, mtimer.clone())?;
 
-        // virt_create_plic(): an M and an S context per hart.
-        let plic = SiFivePlic::new(SiFivePlicConfig {
-            hart_config: vec!["MS"; smp].join(","),
-            hartid_base: 0,
-            num_sources: VIRT_IRQCHIP_NUM_SOURCES,
-            num_priorities: (1 << VIRT_IRQCHIP_NUM_PRIO_BITS) - 1,
-            priority_base: VIRT_PLIC_PRIORITY_BASE,
-            pending_base: VIRT_PLIC_PENDING_BASE,
-            enable_base: VIRT_PLIC_ENABLE_BASE,
-            enable_stride: VIRT_PLIC_ENABLE_STRIDE,
-            context_base: VIRT_PLIC_CONTEXT_BASE,
-            context_stride: VIRT_PLIC_CONTEXT_STRIDE,
-            aperture_size: VIRT_PLIC_SIZE as u32,
-        })
-        .map_err(err)?;
-        map_io(&mem, system, TYPE_SIFIVE_PLIC, VIRT_PLIC, plic.mmio_size(), plic.clone())?;
+        // The per-socket interrupt controller.
+        let aia = cfg.aia;
+        let aia_guests = cfg.aia_guests;
+        let mut cpu = cfg.cpu;
+        let irqchip = if aia == VirtAia::None {
+            // virt_create_plic(): an M and an S context per hart.
+            let plic = SiFivePlic::new(SiFivePlicConfig {
+                hart_config: vec!["MS"; smp].join(","),
+                hartid_base: 0,
+                num_sources: VIRT_IRQCHIP_NUM_SOURCES,
+                num_priorities: (1 << VIRT_IRQCHIP_NUM_PRIO_BITS) - 1,
+                priority_base: VIRT_PLIC_PRIORITY_BASE,
+                pending_base: VIRT_PLIC_PENDING_BASE,
+                enable_base: VIRT_PLIC_ENABLE_BASE,
+                enable_stride: VIRT_PLIC_ENABLE_STRIDE,
+                context_base: VIRT_PLIC_CONTEXT_BASE,
+                context_stride: VIRT_PLIC_CONTEXT_STRIDE,
+                aperture_size: VIRT_PLIC_SIZE as u32,
+            })
+            .map_err(err)?;
+            map_io(&mem, system, TYPE_SIFIVE_PLIC, VIRT_PLIC, plic.mmio_size(), plic.clone())?;
+            Irqchip::Plic(plic)
+        } else {
+            if aia_guests > VIRT_IRQCHIP_MAX_GUESTS {
+                return Err("Invalid number of AIA IMSIC guests".to_string());
+            }
+            let msimode = aia == VirtAia::AplicImsic;
+            let params = aia::AiaParams {
+                msimode,
+                aia_guests,
+                m_imsic_stride: imsic_hart_size(0),
+                num_sources: VIRT_IRQCHIP_NUM_SOURCES,
+                aplic_m: aia::MemMapEntry { base: VIRT_APLIC_M, size: VIRT_APLIC_SIZE },
+                aplic_s: aia::MemMapEntry { base: VIRT_APLIC_S, size: VIRT_APLIC_SIZE },
+                imsic_m: aia::MemMapEntry { base: VIRT_IMSIC_M, size: VIRT_IMSIC_MAX_SIZE },
+                imsic_s: aia::MemMapEntry { base: VIRT_IMSIC_S, size: VIRT_IMSIC_MAX_SIZE },
+                socket: 0,
+                base_hartid: 0,
+                hart_count: harts,
+                num_msis: VIRT_IRQCHIP_NUM_MSIS,
+                num_prio_bits: VIRT_IRQCHIP_NUM_PRIO_BITS,
+            };
+            let a = aia::riscv_create_aia(&mem, system, &params)?;
+            for aplic in [a.aplic_m(), a.aplic_s()] {
+                aplic.set_msi_sink(Box::new(msi_store(&memory_as)));
+            }
+            if msimode {
+                // riscv_imsic_realize() forces the AIA extensions on the harts.
+                cpu.ext_smaia = true;
+                cpu.ext_ssaia = true;
+            }
+            Irqchip::Aia(a)
+        };
 
         // The harts.
         let hub = Arc::new(CpuHub::new(mtimer.clone(), smp, clock.clone()));
+        if let Irqchip::Aia(a) = &irqchip {
+            hub.set_imsics(a.imsic_m().to_vec(), a.imsic_s().to_vec());
+        }
         let heap = Arc::new(Mutex::new((0, 0)));
-        let mut riscv = Riscv::new().with_cfg(cfg.cpu);
+        let mut riscv = Riscv::new().with_cfg(cpu);
+        if aia == VirtAia::AplicImsic {
+            // riscv_cpu_set_geilen() from the realize of the S level IMSICs.
+            riscv = riscv.with_geilen(aia_guests);
+        }
         if let Some(host) = cfg.semihosting {
             let semi = VirtSemihost {
                 host,
@@ -683,7 +826,7 @@ impl VirtMachine {
         for i in 0..VIRTIO_COUNT {
             let t = VirtioMmio::new(None, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT).map_err(err)?;
             let slot = Arc::new(VirtioSlot {
-                irq: plic.input(VIRTIO_IRQ + i as u32),
+                irq: irqchip.input(VIRTIO_IRQ + i as u32),
                 transport: RwLock::new(Arc::new(t)),
                 plugged: RwLock::new(false),
             });
@@ -692,7 +835,7 @@ impl VirtMachine {
             virtio.push(slot);
         }
 
-        let gpex = gpex_pcie_init(&mem, system, &memory_as, &plic, ram_size)?;
+        let gpex = gpex_pcie_init(&mem, system, &memory_as, &irqchip, ram_size)?;
 
         // create_platform_bus(): the window, with nothing on it yet.
         let pbus = mem.new_container("platform bus", VIRT_PLATFORM_BUS_SIZE.into()).map_err(err)?;
@@ -700,7 +843,7 @@ impl VirtMachine {
 
         // serial_mm_init().
         let uart = Serial::new(clock.clone(), UART_BAUDBASE, cfg.serial);
-        uart.irq().connect(plic.input(UART0_IRQ));
+        uart.irq().connect(irqchip.input(UART0_IRQ));
         let ops = Arc::new(SerialMm(uart.clone()));
         map_io(&mem, system, "serial", VIRT_UART0, UART_REGION_SIZE, ops)?;
 
@@ -712,7 +855,7 @@ impl VirtMachine {
         let rtc_date =
             if rtc_clock.kind() == ClockType::Host { UNIX_EPOCH } else { SystemTime::now() };
         let rtc = GoldfishRtc::new(rtc_clock, rtc_date, false);
-        rtc.irq().connect(plic.input(RTC_IRQ));
+        rtc.irq().connect(irqchip.input(RTC_IRQ));
         map_io(&mem, system, TYPE_GOLDFISH_RTC, VIRT_RTC, GOLDFISH_RTC_MMIO_SIZE, rtc.clone())?;
 
         // virt_flash_create() and virt_flash_map().
@@ -734,7 +877,7 @@ impl VirtMachine {
             None => {
                 let mut fdt = Fdt::new();
                 let seed = cfg.rng_seed.unwrap_or_else(random_seed);
-                dt::create_fdt(&mut fdt, &seed, cfg.cpu.pmu_mask)?;
+                dt::create_fdt(&mut fdt, &seed, riscv.cfg().pmu_mask)?;
                 fdt
             }
         };
@@ -761,7 +904,9 @@ impl VirtMachine {
             hub,
             swi,
             mtimer,
-            plic,
+            irqchip,
+            aia,
+            aia_guests,
             test,
             uart,
             rtc,
@@ -862,8 +1007,13 @@ impl VirtMachine {
         // A user provided dtb must include everything; ours needs to be finalized.
         if self.dtb_filename.is_none() {
             let riscv = self.riscv.clone();
-            let args =
-                dt::FinalizeArgs { smp: self.smp, ram_size: self.ram_size, cpu: riscv.cfg() };
+            let args = dt::FinalizeArgs {
+                smp: self.smp,
+                ram_size: self.ram_size,
+                cpu: riscv.cfg(),
+                aia: self.aia,
+                aia_guests: self.aia_guests,
+            };
             dt::finalize_fdt(&mut self.fdt, args)?;
         }
 
@@ -982,7 +1132,7 @@ impl VirtMachine {
     pub fn system_reset(&mut self) -> Result<(), String> {
         self.swi.reset();
         self.mtimer.reset();
-        self.plic.reset();
+        self.irqchip.reset();
         self.uart.reset();
         self.rtc.reset();
         for f in &self.flash {
@@ -1003,7 +1153,8 @@ impl VirtMachine {
         Ok(())
     }
 
-    /// Make the vCPUs on `jit`, wire their interrupt lines to the CLINT and PLIC and reset
+    /// Make the vCPUs on `jit`, wire their interrupt lines to the CLINT and the interrupt
+    /// controllers and reset
     /// them. Call it once, after [`VirtMachine::machine_done`], on a `jit` that has no
     /// vCPUs yet.
     pub fn create_vcpus(&self, jit: &Arc<Jit>) -> Result<Vec<Vcpu>, String> {
@@ -1030,15 +1181,33 @@ impl VirtMachine {
         Ok(vcpus)
     }
 
-    /// Connect the MSIP, MTIP and the two external interrupt lines of hart `i` to the
-    /// vCPU `shared`.
+    /// Connect the MSIP, MTIP, the two external interrupt lines and the guest external
+    /// interrupt lines of hart `i` to the vCPU `shared`.
     fn wire(&self, i: usize, shared: &Arc<CpuShared>) {
-        let lines: [(&IrqPin, u32); 4] = [
-            (self.swi.soft_irq(i), IRQ_M_SOFT),
-            (self.mtimer.timer_irq(i), IRQ_M_TIMER),
-            (self.plic.m_external_irq(i), IRQ_M_EXT),
-            (self.plic.s_external_irq(i), IRQ_S_EXT),
-        ];
+        let mut lines: Vec<(&IrqPin, u32)> =
+            vec![(self.swi.soft_irq(i), IRQ_M_SOFT), (self.mtimer.timer_irq(i), IRQ_M_TIMER)];
+        match &self.irqchip {
+            Irqchip::Plic(plic) => {
+                lines.push((plic.m_external_irq(i), IRQ_M_EXT));
+                lines.push((plic.s_external_irq(i), IRQ_S_EXT));
+            }
+            Irqchip::Aia(aia) if !aia.msimode() => {
+                // riscv_aplic_realize(): the direct mode domains drive the external lines.
+                lines.push((aia.aplic_m().external_irq(i), IRQ_M_EXT));
+                lines.push((aia.aplic_s().external_irq(i), IRQ_S_EXT));
+            }
+            Irqchip::Aia(aia) => {
+                // riscv_imsic_realize(): page 0 is the external interrupt of the level, the
+                // guest pages are the guest external interrupts. QEMU asserts when a hart
+                // has fewer guest lines (no H); those are left unconnected here.
+                lines.push((aia.imsic_m()[i].external_irq(0), IRQ_M_EXT));
+                let s = &aia.imsic_s()[i];
+                lines.push((s.external_irq(0), IRQ_S_EXT));
+                for page in 1..=self.aia_guests.min(self.riscv.geilen()) {
+                    lines.push((s.external_irq(page as usize), IRQ_LOCAL_MAX + page - 1));
+                }
+            }
+        }
         for (pin, irq) in lines {
             let riscv = Arc::downgrade(&self.riscv);
             let cpu = Arc::downgrade(shared);
@@ -1060,6 +1229,7 @@ impl VirtMachine {
             st.pc = l.addr;
         }
         st.store(cpu.env);
+        self.riscv.reset_lines(&shared);
         ruvm_jit::cputlb::tlb_flush(cpu);
         // cpu_common_reset(): the harts start powered on.
         shared.halted.store(0, std::sync::atomic::Ordering::Release);
@@ -1113,9 +1283,20 @@ impl VirtMachine {
         &self.mtimer
     }
 
-    /// The PLIC.
-    pub fn plic(&self) -> &Arc<SiFivePlic> {
-        &self.plic
+    /// The PLIC, with `aia=none`.
+    pub fn plic(&self) -> Option<&Arc<SiFivePlic>> {
+        match &self.irqchip {
+            Irqchip::Plic(plic) => Some(plic),
+            Irqchip::Aia(_) => None,
+        }
+    }
+
+    /// The APLIC domains and IMSICs, with `aia=aplic` or `aia=aplic-imsic`.
+    pub fn aia(&self) -> Option<&Aia> {
+        match &self.irqchip {
+            Irqchip::Plic(_) => None,
+            Irqchip::Aia(aia) => Some(aia),
+        }
     }
 
     /// The SiFive test device.
@@ -1279,6 +1460,59 @@ mod tests {
             m.machine_done().unwrap_err(),
             "could not load kernel '/nonexistent/ruvm-kernel'"
         );
+    }
+
+    fn write32(m: &VirtMachine, addr: u64, value: u32) {
+        assert!(m.memory_as().write(addr, MemTxAttrs::UNSPECIFIED, &value.to_le_bytes()).is_ok());
+    }
+
+    #[test]
+    fn aplic_replaces_the_plic() {
+        let m = board(VirtConfig { smp: 2, aia: VirtAia::Aplic, ..VirtConfig::default() });
+        assert!(m.plic().is_none());
+        let aia = m.aia().unwrap();
+        assert!(!aia.msimode());
+        assert!(aia.imsic_m().is_empty() && aia.imsic_s().is_empty());
+        assert_eq!(aia.aplic_m().config().num_harts, 2);
+        // domaincfg reads with bit 31 set, at both domains.
+        assert_eq!(read(&m, VIRT_APLIC_M, 4), [0, 0, 0, 0x80]);
+        assert_eq!(read(&m, VIRT_APLIC_S, 4), [0, 0, 0, 0x80]);
+        assert!(m.fdt().getprop("/cpus/cpu@0", "riscv,isa").unwrap().starts_with(b"rv64"));
+        assert_eq!(m.isa(), QEMU_RV64_ISA);
+    }
+
+    #[test]
+    fn aplic_imsic_sends_messages() {
+        let cfg =
+            VirtConfig { smp: 2, aia: VirtAia::AplicImsic, aia_guests: 2, ..VirtConfig::default() };
+        let m = board(cfg);
+        assert!(m.riscv().cfg().ext_smaia && m.riscv().cfg().ext_ssaia);
+        assert_eq!(m.riscv().geilen(), 2);
+        let aia = m.aia().unwrap();
+        assert_eq!(aia.imsic_s()[1].num_pages(), 3);
+
+        // A store to the S level IMSIC of hart 1, guest file 2, sets that interrupt.
+        let guest2 = VIRT_IMSIC_S + imsic_hart_size(imsic_num_bits(3)) + 2 * 0x1000;
+        write32(&m, guest2, 9);
+        assert!(aia.imsic_s()[1].is_pending(2, 9));
+
+        // The M level domain in MSI mode: source 10, level high, to hart 0 with EIID 7.
+        write32(&m, VIRT_APLIC_M + 0x1bc0, (VIRT_IMSIC_M >> 12) as u32);
+        write32(&m, VIRT_APLIC_M + 0x1bc4, 0);
+        write32(&m, VIRT_APLIC_M + 0x4 + 9 * 4, 6);
+        write32(&m, VIRT_APLIC_M + 0x3004 + 9 * 4, 7);
+        write32(&m, VIRT_APLIC_M + 0x1edc, 10);
+        write32(&m, VIRT_APLIC_M, (1 << 8) | (1 << 2));
+        assert!(!aia.imsic_m()[0].is_pending(0, 7));
+        aia.input(10).raise();
+        assert!(aia.imsic_m()[0].is_pending(0, 7));
+        assert!(!aia.imsic_m()[1].is_pending(0, 7));
+    }
+
+    #[test]
+    fn too_many_aia_guests() {
+        let cfg = VirtConfig { aia: VirtAia::AplicImsic, aia_guests: 8, ..VirtConfig::default() };
+        assert_eq!(VirtMachine::new(cfg).unwrap_err(), "Invalid number of AIA IMSIC guests");
     }
 
     #[test]

@@ -5,20 +5,24 @@
 //! `riscv_pmu_generate_fdt_node()` and `platform_bus_add_all_fdt_nodes()`. Each function makes
 //! the same libfdt calls in the same order as its QEMU namesake, so with the same CPU
 //! configuration and `rng-seed` the packed blob is byte for byte what `-M virt,dumpdtb=`
-//! writes (see the test against `tests/data/virt.dtb`).
+//! writes (see the tests against the trees in `tests/data`).
 
 use ruvm_hw_misc::sifive_test::{FINISHER_PASS, FINISHER_RESET};
 use ruvm_machine_arm::fdt::{Fdt, sized_cells};
 use ruvm_target_riscv::cfg::RiscvCfg;
 use ruvm_target_riscv::cpu::{IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT};
 
+use ruvm_hw_intc::riscv_imsic::imsic_hart_size;
+
+use super::aia::imsic_num_bits;
 use super::{
-    PCIE_IRQ, RTC_IRQ, UART0_IRQ, VIRT_CLINT, VIRT_CLINT_SIZE, VIRT_DRAM, VIRT_FLASH,
-    VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE, VIRT_IRQCHIP_NUM_SOURCES, VIRT_PCIE_ECAM,
+    PCIE_IRQ, RTC_IRQ, UART0_IRQ, VIRT_APLIC_M, VIRT_APLIC_S, VIRT_APLIC_SIZE, VIRT_CLINT,
+    VIRT_CLINT_SIZE, VIRT_DRAM, VIRT_FLASH, VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE,
+    VIRT_IMSIC_M, VIRT_IMSIC_S, VIRT_IRQCHIP_NUM_MSIS, VIRT_IRQCHIP_NUM_SOURCES, VIRT_PCIE_ECAM,
     VIRT_PCIE_ECAM_SIZE, VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE,
     VIRT_PLATFORM_BUS, VIRT_PLATFORM_BUS_IRQ, VIRT_PLATFORM_BUS_SIZE, VIRT_PLIC, VIRT_PLIC_SIZE,
     VIRT_RTC, VIRT_RTC_SIZE, VIRT_TEST, VIRT_TEST_SIZE, VIRT_UART0, VIRT_UART0_SIZE, VIRT_VIRTIO,
-    VIRT_VIRTIO_SIZE, VIRTIO_COUNT, VIRTIO_IRQ, high_pcie_base,
+    VIRT_VIRTIO_SIZE, VIRTIO_COUNT, VIRTIO_IRQ, VirtAia, high_pcie_base,
 };
 
 /// `RISCV_ACLINT_DEFAULT_TIMEBASE_FREQ`, the `timebase-frequency` of `/cpus`.
@@ -33,6 +37,12 @@ const FDT_PCI_RANGE_MMIO: u32 = 0x0200_0000;
 const FDT_PCI_RANGE_MMIO_64BIT: u32 = 0x0300_0000;
 /// `PCI_NUM_PINS`.
 const PCI_NUM_PINS: u32 = 4;
+/// `FDT_APLIC_ADDR_CELLS`, `FDT_APLIC_INT_CELLS` and `FDT_IMSIC_INT_CELLS`.
+const FDT_APLIC_ADDR_CELLS: u32 = 0;
+const FDT_APLIC_INT_CELLS: u32 = 2;
+const FDT_IMSIC_INT_CELLS: u32 = 0;
+/// The trigger type the devices give with the AIA, `IRQ_TYPE_LEVEL_HIGH`.
+const IRQ_TYPE_LEVEL_HIGH: u32 = 0x4;
 
 /// The `riscv,isa` string QEMU 11.1 writes for its default `rv64` CPU.
 pub const QEMU_RV64_ISA: &str = "rv64imafdch_zic64b_zicbom_zicbop_zicboz_ziccamoa_ziccif_\
@@ -156,27 +166,43 @@ pub(crate) struct FinalizeArgs<'a> {
     pub(crate) ram_size: u64,
     /// The configuration of the harts.
     pub(crate) cpu: &'a RiscvCfg,
+    /// The interrupt controller, `aia`.
+    pub(crate) aia: VirtAia,
+    /// The guest interrupt files of each S level IMSIC, `aia-guests`.
+    pub(crate) aia_guests: u32,
 }
 
-/// `finalize_fdt()`: the CPU, memory, CLINT, PLIC, platform bus, virtio, PCIe, reset, UART
-/// and RTC nodes, with the phandles counted from 1.
+/// `finalize_fdt()`: the CPU, memory, CLINT, interrupt controller, platform bus, virtio,
+/// PCIe, reset, UART and RTC nodes, with the phandles counted from 1.
 pub(crate) fn finalize_fdt(fdt: &mut Fdt, args: FinalizeArgs<'_>) -> Result<(), String> {
     let mut phandle = 1u32;
-    let irq_phandle = create_fdt_sockets(fdt, args, &mut phandle)?;
-    create_fdt_virtio(fdt, irq_phandle)?;
-    create_fdt_pcie(fdt, irq_phandle, args.ram_size)?;
+    let (irq_phandle, msi_pcie_phandle) = create_fdt_sockets(fdt, args, &mut phandle)?;
+    let aia = args.aia;
+    create_fdt_virtio(fdt, aia, irq_phandle)?;
+    create_fdt_pcie(fdt, aia, irq_phandle, msi_pcie_phandle, args.ram_size)?;
     create_fdt_reset(fdt, &mut phandle)?;
-    create_fdt_uart(fdt, irq_phandle)?;
-    create_fdt_rtc(fdt, irq_phandle)
+    create_fdt_uart(fdt, aia, irq_phandle)?;
+    create_fdt_rtc(fdt, aia, irq_phandle)
 }
 
-/// `create_fdt_sockets()` for one socket and the SiFive CLINT and PLIC. Returns the PLIC's
-/// phandle, the interrupt parent of the devices.
+/// The `interrupts` of a device on source `irq`: the source alone with the PLIC, the source
+/// and its trigger type with an APLIC.
+fn set_interrupts(fdt: &mut Fdt, name: &str, aia: VirtAia, irq: u32) -> Result<(), String> {
+    if aia == VirtAia::None {
+        fdt.setprop_cell(name, "interrupts", irq)
+    } else {
+        fdt.setprop_cells(name, "interrupts", &[irq, IRQ_TYPE_LEVEL_HIGH])
+    }
+}
+
+/// `create_fdt_sockets()` for one socket, with the SiFive CLINT and the PLIC or the AIA
+/// devices. Returns the phandle of the interrupt parent of the devices and that of the MSI
+/// parent of PCIe (0 without IMSICs).
 fn create_fdt_sockets(
     fdt: &mut Fdt,
     args: FinalizeArgs<'_>,
     phandle: &mut u32,
-) -> Result<u32, String> {
+) -> Result<(u32, u32), String> {
     // fdt_create_cpu_socket_subnode().
     fdt.add_subnode("/cpus")?;
     fdt.setprop_cell("/cpus", "timebase-frequency", TIMEBASE_FREQ)?;
@@ -190,6 +216,29 @@ fn create_fdt_sockets(
     let intc_phandles = create_fdt_socket_cpus(fdt, args, &clust_name, phandle)?;
     create_fdt_socket_memory(fdt, args.ram_size)?;
     create_fdt_socket_clint(fdt, &intc_phandles)?;
+
+    let (mut msi_m_phandle, mut msi_s_phandle) = (0, 0);
+    if args.aia == VirtAia::AplicImsic {
+        // create_fdt_imsic().
+        msi_m_phandle = *phandle;
+        *phandle += 1;
+        msi_s_phandle = *phandle;
+        *phandle += 1;
+        create_fdt_one_imsic(fdt, VIRT_IMSIC_M, &intc_phandles, msi_m_phandle, true, 0)?;
+        let bits = imsic_num_bits(args.aia_guests + 1);
+        create_fdt_one_imsic(fdt, VIRT_IMSIC_S, &intc_phandles, msi_s_phandle, false, bits)?;
+    }
+    if args.aia != VirtAia::None {
+        let aplic_s_phandle = create_fdt_socket_aplic(
+            fdt,
+            args.aia,
+            msi_m_phandle,
+            msi_s_phandle,
+            phandle,
+            &intc_phandles,
+        )?;
+        return Ok((aplic_s_phandle, msi_s_phandle));
+    }
 
     // create_fdt_socket_plic().
     let mut plic_cells = Vec::with_capacity(intc_phandles.len() * 4);
@@ -207,7 +256,127 @@ fn create_fdt_sockets(
         VIRT_PLATFORM_BUS_SIZE,
         VIRT_PLATFORM_BUS_IRQ,
     )?;
-    Ok(plic_phandle)
+    Ok((plic_phandle, 0))
+}
+
+/// `create_fdt_one_imsic()` for one socket: the IMSICs of level M or S of all the harts.
+fn create_fdt_one_imsic(
+    fdt: &mut Fdt,
+    base_addr: u64,
+    intc_phandles: &[u32],
+    msi_phandle: u32,
+    m_mode: bool,
+    imsic_guest_bits: u32,
+) -> Result<(), String> {
+    let irq = if m_mode { IRQ_M_EXT } else { IRQ_S_EXT };
+    let imsic_cells: Vec<u32> = intc_phandles.iter().flat_map(|&intc| [intc, irq]).collect();
+    // The cells are 32 bits wide, as in QEMU.
+    let imsic_size = imsic_hart_size(imsic_guest_bits) * intc_phandles.len() as u64;
+    let imsic_regs = [0, base_addr as u32, 0, imsic_size as u32];
+
+    let name = format!("/soc/interrupt-controller@{base_addr:x}");
+    fdt.add_subnode(&name)?;
+    fdt.setprop(&name, "compatible", &string_array(&["qemu,imsics", "riscv,imsics"]))?;
+    fdt.setprop_cell(&name, "#interrupt-cells", FDT_IMSIC_INT_CELLS)?;
+    fdt.setprop(&name, "interrupt-controller", &[])?;
+    fdt.setprop(&name, "msi-controller", &[])?;
+    fdt.setprop(&name, "interrupts-extended", &be_cells(&imsic_cells))?;
+    fdt.setprop(&name, "reg", &be_cells(&imsic_regs))?;
+    fdt.setprop_cell(&name, "riscv,num-ids", VIRT_IRQCHIP_NUM_MSIS)?;
+    if imsic_guest_bits != 0 {
+        fdt.setprop_cell(&name, "riscv,guest-index-bits", imsic_guest_bits)?;
+    }
+    fdt.setprop_cell(&name, "phandle", msi_phandle)
+}
+
+/// `create_fdt_one_aplic()`.
+#[allow(clippy::too_many_arguments)]
+fn create_fdt_one_aplic(
+    fdt: &mut Fdt,
+    aia: VirtAia,
+    aplic_addr: u64,
+    msi_phandle: u32,
+    intc_phandles: &[u32],
+    aplic_phandle: u32,
+    aplic_child_phandle: u32,
+    m_mode: bool,
+) -> Result<(), String> {
+    let irq = if m_mode { IRQ_M_EXT } else { IRQ_S_EXT };
+    let aplic_cells: Vec<u32> = intc_phandles.iter().flat_map(|&intc| [intc, irq]).collect();
+
+    let name = format!("/soc/interrupt-controller@{aplic_addr:x}");
+    fdt.add_subnode(&name)?;
+    fdt.setprop(&name, "compatible", &string_array(&["qemu,aplic", "riscv,aplic"]))?;
+    fdt.setprop_cell(&name, "#address-cells", FDT_APLIC_ADDR_CELLS)?;
+    fdt.setprop_cell(&name, "#interrupt-cells", FDT_APLIC_INT_CELLS)?;
+    fdt.setprop(&name, "interrupt-controller", &[])?;
+    if aia == VirtAia::Aplic {
+        fdt.setprop(&name, "interrupts-extended", &be_cells(&aplic_cells))?;
+    } else {
+        fdt.setprop_cell(&name, "msi-parent", msi_phandle)?;
+    }
+    let reg = cells(&[(2, aplic_addr), (2, VIRT_APLIC_SIZE)], "aplic reg")?;
+    fdt.setprop(&name, "reg", &reg)?;
+    fdt.setprop_cell(&name, "riscv,num-sources", VIRT_IRQCHIP_NUM_SOURCES)?;
+    if aplic_child_phandle != 0 {
+        fdt.setprop_cell(&name, "riscv,children", aplic_child_phandle)?;
+        fdt.setprop_cells(
+            &name,
+            "riscv,delegation",
+            &[aplic_child_phandle, 0x1, VIRT_IRQCHIP_NUM_SOURCES],
+        )?;
+    }
+    fdt.setprop_cell(&name, "phandle", aplic_phandle)
+}
+
+/// `create_fdt_socket_aplic()` for socket 0: the M level domain, then the S level one, its
+/// child, and the platform bus on the S level one. Returns the phandle of the S level domain.
+fn create_fdt_socket_aplic(
+    fdt: &mut Fdt,
+    aia: VirtAia,
+    msi_m_phandle: u32,
+    msi_s_phandle: u32,
+    phandle: &mut u32,
+    intc_phandles: &[u32],
+) -> Result<u32, String> {
+    let aplic_m_phandle = *phandle;
+    *phandle += 1;
+    let aplic_s_phandle = *phandle;
+    *phandle += 1;
+
+    // M-level APLIC node
+    create_fdt_one_aplic(
+        fdt,
+        aia,
+        VIRT_APLIC_M,
+        msi_m_phandle,
+        intc_phandles,
+        aplic_m_phandle,
+        aplic_s_phandle,
+        true,
+    )?;
+
+    // S-level APLIC node
+    create_fdt_one_aplic(
+        fdt,
+        aia,
+        VIRT_APLIC_S,
+        msi_s_phandle,
+        intc_phandles,
+        aplic_s_phandle,
+        0,
+        false,
+    )?;
+
+    let aplic_name = format!("/soc/interrupt-controller@{VIRT_APLIC_S:x}");
+    platform_bus_add_all_fdt_nodes(
+        fdt,
+        &aplic_name,
+        VIRT_PLATFORM_BUS,
+        VIRT_PLATFORM_BUS_SIZE,
+        VIRT_PLATFORM_BUS_IRQ,
+    )?;
+    Ok(aplic_s_phandle)
 }
 
 /// `create_fdt_socket_cpus()` and `create_fdt_socket_cpu_internal()`, from the last hart
@@ -329,7 +498,7 @@ fn platform_bus_add_all_fdt_nodes(
 }
 
 /// `create_fdt_virtio()`.
-fn create_fdt_virtio(fdt: &mut Fdt, irq_virtio_phandle: u32) -> Result<(), String> {
+fn create_fdt_virtio(fdt: &mut Fdt, aia: VirtAia, irq_virtio_phandle: u32) -> Result<(), String> {
     for i in 0..VIRTIO_COUNT {
         let addr = VIRT_VIRTIO + i as u64 * VIRT_VIRTIO_SIZE;
         let name = format!("/soc/virtio_mmio@{addr:x}");
@@ -337,13 +506,19 @@ fn create_fdt_virtio(fdt: &mut Fdt, irq_virtio_phandle: u32) -> Result<(), Strin
         fdt.setprop_string(&name, "compatible", "virtio,mmio")?;
         fdt.setprop(&name, "reg", &cells(&[(2, addr), (2, VIRT_VIRTIO_SIZE)], "virtio reg")?)?;
         fdt.setprop_cell(&name, "interrupt-parent", irq_virtio_phandle)?;
-        fdt.setprop_cell(&name, "interrupts", VIRTIO_IRQ + i as u32)?;
+        set_interrupts(fdt, &name, aia, VIRTIO_IRQ + i as u32)?;
     }
     Ok(())
 }
 
 /// `create_fdt_pcie()` and `create_pcie_irq_map()`.
-fn create_fdt_pcie(fdt: &mut Fdt, irq_pcie_phandle: u32, ram_size: u64) -> Result<(), String> {
+fn create_fdt_pcie(
+    fdt: &mut Fdt,
+    aia: VirtAia,
+    irq_pcie_phandle: u32,
+    msi_pcie_phandle: u32,
+    ram_size: u64,
+) -> Result<(), String> {
     let name = format!("/soc/pci@{VIRT_PCIE_ECAM:x}");
     fdt.setprop_cell(&name, "#address-cells", 3)?;
     fdt.setprop_cell(&name, "#interrupt-cells", 1)?;
@@ -357,6 +532,9 @@ fn create_fdt_pcie(fdt: &mut Fdt, irq_pcie_phandle: u32, ram_size: u64) -> Resul
         &[0, (VIRT_PCIE_ECAM_SIZE / PCIE_MMCFG_SIZE_MIN - 1) as u32],
     )?;
     fdt.setprop(&name, "dma-coherent", &[])?;
+    if aia == VirtAia::AplicImsic {
+        fdt.setprop_cell(&name, "msi-parent", msi_pcie_phandle)?;
+    }
     fdt.setprop(&name, "reg", &cells(&[(2, VIRT_PCIE_ECAM), (2, VIRT_PCIE_ECAM_SIZE)], "reg")?)?;
     let high = high_pcie_base(ram_size);
     let ranges = cells(
@@ -380,12 +558,15 @@ fn create_fdt_pcie(fdt: &mut Fdt, irq_pcie_phandle: u32, ram_size: u64) -> Resul
 
     // A standard swizzle of interrupts such that each device's first interrupt is based on
     // its PCI_SLOT number.
-    let mut map = Vec::with_capacity((PCI_NUM_PINS * PCI_NUM_PINS * 6) as usize);
+    let mut map = Vec::with_capacity((PCI_NUM_PINS * PCI_NUM_PINS * 7) as usize);
     for dev in 0..PCI_NUM_PINS {
         let devfn = dev * 0x8;
         for pin in 0..PCI_NUM_PINS {
             let irq_nr = PCIE_IRQ + ((pin + (devfn >> 3)) % PCI_NUM_PINS);
             map.extend_from_slice(&[devfn << 8, 0, 0, pin + 1, irq_pcie_phandle, irq_nr]);
+            if aia != VirtAia::None {
+                map.push(IRQ_TYPE_LEVEL_HIGH);
+            }
         }
     }
     fdt.setprop(&name, "interrupt-map", &be_cells(&map))?;
@@ -417,26 +598,26 @@ fn create_fdt_reset(fdt: &mut Fdt, phandle: &mut u32) -> Result<(), String> {
 }
 
 /// `create_fdt_uart()`.
-fn create_fdt_uart(fdt: &mut Fdt, irq_mmio_phandle: u32) -> Result<(), String> {
+fn create_fdt_uart(fdt: &mut Fdt, aia: VirtAia, irq_mmio_phandle: u32) -> Result<(), String> {
     let name = format!("/soc/serial@{VIRT_UART0:x}");
     fdt.add_subnode(&name)?;
     fdt.setprop_string(&name, "compatible", "ns16550a")?;
     fdt.setprop(&name, "reg", &cells(&[(2, VIRT_UART0), (2, VIRT_UART0_SIZE)], "uart reg")?)?;
     fdt.setprop_cell(&name, "clock-frequency", 3_686_400)?;
     fdt.setprop_cell(&name, "interrupt-parent", irq_mmio_phandle)?;
-    fdt.setprop_cell(&name, "interrupts", UART0_IRQ)?;
+    set_interrupts(fdt, &name, aia, UART0_IRQ)?;
     fdt.setprop_string("/chosen", "stdout-path", &name)?;
     fdt.setprop_string("/aliases", "serial0", &name)
 }
 
 /// `create_fdt_rtc()`.
-fn create_fdt_rtc(fdt: &mut Fdt, irq_mmio_phandle: u32) -> Result<(), String> {
+fn create_fdt_rtc(fdt: &mut Fdt, aia: VirtAia, irq_mmio_phandle: u32) -> Result<(), String> {
     let name = format!("/soc/rtc@{VIRT_RTC:x}");
     fdt.add_subnode(&name)?;
     fdt.setprop_string(&name, "compatible", "google,goldfish-rtc")?;
     fdt.setprop(&name, "reg", &cells(&[(2, VIRT_RTC), (2, VIRT_RTC_SIZE)], "rtc reg")?)?;
     fdt.setprop_cell(&name, "interrupt-parent", irq_mmio_phandle)?;
-    fdt.setprop_cell(&name, "interrupts", RTC_IRQ)
+    set_interrupts(fdt, &name, aia, RTC_IRQ)
 }
 
 fn be32(b: &[u8], off: usize) -> usize {
@@ -517,10 +698,69 @@ mod tests {
     }
 
     fn build(cpu: &RiscvCfg, smp: usize, ram_size: u64) -> Fdt {
+        build_aia(cpu, smp, ram_size, VirtAia::None, 0, &seed())
+    }
+
+    fn build_aia(
+        cpu: &RiscvCfg,
+        smp: usize,
+        ram_size: u64,
+        aia: VirtAia,
+        aia_guests: u32,
+        seed: &[u8; 32],
+    ) -> Fdt {
         let mut fdt = Fdt::new();
-        create_fdt(&mut fdt, &seed(), cpu.pmu_mask).unwrap();
-        finalize_fdt(&mut fdt, FinalizeArgs { smp, ram_size, cpu }).unwrap();
+        create_fdt(&mut fdt, seed, cpu.pmu_mask).unwrap();
+        finalize_fdt(&mut fdt, FinalizeArgs { smp, ram_size, cpu, aia, aia_guests }).unwrap();
         fdt_pack(&fdt).unwrap()
+    }
+
+    /// Build the tree of `golden`, a `dumpdtb` of QEMU 11.1.2 with 128 MiB, `-bios none` and
+    /// the given `-smp` and `-M virt,aia=...,aia-guests=...`, with its `rng-seed`, and check
+    /// that the two are the same bytes.
+    fn check_golden(golden: &[u8], smp: usize, aia: VirtAia, aia_guests: u32) -> Fdt {
+        let qemu = Fdt::open_into(golden, golden.len()).unwrap();
+        let seed: [u8; 32] = qemu.getprop("/chosen", "rng-seed").unwrap().try_into().unwrap();
+        let imsic = aia == VirtAia::AplicImsic;
+        let cpu = RiscvCfg { ext_smaia: imsic, ext_ssaia: imsic, ..RiscvCfg::default() };
+        let fdt = build_aia(&cpu, smp, 128 << 20, aia, aia_guests, &seed);
+        assert_eq!(fdt.as_bytes().len(), golden.len());
+        assert!(fdt.as_bytes() == golden, "the tree differs from QEMU's");
+        fdt
+    }
+
+    #[test]
+    fn aplic_matches_qemu() {
+        let golden = include_bytes!("../../tests/data/virt-aplic-smp2.dtb");
+        let fdt = check_golden(golden, 2, VirtAia::Aplic, 0);
+        // cpu@1 and its controller, cpu@0 and its controller, then the M and S domains.
+        assert_eq!(fdt.get_phandle("/soc/interrupt-controller@c000000").unwrap(), 5);
+        assert_eq!(fdt.get_phandle("/soc/interrupt-controller@d000000").unwrap(), 6);
+        let m = fdt.getprop("/soc/interrupt-controller@c000000", "interrupts-extended");
+        assert_eq!(m.unwrap(), be_cells(&[4, 11, 2, 11]));
+        let s = fdt.getprop("/soc/interrupt-controller@d000000", "interrupts-extended");
+        assert_eq!(s.unwrap(), be_cells(&[4, 9, 2, 9]));
+        assert_eq!(fdt.getprop("/soc/serial@10000000", "interrupts").unwrap(), be_cells(&[10, 4]));
+    }
+
+    #[test]
+    fn aplic_imsic_matches_qemu() {
+        let golden = include_bytes!("../../tests/data/virt-aplic-imsic.dtb");
+        let fdt = check_golden(golden, 1, VirtAia::AplicImsic, 0);
+        let isa = fdt.getprop("/cpus/cpu@0", "riscv,isa").unwrap();
+        assert!(isa.windows(13).any(|w| w == b"_smaia_ssaia_"));
+        let pci = fdt.getprop_cell("/soc/pci@30000000", "msi-parent").unwrap();
+        assert_eq!(pci, fdt.get_phandle("/soc/interrupt-controller@28000000").unwrap());
+    }
+
+    #[test]
+    fn aplic_imsic_guests_match_qemu() {
+        let golden = include_bytes!("../../tests/data/virt-aplic-imsic-smp2-g3.dtb");
+        let fdt = check_golden(golden, 2, VirtAia::AplicImsic, 3);
+        let s = "/soc/interrupt-controller@28000000";
+        assert_eq!(fdt.getprop_cell(s, "riscv,guest-index-bits").unwrap(), 2);
+        // Two harts of four pages each.
+        assert_eq!(fdt.getprop(s, "reg").unwrap(), be_cells(&[0, 0x2800_0000, 0, 0x8000]));
     }
 
     #[test]

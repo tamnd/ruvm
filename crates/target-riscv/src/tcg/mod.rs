@@ -6,7 +6,10 @@
 //!
 //! The `mip` register and the interrupt lines that drive it live in [`Riscv`] rather than
 //! in `env`, because devices on other threads change them (QEMU changes `env->mip` under
-//! the BQL). The vCPU thread reads them under the same lock.
+//! the BQL). The vCPU thread reads them under the same lock. So do the guest external
+//! interrupt lines of H (`hgeip`), with the copies of `hgeie` and `hstatus.VGEIN` they need,
+//! and whether an interrupt `mvien` or `hvien` injects is pending. The board gives GEILEN
+//! ([`Riscv::with_geilen`]) and the registers of the IMSIC ([`RiscvBoard::aia_ireg_rmw`]).
 //!
 //! Differences from QEMU:
 //!
@@ -16,8 +19,6 @@
 //!   QEMU. Extensions this port does not have yet cannot be turned on, and CPU models
 //!   that need them are refused. VLEN is fixed at 128 bits, QEMU's default, so other `vlen`
 //!   values are refused too.
-//! - With H there are no guest external interrupts (GEILEN is 0), so `hgeie` and `hgeip`
-//!   read as zero, and no AIA virtual interrupts (`hvien`, `hvictl`).
 //! - `vsstatus` keeps every bit a write gives it, as in QEMU, but only the bits that
 //!   `riscv_cpu_swap_hypervisor_regs()` swaps reach `mstatus` when V becomes 1; QEMU ORs
 //!   the whole of `vsstatus` into `mstatus`.
@@ -26,8 +27,7 @@
 //!   `mhpmevent` selects the cycle or instruction event ([`pmu`]).
 //! - The page walk updates the A and D bits of a PTE with a plain store, where QEMU uses a
 //!   compare and swap on RAM and restarts the walk if the PTE changed under it.
-//! - There is no AIA, no Smrnmi, Smdbltrp, Ssdbltrp, Smctr or control flow integrity, no
-//!   pointer masking and no icount.
+//! - There is no Smrnmi, Smdbltrp, Ssdbltrp, Smctr or control flow integrity and no icount.
 //! - The debug triggers (`tselect`, `tdata1` to `tdata3`) hold values but never fire.
 //! - Conditional branches may continue the block on the fall-through path (a superblock),
 //!   with the taken edge emitted out of line at the end of the block; QEMU ends the block
@@ -76,15 +76,17 @@ use crate::cpu::{
     EXCP_M_ECALL, EXCP_S_ECALL, EXCP_SEMIHOST, EXCP_STORE_AMO_ACCESS_FAULT,
     EXCP_STORE_AMO_ADDR_MIS, EXCP_STORE_GUEST_AMO_ACCESS_FAULT, EXCP_STORE_PAGE_FAULT,
     EXCP_U_ECALL, EXCP_VIRT_INSTRUCTION_FAULT, EXCP_VS_ECALL, HSTATUS_GVA, HSTATUS_SPV,
-    HSTATUS_SPVP, IRQ_S_EXT, IRQ_VS_EXT, IRQ_VS_SOFT, IRQ_VS_TIMER, MENVCFG_STCE, MIP_LCOFIP,
-    MIP_SEIP, MIP_STIP, MIP_VSTIP, MMU_2STAGE_BIT, MMU_IDX_S_SUM, MSTATUS, MSTATUS_FS, MSTATUS_GVA,
-    MSTATUS_HS, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV, MSTATUS_MPV, MSTATUS_MXR,
-    MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_SUM, MSTATUS_VS, MSTATUS64_UXL, NB_MMU_MODES,
-    PC, PRIV, PRV_M, PRV_S, RVF, RiscvCfg, UW2_ALWAYS_STORE_AMO, VILL, VIRT_ENABLED,
-    VS_MODE_INTERRUPTS, VSSTATUS, VSTART, VTYPE, VTYPE_VLMUL, VTYPE_VMA, VTYPE_VSEW, VTYPE_VTA,
-    get_field, set_field,
+    HSTATUS_SPVP, IPRIO_DEFAULT_M, IPRIO_DEFAULT_S, IPRIO_MMAXIPRIO, IRQ_LOCAL_GUEST_MAX,
+    IRQ_LOCAL_MAX, IRQ_M_EXT, IRQ_S_EXT, IRQ_VS_EXT, IRQ_VS_SOFT, IRQ_VS_TIMER, MENVCFG_STCE,
+    MIP_LCOFIP, MIP_SEIP, MIP_SGEIP, MIP_STIP, MIP_VSEIP, MIP_VSTIP, MMU_2STAGE_BIT, MMU_IDX_S_SUM,
+    MSTATUS, MSTATUS_FS, MSTATUS_GVA, MSTATUS_HS, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP,
+    MSTATUS_MPRV, MSTATUS_MPV, MSTATUS_MXR, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_SUM,
+    MSTATUS_VS, MSTATUS64_UXL, NB_MMU_MODES, PC, PRIV, PRV_M, PRV_S, RVF, RiscvCfg,
+    UW2_ALWAYS_STORE_AMO, VILL, VIRT_ENABLED, VS_MODE_INTERRUPTS, VSSTATUS, VSTART, VTYPE,
+    VTYPE_VLMUL, VTYPE_VMA, VTYPE_VSEW, VTYPE_VTA, default_priority, get_field, iprio, set_field,
 };
 
+use csr::vs_bits_down;
 pub use semihost::{ADP_STOPPED_APPLICATION_EXIT, SemihostingHost};
 
 /// The TB flags: the MMU index of data accesses in bits 0 to 2.
@@ -144,6 +146,23 @@ pub trait RiscvBoard: Send + Sync {
     fn vstimer_update(&self, shared: &CpuShared, deadline: Option<Instant>) {
         let _ = (shared, deadline);
     }
+
+    /// The `aia_ireg_rmw_fn` the IMSIC of level `priv_lvl` (`PRV_M` or `PRV_S`) of the
+    /// vCPU `shared` registers, `riscv_imsic_rmw()`: read the IMSIC register `reg` (the
+    /// `AIA_MAKE_IREG()` encoding) and replace its `wr_mask` bits with those of `new`.
+    /// `None` if the hart has no IMSIC at that level, `Some(Err(()))` if the IMSIC
+    /// refuses the access.
+    fn aia_ireg_rmw(
+        &self,
+        shared: &CpuShared,
+        priv_lvl: u64,
+        reg: u32,
+        new: u64,
+        wr_mask: u64,
+    ) -> Option<Result<u64, ()>> {
+        let _ = (shared, priv_lvl, reg, new, wr_mask);
+        None
+    }
 }
 
 /// Which Sstc timer a write is for: the `timer_irq` argument of QEMU's timer helpers.
@@ -169,6 +188,41 @@ pub(crate) struct CpuLines {
     /// The PMU timer has fired and the vCPU has not yet run `riscv_pmu_timer_cb()`, which
     /// needs `env`.
     pub(crate) pmu_timer: bool,
+    /// `hgeip`: bit `i` is the guest external interrupt line `i`, 1 to GEILEN.
+    pub(crate) hgeip: u64,
+    /// A copy of `hgeie`, which decides SGEIP when a guest external interrupt line moves.
+    pub(crate) hgeie: u64,
+    /// A copy of `hstatus.VGEIN`, the guest external interrupt that shows as VSEIP.
+    pub(crate) vgein: u32,
+    /// Whether an interrupt injected through `mvien` and `mvip`, or `hvien` and `hvip`,
+    /// is pending and enabled in `sie` or `vsie`.
+    pub(crate) irqf: bool,
+}
+
+impl CpuLines {
+    /// VSEIP if the guest external interrupt `hstatus.VGEIN` selects is pending, the
+    /// `vsgein` of `riscv_cpu_all_pending()`.
+    pub(crate) fn vsgein(&self) -> u64 {
+        if self.vgein < 64 && (self.hgeip >> self.vgein) & 1 != 0 { MIP_VSEIP } else { 0 }
+    }
+
+    /// Set SGEIP in `mip` to whether a guest external interrupt is pending and enabled.
+    pub(crate) fn update_sgeip(&mut self) {
+        let v = if self.hgeie & self.hgeip != 0 { MIP_SGEIP } else { 0 };
+        self.mip = (self.mip & !MIP_SGEIP) | v;
+    }
+
+    /// `riscv_cpu_all_pending()` with the enables `mie`.
+    pub(crate) fn all_pending(&self, mie: u64) -> u64 {
+        let vstip = if self.vstime_irq { MIP_VSTIP } else { 0 };
+        (self.mip | self.vsgein() | vstip) & mie
+    }
+
+    /// Whether `riscv_cpu_interrupt()` raises the hard interrupt request: an interrupt
+    /// is pending in `mip`, through VGEIN, the VS timer or the injected ones.
+    fn hard(&self) -> bool {
+        self.mip != 0 || self.vsgein() != 0 || self.vstime_irq || self.irqf
+    }
 }
 
 /// The RV64 CPU: the [`CpuOps`] of vCPUs translated by the RISC-V front end.
@@ -177,6 +231,7 @@ pub struct Riscv {
     board: OnceLock<Arc<dyn RiscvBoard>>,
     semihost: Option<semihost::Semihosting>,
     cfg: RiscvCfg,
+    geilen: u32,
     lines: Mutex<Vec<CpuLines>>,
 }
 
@@ -203,6 +258,7 @@ impl Riscv {
             board: OnceLock::new(),
             semihost: None,
             cfg: RiscvCfg::default(),
+            geilen: 0,
             lines: Mutex::new(Vec::new()),
         }
     }
@@ -238,6 +294,22 @@ impl Riscv {
     /// The configuration of the CPU.
     pub fn cfg(&self) -> &RiscvCfg {
         &self.cfg
+    }
+
+    /// The same CPU with `geilen` guest external interrupts, as an S level IMSIC with
+    /// `geilen + 1` interrupt files sets with `riscv_cpu_set_geilen()`. Without H, or for
+    /// more than `IRQ_LOCAL_GUEST_MAX`, nothing changes, as in QEMU. Call it after
+    /// [`Riscv::with_cfg`].
+    pub fn with_geilen(mut self, geilen: u32) -> Riscv {
+        if self.cfg.ext_h() && geilen <= IRQ_LOCAL_GUEST_MAX {
+            self.geilen = geilen;
+        }
+        self
+    }
+
+    /// `GEILEN`: the number of guest external interrupts of each hart.
+    pub fn geilen(&self) -> u32 {
+        self.geilen
     }
 
     /// Wire the CPU to `board`. Only the first call has an effect; the board usually
@@ -280,7 +352,7 @@ impl Riscv {
         let r = f(&mut g[i]);
         // riscv_cpu_interrupt(). The request bit follows mip under the lock, so a racing
         // update can never leave it clear while an interrupt is pending.
-        let raise = g[i].mip != 0 || g[i].vstime_irq || g[i].pmu_timer;
+        let raise = g[i].hard() || g[i].pmu_timer;
         if raise {
             shared.set_interrupt(interrupt::HARD);
         } else {
@@ -320,19 +392,61 @@ impl Riscv {
     }
 
     /// `riscv_cpu_set_irq()`: drive the local interrupt input `irq` (an `IRQ_*` number) of
-    /// the vCPU `shared` to `level`, as the interrupt controllers and timers do.
+    /// the vCPU `shared` to `level`, as the interrupt controllers and timers do. Inputs
+    /// `IRQ_LOCAL_MAX + i - 1` are the guest external interrupt lines, bit `i` of `hgeip`,
+    /// which need H and `i` no more than GEILEN.
     pub fn set_irq(&self, shared: &CpuShared, irq: u32, level: bool) {
-        assert!(irq < 64, "riscv: bad interrupt line {irq}");
         if irq == IRQ_S_EXT {
             self.with_lines(shared, |l| {
                 l.external_seip = level;
                 let v = level || l.software_seip;
                 l.mip = (l.mip & !MIP_SEIP) | if v { MIP_SEIP } else { 0 };
             });
-        } else {
+        } else if irq < IRQ_LOCAL_MAX {
             let bit = 1u64 << irq;
             self.update_mip(shared, bit, if level { bit } else { 0 });
+        } else {
+            assert!(
+                irq < IRQ_LOCAL_MAX + IRQ_LOCAL_GUEST_MAX && self.cfg.ext_h(),
+                "riscv: bad interrupt line {irq}"
+            );
+            let gein = irq - IRQ_LOCAL_MAX + 1;
+            assert!(gein <= self.geilen, "riscv: guest external interrupt {gein} past GEILEN");
+            self.with_lines(shared, |l| {
+                l.hgeip = (l.hgeip & !(1 << gein)) | (u64::from(level) << gein);
+                l.update_sgeip();
+            });
         }
+    }
+
+    /// `hgeip` of the vCPU `cpu_index`.
+    pub fn hgeip(&self, cpu_index: usize) -> u64 {
+        let (g, i) = self.lines(cpu_index);
+        g[i].hgeip
+    }
+
+    /// Bring the copies of `hgeie` and `hstatus.VGEIN` the lines keep back to their reset
+    /// values, and drop the injected interrupts, as the reset of `env` does. Call it with
+    /// every reset of the vCPU `shared`.
+    pub fn reset_lines(&self, shared: &CpuShared) {
+        self.with_lines(shared, |l| {
+            l.hgeie = 0;
+            l.vgein = 0;
+            l.irqf = false;
+            l.update_sgeip();
+        });
+    }
+
+    /// The IMSIC callback of [`RiscvBoard::aia_ireg_rmw`], `None` without a board or IMSIC.
+    pub(crate) fn aia_ireg_rmw(
+        &self,
+        shared: &CpuShared,
+        priv_lvl: u64,
+        reg: u32,
+        new: u64,
+        wr_mask: u64,
+    ) -> Option<Result<u64, ()>> {
+        self.board()?.aia_ireg_rmw(shared, priv_lvl, reg, new, wr_mask)
     }
 
     /// `rdtime_fn()`: the board's `mtime`, if it has a timer.
@@ -481,12 +595,12 @@ impl Riscv {
         self.set_vstime_irq(shared, true);
     }
 
-    /// `riscv_cpu_all_pending()`: the enabled pending interrupts, with VSTIP while the VS
-    /// timer has fired.
+    /// `riscv_cpu_all_pending()`: the enabled pending interrupts, with VSEIP while the
+    /// guest external interrupt VGEIN selects is pending and VSTIP while the VS timer has
+    /// fired. The interrupts injected through `mvip` and `hvip` are not in it.
     fn all_pending(&self, cpu_index: usize, mie: u64) -> u64 {
         let (g, i) = self.lines(cpu_index);
-        let vstip = if g[i].vstime_irq { MIP_VSTIP } else { 0 };
-        (g[i].mip | vstip) & mie
+        g[i].all_pending(mie)
     }
 
     /// `riscv_cpu_local_irq_pending()`: the interrupt to take now, if any.
@@ -502,22 +616,24 @@ impl Riscv {
             )
         };
         let pending = self.all_pending(cpu_index, st.mie);
-        // M mode interrupts first, then HS mode, then VS mode ones; without AIA the lowest
-        // numbered pending interrupt wins (riscv_cpu_pending_to_irq()).
+        // M mode interrupts first, then HS mode, then VS mode ones; within a level
+        // riscv_cpu_pending_to_irq() picks one.
         let irqs = pending & !st.mideleg;
         if mie && irqs != 0 {
-            return Some(irqs.trailing_zeros());
+            return pending_to_irq(&self.cfg, IRQ_M_EXT, IPRIO_DEFAULT_M, irqs, &st.miprio);
         }
-        let irqs = pending & st.mideleg & !st.hideleg;
+        // The S level interrupts M mode injects through mvien and mvip.
+        let irqs_f = st.mvip & st.mvien & !st.mideleg & st.sie;
+        let irqs = (pending & st.mideleg & !st.hideleg) | irqs_f;
         if hsie && irqs != 0 {
-            return Some(irqs.trailing_zeros());
+            return pending_to_irq(&self.cfg, IRQ_S_EXT, IPRIO_DEFAULT_S, irqs, &st.siprio);
         }
-        // Bring the VS level bits down to their S level positions.
-        let delegated = pending & st.mideleg & st.hideleg;
-        let vsbits = delegated & VS_MODE_INTERRUPTS;
-        let irqs = (delegated & !VS_MODE_INTERRUPTS) | (vsbits >> 1);
+        // The VS level interrupts HS mode injects through hvien and hvip, and the
+        // delegated ones with the VS level bits brought down to their S level positions.
+        let irqs_f_vs = st.hvip & st.hvien & !st.hideleg & st.vsie;
+        let irqs = vs_bits_down(pending & st.mideleg & st.hideleg) | irqs_f_vs;
         if vsie && irqs != 0 {
-            let virq = irqs.trailing_zeros();
+            let virq = pending_to_irq(&self.cfg, IRQ_S_EXT, IPRIO_DEFAULT_S, irqs, &st.hviprio)?;
             return Some(if virq == 0 || virq > 12 { virq } else { virq + 1 });
         }
         None
@@ -680,6 +796,70 @@ impl Riscv {
         }
         cpu.core.exception_index = -1;
     }
+}
+
+/// `riscv_cpu_pending_to_irq()`: the interrupt of `pending` to take first. Without Smaia
+/// (for M mode, `extirq` `IRQ_M_EXT`) or Ssaia it is the lowest numbered one; with it the
+/// one with the lowest priority in `prios`, where 0 means the default order around the
+/// external interrupt `extirq`, whose default is `def_prio`. A tie goes to the higher
+/// numbered interrupt.
+pub(crate) fn pending_to_irq(
+    cfg: &RiscvCfg,
+    extirq: u32,
+    def_prio: u8,
+    pending: u64,
+    prios: &[u64; 8],
+) -> Option<u32> {
+    if pending == 0 {
+        return None;
+    }
+    let aia = if extirq == IRQ_M_EXT { cfg.ext_smaia } else { cfg.ext_ssaia };
+    if !aia {
+        return Some(pending.trailing_zeros());
+    }
+    let mut best = None;
+    let mut best_prio = u32::MAX;
+    for irq in pending.trailing_zeros()..64 {
+        if (pending >> irq) & 1 == 0 {
+            continue;
+        }
+        let mut prio = u32::from(iprio(prios, irq));
+        if prio == 0 {
+            prio = if irq == extirq {
+                u32::from(def_prio)
+            } else if default_priority(irq) < def_prio {
+                1
+            } else {
+                u32::from(IPRIO_MMAXIPRIO)
+            };
+        }
+        if prio <= best_prio {
+            best = Some(irq);
+            best_prio = prio;
+        }
+    }
+    best
+}
+
+/// `riscv_cpu_mirq_pending()`: the M level interrupt `mtopi` reports, from the
+/// `riscv_cpu_all_pending()` value `all`.
+pub(crate) fn mirq_pending(cfg: &RiscvCfg, all: u64, st: &CpuRiscvState) -> Option<u32> {
+    let irqs = all & !st.mideleg & !(MIP_SGEIP | VS_MODE_INTERRUPTS);
+    pending_to_irq(cfg, IRQ_M_EXT, IPRIO_DEFAULT_M, irqs, &st.miprio)
+}
+
+/// `riscv_cpu_sirq_pending()`: the S level interrupt `stopi` reports.
+pub(crate) fn sirq_pending(cfg: &RiscvCfg, all: u64, st: &CpuRiscvState) -> Option<u32> {
+    let irqs = all & st.mideleg & !st.hideleg;
+    let irqs_f = st.mvip & st.mvien & !st.mideleg & st.sie;
+    pending_to_irq(cfg, IRQ_S_EXT, IPRIO_DEFAULT_S, irqs | irqs_f, &st.siprio)
+}
+
+/// `riscv_cpu_vsirq_pending()`: the VS level interrupt, at its S level number.
+pub(crate) fn vsirq_pending(cfg: &RiscvCfg, all: u64, st: &CpuRiscvState) -> Option<u32> {
+    let irqs = vs_bits_down(all & st.mideleg & st.hideleg);
+    let irqs_f_vs = st.hvip & st.hvien & !st.hideleg & st.vsie;
+    pending_to_irq(cfg, IRQ_S_EXT, IPRIO_DEFAULT_S, irqs | irqs_f_vs, &st.hviprio)
 }
 
 /// `promote_load_fault()`: an AMO that faults on its load reports a store fault.
@@ -989,7 +1169,7 @@ impl CpuOps for Riscv {
         let fired = {
             let (mut g, i) = self.lines(shared.cpu_index);
             let fired = std::mem::take(&mut g[i].pmu_timer);
-            if fired && g[i].mip == 0 && !g[i].vstime_irq {
+            if fired && !g[i].hard() {
                 shared.reset_interrupt(interrupt::HARD);
             }
             fired
@@ -1019,7 +1199,16 @@ impl CpuOps for Riscv {
         let mie = ld64(cpu.env, crate::cpu::MIE);
         let i = cpu.core.shared().cpu_index;
         // A fired PMU timer wakes the vCPU to run its callback, which may raise LCOFIP.
-        self.all_pending(i, mie) != 0 || self.lines(i).0[i].pmu_timer
+        if self.all_pending(i, mie) != 0 || self.lines(i).0[i].pmu_timer {
+            return true;
+        }
+        // The interrupts injected through mvip and hvip, which only exist with the AIA.
+        if !self.cfg.ext_smaia && !self.cfg.ext_ssaia {
+            return false;
+        }
+        let st = CpuRiscvState::load(cpu.env);
+        st.mvip & st.mvien & !st.mideleg & st.sie != 0
+            || st.hvip & st.hvien & !st.hideleg & st.vsie != 0
     }
 
     fn tlb_fill(
@@ -1131,4 +1320,65 @@ pub fn save_vcpu(v: &Vcpu) -> CpuRiscvState {
 /// Whether `v` is halted in WFI.
 pub fn vcpu_halted(v: &Vcpu) -> bool {
     v.shared().halted.load(Ordering::Acquire) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::{IPRIO_DEFAULT_UPPER, MIP_MEIP, MIP_MSIP, MIP_MTIP, MIP_SSIP, set_iprio};
+
+    #[test]
+    fn default_priorities() {
+        assert_eq!(default_priority(IRQ_M_EXT), IPRIO_DEFAULT_M);
+        assert_eq!(default_priority(3), IPRIO_DEFAULT_M + 1);
+        assert_eq!(default_priority(IRQ_S_EXT), IPRIO_DEFAULT_S);
+        assert_eq!(default_priority(47), IPRIO_DEFAULT_UPPER);
+        // Interrupts without a default order, and those past 63, come last.
+        assert_eq!(default_priority(0), IPRIO_MMAXIPRIO);
+        assert_eq!(default_priority(13), IPRIO_MMAXIPRIO);
+        assert_eq!(default_priority(64), IPRIO_MMAXIPRIO);
+    }
+
+    #[test]
+    fn pending_interrupt_order() {
+        let mut cfg = RiscvCfg::default();
+        let mut prios = [0u64; 8];
+        let pending = MIP_MSIP | MIP_MTIP | MIP_MEIP;
+        let m = |cfg: &RiscvCfg, pending: u64, prios: &[u64; 8]| {
+            pending_to_irq(cfg, IRQ_M_EXT, IPRIO_DEFAULT_M, pending, prios)
+        };
+        // Without Smaia the lowest numbered interrupt goes first.
+        assert_eq!(m(&cfg, 0, &prios), None);
+        assert_eq!(m(&cfg, pending, &prios), Some(3));
+        // With it, priority 0 puts the external interrupt at its default, the interrupts
+        // that come before it by default at 1 and the others at 255; a tie goes to the
+        // higher number.
+        cfg.ext_smaia = true;
+        assert_eq!(m(&cfg, pending, &prios), Some(IRQ_M_EXT));
+        assert_eq!(m(&cfg, MIP_MSIP | MIP_MTIP, &prios), Some(7));
+        assert_eq!(m(&cfg, MIP_MEIP | (1 << 47), &prios), Some(47));
+        set_iprio(&mut prios, 7, 1);
+        set_iprio(&mut prios, 3, 2);
+        assert_eq!(m(&cfg, pending, &prios), Some(7));
+        set_iprio(&mut prios, IRQ_M_EXT, 1);
+        assert_eq!(m(&cfg, pending, &prios), Some(IRQ_M_EXT));
+        // The S level follows Ssaia, not Smaia.
+        let s = pending_to_irq(&cfg, IRQ_S_EXT, IPRIO_DEFAULT_S, MIP_SSIP | (1 << 5), &prios);
+        assert_eq!(s, Some(1));
+    }
+
+    #[test]
+    fn guest_external_lines() {
+        let mut l = CpuLines { hgeip: 0b100, ..CpuLines::default() };
+        assert_eq!(l.vsgein(), 0);
+        l.vgein = 2;
+        assert_eq!(l.vsgein(), MIP_VSEIP);
+        assert_eq!(l.all_pending(MIP_VSEIP), MIP_VSEIP);
+        assert!(l.hard());
+        l.update_sgeip();
+        assert_eq!(l.mip, 0);
+        l.hgeie = 0b110;
+        l.update_sgeip();
+        assert_eq!(l.mip, MIP_SGEIP);
+    }
 }

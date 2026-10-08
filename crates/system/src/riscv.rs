@@ -23,9 +23,9 @@
 //!   The other models, a profile CPU that needs such an extension, and a property that turns
 //!   one on fail with "... is not supported by ruvm yet".
 //! - The machine properties are taken only where their value describes the board that
-//!   exists: `aclint=off`, `aia=none`, `aia-guests=0`, `acpi=off` or `auto` (there are no
-//!   ACPI tables either way) and `iommu-sys=off` or `auto`. Other values fail with "... is not
-//!   supported by ruvm yet".
+//!   exists: `aclint=off`, `acpi=off` or `auto` (there are no ACPI tables either way) and
+//!   `iommu-sys=off` or `auto`. Other values fail with "... is not supported by ruvm yet".
+//!   `aia` and `aia-guests` take all of QEMU's values.
 //! - Every hart is in one socket: `-smp sockets=` above 1 fails.
 //! - `-device` knows `loader` and the virtio block, RNG and serial devices only, and
 //!   `-drive if=pflash` is not wired to the flash yet.
@@ -52,7 +52,7 @@ use ruvm_machine_riscv::tcg_run::{
     ShutdownReason, VirtEvent, VirtEventHandler, VirtRunConfig, VirtTcgMachine,
 };
 use ruvm_machine_riscv::virt::{
-    GenericLoader, VIRT_CPUS_MAX, VirtConfig, VirtMachine, riscv_find_firmware,
+    GenericLoader, VIRT_CPUS_MAX, VirtAia, VirtConfig, VirtMachine, riscv_find_firmware,
 };
 use ruvm_machine_x86::FirmwareSearch;
 use ruvm_qapi::events::event_reset;
@@ -109,6 +109,10 @@ pub(crate) struct BoardOptions {
     pub firmware: Option<String>,
     /// `dumpdtb`: write the device tree there and exit.
     pub dumpdtb: Option<String>,
+    /// `aia`: the interrupt controller.
+    pub aia: VirtAia,
+    /// `aia-guests`: the guest interrupt files of each S level IMSIC.
+    pub aia_guests: u32,
 }
 
 /// Visits `name` of `machine` as a `T`, the way the machine property setter does.
@@ -165,8 +169,8 @@ fn on_off_auto<'a>(name: &str, value: &'a str) -> Result<&'a str> {
     }
 }
 
-/// Checks one virt property against the board that exists.
-fn check_virt_prop(name: &str, value: &str) -> Result<()> {
+/// Checks one virt property against the board that exists and stores it in `o`.
+fn check_virt_prop(o: &mut BoardOptions, name: &str, value: &str) -> Result<()> {
     match name {
         "aclint" => {
             if prop_bool(name, value)? {
@@ -175,12 +179,18 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
                 Ok(())
             }
         }
-        "aia" => match value {
-            "none" => Ok(()),
-            "aplic" | "aplic-imsic" => Err(not_supported(name, value)),
-            _ => Err(Error::generic("Invalid AIA interrupt controller type")
-                .hint("Valid values are none, aplic, and aplic-imsic.\n")),
-        },
+        "aia" => {
+            o.aia = match value {
+                "none" => VirtAia::None,
+                "aplic" => VirtAia::Aplic,
+                "aplic-imsic" => VirtAia::AplicImsic,
+                _ => {
+                    return Err(Error::generic("Invalid AIA interrupt controller type")
+                        .hint("Valid values are none, aplic, and aplic-imsic.\n"));
+                }
+            };
+            Ok(())
+        }
         "aia-guests" => {
             // atoi()
             let digits: String = value
@@ -195,7 +205,8 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
                 return Err(Error::generic("Invalid number of AIA IMSIC guests")
                     .hint("Valid values be between 0 and 7.\n"));
             }
-            if n == 0 { Ok(()) } else { Err(not_supported(name, value)) }
+            o.aia_guests = n as u32;
+            Ok(())
         }
         "acpi" => match on_off_auto(name, value)? {
             "on" => Err(not_supported(name, value)),
@@ -326,7 +337,7 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
             "firmware" => o.firmware = Some(prop_string(name, value)?),
             // Generic machine properties that change nothing here.
             "dump-guest-core" | "mem-merge" | "graphics" | "suppress-vmdesc" => {}
-            _ => check_virt_prop(name, &prop_string(name, value)?)?,
+            _ => check_virt_prop(&mut o, name, &prop_string(name, value)?)?,
         }
     }
     o.kernel = o.kernel.filter(|k| !k.is_empty());
@@ -737,6 +748,8 @@ pub(crate) fn start_board_tcg(
     cfg.dtb = opts.dtb;
     cfg.firmware = firmware;
     cfg.cpu = cpu;
+    cfg.aia = opts.aia;
+    cfg.aia_guests = opts.aia_guests;
     cfg.loaders = plan.loaders;
     cfg.semihosting = console.clone().map(|c| c as Arc<dyn SemihostingHost>);
     cfg.semihosting_userspace = semi.userspace;
@@ -857,12 +870,21 @@ mod tests {
         let o = take_board_options(&m).unwrap();
         assert_eq!(o.kernel.as_deref(), Some("k"));
         assert_eq!(o.firmware.as_deref(), Some("none"));
+        assert_eq!(o.aia, VirtAia::None);
+        let mut m = QDict::new();
+        m.put("aia", "aplic-imsic");
+        m.put("aia-guests", "3");
+        let o = take_board_options(&m).unwrap();
+        assert_eq!((o.aia, o.aia_guests), (VirtAia::AplicImsic, 3));
         let mut m = QDict::new();
         m.put("aia", "aplic");
-        assert_eq!(
-            take_board_options(&m).unwrap_err().message(),
-            "aia=aplic is not supported by ruvm yet"
-        );
+        m.put("aia-guests", "2x");
+        let o = take_board_options(&m).unwrap();
+        assert_eq!((o.aia, o.aia_guests), (VirtAia::Aplic, 2));
+        let mut m = QDict::new();
+        m.put("aia-guests", "8");
+        let e = take_board_options(&m).unwrap_err();
+        assert_eq!(e.message(), "Invalid number of AIA IMSIC guests");
         let mut m = QDict::new();
         m.put("aia", "foo");
         assert_eq!(
