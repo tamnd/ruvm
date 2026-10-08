@@ -42,8 +42,12 @@
 //!   that no later code loads.
 //! - Helper calls pass every argument through memory: the target says where each argument
 //!   word goes ([`Target::call_arg_home`]) and results come back the same way.
+//! - Constraint sets are parsed the first time an op uses them and kept per thread for every
+//!   later function, where QEMU parses all of them in `process_constraint_sets()` at startup.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::hash::FastHashMap;
 use crate::ir::{DEAD_ARG, Func, Label, MAX_OP_ARGS, Op, OpId, SYNC_ARG, Temp, TempData};
@@ -324,6 +328,18 @@ struct BranchStub {
     consts: Vec<(Type, i64, Reg, i64)>,
 }
 
+/// A key of [`CONSTRAINTS`]: the target type's name, then the output count, address and
+/// length of the target's static strings, so a lookup hashes four words rather than strings.
+type ConstraintKey = (usize, usize, usize, usize);
+
+thread_local! {
+    /// The parsed constraint sets, kept for every function the thread allocates. QEMU parses
+    /// all of a target's sets once at startup; parsing them again for each block cost a few
+    /// microseconds a block. The target's strings are static, so their addresses stay valid.
+    static CONSTRAINTS: RefCell<FastHashMap<ConstraintKey, Rc<[ArgConstraint]>>> =
+        RefCell::new(FastHashMap::default());
+}
+
 /// The allocator state for one function.
 #[derive(Debug)]
 pub struct RegAlloc<'f> {
@@ -332,11 +348,6 @@ pub struct RegAlloc<'f> {
     coherent: Vec<bool>,
     reg_to_temp: [Option<Temp>; 64],
     reserved: RegSet,
-    /// Parsed constraint sets, keyed by output count and the address and length of the
-    /// target's static strings, so a lookup hashes three words rather than the strings.
-    cache: FastHashMap<(usize, usize, usize), usize>,
-    /// The sets `cache` points into.
-    ct_sets: Vec<Vec<ArgConstraint>>,
     stubs: Vec<BranchStub>,
     next_label: u32,
     /// For each conditional branch, the globals that are dead on its fall through path.
@@ -416,8 +427,6 @@ impl<'f> RegAlloc<'f> {
             coherent: vec![true; f.nb_temps()],
             reg_to_temp: [None; 64],
             reserved: t.reserved_regs(),
-            cache: FastHashMap::default(),
-            ct_sets: Vec::new(),
             stubs: Vec::new(),
             next_label: f.nb_labels() as u32,
             drops: FastHashMap::default(),
@@ -870,33 +879,25 @@ impl<'f> RegAlloc<'f> {
         self.do_movi(tg, ots, val, op);
     }
 
-    /// The parsed constraints of `op`, copied out of the cache so the caller can keep them
-    /// while it mutates the allocator.
-    fn constraints<T: Target>(
-        &mut self,
-        tg: &T,
-        op: &Op,
-    ) -> Result<[ArgConstraint; MAX_OP_ARGS], T::Error> {
+    /// The parsed constraints of `op`, shared with the cache so the caller can keep them while
+    /// it mutates the allocator.
+    fn constraints<T: Target>(&self, tg: &T, op: &Op) -> Result<Rc<[ArgConstraint]>, T::Error> {
         let set = tg.op_constraints(self.f, op)?;
         let nb_oargs = op.nb_oargs();
         if set.len() != nb_oargs + op.nb_iargs() || set.len() > MAX_OP_ARGS {
             return Err(tg.bad_ir(format!("{}: constraint set has the wrong size", op.opc.name())));
         }
-        let key = (nb_oargs, set.as_ptr() as usize, set.len());
-        let idx = match self.cache.get(&key) {
-            Some(&i) => i,
-            None => {
-                let c = parse_constraints(set, nb_oargs, &|ch| tg.constraint_letter(ch))
-                    .map_err(|e| tg.bad_ir(format!("{}: {e}", op.opc.name())))?;
-                self.ct_sets.push(c);
-                self.cache.insert(key, self.ct_sets.len() - 1);
-                self.ct_sets.len() - 1
-            }
-        };
-        let c = &self.ct_sets[idx];
-        let mut out = [ArgConstraint::default(); MAX_OP_ARGS];
-        out[..c.len()].copy_from_slice(c);
-        Ok(out)
+        let name = std::any::type_name::<T>();
+        let key = (name.as_ptr() as usize, nb_oargs, set.as_ptr() as usize, set.len());
+        if let Some(c) = CONSTRAINTS.with(|m| m.borrow().get(&key).cloned()) {
+            return Ok(c);
+        }
+        let c: Rc<[ArgConstraint]> =
+            parse_constraints(set, nb_oargs, &|ch| tg.constraint_letter(ch))
+                .map_err(|e| tg.bad_ir(format!("{}: {e}", op.opc.name())))?
+                .into();
+        CONSTRAINTS.with(|m| m.borrow_mut().insert(key, Rc::clone(&c)));
+        Ok(c)
     }
 
     /// `tcg_reg_alloc_op`.

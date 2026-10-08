@@ -25,30 +25,32 @@ use std::mem::{offset_of, size_of};
 use ruvm_jit::ENV_TARGET_OFFSET;
 
 /// A field of [`CpuRiscvState`] that can be copied to and from `env`.
-trait Field {
+trait Field: Sized {
     fn put(&self, b: &mut [u8]);
-    fn get(&mut self, b: &[u8]);
+    fn read(b: &[u8]) -> Self;
 }
 
 impl Field for u64 {
+    #[inline(always)]
     fn put(&self, b: &mut [u8]) {
         b[..8].copy_from_slice(&self.to_le_bytes());
     }
-    fn get(&mut self, b: &[u8]) {
-        *self = u64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
+    #[inline(always)]
+    fn read(b: &[u8]) -> u64 {
+        u64::from_le_bytes(b[..8].try_into().expect("8 bytes"))
     }
 }
 
 impl<T: Field, const N: usize> Field for [T; N] {
+    #[inline(always)]
     fn put(&self, b: &mut [u8]) {
         for (i, v) in self.iter().enumerate() {
             v.put(&mut b[size_of::<T>() * i..]);
         }
     }
-    fn get(&mut self, b: &[u8]) {
-        for (i, v) in self.iter_mut().enumerate() {
-            v.get(&b[size_of::<T>() * i..]);
-        }
+    #[inline(always)]
+    fn read(b: &[u8]) -> [T; N] {
+        std::array::from_fn(|i| T::read(&b[size_of::<T>() * i..]))
     }
 }
 
@@ -64,14 +66,22 @@ macro_rules! riscv_state {
         impl $name {
             /// Read the state from a vCPU's `env` buffer.
             pub fn load(env: &[u8]) -> $name {
-                let mut s = $name::default();
-                $(s.$f.get(&env[ENV_TARGET_OFFSET + offset_of!($name, $f)..]);)*
-                s
+                // A slice of a fixed length makes every field's offset checked at compile
+                // time, so the copy is straight loads.
+                let b: &[u8; size_of::<$name>()] = env
+                    [ENV_TARGET_OFFSET..ENV_TARGET_OFFSET + size_of::<$name>()]
+                    .try_into()
+                    .expect("env holds the state");
+                $name { $($f: Field::read(&b[offset_of!($name, $f)..]),)* }
             }
 
             /// Write the state into a vCPU's `env` buffer.
             pub fn store(&self, env: &mut [u8]) {
-                $(self.$f.put(&mut env[ENV_TARGET_OFFSET + offset_of!($name, $f)..]);)*
+                let b: &mut [u8; size_of::<$name>()] = (&mut env
+                    [ENV_TARGET_OFFSET..ENV_TARGET_OFFSET + size_of::<$name>()])
+                    .try_into()
+                    .expect("env holds the state");
+                $(self.$f.put(&mut b[offset_of!($name, $f)..]);)*
             }
         }
     };
