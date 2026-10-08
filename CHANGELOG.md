@@ -6,6 +6,12 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.4.4
+
+This patch is all M6. The riscv virt board gets AIA and ACPI, the riscv Linux boot is about 30% faster, and the arm virt board gets its PCIe host bridge.
+
+For M6: riscv virt has the APLIC and IMSIC interrupt controllers with `-M virt,aia=aplic|aplic-imsic,aia-guests=N`, the Smaia and Ssaia CSRs, and guest external interrupts for the H extension (#167). The device tree matches QEMU 11.1 apart from rng-seed in every setup checked, and Linux boots on both APLIC modes. riscv virt also builds QEMU's ACPI tables, so EDK2 can boot Linux with `-drive if=pflash` and `acpi=on` (#168). Every table the guest sees has the same md5sum as under QEMU, with the PLIC and with `aia=aplic-imsic`. There is no SMBIOS or `-numa` yet. The TCG code buffer is now sized as in QEMU, and register allocation caches its constraint sets, which takes the riscv boot to a shell from about 9 to 10 s down to about 6 to 7 s, against 5.3 to 5.9 s for QEMU (#169). An x86 TCG boot is about 20% faster too. arm virt has QEMU's generic PCIe host bridge at QEMU 11.1's addresses, with all six `highmem*` properties, `-device virtio-{blk,rng,serial}-pci` and `-drive if=virtio` (#171). The guest sees the same config space as under QEMU for every function. The ITS, the PL061 and virtio-net-pci on arm are not in yet.
+
 ## 0.4.3
 
 This patch finishes device state for migration and fills in more of the riscv virt board.
