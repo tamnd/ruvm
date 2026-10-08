@@ -391,7 +391,7 @@ isa_exts! {
     Internal shvsatpa V1_12 has_priv_1_12 true;
     Internal shvstvala V1_12 has_priv_1_12 true;
     Internal shvstvecd V1_12 has_priv_1_12 true;
-    User smaia V1_12 ext_smaia false;
+    User smaia V1_12 ext_smaia true;
     User smcdeleg V1_13 ext_smcdeleg true;
     User smcntrpmf V1_12 ext_smcntrpmf true;
     User smcsrind V1_13 ext_smcsrind true;
@@ -403,7 +403,7 @@ isa_exts! {
     User smmpm V1_13 ext_smmpm true;
     User smnpm V1_13 ext_smnpm true;
     User smstateen V1_12 ext_smstateen true;
-    User ssaia V1_12 ext_ssaia false;
+    User ssaia V1_12 ext_ssaia true;
     User ssccfg V1_13 ext_ssccfg true;
     Internal ssccptr V1_11 has_priv_1_11 true;
     User sscofpmf V1_12 ext_sscofpmf true;

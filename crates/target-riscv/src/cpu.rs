@@ -288,6 +288,27 @@ riscv_state! {
         pub siselect: u64,
         /// `vsiselect`.
         pub vsiselect: u64,
+        /// `mvien`, the interrupts M mode injects into S mode with Smaia.
+        pub mvien: u64,
+        /// `mvip`, the pending bits of the injected interrupts in `mvien`.
+        pub mvip: u64,
+        /// `hvien`, the interrupts HS mode injects into VS mode with Ssaia.
+        pub hvien: u64,
+        /// `hvictl`.
+        pub hvictl: u64,
+        /// `hvip`, the pending bits of the injected interrupts in `hvien`.
+        pub hvip: u64,
+        /// `sie`, the S enables of the interrupts injected through `mvien`.
+        pub sie: u64,
+        /// `vsie`, the VS enables of the interrupts injected through `hvien`.
+        pub vsie: u64,
+        /// `miprio`: the M priority of each local interrupt, one byte each, packed eight
+        /// to a word with interrupt 0 in the low byte of word 0.
+        pub miprio: [u64; 8],
+        /// `siprio`: the S priorities, packed the same way.
+        pub siprio: [u64; 8],
+        /// `hviprio`: the VS priorities `hviprio1` and `hviprio2` set, packed the same way.
+        pub hviprio: [u64; 8],
     }
 }
 
@@ -596,6 +617,109 @@ pub const M_MODE_INTERRUPTS: u64 = MIP_MSIP | MIP_MTIP | MIP_MEIP;
 /// The hypervisor interrupts, `HS_MODE_INTERRUPTS`.
 pub const HS_MODE_INTERRUPTS: u64 = MIP_SGEIP | VS_MODE_INTERRUPTS;
 
+/// `IRQ_LOCAL_MAX`: interrupt numbers from here up are guest external interrupts on
+/// `set_irq`, `IRQ_LOCAL_MAX + i - 1` raising bit `i` of `hgeip`.
+pub const IRQ_LOCAL_MAX: u32 = 64;
+/// `IRQ_LOCAL_GUEST_MAX`: the most guest external interrupts a hart can have, `GEILEN`.
+pub const IRQ_LOCAL_GUEST_MAX: u32 = 63;
+
+// Interrupt priorities, from the AIA.
+
+/// `IPRIO_MMAXIPRIO`: the lowest priority.
+pub const IPRIO_MMAXIPRIO: u8 = 255;
+/// `IPRIO_DEFAULT_UPPER`.
+pub const IPRIO_DEFAULT_UPPER: u8 = 4;
+/// `IPRIO_DEFAULT_M`: the default priority of the machine external interrupt.
+pub const IPRIO_DEFAULT_M: u8 = IPRIO_DEFAULT_UPPER + 12;
+/// `IPRIO_DEFAULT_S`: the default priority of the supervisor external interrupt.
+pub const IPRIO_DEFAULT_S: u8 = IPRIO_DEFAULT_M + 3;
+/// `IPRIO_DEFAULT_SGEXT`.
+pub const IPRIO_DEFAULT_SGEXT: u8 = IPRIO_DEFAULT_S + 3;
+/// `IPRIO_DEFAULT_VS`.
+pub const IPRIO_DEFAULT_VS: u8 = IPRIO_DEFAULT_SGEXT + 1;
+/// `IPRIO_DEFAULT_LOWER`.
+pub const IPRIO_DEFAULT_LOWER: u8 = IPRIO_DEFAULT_VS + 3;
+
+/// `default_iprio`: the default priority of each local interrupt, with 0 for the ones that
+/// have none and so take the lowest.
+const DEFAULT_IPRIO: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut i = 24;
+    while i < 32 {
+        t[i] = IPRIO_MMAXIPRIO;
+        i += 1;
+    }
+    let mut i = 48;
+    while i < 64 {
+        t[i] = IPRIO_MMAXIPRIO;
+        i += 1;
+    }
+    let upper = [47, 23, 46, 45, 22, 44, 43, 21, 42, 41, 20, 40];
+    let mut i = 0;
+    while i < upper.len() {
+        t[upper[i]] = IPRIO_DEFAULT_UPPER + i as u8;
+        i += 1;
+    }
+    t[11] = IPRIO_DEFAULT_M;
+    t[3] = IPRIO_DEFAULT_M + 1;
+    t[7] = IPRIO_DEFAULT_M + 2;
+    t[9] = IPRIO_DEFAULT_S;
+    t[1] = IPRIO_DEFAULT_S + 1;
+    t[5] = IPRIO_DEFAULT_S + 2;
+    t[12] = IPRIO_DEFAULT_SGEXT;
+    t[10] = IPRIO_DEFAULT_VS;
+    t[2] = IPRIO_DEFAULT_VS + 1;
+    t[6] = IPRIO_DEFAULT_VS + 2;
+    let lower = [39, 19, 38, 37, 18, 36, 35, 17, 34, 33, 16, 32];
+    let mut i = 0;
+    while i < lower.len() {
+        t[lower[i]] = IPRIO_DEFAULT_LOWER + i as u8;
+        i += 1;
+    }
+    t
+};
+
+/// `riscv_cpu_default_priority`: the default priority of local interrupt `irq`.
+pub fn default_priority(irq: u32) -> u8 {
+    match DEFAULT_IPRIO.get(irq as usize) {
+        Some(&p) if p != 0 => p,
+        _ => IPRIO_MMAXIPRIO,
+    }
+}
+
+/// `hviprio_index2irq` and `hviprio_index2rdzero`: the interrupt each byte of `hviprio1`
+/// and `hviprio2` holds the priority of, and whether that byte reads as zero.
+pub const HVIPRIO_INDEX2IRQ: [(u32, bool); 16] = [
+    (0, true),
+    (1, false),
+    (4, true),
+    (5, false),
+    (8, true),
+    (13, false),
+    (14, false),
+    (15, false),
+    (16, false),
+    (17, false),
+    (18, false),
+    (19, false),
+    (20, false),
+    (21, false),
+    (22, false),
+    (23, false),
+];
+
+/// The priority byte of interrupt `irq` in a packed `miprio`, `siprio` or `hviprio`.
+pub fn iprio(prios: &[u64; 8], irq: u32) -> u8 {
+    (prios[(irq / 8) as usize] >> ((irq % 8) * 8)) as u8
+}
+
+/// Set the priority byte of interrupt `irq` in a packed priority array.
+pub fn set_iprio(prios: &mut [u64; 8], irq: u32, prio: u8) {
+    let word = &mut prios[(irq / 8) as usize];
+    let shift = (irq % 8) * 8;
+    *word = (*word & !(0xff << shift)) | (u64::from(prio) << shift);
+}
+
 // Exceptions, `RISCV_EXCP_*`.
 
 /// Instruction address misaligned.
@@ -805,6 +929,22 @@ impl CpuRiscvState {
             s.mstatus_hs = (2 << 34) | (2 << 32);
             // Bits 10, 6, 2 and 12 of mideleg are read only 1 with the H extension.
             s.mideleg |= HS_MODE_INTERRUPTS;
+        }
+        // The interrupt priorities start at their defaults, with the external interrupt of
+        // each level at 0, and the VS priorities `hviprio1` and `hviprio2` hold start as
+        // the M ones.
+        for i in 0..64 {
+            let prio = default_priority(i);
+            let m = if i == IRQ_M_EXT { 0 } else { prio };
+            let s_prio = if i == IRQ_S_EXT { 0 } else { prio };
+            set_iprio(&mut s.miprio, i, m);
+            set_iprio(&mut s.siprio, i, s_prio);
+        }
+        for (irq, rdzero) in HVIPRIO_INDEX2IRQ {
+            if !rdzero {
+                let m = iprio(&s.miprio, irq);
+                set_iprio(&mut s.hviprio, irq, m);
+            }
         }
         s
     }

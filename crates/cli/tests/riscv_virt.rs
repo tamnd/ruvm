@@ -183,6 +183,66 @@ const RESET_VECTOR_PROBE: &[u32] = &[
     0x0000_006f, // j      .
 ];
 
+/// With `aia=aplic-imsic,aia-guests=1`: makes identity 3 pending in the M level IMSIC file
+/// of hart 0 and identity 5 in guest file 1 of its S level IMSIC with stores, after turning
+/// on delivery and the identities through `miselect`/`mireg` and, with `hstatus.VGEIN` at 1,
+/// `vsiselect`/`vsireg`. Exits through the SiFive test device with 1 if `hgeip` is 2, plus
+/// 2 if `mip.VSEIP` is set, 4 if `vstopei` gives identity 5 and 8 if `mtopei` gives
+/// identity 3. QEMU 11.1 exits with 15.
+const AIA_IMSIC_PROBE: &[u32] = &[
+    0x0000_0793, // li a5, 0
+    0x0700_0293, // li t0, 0x70
+    0x3502_9073, // csrw miselect, t0
+    0x0010_0293, // li t0, 1
+    0x3512_9073, // csrw mireg, t0 (eidelivery)
+    0x0c00_0293, // li t0, 0xc0
+    0x3502_9073, // csrw miselect, t0
+    0x0080_0293, // li t0, 8
+    0x3512_9073, // csrw mireg, t0 (eie0: identity 3)
+    0x2400_02b7, // lui t0, 0x24000
+    0x0030_0313, // li t1, 3
+    0x0062_a023, // sw t1, 0(t0)
+    0x35c0_23f3, // csrr t2, mtopei
+    0x0003_0e37, // lui t3, 0x30
+    0x003e_0e1b, // addiw t3, t3, 3
+    0x01c3_9463, // bne t2, t3, 1f
+    0x0087_e793, // ori a5, a5, 8
+    0x0000_12b7, // 1: lui t0, 0x1
+    0x6002_a073, // csrs hstatus, t0 (VGEIN = 1)
+    0x0700_0293, // li t0, 0x70
+    0x2502_9073, // csrw vsiselect, t0
+    0x0010_0293, // li t0, 1
+    0x2512_9073, // csrw vsireg, t0 (eidelivery)
+    0x0c00_0293, // li t0, 0xc0
+    0x2502_9073, // csrw vsiselect, t0
+    0x0200_0293, // li t0, 0x20
+    0x2512_9073, // csrw vsireg, t0 (eie0: identity 5)
+    0x2800_12b7, // lui t0, 0x28001
+    0x0050_0313, // li t1, 5
+    0x0062_a023, // sw t1, 0(t0)
+    0xe120_23f3, // csrr t2, hgeip
+    0x0020_0e13, // li t3, 2
+    0x01c3_9463, // bne t2, t3, 2f
+    0x0017_e793, // ori a5, a5, 1
+    0x3440_23f3, // 2: csrr t2, mip
+    0x00a3_d393, // srli t2, t2, 10
+    0x0013_f393, // andi t2, t2, 1
+    0x0013_9393, // slli t2, t2, 1
+    0x0077_e7b3, // or a5, a5, t2
+    0x25c0_23f3, // csrr t2, vstopei
+    0x0005_0e37, // lui t3, 0x50
+    0x005e_0e1b, // addiw t3, t3, 5
+    0x01c3_9463, // bne t2, t3, 3f
+    0x0047_e793, // ori a5, a5, 4
+    0x0010_02b7, // 3: lui t0, 0x100
+    0x0107_9793, // slli a5, a5, 16
+    0x0000_3337, // lui t1, 0x3
+    0x3333_031b, // addiw t1, t1, 0x333
+    0x00f3_6333, // or t1, t1, a5
+    0x0062_a023, // sw t1, 0(t0)
+    0x0000_006f, // j .
+];
+
 fn run_guest(tag: &str, code: &[u32], extra: &[&str]) -> (i32, String, String) {
     let dir = TempDir::new(tag);
     let elf = dir.path("guest.elf");
@@ -266,6 +326,13 @@ fn vector_is_on_with_v_true() {
     assert_eq!(code, 113, "{err}");
 }
 
+#[test]
+fn aia_imsic_files_reach_the_hart() {
+    let (code, _, err) =
+        run_guest("aia", AIA_IMSIC_PROBE, &["-M", "virt,aia=aplic-imsic,aia-guests=1"]);
+    assert_eq!(code, 15, "{err}");
+}
+
 /// Boots Linux on `-M virt -nographic` through the default OpenSBI firmware to a busybox
 /// shell on the 16550 and runs a command there. The kernel (a flat `Image`, such as the
 /// `linux` of Debian's riscv64 netboot installer) and the initramfs come from
@@ -274,7 +341,8 @@ fn vector_is_on_with_v_true() {
 /// (`exec setsid cttyhack sh`), as `scripts/arm64-linux-test-image.py` makes for arm64.
 /// Without them the test says so and passes. `RUVM_TEST_FIRMWARE_DIR` is passed as `-L`, for
 /// when `opensbi-riscv64-generic-fw_dynamic.bin` is not in a default data directory.
-/// `RUVM_TEST_RISCV64_SMP` sets `-smp` (2 by default) and `RUVM_TEST_TIMEOUT_SECS` how long
+/// `RUVM_TEST_RISCV64_MACHINE` sets `-M` (`virt` by default, `virt,aia=aplic-imsic` for
+/// instance), `RUVM_TEST_RISCV64_SMP` sets `-smp` (2 by default) and `RUVM_TEST_TIMEOUT_SECS` how long
 /// to wait for the prompt and then for the command.
 #[test]
 #[ignore = "needs a kernel, an initramfs and OpenSBI"]
@@ -286,13 +354,14 @@ fn linux_boots_to_a_shell() {
         eprintln!("skipped: RUVM_TEST_RISCV64_KERNEL and RUVM_TEST_RISCV64_INITRD are not set");
         return;
     };
+    let machine = std::env::var("RUVM_TEST_RISCV64_MACHINE").unwrap_or_else(|_| "virt".into());
     let smp = std::env::var("RUVM_TEST_RISCV64_SMP").unwrap_or_else(|_| "2".to_string());
     let fw = std::env::var("RUVM_TEST_FIRMWARE_DIR").ok();
     let fw_args: Vec<&str> = fw.iter().flat_map(|d| ["-L", d.as_str()]).collect();
     let mut child = Command::new(ruvm())
         .arg("qemu-system-riscv64")
         .args(fw_args)
-        .args(["-M", "virt", "-smp", &smp, "-m", "512", "-nographic"])
+        .args(["-M", &machine, "-smp", &smp, "-m", "512", "-nographic"])
         .args(["-kernel", &kernel, "-initrd", &initrd, "-append", "console=ttyS0"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

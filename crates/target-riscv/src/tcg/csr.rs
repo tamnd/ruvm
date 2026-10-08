@@ -18,17 +18,21 @@
 //! Smstateen; `scountovf` with Sscofpmf; and `mcyclecfg` and `minstretcfg` with Smcntrpmf;
 //! `miselect`, `mireg` to `mireg6`, `siselect`, `sireg` to `sireg6`, `vsiselect` and `vsireg` to
 //! `vsireg6` with Smcsrind and Sscsrind, which reach the counters delegated with Smcdeleg and
-//! Ssccfg; and `scountinhibit` with Ssccfg. Every other CSR raises an illegal instruction
-//! exception, as the extensions behind them (AIA, Smrnmi, Smctr, control flow integrity) are not in
-//! the model, and so do the AIA ranges of the indirect registers. The counters themselves are in
+//! Ssccfg; `scountinhibit` with Ssccfg; `mtopei`, `mtopi`, `mvien`, `mvip` and the AIA ranges of
+//! `miselect` and `mireg` with Smaia; and `stopei`, `stopi`, `hvien`, `hvictl`, `hviprio1`,
+//! `hviprio2`, `vstopei`, `vstopi` and the AIA ranges of `siselect`, `sireg`, `vsiselect` and
+//! `vsireg` with Ssaia, where the registers of the IMSIC come from the board through
+//! [`Hw::aia_ireg_rmw`]. Every other CSR raises an illegal instruction exception, as the
+//! extensions behind them (Smrnmi, Smctr, control flow integrity) are not in the model. The
+//! counters themselves are in
 //! [`super::pmu`]. The PMM fields of `menvcfg`, `senvcfg`, `henvcfg`, `hstatus` and `mseccfg` take
 //! the pointer masking modes of Smnpm, Ssnpm and Smmpm, which [`super::pm`] applies.
 //!
 //! In VS and VU mode the S mode CSRs reach the VS registers, which the trap and return
 //! paths swap into the S mode slots (`riscv_cpu_swap_hypervisor_regs()`), while `sie`,
-//! `sip` and `stimecmp` redirect to `vsie`, `vsip` and `vstimecmp` like QEMU's. GEILEN is
-//! 0, so `hgeie` and `hgeip` read as zero, and without AIA `hvien` is zero, so `hvip`
-//! only holds the VS level bits of `mip`.
+//! `sip` and `stimecmp` redirect to `vsie`, `vsip` and `vstimecmp` like QEMU's. `hgeip`
+//! shows the guest external interrupt lines of the board, of which there are GEILEN, the
+//! number of guest interrupt files of the hart's S level IMSIC.
 //!
 //! Differences from QEMU:
 //!
@@ -45,11 +49,16 @@
 //!   QEMU 11.1 hits an assertion.
 //! - Triggers hold their values but never fire, and an instruction count trigger does
 //!   not count.
+//! - QEMU updates the interrupt request when `mvip` or `hvip` changes. This port does so
+//!   after any CSR access that changes whether an interrupt `mvien` or `hvien` injects is
+//!   pending and enabled, for either value of V, which also covers writes to `sie`,
+//!   `vsie`, `mvien` and `hvien`. A request that turns out to have nothing to take is
+//!   dropped, as for a pending interrupt that `mie` masks.
 
 use ruvm_jit::{Cpu, CpuShared, cputlb};
 
 use super::pm::PMM_FIELD_RESERVED;
-use super::{CpuLines, Riscv, SstcTimer, pmp, pmu};
+use super::{CpuLines, Riscv, SstcTimer, mirq_pending, pmp, pmu, sirq_pending, vsirq_pending};
 use crate::cfg::PrivVer;
 use crate::cpu::{
     COUNTEREN_CY, COUNTEREN_IR, COUNTEREN_TM, CpuRiscvState, EXCP_BREAKPOINT, EXCP_ILLEGAL_INST,
@@ -60,14 +69,18 @@ use crate::cpu::{
     EXCP_VIRT_INSTRUCTION_FAULT, EXCP_VS_ECALL, FFLAGS_MASK, HS_MODE_INTERRUPTS, HSTATUS_HUKTE,
     HSTATUS_HUPMM, HSTATUS_VSBE, HSTATUS_VSXL, HSTATUS_VTVM, M_MODE_INTERRUPTS, MENVCFG_ADUE,
     MENVCFG_CBCFE, MENVCFG_CBIE, MENVCFG_CBZE, MENVCFG_CDE, MENVCFG_DTE, MENVCFG_FIOM,
-    MENVCFG_PBMTE, MENVCFG_STCE, MIP_LCOFIP, MIP_SEIP, MIP_SGEIP, MIP_SSIP, MIP_STIP, MIP_VSEIP,
-    MIP_VSSIP, MIP_VSTIP, MSTATUS_FS, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV,
-    MSTATUS_MXR, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_SUM, MSTATUS_TSR, MSTATUS_TVM,
-    MSTATUS_TW, MSTATUS64_UXL, NUM_TRIGGERS, PRV_M, PRV_S, PRV_U, RVF, RVS, RVU, S_MODE_INTERRUPTS,
+    MENVCFG_PBMTE, MENVCFG_STCE, MIP_LCOFIP, MIP_SEIP, MIP_SSIP, MIP_STIP, MIP_VSEIP, MIP_VSSIP,
+    MIP_VSTIP, MSTATUS_FS, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV, MSTATUS_MXR,
+    MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_SUM, MSTATUS_TSR, MSTATUS_TVM, MSTATUS_TW,
+    MSTATUS64_UXL, NUM_TRIGGERS, PRV_M, PRV_S, PRV_U, RVF, RVS, RVU, S_MODE_INTERRUPTS,
     SATP64_ASID, SATP64_MODE, SATP64_PPN, SSTATUS_MASK, VS_MODE_INTERRUPTS, VSSTATUS64_UXL,
     add_status_sd, get_field, set_field,
 };
-use crate::cpu::{MENVCFG_PMM, MSTATUS_VS, RiscvCfg};
+use crate::cpu::{
+    HSTATUS_VGEIN, HVIPRIO_INDEX2IRQ, IPRIO_DEFAULT_M, IPRIO_DEFAULT_S, IPRIO_MMAXIPRIO,
+    IRQ_LOCAL_MAX, IRQ_M_EXT, IRQ_S_EXT, MENVCFG_PMM, MSTATUS_VS, RiscvCfg, default_priority,
+    iprio, set_iprio,
+};
 
 /// `ISELECT_*`: the `xiselect` values of Smcdeleg's counters, and the bits `xiselect`
 /// holds with Smcsrind or Sscsrind, or with AIA alone.
@@ -79,6 +92,84 @@ const ISELECT_IMSIC_FIRST: u64 = 0x70;
 const ISELECT_IMSIC_LAST: u64 = 0xff;
 const ISELECT_MASK_AIA: u64 = 0x1ff;
 const ISELECT_MASK_SXCSRIND: u64 = 0xfff;
+/// `ISELECT_IMSIC_TOPEI`: the `ireg` select of the IMSIC's `xtopei`.
+const ISELECT_IMSIC_TOPEI: u64 = ISELECT_MASK_AIA + 1;
+
+/// The `IID` field of `xtopi`, `TOPI_IID_MASK << TOPI_IID_SHIFT`.
+const TOPI_IID_SHIFT: u32 = 16;
+/// `TOPI_IID_MASK`.
+const TOPI_IID_MASK: u32 = 0xfff;
+/// `IMSIC_TOPEI_IPRIO_MASK`: the priority of the IMSIC's `topei`.
+const IMSIC_TOPEI_IPRIO_MASK: u64 = 0x7ff;
+
+// The `hvictl` fields.
+/// `HVICTL_VTI`: `sip` and `sie` raise a virtual instruction exception in VS mode.
+const HVICTL_VTI: u64 = 0x4000_0000;
+/// `HVICTL_IID`.
+const HVICTL_IID: u64 = 0x0fff_0000;
+/// `HVICTL_IPRIOM`.
+const HVICTL_IPRIOM: u64 = 0x100;
+/// `HVICTL_IPRIO`.
+const HVICTL_IPRIO: u64 = 0xff;
+/// `HVICTL_VALID_MASK`.
+const HVICTL_VALID_MASK: u64 = HVICTL_VTI | HVICTL_IID | HVICTL_IPRIOM | HVICTL_IPRIO;
+
+/// `AIA_MAKE_IREG()`: the register number the IMSIC callback takes, for `isel` of the
+/// interrupt file of `priv_lvl`, or of guest `vgein` when `virt`, on RV64.
+fn aia_make_ireg(isel: u64, priv_lvl: u64, virt: bool, vgein: u64) -> u32 {
+    (64 << 24)
+        | (((vgein & 0x3f) as u32) << 20)
+        | (u32::from(virt) << 18)
+        | (((priv_lvl & 3) as u32) << 16)
+        | (isel & 0xffff) as u32
+}
+
+/// The `xtopi` value for interrupt `irq` with priority `prio`, which reads as the lowest
+/// priority if it is 0 and the interrupt comes after the default `def_prio` of the
+/// external interrupt of the level.
+fn topi(irq: u32, prio: u8, def_prio: u8) -> u64 {
+    let prio = if prio == 0 && default_priority(irq) > def_prio { IPRIO_MMAXIPRIO } else { prio };
+    (u64::from(irq & TOPI_IID_MASK) << TOPI_IID_SHIFT) | u64::from(prio)
+}
+
+/// `rmw_iprio()` on RV64: the even `iselect` 0x30 to 0x3e holds the priorities of eight
+/// interrupts, which is one word of the packed `prios`. The priority of the external
+/// interrupt `ext_irq` of the level stays zero.
+fn rmw_iprio(
+    prios: &mut [u64; 8],
+    isel: u64,
+    new: u64,
+    mask: u64,
+    ext_irq: u32,
+) -> Result<u64, ()> {
+    if !(ISELECT_IPRIO0..=ISELECT_IPRIO15).contains(&isel) || isel & 1 != 0 {
+        return Err(());
+    }
+    let word = ((isel - ISELECT_IPRIO0) / 2) as usize;
+    let old = prios[word];
+    if mask != 0 {
+        let mut v = (old & !mask) | (new & mask);
+        let ext = ext_irq as usize;
+        if ext / 8 == word {
+            let shift = (ext % 8) * 8;
+            v = (v & !(0xff << shift)) | (old & (0xff << shift));
+        }
+        prios[word] = v;
+    }
+    Ok(old)
+}
+
+/// `read_hvipriox()`: the bytes of `hviprio1` or `hviprio2` from `first`, those that
+/// read as zero left clear.
+fn read_hviprio(prios: &[u64; 8], first: usize) -> u64 {
+    let mut v = 0;
+    for (i, &(irq, rdzero)) in HVIPRIO_INDEX2IRQ[first..first + 8].iter().enumerate() {
+        if !rdzero {
+            v |= u64::from(iprio(prios, irq)) << (i * 8);
+        }
+    }
+    v
+}
 
 // The CSR numbers, from `cpu_bits.h`.
 const CSR_FFLAGS: u32 = 0x001;
@@ -149,6 +240,18 @@ const CSR_HVIP: u32 = 0x645;
 const CSR_HTINST: u32 = 0x64a;
 const CSR_HGATP: u32 = 0x680;
 const CSR_HGEIP: u32 = 0xe12;
+const CSR_MTOPEI: u32 = 0x35c;
+const CSR_MTOPI: u32 = 0xfb0;
+const CSR_MVIEN: u32 = 0x308;
+const CSR_MVIP: u32 = 0x309;
+const CSR_STOPEI: u32 = 0x15c;
+const CSR_STOPI: u32 = 0xdb0;
+const CSR_HVIEN: u32 = 0x608;
+const CSR_HVICTL: u32 = 0x609;
+const CSR_HVIPRIO1: u32 = 0x646;
+const CSR_HVIPRIO2: u32 = 0x647;
+const CSR_VSTOPEI: u32 = 0x25c;
+const CSR_VSTOPI: u32 = 0xeb0;
 const CSR_MSTATUS: u32 = 0x300;
 const CSR_MISA: u32 = 0x301;
 const CSR_MEDELEG: u32 = 0x302;
@@ -223,6 +326,10 @@ const DELEGABLE_INTS: u64 = S_MODE_INTERRUPTS | VS_MODE_INTERRUPTS | MIP_LCOFIP;
 const VS_DELEGABLE_INTS: u64 = (VS_MODE_INTERRUPTS | LOCAL_INTERRUPTS) & !MIP_LCOFIP;
 /// `all_ints`.
 const ALL_INTS: u64 = M_MODE_INTERRUPTS | S_MODE_INTERRUPTS | HS_MODE_INTERRUPTS | LOCAL_INTERRUPTS;
+/// `mvien_writable_mask`.
+const MVIEN_WRITABLE_MASK: u64 = MIP_SSIP | MIP_SEIP | LOCAL_INTERRUPTS;
+/// `hvien_writable_mask`.
+const HVIEN_WRITABLE_MASK: u64 = LOCAL_INTERRUPTS;
 /// `mvip_writable_mask`.
 const MVIP_WRITABLE_MASK: u64 = MIP_SSIP | MIP_STIP | MIP_SEIP | LOCAL_INTERRUPTS;
 /// `sip_writable_mask`.
@@ -349,6 +456,19 @@ trait Hw {
     fn pmu_timer(&self, delay_ns: u64);
     /// The configuration of the CPU.
     fn cfg(&self) -> &RiscvCfg;
+    /// A copy of the interrupt lines, read without touching the interrupt request.
+    fn lines(&self) -> CpuLines;
+    /// `GEILEN`, the number of guest external interrupts.
+    fn geilen(&self) -> u32;
+    /// `env->aia_ireg_rmw_fn[priv_lvl]`: the IMSIC register access, `None` without an
+    /// IMSIC at that level.
+    fn aia_ireg_rmw(
+        &self,
+        priv_lvl: u64,
+        reg: u32,
+        new: u64,
+        wr_mask: u64,
+    ) -> Option<Result<u64, ()>>;
 }
 
 /// The [`Hw`] of a vCPU.
@@ -384,6 +504,25 @@ impl Hw for CpuHw<'_> {
 
     fn cfg(&self) -> &RiscvCfg {
         self.rv.cfg()
+    }
+
+    fn lines(&self) -> CpuLines {
+        let (g, i) = self.rv.lines(self.shared.cpu_index);
+        g[i]
+    }
+
+    fn geilen(&self) -> u32 {
+        self.rv.geilen()
+    }
+
+    fn aia_ireg_rmw(
+        &self,
+        priv_lvl: u64,
+        reg: u32,
+        new: u64,
+        wr_mask: u64,
+    ) -> Option<Result<u64, ()>> {
+        self.rv.aia_ireg_rmw(self.shared, priv_lvl, reg, new, wr_mask)
     }
 }
 
@@ -495,7 +634,7 @@ fn vs_bits_up(v: u64) -> u64 {
 
 /// Move the VS level interrupt bits of an `mie` or `mip` value down to their S level
 /// positions in `vsie` or `vsip`.
-fn vs_bits_down(v: u64) -> u64 {
+pub(super) fn vs_bits_down(v: u64) -> u64 {
     let vsbits = v & VS_MODE_INTERRUPTS;
     (v & !VS_MODE_INTERRUPTS) | (vsbits >> 1)
 }
@@ -551,18 +690,45 @@ fn tdata_mapped(ttype: u64, index: usize) -> bool {
 }
 
 impl Csrs<'_> {
-    /// `riscv_csrrw_check()` then `riscv_csrrw_do64()`.
+    /// `riscv_csrrw_check()` then `riscv_csrrw_do64()`. A change of the injected
+    /// interrupts of `mvip` and `hvip` or of their enables updates the interrupt request,
+    /// as `riscv_cpu_interrupt()` does.
     fn rw(&mut self, csrno: u32, write: bool, new: u64, mask: u64) -> Result<u64, i32> {
         self.check(csrno, write)?;
+        let irqf = self.irqf();
+        let r = self.rw_do(csrno, new, mask);
+        let now = self.irqf();
+        if now != irqf {
+            self.hw.with_lines(&mut |l| {
+                l.irqf = now;
+                0
+            });
+        }
+        r
+    }
+
+    /// Whether an interrupt injected through `mvien` and `mvip`, or `hvien` and `hvip`, is
+    /// pending and enabled, the `irqf` of `riscv_cpu_interrupt()` for either value of V.
+    fn irqf(&self) -> bool {
+        let st = &self.st;
+        (st.mvien & st.mvip & st.sie) | (st.hvien & st.hvip & st.vsie) != 0
+    }
+
+    /// `riscv_csrrw_do64()`.
+    fn rw_do(&mut self, csrno: u32, new: u64, mask: u64) -> Result<u64, i32> {
         match csrno {
             // The CSRs with a combined read-modify-write operation.
             CSR_MIDELEG => return Ok(self.rmw_mideleg(new, mask)),
             CSR_MIE => return Ok(self.rmw_mie(new, mask)),
             CSR_MIP => return Ok(self.rmw_mip(new, mask)),
-            CSR_SIE => return Ok(self.rmw_sie(new, mask)),
-            CSR_SIP => return Ok(self.rmw_sip(new, mask)),
+            CSR_MVIEN => return Ok(self.rmw_mvien(new, mask)),
+            CSR_MVIP => return Ok(self.rmw_mvip(CSR_MVIP, new, mask)),
+            CSR_SIE => return self.rmw_sie(new, mask),
+            CSR_SIP => return self.rmw_sip(new, mask),
             CSR_HIDELEG => return Ok(self.rmw_hideleg(new, mask)),
+            CSR_HVIEN => return Ok(self.rmw_hvien(new, mask)),
             CSR_HVIP => return Ok(self.rmw_hvip(CSR_HVIP, new, mask)),
+            CSR_MTOPEI | CSR_STOPEI | CSR_VSTOPEI => return self.rmw_xtopei(csrno, new, mask),
             CSR_HIP => {
                 let old = self.rmw_mip64(CSR_HIP, new, mask & HIP_WRITABLE_MASK);
                 return Ok(old & HS_MODE_INTERRUPTS);
@@ -708,6 +874,26 @@ impl Csrs<'_> {
                     return Err(EXCP_VIRT_INSTRUCTION_FAULT);
                 }
                 smode
+            }
+            // aia_any().
+            CSR_MTOPEI | CSR_MTOPI | CSR_MVIEN | CSR_MVIP => cfg.ext_smaia,
+            // aia_smode(): stopei is guarded by the IMSIC bit of the stateen registers.
+            CSR_STOPEI | CSR_STOPI => {
+                if !cfg.ext_ssaia {
+                    return Err(EXCP_ILLEGAL_INST);
+                }
+                let bit = if csrno == CSR_STOPEI { SMSTATEEN0_IMSIC } else { SMSTATEEN0_AIA };
+                self.stateen_ok(0, bit)?;
+                smode
+            }
+            // aia_hmode().
+            CSR_HVIEN | CSR_HVICTL | CSR_HVIPRIO1 | CSR_HVIPRIO2 | CSR_VSTOPEI | CSR_VSTOPI => {
+                if !cfg.ext_ssaia {
+                    return Err(EXCP_ILLEGAL_INST);
+                }
+                let bit = if csrno == CSR_VSTOPEI { SMSTATEEN0_IMSIC } else { SMSTATEEN0_AIA };
+                self.stateen_ok(0, bit)?;
+                self.st.has_h()
             }
             // csrind_or_aia_any(), csrind_or_aia_smode() and csrind_or_aia_hmode().
             CSR_MISELECT | CSR_MIREG => cfg.ext_smaia || cfg.ext_smcsrind,
@@ -944,6 +1130,13 @@ impl Csrs<'_> {
             }
             CSR_HCOUNTEREN => st.hcounteren,
             CSR_HGEIE => st.hgeie,
+            CSR_HVICTL => st.hvictl,
+            CSR_HVIPRIO1 => read_hviprio(&st.hviprio, 0),
+            CSR_HVIPRIO2 => read_hviprio(&st.hviprio, 8),
+            CSR_MTOPI => self.read_mtopi(),
+            CSR_STOPI if st.virt() => self.read_vstopi(),
+            CSR_STOPI => self.read_stopi(),
+            CSR_VSTOPI => self.read_vstopi(),
             CSR_HENVCFG => {
                 self.stateen_ok(0, SMSTATEEN0_HSENVCFG)?;
                 st.henvcfg & (!HENVCFG_FOLLOWS_M | st.menvcfg)
@@ -951,8 +1144,7 @@ impl Csrs<'_> {
             CSR_HTVAL => st.htval,
             CSR_HTINST => st.htinst,
             CSR_HGATP => st.hgatp,
-            // GEILEN is 0: no guest external interrupt is ever pending.
-            CSR_HGEIP => 0,
+            CSR_HGEIP => self.hw.lines().hgeip,
             CSR_VSSTATUS => st.vsstatus,
             CSR_VSTVEC => st.vstvec,
             CSR_VSSCRATCH => st.vsscratch,
@@ -1097,7 +1289,17 @@ impl Csrs<'_> {
                 if !self.hw.cfg().ext_ssnpm || get_field(val, HSTATUS_HUPMM) == PMM_FIELD_RESERVED {
                     mask &= !HSTATUS_HUPMM;
                 }
+                let old_vgein = get_field(self.st.hstatus, HSTATUS_VGEIN);
                 self.st.hstatus = (self.st.hstatus & !mask) | (val & mask);
+                // The lines keep VGEIN, which picks the guest external interrupt that
+                // shows as VSEIP.
+                let vgein = get_field(self.st.hstatus, HSTATUS_VGEIN);
+                if vgein != old_vgein {
+                    self.hw.with_lines(&mut |l| {
+                        l.vgein = vgein as u32;
+                        0
+                    });
+                }
                 // QEMU logs "QEMU does not support mixed HSXLEN options." for a VSXL other
                 // than 2 and "QEMU does not support big endian guests." for VSBE set.
             }
@@ -1109,14 +1311,18 @@ impl Csrs<'_> {
             }
             CSR_HCOUNTEREN => self.st.hcounteren = val & self.counteren_mask(),
             CSR_HGEIE => {
-                // Only bits 1 to GEILEN exist, and GEILEN is 0; mip.SGEIP follows
-                // hgeie & hgeip, which is 0.
-                self.st.hgeie = 0;
+                // Only bits 1 to GEILEN exist, and mip.SGEIP follows hgeie & hgeip.
+                let v = val & (((1u64 << self.hw.geilen()) - 1) << 1);
+                self.st.hgeie = v;
                 self.hw.with_lines(&mut |l| {
-                    l.mip &= !MIP_SGEIP;
+                    l.hgeie = v;
+                    l.update_sgeip();
                     0
                 });
             }
+            CSR_HVICTL => self.st.hvictl = val & HVICTL_VALID_MASK,
+            CSR_HVIPRIO1 => self.write_hviprio(0, val),
+            CSR_HVIPRIO2 => self.write_hviprio(8, val),
             CSR_HENVCFG => {
                 self.stateen_ok(0, SMSTATEEN0_HSENVCFG)?;
                 self.write_henvcfg(val);
@@ -1382,15 +1588,183 @@ impl Csrs<'_> {
         };
         let aia = (ISELECT_IPRIO0..=ISELECT_IPRIO15).contains(&isel)
             || (ISELECT_IMSIC_FIRST..=ISELECT_IMSIC_LAST).contains(&isel);
-        let cfg = self.hw.cfg();
         if aia {
-            // rmw_xireg_aia() without Smaia and Ssaia.
-            return Err(EXCP_ILLEGAL_INST);
+            return self.rmw_xireg_aia(csrno, isel, new, mask);
         }
+        let cfg = self.hw.cfg();
         if cfg.ext_smcsrind || cfg.ext_sscsrind {
             return self.rmw_xireg_csrind(csrno, isel, new, mask);
         }
         Err(EXCP_ILLEGAL_INST)
+    }
+
+    /// `rmw_xireg_aia()`: the priorities of the local interrupts and the registers of the
+    /// IMSIC behind `mireg`, `sireg` and `vsireg` (already translated for VS mode).
+    fn rmw_xireg_aia(&mut self, csrno: u32, isel: u64, new: u64, mask: u64) -> Result<u64, i32> {
+        let cfg = self.hw.cfg();
+        let (priv_lvl, virt) = match csrno {
+            CSR_MIREG if cfg.ext_smaia => (PRV_M, false),
+            CSR_SIREG
+                if cfg.ext_ssaia
+                    && !(self.st.priv_lvl == PRV_S
+                        && self.st.mvien & MIP_SEIP != 0
+                        && (ISELECT_IMSIC_FIRST..=ISELECT_IMSIC_LAST)
+                            .contains(&self.st.siselect)) =>
+            {
+                (PRV_S, false)
+            }
+            CSR_VSIREG if cfg.ext_ssaia => (PRV_S, true),
+            _ => return Err(EXCP_ILLEGAL_INST),
+        };
+        let vgein = if virt { get_field(self.st.hstatus, HSTATUS_VGEIN) } else { 0 };
+        let mut reserved = false;
+        let r = if (ISELECT_IPRIO0..=ISELECT_IPRIO15).contains(&isel) {
+            // The priorities of the local interrupts are not there for VS mode.
+            if virt {
+                Err(())
+            } else if csrno == CSR_MIREG {
+                rmw_iprio(&mut self.st.miprio, isel, new, mask, IRQ_M_EXT)
+            } else {
+                rmw_iprio(&mut self.st.siprio, isel, new, mask, IRQ_S_EXT)
+            }
+        } else if (ISELECT_IMSIC_FIRST..=ISELECT_IMSIC_LAST).contains(&isel) {
+            if virt && (vgein == 0 || u64::from(self.hw.geilen()) < vgein) {
+                Err(())
+            } else {
+                let reg = aia_make_ireg(isel, priv_lvl, virt, vgein);
+                self.hw.aia_ireg_rmw(priv_lvl, reg, new, mask).unwrap_or(Err(()))
+            }
+        } else {
+            reserved = true;
+            Err(())
+        };
+        r.map_err(|()| {
+            if self.st.virt() && virt && !reserved {
+                EXCP_VIRT_INSTRUCTION_FAULT
+            } else {
+                EXCP_ILLEGAL_INST
+            }
+        })
+    }
+
+    /// `rmw_xtopei()`: `mtopei`, `stopei` and `vstopei` (`stopei` in VS mode), which claim
+    /// the top interrupt of the IMSIC's interrupt file.
+    fn rmw_xtopei(&mut self, csrno: u32, new: u64, mask: u64) -> Result<u64, i32> {
+        let csrno = if self.st.virt() && csrno == CSR_STOPEI { CSR_VSTOPEI } else { csrno };
+        let (priv_lvl, virt) = match csrno {
+            CSR_MTOPEI => (PRV_M, false),
+            CSR_STOPEI if self.st.mvien & MIP_SEIP != 0 && self.st.priv_lvl == PRV_S => {
+                return Err(EXCP_ILLEGAL_INST);
+            }
+            CSR_STOPEI => (PRV_S, false),
+            _ => (PRV_S, true),
+        };
+        let fault =
+            if self.st.virt() && virt { EXCP_VIRT_INSTRUCTION_FAULT } else { EXCP_ILLEGAL_INST };
+        let vgein = if virt { get_field(self.st.hstatus, HSTATUS_VGEIN) } else { 0 };
+        if virt && (vgein == 0 || u64::from(self.hw.geilen()) < vgein) {
+            // QEMU checks for the IMSIC first, with the same exception.
+            return Err(fault);
+        }
+        let reg = aia_make_ireg(ISELECT_IMSIC_TOPEI, priv_lvl, virt, vgein);
+        match self.hw.aia_ireg_rmw(priv_lvl, reg, new, mask) {
+            Some(Ok(v)) => Ok(v),
+            _ => Err(fault),
+        }
+    }
+
+    /// `read_mtopi()`: the top pending M level interrupt and its priority.
+    fn read_mtopi(&self) -> u64 {
+        let all = self.hw.lines().all_pending(self.st.mie);
+        match mirq_pending(self.hw.cfg(), all, &self.st) {
+            Some(irq) if (1..IRQ_LOCAL_MAX).contains(&irq) => {
+                topi(irq, iprio(&self.st.miprio, irq), IPRIO_DEFAULT_M)
+            }
+            _ => 0,
+        }
+    }
+
+    /// `read_stopi()` outside VS mode: the top pending S level interrupt.
+    fn read_stopi(&self) -> u64 {
+        let all = self.hw.lines().all_pending(self.st.mie);
+        match sirq_pending(self.hw.cfg(), all, &self.st) {
+            Some(irq) if (1..IRQ_LOCAL_MAX).contains(&irq) => {
+                topi(irq, iprio(&self.st.siprio, irq), IPRIO_DEFAULT_S)
+            }
+            _ => 0,
+        }
+    }
+
+    /// `read_vstopi()`: the top VS level interrupt out of the guest external interrupt
+    /// `hstatus.VGEIN` picks (with the priority of the guest interrupt file's top
+    /// interrupt), the one `hvictl` injects, and the pending VS level interrupts.
+    fn read_vstopi(&self) -> u64 {
+        let st = &self.st;
+        let lines = self.hw.lines();
+        let gein = get_field(st.hstatus, HSTATUS_VGEIN);
+        let hviid = get_field(st.hvictl, HVICTL_IID) as u32;
+        let hviprio = u32::from(get_field(st.hvictl, HVICTL_IPRIO) as u8);
+        let mut cands: [(u32, u32); 2] = [(0, 0); 2];
+        let mut n = 0;
+        if gein != 0 {
+            let vsgein = if (lines.hgeip >> gein) & 1 != 0 { MIP_VSEIP } else { 0 };
+            let vseip = st.mie & (lines.mip | vsgein) & MIP_VSEIP;
+            if gein <= u64::from(self.hw.geilen()) && vseip != 0 {
+                let mut prio = u32::from(IPRIO_MMAXIPRIO) + 1;
+                let reg = aia_make_ireg(ISELECT_IMSIC_TOPEI, PRV_S, true, gein);
+                if let Some(Ok(topei)) = self.hw.aia_ireg_rmw(PRV_S, reg, 0, 0) {
+                    if topei != 0 {
+                        prio = (topei & IMSIC_TOPEI_IPRIO_MASK) as u32;
+                    }
+                }
+                cands[n] = (IRQ_S_EXT, prio);
+                n += 1;
+            }
+        } else if hviid == IRQ_S_EXT && hviprio != 0 {
+            cands[n] = (IRQ_S_EXT, hviprio);
+            n += 1;
+        }
+        if st.hvictl & HVICTL_VTI != 0 {
+            if hviid != IRQ_S_EXT {
+                cands[n] = (hviid, hviprio);
+                n += 1;
+            }
+        } else {
+            let all = lines.all_pending(st.mie);
+            if let Some(irq) = vsirq_pending(self.hw.cfg(), all, st) {
+                if irq != IRQ_S_EXT && (1..IRQ_LOCAL_MAX).contains(&irq) {
+                    cands[n] = (irq, u32::from(iprio(&st.hviprio, irq)));
+                    n += 1;
+                }
+            }
+        }
+        let mut iid = 0;
+        let mut prio = u32::MAX;
+        for &(i, p) in &cands[..n] {
+            if p < prio {
+                iid = i;
+                prio = p;
+            }
+        }
+        if iid == 0 {
+            return 0;
+        }
+        let prio = if st.hvictl & HVICTL_IPRIOM == 0 {
+            1
+        } else {
+            let p = prio.min(u32::from(IPRIO_MMAXIPRIO)) as u8;
+            if p == 0 && default_priority(iid) > IPRIO_DEFAULT_S { IPRIO_MMAXIPRIO } else { p }
+        };
+        (u64::from(iid & TOPI_IID_MASK) << TOPI_IID_SHIFT) | u64::from(prio)
+    }
+
+    /// `write_hvipriox()`: the bytes of `hviprio1` or `hviprio2` from `first`, of which
+    /// those that read as zero are cleared.
+    fn write_hviprio(&mut self, first: usize, val: u64) {
+        for (i, &(irq, rdzero)) in HVIPRIO_INDEX2IRQ[first..first + 8].iter().enumerate() {
+            let prio = if rdzero { 0 } else { (val >> (i * 8)) as u8 };
+            set_iprio(&mut self.st.hviprio, irq, prio);
+        }
     }
 
     /// `rmw_xiregi()`: the aliases `mireg2` to `mireg6` and the like.
@@ -1505,21 +1879,35 @@ impl Csrs<'_> {
         old
     }
 
-    /// `rmw_sie64()`: `sie` shows the delegated bits of `mie`, or of `vsie` in VS mode.
-    fn rmw_sie(&mut self, new: u64, wr_mask: u64) -> u64 {
+    /// `rmw_sie64()`: `sie` shows the delegated bits of `mie`, and the bits `mvien`
+    /// injects through `mvip` have their own enables; in VS mode `vsie`.
+    fn rmw_sie(&mut self, new: u64, wr_mask: u64) -> Result<u64, i32> {
+        let nalias = (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS) & !self.st.mideleg & self.st.mvien;
         let alias = (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS) & self.st.mideleg;
         if self.st.virt() {
-            return self.rmw_vsie(new, wr_mask) & alias;
+            if self.st.hvictl & HVICTL_VTI != 0 {
+                return Err(EXCP_VIRT_INSTRUCTION_FAULT);
+            }
+            return Ok(self.rmw_vsie(new, wr_mask) & alias);
         }
-        self.rmw_mie(new, wr_mask & alias) & alias
+        let old = (self.rmw_mie(new, wr_mask & alias) & alias) | (self.st.sie & nalias);
+        let m = wr_mask & nalias;
+        self.st.sie = (self.st.sie & !m) | (new & m);
+        Ok(old)
     }
 
     /// `rmw_vsie64()`: the bits of `mie` delegated to VS mode, with the VS level bits at
-    /// their S level positions.
+    /// their S level positions, and the enables of the local interrupts `hvien` injects
+    /// through `hvip`.
     fn rmw_vsie(&mut self, new: u64, wr_mask: u64) -> u64 {
         let alias = (LOCAL_INTERRUPTS | VS_MODE_INTERRUPTS) & self.st.hideleg;
-        let old = self.rmw_mie(vs_bits_up(new), vs_bits_up(wr_mask) & alias);
-        vs_bits_down(old & alias)
+        let nalias = LOCAL_INTERRUPTS & !self.st.hideleg & self.st.hvien;
+        let (new, wr_mask) = (vs_bits_up(new), vs_bits_up(wr_mask));
+        let old = self.rmw_mie(new, wr_mask & alias);
+        let old_vs = self.st.vsie & nalias;
+        let m = wr_mask & nalias;
+        self.st.vsie = (self.st.vsie & !m) | (new & m);
+        vs_bits_down(old & alias) | old_vs
     }
 
     /// `rmw_hideleg64()`.
@@ -1542,11 +1930,16 @@ impl Csrs<'_> {
     }
 
     /// `rmw_mip64()` for `csrno`: the SEIP bit software writes is kept apart from the
-    /// interrupt controller's input, STIP (and VSTIP with `henvcfg.STCE`) belong to Sstc
-    /// when it is on, and the old value shows VSTIP while the VS timer has fired, except
-    /// for `hvip`.
+    /// interrupt controller's input (and is read only with `mvien.SEIP`), STIP (and VSTIP
+    /// with `henvcfg.STCE`) belong to Sstc when it is on, and the old value shows the
+    /// guest external interrupt VGEIN selects as VSEIP and VSTIP while the VS timer has
+    /// fired, except for `hvip`.
     fn rmw_mip64(&mut self, csrno: u32, new: u64, wr_mask: u64) -> u64 {
         let mut m = wr_mask & DELEGABLE_INTS;
+        // With mvien.SEIP set, mip.SEIP only shows the interrupt controller's signal.
+        if self.st.mvien & MIP_SEIP != 0 {
+            m &= !MIP_SEIP;
+        }
         if self.stip_from_sstc() {
             m &= !MIP_STIP;
             if self.st.henvcfg & MENVCFG_STCE != 0 {
@@ -1567,45 +1960,97 @@ impl Csrs<'_> {
             if m != 0 {
                 l.mip = (old & !m) | (new & m);
             }
-            if csrno != CSR_HVIP && l.vstime_irq {
-                old |= MIP_VSTIP;
+            if csrno != CSR_HVIP {
+                old |= l.vsgein();
+                if l.vstime_irq {
+                    old |= MIP_VSTIP;
+                }
             }
             old
         })
     }
 
-    /// `rmw_hvip64()` for `hvip`, or for `vsip` as `csrno`. Without AIA `hvien` is zero,
-    /// so every bit aliases `mip`; for `vsip` only the bits delegated by `hideleg`. Like
-    /// QEMU, reading `hvip` gives all of `mip`.
+    /// `rmw_mvien64()`.
+    fn rmw_mvien(&mut self, new: u64, wr_mask: u64) -> u64 {
+        let m = wr_mask & MVIEN_WRITABLE_MASK;
+        let old = self.st.mvien;
+        self.st.mvien = (old & !m) | (new & m);
+        old
+    }
+
+    /// `rmw_hvien64()`.
+    fn rmw_hvien(&mut self, new: u64, wr_mask: u64) -> u64 {
+        let m = wr_mask & HVIEN_WRITABLE_MASK;
+        let old = self.st.hvien;
+        self.st.hvien = (old & !m) | (new & m);
+        old
+    }
+
+    /// `rmw_mvip64()` for `mvip`, or for `sip` as `csrno`: a bit is an alias of `mip`
+    /// unless it is not delegated and `mvien` injects it, when `mvip` holds it apart.
+    fn rmw_mvip(&mut self, csrno: u32, new: u64, wr_mask: u64) -> u64 {
+        let (mideleg, mvien) = (self.st.mideleg, self.st.mvien);
+        let mut alias = ((S_MODE_INTERRUPTS | LOCAL_INTERRUPTS) & (mideleg | !mvien)) | MIP_STIP;
+        let mut nalias = (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS) & !mideleg & mvien;
+        if csrno == CSR_SIP {
+            // sip reads as zero where both mideleg and mvien are clear.
+            alias &= mideleg | mvien;
+            nalias &= mideleg | mvien;
+        }
+        if self.stip_from_sstc() {
+            alias &= !MIP_STIP;
+        }
+        let old_mip = self.rmw_mip(new, wr_mask & alias & MVIP_WRITABLE_MASK);
+        let old_mvip = self.st.mvip;
+        let m = wr_mask & nalias & MVIP_WRITABLE_MASK;
+        self.st.mvip = (old_mvip & !m) | (new & m);
+        (old_mip & alias) | (old_mvip & nalias)
+    }
+
+    /// `rmw_hvip64()` for `hvip`, or for `vsip` as `csrno`: the VS level bits and the
+    /// delegated local interrupts are aliases of `mip`, and `hvip` holds the local
+    /// interrupts `hvien` injects. Like QEMU, reading `hvip` gives the other bits of
+    /// `mip` too.
     fn rmw_hvip(&mut self, csrno: u32, new: u64, wr_mask: u64) -> u64 {
-        let alias = if csrno == CSR_VSIP { self.st.hideleg } else { !0 };
-        let old = self.rmw_mip64(csrno, new, wr_mask & alias & HVIP_WRITABLE_MASK);
-        old & alias
+        let (hideleg, hvien) = (self.st.hideleg, self.st.hvien);
+        let mut alias = hideleg | !hvien | VS_MODE_INTERRUPTS;
+        let mut nalias = !hideleg & hvien;
+        if csrno == CSR_VSIP {
+            alias &= hideleg | !VS_MODE_INTERRUPTS;
+            nalias &= hideleg | hvien;
+            alias &= hideleg | hvien;
+        }
+        let m = wr_mask & nalias & HVIP_WRITABLE_MASK;
+        let old_mip = self.rmw_mip64(csrno, new, wr_mask & alias & HVIP_WRITABLE_MASK);
+        let old_hvip = self.st.hvip;
+        self.st.hvip = (old_hvip & !m) | (new & m);
+        (old_mip & alias) | (old_hvip & nalias)
     }
 
     /// `rmw_vsip64()`: the bits of `mip` delegated to VS mode, with the VS level bits at
-    /// their S level positions; VSSIP is writable.
+    /// their S level positions, and the local interrupts `hvien` injects; VSSIP and the
+    /// local interrupts are writable.
     fn rmw_vsip(&mut self, new: u64, wr_mask: u64) -> u64 {
-        let mask = self.st.hideleg & VS_MODE_INTERRUPTS;
+        let mask = (self.st.hideleg & VS_MODE_INTERRUPTS) | (self.st.hvien & !self.st.hideleg);
         let wr_mask = vs_bits_up(wr_mask) & mask & VSIP_WRITABLE_MASK;
         let old = self.rmw_hvip(CSR_VSIP, vs_bits_up(new), wr_mask);
         vs_bits_down(old & mask)
     }
 
-    /// `rmw_sip64()` and `rmw_mvip64()` for `sip`: the delegated bits of `mip`, of which
-    /// SSIP and the local interrupts are writable; in VS mode `vsip`.
-    fn rmw_sip(&mut self, new: u64, wr_mask: u64) -> u64 {
-        if self.st.virt() {
-            let old = self.rmw_vsip(new, wr_mask);
-            return old & self.st.mideleg & (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS);
-        }
-        let wr_mask = wr_mask & self.st.mideleg & SIP_WRITABLE_MASK;
-        let mut alias = (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS | MIP_STIP) & self.st.mideleg;
-        if self.stip_from_sstc() {
-            alias &= !MIP_STIP;
-        }
-        let old = self.rmw_mip(new, wr_mask & alias & MVIP_WRITABLE_MASK) & alias;
-        old & self.st.mideleg & (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS)
+    /// `rmw_sip64()`: the bits of `mip` delegated to S mode and the ones `mvien` injects
+    /// through `mvip`, of which SSIP and the local interrupts are writable; in VS mode
+    /// `vsip`.
+    fn rmw_sip(&mut self, new: u64, wr_mask: u64) -> Result<u64, i32> {
+        let shown = self.st.mideleg | self.st.mvien;
+        let old = if self.st.virt() {
+            if self.st.hvictl & HVICTL_VTI != 0 {
+                return Err(EXCP_VIRT_INSTRUCTION_FAULT);
+            }
+            self.rmw_vsip(new, wr_mask)
+        } else {
+            self.rmw_mvip(CSR_SIP, new, wr_mask & shown & SIP_WRITABLE_MASK)
+        };
+        Ok(old & shown & (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS))
     }
 
     /// The type of the selected trigger.
@@ -1654,7 +2099,9 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
-    use crate::cpu::{MIP_MEIP, MIP_MSIP, MIP_MTIP, MSTATUS_UBE, MSTATUS64_SD, VM_SV39, VM_SV48};
+    use crate::cpu::{
+        MIP_MEIP, MIP_MSIP, MIP_MTIP, MIP_SGEIP, MSTATUS_UBE, MSTATUS64_SD, VM_SV39, VM_SV48,
+    };
 
     #[derive(Default)]
     struct FakeHw {
@@ -1668,6 +2115,12 @@ mod tests {
         /// The delay of each `pmu_timer()`.
         pmu_timer: RefCell<Vec<u64>>,
         cfg: RiscvCfg,
+        geilen: u32,
+        /// The levels (bit `PRV_M` or `PRV_S`) with an IMSIC.
+        imsic: u8,
+        /// The `priv_lvl`, `reg`, `new` and `wr_mask` of each `aia_ireg_rmw()`, which
+        /// returns `reg`, or fails for the topei of guest interrupt file 2.
+        ireg: RefCell<Vec<(u64, u32, u64, u64)>>,
     }
 
     impl Hw for FakeHw {
@@ -1698,6 +2151,31 @@ mod tests {
 
         fn cfg(&self) -> &RiscvCfg {
             &self.cfg
+        }
+
+        fn lines(&self) -> CpuLines {
+            *self.lines.borrow()
+        }
+
+        fn geilen(&self) -> u32 {
+            self.geilen
+        }
+
+        fn aia_ireg_rmw(
+            &self,
+            priv_lvl: u64,
+            reg: u32,
+            new: u64,
+            wr_mask: u64,
+        ) -> Option<Result<u64, ()>> {
+            if self.imsic & (1 << priv_lvl) == 0 {
+                return None;
+            }
+            self.ireg.borrow_mut().push((priv_lvl, reg, new, wr_mask));
+            if reg == aia_make_ireg(ISELECT_IMSIC_TOPEI, PRV_S, true, 2) {
+                return Some(Err(()));
+            }
+            Some(Ok(u64::from(reg)))
         }
     }
 
@@ -2092,10 +2570,11 @@ mod tests {
         assert_eq!(w(&mut c, CSR_MISELECT, u64::MAX), Ok(0));
         assert_eq!(r(&mut c, CSR_MISELECT), Ok(0xfff));
         assert_eq!(r(&mut c, CSR_MIREG4 - 1), ILL);
-        // Unimplemented and AIA ranges raise illegal instruction exceptions.
+        // Unimplemented ranges raise illegal instruction exceptions; the AIA ones reach
+        // the priorities of Ssaia.
         assert_eq!(r(&mut c, CSR_MIREG), ILL);
         w(&mut c, CSR_SISELECT, ISELECT_IPRIO0).unwrap();
-        assert_eq!(r(&mut c, CSR_SIREG), ILL);
+        assert_eq!(r(&mut c, CSR_SIREG), Ok(c.st.siprio[0]));
         // The counters need menvcfg.CDE and their mcounteren bit.
         w(&mut c, CSR_SISELECT, ISELECT_CD_FIRST + 3).unwrap();
         assert_eq!(r(&mut c, CSR_SIREG), ILL);
@@ -2339,6 +2818,243 @@ mod tests {
         assert_eq!(r(&mut c, CSR_SIP), Ok(MIP_STIP));
         assert_eq!(w(&mut c, CSR_SIE, 0), Ok(MIP_STIP | MIP_SSIP));
         assert_eq!(c.st.mie, MIP_SGEIP | MIP_VSEIP);
+    }
+
+    /// A configuration with Smaia and Ssaia.
+    fn aia_cfg() -> RiscvCfg {
+        RiscvCfg { ext_smaia: true, ext_ssaia: true, ..RiscvCfg::default() }
+    }
+
+    /// A hart with Smaia and Ssaia, an IMSIC at both levels and three guest files.
+    fn aia_hw() -> FakeHw {
+        FakeHw {
+            cfg: aia_cfg(),
+            geilen: 3,
+            imsic: (1 << PRV_M) | (1 << PRV_S),
+            ..FakeHw::default()
+        }
+    }
+
+    /// Run `c` in S mode, or VS mode with `virt`, with every stateen bit set.
+    fn lower(c: &mut Csrs<'_>, virt: bool) {
+        c.st.priv_lvl = PRV_S;
+        c.st.virt_enabled = u64::from(virt);
+        c.st.mstateen = [u64::MAX; 4];
+        c.st.hstateen = [u64::MAX; 4];
+    }
+
+    #[test]
+    fn aia_csrs_need_smaia_and_ssaia() {
+        let hw = FakeHw::default();
+        let mut c = csrs(&hw);
+        for csrno in [CSR_MTOPEI, CSR_MTOPI, CSR_MVIEN, CSR_MVIP, CSR_STOPEI, CSR_STOPI] {
+            assert_eq!(r(&mut c, csrno), ILL, "{csrno:#x}");
+        }
+        for csrno in [CSR_HVIEN, CSR_HVICTL, CSR_HVIPRIO1, CSR_HVIPRIO2, CSR_VSTOPI] {
+            assert_eq!(r(&mut c, csrno), ILL, "{csrno:#x}");
+        }
+        let hw = FakeHw { cfg: aia_cfg(), ..FakeHw::default() };
+        let mut c = csrs(&hw);
+        for csrno in [CSR_MTOPI, CSR_MVIEN, CSR_MVIP, CSR_STOPI, CSR_HVIEN, CSR_HVICTL] {
+            assert_eq!(r(&mut c, csrno), Ok(0), "{csrno:#x}");
+        }
+        assert_eq!(w(&mut c, CSR_MTOPI, 0), ILL, "mtopi is read only");
+        // Without an IMSIC the topei registers and the IMSIC range of mireg do not exist.
+        assert_eq!(r(&mut c, CSR_MTOPEI), ILL);
+        c.st.miselect = ISELECT_IMSIC_FIRST;
+        assert_eq!(r(&mut c, CSR_MIREG), ILL);
+        assert!(hw.ireg.borrow().is_empty());
+    }
+
+    #[test]
+    fn aia_topi_and_iprio() {
+        let hw = aia_hw();
+        let mut c = csrs(&hw);
+        // The timer interrupt at its default priority.
+        c.st.mie = MIP_MTIP | MIP_MSIP;
+        hw.lines.borrow_mut().mip = MIP_MTIP;
+        let def = u64::from(default_priority(7));
+        assert_eq!(r(&mut c, CSR_MTOPI), Ok((7 << 16) | def));
+        // iprio0 holds interrupts 0 to 7, of which 7 is the top byte.
+        w(&mut c, CSR_MISELECT, ISELECT_IPRIO0).unwrap();
+        assert_eq!(r(&mut c, CSR_MIREG), Ok(c.st.miprio[0]));
+        w(&mut c, CSR_MIREG, 5 << 56).unwrap();
+        assert_eq!(r(&mut c, CSR_MTOPI), Ok((7 << 16) | 5));
+        // Priority 0 for an interrupt below the external one reads as the lowest.
+        w(&mut c, CSR_MIREG, 0).unwrap();
+        assert_eq!(r(&mut c, CSR_MTOPI), Ok((7 << 16) | 255));
+        // A lower number wins: the software interrupt at 3 beats the timer at 4.
+        w(&mut c, CSR_MIREG, (4 << 56) | (3 << 24)).unwrap();
+        hw.lines.borrow_mut().mip = MIP_MTIP | MIP_MSIP;
+        assert_eq!(r(&mut c, CSR_MTOPI), Ok((3 << 16) | 3));
+        // The priority of the external interrupt of the level stays zero, and odd
+        // selects do not exist on RV64.
+        w(&mut c, CSR_MISELECT, ISELECT_IPRIO0 + 2).unwrap();
+        w(&mut c, CSR_MIREG, u64::MAX).unwrap();
+        assert_eq!(r(&mut c, CSR_MIREG), Ok(0xffff_ffff_00ff_ffff));
+        w(&mut c, CSR_MISELECT, ISELECT_IPRIO0 + 1).unwrap();
+        assert_eq!(r(&mut c, CSR_MIREG), ILL);
+        w(&mut c, CSR_SISELECT, ISELECT_IPRIO0 + 2).unwrap();
+        w(&mut c, CSR_SIREG, u64::MAX).unwrap();
+        assert_eq!(r(&mut c, CSR_SIREG), Ok(0xffff_ffff_ffff_00ff));
+        // stopi: the delegated supervisor timer interrupt.
+        c.st.mideleg |= MIP_STIP;
+        c.st.mie = MIP_STIP;
+        hw.lines.borrow_mut().mip = MIP_STIP;
+        assert_eq!(r(&mut c, CSR_MTOPI), Ok(0));
+        let def = u64::from(default_priority(5));
+        assert_eq!(r(&mut c, CSR_STOPI), Ok((5 << 16) | def));
+    }
+
+    #[test]
+    fn aia_mvien_and_mvip() {
+        let hw = aia_hw();
+        let mut c = csrs(&hw);
+        c.st.menvcfg = 0;
+        w(&mut c, CSR_MVIEN, u64::MAX).unwrap();
+        assert_eq!(c.st.mvien, MIP_SSIP | MIP_SEIP | LOCAL_INTERRUPTS);
+        // mvip.SSIP is apart from mip while mvien.SSIP is set and SSIP is not delegated.
+        c.st.mideleg &= !S_MODE_INTERRUPTS;
+        w(&mut c, CSR_MVIP, MIP_SSIP | MIP_STIP).unwrap();
+        assert_eq!(c.st.mvip, MIP_SSIP);
+        assert_eq!(hw.lines.borrow().mip, MIP_STIP, "STIP is an alias of mip");
+        assert_eq!(r(&mut c, CSR_MVIP), Ok(MIP_SSIP | MIP_STIP));
+        // With mvien.SEIP, mip.SEIP is read only.
+        w(&mut c, CSR_MIP, MIP_SEIP).unwrap();
+        assert_eq!(hw.lines.borrow().mip & MIP_SEIP, 0);
+        // sip and sie show the injected bits, and sie holds their enables apart from mie.
+        assert_eq!(r(&mut c, CSR_SIP), Ok(MIP_SSIP));
+        assert!(!hw.lines.borrow().irqf);
+        w(&mut c, CSR_SIE, MIP_SSIP).unwrap();
+        assert_eq!((c.st.sie, c.st.mie), (MIP_SSIP, 0));
+        assert_eq!(r(&mut c, CSR_SIE), Ok(MIP_SSIP));
+        assert!(hw.lines.borrow().irqf, "the enabled injected interrupt requests");
+        let def = u64::from(default_priority(1));
+        assert_eq!(r(&mut c, CSR_STOPI), Ok((1 << 16) | def));
+        // Clearing mvip drops the request.
+        w(&mut c, CSR_MVIP, 0).unwrap();
+        assert!(!hw.lines.borrow().irqf);
+        // A delegated bit goes back to mip.
+        c.st.mideleg |= MIP_SSIP;
+        w(&mut c, CSR_SIP, MIP_SSIP).unwrap();
+        assert_eq!(hw.lines.borrow().mip & MIP_SSIP, MIP_SSIP);
+        // With mvien.SEIP, S mode cannot reach stopei nor the IMSIC range of sireg.
+        lower(&mut c, false);
+        assert_eq!(r(&mut c, CSR_STOPEI), ILL);
+        c.st.siselect = ISELECT_IMSIC_FIRST;
+        assert_eq!(r(&mut c, CSR_SIREG), ILL);
+        c.st.mvien = 0;
+        let reg = u64::from(aia_make_ireg(ISELECT_IMSIC_FIRST, PRV_S, false, 0));
+        assert_eq!(r(&mut c, CSR_SIREG), Ok(reg));
+    }
+
+    #[test]
+    fn aia_hvien_and_hvip() {
+        let hw = aia_hw();
+        let mut c = csrs(&hw);
+        let bit = 1 << 20;
+        w(&mut c, CSR_HVIEN, u64::MAX).unwrap();
+        assert_eq!(c.st.hvien, LOCAL_INTERRUPTS);
+        // hvip holds the local interrupts hvien injects, apart from mip.
+        w(&mut c, CSR_HVIP, bit | MIP_VSSIP).unwrap();
+        assert_eq!(c.st.hvip, bit);
+        assert_eq!(hw.lines.borrow().mip, MIP_VSSIP);
+        assert_eq!(r(&mut c, CSR_HVIP), Ok(bit | MIP_VSSIP));
+        // vsip and vsie show them, and vsie holds their enables.
+        assert_eq!(r(&mut c, CSR_VSIP), Ok(bit));
+        w(&mut c, CSR_VSIE, bit).unwrap();
+        assert_eq!((c.st.vsie, c.st.mie), (bit, 0));
+        assert!(hw.lines.borrow().irqf);
+        assert_eq!(r(&mut c, CSR_VSIE), Ok(bit));
+        // vstopi reports it at its hviprio priority, which reads as 1 without IPRIOM.
+        assert_eq!(r(&mut c, CSR_VSTOPI), Ok((20 << 16) | 1));
+        // hvictl and the hviprio registers.
+        w(&mut c, CSR_HVICTL, u64::MAX).unwrap();
+        assert_eq!(c.st.hvictl, HVICTL_VALID_MASK);
+        w(&mut c, CSR_HVICTL, HVICTL_IPRIOM).unwrap();
+        w(&mut c, CSR_HVIPRIO2, 7 << 32).unwrap();
+        assert_eq!(r(&mut c, CSR_VSTOPI), Ok((20 << 16) | 7));
+        w(&mut c, CSR_HVIPRIO1, u64::MAX).unwrap();
+        assert_eq!(r(&mut c, CSR_HVIPRIO1), Ok(0xffff_ff00_ff00_ff00));
+        assert_eq!(r(&mut c, CSR_HVIPRIO2), Ok(7 << 32));
+        // hvictl.VTI injects an interrupt with its own priority, and makes sie and sip
+        // raise virtual instruction exceptions in VS mode.
+        w(&mut c, CSR_HVICTL, HVICTL_VTI | (30 << 16) | HVICTL_IPRIOM | 3).unwrap();
+        assert_eq!(r(&mut c, CSR_VSTOPI), Ok((30 << 16) | 3));
+        lower(&mut c, true);
+        assert_eq!(r(&mut c, CSR_STOPI), Ok((30 << 16) | 3), "stopi is vstopi");
+        assert_eq!(r(&mut c, CSR_SIE), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        assert_eq!(r(&mut c, CSR_SIP), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        // Like QEMU, sip keeps to the bits of mideleg and mvien in VS mode too.
+        c.st.hvictl = 0;
+        assert_eq!(r(&mut c, CSR_SIP), Ok(0));
+        c.st.mideleg |= bit;
+        assert_eq!(r(&mut c, CSR_SIP), Ok(bit));
+    }
+
+    #[test]
+    fn aia_guest_external_interrupts() {
+        let hw = aia_hw();
+        let mut c = csrs(&hw);
+        // hgeie holds bits 1 to GEILEN, and SGEIP follows hgeie & hgeip.
+        hw.lines.borrow_mut().hgeip = 0b100;
+        assert_eq!(r(&mut c, CSR_HGEIP), Ok(0b100));
+        w(&mut c, CSR_HGEIE, u64::MAX).unwrap();
+        assert_eq!(r(&mut c, CSR_HGEIE), Ok(0b1110));
+        assert_eq!(hw.lines.borrow().mip, MIP_SGEIP);
+        w(&mut c, CSR_HGEIE, 0b10).unwrap();
+        assert_eq!(hw.lines.borrow().mip, 0);
+        // hstatus.VGEIN picks the line that shows as VSEIP.
+        assert_eq!(r(&mut c, CSR_HIP), Ok(0));
+        w(&mut c, CSR_HSTATUS, 2 << 12).unwrap();
+        assert_eq!(hw.lines.borrow().vgein, 2);
+        assert_eq!(r(&mut c, CSR_HIP), Ok(MIP_VSEIP));
+        assert_eq!(r(&mut c, CSR_HVIP), Ok(0), "hvip does not show it");
+        // vstopi takes the priority of the guest file's top interrupt, here from the
+        // failing topei of file 2.
+        c.st.mie = MIP_VSEIP;
+        assert_eq!(r(&mut c, CSR_VSTOPI), Ok((9 << 16) | 1));
+        c.st.hvictl = HVICTL_IPRIOM;
+        assert_eq!(r(&mut c, CSR_VSTOPI), Ok((9 << 16) | 255));
+        // vstopei reaches the guest file VGEIN selects.
+        w(&mut c, CSR_HSTATUS, 1 << 12).unwrap();
+        let reg = aia_make_ireg(ISELECT_IMSIC_TOPEI, PRV_S, true, 1);
+        assert_eq!(r(&mut c, CSR_VSTOPEI), Ok(u64::from(reg)));
+        assert_eq!(hw.ireg.borrow().last(), Some(&(PRV_S, reg, 0, 0)));
+    }
+
+    #[test]
+    fn aia_imsic_registers() {
+        let hw = aia_hw();
+        let mut c = csrs(&hw);
+        let m = aia_make_ireg(ISELECT_IMSIC_TOPEI, PRV_M, false, 0);
+        assert_eq!(w(&mut c, CSR_MTOPEI, 0), Ok(u64::from(m)));
+        assert_eq!(hw.ireg.borrow().last(), Some(&(PRV_M, m, 0, u64::MAX)));
+        let s = aia_make_ireg(ISELECT_IMSIC_TOPEI, PRV_S, false, 0);
+        assert_eq!(r(&mut c, CSR_STOPEI), Ok(u64::from(s)));
+        w(&mut c, CSR_MISELECT, 0x80).unwrap();
+        w(&mut c, CSR_MIREG, 0x1234).unwrap();
+        let reg = aia_make_ireg(0x80, PRV_M, false, 0);
+        assert_eq!(hw.ireg.borrow().last(), Some(&(PRV_M, reg, 0x1234, u64::MAX)));
+        // In VS mode stopei and sireg are the guest file's; VGEIN 0 or above GEILEN has
+        // none.
+        lower(&mut c, true);
+        assert_eq!(r(&mut c, CSR_STOPEI), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        c.st.vsiselect = 0x70;
+        assert_eq!(r(&mut c, CSR_SIREG), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        c.st.hstatus = 4 << 12;
+        assert_eq!(r(&mut c, CSR_SIREG), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        c.st.hstatus = 3 << 12;
+        let reg = aia_make_ireg(0x70, PRV_S, true, 3);
+        assert_eq!(r(&mut c, CSR_SIREG), Ok(u64::from(reg)));
+        let reg = aia_make_ireg(ISELECT_IMSIC_TOPEI, PRV_S, true, 3);
+        assert_eq!(r(&mut c, CSR_STOPEI), Ok(u64::from(reg)));
+        // VS mode has no priority registers; a select outside the AIA ranges is illegal
+        // without Sscsrind.
+        c.st.vsiselect = ISELECT_IPRIO0;
+        assert_eq!(r(&mut c, CSR_SIREG), Err(EXCP_VIRT_INSTRUCTION_FAULT));
+        c.st.vsiselect = 0x10;
+        assert_eq!(r(&mut c, CSR_SIREG), ILL);
     }
 
     #[test]

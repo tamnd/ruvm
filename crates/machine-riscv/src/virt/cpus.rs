@@ -2,7 +2,8 @@
 
 //! How the virt board meets its harts: the ACLINT `mtime` the `time` CSR reads, the Sstc
 //! timers behind `stimecmp` and `vstimecmp` and the Sscofpmf overflow timer ([`CpuHub`], the
-//! board side of `RiscvBoard`), the shutdown and reset requests of the SiFive test device,
+//! board side of `RiscvBoard`), the IMSIC registers behind `mireg`, `sireg` and `vsireg`, the
+//! shutdown and reset requests of the SiFive test device,
 //! and semihosting ([`VirtSemihost`]).
 
 use std::fmt;
@@ -11,7 +12,9 @@ use std::time::Instant;
 
 use ruvm_hw_core::{Clock, Timer};
 use ruvm_hw_intc::riscv_aclint::RiscvAclintMtimer;
+use ruvm_hw_intc::riscv_imsic::RiscvImsic;
 use ruvm_jit::CpuShared;
+use ruvm_target_riscv::cpu::{PRV_M, PRV_S};
 use ruvm_target_riscv::tcg::{Riscv, RiscvBoard, SemihostingHost};
 
 use super::{VirtRequest, VirtRequestHandler};
@@ -32,12 +35,17 @@ struct CpuSlot {
     pmu_timer: Option<Timer>,
 }
 
+/// The IMSICs of one level, by hart.
+type Imsics = Vec<Arc<RiscvImsic>>;
+
 /// The board side of every hart: `rdtime_fn` on the ACLINT timer, the Sstc timers on the
 /// board clock, and the requests of the SiFive test device.
 pub(crate) struct CpuHub {
     mtimer: Arc<RiscvAclintMtimer>,
     clock: Arc<Clock>,
     riscv: OnceLock<Weak<Riscv>>,
+    /// The M and S level IMSICs by hart, with `aia=aplic-imsic`.
+    imsics: OnceLock<(Imsics, Imsics)>,
     slots: Mutex<Vec<CpuSlot>>,
     request: Mutex<Option<VirtRequest>>,
     /// Where requests go instead of [`CpuHub::take_request`], once a run loop has set it.
@@ -62,6 +70,7 @@ impl CpuHub {
             mtimer,
             clock,
             riscv: OnceLock::new(),
+            imsics: OnceLock::new(),
             slots: Mutex::new(slots),
             request: Mutex::new(None),
             handler: Mutex::new(None),
@@ -70,6 +79,11 @@ impl CpuHub {
 
     pub(crate) fn set_riscv(&self, riscv: &Arc<Riscv>) {
         let _ = self.riscv.set(Arc::downgrade(riscv));
+    }
+
+    /// The IMSICs of the harts, M level and S level, whose registers the AIA CSRs reach.
+    pub(crate) fn set_imsics(&self, m: Imsics, s: Imsics) {
+        let _ = self.imsics.set((m, s));
     }
 
     /// Record the vCPU with index `cpu`.
@@ -188,6 +202,23 @@ impl RiscvBoard for CpuHub {
             })
         });
         t.modify_anticipate(when);
+    }
+
+    fn aia_ireg_rmw(
+        &self,
+        shared: &CpuShared,
+        priv_lvl: u64,
+        reg: u32,
+        new: u64,
+        wr_mask: u64,
+    ) -> Option<Result<u64, ()>> {
+        let (m, s) = self.imsics.get()?;
+        let imsic = match priv_lvl {
+            PRV_M => m.get(shared.cpu_index)?,
+            PRV_S => s.get(shared.cpu_index)?,
+            _ => return None,
+        };
+        Some(imsic.rmw(reg, new, wr_mask).map_err(|_| ()))
     }
 }
 
