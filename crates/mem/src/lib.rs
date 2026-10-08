@@ -48,6 +48,8 @@
 mod access;
 mod address_space;
 mod attrs;
+#[cfg(unix)]
+pub mod cpr;
 mod dirty;
 mod error;
 mod flatview;

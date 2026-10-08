@@ -9,6 +9,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::access::MmioOps;
@@ -102,6 +103,8 @@ impl Inner {
 pub struct MemorySystem {
     config: MemoryConfig,
     inner: Mutex<Inner>,
+    // The machine's `aux-ram-share`: RAM made without saying whether it is shared is.
+    aux_ram_share: AtomicBool,
 }
 
 /// An open transaction, committed when dropped. See [`MemorySystem::transaction`].
@@ -163,6 +166,7 @@ impl MemorySystem {
                 pending: false,
                 global_dirty: 0,
             }),
+            aux_ram_share: AtomicBool::new(false),
         }
     }
 
@@ -209,14 +213,41 @@ impl MemorySystem {
         Ok(g.arena.insert(Node::new(target, size)))
     }
 
+    /// The machine property `aux-ram-share`: from now on RAM, ROM and ROM devices made without
+    /// a say in sharing (everything but memory backends) are shared memory that CPR can hand to
+    /// the next process.
+    pub fn set_aux_ram_share(&self, on: bool) {
+        self.aux_ram_share.store(on, Ordering::Relaxed);
+    }
+
     fn new_block(&self, name: &str, size: u64) -> Result<Arc<RamBlock>, MemError> {
-        let block = RamBlock::new(name, size, self.config.page_bits)?;
+        self.new_block_shared(name, size, None)
+    }
+
+    /// A block for a new region, `qemu_ram_alloc_internal()`. `share` is `RAM_SHARED` or
+    /// `RAM_PRIVATE`; with neither `aux-ram-share` decides.
+    fn new_block_shared(
+        &self,
+        name: &str,
+        size: u64,
+        share: Option<bool>,
+    ) -> Result<Arc<RamBlock>, MemError> {
+        let shared = share.unwrap_or_else(|| self.aux_ram_share.load(Ordering::Relaxed));
+        let block = if shared {
+            RamBlock::new_shared(name, size, self.config.page_bits)?
+        } else {
+            RamBlock::new(name, size, self.config.page_bits)?
+        };
+        Ok(Self::track(block))
+    }
+
+    fn track(block: RamBlock) -> Arc<RamBlock> {
         // Like QEMU, every block has a bitmap for every client, and which bits get set is up to
         // the dirty log mask of the region written through.
         for client in DirtyClient::ALL {
             block.start_dirty_log(client);
         }
-        Ok(Arc::new(block))
+        Arc::new(block)
     }
 
     /// A container, `memory_region_init()`: no contents of its own, only subregions. `size`
@@ -229,6 +260,23 @@ impl MemorySystem {
     pub fn new_ram(&self, name: &str, size: u64) -> Result<RegionId, MemError> {
         let block = self.new_block(name, size)?;
         self.create(name, u128::from(size), RegionType::Ram, TargetKind::Ram(block))
+    }
+
+    /// RAM that is shared memory or private memory whatever `aux-ram-share` says,
+    /// `memory_region_init_ram_flags_nomigrate()` with `RAM_SHARED` or `RAM_PRIVATE`, which is
+    /// how a memory backend makes its RAM.
+    pub fn new_ram_shared(&self, name: &str, size: u64, share: bool) -> Result<RegionId, MemError> {
+        let block = self.new_block_shared(name, size, Some(share))?;
+        self.create(name, u128::from(size), RegionType::Ram, TargetKind::Ram(block))
+    }
+
+    /// RAM over a block that already exists, possibly in another memory system: the RAM of a
+    /// memory backend that a machine takes as its main memory, `machine_consume_memdev()`. The
+    /// region is named after the block, as QEMU names both after the backend.
+    pub fn new_ram_from_block(&self, block: Arc<RamBlock>) -> Result<RegionId, MemError> {
+        let size = u128::from(block.len());
+        let name = block.name().to_owned();
+        self.create(&name, size, RegionType::Ram, TargetKind::Ram(block))
     }
 
     /// ROM, `memory_region_init_rom()`: RAM the guest cannot write. Fill it through

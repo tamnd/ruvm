@@ -11,12 +11,15 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 12
+unsafe-budget = 18
 
 [dependencies]
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true

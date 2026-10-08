@@ -32,14 +32,50 @@ impl RamBlock {
     /// tracking at `1 << page_bits` byte granularity.
     pub fn new(name: &str, size: u64, page_bits: u32) -> Result<Self, MemError> {
         let len = usize::try_from(size).map_err(|_| MemError::TooLarge(u128::from(size)))?;
-        Ok(RamBlock {
-            name: name.to_string(),
-            mem: HostMemory::new(len).map_err(|e| {
-                MemError::Alloc(format!("cannot set up guest memory '{name}': {e}"))
+        let mem = HostMemory::new(len)
+            .map_err(|e| MemError::Alloc(format!("cannot set up guest memory '{name}': {e}")))?;
+        Ok(Self::with_memory(name, mem, page_bits))
+    }
+
+    /// A block of shared memory, the `RAM_SHARED` branch of `qemu_ram_alloc_internal()`: the
+    /// memfd CPR saved under `name` when the process before passed one on, or else a new one
+    /// that is saved there for the process after. When no memfd can be had the block quietly
+    /// falls back to private memory, as in QEMU.
+    #[cfg(unix)]
+    pub fn new_shared(name: &str, size: u64, page_bits: u32) -> Result<Self, MemError> {
+        let len = usize::try_from(size).map_err(|_| MemError::TooLarge(u128::from(size)))?;
+        let mem = match crate::cpr::find_fd(name, 0) {
+            // Grown when the block is larger here than it was before, like `reused` does.
+            Some(fd) => HostMemory::from_fd(fd, len).map_err(|e| {
+                MemError::Alloc(format!("cannot map the shared memory of '{name}': {e}"))
             })?,
-            page_bits,
-            dirty: Default::default(),
-        })
+            None => match HostMemory::shared(name, len) {
+                Ok(mem) => {
+                    if let Some(fd) = mem.fd().and_then(|fd| fd.try_clone_to_owned().ok()) {
+                        crate::cpr::save_fd(name, 0, fd);
+                    }
+                    mem
+                }
+                Err(_) => return Self::new(name, size, page_bits),
+            },
+        };
+        Ok(Self::with_memory(name, mem, page_bits))
+    }
+
+    /// A block of shared memory. Without Unix there is none, so this is private memory.
+    #[cfg(not(unix))]
+    pub fn new_shared(name: &str, size: u64, page_bits: u32) -> Result<Self, MemError> {
+        Self::new(name, size, page_bits)
+    }
+
+    fn with_memory(name: &str, mem: HostMemory, page_bits: u32) -> Self {
+        RamBlock { name: name.to_string(), mem, page_bits, dirty: Default::default() }
+    }
+
+    /// Whether the block is shared memory that another process can map,
+    /// `qemu_ram_is_shared()` for a block with a descriptor.
+    pub fn is_shared(&self) -> bool {
+        self.mem.is_shared()
     }
 
     fn bytes(&self) -> &[AtomicU8] {
@@ -57,6 +93,20 @@ impl RamBlock {
     /// guest RAM into the hypervisor.
     pub fn host_addr(&self) -> usize {
         self.mem.host_addr()
+    }
+
+    /// The host memory behind the block, for postcopy migration, which registers it with
+    /// userfaultfd.
+    pub fn host_memory(&self) -> &HostMemory {
+        &self.mem
+    }
+
+    /// `ram_block_discard_range()`: drops `len` bytes of pages at `offset` so that they read
+    /// as zero, and on Linux are unmapped again.
+    pub fn discard_range(&self, offset: u64, len: u64) -> Result<(), MemError> {
+        let o = usize::try_from(offset).map_err(|_| MemError::OutOfRange)?;
+        let l = usize::try_from(len).map_err(|_| MemError::OutOfRange)?;
+        self.mem.discard(o, l).map_err(|_| MemError::OutOfRange)
     }
 
     /// The block's name, `idstr`.
@@ -230,9 +280,36 @@ impl fmt::Debug for RamBlock {
     }
 }
 
+/// `qemu_ram_free()` forgets the descriptor of shared memory, so that a block made again under
+/// the same name gets new memory.
+#[cfg(unix)]
+impl Drop for RamBlock {
+    fn drop(&mut self) {
+        if self.mem.is_shared() {
+            crate::cpr::delete_fd(&self.name, 0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn shared_blocks_find_their_memory_again() {
+        let a = RamBlock::new_shared("ram-shared-test", 0x2000, 12).unwrap();
+        assert!(a.is_shared());
+        a.write(0x1000, &[5]).unwrap();
+        // What the next process does with the descriptor CPR gave it.
+        let b = RamBlock::new_shared("ram-shared-test", 0x3000, 12).unwrap();
+        let mut out = [0];
+        b.read(0x1000, &mut out).unwrap();
+        assert_eq!(out, [5]);
+        drop(a);
+        assert!(crate::cpr::find_fd("ram-shared-test", 0).is_none());
+        assert!(!RamBlock::new("ram", 0x1000, 12).unwrap().is_shared());
+    }
 
     #[test]
     fn bytes_round_trip_and_bounds_hold() {
