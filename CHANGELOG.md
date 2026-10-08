@@ -6,6 +6,16 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.4.5
+
+This patch brings in most of M5, the migration modes beyond plain precopy, and moves M6 along with a riscv64 host backend and the ITS on arm virt.
+
+For M5: ruvm now does postcopy, multifd with no compression or zlib, XBZRLE, mapped-ram over the file channel with direct-io, savevm and loadvm to qcow2, background snapshots, and the cpr-reboot and cpr-transfer modes, all interoperating with QEMU 11.1 (#178, #179, #180). Every mode passed hops between QEMU and ruvm with a guest that checksums its memory, with no bad output. `query-migrate` reports downtime, expected-downtime and the byte counters the way QEMU does, `-incoming` takes JSON and keyval channels, and `-machine memory-backend=` works on x86. `-accel kvm,dirty-ring-size=` is accepted but ruvm doesn't collect from the ring yet. Postcopy recovery, zstd and the other multifd compressors, TLS and `-loadvm` are not in yet.
+
+For M6: there is a riscv64 host backend for the JIT, covering RV64GC, Zba, Zbb, Zbs, Zicond and RVV (#173, #176). Under qemu-riscv64, a riscv virt guest and an x86 q35 guest both boot Linux to a shell on it. arm virt has the GICv3 ITS and LPIs, with `msi-map` on the PCIe node, the second redistributor region for more than 123 CPUs, and the `msi=` and `its=` options (#175). A Debian guest takes its virtio-pci interrupts through the ITS with the same numbers as on QEMU. On riscv virt, virtio-blk-pci now gets one queue per vCPU as on QEMU (#174).
+
+Also, two files that the pinned rustfmt formats differently are now formatted (#177).
+
 ## 0.4.4
 
 This patch is all M6. The riscv virt board gets AIA and ACPI, the riscv Linux boot is about 30% faster, and the arm virt board gets its PCIe host bridge.
