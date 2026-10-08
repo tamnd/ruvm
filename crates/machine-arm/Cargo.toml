@@ -22,6 +22,7 @@ ruvm-hw-acpi.workspace = true
 ruvm-hw-char.workspace = true
 ruvm-hw-core.workspace = true
 ruvm-hw-intc.workspace = true
+ruvm-hw-iommu.workspace = true
 ruvm-hw-pci.workspace = true
 ruvm-hw-timer.workspace = true
 ruvm-hw-virtio.workspace = true

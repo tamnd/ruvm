@@ -56,6 +56,12 @@ dump_its() {
 dump_its virt-a57-smp2-its -cpu cortex-a57,pmu=off -smp 2
 dump_its virt-a57-smp130-its -cpu cortex-a57,pmu=off -smp 130
 
+# iommu=smmuv3: the SMMUv3 node and the iommu-map of the PCIe node, and the same with the
+# root bus bypassing it, which drops the iommu-map.
+dump_its virt-a57-smmuv3 -cpu cortex-a57,pmu=off -M iommu=smmuv3
+dump_its virt-a57-smmuv3-bypass -cpu cortex-a57,pmu=off \
+    -M iommu=smmuv3,default-bus-bypass-iommu=on
+
 # A user -dtb: QEMU drops its memory nodes and /psci and adds its own.
 dtc -q -I dts -O dtb -o "$TMP/user.dtb" user.dts
 cp "$TMP/user.dtb" user.dtb

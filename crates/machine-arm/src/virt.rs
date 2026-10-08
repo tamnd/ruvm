@@ -14,7 +14,9 @@
 //! ECAM and its high MMIO window above RAM (see [`memmap`]) and INTx on SPIs 3 to 6, fw_cfg
 //! with DMA at 0x09020000, 32 virtio-mmio transports from 0x0a000000 (SPIs 16 to 47) and an
 //! empty platform bus window at 0x0c000000, and the two CFI flashes at 0 and 0x04000000, the
-//! first one holding `-bios`. A
+//! first one holding `-bios`. `iommu=smmuv3` puts the SMMUv3 (stage 1, stage 2 and nested) at
+//! 0x09050000 (SPIs 74 to 77) in front of the root bus: each PCIe function does its DMA and
+//! sends its MSIs through an address space of its own that the SMMU translates. A
 //! second `-serial` adds the second PL011 at 0x09040000 (SPI 8). `virtualization=on` keeps EL2
 //! and `secure=on` keeps EL3 and adds the secure UART at 0x09040000 and the secure RAM at
 //! 0x0e000000. PSCI goes through HVC, or SMC with `virtualization=on`, and is left to the
@@ -50,7 +52,6 @@
 //!
 //! - The GICv2m (`msi=gicv2m`), which only makes sense with the GICv2 that is not modelled
 //!   either.
-//! - SMMUv3 (`iommu=smmuv3`).
 //! - CXL, so the empty `cxl_host_reg` container QEMU maps above the redistributors is not
 //!   there either.
 //! - SMBIOS (`virt_build_smbios()`), so firmware finds no SMBIOS tables in fw_cfg.
@@ -87,13 +88,13 @@ mod dt;
 pub mod memmap;
 
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ruvm_base::ClockType;
 use ruvm_firmware::acpi::BuildTables;
 use ruvm_firmware::acpi::arm_virt::{
-    self, ArmVirtAcpi, PsciConduit as AcpiPsci, VirtIrqs, VirtMemmap as AcpiMemmap,
+    self, ArmVirtAcpi, IortSmmu, PsciConduit as AcpiPsci, VirtIrqs, VirtMemmap as AcpiMemmap,
 };
 use ruvm_firmware::acpi::gpex::Window;
 use ruvm_firmware::acpi::q35::{PciDevice as AcpiPciDevice, PciDeviceAml};
@@ -114,10 +115,12 @@ use ruvm_hw_intc::gicv3::{
     GICV3_DIST_SIZE, GICV3_REDIST_SIZE, GicV3, GicV3Its, GicV3Props, ITS_CONTROL_SIZE, ITS_SIZE,
     ITS_TRANS_SIZE,
 };
+use ruvm_hw_iommu::{SMMU_SIZE, SmmuStage, SmmuV3};
 use ruvm_hw_pci::regs::PCI_NUM_PINS;
 use ruvm_hw_pci::{GpexConfig, GpexHost, GpexWindow, MsiTrigger};
 use ruvm_hw_timer::pl031::{PL031_MMIO_SIZE, Pl031};
 use ruvm_hw_virtio::mmio::{VIRTIO_MMIO_FORCE_LEGACY_DEFAULT, VIRTIO_MMIO_REGION_SIZE};
+use ruvm_hw_virtio::virtio::VIRTIO_F_IOMMU_PLATFORM;
 use ruvm_hw_virtio::{VirtioBackend, VirtioDeviceClass, VirtioMmio, VirtioPci, VirtioPciProps};
 use ruvm_jit::{Cpu, CpuShared, Jit, Vcpu};
 use ruvm_mem::{
@@ -167,6 +170,8 @@ pub const VIRT_GPIO: u64 = 0x0903_0000;
 pub const VIRT_GPIO_SIZE: u64 = 0x1000;
 /// `VIRT_ACPI_GED`.
 pub const VIRT_ACPI_GED: u64 = 0x0908_0000;
+/// `VIRT_SMMU`, where the SMMUv3 of `iommu=smmuv3` sits.
+pub const VIRT_SMMU: u64 = 0x0905_0000;
 /// `VIRT_FW_CFG`.
 pub const VIRT_FW_CFG: u64 = 0x0902_0000;
 /// The size of the fw_cfg window: data, control and DMA.
@@ -207,6 +212,8 @@ pub const VIRT_MMIO_IRQ: u32 = 16;
 pub const VIRT_GPIO_IRQ: u32 = 7;
 /// The SPI of the ACPI GED.
 pub const VIRT_ACPI_GED_IRQ: u32 = 9;
+/// The first of the four SPIs of the SMMUv3.
+pub const VIRT_SMMU_IRQ: u32 = 74;
 /// `ARM_SPI_BASE`, the INTID of SPI 0.
 pub const ARM_SPI_BASE: u32 = 32;
 /// The first SPI of the platform bus.
@@ -234,6 +241,16 @@ pub enum VirtMsi {
     Off,
 }
 
+/// The `iommu` machine property: the IOMMU in front of the PCIe root bus.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VirtIommu {
+    /// `iommu=none`, the default.
+    #[default]
+    None,
+    /// `iommu=smmuv3`.
+    SmmuV3,
+}
+
 /// The `-smp` topology, `ms->smp`, which the possible CPUs are numbered by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuTopology {
@@ -259,7 +276,7 @@ impl CpuTopology {
 
 /// What the board is built from: the `-cpu`, `-smp`, `-m`, `-kernel`, `-initrd`, `-append`,
 /// `-dtb`, `-bios`, `-serial` and `-semihosting` options and the `secure`, `virtualization`,
-/// `msi`, `acpi`, `spcr`, `x-oem-id` and `x-oem-table-id` machine properties.
+/// `msi`, `iommu`, `default-bus-bypass-iommu`, `acpi`, `spcr`, `x-oem-id` and `x-oem-table-id` machine properties.
 #[derive(Clone)]
 pub struct VirtConfig {
     /// The CPU model.
@@ -289,6 +306,10 @@ pub struct VirtConfig {
     pub highmem: Highmem,
     /// The `msi` property.
     pub msi: VirtMsi,
+    /// The `iommu` property.
+    pub iommu: VirtIommu,
+    /// `default-bus-bypass-iommu`: the root bus is not behind the IOMMU.
+    pub default_bus_bypass_iommu: bool,
     /// `-bios`: the firmware image, loaded into the first flash.
     pub firmware: Option<String>,
     /// The drives of the two flashes, `pflash0` and `pflash1` (`-drive if=pflash`).
@@ -337,6 +358,8 @@ impl fmt::Debug for VirtConfig {
             .field("mte", &self.mte)
             .field("highmem", &self.highmem)
             .field("msi", &self.msi)
+            .field("iommu", &self.iommu)
+            .field("default_bus_bypass_iommu", &self.default_bus_bypass_iommu)
             .field("firmware", &self.firmware)
             .field("pflash", &self.pflash)
             .field("serial", &self.serial.is_some())
@@ -369,6 +392,8 @@ impl VirtConfig {
             mte: false,
             highmem: Highmem::default(),
             msi: VirtMsi::Auto,
+            iommu: VirtIommu::None,
+            default_bus_bypass_iommu: false,
             firmware: None,
             pflash: [PflashBacking::None, PflashBacking::None],
             serial: None,
@@ -436,6 +461,32 @@ impl GuestMemory for WeakGuestMemory {
 
     fn write(&self, addr: u64, buf: &[u8]) -> Result<(), MemoryError> {
         match self.0.upgrade() {
+            Some(a) if a.write(addr, MemTxAttrs::UNSPECIFIED, buf).is_ok() => Ok(()),
+            _ => Err(MemoryError::OutOfRange { addr, len: buf.len() as u64 }),
+        }
+    }
+}
+
+/// The DMA of a PCI function behind the SMMU with `iommu_platform` on: its own address space,
+/// which only exists once the function has its devfn, through a weak reference.
+struct LateGuestMemory(Arc<OnceLock<Weak<AddressSpace>>>);
+
+impl LateGuestMemory {
+    fn space(&self) -> Option<Arc<AddressSpace>> {
+        self.0.get().and_then(Weak::upgrade)
+    }
+}
+
+impl GuestMemory for LateGuestMemory {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryError> {
+        match self.space() {
+            Some(a) if a.read(addr, MemTxAttrs::UNSPECIFIED, buf).is_ok() => Ok(()),
+            _ => Err(MemoryError::OutOfRange { addr, len: buf.len() as u64 }),
+        }
+    }
+
+    fn write(&self, addr: u64, buf: &[u8]) -> Result<(), MemoryError> {
+        match self.space() {
             Some(a) if a.write(addr, MemTxAttrs::UNSPECIFIED, buf).is_ok() => Ok(()),
             _ => Err(MemoryError::OutOfRange { addr, len: buf.len() as u64 }),
         }
@@ -590,6 +641,12 @@ pub struct VirtMachine {
     rtc: Arc<Pl031>,
     memmap: VirtMemmap,
     gpex: GpexHost,
+    /// The SMMUv3 of `iommu=smmuv3`.
+    smmu: Option<Arc<SmmuV3>>,
+    /// `default-bus-bypass-iommu`: the root bus is not behind the SMMU.
+    iommu_bypass: bool,
+    /// The address spaces of the functions behind the SMMU, `SMMUDevice.as`.
+    iommu_spaces: Mutex<Vec<Arc<AddressSpace>>>,
     pci_devices: Mutex<Vec<VirtioPci>>,
     virtio: Vec<Arc<VirtioSlot>>,
     fw_cfg: FwCfgMem,
@@ -892,6 +949,19 @@ impl VirtMachine {
         // create_pcie(), with the msi-map to the ITS.
         let gpex = create_pcie(&mem, system, &memmap, &gic, &memory_as)?;
         dt::create_pcie(&mut fdt, &memmap, gic_phandle, msi_phandle, VIRT_PCIE_IRQ)?;
+        // create_smmu(), with the stage property set to nested as on every virt version that
+        // has the SMMU. It reads its tables from system memory, and the functions on the root
+        // bus get their address spaces from it as they are plugged.
+        let smmu = if cfg.iommu == VirtIommu::SmmuV3 {
+            let irqs = std::array::from_fn(|i| gic.spi(VIRT_SMMU_IRQ + i as u32));
+            let smmu = SmmuV3::new(SmmuStage::Nested, &memory_as, irqs);
+            let r = mem.new_io("smmuv3", SMMU_SIZE.into(), smmu.mmio_ops()).map_err(err)?;
+            mem.add_subregion(system, VIRT_SMMU, r).map_err(err)?;
+            dt::create_smmu(&mut fdt, !cfg.default_bus_bypass_iommu)?;
+            Some(smmu)
+        } else {
+            None
+        };
 
         // create_acpi_ged(), for firmware that boots with ACPI. Without it QEMU creates the
         // PL061 GPIO with the poweroff key, which ruvm does not have.
@@ -987,6 +1057,9 @@ impl VirtMachine {
             rtc,
             memmap,
             gpex,
+            smmu,
+            iommu_bypass: cfg.default_bus_bypass_iommu,
+            iommu_spaces: Mutex::new(Vec::new()),
             pci_devices: Mutex::new(Vec::new()),
             virtio,
             fw_cfg,
@@ -1046,17 +1119,51 @@ impl VirtMachine {
         devfn: Option<u8>,
         props: &VirtioPciProps,
     ) -> Result<VirtioPci, String> {
+        self.attach_virtio_pci_with(class, devfn, props, false)
+    }
+
+    /// [`VirtMachine::attach_virtio_pci`] with the `iommu_platform` property of the virtio
+    /// device. As in `virtio_bus_device_plugged()`, only a device with it on does its DMA
+    /// through the SMMU; the others use system memory, and only their MSIs go through the SMMU.
+    pub fn attach_virtio_pci_with(
+        &self,
+        class: Box<dyn VirtioDeviceClass>,
+        devfn: Option<u8>,
+        props: &VirtioPciProps,
+        iommu_platform: bool,
+    ) -> Result<VirtioPci, String> {
         if self.done {
             return Err("PCI devices must be plugged before machine_done".to_string());
         }
-        let memory: Arc<dyn GuestMemory + Send + Sync> =
-            Arc::new(WeakGuestMemory(Arc::downgrade(&self.memory_as)));
-        let backend = VirtioBackend::new(class, memory).map_err(err)?;
+        // pci_device_iommu_address_space(): the SMMU unless the root bus bypasses it.
+        let smmu = self.smmu.as_ref().filter(|_| !self.iommu_bypass);
+        let late = Arc::new(OnceLock::new());
+        let memory: Arc<dyn GuestMemory + Send + Sync> = match smmu {
+            Some(_) if iommu_platform => Arc::new(LateGuestMemory(Arc::clone(&late))),
+            _ => Arc::new(WeakGuestMemory(Arc::downgrade(&self.memory_as))),
+        };
+        let mut backend = VirtioBackend::new(class, memory).map_err(err)?;
+        if iommu_platform {
+            backend.vdev_mut().set_host_feature(VIRTIO_F_IOMMU_PLATFORM, true);
+        }
         let dev = VirtioPci::new(self.gpex.bus(), devfn, backend, props).map_err(err)?;
+        let mut memory_as = Arc::downgrade(&self.memory_as);
+        if let Some(smmu) = smmu {
+            // smmu_find_add_as(): an IOMMU region and an address space of the same name for
+            // the function, whose stream ID is its requester ID on bus 0.
+            let devfn = dev.pci_dev().devfn();
+            let mut spaces = self.iommu_spaces.lock().unwrap_or_else(PoisonError::into_inner);
+            let name = format!("smmuv3-iommu-memory-region-{devfn}-{}", spaces.len());
+            let ops = smmu.device_ops(u32::from(devfn));
+            let r = self.mem.new_iommu(&name, 1 << 64, ops).map_err(err)?;
+            let space = self.mem.address_space_init(r, &name).map_err(err)?;
+            memory_as = Arc::downgrade(&space);
+            let _ = late.set(Arc::downgrade(&space));
+            spaces.push(space);
+        }
         // msi_send_message() stores with the function's requester ID, which is the device ID
-        // the ITS translates.
+        // the ITS translates, into the function's address space.
         let pci_dev = Arc::downgrade(dev.pci_dev());
-        let memory_as = Arc::downgrade(&self.memory_as);
         dev.pci_dev().set_msi_trigger(Some(Arc::new(move |address, data| {
             let (Some(d), Some(a)) = (pci_dev.upgrade(), memory_as.upgrade()) else { return };
             let attrs = MemTxAttrs::new().with_requester_id(d.requester_id());
@@ -1130,6 +1237,13 @@ impl VirtMachine {
             spcr: self.spcr,
             pci_devices,
             numa: Vec::new(),
+            // populate_smmuv3_legacy_dev(): the bus range of the root bus, which has no bridges
+            // under it, goes through the SMMU unless the bus bypasses it.
+            smmu: self.smmu.as_ref().map(|_| IortSmmu {
+                base: VIRT_SMMU,
+                gsi: spi(VIRT_SMMU_IRQ),
+                rc_id_maps: if self.iommu_bypass { Vec::new() } else { vec![(0, 0x100)] },
+            }),
         };
         arm_virt::build(&acpi)
     }
@@ -1254,6 +1368,9 @@ impl VirtMachine {
             s.current().reset();
         }
         self.gpex.reset();
+        if let Some(s) = &self.smmu {
+            s.reset();
+        }
         let fwc = self.fw_cfg.state();
         fwc.reset();
         fwc.machine_reset(Vec::new(), Vec::new()).map_err(err)?;

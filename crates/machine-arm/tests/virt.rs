@@ -9,13 +9,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use ruvm_hw_pci::MsiMessage;
-use ruvm_hw_virtio::VirtioPciProps;
 use ruvm_hw_virtio::rng::{RandomFile, VirtioRng, VirtioRngConf};
+use ruvm_hw_virtio::{VirtioPci, VirtioPciProps};
 use ruvm_jit::cpu_exec::cpu_exec;
 use ruvm_jit::{Vcpu, excp};
 use ruvm_machine_arm::virt::{
     VIRT_FW_CFG, VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_MEM, VIRT_MMIO, VIRT_PCIE_MMIO,
-    VIRT_PCIE_PIO, VIRT_RTC, VIRT_UART, VirtConfig, VirtMachine, VirtMsi, VirtRequest,
+    VIRT_PCIE_PIO, VIRT_RTC, VIRT_SMMU, VIRT_UART, VirtConfig, VirtIommu, VirtMachine, VirtMsi,
+    VirtRequest,
 };
 use ruvm_mem::{Endian, MemTxAttrs};
 use ruvm_target_arm::cpu::ArmCpuModel;
@@ -278,6 +279,17 @@ fn dtb_a57_smp130_matches_qemu() {
     let mut cfg = VirtConfig::new(model("cortex-a57"));
     cfg.smp = 130;
     compare(cfg, "virt-a57-smp130-its.dtb.gz");
+}
+
+#[test]
+fn dtb_a57_smmuv3_matches_qemu() {
+    // iommu=smmuv3: the SMMUv3 node after the PCIe node and its iommu-map.
+    let mut cfg = VirtConfig::new(model("cortex-a57"));
+    cfg.iommu = VirtIommu::SmmuV3;
+    compare(cfg.clone(), "virt-a57-smmuv3.dtb.gz");
+    // default-bus-bypass-iommu=on keeps the SMMU but drops the iommu-map.
+    cfg.default_bus_bypass_iommu = true;
+    compare(cfg, "virt-a57-smmuv3-bypass.dtb.gz");
 }
 
 /// A chardev that drops what it is given.
@@ -722,6 +734,45 @@ fn w(m: &VirtMachine, addr: u64, size: u32, v: u64) {
     assert!(r.is_ok(), "write of {addr:#x} failed");
 }
 
+/// Turns on the LPIs of CPU 0 and the ITS, and maps event 0 of `devid` to LPI 8192, which
+/// is enabled. Gives a check of whether that LPI is pending.
+fn its_map_lpi(m: &VirtMachine, devid: u64) -> impl Fn(&VirtMachine) -> bool + use<> {
+    // LPI 8192 enabled in the property table, and the LPIs of CPU 0 on.
+    let (propbase, pendbase) = (VIRT_MEM + 0x100_0000, VIRT_MEM + 0x101_0000);
+    let (dt, ct, cmdq, itt) = (
+        VIRT_MEM + 0x110_0000,
+        VIRT_MEM + 0x120_0000,
+        VIRT_MEM + 0x130_0000,
+        VIRT_MEM + 0x140_0000,
+    );
+    w(m, propbase, 1, 0xa1);
+    w(m, VIRT_GIC_REDIST + 0x70, 8, propbase | 0xf);
+    w(m, VIRT_GIC_REDIST + 0x78, 8, pendbase);
+    w(m, VIRT_GIC_REDIST, 4, 1);
+    // The device and collection tables, the command queue, and the ITS on.
+    for (reg, base) in [(0x100, dt), (0x108, ct)] {
+        let baser = u64::from(r32(m, VIRT_GIC_ITS + reg + 4)) << 32;
+        w(m, VIRT_GIC_ITS + reg, 8, baser | (1 << 63) | base);
+    }
+    w(m, VIRT_GIC_ITS + 0x80, 8, (1 << 63) | cmdq);
+    w(m, VIRT_GIC_ITS, 4, 1);
+    // MAPD of 00:02.0 with five bits of event ID, MAPC of collection 0 to CPU 0, and MAPTI of
+    // event 0 to LPI 8192.
+    let cmds: [[u64; 4]; 3] = [
+        [0x08 | (devid << 32), 4, (1 << 63) | itt, 0],
+        [0x09, 0, 1 << 63, 0],
+        [0x0a | (devid << 32), 8192 << 32, 0, 0],
+    ];
+    for (i, c) in cmds.iter().enumerate() {
+        for (j, word) in c.iter().enumerate() {
+            w(m, cmdq + 32 * i as u64 + 8 * j as u64, 8, *word);
+        }
+    }
+    w(m, VIRT_GIC_ITS + 0x88, 8, 32 * cmds.len() as u64);
+    assert_eq!(r32(m, VIRT_GIC_ITS + 0x90), 32 * cmds.len() as u32, "GITS_CREADR");
+    move |m| read(m, pendbase + 8192 / 8, 1)[0] & 1 != 0
+}
+
 #[test]
 fn msi_through_the_its() {
     let rng =
@@ -735,45 +786,12 @@ fn msi_through_the_its() {
     let typer = u64::from(r32(&m, VIRT_GIC_ITS + 8)) | u64::from(r32(&m, VIRT_GIC_ITS + 12)) << 32;
     assert_eq!(typer, (1 << 36) | (0xf << 32) | (0xf << 13) | (0xf << 8) | 0xb1);
 
-    // LPI 8192 enabled in the property table, and the LPIs of CPU 0 on.
-    let (propbase, pendbase) = (VIRT_MEM + 0x100_0000, VIRT_MEM + 0x101_0000);
-    let (dt, ct, cmdq, itt) = (
-        VIRT_MEM + 0x110_0000,
-        VIRT_MEM + 0x120_0000,
-        VIRT_MEM + 0x130_0000,
-        VIRT_MEM + 0x140_0000,
-    );
-    w(&m, propbase, 1, 0xa1);
-    w(&m, VIRT_GIC_REDIST + 0x70, 8, propbase | 0xf);
-    w(&m, VIRT_GIC_REDIST + 0x78, 8, pendbase);
-    w(&m, VIRT_GIC_REDIST, 4, 1);
-    // The device and collection tables, the command queue, and the ITS on.
-    for (reg, base) in [(0x100, dt), (0x108, ct)] {
-        let baser = u64::from(r32(&m, VIRT_GIC_ITS + reg + 4)) << 32;
-        w(&m, VIRT_GIC_ITS + reg, 8, baser | (1 << 63) | base);
-    }
-    w(&m, VIRT_GIC_ITS + 0x80, 8, (1 << 63) | cmdq);
-    w(&m, VIRT_GIC_ITS, 4, 1);
-    // MAPD of 00:02.0 with five bits of event ID, MAPC of collection 0 to CPU 0, and MAPTI of
-    // event 0 to LPI 8192.
     let devid = u64::from(dev.pci_dev().requester_id());
     assert_eq!(devid, 0x10);
-    let cmds: [[u64; 4]; 3] = [
-        [0x08 | (devid << 32), 4, (1 << 63) | itt, 0],
-        [0x09, 0, 1 << 63, 0],
-        [0x0a | (devid << 32), 8192 << 32, 0, 0],
-    ];
-    for (i, c) in cmds.iter().enumerate() {
-        for (j, word) in c.iter().enumerate() {
-            w(&m, cmdq + 32 * i as u64 + 8 * j as u64, 8, *word);
-        }
-    }
-    w(&m, VIRT_GIC_ITS + 0x88, 8, 32 * cmds.len() as u64);
-    assert_eq!(r32(&m, VIRT_GIC_ITS + 0x90), 32 * cmds.len() as u32, "GITS_CREADR");
+    let lpi_pending = its_map_lpi(&m, devid);
 
     let ecam = m.memmap().ecam.base;
     let msg = MsiMessage { address: VIRT_GIC_ITS + 0x1_0040, data: 0 };
-    let lpi_pending = |m: &VirtMachine| read(m, pendbase + 8192 / 8, 1)[0] & 1 != 0;
     // Not a bus master yet, so nothing is sent.
     dev.pci_dev().msi_send_message(msg);
     assert!(!lpi_pending(&m));
@@ -952,4 +970,74 @@ fn tcg_system_hello() {
     let out = String::from_utf8(host.console.lock().unwrap().clone()).unwrap();
     assert_eq!(out, "Hello World\n");
     assert_eq!(*host.exit.lock().unwrap(), Some(0));
+}
+
+/// With `iommu=smmuv3` a function's MSIs go through the SMMU: an aborting stream table entry
+/// drops them, and with the SMMU off they pass through to the ITS. The IORT sends the root
+/// bus to the SMMU node and the SMMU on to the ITS.
+#[test]
+fn msi_through_the_smmu() {
+    let rng = Box::new(VirtioRng::new(Box::new(RandomFile::default()), VirtioRngConf::default()));
+    let cfg = VirtConfig { iommu: VirtIommu::SmmuV3, ..VirtConfig::default() };
+    let mut m = VirtMachine::new(cfg).unwrap();
+    let dev = m.attach_virtio_pci(rng, Some(2 << 3), &VirtioPciProps::default()).unwrap();
+    m.machine_done().unwrap();
+    // SMMU_IDR0: two level stream tables, stage 1 and stage 2, and the AArch64 tables.
+    assert_eq!(r32(&m, VIRT_SMMU) & 0xf, 0xb);
+    let devid = u64::from(dev.pci_dev().requester_id());
+    let lpi_pending = its_map_lpi(&m, devid);
+    let ecam = m.memmap().ecam.base;
+    w(&m, ecam + (2 << 15) + 4, 2, 0x6);
+
+    // A linear stream table of 32 entries whose entry for the function is valid and aborts.
+    let strtab = VIRT_MEM + 0x150_0000;
+    w(&m, strtab + devid * 64, 8, 1);
+    w(&m, VIRT_SMMU + 0x80, 8, strtab);
+    w(&m, VIRT_SMMU + 0x88, 4, 5);
+    w(&m, VIRT_SMMU + 0x20, 4, 1);
+    assert_eq!(r32(&m, VIRT_SMMU + 0x24), 1, "CR0ACK");
+    let msg = MsiMessage { address: VIRT_GIC_ITS + 0x1_0040, data: 0 };
+    dev.pci_dev().msi_send_message(msg);
+    assert!(!lpi_pending(&m));
+    // With the SMMU off and SMMU_GBPA not aborting, the message goes through untranslated.
+    w(&m, VIRT_SMMU + 0x20, 4, 0);
+    dev.pci_dev().msi_send_message(msg);
+    assert!(lpi_pending(&m));
+
+    // A system reset turns the SMMU off again.
+    w(&m, VIRT_SMMU + 0x20, 4, 1);
+    m.system_reset().unwrap();
+    assert_eq!(r32(&m, VIRT_SMMU + 0x24), 0);
+
+    let tables = m.acpi_tables();
+    let data = &tables.table_data;
+    let at = data.windows(4).position(|w| w == b"IORT").unwrap();
+    let len = u32::from_le_bytes(data[at + 4..at + 8].try_into().unwrap()) as usize;
+    let iort = &data[at..at + len];
+    let r = |o: usize| u32::from_le_bytes(iort[o..o + 4].try_into().unwrap());
+    // The ITS group, the SMMUv3 node at 0x09050000 with GSIs 106 to 109, and the root complex
+    // with bus 0 to the SMMU and the other requester IDs to the ITS.
+    assert_eq!(len, 48 + 24 + 88 + 36 + 2 * 20);
+    assert_eq!(iort[72..76], [4, 88, 0, 4]);
+    assert_eq!(r(72 + 16), VIRT_SMMU as u32);
+    assert_eq!(r(72 + 44), 106);
+    assert_eq!([r(196), r(200), r(208)], [0, 0xff, 72]);
+    assert_eq!([r(216), r(220), r(228)], [0x100, 0xfeff, 48]);
+}
+
+/// `iommu_platform` offers VIRTIO_F_IOMMU_PLATFORM, which a legacy capable function refuses.
+#[test]
+fn virtio_iommu_platform() {
+    let rng =
+        || Box::new(VirtioRng::new(Box::new(RandomFile::default()), VirtioRngConf::default()));
+    let cfg = VirtConfig { iommu: VirtIommu::SmmuV3, ..VirtConfig::default() };
+    let m = VirtMachine::new(cfg).unwrap();
+    let e = m.attach_virtio_pci_with(rng(), None, &VirtioPciProps::default(), true).unwrap_err();
+    assert!(e.contains("VIRTIO_F_IOMMU_PLATFORM was supported by neither legacy"), "{e}");
+    let props = VirtioPciProps { disable_legacy: Some(true), ..VirtioPciProps::default() };
+    let on = m.attach_virtio_pci_with(rng(), None, &props, true).unwrap();
+    let off = m.attach_virtio_pci(rng(), None, &props).unwrap();
+    let offered = |d: &VirtioPci| d.with_backend(|b| b.vdev().host_has_feature(33)).unwrap();
+    assert!(offered(&on));
+    assert!(!offered(&off));
 }

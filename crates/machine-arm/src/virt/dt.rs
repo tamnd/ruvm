@@ -12,11 +12,12 @@ use super::{
     VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GIC_REDIST_SIZE, VIRT_MMIO, VIRT_MMIO_IRQ,
     VIRT_MMIO_SIZE, VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE,
     VIRT_PLATFORM_BUS, VIRT_PLATFORM_BUS_SIZE, VIRT_RTC, VIRT_RTC_IRQ, VIRT_RTC_SIZE,
-    VIRT_SECURE_MEM, VIRT_SECURE_MEM_SIZE, VIRT_UART, VIRT_UART_IRQ, VIRT_UART_SIZE, VIRT_UART1,
-    VIRT_UART1_IRQ, VIRTIO_TRANSPORTS, VirtMemmap,
+    VIRT_SECURE_MEM, VIRT_SECURE_MEM_SIZE, VIRT_SMMU, VIRT_SMMU_IRQ, VIRT_UART, VIRT_UART_IRQ,
+    VIRT_UART_SIZE, VIRT_UART1, VIRT_UART1_IRQ, VIRTIO_TRANSPORTS, VirtMemmap,
 };
 use crate::fdt::{Fdt, sized_cells};
 use ruvm_hw_intc::gicv3::{GICV3_DIST_SIZE, ITS_SIZE};
+use ruvm_hw_iommu::SMMU_SIZE;
 
 /// `GIC_FDT_IRQ_TYPE_SPI`.
 const GIC_FDT_IRQ_TYPE_SPI: u32 = 0;
@@ -480,6 +481,31 @@ pub(crate) fn create_pcie(
     setprop_sized_cells(fdt, &nodename, "ranges", &ranges)?;
     fdt.setprop_cell(&nodename, "#interrupt-cells", 1)?;
     create_pcie_irq_map(fdt, gic_phandle, first_irq, &nodename)
+}
+
+/// The FDT end of `create_pcie()` with `iommu=smmuv3`: `create_smmuv3_dt_bindings()` for the
+/// SMMUv3 at `VIRT_SMMU`, then, when the root bus does not bypass it (`iommu_map`), the
+/// `iommu-map` that sends every requester ID of the PCIe node to it.
+pub(crate) fn create_smmu(fdt: &mut Fdt, iommu_map: bool) -> Result<(), String> {
+    let phandle = fdt.alloc_phandle();
+    let node = format!("/smmuv3@{VIRT_SMMU:x}");
+    fdt.add_subnode(&node)?;
+    fdt.setprop(&node, "compatible", b"arm,smmu-v3\0")?;
+    setprop_sized_cells(fdt, &node, "reg", &[(2, VIRT_SMMU), (2, SMMU_SIZE)])?;
+    let mut irqs = Vec::with_capacity(12);
+    for i in 0..4 {
+        irqs.extend([GIC_FDT_IRQ_TYPE_SPI, VIRT_SMMU_IRQ + i, GIC_FDT_IRQ_FLAGS_EDGE_LO_HI]);
+    }
+    fdt.setprop_cells(&node, "interrupts", &irqs)?;
+    fdt.setprop(&node, "interrupt-names", b"eventq\0priq\0cmdq-sync\0gerror\0")?;
+    fdt.setprop(&node, "dma-coherent", &[])?;
+    fdt.setprop_cell(&node, "#iommu-cells", 1)?;
+    fdt.setprop_cell(&node, "phandle", phandle)?;
+    if !iommu_map {
+        return Ok(());
+    }
+    let pcie = format!("/pcie@{VIRT_PCIE_MMIO:x}");
+    fdt.setprop_cells(&pcie, "iommu-map", &[0, phandle, 0, 0x10000])
 }
 
 /// The FDT part of `create_virtio_devices()`. The nodes go in from the highest address down

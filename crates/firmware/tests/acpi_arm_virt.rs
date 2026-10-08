@@ -9,7 +9,8 @@
 mod common;
 
 use ruvm_firmware::acpi::arm_virt::{
-    self, ArmVirtAcpi, NumaNode, PossibleCpu, PsciConduit, VIRTUAL_PMU_IRQ, VirtIrqs, VirtMemmap,
+    self, ArmVirtAcpi, IortSmmu, NumaNode, PossibleCpu, PsciConduit, VIRTUAL_PMU_IRQ, VirtIrqs,
+    VirtMemmap,
 };
 use ruvm_firmware::acpi::gpex::Window;
 use ruvm_firmware::acpi::linker::Command;
@@ -63,6 +64,7 @@ fn base() -> ArmVirtAcpi {
         spcr: true,
         pci_devices: vec![pci(0), pci(8)],
         numa: Vec::new(),
+        smmu: None,
     }
 }
 
@@ -282,6 +284,50 @@ fn madt_and_iort_with_its() {
     let map = &rc[36..];
     let r = |o: usize| u32::from_le_bytes(map[o..o + 4].try_into().unwrap());
     assert_eq!([r(0), r(4), r(8), r(12), r(16)], [0, 0xffff, 0, 48, 0]);
+}
+
+/// The `smmuv3-legacy` test: `iommu=smmuv3` with a GICv2, so no ITS, and three host bridges,
+/// the root bus with a root port (buses 0 and 1), a pxb-pcie at bus 0x10 and one at 0x20 that
+/// bypasses the IOMMU. The SMMU node has no ID mappings and the root complex sends the first
+/// two bus ranges to it.
+#[test]
+fn iort_smmuv3_legacy() {
+    let mut m = base();
+    m.memmap.gic_its = None;
+    m.smmu = Some(IortSmmu {
+        base: 0x0905_0000,
+        gsi: 74 + 32,
+        rc_id_maps: vec![(0, 0x200), (0x1000, 0x100)],
+    });
+    check(&m, "IORT", "IORT.smmuv3-legacy");
+}
+
+/// `iommu=smmuv3` with the ITS: the SMMU maps its IDs to the ITS group, and the root complex
+/// sends bus 0 to the SMMU and the rest straight to the ITS.
+#[test]
+fn iort_smmuv3_with_its() {
+    let mut m = base();
+    m.smmu = Some(IortSmmu { base: 0x0905_0000, gsi: 106, rc_id_maps: vec![(0, 0x100)] });
+    let iort = common::table(&load(&arm_virt::build(&m)), "IORT");
+    let r = |o: usize| u32::from_le_bytes(iort[o..o + 4].try_into().unwrap());
+    assert_eq!(iort.len(), 48 + 24 + 88 + 36 + 2 * 20);
+    assert_eq!(r(36), 3, "nodes");
+    let smmu = 72;
+    assert_eq!(iort[smmu..smmu + 4], [4, 88, 0, 4]);
+    assert_eq!([r(smmu + 8), r(smmu + 12)], [1, 68], "ID mappings");
+    assert_eq!(r(smmu + 16), 0x0905_0000);
+    assert_eq!([r(smmu + 44), r(smmu + 48), r(smmu + 52), r(smmu + 56)], [106, 107, 109, 108]);
+    let map = smmu + 68;
+    assert_eq!([r(map), r(map + 4), r(map + 8), r(map + 12)], [0, 0xffff, 0, 48]);
+    let rc = smmu + 88;
+    assert_eq!(iort[rc..rc + 4], [2, 76, 0, 3]);
+    assert_eq!([r(rc + 4), r(rc + 8)], [2, 2], "identifier and mappings");
+    let maps = rc + 36;
+    assert_eq!([r(maps), r(maps + 4), r(maps + 8), r(maps + 12)], [0, 0xff, 0, 72]);
+    assert_eq!(
+        [r(maps + 20), r(maps + 24), r(maps + 28), r(maps + 32)],
+        [0x100, 0xfeff, 0x100, 48]
+    );
 }
 
 /// Without the GED, as when a kernel is booted with no firmware, the PL061 raises the power

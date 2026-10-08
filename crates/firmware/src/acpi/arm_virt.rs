@@ -8,10 +8,12 @@
 //! virtio-mmio transports, the PCIe host bridge, then the GED (with firmware) or the PL061
 //! GPIO controller that raises the power button, the power button, the error device and the
 //! functions on the root bus. The MADT describes a GICv3: the distributor, a GICC per CPU,
-//! the redistributor regions and the ITS. The IORT has the ITS group and the root complex,
-//! whose requester IDs all go to the ITS.
+//! the redistributor regions and the ITS. The IORT has the ITS group, the SMMUv3 of
+//! `iommu=smmuv3` and the root complex, whose requester IDs go to the SMMU or straight to the
+//! ITS.
 //!
-//! Not built: the GICv2 and GICv2m forms of the MADT and the IORT, the SMMUv3 nodes, the
+//! Not built: the GICv2 and GICv2m forms of the MADT, the IORT of the GICv2m, the SMMUv3
+//! nodes of `-device arm-smmuv3` and their RMR nodes, the
 //! cache nodes of the PPTT (`smp-cache`), HEST (`ras=on`), HMAT, the GWDT and WDAT, CEDT,
 //! NFIT, TPM2 and VIOT, and the memory hotplug and ACPI PCI hotplug AML, since ruvm has none
 //! of those devices.
@@ -55,6 +57,8 @@ const IORT_NODE_OFFSET: u32 = 48;
 const ROOT_COMPLEX_ENTRY_SIZE: u32 = 36;
 /// `ID_MAPPING_ENTRY_SIZE`.
 const ID_MAPPING_ENTRY_SIZE: u32 = 20;
+/// `SMMU_V3_ENTRY_SIZE`.
+const SMMU_V3_ENTRY_SIZE: u32 = 68;
 
 /// `ACPI_FADT_ARM_PSCI_COMPLIANT`.
 const ACPI_FADT_ARM_PSCI_COMPLIANT: u16 = 1 << 0;
@@ -153,6 +157,21 @@ pub struct ArmVirtAcpi {
     /// The functions on the PCIe root bus.
     pub pci_devices: Vec<PciDevice>,
     pub numa: Vec<NumaNode>,
+    /// The SMMUv3 of `iommu=smmuv3`, `legacy_smmuv3_present`.
+    pub smmu: Option<IortSmmu>,
+}
+
+/// The machine wide SMMUv3 as the IORT describes it, `AcpiIortSMMUv3Dev`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IortSmmu {
+    /// The base of its register frame.
+    pub base: u64,
+    /// The GSI of its first interrupt, the event queue. PRI, sync and global error follow.
+    pub gsi: u32,
+    /// The requester ID ranges that go through it, as input base and count, sorted by input
+    /// base: the bus range of each host bridge that does not bypass the IOMMU, from bus
+    /// `min << 8` for `(max - min + 1) << 8` IDs.
+    pub rc_id_maps: Vec<(u32, u32)>,
 }
 
 /// `acpi_dsdt_add_cpus()`.
@@ -562,24 +581,60 @@ fn build_srat(tbl: &mut Vec<u8>, linker: &mut BiosLinker, s: &ArmVirtAcpi) {
 }
 
 /// `build_iort_id_mapping()`.
-fn append_iort_id_mapping(tbl: &mut Vec<u8>, input_base: u32, id_count: u32, out_ref: u32) {
+fn append_iort_id_mapping(
+    tbl: &mut Vec<u8>,
+    input_base: u32,
+    id_count: u32,
+    out_ref: u32,
+    flags: u32,
+) {
     // Table 4 ID mapping format
     append_int_noprefix(tbl, input_base.into(), 4); // Input base
     // Number of IDs - The number of IDs in the range minus one
     append_int_noprefix(tbl, (id_count - 1).into(), 4);
     append_int_noprefix(tbl, input_base.into(), 4); // Output base
     append_int_noprefix(tbl, out_ref.into(), 4); // Output Reference
-    append_int_noprefix(tbl, 0, 4); // Flags
+    append_int_noprefix(tbl, flags.into(), 4); // Flags
 }
 
-/// `build_iort()` without SMMUv3 nodes (IO Remapping Table, E.b).
+/// `create_rc_its_idmaps()`: the requester ID ranges outside those of `smmu`, which go
+/// straight to the ITS group.
+fn rc_its_idmaps(smmu: &IortSmmu) -> Vec<(u32, u32)> {
+    let mut maps = Vec::new();
+    let mut next = 0;
+    for &(input_base, id_count) in &smmu.rc_id_maps {
+        if next < input_base {
+            maps.push((next, input_base - next));
+        }
+        next = input_base + id_count;
+    }
+    // Requester IDs are 16 bits, so the last range ends at 0x10000.
+    if next < 0x10000 {
+        maps.push((next, 0x10000 - next));
+    }
+    maps
+}
+
+/// `build_iort()` with the legacy SMMUv3 only (IO Remapping Table, E.b).
 fn build_iort(tbl: &mut Vec<u8>, linker: &mut BiosLinker, s: &ArmVirtAcpi) {
     let its = s.memmap.gic_its.is_some();
     let table = AcpiTable::begin("IORT", 5, &s.oem_id, &s.oem_table_id, tbl);
     let mut id = 0u64;
 
-    // RC and ITS with a direct map to the ITS, or the RC alone with no output mapping.
-    let (nb_nodes, rc_mapping_count) = if its { (2, 1) } else { (1, 0) };
+    let its_maps = match &s.smmu {
+        Some(smmu) if its => rc_its_idmaps(smmu),
+        _ => Vec::new(),
+    };
+    let (nb_nodes, rc_mapping_count) = match &s.smmu {
+        // RC and SMMUv3, and the ITS with the IDs that bypass the SMMU.
+        Some(smmu) => {
+            let n = smmu.rc_id_maps.len() as u32;
+            if its { (3, n + its_maps.len() as u32) } else { (2, n) }
+        }
+        // RC and ITS with a direct map to the ITS, or the RC alone with no output mapping.
+        None if its => (2, 1),
+        None => (1, 0),
+    };
     append_int_noprefix(tbl, nb_nodes, 4); // Number of IORT Nodes
     append_int_noprefix(tbl, IORT_NODE_OFFSET.into(), 4); // Offset to Array of IORT Nodes
     append_int_noprefix(tbl, 0, 4); // Reserved
@@ -596,6 +651,39 @@ fn build_iort(tbl: &mut Vec<u8>, linker: &mut BiosLinker, s: &ArmVirtAcpi) {
         append_int_noprefix(tbl, 0, 4); // Reference to ID Array
         append_int_noprefix(tbl, 1, 4); // Number of ITSs
         append_int_noprefix(tbl, 0, 4); // GIC ITS Identifier Array: MADT translation_id
+    }
+
+    let mut smmu_offset = 0;
+    if let Some(smmu) = &s.smmu {
+        // The ITS group node when there is an ITS, or no ID mappings at all.
+        let (mapping_count, offset_to_id_array) =
+            if its { (1, SMMU_V3_ENTRY_SIZE) } else { (0, 0) };
+        smmu_offset = (tbl.len() - table.offset()) as u32;
+        // Table 9 SMMUv3 Format
+        tbl.push(4); // Type: SMMUv3
+        let node_size = SMMU_V3_ENTRY_SIZE + ID_MAPPING_ENTRY_SIZE * mapping_count;
+        append_int_noprefix(tbl, node_size.into(), 2); // Length
+        tbl.push(4); // Revision
+        append_int_noprefix(tbl, 0, 4); // Identifier
+        id += 1; // advance the shared counter for the uniqueness of the RC node
+        append_int_noprefix(tbl, mapping_count.into(), 4); // Number of ID mappings
+        append_int_noprefix(tbl, offset_to_id_array.into(), 4); // Reference to ID Array
+        append_int_noprefix(tbl, smmu.base, 8); // Base address
+        append_int_noprefix(tbl, 1, 4); // Flags: COHACC Override
+        append_int_noprefix(tbl, 0, 4); // Reserved
+        append_int_noprefix(tbl, 0, 8); // VATOS address
+        append_int_noprefix(tbl, 0, 4); // Model: Generic SMMU-v3
+        append_int_noprefix(tbl, smmu.gsi.into(), 4); // Event
+        append_int_noprefix(tbl, (smmu.gsi + 1).into(), 4); // PRI
+        append_int_noprefix(tbl, (smmu.gsi + 3).into(), 4); // GERR
+        append_int_noprefix(tbl, (smmu.gsi + 2).into(), 4); // Sync
+        append_int_noprefix(tbl, 0, 4); // Proximity domain
+        // DeviceID mapping index, ignored since the interrupts are GSIV based
+        append_int_noprefix(tbl, 0, 4);
+        if its {
+            // Output IORT node is the ITS group node (the first node).
+            append_iort_id_mapping(tbl, 0, 0x10000, IORT_NODE_OFFSET, 0);
+        }
     }
 
     // Table 17 Root Complex Node
@@ -617,9 +705,19 @@ fn build_iort(tbl: &mut Vec<u8>, linker: &mut BiosLinker, s: &ArmVirtAcpi) {
     tbl.push(64); // Memory address size limit
     append_int_noprefix(tbl, 0, 3); // Reserved
 
-    // Map all requester IDs to the ITS Group node directly, since there is no SMMU.
-    if its {
-        append_iort_id_mapping(tbl, 0, 0x10000, IORT_NODE_OFFSET);
+    if let Some(smmu) = &s.smmu {
+        // The requester IDs that go through the SMMU: RC -> SMMUv3. The SMMUv3 node maps its
+        // IDs on to the ITS group.
+        for &(input_base, id_count) in &smmu.rc_id_maps {
+            append_iort_id_mapping(tbl, input_base, id_count, smmu_offset, 0);
+        }
+        // The bypassed ones go to the ITS group directly: RC -> ITS.
+        for &(input_base, id_count) in &its_maps {
+            append_iort_id_mapping(tbl, input_base, id_count, IORT_NODE_OFFSET, 0);
+        }
+    } else if its {
+        // Map all requester IDs to the ITS Group node directly, since there is no SMMU.
+        append_iort_id_mapping(tbl, 0, 0x10000, IORT_NODE_OFFSET, 0);
     }
     table.end(Some(linker), tbl);
 }
