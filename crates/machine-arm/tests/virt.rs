@@ -8,15 +8,16 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use ruvm_hw_pci::MsiMessage;
 use ruvm_hw_virtio::VirtioPciProps;
 use ruvm_hw_virtio::rng::{RandomFile, VirtioRng, VirtioRngConf};
 use ruvm_jit::cpu_exec::cpu_exec;
 use ruvm_jit::{Vcpu, excp};
 use ruvm_machine_arm::virt::{
-    VIRT_FW_CFG, VIRT_GIC_DIST, VIRT_MEM, VIRT_MMIO, VIRT_PCIE_MMIO, VIRT_PCIE_PIO, VIRT_RTC,
-    VIRT_UART, VirtConfig, VirtMachine, VirtRequest,
+    VIRT_FW_CFG, VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_MEM, VIRT_MMIO, VIRT_PCIE_MMIO,
+    VIRT_PCIE_PIO, VIRT_RTC, VIRT_UART, VirtConfig, VirtMachine, VirtMsi, VirtRequest,
 };
-use ruvm_mem::MemTxAttrs;
+use ruvm_mem::{Endian, MemTxAttrs};
 use ruvm_target_arm::cpu::ArmCpuModel;
 use ruvm_target_arm::tcg::{PSCI_OFF, PSCI_ON, SemihostingHost, new_jit, save_vcpu};
 
@@ -210,7 +211,13 @@ fn header(blob: &[u8]) -> (u32, u32, u32) {
     (be32(blob, 4), be32(blob, 20), be32(blob, 28))
 }
 
-fn compare_with_qemu(cfg: VirtConfig, dump: &str) {
+/// Compares the board's tree with a dump of gen.sh's `$M`, which has `its=off`.
+fn compare_with_qemu(mut cfg: VirtConfig, dump: &str) {
+    cfg.msi = VirtMsi::Off;
+    compare(cfg, dump);
+}
+
+fn compare(cfg: VirtConfig, dump: &str) {
     let mut m = VirtMachine::new(cfg).unwrap();
     m.machine_done().unwrap();
     let ours = m.fdt().as_bytes().to_vec();
@@ -255,6 +262,22 @@ fn dtb_a76_smp20_matches_qemu() {
     cfg.smp = 20;
     cfg.ram_size = 256 * MIB;
     compare_with_qemu(cfg, "virt-a76-smp20.dtb.gz");
+}
+
+#[test]
+fn dtb_a57_its_matches_qemu() {
+    // The default msi=auto: the ITS node under the GIC and the msi-map of the PCIe node.
+    let mut cfg = VirtConfig::new(model("cortex-a57"));
+    cfg.smp = 2;
+    compare(cfg, "virt-a57-smp2-its.dtb.gz");
+}
+
+#[test]
+fn dtb_a57_smp130_matches_qemu() {
+    // 123 redistributors fill the low region, so the other 7 go to the high one.
+    let mut cfg = VirtConfig::new(model("cortex-a57"));
+    cfg.smp = 130;
+    compare(cfg, "virt-a57-smp130-its.dtb.gz");
 }
 
 /// A chardev that drops what it is given.
@@ -398,11 +421,23 @@ fn memory_map() {
 fn config_errors() {
     let mut cfg = a57();
     cfg.smp = 124;
+    cfg.highmem.redists = false;
     assert_eq!(
         VirtMachine::new(cfg).unwrap_err(),
         "Number of SMP CPUs requested (124) exceeds max CPUs supported by machine 'mach-virt' \
-         (123)"
+         (123)\nTry 'highmem-redists=on' for more CPUs"
     );
+    // The high region has room for 512 more.
+    let mut cfg = a57();
+    cfg.max_cpus = Some(636);
+    assert_eq!(
+        VirtMachine::new(cfg).unwrap_err(),
+        "Number of SMP CPUs requested (636) exceeds max CPUs supported by machine 'mach-virt' \
+         (635)"
+    );
+    let mut cfg = a57();
+    cfg.msi = VirtMsi::Gicv2m;
+    assert_eq!(VirtMachine::new(cfg).unwrap_err(), "msi=gicv2m is not supported by ruvm yet");
     let mut cfg = a57();
     let bits = cfg.cpu.pamax();
     cfg.ram_size = 1 << bits;
@@ -675,6 +710,88 @@ fn pcie_host() {
     let pcie = pcie.unwrap();
     let bus_range = pcie.props.iter().find(|(n, _)| n == "bus-range").unwrap();
     assert_eq!(bus_range.1, [0, 0, 0, 0, 0, 0, 0, 15]);
+}
+
+fn w(m: &VirtMachine, addr: u64, size: u32, v: u64) {
+    let r = m.memory_as().store(addr, size, v, Endian::Little, U);
+    assert!(r.is_ok(), "write of {addr:#x} failed");
+}
+
+#[test]
+fn msi_through_the_its() {
+    let rng =
+        || Box::new(VirtioRng::new(Box::new(RandomFile::default()), VirtioRngConf::default()));
+    let mut m = VirtMachine::new(VirtConfig::default()).unwrap();
+    let props = VirtioPciProps::default();
+    let dev = m.attach_virtio_pci(rng(), Some(2 << 3), &props).unwrap();
+    let other = m.attach_virtio_pci(rng(), Some(3 << 3), &props).unwrap();
+    m.machine_done().unwrap();
+    // GITS_TYPER: physical LPIs, 16 bits of device and event ID.
+    let typer = u64::from(r32(&m, VIRT_GIC_ITS + 8)) | u64::from(r32(&m, VIRT_GIC_ITS + 12)) << 32;
+    assert_eq!(typer, (1 << 36) | (0xf << 32) | (0xf << 13) | (0xf << 8) | 0xb1);
+
+    // LPI 8192 enabled in the property table, and the LPIs of CPU 0 on.
+    let (propbase, pendbase) = (VIRT_MEM + 0x100_0000, VIRT_MEM + 0x101_0000);
+    let (dt, ct, cmdq, itt) = (
+        VIRT_MEM + 0x110_0000,
+        VIRT_MEM + 0x120_0000,
+        VIRT_MEM + 0x130_0000,
+        VIRT_MEM + 0x140_0000,
+    );
+    w(&m, propbase, 1, 0xa1);
+    w(&m, VIRT_GIC_REDIST + 0x70, 8, propbase | 0xf);
+    w(&m, VIRT_GIC_REDIST + 0x78, 8, pendbase);
+    w(&m, VIRT_GIC_REDIST, 4, 1);
+    // The device and collection tables, the command queue, and the ITS on.
+    for (reg, base) in [(0x100, dt), (0x108, ct)] {
+        let baser = u64::from(r32(&m, VIRT_GIC_ITS + reg + 4)) << 32;
+        w(&m, VIRT_GIC_ITS + reg, 8, baser | (1 << 63) | base);
+    }
+    w(&m, VIRT_GIC_ITS + 0x80, 8, (1 << 63) | cmdq);
+    w(&m, VIRT_GIC_ITS, 4, 1);
+    // MAPD of 00:02.0 with five bits of event ID, MAPC of collection 0 to CPU 0, and MAPTI of
+    // event 0 to LPI 8192.
+    let devid = u64::from(dev.pci_dev().requester_id());
+    assert_eq!(devid, 0x10);
+    let cmds: [[u64; 4]; 3] = [
+        [0x08 | (devid << 32), 4, (1 << 63) | itt, 0],
+        [0x09, 0, 1 << 63, 0],
+        [0x0a | (devid << 32), 8192 << 32, 0, 0],
+    ];
+    for (i, c) in cmds.iter().enumerate() {
+        for (j, word) in c.iter().enumerate() {
+            w(&m, cmdq + 32 * i as u64 + 8 * j as u64, 8, *word);
+        }
+    }
+    w(&m, VIRT_GIC_ITS + 0x88, 8, 32 * cmds.len() as u64);
+    assert_eq!(r32(&m, VIRT_GIC_ITS + 0x90), 32 * cmds.len() as u32, "GITS_CREADR");
+
+    let ecam = m.memmap().ecam.base;
+    let msg = MsiMessage { address: VIRT_GIC_ITS + 0x1_0040, data: 0 };
+    let lpi_pending = |m: &VirtMachine| read(m, pendbase + 8192 / 8, 1)[0] & 1 != 0;
+    // Not a bus master yet, so nothing is sent.
+    dev.pci_dev().msi_send_message(msg);
+    assert!(!lpi_pending(&m));
+    // The other function's requester ID has no device table entry.
+    w(&m, ecam + (3 << 15) + 4, 2, 0x6);
+    other.pci_dev().msi_send_message(msg);
+    assert!(!lpi_pending(&m));
+    w(&m, ecam + (2 << 15) + 4, 2, 0x6);
+    dev.pci_dev().msi_send_message(msg);
+    assert!(lpi_pending(&m));
+
+    // msi=off: no ITS, but the GIC keeps its LPIs (GICD_TYPER.LPIS) as in QEMU.
+    let mut cfg = a57();
+    cfg.msi = VirtMsi::Off;
+    let mut m = VirtMachine::new(cfg).unwrap();
+    m.machine_done().unwrap();
+    assert_ne!(r32(&m, VIRT_GIC_DIST + 4) & (1 << 17), 0);
+    let mut b = [0; 4];
+    assert!(!m.memory_as().read(VIRT_GIC_ITS + 8, U, &mut b).is_ok());
+    let nodes = parse(m.fdt().as_bytes());
+    assert!(!nodes.iter().any(|n| n.path.contains("/its@")));
+    let pcie = nodes.iter().find(|n| n.path == "/pcie@10000000").unwrap();
+    assert!(!pcie.props.iter().any(|(n, _)| n == "msi-map"));
 }
 
 fn movz(rd: u32, imm: u32, hw: u32) -> u32 {

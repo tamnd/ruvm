@@ -4,8 +4,11 @@
 //!
 //! # What is there
 //!
-//! RAM (`mach-virt.ram`) at 0x40000000, the GICv3 distributor at 0x08000000 and one
-//! redistributor region at 0x080a0000, the generic timers wired to their PPIs, the PL011 UART at
+//! RAM (`mach-virt.ram`) at 0x40000000, the GICv3 distributor at 0x08000000 and the
+//! redistributors at 0x080a0000, with those of the CPUs past 123 in the high memory region (see
+//! [`memmap`]), the ITS at 0x08080000 with LPIs in the GIC unless `msi=off`, the PCIe functions
+//! sending their MSIs to it with their requester ID (`msi-map`), the generic timers wired to
+//! their PPIs, the PL011 UART at
 //! 0x09000000 (SPI 1), the PL031 RTC at 0x09010000 (SPI 2), the generic PCIe host bridge
 //! (`gpex-pcihost`) with its MMIO window at 0x10000000, its I/O port window at 0x3eff0000, its
 //! ECAM and its high MMIO window above RAM (see [`memmap`]) and INTx on SPIs 3 to 6, fw_cfg
@@ -37,17 +40,14 @@
 //!
 //! These leave a seam for M6:
 //!
-//! - ITS (`its=on`): no `/intc/its` node and no MSI controller, so the PCIe node has no
-//!   `msi-map` and the guest uses INTx. PCI functions still get their MSI-X capability, as in
-//!   QEMU, where `msi_nonbroken` is always set (see `create_pcie()`).
+//! - The GICv2m (`msi=gicv2m`), which only makes sense with the GICv2 that is not modelled
+//!   either.
 //! - SMMUv3 (`iommu=smmuv3`).
 //! - CXL, so the empty `cxl_host_reg` container QEMU maps above the redistributors is not
 //!   there either.
 //! - ACPI (`virt_acpi_setup()`, the GED device) and SMBIOS (`virt_build_smbios()`), so
 //!   `virt_machine_done()` stops after `arm_load_dtb()`. Firmware that wants ACPI tables
 //!   finds none in fw_cfg.
-//! - The high memory redistributor region: its place is worked out, but the GIC only uses the
-//!   low one, so at most 123 CPUs.
 //!
 //! Also missing: the PL061 GPIO with `gpio-keys` and the poweroff key and the secure PL061,
 //! the PMU, NUMA, GICv2 and GICv5, the GICv3 virtual interface (`ICH_*`) and its maintenance
@@ -66,8 +66,6 @@
 //!   exiting. Messages QEMU prints and carries on after go to standard error and are kept in
 //!   [`VirtMachine::messages`].
 //! - The default CPU is cortex-a57; QEMU's is the 32-bit cortex-a15, which is not modelled.
-//! - The CPU limit error leaves out "Try 'highmem-redists=on' for more CPUs", since there is
-//!   no such option here.
 //! - A gzip stream that ends early reports `inflate()` error -5 and corrupt data reports -3,
 //!   as zlib would, but other zlib codes are not reproduced.
 //! - The generic timer deadlines are host [`Instant`]s converted onto the board clock.
@@ -92,7 +90,10 @@ use ruvm_hw_core::fw_cfg::{
 };
 use ruvm_hw_core::timer::TimeSource;
 use ruvm_hw_core::{Clock, IrqLine};
-use ruvm_hw_intc::gicv3::{GICV3_DIST_SIZE, GICV3_REDIST_SIZE, GicV3, GicV3Props};
+use ruvm_hw_intc::gicv3::{
+    GICV3_DIST_SIZE, GICV3_REDIST_SIZE, GicV3, GicV3Its, GicV3Props, ITS_CONTROL_SIZE, ITS_SIZE,
+    ITS_TRANS_SIZE,
+};
 use ruvm_hw_pci::regs::PCI_NUM_PINS;
 use ruvm_hw_pci::{GpexConfig, GpexHost, GpexWindow, MsiTrigger};
 use ruvm_hw_timer::pl031::{PL031_MMIO_SIZE, Pl031};
@@ -125,9 +126,11 @@ pub const VIRT_GIC_DIST: u64 = 0x0800_0000;
 pub const VIRT_GIC_REDIST: u64 = 0x080a_0000;
 /// The size of the `VIRT_GIC_REDIST` window.
 pub const VIRT_GIC_REDIST_SIZE: u64 = 0x00f6_0000;
-/// The most CPUs the GICv3 redistributor window has room for, `virt_max_cpus` in
-/// `machvirt_init()`.
+/// The most CPUs the low GICv3 redistributor window has room for, `virt_redist_capacity()` of
+/// `VIRT_GIC_REDIST`. The high memory region takes the CPUs past these.
 pub const VIRT_GICV3_MAX_CPUS: usize = (VIRT_GIC_REDIST_SIZE / GICV3_REDIST_SIZE) as usize;
+/// `VIRT_GIC_ITS`.
+pub const VIRT_GIC_ITS: u64 = 0x0808_0000;
 /// `VIRT_UART0`.
 pub const VIRT_UART: u64 = 0x0900_0000;
 /// The size of the UART window.
@@ -185,15 +188,32 @@ pub const VIRT_DEFAULT_RAM_SIZE: u64 = 128 << 20;
 /// The RAM region name, `default_ram_id`.
 pub const VIRT_RAM_ID: &str = "mach-virt.ram";
 
+/// The `msi` machine property, which `its` sets too: the MSI controller of the board.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VirtMsi {
+    /// `msi=auto`, the default, which is the ITS with a GICv3.
+    #[default]
+    Auto,
+    /// `msi=its` or `its=on`.
+    Its,
+    /// `msi=gicv2m`, which is not modelled.
+    Gicv2m,
+    /// `msi=off`, or `its=off` with a GICv3.
+    Off,
+}
+
 /// What the board is built from: the `-cpu`, `-smp`, `-m`, `-kernel`, `-initrd`, `-append`,
-/// `-dtb`, `-bios`, `-serial` and `-semihosting` options and the `secure` and
-/// `virtualization` machine properties.
+/// `-dtb`, `-bios`, `-serial` and `-semihosting` options and the `secure`, `virtualization`
+/// and `msi` machine properties.
 #[derive(Clone)]
 pub struct VirtConfig {
     /// The CPU model.
     pub cpu: ArmCpuModel,
     /// The number of CPUs.
     pub smp: usize,
+    /// `maxcpus` of `-smp`, which the redistributor space must have room for. `None` means
+    /// `smp`.
+    pub max_cpus: Option<usize>,
     /// The RAM size in bytes.
     pub ram_size: u64,
     /// `-kernel`.
@@ -212,6 +232,8 @@ pub struct VirtConfig {
     pub mte: bool,
     /// The `highmem*` properties, which place the regions above RAM.
     pub highmem: Highmem,
+    /// The `msi` property.
+    pub msi: VirtMsi,
     /// `-bios`: the firmware image, loaded into the first flash.
     pub firmware: Option<String>,
     /// The drives of the two flashes, `pflash0` and `pflash1` (`-drive if=pflash`).
@@ -238,6 +260,7 @@ impl fmt::Debug for VirtConfig {
         f.debug_struct("VirtConfig")
             .field("cpu", &self.cpu.name)
             .field("smp", &self.smp)
+            .field("max_cpus", &self.max_cpus)
             .field("ram_size", &self.ram_size)
             .field("kernel", &self.kernel)
             .field("initrd", &self.initrd)
@@ -247,6 +270,7 @@ impl fmt::Debug for VirtConfig {
             .field("secure", &self.secure)
             .field("mte", &self.mte)
             .field("highmem", &self.highmem)
+            .field("msi", &self.msi)
             .field("firmware", &self.firmware)
             .field("pflash", &self.pflash)
             .field("serial", &self.serial.is_some())
@@ -263,6 +287,7 @@ impl VirtConfig {
         VirtConfig {
             cpu,
             smp: 1,
+            max_cpus: None,
             ram_size: VIRT_DEFAULT_RAM_SIZE,
             kernel: None,
             initrd: None,
@@ -272,6 +297,7 @@ impl VirtConfig {
             secure: false,
             mte: false,
             highmem: Highmem::default(),
+            msi: VirtMsi::Auto,
             firmware: None,
             pflash: [PflashBacking::None, PflashBacking::None],
             serial: None,
@@ -462,6 +488,7 @@ pub struct VirtMachine {
     arm: Arc<Arm>,
     hub: Arc<CpuHub>,
     gic: Arc<GicV3>,
+    its: Option<Arc<GicV3Its>>,
     uart: Arc<Pl011>,
     uart1: Option<Arc<Pl011>>,
     flash: [Arc<Pflash>; 2],
@@ -521,6 +548,12 @@ impl VirtMachine {
         let ram_size = cfg.ram_size;
 
         let memmap = memmap::virt_set_memmap(VIRT_MEM, ram_size, model.pamax(), &cfg.highmem)?;
+        // finalize_msi_controller(): auto is the ITS with a GICv3.
+        let its_on = match cfg.msi {
+            VirtMsi::Auto | VirtMsi::Its => true,
+            VirtMsi::Off => false,
+            VirtMsi::Gicv2m => return Err("msi=gicv2m is not supported by ruvm yet".to_string()),
+        };
 
         let mem = Arc::new(MemorySystem::new());
         let system = mem.new_container("system", 1 << 64).map_err(err)?;
@@ -561,12 +594,21 @@ impl VirtMachine {
             PsciConduit::Hvc
         };
 
-        let max_cpus = VIRT_GICV3_MAX_CPUS;
-        if smp > max_cpus {
-            return Err(format!(
-                "Number of SMP CPUs requested ({smp}) exceeds max CPUs supported by machine \
-                 'mach-virt' ({max_cpus})"
-            ));
+        // The low redistributor region, and the high one when highmem-redists left it in the
+        // memory map.
+        let redist2_capacity =
+            memmap.high_redist2.map_or(0, |r| (r.size / GICV3_REDIST_SIZE) as usize);
+        let virt_max_cpus = VIRT_GICV3_MAX_CPUS + redist2_capacity;
+        let max_cpus = cfg.max_cpus.unwrap_or(smp);
+        if max_cpus > virt_max_cpus {
+            let mut msg = format!(
+                "Number of SMP CPUs requested ({max_cpus}) exceeds max CPUs supported by \
+                 machine 'mach-virt' ({virt_max_cpus})"
+            );
+            if memmap.high_redist2.is_none() {
+                msg.push_str("\nTry 'highmem-redists=on' for more CPUs");
+            }
+            return Err(msg);
         }
         if smp == 0 {
             return Err(
@@ -588,23 +630,59 @@ impl VirtMachine {
 
         dt::virt_flash_fdt(&mut fdt, cfg.secure)?;
 
-        // create_gic().
-        let gic = GicV3::new(GicV3Props {
-            num_cpu: smp,
-            num_irq: VIRT_GIC_NUM_IRQ,
-            revision: 3,
-            security_extn: cfg.secure,
-            redist_region_count: vec![smp as u32],
-            mp_affinity: mpidrs.clone(),
-            pribits: model.gic_pribits,
-        })?;
+        // create_gic(), with the second redistributor region when the CPUs do not fit in the
+        // first.
+        let redist0_count = smp.min(VIRT_GICV3_MAX_CPUS);
+        let redist2 = memmap.high_redist2.filter(|_| smp > VIRT_GICV3_MAX_CPUS);
+        let mut redist_region_count = vec![redist0_count as u32];
+        if redist2.is_some() {
+            redist_region_count.push((smp - redist0_count).min(redist2_capacity) as u32);
+        }
+        let gic = GicV3::with_sysmem(
+            GicV3Props {
+                num_cpu: smp,
+                num_irq: VIRT_GIC_NUM_IRQ,
+                revision: 3,
+                security_extn: cfg.secure,
+                redist_region_count,
+                mp_affinity: mpidrs.clone(),
+                pribits: model.gic_pribits,
+                // The TCG ITS is on for every current machine version, so the GIC has LPIs
+                // even when msi=off leaves the ITS out.
+                has_lpi: true,
+            },
+            Some(&memory_as),
+        )?;
         let r = mem.new_io("gicv3_dist", GICV3_DIST_SIZE.into(), gic.dist_ops()).map_err(err)?;
         mem.add_subregion(system, VIRT_GIC_DIST, r).map_err(err)?;
-        let r = mem
-            .new_io("gicv3_redist_region[0]", gic.redist_region_size(0).into(), gic.redist_ops(0))
-            .map_err(err)?;
-        mem.add_subregion(system, VIRT_GIC_REDIST, r).map_err(err)?;
-        let gic_phandle = dt::add_gic_node(&mut fdt, cfg.virtualization)?;
+        let redist_bases = [Some(VIRT_GIC_REDIST), redist2.map(|r| r.base)];
+        for (i, base) in redist_bases.into_iter().enumerate() {
+            let Some(base) = base else { continue };
+            let name = format!("gicv3_redist_region[{i}]");
+            let r = mem
+                .new_io(&name, gic.redist_region_size(i).into(), gic.redist_ops(i))
+                .map_err(err)?;
+            mem.add_subregion(system, base, r).map_err(err)?;
+        }
+        let gic_phandle = dt::add_gic_node(&mut fdt, redist2, cfg.virtualization)?;
+
+        // create_msi_controller(): the ITS, its control frame and then its translation frame
+        // in one container.
+        let (its, msi_phandle) = if its_on {
+            let its = GicV3Its::new(&gic)?;
+            let main = mem.new_container("gicv3_its", ITS_SIZE.into()).map_err(err)?;
+            let r =
+                mem.new_io("control", ITS_CONTROL_SIZE.into(), its.control_ops()).map_err(err)?;
+            mem.add_subregion(main, 0, r).map_err(err)?;
+            let r = mem
+                .new_io("translation", ITS_TRANS_SIZE.into(), its.translation_ops())
+                .map_err(err)?;
+            mem.add_subregion(main, ITS_CONTROL_SIZE, r).map_err(err)?;
+            mem.add_subregion(system, VIRT_GIC_ITS, main).map_err(err)?;
+            (Some(its), Some(dt::add_its_node(&mut fdt)?))
+        } else {
+            (None, None)
+        };
 
         // arm_load_kernel(), which decides the PSCI conduit the CPUs are created with.
         let mut loader = Loader::default();
@@ -707,9 +785,9 @@ impl VirtMachine {
         rtc.irq().connect(gic.spi(VIRT_RTC_IRQ));
         dt::create_rtc(&mut fdt, clock_phandle)?;
 
-        // create_pcie(). There is no MSI controller yet, so the device tree has no msi-map.
+        // create_pcie(), with the msi-map to the ITS.
         let gpex = create_pcie(&mem, system, &memmap, &gic, &memory_as)?;
-        dt::create_pcie(&mut fdt, &memmap, gic_phandle, None, VIRT_PCIE_IRQ)?;
+        dt::create_pcie(&mut fdt, &memmap, gic_phandle, msi_phandle, VIRT_PCIE_IRQ)?;
 
         // create_virtio_devices().
         let mut virtio = Vec::with_capacity(VIRTIO_TRANSPORTS);
@@ -764,6 +842,7 @@ impl VirtMachine {
             arm,
             hub,
             gic,
+            its,
             uart,
             uart1,
             flash: [flash0, flash1],
@@ -837,6 +916,15 @@ impl VirtMachine {
             Arc::new(WeakGuestMemory(Arc::downgrade(&self.memory_as)));
         let backend = VirtioBackend::new(class, memory).map_err(err)?;
         let dev = VirtioPci::new(self.gpex.bus(), devfn, backend, props).map_err(err)?;
+        // msi_send_message() stores with the function's requester ID, which is the device ID
+        // the ITS translates.
+        let pci_dev = Arc::downgrade(dev.pci_dev());
+        let memory_as = Arc::downgrade(&self.memory_as);
+        dev.pci_dev().set_msi_trigger(Some(Arc::new(move |address, data| {
+            let (Some(d), Some(a)) = (pci_dev.upgrade(), memory_as.upgrade()) else { return };
+            let attrs = MemTxAttrs::new().with_requester_id(d.requester_id());
+            let _ = a.store(address, 4, data.into(), Endian::Little, attrs);
+        })));
         self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).push(dev.clone());
         Ok(dev)
     }
@@ -923,6 +1011,9 @@ impl VirtMachine {
     /// [`VirtMachine::reset_cpu`] on its own thread.
     pub fn system_reset(&mut self) -> Result<(), String> {
         self.gic.reset();
+        if let Some(its) = &self.its {
+            its.reset();
+        }
         self.uart.reset();
         if let Some(u) = &self.uart1 {
             u.reset();

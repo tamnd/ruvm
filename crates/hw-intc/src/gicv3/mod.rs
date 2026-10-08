@@ -61,11 +61,27 @@
 //!   priority bits do not provide. QEMU never registers those, so it never gets asked.
 //! - The AArch32 views (ICC_SGI1R and friends through MCRR) are left to target-arm, and the model
 //!   assumes EL3 is AArch64 wherever QEMU asks `arm_el_is_aa64(env, 3)`.
+//! - Deactivating an LPI (an EOI with EOImode 0) does nothing. QEMU clears a bit past the end of
+//!   its active bitmap there and rescans one interrupt, which has no effect a guest can rely on.
+//! - The pending table scan reads the whole table in one access where QEMU reads it a byte at a
+//!   time. For tables in RAM, which is where guests put them, the result is the same.
+//! - A thread that holds the GIC or ITS lock and reaches the GIC or the ITS again through guest
+//!   memory (an LPI table placed over their registers, or over a device that raises an
+//!   interrupt) has that access refused with `MEMTX_ACCESS_ERROR`, or the interrupt input change
+//!   dropped, instead of deadlocking. QEMU's reentrancy guard refuses only the accesses back into
+//!   the same device.
+//!
+//! # LPIs and the ITS
+//!
+//! With [`GicV3Props::has_lpi`] (QEMU's `has-lpi`) the redistributors implement physical LPIs:
+//! GICD_TYPER.LPIS and GICR_TYPER.PLPIS read as 1, GICR_CTLR.EnableLPIs is writable and the LPI
+//! configuration and pending tables are read from guest memory, which [`GicV3::with_sysmem`]
+//! supplies, as QEMU's `sysmem` link does. [`GicV3Its`] is the ITS (`arm-gicv3-its`), which turns
+//! writes to GITS_TRANSLATER into LPIs through the device, collection and interrupt translation
+//! tables in guest memory, and runs the commands of its command queue.
 //!
 //! # Not done yet (M6 seams)
 //!
-//! - LPIs and the ITS. GICD_TYPER.LPIS and GICR_TYPER.PLPIS are 0, GICR_CTLR is read only and
-//!   GICR_PROPBASER and GICR_PENDBASER are plain storage.
 //! - The virtual CPU interface (ICH_* and ICV_*). HCR_EL2.IMO and FMO do not redirect EL1 accesses
 //!   to ICV registers, the ICH_HCR_EL2 traps are absent and the vIRQ and vFIQ pins stay low.
 //! - NMI (FEAT_GICv3_NMI): GICD_INMIR and GICR_INMIR0 read as zero, ICC_NMIAR1_EL1 is absent and
@@ -75,14 +91,20 @@
 
 mod cpuif;
 mod dist;
+mod its;
 mod redist;
 
+use std::cell::Cell;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use ruvm_hw_core::irq::{IrqLine, IrqPin};
-use ruvm_mem::{AccessConstraints, AccessCtx, AccessSize, MemResult, MmioOps};
+use ruvm_mem::{
+    AccessConstraints, AccessCtx, AccessSize, AddressSpace, MemResult, MemTxResult, MmioOps,
+};
+
+pub use its::{GicV3Its, ITS_CONTROL_SIZE, ITS_SIZE, ITS_TRANS_SIZE};
 
 /// The size of the distributor MMIO region.
 pub const GICV3_DIST_SIZE: u64 = 0x10000;
@@ -94,6 +116,8 @@ pub const GICV3_MAXIRQ: u32 = 1020;
 pub const GIC_INTERNAL: u32 = 32;
 /// `GIC_NR_SGIS`.
 pub const GIC_NR_SGIS: u32 = 16;
+/// `GICV3_LPI_INTID_START`: the first LPI.
+pub const GICV3_LPI_INTID_START: u32 = 8192;
 
 pub const INTID_SECURE: u64 = 1020;
 pub const INTID_NONSECURE: u64 = 1021;
@@ -121,6 +145,11 @@ const GICD_CTLR_RWP: u32 = 1 << 31;
 const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
 const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 const GICR_TYPER_LAST: u64 = 1 << 4;
+const GICR_TYPER_PLPIS: u64 = 1 << 0;
+const GICR_CTLR_ENABLE_LPIS: u32 = 1 << 0;
+const GICR_CTLR_CES: u32 = 1 << 1;
+/// `GICD_TYPER_IDBITS`: 16 bits of interrupt ID.
+const GICD_TYPER_IDBITS: u64 = 0xf;
 
 /// `gicv3_iidr()`: an Arm r0p0 with a zero ProductID, like an r0p0 GIC-500.
 const GICV3_IIDR: u32 = 0x43b;
@@ -148,6 +177,8 @@ pub struct GicV3Props {
     pub mp_affinity: Vec<u64>,
     /// The CPU's `gic_pribits`. Zero means 5, the default.
     pub pribits: u8,
+    /// `has-lpi`: physical LPIs, which need the system memory of [`GicV3::with_sysmem`].
+    pub has_lpi: bool,
 }
 
 impl Default for GicV3Props {
@@ -161,6 +192,7 @@ impl Default for GicV3Props {
             redist_region_count: Vec::new(),
             mp_affinity: Vec::new(),
             pribits: 0,
+            has_lpi: false,
         }
     }
 }
@@ -426,6 +458,8 @@ struct CpuState {
     prebits: u8,
 
     hppi: Pending,
+    /// The best pending LPI, `hpplpi`.
+    hpplpi: Pending,
     seenbetter: bool,
 
     /// The last CPU context seen for this CPU.
@@ -441,6 +475,10 @@ struct GicState {
     security_extn: bool,
     irq_reset_nonsecure: bool,
     revision: u32,
+    /// `lpi_enable`, the `has-lpi` property.
+    lpi_enable: bool,
+    /// The LPI tables' memory, `dma_as`.
+    dma: Option<Weak<AddressSpace>>,
 
     gicd_ctlr: u32,
     group: [u32; BMP_WORDS],
@@ -543,6 +581,7 @@ impl CpuState {
             pribits,
             prebits: prebits_for(pribits),
             hppi: Pending { irq: 0, prio: 0xff, grp: G0 },
+            hpplpi: Pending { irq: 0, prio: 0xff, grp: G0 },
             seenbetter: false,
             ctx: IccCpuCtx::default(),
             out: 0,
@@ -674,10 +713,24 @@ impl GicState {
             self.cpu[cpu].hppi.grp = self.irq_group(cpu, irq);
         }
 
+        let hpplpi = self.cpu[cpu].hpplpi;
+        if self.cpu[cpu].gicr_ctlr & GICR_CTLR_ENABLE_LPIS != 0
+            && self.lpi_enable
+            && self.gicd_ctlr & GICD_CTLR_EN_GRP1NS != 0
+            && hpplpi.prio != 0xff
+            && self.irqbetter(cpu, hpplpi.irq, hpplpi.prio)
+        {
+            self.cpu[cpu].hppi = hpplpi;
+            seenbetter = true;
+        }
+
         // If nothing beat the previous best and the previous best was one of ours, it may have
         // dropped in priority and anything could be the best now.
         let hppi = self.cpu[cpu].hppi;
-        if !seenbetter && hppi.prio != 0xff && hppi.irq < GIC_INTERNAL {
+        if !seenbetter
+            && hppi.prio != 0xff
+            && (hppi.irq < GIC_INTERNAL || hppi.irq >= GICV3_LPI_INTID_START)
+        {
             self.full_update_noirqset();
         }
     }
@@ -835,9 +888,11 @@ impl GicState {
     /// `arm_gicv3_common_reset_hold()`. The CPU interfaces are not touched.
     fn reset(&mut self) {
         let irq_reset_nonsecure = self.irq_reset_nonsecure;
+        // Clearing GICR_CTLR.EnableLPIs is supported, so CES is set with LPIs.
+        let ctlr = if self.lpi_enable { GICR_CTLR_CES } else { 0 };
         for cs in &mut self.cpu {
             cs.level = 0;
-            cs.gicr_ctlr = 0;
+            cs.gicr_ctlr = ctlr;
             cs.gicr_waker = GICR_WAKER_PROCESSOR_SLEEP | GICR_WAKER_CHILDREN_ASLEEP;
             cs.gicr_propbaser = 0;
             cs.gicr_pendbaser = 0;
@@ -852,6 +907,7 @@ impl GicState {
             cs.gicr_nsacr = 0;
             cs.gicr_ipriorityr = [0; GIC_INTERNAL as usize];
             cs.hppi.prio = 0xff;
+            cs.hpplpi.prio = 0xff;
         }
 
         // Affinity routing is always enabled.
@@ -897,11 +953,41 @@ impl GicState {
     }
 }
 
+thread_local! {
+    /// Whether this thread holds the state lock of a GIC or an ITS.
+    static ENGAGED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks the thread as inside a GIC or an ITS while it lives.
+struct Engaged {
+    prev: bool,
+}
+
+impl Engaged {
+    fn enter() -> Engaged {
+        Engaged { prev: ENGAGED.replace(true) }
+    }
+}
+
+impl Drop for Engaged {
+    fn drop(&mut self) {
+        ENGAGED.set(self.prev);
+    }
+}
+
+/// Whether this thread is already inside a GIC or an ITS, so that coming in again from outside
+/// would deadlock.
+fn engaged() -> bool {
+    ENGAGED.get()
+}
+
 /// The GICv3 device.
 pub struct GicV3 {
     num_cpu: usize,
     num_irq: u32,
     pribits: u8,
+    lpi_enable: bool,
+    dma: Option<Weak<AddressSpace>>,
     /// The first CPU and the CPU count of each redistributor region.
     regions: Vec<(usize, u32)>,
     state: Mutex<GicState>,
@@ -926,6 +1012,16 @@ impl fmt::Debug for GicV3 {
 impl GicV3 {
     /// Check the props like `arm_gicv3_common_realize()` and build the device, already reset.
     pub fn new(props: GicV3Props) -> Result<Arc<GicV3>, String> {
+        GicV3::with_sysmem(props, None)
+    }
+
+    /// [`GicV3::new`] with the memory the LPI tables live in, QEMU's `sysmem` link. The GIC
+    /// keeps a weak reference, so the address space that maps the GIC does not keep itself
+    /// alive.
+    pub fn with_sysmem(
+        props: GicV3Props,
+        sysmem: Option<&Arc<AddressSpace>>,
+    ) -> Result<Arc<GicV3>, String> {
         if props.revision != 3 {
             return Err(format!("unsupported GIC revision {}", props.revision));
         }
@@ -950,6 +1046,10 @@ impl GicV3 {
                 props.num_irq
             ));
         }
+        if props.has_lpi && sysmem.is_none() {
+            return Err("Redist-ITS: Guest 'sysmem' reference link not set".to_string());
+        }
+        let dma = if props.has_lpi { sysmem.map(Arc::downgrade) } else { None };
         let capacity: u64 = props.redist_region_count.iter().map(|&c| u64::from(c)).sum();
         if capacity != props.num_cpu as u64 {
             return Err(format!(
@@ -973,7 +1073,10 @@ impl GicV3 {
         for (i, &mpidr) in props.mp_affinity.iter().enumerate() {
             // Squash the MPIDR affinity bytes into the 32 bits GICR_TYPER has room for.
             let affid = ((mpidr & 0xff_0000_0000) >> 8) | (mpidr & 0xff_ffff);
-            let typer = (affid << 32) | (1 << 24) | ((i as u64) << 8);
+            let mut typer = (affid << 32) | (1 << 24) | ((i as u64) << 8);
+            if props.has_lpi {
+                typer |= GICR_TYPER_PLPIS;
+            }
             cpu.push(CpuState::new(typer, pribits));
         }
         // GICR_TYPER.Last marks the final redistributor of each region.
@@ -1002,6 +1105,8 @@ impl GicV3 {
             security_extn: props.security_extn,
             irq_reset_nonsecure: false,
             revision: props.revision,
+            lpi_enable: props.has_lpi,
+            dma: dma.clone(),
             gicd_ctlr: 0,
             group: [0; BMP_WORDS],
             grpmod: [0; BMP_WORDS],
@@ -1024,6 +1129,8 @@ impl GicV3 {
             num_cpu: props.num_cpu,
             num_irq: props.num_irq,
             pribits,
+            lpi_enable: props.has_lpi,
+            dma,
             regions,
             state: Mutex::new(state),
             out: (0..props.num_cpu).map(|_| AtomicU64::new(0)).collect(),
@@ -1041,6 +1148,7 @@ impl GicV3 {
     /// Run `f` on the state, then drive the output pins of every CPU it touched, after the lock
     /// is released.
     fn with_state<R>(&self, f: impl FnOnce(&mut GicState) -> R) -> R {
+        let engaged = Engaged::enter();
         let mut s = self.lock();
         let r = f(&mut s);
         let mut touched = Vec::new();
@@ -1056,6 +1164,7 @@ impl GicV3 {
             touched.push(cpu);
         }
         drop(s);
+        drop(engaged);
         for cpu in touched {
             self.drive(cpu);
         }
@@ -1090,6 +1199,16 @@ impl GicV3 {
         self.pribits
     }
 
+    /// Whether the redistributors implement physical LPIs, `has-lpi`.
+    pub fn has_lpi(&self) -> bool {
+        self.lpi_enable
+    }
+
+    /// The memory the LPI tables and the ITS tables live in, `dma_as`.
+    fn dma(&self) -> Option<Arc<AddressSpace>> {
+        self.dma.as_ref().and_then(Weak::upgrade)
+    }
+
     /// How many GPIO inputs there are: the SPIs, then 32 per CPU.
     pub fn num_gpio_in(&self) -> u32 {
         self.num_irq - GIC_INTERNAL + GIC_INTERNAL * self.num_cpu as u32
@@ -1101,6 +1220,11 @@ impl GicV3 {
         let w = Arc::downgrade(self);
         IrqLine::new(
             Arc::new(move |n, level| {
+                // A change raised from inside the GIC or the ITS, through guest memory, is
+                // dropped rather than deadlock.
+                if engaged() {
+                    return;
+                }
                 if let Some(s) = w.upgrade() {
                     s.with_state(|st| st.set_irq(n, level != 0));
                 }
@@ -1234,11 +1358,17 @@ impl fmt::Debug for GicV3Dist {
 
 impl MmioOps for GicV3Dist {
     fn read(&self, cx: &AccessCtx, offset: u64, size: AccessSize) -> MemResult<u64> {
+        if engaged() {
+            return Err(MemTxResult::ACCESS_ERROR);
+        }
         let secure = cx.attrs.secure();
         Ok(self.gic.with_state(|s| s.dist_read(secure, offset, size.bytes())))
     }
 
     fn write(&self, cx: &AccessCtx, offset: u64, size: AccessSize, value: u64) -> MemResult<()> {
+        if engaged() {
+            return Err(MemTxResult::ACCESS_ERROR);
+        }
         let secure = cx.attrs.secure();
         self.gic.with_state(|s| s.dist_write(secure, offset, size.bytes(), value));
         Ok(())
@@ -1285,6 +1415,9 @@ impl GicV3Redist {
 
 impl MmioOps for GicV3Redist {
     fn read(&self, cx: &AccessCtx, offset: u64, size: AccessSize) -> MemResult<u64> {
+        if engaged() {
+            return Err(MemTxResult::ACCESS_ERROR);
+        }
         let Some((cpu, offset)) = self.locate(offset) else {
             return Ok(0);
         };
@@ -1293,6 +1426,9 @@ impl MmioOps for GicV3Redist {
     }
 
     fn write(&self, cx: &AccessCtx, offset: u64, size: AccessSize, value: u64) -> MemResult<()> {
+        if engaged() {
+            return Err(MemTxResult::ACCESS_ERROR);
+        }
         let Some((cpu, offset)) = self.locate(offset) else {
             return Ok(());
         };

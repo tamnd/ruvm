@@ -8,15 +8,15 @@
 use ruvm_target_arm::cpu::ArmCpuModel;
 
 use super::{
-    VIRT_FLASH, VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE, VIRT_GIC_DIST, VIRT_GIC_REDIST,
-    VIRT_GIC_REDIST_SIZE, VIRT_MMIO, VIRT_MMIO_IRQ, VIRT_MMIO_SIZE, VIRT_PCIE_MMIO,
-    VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE, VIRT_PLATFORM_BUS,
+    MemMapEntry, VIRT_FLASH, VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE, VIRT_GIC_DIST,
+    VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GIC_REDIST_SIZE, VIRT_MMIO, VIRT_MMIO_IRQ, VIRT_MMIO_SIZE,
+    VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE, VIRT_PLATFORM_BUS,
     VIRT_PLATFORM_BUS_SIZE, VIRT_RTC, VIRT_RTC_IRQ, VIRT_RTC_SIZE, VIRT_SECURE_MEM,
     VIRT_SECURE_MEM_SIZE, VIRT_UART, VIRT_UART_IRQ, VIRT_UART_SIZE, VIRT_UART1, VIRT_UART1_IRQ,
     VIRTIO_TRANSPORTS, VirtMemmap,
 };
 use crate::fdt::{Fdt, sized_cells};
-use ruvm_hw_intc::gicv3::GICV3_DIST_SIZE;
+use ruvm_hw_intc::gicv3::{GICV3_DIST_SIZE, ITS_SIZE};
 
 /// `GIC_FDT_IRQ_TYPE_SPI`.
 const GIC_FDT_IRQ_TYPE_SPI: u32 = 0;
@@ -252,9 +252,14 @@ pub(crate) fn virt_flash_fdt(fdt: &mut Fdt, secure: bool) -> Result<(), String> 
     }
 }
 
-/// `fdt_add_gic_node()` for a GICv3 with one redistributor region and no ITS. `virt` is
-/// `virtualization=on`, which describes the maintenance interrupt. Returns the GIC phandle.
-pub(crate) fn add_gic_node(fdt: &mut Fdt, virt: bool) -> Result<u32, String> {
+/// `fdt_add_gic_node()` for a GICv3. `redist2` is the high memory redistributor region when
+/// the GIC uses it, and `virt` is `virtualization=on`, which describes the maintenance
+/// interrupt. Returns the GIC phandle.
+pub(crate) fn add_gic_node(
+    fdt: &mut Fdt,
+    redist2: Option<MemMapEntry>,
+    virt: bool,
+) -> Result<u32, String> {
     let gic = fdt.alloc_phandle();
     fdt.setprop_cell("/", "interrupt-parent", gic)?;
 
@@ -266,18 +271,17 @@ pub(crate) fn add_gic_node(fdt: &mut Fdt, virt: bool) -> Result<u32, String> {
     fdt.setprop_cell(&nodename, "#size-cells", 0x2)?;
     fdt.setprop(&nodename, "ranges", &[])?;
     fdt.setprop_string(&nodename, "compatible", "arm,gic-v3")?;
-    fdt.setprop_cell(&nodename, "#redistributor-regions", 1)?;
-    setprop_sized_cells(
-        fdt,
-        &nodename,
-        "reg",
-        &[
-            (2, VIRT_GIC_DIST),
-            (2, GICV3_DIST_SIZE),
-            (2, VIRT_GIC_REDIST),
-            (2, VIRT_GIC_REDIST_SIZE),
-        ],
-    )?;
+    fdt.setprop_cell(&nodename, "#redistributor-regions", 1 + u32::from(redist2.is_some()))?;
+    let mut reg = vec![
+        (2, VIRT_GIC_DIST),
+        (2, GICV3_DIST_SIZE),
+        (2, VIRT_GIC_REDIST),
+        (2, VIRT_GIC_REDIST_SIZE),
+    ];
+    if let Some(r) = redist2 {
+        reg.extend([(2, r.base), (2, r.size)]);
+    }
+    setprop_sized_cells(fdt, &nodename, "reg", &reg)?;
     if virt {
         fdt.setprop_cells(
             &nodename,
@@ -287,6 +291,19 @@ pub(crate) fn add_gic_node(fdt: &mut Fdt, virt: bool) -> Result<u32, String> {
     }
     fdt.setprop_cell(&nodename, "phandle", gic)?;
     Ok(gic)
+}
+
+/// `fdt_add_its_gic_node()`: the ITS under the GIC node. Returns the MSI controller phandle.
+pub(crate) fn add_its_node(fdt: &mut Fdt) -> Result<u32, String> {
+    let msi = fdt.alloc_phandle();
+    let nodename = format!("/intc/its@{VIRT_GIC_ITS:x}");
+    fdt.add_subnode(&nodename)?;
+    fdt.setprop_string(&nodename, "compatible", "arm,gic-v3-its")?;
+    fdt.setprop(&nodename, "msi-controller", &[])?;
+    fdt.setprop_cell(&nodename, "#msi-cells", 1)?;
+    setprop_sized_cells(fdt, &nodename, "reg", &[(2, VIRT_GIC_ITS), (2, ITS_SIZE)])?;
+    fdt.setprop_cell(&nodename, "phandle", msi)?;
+    Ok(msi)
 }
 
 /// Which UART [`create_uart`] describes.

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use ruvm_hw_core::irq::IrqLine;
 use ruvm_hw_intc::gicv3::*;
-use ruvm_mem::{AccessCtx, AccessSize, MemTxAttrs, MmioOps};
+use ruvm_mem::{AccessCtx, AccessSize, AddressSpace, Endian, MemTxAttrs, MemorySystem, MmioOps};
 
 /// Non-secure EL1 on a CPU without EL2 or EL3.
 const NS_EL1: IccCpuCtx = IccCpuCtx {
@@ -64,6 +64,7 @@ fn props(mp_affinity: Vec<u64>, security_extn: bool) -> GicV3Props {
         redist_region_count: vec![mp_affinity.len() as u32],
         mp_affinity,
         pribits: 5,
+        has_lpi: false,
     }
 }
 
@@ -659,4 +660,362 @@ fn access_checks() {
     }
     assert_eq!(IccReg::Ap1r(2).name(), "ICC_AP1R2_EL1");
     assert_eq!(r.icc_r(0, IccReg::SreEl1), 7);
+}
+
+// LPIs and the ITS, with the GIC, the ITS and some RAM mapped the way hw/arm/virt.c maps them.
+
+const DIST_BASE: u64 = 0x0800_0000;
+const ITS_BASE: u64 = 0x0808_0000;
+const REDIST_BASE: u64 = 0x080a_0000;
+const RAM: u64 = 0x4000_0000;
+const PROPBASE: u64 = RAM;
+/// The pending tables of the CPUs, 64K apart.
+const PENDBASE: u64 = RAM + 0x1_0000;
+const DT_BASE: u64 = RAM + 0x10_0000;
+const CT_BASE: u64 = RAM + 0x20_0000;
+const CMDQ_BASE: u64 = RAM + 0x30_0000;
+const ITT_BASE: u64 = RAM + 0x40_0000;
+
+const GICR_PROPBASER: u64 = 0x70;
+const GICR_PENDBASER: u64 = 0x78;
+const GITS_CTLR: u64 = 0x0;
+const GITS_IIDR: u64 = 0x4;
+const GITS_TYPER: u64 = 0x8;
+const GITS_CBASER: u64 = 0x80;
+const GITS_CWRITER: u64 = 0x88;
+const GITS_CREADR: u64 = 0x90;
+const GITS_BASER: u64 = 0x100;
+const GITS_TRANSLATER: u64 = ITS_CONTROL_SIZE + 0x40;
+
+struct LpiRig {
+    _mem: Arc<MemorySystem>,
+    space: Arc<AddressSpace>,
+    gic: Arc<GicV3>,
+    its: Arc<GicV3Its>,
+    irq: Vec<Arc<AtomicI32>>,
+    /// The commands queued so far.
+    queued: u64,
+}
+
+impl LpiRig {
+    fn new(ncpu: usize) -> LpiRig {
+        let mem = Arc::new(MemorySystem::new());
+        let sysmem = mem.new_container("system", 1 << 64).unwrap();
+        let ram = mem.new_ram("ram", 0x80_0000).unwrap();
+        mem.add_subregion(sysmem, RAM, ram).unwrap();
+        let space = mem.address_space_init(sysmem, "memory").unwrap();
+
+        let mut p = props((0..ncpu as u64).collect(), false);
+        p.has_lpi = true;
+        let gic = GicV3::with_sysmem(p, Some(&space)).unwrap();
+        let dist = mem.new_io("gicv3_dist", GICV3_DIST_SIZE.into(), gic.dist_ops()).unwrap();
+        mem.add_subregion(sysmem, DIST_BASE, dist).unwrap();
+        let size = gic.redist_region_size(0);
+        let redist = mem.new_io("gicv3_redist_region[0]", size.into(), gic.redist_ops(0)).unwrap();
+        mem.add_subregion(sysmem, REDIST_BASE, redist).unwrap();
+
+        let its = GicV3Its::new(&gic).unwrap();
+        let ctl = mem.new_io("control", ITS_CONTROL_SIZE.into(), its.control_ops()).unwrap();
+        mem.add_subregion(sysmem, ITS_BASE, ctl).unwrap();
+        let trans =
+            mem.new_io("translation", ITS_TRANS_SIZE.into(), its.translation_ops()).unwrap();
+        mem.add_subregion(sysmem, ITS_BASE + ITS_CONTROL_SIZE, trans).unwrap();
+
+        let mut irq = Vec::new();
+        for cpu in 0..ncpu {
+            let (level, line) = watch();
+            gic.cpu_irq(cpu).connect(line);
+            irq.push(level);
+        }
+        LpiRig { _mem: mem, space, gic, its, irq, queued: 0 }
+    }
+
+    fn rd(&self, addr: u64, size: u32) -> u64 {
+        let (v, r) = self.space.load(addr, size, Endian::Little, MemTxAttrs::UNSPECIFIED);
+        assert!(r.is_ok(), "read of {addr:#x} failed");
+        v
+    }
+
+    fn wr(&self, addr: u64, size: u32, v: u64) {
+        let r = self.space.store(addr, size, v, Endian::Little, MemTxAttrs::UNSPECIFIED);
+        assert!(r.is_ok(), "write of {addr:#x} failed");
+    }
+
+    /// An MSI from the device with requester ID `devid`.
+    fn msi(&self, devid: u16, eventid: u32) {
+        let attrs = MemTxAttrs::new().with_requester_id(devid);
+        let r =
+            self.space.store(ITS_BASE + GITS_TRANSLATER, 4, eventid.into(), Endian::Little, attrs);
+        assert!(r.is_ok());
+    }
+
+    fn irq(&self, cpu: usize) -> i32 {
+        self.irq[cpu].load(Ordering::SeqCst)
+    }
+
+    fn pending(&self, cpu: u64, intid: u64) -> bool {
+        self.rd(PENDBASE + cpu * 0x1_0000 + intid / 8, 1) & (1 << (intid % 8)) != 0
+    }
+
+    /// Group 1 on, the CPU interfaces open, LPI 8192 + n at priority 0x80 + 8 * n for n below
+    /// 8, and each CPU's LPIs enabled with 16 bits of interrupt ID.
+    fn setup_lpis(&self) {
+        self.wr(DIST_BASE + GICD_CTLR, 4, 0x12);
+        for n in 0..8 {
+            self.wr(PROPBASE + n, 1, (0x80 + 8 * n) | 1);
+        }
+        for cpu in 0..self.gic.num_cpu() {
+            let rd = REDIST_BASE + cpu as u64 * GICV3_REDIST_SIZE;
+            self.wr(rd + GICR_WAKER, 4, 0);
+            self.wr(rd + GICR_PROPBASER, 8, PROPBASE | 0xf);
+            self.wr(rd + GICR_PENDBASER, 8, PENDBASE + cpu as u64 * 0x1_0000);
+            self.wr(rd + GICR_CTLR, 4, 1);
+            self.gic.icc_write(cpu, IccReg::Pmr, &NS_EL1, 0xff);
+            self.gic.icc_write(cpu, IccReg::Igrpen1, &NS_EL1, 1);
+        }
+    }
+
+    /// Flat device and collection tables of one 64K page, a 4K command queue, and the ITS
+    /// enabled.
+    fn setup_its(&self) {
+        let baser0 = self.rd(ITS_BASE + GITS_BASER, 8);
+        self.wr(ITS_BASE + GITS_BASER, 8, baser0 | (1 << 63) | DT_BASE);
+        let baser1 = self.rd(ITS_BASE + GITS_BASER + 8, 8);
+        self.wr(ITS_BASE + GITS_BASER + 8, 8, baser1 | (1 << 63) | CT_BASE);
+        self.wr(ITS_BASE + GITS_CBASER, 8, (1 << 63) | CMDQ_BASE);
+        self.wr(ITS_BASE + GITS_CWRITER, 8, 0);
+        self.wr(ITS_BASE + GITS_CTLR, 4, 1);
+    }
+
+    /// Queue one command and run the queue.
+    fn cmd(&mut self, pkt: [u64; 4]) {
+        let at = CMDQ_BASE + (self.queued % 128) * 32;
+        for (i, w) in pkt.iter().enumerate() {
+            self.wr(at + i as u64 * 8, 8, *w);
+        }
+        self.queued += 1;
+        self.wr(ITS_BASE + GITS_CWRITER, 8, (self.queued % 128) * 32);
+    }
+
+    fn mapd(&mut self, devid: u64, ittaddr: u64) {
+        // Five bits of event ID.
+        self.cmd([0x08 | (devid << 32), 4, (1 << 63) | ittaddr, 0]);
+    }
+
+    fn mapc(&mut self, icid: u64, cpu: u64) {
+        self.cmd([0x09, 0, (1 << 63) | (cpu << 16) | icid, 0]);
+    }
+
+    fn mapti(&mut self, devid: u64, eventid: u64, intid: u64, icid: u64) {
+        self.cmd([0x0a | (devid << 32), eventid | (intid << 32), icid, 0]);
+    }
+}
+
+#[test]
+fn lpi_registers() {
+    let r = LpiRig::new(2);
+    // GICD_TYPER.LPIS and GICR_TYPER.PLPIS are set, and GICR_CTLR.CES with them.
+    assert_eq!(
+        r.rd(DIST_BASE + GICD_TYPER, 4),
+        (1 << 25) | (1 << 24) | (0xf << 19) | (1 << 17) | 1
+    );
+    assert_eq!(r.rd(REDIST_BASE + GICR_TYPER, 4), (1 << 24) | 1);
+    assert_eq!(r.rd(REDIST_BASE + GICR_CTLR, 4), 2);
+    r.wr(REDIST_BASE + GICR_CTLR, 4, 1);
+    assert_eq!(r.rd(REDIST_BASE + GICR_CTLR, 4), 3);
+    r.wr(REDIST_BASE + GICR_CTLR, 4, 0);
+    assert_eq!(r.rd(REDIST_BASE + GICR_CTLR, 4), 2);
+
+    assert_eq!(r.rd(ITS_BASE + GITS_CTLR, 4), 1 << 31);
+    assert_eq!(r.rd(ITS_BASE + GITS_IIDR, 4), 0x43b);
+    assert_eq!(
+        r.rd(ITS_BASE + GITS_TYPER, 8),
+        (1 << 36) | (0xf << 32) | (0xf << 13) | (0xf << 8) | 0xb1
+    );
+    assert_eq!(r.rd(ITS_BASE + 0xffe0, 4), 0x94);
+    assert_eq!(r.rd(ITS_BASE + 0xffe8, 4), 0x3b);
+    assert_eq!(r.rd(ITS_BASE + GITS_BASER, 8), 0x0107_0000_0000_0200);
+    assert_eq!(r.rd(ITS_BASE + GITS_BASER + 8, 8), 0x0407_0000_0000_0200);
+    assert_eq!(r.rd(ITS_BASE + GITS_BASER + 16, 8), 0);
+
+    // TYPE and ENTRYSIZE are read only and unimplemented tables ignore writes.
+    r.wr(ITS_BASE + GITS_BASER + 4, 4, 0xffff_ffff);
+    assert_eq!(r.rd(ITS_BASE + GITS_BASER, 8), 0xf8e0_ffff_0000_0200 | 0x0107_0000_0000_0000);
+    r.wr(ITS_BASE + GITS_BASER + 16, 8, u64::MAX);
+    assert_eq!(r.rd(ITS_BASE + GITS_BASER + 16, 8), 0);
+    // The translation frame reads as zero.
+    assert_eq!(r.rd(ITS_BASE + GITS_TRANSLATER, 4), 0);
+
+    // Without has-lpi there is no ITS, and has-lpi needs the memory the tables live in.
+    let gic = GicV3::new(props(vec![0], false)).unwrap();
+    assert_eq!(GicV3Its::new(&gic).unwrap_err(), "Physical LPI not supported by CPU 0");
+    let mut p = props(vec![0], false);
+    p.has_lpi = true;
+    assert_eq!(GicV3::new(p).unwrap_err(), "Redist-ITS: Guest 'sysmem' reference link not set");
+}
+
+#[test]
+fn msi_through_the_its_raises_an_lpi() {
+    let mut r = LpiRig::new(2);
+    r.setup_lpis();
+    r.setup_its();
+    r.mapd(0x10, ITT_BASE);
+    r.mapc(0, 0);
+    r.mapc(1, 1);
+    r.mapti(0x10, 3, 8195, 0);
+    r.mapti(0x10, 5, 8193, 1);
+    r.cmd([0x05, 0, 0, 0]);
+    assert_eq!(r.rd(ITS_BASE + GITS_CREADR, 8), 6 * 32);
+    assert_eq!(r.irq(0), 0);
+
+    r.msi(0x10, 3);
+    assert!(r.pending(0, 8195));
+    assert_eq!(r.irq(0), 1);
+    assert_eq!(r.irq(1), 0);
+    assert_eq!(r.gic.icc_read(0, IccReg::Hppir1, &NS_EL1), 8195);
+    assert_eq!(r.gic.icc_read(0, IccReg::Iar1, &NS_EL1), 8195);
+    // Acknowledging an LPI clears its pending bit. LPIs have no active state.
+    assert!(!r.pending(0, 8195));
+    assert_eq!(r.irq(0), 0);
+    r.gic.icc_write(0, IccReg::Eoir1, &NS_EL1, 8195);
+    assert_eq!(r.gic.icc_read(0, IccReg::Iar1, &NS_EL1), 1023);
+
+    // Event 5 goes to CPU 1. An unmapped event or device does nothing.
+    r.msi(0x10, 5);
+    assert_eq!(r.irq(1), 1);
+    assert_eq!(r.gic.icc_read(1, IccReg::Iar1, &NS_EL1), 8193);
+    r.gic.icc_write(1, IccReg::Eoir1, &NS_EL1, 8193);
+    r.msi(0x10, 4);
+    r.msi(0x11, 3);
+    r.msi(0x10, 40);
+    assert_eq!(r.irq(0), 0);
+    assert_eq!(r.irq(1), 0);
+
+    // A disabled LPI stays pending without being signalled, and enabling it in the
+    // configuration table only takes effect with INV or INVALL.
+    r.wr(PROPBASE + 3, 1, 0x88);
+    r.msi(0x10, 3);
+    assert!(r.pending(0, 8195));
+    assert_eq!(r.irq(0), 0);
+    r.wr(PROPBASE + 3, 1, 0x89);
+    assert_eq!(r.irq(0), 0);
+    r.cmd([0x0c | (0x10 << 32), 3, 0, 0]);
+    assert_eq!(r.irq(0), 1);
+    r.wr(PROPBASE + 3, 1, 0x88);
+    r.cmd([0x0d, 0, 0, 0]);
+    assert_eq!(r.irq(0), 0);
+    r.wr(PROPBASE + 3, 1, 0x89);
+    r.cmd([0x0d, 0, 0, 0]);
+    assert_eq!(r.irq(0), 1);
+
+    // CLEAR takes the pending bit away again, and INT sets it.
+    r.cmd([0x04 | (0x10 << 32), 3, 0, 0]);
+    assert!(!r.pending(0, 8195));
+    assert_eq!(r.irq(0), 0);
+    r.cmd([0x03 | (0x10 << 32), 3, 0, 0]);
+    assert_eq!(r.irq(0), 1);
+
+    // Turning GITS_CTLR.Enabled off stops translation.
+    r.cmd([0x04 | (0x10 << 32), 3, 0, 0]);
+    r.wr(ITS_BASE + GITS_CTLR, 4, 0);
+    r.msi(0x10, 3);
+    assert_eq!(r.irq(0), 0);
+}
+
+#[test]
+fn lpi_priorities_and_disable() {
+    let mut r = LpiRig::new(1);
+    r.setup_lpis();
+    r.setup_its();
+    r.mapd(1, ITT_BASE);
+    r.mapc(0, 0);
+    for ev in 0..4 {
+        r.mapti(1, ev, 8192 + ev, 0);
+    }
+    // LPI 8192 + n has priority 0x80 + 8 * n, so the lowest number wins.
+    r.msi(1, 2);
+    r.msi(1, 1);
+    r.msi(1, 3);
+    assert_eq!(r.gic.icc_read(0, IccReg::Iar1, &NS_EL1), 8193);
+    r.gic.icc_write(0, IccReg::Eoir1, &NS_EL1, 8193);
+    assert_eq!(r.gic.icc_read(0, IccReg::Hppir1, &NS_EL1), 8194);
+
+    // Clearing EnableLPIs hides them, setting it again rescans the pending table.
+    r.wr(REDIST_BASE + GICR_CTLR, 4, 0);
+    assert_eq!(r.irq(0), 0);
+    r.wr(REDIST_BASE + GICR_CTLR, 4, 1);
+    assert_eq!(r.irq(0), 1);
+    assert_eq!(r.gic.icc_read(0, IccReg::Hppir1, &NS_EL1), 8194);
+
+    // DISCARD clears the pending state and the mapping.
+    r.cmd([0x0f | (1 << 32), 2, 0, 0]);
+    assert!(!r.pending(0, 8194));
+    assert_eq!(r.gic.icc_read(0, IccReg::Hppir1, &NS_EL1), 8195);
+    r.msi(1, 2);
+    assert!(!r.pending(0, 8194));
+}
+
+#[test]
+fn movi_and_movall_move_pending_lpis() {
+    let mut r = LpiRig::new(2);
+    r.setup_lpis();
+    r.setup_its();
+    r.mapd(7, ITT_BASE);
+    r.mapc(0, 0);
+    r.mapc(1, 1);
+    r.mapti(7, 0, 8192, 0);
+    r.mapti(7, 1, 8193, 0);
+    r.msi(7, 0);
+    r.msi(7, 1);
+    assert_eq!(r.irq(0), 1);
+
+    // MOVI moves the pending state of one LPI and retargets its event.
+    r.cmd([0x01 | (7 << 32), 0, 1, 0]);
+    assert!(!r.pending(0, 8192));
+    assert!(r.pending(1, 8192));
+    assert_eq!(r.irq(1), 1);
+    assert_eq!(r.gic.icc_read(0, IccReg::Hppir1, &NS_EL1), 8193);
+
+    // MOVALL moves the rest.
+    r.cmd([0x0e, 0, 0, 1 << 16]);
+    assert!(!r.pending(0, 8193));
+    assert!(r.pending(1, 8193));
+    assert_eq!(r.irq(0), 0);
+    assert_eq!(r.gic.icc_read(1, IccReg::Iar1, &NS_EL1), 8192);
+    r.gic.icc_write(1, IccReg::Eoir1, &NS_EL1, 8192);
+    assert_eq!(r.gic.icc_read(1, IccReg::Iar1, &NS_EL1), 8193);
+    r.gic.icc_write(1, IccReg::Eoir1, &NS_EL1, 8193);
+
+    // The event now goes to CPU 1.
+    r.msi(7, 0);
+    assert_eq!(r.irq(0), 0);
+    assert_eq!(r.irq(1), 1);
+}
+
+#[test]
+fn command_queue_stalls_and_resets() {
+    let mut r = LpiRig::new(1);
+    r.setup_lpis();
+    // CBASER is read only while the ITS is enabled.
+    r.setup_its();
+    r.wr(ITS_BASE + GITS_CBASER, 8, 0);
+    assert_eq!(r.rd(ITS_BASE + GITS_CBASER, 8), (1 << 63) | CMDQ_BASE);
+
+    // A device table pointing at nothing stalls MAPD.
+    r.wr(ITS_BASE + GITS_CTLR, 4, 0);
+    let baser0 = r.rd(ITS_BASE + GITS_BASER, 8);
+    r.wr(ITS_BASE + GITS_BASER, 8, (baser0 & !0xffff_ffff_f000) | 0x7f_0000_0000);
+    r.wr(ITS_BASE + GITS_CTLR, 4, 1);
+    r.mapd(1, ITT_BASE);
+    assert_eq!(r.rd(ITS_BASE + GITS_CREADR, 8), 1);
+
+    // Without security CREADR is writable, which is how a stall is cleared.
+    r.wr(ITS_BASE + GITS_CREADR, 8, 32 | 1);
+    assert_eq!(r.rd(ITS_BASE + GITS_CREADR, 8), 32);
+
+    r.its.reset();
+    assert_eq!(r.rd(ITS_BASE + GITS_CTLR, 4), 1 << 31);
+    assert_eq!(r.rd(ITS_BASE + GITS_CBASER, 8), 0);
+    assert_eq!(r.rd(ITS_BASE + GITS_CREADR, 8), 0);
+    assert_eq!(r.rd(ITS_BASE + GITS_BASER, 8), 0x0107_0000_0000_0200);
 }

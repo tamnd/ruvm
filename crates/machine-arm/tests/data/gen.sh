@@ -46,6 +46,16 @@ dump_m virt-a57-el2-serial2 ,virtualization=on -cpu cortex-a57,pmu=off -smp 2 \
     -serial null -serial null
 dump_m virt-max-secure-bios ,secure=on -cpu max,pmu=off -smp 2 -bios "$TMP/bios.fd"
 
+# The default msi=auto, which is the ITS, and a second redistributor region past 123 CPUs.
+dump_its() {
+    local name=$1
+    shift
+    "$QEMU" -nodefaults -display none -M "virt,gic-version=3,dtb-randomness=off,dumpdtb=$TMP/$name.dtb" "$@"
+    gzip -9n -c "$TMP/$name.dtb" > "$name.dtb.gz"
+}
+dump_its virt-a57-smp2-its -cpu cortex-a57,pmu=off -smp 2
+dump_its virt-a57-smp130-its -cpu cortex-a57,pmu=off -smp 130
+
 # A user -dtb: QEMU drops its memory nodes and /psci and adds its own.
 dtc -q -I dts -O dtb -o "$TMP/user.dtb" user.dts
 cp "$TMP/user.dtb" user.dtb

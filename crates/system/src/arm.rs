@@ -20,11 +20,10 @@
 //!   models virt accepts fail with "... is not supported by ruvm yet", and so do the CPU
 //!   properties other than `sve-max-vq` and `pmu=off` (there is no PMU).
 //! - The machine properties are taken only where their value describes the board that exists:
-//!   `gic-version=3`, `its=off`, `secure`, `virtualization`, `mte`, `ras=off`,
-//!   `acpi=off` or `auto`, `iommu=none`, `msi=off` or `auto`, 32 virtio-mmio transports and
-//!   the `highmem*` properties. Other values fail with "... is not supported by ruvm yet".
-//!   The board has no ITS, where QEMU's default is `its=on`, and it behaves as with
-//!   `dtb-randomness=off` whatever that property says.
+//!   `gic-version=3`, `its`, `secure`, `virtualization`, `mte`, `ras=off`, `acpi=off` or
+//!   `auto`, `iommu=none`, `msi` other than `gicv2m`, 32 virtio-mmio transports and the
+//!   `highmem*` properties. Other values fail with "... is not supported by ruvm yet". The
+//!   board behaves as with `dtb-randomness=off` whatever that property says.
 //! - `-semihosting-config target=gdb` fails, since there is no gdbstub; `auto` and `native`
 //!   both mean native.
 //! - SYS_EXIT asks the main loop to quit with the guest's status (`shutdown_request` with the
@@ -56,7 +55,7 @@ use ruvm_machine_arm::tcg_run::{
     ShutdownReason, VirtEvent, VirtEventHandler, VirtRunConfig, VirtTcgMachine,
 };
 use ruvm_machine_arm::virt::memmap::check_highmem_mmio_size;
-use ruvm_machine_arm::virt::{Highmem, VIRT_GICV3_MAX_CPUS, VirtConfig, VirtMachine};
+use ruvm_machine_arm::virt::{Highmem, VirtConfig, VirtMachine, VirtMsi};
 use ruvm_qapi::events::event_reset;
 use ruvm_qapi::opts::{QemuOptDesc, QemuOptType, QemuOptsList};
 use ruvm_qapi::types::{
@@ -207,6 +206,8 @@ pub(crate) struct BoardOptions {
     /// `highmem`, `compact-highmem`, `highmem-redists`, `highmem-ecam`, `highmem-mmio` and
     /// `highmem-mmio-size`.
     pub highmem: Highmem,
+    /// `msi`, or `its`, whichever came last.
+    pub msi: VirtMsi,
     /// `dumpdtb`: write the device tree there and exit.
     pub dumpdtb: Option<String>,
 }
@@ -263,7 +264,7 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
         if prop_bool(name, value)? == want { Ok(()) } else { Err(not_supported(name, value)) }
     };
     match name {
-        "ras" | "its" | "usb" => want_bool(false),
+        "ras" | "usb" => want_bool(false),
         // There is no IOMMU for the root bus to bypass, and the board always behaves as with
         // dtb-randomness=off.
         "default-bus-bypass-iommu" | "dtb-randomness" | "dtb-kaslr-seed" => {
@@ -286,12 +287,6 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
             "smmuv3" => Err(not_supported(name, value)),
             _ => Err(Error::generic("Invalid iommu value".to_string())
                 .hint("Valid values are none, smmuv3.\n")),
-        },
-        "msi" => match value {
-            "auto" | "off" => Ok(()),
-            "its" | "gicv2m" => Err(not_supported(name, value)),
-            _ => Err(Error::generic("Invalid msi value".to_string())
-                .hint("Valid values are auto, its, gicv2m, off.\n")),
         },
         "virtio-mmio-transports" => match value.parse::<u8>() {
             Ok(32) => Ok(()),
@@ -425,6 +420,23 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
             }
             "highmem-redists" => {
                 o.highmem.redists = prop_bool(name, &prop_string(name, value)?)?;
+            }
+            // virt_set_msi() and virt_set_its(). its=off means no MSI controller with a GICv3.
+            "msi" => {
+                o.msi = match prop_string(name, value)?.as_str() {
+                    "auto" => VirtMsi::Auto,
+                    "its" => VirtMsi::Its,
+                    "gicv2m" => return Err(not_supported(name, "gicv2m")),
+                    "off" => VirtMsi::Off,
+                    _ => {
+                        return Err(Error::generic("Invalid msi value")
+                            .hint("Valid values are auto, gicv2m, its, off\n"));
+                    }
+                };
+            }
+            "its" => {
+                let on = prop_bool(name, &prop_string(name, value)?)?;
+                o.msi = if on { VirtMsi::Its } else { VirtMsi::Off };
             }
             "highmem-ecam" => o.highmem.ecam = prop_bool(name, &prop_string(name, value)?)?,
             "highmem-mmio" => o.highmem.mmio = prop_bool(name, &prop_string(name, value)?)?,
@@ -847,6 +859,9 @@ pub(crate) fn start_board_tcg(
     cfg.virtualization = opts.virtualization;
     cfg.mte = opts.mte;
     cfg.highmem = opts.highmem;
+    cfg.msi = opts.msi;
+    // machvirt_init() checks maxcpus against the redistributor space.
+    cfg.max_cpus = Some(opts.max_cpus as usize);
     for (slot, drive) in cfg.pflash.iter_mut().zip(plan.pflash) {
         if let Some(backing) = drive {
             *slot = backing;
@@ -861,14 +876,6 @@ pub(crate) fn start_board_tcg(
     cfg.semihosting_userspace = semi.userspace;
     cfg.clock = Some(Arc::clone(&clock));
     cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
-    // machvirt_init() checks maxcpus against the redistributor space; the board checks smp.
-    if opts.max_cpus as usize > VIRT_GICV3_MAX_CPUS {
-        return Err(one(Error::generic(format!(
-            "Number of SMP CPUs requested ({}) exceeds max CPUs supported by machine \
-             'mach-virt' ({VIRT_GICV3_MAX_CPUS})",
-            opts.max_cpus
-        ))));
-    }
     let mut board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
     devices::plug(&board, &plan.virtio, args.drives).map_err(|e| vec![e])?;
 
@@ -996,6 +1003,27 @@ mod tests {
         let o = take_board_options(&m).unwrap();
         assert_eq!(o.kernel.as_deref(), Some("k"));
         assert_eq!(o.dtb.as_deref(), Some("d.dtb"));
+        assert_eq!(o.msi, VirtMsi::Off);
+        // msi and its set the same thing, and the last one wins.
+        let msi = |props: &[(&str, &str)]| {
+            let mut m = QDict::new();
+            for (k, v) in props {
+                m.put(*k, *v);
+            }
+            take_board_options(&m).map(|o| o.msi)
+        };
+        assert_eq!(msi(&[]).unwrap(), VirtMsi::Auto);
+        assert_eq!(msi(&[("msi", "off"), ("its", "on")]).unwrap(), VirtMsi::Its);
+        assert_eq!(msi(&[("its", "on"), ("msi", "off")]).unwrap(), VirtMsi::Off);
+        assert_eq!(msi(&[("msi", "its")]).unwrap(), VirtMsi::Its);
+        assert_eq!(msi(&[("msi", "auto")]).unwrap(), VirtMsi::Auto);
+        let e = msi(&[("msi", "foo")]).unwrap_err();
+        assert_eq!(e.message(), "Invalid msi value");
+        assert_eq!(e.hint_text(), Some("Valid values are auto, gicv2m, its, off\n"));
+        assert_eq!(
+            msi(&[("msi", "gicv2m")]).unwrap_err().message(),
+            "msi=gicv2m is not supported by ruvm yet"
+        );
         let mut m = QDict::new();
         m.put("secure", "on");
         m.put("virtualization", "on");
