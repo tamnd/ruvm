@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Table framing and the generic tables from hw/acpi/aml-build.c: the System Description Table
-//! header, RSDP, RSDT, XSDT and FADT.
+//! header, RSDP, RSDT, XSDT, FADT, MCFG, SPCR and SLIT.
 
 use super::aml::{AddressSpace, append_int_noprefix};
 use super::linker::BiosLinker;
@@ -377,6 +377,116 @@ pub fn build_fadt(
                 assert_eq!(f.rev, 6, "FADT revision {}", f.rev);
                 append_padded_str(tbl, "QEMU", 8, 0);
             }
+        }
+    }
+    table.end(Some(linker), tbl);
+}
+
+/// `AcpiSpcrData`, the Serial Port Console Redirection table's fields.
+#[derive(Clone, Debug, Default)]
+pub struct SpcrData {
+    pub interface_type: u8,
+    pub base_addr: Gas,
+    pub interrupt_type: u8,
+    pub pc_interrupt: u8,
+    pub interrupt: u32,
+    pub baud_rate: u8,
+    pub parity: u8,
+    pub stop_bits: u8,
+    pub flow_control: u8,
+    pub terminal_type: u8,
+    pub language: u8,
+    pub pci_device_id: u16,
+    pub pci_vendor_id: u16,
+    pub pci_bus: u8,
+    pub pci_device: u8,
+    pub pci_function: u8,
+    pub pci_flags: u32,
+    pub pci_segment: u8,
+    pub uart_clk_freq: u32,
+    pub precise_baudrate: u32,
+    pub namespace_string_length: u16,
+    pub namespace_string_offset: u16,
+}
+
+/// `build_spcr()`. From revision 4 on the table ends with the namespace string `name`, of
+/// which `namespace_string_length` bytes are written.
+pub fn build_spcr(
+    tbl: &mut Vec<u8>,
+    linker: &mut BiosLinker,
+    f: &SpcrData,
+    rev: u8,
+    oem_id: &str,
+    oem_table_id: &str,
+    name: &[u8],
+) {
+    let table = AcpiTable::begin("SPCR", rev, oem_id, oem_table_id, tbl);
+    tbl.push(f.interface_type);
+    append_int_noprefix(tbl, 0, 3); // Reserved
+    append_gas_from(tbl, &f.base_addr);
+    tbl.push(f.interrupt_type);
+    tbl.push(f.pc_interrupt);
+    append_int_noprefix(tbl, f.interrupt.into(), 4); // Global System Interrupt
+    tbl.push(f.baud_rate);
+    tbl.push(f.parity);
+    tbl.push(f.stop_bits);
+    tbl.push(f.flow_control);
+    tbl.push(f.terminal_type);
+    tbl.push(f.language);
+    append_int_noprefix(tbl, f.pci_device_id.into(), 2);
+    append_int_noprefix(tbl, f.pci_vendor_id.into(), 2);
+    tbl.push(f.pci_bus);
+    tbl.push(f.pci_device);
+    tbl.push(f.pci_function);
+    append_int_noprefix(tbl, f.pci_flags.into(), 4);
+    tbl.push(f.pci_segment);
+    if rev < 4 {
+        append_int_noprefix(tbl, 0, 4); // Reserved
+    } else {
+        append_int_noprefix(tbl, f.uart_clk_freq.into(), 4);
+        append_int_noprefix(tbl, f.precise_baudrate.into(), 4);
+        append_int_noprefix(tbl, f.namespace_string_length.into(), 2);
+        append_int_noprefix(tbl, f.namespace_string_offset.into(), 2);
+        tbl.extend_from_slice(&name[..f.namespace_string_length.into()]);
+    }
+    table.end(Some(linker), tbl);
+}
+
+/// `MEM_AFFINITY_ENABLED`, a `MemoryAffinityFlags` bit.
+pub const MEM_AFFINITY_ENABLED: u32 = 1 << 0;
+
+/// `build_srat_memory()`, the SRAT Memory Affinity structure (ACPI 6.3, 5.2.16.2).
+pub fn build_srat_memory(tbl: &mut Vec<u8>, base: u64, len: u64, node: u32, flags: u32) {
+    tbl.push(1); // Type
+    tbl.push(40); // Length
+    append_int_noprefix(tbl, node.into(), 4); // Proximity Domain
+    append_int_noprefix(tbl, 0, 2); // Reserved
+    append_int_noprefix(tbl, base & 0xffff_ffff, 4); // Base Address Low
+    append_int_noprefix(tbl, base >> 32, 4); // Base Address High
+    append_int_noprefix(tbl, len & 0xffff_ffff, 4); // Length Low
+    append_int_noprefix(tbl, len >> 32, 4); // Length High
+    append_int_noprefix(tbl, 0, 4); // Reserved
+    append_int_noprefix(tbl, flags.into(), 4);
+    append_int_noprefix(tbl, 0, 8); // Reserved
+}
+
+/// `build_slit()`: `distance[i][j]` is the distance from NUMA node `i` to node `j`, none of
+/// them zero.
+pub fn build_slit(
+    tbl: &mut Vec<u8>,
+    linker: &mut BiosLinker,
+    distance: &[Vec<u8>],
+    oem_id: &str,
+    oem_table_id: &str,
+) {
+    let nb_numa_nodes = distance.len();
+    let table = AcpiTable::begin("SLIT", 1, oem_id, oem_table_id, tbl);
+    append_int_noprefix(tbl, nb_numa_nodes as u64, 8);
+    for row in distance {
+        assert_eq!(row.len(), nb_numa_nodes, "SLIT row length");
+        for &d in row {
+            assert!(d != 0, "SLIT distance of 0");
+            tbl.push(d);
         }
     }
     table.end(Some(linker), tbl);

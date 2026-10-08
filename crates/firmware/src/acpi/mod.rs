@@ -6,11 +6,13 @@
 pub mod aml;
 pub mod cpuhp;
 pub mod devices;
+pub mod gpex;
 pub mod linker;
 pub mod microvm;
 pub mod pci;
 pub mod pcihp;
 pub mod q35;
+pub mod riscv_virt;
 pub mod table;
 pub mod x86;
 

@@ -16,8 +16,14 @@ use ruvm_firmware::acpi::table::{TABLE_FILE, checksum};
 
 /// Reads `vendor-qemu/acpi-expected/x86/<machine>/<name>`.
 pub(crate) fn expected(machine: &str, name: &str) -> Vec<u8> {
+    expected_arch("x86", machine, name)
+}
+
+/// Reads `vendor-qemu/acpi-expected/<arch>/<machine>/<name>`.
+pub(crate) fn expected_arch(arch: &str, machine: &str, name: &str) -> Vec<u8> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vendor-qemu/acpi-expected/x86")
+        .join("../../vendor-qemu/acpi-expected")
+        .join(arch)
         .join(machine);
     std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
@@ -76,7 +82,12 @@ pub(crate) fn hex(b: &[u8]) -> String {
 
 /// Asserts that table `sig` in `t` matches the expected blob `file`.
 pub(crate) fn check(t: &BuildTables, machine: &str, sig: &str, file: &str) {
+    check_arch(t, "x86", machine, sig, file);
+}
+
+/// Asserts that table `sig` in `t` matches `vendor-qemu/acpi-expected/<arch>/<machine>/<file>`.
+pub(crate) fn check_arch(t: &BuildTables, arch: &str, machine: &str, sig: &str, file: &str) {
     let got = table(&load(t), sig);
-    let want = expected(machine, file);
+    let want = expected_arch(arch, machine, file);
     assert!(got == want, "{file} differs\ngot:\n{}\nwant:\n{}", hex(&got), hex(&want));
 }

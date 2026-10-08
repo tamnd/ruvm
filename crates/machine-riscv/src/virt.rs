@@ -50,6 +50,15 @@
 //! calls in the same order as QEMU, so with the same CPU configuration and `rng-seed` it
 //! matches `-M virt,dumpdtb=` byte for byte.
 //!
+//! With a firmware in the first flash (EDK2) and a `-bios`, the harts go from the `-bios`
+//! firmware to the flash, and `-kernel`, `-initrd` and `-append` go to the flash firmware
+//! through fw_cfg (`riscv_setup_firmware_boot()`), the kernel inflated if it is gzip.
+//!
+//! Unless `acpi=off`, the board puts the ACPI tables of hw/riscv/virt-acpi-build.c in fw_cfg
+//! as `etc/acpi/tables`, `etc/acpi/rsdp` and `etc/table-loader` for the firmware to install
+//! ([`VirtMachine::acpi_tables`]): DSDT, FADT, MADT, RHCT, SPCR (unless `spcr=off`) and
+//! MCFG, which match QEMU's byte for byte for the same CPU configuration.
+//!
 //! # Using it
 //!
 //! [`VirtMachine::new`] builds the board and realizes the `-device loader`s. Plug virtio
@@ -67,11 +76,9 @@
 //!
 //! - The ACLINT SSWI (`aclint=on`) and the RISC-V IOMMU (`iommu-sys=on`); those properties
 //!   are taken only with their default values.
-//! - ACPI and SMBIOS (`virt_build_smbios()` and `virt_acpi_setup()`).
+//! - SMBIOS (`virt_build_smbios()`).
 //! - NUMA and more than one socket: every hart is in socket 0.
 //! - uImage kernels, Intel HEX files for `-device loader`, u-boot ramdisks.
-//! - `-kernel` together with a firmware in the first flash, which QEMU passes through
-//!   fw_cfg (`riscv_setup_firmware_boot()`).
 //! - KVM: only TCG.
 //!
 //! # Differences from QEMU
@@ -103,6 +110,12 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ruvm_base::ClockType;
+use ruvm_firmware::acpi::BuildTables;
+use ruvm_firmware::acpi::gpex::Window;
+use ruvm_firmware::acpi::riscv_virt::{
+    self, Cmo, Hart, MmuType, RiscvVirtAcpi, Socket, VirtAia as AcpiAia, VirtMemmap,
+};
+use ruvm_firmware::acpi::table::{APPNAME6, APPNAME8, LOADER_FILE, RSDP_FILE, TABLE_FILE};
 use ruvm_hw_char::serial::{Serial, SerialBackend};
 use ruvm_hw_core::fw_cfg::{
     DmaMemory, FW_CFG_CTL_SIZE, FW_CFG_DMA_SIZE, FW_CFG_NB_CPUS, FwCfgMachineConfig, FwCfgMem,
@@ -131,6 +144,7 @@ use ruvm_mem::{
     AccessConstraints, AccessCtx, AccessSize, AddressSpace, Endian, MemResult, MemTxAttrs,
     MemorySystem, MmioOps, RegionId, RegionType,
 };
+use ruvm_target_riscv::cfg::{VM_SV39, VM_SV48, VM_SV57};
 use ruvm_target_riscv::cpu::{
     CpuRiscvState, IRQ_LOCAL_MAX, IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, RiscvCfg,
 };
@@ -319,6 +333,10 @@ pub struct VirtConfig {
     /// `aia-guests`: the guest files of each S level IMSIC, at most
     /// [`VIRT_IRQCHIP_MAX_GUESTS`]. Used with [`VirtAia::AplicImsic`] only.
     pub aia_guests: u32,
+    /// `acpi`: false for `acpi=off`, true for `on` and `auto` (the default).
+    pub acpi: bool,
+    /// The machine's `spcr` property: whether the ACPI tables include an SPCR.
+    pub spcr: bool,
 }
 
 /// `RISCVVirtAIAType`, the `aia` property.
@@ -362,6 +380,8 @@ impl fmt::Debug for VirtConfig {
             .field("loaders", &self.loaders)
             .field("aia", &self.aia)
             .field("aia_guests", &self.aia_guests)
+            .field("acpi", &self.acpi)
+            .field("spcr", &self.spcr)
             .finish_non_exhaustive()
     }
 }
@@ -389,6 +409,8 @@ impl Default for VirtConfig {
             rng_seed: None,
             aia: VirtAia::None,
             aia_guests: 0,
+            acpi: true,
+            spcr: true,
         }
     }
 }
@@ -566,6 +588,8 @@ pub struct VirtMachine {
     irqchip: Irqchip,
     aia: VirtAia,
     aia_guests: u32,
+    acpi: bool,
+    spcr: bool,
     test: Arc<SiFiveTest>,
     uart: Arc<Serial>,
     rtc: Arc<GoldfishRtc>,
@@ -907,6 +931,8 @@ impl VirtMachine {
             irqchip,
             aia,
             aia_guests,
+            acpi: cfg.acpi,
+            spcr: cfg.spcr,
             test,
             uart,
             rtc,
@@ -1037,12 +1063,15 @@ impl VirtMachine {
                 // Pflash was supplied but bios is none: jump to the base of the flash.
                 start_addr = VIRT_FLASH;
             } else {
-                // The flash holds an S-mode payload; riscv_setup_firmware_boot() hands it
-                // the kernel through fw_cfg.
-                if self.kernel.is_some() {
-                    return Err("loading -kernel through fw_cfg for the firmware is not \
-                                supported by ruvm yet"
-                        .to_string());
+                // The flash holds an S-mode payload, which gets the kernel through fw_cfg.
+                if let Some(kernel) = self.kernel.clone() {
+                    let files = KernelFiles {
+                        kernel: &kernel,
+                        initrd: self.initrd.as_deref(),
+                        cmdline: self.append.as_deref(),
+                    };
+                    let fwc = self.fw_cfg.state().clone();
+                    boot::riscv_setup_firmware_boot(&mut self.loader, &fwc, files)?;
                 }
                 kernel_entry = VIRT_FLASH;
             }
@@ -1087,6 +1116,16 @@ impl VirtMachine {
         info.fdt_addr = fdt_addr;
         self.info = info;
 
+        // virt_acpi_setup(). The tables never change, so unlike QEMU they are not rebuilt
+        // when the firmware first reads them.
+        if self.acpi {
+            let tables = self.acpi_tables();
+            let fwc = self.fw_cfg.state();
+            fwc.add_file(TABLE_FILE, tables.table_data).map_err(err)?;
+            fwc.add_file(LOADER_FILE, tables.linker.cmd_blob().to_vec()).map_err(err)?;
+            fwc.add_file(RSDP_FILE, tables.rsdp).map_err(err)?;
+        }
+
         self.ram = self.ram_ranges_now()?;
         // common_semi_find_bases(): the largest gap in the largest RAM region.
         let mut best: Option<&RamRange> = None;
@@ -1105,6 +1144,60 @@ impl VirtMachine {
         }
         self.done = true;
         self.system_reset()
+    }
+
+    /// `virt_acpi_build()`: the ACPI tables of the board as it is now.
+    pub fn acpi_tables(&self) -> BuildTables {
+        let cfg = self.riscv.cfg();
+        let w = |base, size| Window { base, size };
+        let num_harts = self.smp as u32;
+        let acpi = RiscvVirtAcpi {
+            oem_id: APPNAME6.to_string(),
+            oem_table_id: APPNAME8.to_string(),
+            memmap: VirtMemmap {
+                plic: w(VIRT_PLIC, VIRT_PLIC_SIZE),
+                aplic_s: w(VIRT_APLIC_S, VIRT_APLIC_SIZE),
+                imsic_s: w(VIRT_IMSIC_S, VIRT_IMSIC_MAX_SIZE),
+                uart0: w(VIRT_UART0, VIRT_UART0_SIZE),
+                virtio: w(VIRT_VIRTIO, VIRT_VIRTIO_SIZE),
+                fw_cfg: w(VIRT_FW_CFG, VIRT_FW_CFG_SIZE),
+                pcie_ecam: w(VIRT_PCIE_ECAM, VIRT_PCIE_ECAM_SIZE),
+                pcie_mmio: w(VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE),
+                pcie_pio: w(VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE),
+                pcie_mmio_high: w(high_pcie_base(self.ram_size), dt::VIRT64_HIGH_PCIE_MMIO_SIZE),
+                dram: w(VIRT_DRAM, self.ram_size),
+            },
+            harts: (0..self.smp as u64).map(|hart_id| Hart { hart_id, socket: 0 }).collect(),
+            smp_cpus: num_harts,
+            sockets: vec![Socket { first_hartid: 0, num_harts }],
+            aia: match self.aia {
+                VirtAia::None => AcpiAia::None,
+                VirtAia::Aplic => AcpiAia::Aplic,
+                VirtAia::AplicImsic => AcpiAia::AplicImsic,
+            },
+            aia_guests: self.aia_guests,
+            num_sources: VIRT_IRQCHIP_NUM_SOURCES,
+            num_msis: VIRT_IRQCHIP_NUM_MSIS,
+            uart_irq: UART0_IRQ,
+            virtio_irq: VIRTIO_IRQ,
+            virtio_count: VIRTIO_COUNT as u32,
+            pcie_irq: PCIE_IRQ,
+            isa: cfg.isa_string(),
+            cmo: (cfg.ext_zicbom || cfg.ext_zicboz).then_some(Cmo {
+                cbom_blocksize: cfg.cbom_blocksize,
+                cboz_blocksize: cfg.cboz_blocksize,
+            }),
+            mmu: match cfg.max_satp_mode {
+                VM_SV57 => Some(MmuType::Sv57),
+                VM_SV48 => Some(MmuType::Sv48),
+                VM_SV39 => Some(MmuType::Sv39),
+                _ => None,
+            },
+            timebase_freq: RISCV_ACLINT_DEFAULT_TIMEBASE_FREQ.into(),
+            spcr: self.spcr,
+            numa: Vec::new(),
+        };
+        riscv_virt::build(&acpi)
     }
 
     fn ram_ranges_now(&self) -> Result<Vec<RamRange>, String> {
@@ -1513,6 +1606,123 @@ mod tests {
     fn too_many_aia_guests() {
         let cfg = VirtConfig { aia: VirtAia::AplicImsic, aia_guests: 8, ..VirtConfig::default() };
         assert_eq!(VirtMachine::new(cfg).unwrap_err(), "Invalid number of AIA IMSIC guests");
+    }
+
+    /// The tables in `etc/acpi/tables` with their checksums filled in as the firmware would,
+    /// and the FADT pointers zeroed as bios-tables-test does.
+    fn acpi_tables(t: &BuildTables) -> Vec<(String, Vec<u8>)> {
+        use ruvm_firmware::acpi::linker::Command;
+        use ruvm_firmware::acpi::table::checksum;
+        let mut data = t.table_data.clone();
+        for cmd in t.linker.commands() {
+            if let Command::AddChecksum { file, offset, start, length } = cmd {
+                if file != TABLE_FILE {
+                    continue;
+                }
+                let (o, s) = (offset as usize, start as usize);
+                data[o] = 0;
+                data[o] = checksum(&data[s..s + length as usize]);
+            }
+        }
+        let mut tables = Vec::new();
+        let mut at = 0;
+        while at + 8 <= data.len() && data[at..at + 4] != [0; 4] {
+            let len = u32::from_le_bytes(data[at + 4..at + 8].try_into().unwrap()) as usize;
+            let sig = String::from_utf8(data[at..at + 4].to_vec()).unwrap();
+            let mut table = data[at..at + len].to_vec();
+            assert_eq!(checksum(&table), 0, "{sig} checksum");
+            if sig == "FACP" {
+                table[36..44].fill(0);
+                table[132..148].fill(0);
+                table[9] = 0;
+                table[9] = checksum(&table);
+            }
+            tables.push((sig, table));
+            at += len;
+        }
+        tables
+    }
+
+    /// The board's tables with `-cpu rva22s64` against QEMU's bios-tables-test blobs.
+    #[test]
+    fn acpi_tables_match_qemu() {
+        let m = board(VirtConfig { cpu: RiscvCfg::model("rva22s64"), ..VirtConfig::default() });
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor-qemu/acpi-expected/riscv64/virt");
+        let tables = acpi_tables(&m.acpi_tables());
+        let sigs: Vec<&str> = tables.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(sigs, ["DSDT", "FACP", "APIC", "RHCT", "SPCR", "MCFG", "XSDT"]);
+        for (sig, got) in &tables[..6] {
+            let want = std::fs::read(dir.join(sig)).unwrap();
+            assert!(*got == want, "{sig} differs from QEMU's");
+        }
+    }
+
+    #[test]
+    fn acpi_tables_go_to_fw_cfg() {
+        let names = |m: &VirtMachine| -> Vec<String> {
+            m.fw_cfg().state().files().into_iter().map(|(n, _, _)| n).collect()
+        };
+        let m = board(VirtConfig::default());
+        let files = m.fw_cfg().state().files();
+        for name in [TABLE_FILE, RSDP_FILE, LOADER_FILE] {
+            let (_, key, size) = files.iter().find(|(n, _, _)| n == name).unwrap().clone();
+            let data = m.fw_cfg().state().entry_data(key).unwrap();
+            assert_eq!(data.len(), size as usize);
+        }
+        let tables = files.iter().find(|(n, _, _)| n == TABLE_FILE).unwrap();
+        assert_eq!(tables.2, 0x20000);
+        let m = board(VirtConfig { acpi: false, ..VirtConfig::default() });
+        assert!(!names(&m).iter().any(|n| n.starts_with("etc/acpi")));
+        // spcr=off leaves the SPCR out.
+        let m = board(VirtConfig { spcr: false, ..VirtConfig::default() });
+        let sigs: Vec<String> = acpi_tables(&m.acpi_tables()).into_iter().map(|(s, _)| s).collect();
+        assert!(!sigs.contains(&"SPCR".to_string()));
+    }
+
+    /// With a firmware in the first flash and a `-bios`, the kernel (inflated), the initrd and
+    /// the command line go through fw_cfg and the harts go to the flash.
+    #[test]
+    fn firmware_boot_through_fw_cfg() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use ruvm_hw_core::fw_cfg::{
+            FW_CFG_CMDLINE_DATA, FW_CFG_CMDLINE_SIZE, FW_CFG_INITRD_DATA, FW_CFG_INITRD_SIZE,
+            FW_CFG_KERNEL_DATA, FW_CFG_KERNEL_SIZE,
+        };
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("ruvm-riscv-fwboot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fw = dir.join("fw.bin");
+        std::fs::write(&fw, vec![0x11u8; 0x100]).unwrap();
+        let image: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&image).unwrap();
+        let kernel = dir.join("Image.gz");
+        std::fs::write(&kernel, gz.finish().unwrap()).unwrap();
+        let initrd = dir.join("initrd");
+        std::fs::write(&initrd, [0x1f, 0x8b, 1, 2, 3]).unwrap();
+        let path = |p: &std::path::Path| Some(p.to_string_lossy().into_owned());
+        let half = (VIRT_FLASH_SIZE / 2) as usize;
+        let m = board(VirtConfig {
+            firmware: path(&fw),
+            pflash: [PflashBacking::Bytes(vec![0; half]), PflashBacking::None],
+            kernel: path(&kernel),
+            initrd: path(&initrd),
+            append: Some("console=ttyS0".to_string()),
+            ..VirtConfig::default()
+        });
+        assert_eq!(m.boot_info().kernel_entry, VIRT_FLASH);
+        let fwc = m.fw_cfg().state();
+        let get = |key| fwc.entry_data(key).unwrap();
+        assert_eq!(get(FW_CFG_KERNEL_SIZE), 10_000u32.to_le_bytes());
+        assert_eq!(get(FW_CFG_KERNEL_DATA), image);
+        // The initrd is passed as it is even though it starts with the gzip magic.
+        assert_eq!(get(FW_CFG_INITRD_SIZE), 5u32.to_le_bytes());
+        assert_eq!(get(FW_CFG_INITRD_DATA), [0x1f, 0x8b, 1, 2, 3]);
+        assert_eq!(get(FW_CFG_CMDLINE_SIZE), 14u32.to_le_bytes());
+        assert_eq!(get(FW_CFG_CMDLINE_DATA), b"console=ttyS0\0");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

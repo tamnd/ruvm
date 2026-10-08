@@ -13,10 +13,16 @@
 //! prefix.
 
 use std::fmt;
+use std::io::Read;
 use std::sync::Arc;
 
+use flate2::read::GzDecoder;
 use ruvm_base::error::strerror;
 use ruvm_base::warn_report;
+use ruvm_hw_core::fw_cfg::{
+    FW_CFG_CMDLINE_DATA, FW_CFG_CMDLINE_SIZE, FW_CFG_INITRD_DATA, FW_CFG_INITRD_SIZE,
+    FW_CFG_KERNEL_DATA, FW_CFG_KERNEL_SIZE, FwCfgState,
+};
 use ruvm_machine_arm::fdt::Fdt;
 use ruvm_mem::{AddressSpace, MemTxAttrs, RamBlock};
 use ruvm_qapi::cutils::size_to_str;
@@ -40,6 +46,8 @@ const ELFDATA2LSB: u8 = 1;
 /// `ELFCLASS64`.
 const ELFCLASS64: u8 = 2;
 const MIB: u64 = 1 << 20;
+/// `LOAD_IMAGE_MAX_DECOMPRESSED_BYTES`.
+const LOAD_IMAGE_MAX_DECOMPRESSED_BYTES: u64 = 256 << 20;
 
 // `ELF_LOAD_*`.
 const ELF_LOAD_FAILED: i64 = -1;
@@ -546,6 +554,61 @@ pub(crate) fn load_image_targphys_as(
     }
     ld.add(Rom { name: filename.to_string(), addr, data: data.to_vec(), romsize: size, as_name });
     Ok(size)
+}
+
+/// `load_image_gzipped_buffer()` on the contents `data` of `filename`: the inflated image, or
+/// `None` when it is not gzip or does not inflate to at most 256 MiB.
+fn load_gzipped(ld: &mut Loader, filename: &str, data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
+        return None;
+    }
+    let mut out = Vec::new();
+    let max = LOAD_IMAGE_MAX_DECOMPRESSED_BYTES;
+    match GzDecoder::new(data).take(max + 1).read_to_end(&mut out) {
+        Ok(n) if n as u64 <= max => Some(out),
+        _ => {
+            ld.note(format!("{filename}: unable to decompress gzipped kernel file"));
+            None
+        }
+    }
+}
+
+/// `load_image_to_fw_cfg()`: `filename` as the fw_cfg items `size_key` and `data_key`,
+/// inflated first if `try_decompress` is set and it is gzip.
+fn load_image_to_fw_cfg(
+    ld: &mut Loader,
+    fw_cfg: &FwCfgState,
+    keys: (u16, u16),
+    filename: Option<&str>,
+    try_decompress: bool,
+) -> Result<(), String> {
+    let Some(filename) = filename else {
+        return Ok(());
+    };
+    let raw = std::fs::read(filename).map_err(|_| format!("failed to load \"{filename}\""))?;
+    let data = if try_decompress { load_gzipped(ld, filename, &raw) } else { None };
+    let data = data.unwrap_or(raw);
+    fw_cfg.add_i32(keys.0, data.len() as u32);
+    fw_cfg.add_bytes(keys.1, data);
+    Ok(())
+}
+
+/// `riscv_setup_firmware_boot()`: hand the kernel, the initrd and the command line to the
+/// firmware in the flash through fw_cfg, untouched apart from inflating a gzip kernel.
+pub(crate) fn riscv_setup_firmware_boot(
+    ld: &mut Loader,
+    fw_cfg: &FwCfgState,
+    files: KernelFiles<'_>,
+) -> Result<(), String> {
+    let kernel_keys = (FW_CFG_KERNEL_SIZE, FW_CFG_KERNEL_DATA);
+    load_image_to_fw_cfg(ld, fw_cfg, kernel_keys, Some(files.kernel), true)?;
+    let initrd_keys = (FW_CFG_INITRD_SIZE, FW_CFG_INITRD_DATA);
+    load_image_to_fw_cfg(ld, fw_cfg, initrd_keys, files.initrd, false)?;
+    if let Some(cmdline) = files.cmdline {
+        fw_cfg.add_i32(FW_CFG_CMDLINE_SIZE, cmdline.len() as u32 + 1);
+        fw_cfg.add_string(FW_CFG_CMDLINE_DATA, cmdline);
+    }
+    Ok(())
 }
 
 /// `riscv_find_firmware()`: the file `-bios` names, through `find` (`qemu_find_file()` with

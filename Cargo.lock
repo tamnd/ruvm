@@ -842,8 +842,10 @@ version = "0.4.3"
 name = "ruvm-machine-riscv"
 version = "0.4.3"
 dependencies = [
+ "flate2",
  "ruvm-accel",
  "ruvm-base",
+ "ruvm-firmware",
  "ruvm-hw-char",
  "ruvm-hw-core",
  "ruvm-hw-intc",
