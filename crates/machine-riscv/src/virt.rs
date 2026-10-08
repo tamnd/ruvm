@@ -651,6 +651,9 @@ fn gpex_pcie_init(
         ..GpexConfig::default()
     };
     let gpex = GpexHost::new(Arc::clone(mem), system, config).map_err(err)?;
+    // `mc->pci_allow_0_address`: EDK2 puts the first I/O BAR at port 0, so a BAR at address 0
+    // has to be mapped. It only affects functions plugged after this.
+    gpex.bus().set_allow_0_address(true);
     let aliases = [
         ("pcie-ecam", gpex.ecam(), 0, VIRT_PCIE_ECAM, VIRT_PCIE_ECAM_SIZE),
         ("pcie-mmio", gpex.mmio_window(), VIRT_PCIE_MMIO, VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE),
@@ -1723,6 +1726,11 @@ mod tests {
         assert_eq!(get(FW_CFG_CMDLINE_SIZE), 14u32.to_le_bytes());
         assert_eq!(get(FW_CFG_CMDLINE_DATA), b"console=ttyS0\0");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pci_allows_bars_at_0() {
+        assert!(board(VirtConfig::default()).gpex().bus().allows_0_address());
     }
 
     #[test]
