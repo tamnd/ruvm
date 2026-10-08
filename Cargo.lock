@@ -921,9 +921,12 @@ version = "0.4.4"
 name = "ruvm-migration"
 version = "0.4.4"
 dependencies = [
+ "flate2",
+ "rustix",
  "ruvm-base",
  "ruvm-mem",
  "ruvm-qapi",
+ "ruvm-sys",
  "ruvm-vmstate",
 ]
 

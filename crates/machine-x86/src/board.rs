@@ -21,7 +21,7 @@ use ruvm_hw_virtio::{
     AddressSpaceMemory, SharedGuestMemory, VirtIODevice, VirtioBackend, VirtioDeviceClass,
     VirtioMmio, VirtioPci, VirtioPciProps,
 };
-use ruvm_mem::{AddressSpace, MemorySystem, RegionId};
+use ruvm_mem::{AddressSpace, MemorySystem, RamBlock, RegionId};
 
 use crate::firmware::FirmwareSearch;
 use crate::microvm::{
@@ -402,6 +402,12 @@ pub struct BoardSpec {
     pub props: Vec<(String, String)>,
     /// `-m`, or `None` for the board's default.
     pub ram_size: Option<u64>,
+    /// The RAM of `-machine memory-backend=`, which the board takes instead of making its
+    /// own. Its size is the RAM size.
+    pub memdev: Option<Arc<RamBlock>>,
+    /// `-machine aux-ram-share=`: the RAM and ROM the board makes are shared memory that CPR
+    /// can hand to the next process.
+    pub aux_ram_share: bool,
     /// `-smp cpus=`.
     pub cpus: u32,
     /// `-smp maxcpus=`, 0 for the same as `cpus`.
@@ -446,6 +452,8 @@ impl fmt::Debug for BoardSpec {
             .field("machine_type", &self.machine_type)
             .field("props", &self.props)
             .field("ram_size", &self.ram_size)
+            .field("memdev", &self.memdev.as_ref().map(|b| b.name()))
+            .field("aux_ram_share", &self.aux_ram_share)
             .field("cpus", &self.cpus)
             .field("bios", &self.bios)
             .field("kernel", &self.kernel)
@@ -488,7 +496,20 @@ pub fn load_kernel(files: &KernelFiles) -> Result<KernelConfig, String> {
 /// devices from `-device` and `-drive` are plugged afterwards, before `machine_done()`.
 /// Also gives the warnings setting the properties produced; the board's own are in
 /// [`X86Board::warnings`].
-pub fn build_board(spec: BoardSpec) -> Result<(X86Board, Vec<String>), String> {
+pub fn build_board(mut spec: BoardSpec) -> Result<(X86Board, Vec<String>), String> {
+    // qemu_resolve_machine_memdev() takes the backend's size when there is no -m, and
+    // machine_run_board_init() wants the two to agree otherwise.
+    if let Some(block) = &spec.memdev {
+        match spec.ram_size {
+            None => spec.ram_size = Some(block.len()),
+            Some(size) if size != block.len() => {
+                return Err(
+                    "Machine memory size does not match the size of the memory backend".into()
+                );
+            }
+            Some(_) => {}
+        }
+    }
     let kernel = spec.kernel.as_ref().map(load_kernel).transpose()?;
     let mut rom_files = BTreeMap::new();
     // The APIC's kvmvapic device asks for its option ROM on q35 (microvm creates its CPUs
@@ -527,6 +548,8 @@ pub fn build_board(spec: BoardSpec) -> Result<(X86Board, Vec<String>), String> {
                 clock: spec.clock,
                 rtc_clock: spec.rtc_clock,
                 pit_in_kernel: spec.pit_in_kernel,
+                memdev: spec.memdev,
+                aux_ram_share: spec.aux_ram_share,
                 ..MicrovmConfig::default()
             };
             if let Some(size) = spec.ram_size {
@@ -565,6 +588,8 @@ pub fn build_board(spec: BoardSpec) -> Result<(X86Board, Vec<String>), String> {
                 clock: spec.clock,
                 rtc_clock: spec.rtc_clock,
                 pit_in_kernel: spec.pit_in_kernel,
+                memdev: spec.memdev,
+                aux_ram_share: spec.aux_ram_share,
                 ..Q35MachineConfig::default()
             };
             if let Some(size) = spec.ram_size {

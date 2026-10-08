@@ -57,6 +57,11 @@ pub struct KvmAccel {
     irqchip: KernelIrqchip,
     readonly_mem: bool,
     nr_slots: usize,
+    /// `kvm_dirty_ring_size`: 0 when the dirty bitmap is in use.
+    dirty_ring_size: u32,
+    /// `kvm_dirty_ring_with_bitmap`.
+    dirty_ring_with_bitmap: bool,
+    warnings: Vec<String>,
 }
 
 impl KvmAccel {
@@ -89,6 +94,9 @@ impl KvmAccel {
                 return Err(KvmError::MissingCap(name));
             }
         }
+        let mut warnings = Vec::new();
+        let (dirty_ring_size, dirty_ring_with_bitmap) =
+            dirty_ring_init(&vm, opts.dirty_ring_size, &mut warnings)?;
         let readonly_mem =
             vm.check_extension_raw(libc::c_ulong::from(kvm_bindings::KVM_CAP_READONLY_MEM)) > 0;
         let nr_slots = kvm.get_nr_memslots();
@@ -107,7 +115,31 @@ impl KvmAccel {
             create_irqchip(&kvm, &vm, irqchip)?;
         }
 
-        Ok(KvmAccel { kvm, vm: Arc::new(vm), irqchip, readonly_mem, nr_slots })
+        Ok(KvmAccel {
+            kvm,
+            vm: Arc::new(vm),
+            irqchip,
+            readonly_mem,
+            nr_slots,
+            dirty_ring_size,
+            dirty_ring_with_bitmap,
+            warnings,
+        })
+    }
+
+    /// What `kvm_init()` warned about, for the caller to report.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// `kvm_dirty_ring_size()`: the entries of each vCPU's dirty ring, 0 without one.
+    pub fn dirty_ring_size(&self) -> u32 {
+        self.dirty_ring_size
+    }
+
+    /// Whether the dirty ring comes with a backup bitmap, `kvm_dirty_ring_with_bitmap`.
+    pub fn dirty_ring_with_bitmap(&self) -> bool {
+        self.dirty_ring_with_bitmap
     }
 
     /// The VM file descriptor, for the device and CPU code that issues its own ioctls.
@@ -144,6 +176,47 @@ impl KvmAccel {
             .map_err(|e| KvmError::Ioctl("KVM_CREATE_VCPU", os_error(e)))?;
         Ok(KvmVcpu::new(fd, index))
     }
+}
+
+/// `kvm_dirty_ring_init()`: turns the dirty ring on when `size` asks for one and the kernel
+/// has it, and gives the ring size in use with whether there is a backup bitmap. Without the
+/// capability this warns and stays with the bitmap.
+fn dirty_ring_init(
+    vm: &VmFd,
+    size: u32,
+    warnings: &mut Vec<String>,
+) -> Result<(u32, bool), KvmError> {
+    if size == 0 {
+        return Ok((0, false));
+    }
+    let bytes = u64::from(size) * crate::KVM_DIRTY_GFN_SIZE;
+    let check = |cap: u32| vm.check_extension_raw(libc::c_ulong::from(cap));
+    let mut cap = kvm_bindings::KVM_CAP_DIRTY_LOG_RING;
+    let mut max = check(cap);
+    if max <= 0 {
+        cap = kvm_bindings::KVM_CAP_DIRTY_LOG_RING_ACQ_REL;
+        max = check(cap);
+    }
+    if max <= 0 {
+        warnings.push("KVM dirty ring not available, using bitmap method".to_string());
+        return Ok((0, false));
+    }
+    let max = max as u64;
+    if bytes > max {
+        return Err(KvmError::DirtyRingTooBig { size, max: max / crate::KVM_DIRTY_GFN_SIZE });
+    }
+    let mut enable = kvm_enable_cap { cap, ..Default::default() };
+    enable.args[0] = bytes;
+    vm.enable_cap(&enable).map_err(|e| KvmError::DirtyRing(os_error(e)))?;
+    let with_bitmap = check(kvm_bindings::KVM_CAP_DIRTY_LOG_RING_WITH_BITMAP) > 0;
+    if with_bitmap {
+        let bitmap = kvm_enable_cap {
+            cap: kvm_bindings::KVM_CAP_DIRTY_LOG_RING_WITH_BITMAP,
+            ..Default::default()
+        };
+        vm.enable_cap(&bitmap).map_err(|e| KvmError::DirtyRingBitmap(os_error(e)))?;
+    }
+    Ok((size, with_bitmap))
 }
 
 /// `do_kvm_irqchip_create()` with the x86 `kvm_arch_irqchip_create()` folded in.

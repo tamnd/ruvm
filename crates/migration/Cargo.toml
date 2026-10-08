@@ -14,10 +14,15 @@ publish = false
 unsafe-budget = 0
 
 [dependencies]
+flate2.workspace = true
 ruvm-base.workspace = true
 ruvm-mem.workspace = true
 ruvm-qapi.workspace = true
+ruvm-sys.workspace = true
 ruvm-vmstate.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true

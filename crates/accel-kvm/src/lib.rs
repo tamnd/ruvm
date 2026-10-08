@@ -9,6 +9,9 @@
 //! line can name the accelerator anywhere. The accelerator itself exists only on x86-64 Linux for
 //! now.
 //!
+//! The `dirty-ring-size` property turns the dirty ring on with QEMU's checks and messages, but
+//! nothing reaps it yet.
+//!
 //! Everything else in `spec/06-accelerators.md` comes later: register sync levels, CPUID and MSR
 //! setup (which belong to ruvm-target-x86), GSI routing, irqfd, ioeventfd, dirty logging and the
 //! other architectures.
@@ -61,7 +64,13 @@ pub struct KvmOptions {
     /// The `kernel-irqchip` property. `None` leaves it to the machine, which picks split when
     /// its class sets `default_kernel_irqchip_split` and on otherwise.
     pub kernel_irqchip: Option<KernelIrqchip>,
+    /// The `dirty-ring-size` property: the entries of each vCPU's dirty ring, a power of two,
+    /// or 0 for the dirty bitmap.
+    pub dirty_ring_size: u32,
 }
+
+/// `sizeof(struct kvm_dirty_gfn)`, one entry of a dirty ring.
+pub const KVM_DIRTY_GFN_SIZE: u64 = 16;
 
 /// Capabilities every KVM host must have, from `kvm_required_capabilities[]` in kvm-all.c plus
 /// the two ruvm adds, in the order QEMU checks them. The name is what the error message shows.
@@ -113,6 +122,12 @@ pub enum KvmError {
     Run(io::Error),
     /// The host has no KVM at all.
     Unavailable,
+    /// `dirty-ring-size` is more than the kernel takes, which is `max` entries.
+    DirtyRingTooBig { size: u32, max: u64 },
+    /// `KVM_CAP_DIRTY_LOG_RING` could not be enabled.
+    DirtyRing(io::Error),
+    /// `KVM_CAP_DIRTY_LOG_RING_WITH_BITMAP` could not be enabled.
+    DirtyRingBitmap(io::Error),
 }
 
 /// `strerror()` text, without the `(os error N)` that Rust appends.
@@ -139,6 +154,18 @@ impl fmt::Display for KvmError {
             Self::Ioctl(what, e) => write!(f, "{what} failed: {}", strerror(e)),
             Self::Run(e) => write!(f, "error: kvm run failed {}", strerror(e)),
             Self::Unavailable => f.write_str("-accel kvm: KVM is not available on this host"),
+            Self::DirtyRingTooBig { size, max } => write!(
+                f,
+                "KVM dirty ring size {size} too big (maximum is {max}).  Please use a smaller value."
+            ),
+            Self::DirtyRing(e) => write!(
+                f,
+                "Enabling of KVM dirty ring failed: {}. Suggested minimum value is 1024.",
+                strerror(e)
+            ),
+            Self::DirtyRingBitmap(e) => {
+                write!(f, "Enabling of KVM dirty ring's backup bitmap failed: {}. ", strerror(e))
+            }
         }
     }
 }
@@ -169,6 +196,14 @@ mod tests {
         assert_eq!(
             KvmError::Run(io::Error::from_raw_os_error(14)).to_string(),
             "error: kvm run failed Bad address"
+        );
+        assert_eq!(
+            KvmError::DirtyRingTooBig { size: 1 << 20, max: 65536 }.to_string(),
+            "KVM dirty ring size 1048576 too big (maximum is 65536).  Please use a smaller value."
+        );
+        assert_eq!(
+            KvmError::DirtyRing(io::Error::from_raw_os_error(22)).to_string(),
+            "Enabling of KVM dirty ring failed: Invalid argument. Suggested minimum value is 1024."
         );
     }
 
