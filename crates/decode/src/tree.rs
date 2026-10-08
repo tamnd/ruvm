@@ -98,12 +98,7 @@ fn node_str(m: &Model, ctx: &Ctx, n: Node) -> String {
 
 /// `ExcMultiPattern.__build_tree`. The script also passes the outer fixed bits down, but never
 /// reads them.
-fn exc_build_tree(
-    m: &Model,
-    ctx: &Ctx,
-    pats: &[Node],
-    outermask: u64,
-) -> Result<Tree, Error> {
+fn exc_build_tree(m: &Model, ctx: &Ctx, pats: &[Node], outermask: u64) -> Result<Tree, Error> {
     let mut innermask = !outermask & ctx.insnmask;
     for &p in pats {
         innermask &= m.node_fixed(p).1;
