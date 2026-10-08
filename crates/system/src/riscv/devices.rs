@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use ruvm_base::Error;
 use ruvm_base::report::Location;
 use ruvm_hw_virtio::mmio::VIRTIO_MMIO_FORCE_LEGACY_DEFAULT;
+use ruvm_hw_virtio::pci::virtio_pci_optimal_num_queues;
 use ruvm_hw_virtio::{
     RandomFile, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass, VirtioPciProps,
     VirtioRng, VirtioRngConf,
@@ -314,8 +315,20 @@ pub(crate) fn plug(board: &VirtMachine, plugs: &[Plug], drives: &[Drive]) -> Res
             Model::Blk => {
                 let d = &drives[plug.drive.expect("planned with a drive")];
                 let backend = open_drive(d).map_err(|e| Located::new(&d.loc, e))?;
-                let conf =
-                    VirtioBlkConf { serial: plug.serial.clone(), ..VirtioBlkConf::default() };
+                // virtio_blk_pci_realize() turns the automatic num-queues into one queue per
+                // vCPU. virtio-blk-device keeps one.
+                let num_queues = match plug.transport {
+                    Transport::Pci => {
+                        let cpus = u32::try_from(board.smp()).unwrap_or(u32::MAX);
+                        Some(virtio_pci_optimal_num_queues(0, cpus) as u16)
+                    }
+                    Transport::Mmio => None,
+                };
+                let conf = VirtioBlkConf {
+                    serial: plug.serial.clone(),
+                    num_queues,
+                    ..VirtioBlkConf::default()
+                };
                 Box::new(VirtioBlk::new(Box::new(backend), conf))
             }
             Model::Rng => {
@@ -398,6 +411,25 @@ mod tests {
         );
         assert_eq!(err(&["e1000"]), "'e1000' is not a valid device model name");
         assert_eq!(err(&["loader,foo=1"]), "Property 'loader.foo' not found");
+    }
+
+    #[test]
+    fn blk_pci_queues_follow_smp() {
+        // One queue per vCPU and one MSI-X vector more, as virtio_blk_pci_realize() picks.
+        let path = std::env::temp_dir().join(format!("ruvm-rv-blk-{}.img", std::process::id()));
+        std::fs::write(&path, vec![0u8; 1 << 16]).unwrap();
+        let arg = format!("file={},format=raw", path.display());
+        let d = parse_drives(&[dev(&arg)]).unwrap();
+        let p = plan(&d, &[dev("virtio-rng-pci")]).unwrap();
+        let cfg = ruvm_machine_riscv::virt::VirtConfig {
+            smp: 2,
+            ..ruvm_machine_riscv::virt::VirtConfig::default()
+        };
+        let board = VirtMachine::new(cfg).unwrap();
+        plug(&board, &p.virtio, &d).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let vectors: Vec<u32> = board.pci_devices().iter().map(|f| f.nvectors()).collect();
+        assert_eq!(vectors, [2, 3]);
     }
 
     #[test]
