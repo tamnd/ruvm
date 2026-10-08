@@ -70,6 +70,14 @@ pub fn backend_region(obj: &Object) -> Option<RegionId> {
     lock(&obj.state::<Backend>()?.region).as_ref().map(|(_, id)| *id)
 }
 
+/// The RAM block of a completed backend, for a machine that takes the backend as its memory.
+pub fn backend_ram_block(obj: &Object) -> Option<Arc<ruvm_mem::RamBlock>> {
+    let b = obj.state::<Backend>()?;
+    let region = lock(&b.region);
+    let (objects, id) = region.as_ref()?;
+    objects.memory().ram_block(*id)
+}
+
 /// `host_memory_backend_set_mapped()`: the machine has put the backend's memory in the guest.
 pub fn set_mapped(obj: &Object, mapped: bool) {
     backend(obj).mapped.store(mapped, Ordering::Release);
@@ -122,7 +130,9 @@ fn ram_complete(objects: &Arc<RegionObjects>, obj: &Object) -> Result<()> {
     }
     let name = backend_name(obj, &b);
     let mem = objects.memory();
-    let id = mem.new_ram(&name, size).map_err(|e| Error::generic(e.to_string()))?;
+    // RAM_SHARED or RAM_PRIVATE, so the machine's aux-ram-share has no say.
+    let share = b.share.load(Ordering::Acquire);
+    let id = mem.new_ram_shared(&name, size, share).map_err(|e| Error::generic(e.to_string()))?;
     if let Err(e) = objects.add(obj, &name, id) {
         let _ = mem.destroy_region(id);
         return Err(e);
