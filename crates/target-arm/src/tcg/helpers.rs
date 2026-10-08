@@ -288,6 +288,9 @@ fn pstate_valid_mask(f: &crate::cpu::ArmFeatures) -> u32 {
     if f.mte >= 2 {
         valid |= crate::cpu::PSTATE_TCO;
     }
+    if f.ssbs {
+        valid |= crate::cpu::PSTATE_SSBS;
+    }
     valid
 }
 
@@ -320,6 +323,9 @@ fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> 
         let target = el_from_spsr(spsr).filter(|&el| legal(el));
         match target {
             Some(new_el) => {
+                // arm_call_pre_el_change_hook().
+                let pmu = super::pmu::Pmu::new(arm_of(&ops), cpu.core.shared());
+                pmu.op_start(&mut st);
                 let spsr = spsr as u32 & pstate_valid_mask(&feat);
                 st.pstate_write(spsr);
                 // Single step is never active, so PSTATE.SS is always cleared.
@@ -338,6 +344,8 @@ fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> 
                 }
                 st.pc = new_pc;
                 super::sve_change_el(&feat, &mut st, cur_el, new_el);
+                // arm_call_el_change_hook().
+                pmu.op_finish(&mut st);
             }
             None => {
                 // Illegal return events of various kinds have architecturally mandated

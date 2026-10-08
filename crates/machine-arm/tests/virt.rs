@@ -14,9 +14,9 @@ use ruvm_hw_virtio::{VirtioPci, VirtioPciProps};
 use ruvm_jit::cpu_exec::cpu_exec;
 use ruvm_jit::{Vcpu, excp};
 use ruvm_machine_arm::virt::{
-    VIRT_FW_CFG, VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_MEM, VIRT_MMIO, VIRT_PCIE_MMIO,
-    VIRT_PCIE_PIO, VIRT_RTC, VIRT_SMMU, VIRT_UART, VirtConfig, VirtIommu, VirtMachine, VirtMsi,
-    VirtRequest,
+    VIRT_FW_CFG, VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GPIO, VIRT_MEM, VIRT_MMIO,
+    VIRT_PCIE_MMIO, VIRT_PCIE_PIO, VIRT_RTC, VIRT_SECURE_GPIO, VIRT_SMMU, VIRT_UART, VirtConfig,
+    VirtIommu, VirtMachine, VirtMsi, VirtRequest,
 };
 use ruvm_mem::{Endian, MemTxAttrs};
 use ruvm_target_arm::cpu::ArmCpuModel;
@@ -195,18 +195,6 @@ fn parse(blob: &[u8]) -> Vec<Node> {
     out
 }
 
-/// The nodes QEMU's dumps have for devices the board does not model: the PL061 with its key,
-/// and the secure PL061 of `secure=on` with its poweroff and restart lines.
-const MISSING: [&str; 5] =
-    ["/pl061@9030000", "/gpio-keys", "/pl061@90b0000", "/gpio-poweroff", "/gpio-restart"];
-
-fn strip(nodes: Vec<Node>) -> Vec<Node> {
-    nodes
-        .into_iter()
-        .filter(|n| !MISSING.iter().any(|m| n.path == *m || n.path.starts_with(&format!("{m}/"))))
-        .collect()
-}
-
 fn header(blob: &[u8]) -> (u32, u32, u32) {
     // totalsize, version, boot_cpuid_phys.
     (be32(blob, 4), be32(blob, 20), be32(blob, 28))
@@ -218,17 +206,20 @@ fn compare_with_qemu(mut cfg: VirtConfig, dump: &str) {
     compare(cfg, dump);
 }
 
-fn compare(cfg: VirtConfig, dump: &str) {
+/// gen.sh dumps every tree with `pmu=off`, so the board leaves its `/pmu` node out too.
+fn compare(mut cfg: VirtConfig, dump: &str) {
+    cfg.cpu = cfg.cpu.without_pmu();
     let mut m = VirtMachine::new(cfg).unwrap();
     m.machine_done().unwrap();
     let ours = m.fdt().as_bytes().to_vec();
     let qemu = gunzip_file(dump);
     assert_eq!(header(&ours), header(&qemu), "{dump}");
-    let (a, b) = (parse(&ours), strip(parse(&qemu)));
+    let (a, b) = (parse(&ours), parse(&qemu));
     for (x, y) in a.iter().zip(b.iter()) {
         assert_eq!(x, y, "{dump}");
     }
     assert_eq!(a.len(), b.len(), "{dump}");
+    assert!(ours == qemu, "{dump}: the blobs differ");
 }
 
 #[test]
@@ -1040,4 +1031,45 @@ fn virtio_iommu_platform() {
     let offered = |d: &VirtioPci| d.with_backend(|b| b.vdev().host_has_feature(33)).unwrap();
     assert!(offered(&on));
     assert!(!offered(&off));
+}
+
+#[test]
+fn power_key_on_the_pl061() {
+    // Without firmware there is no GED: the power button is the key on PL061 pin 3, which
+    // reads back through the masked data register at 1 << (3 + 2).
+    let mut m = VirtMachine::new(a57()).unwrap();
+    m.machine_done().unwrap();
+    assert!(m.ged().is_none());
+    assert!(m.gpio().is_some());
+    assert_eq!(r32(&m, VIRT_GPIO + 0x20), 0);
+    // GPIOIEV and GPIOIE for a rising edge on pin 3, then the press raises pin 3 and the
+    // PL061 interrupt.
+    for off in [0x40c, 0x410] {
+        assert!(m.memory_as().write(VIRT_GPIO + off, U, &8u32.to_le_bytes()).is_ok());
+    }
+    m.system_powerdown();
+    assert_eq!(r32(&m, VIRT_GPIO + 0x20), 8);
+    assert_eq!(r32(&m, VIRT_GPIO + 0x418), 8);
+    assert!(m.secure_gpio().is_none());
+}
+
+#[test]
+fn secure_gpio_pwr() {
+    // secure=on adds the secure PL061, whose pin 1 resets the machine and pin 0 powers it off
+    // when driven high.
+    let mut cfg = a57();
+    cfg.secure = true;
+    let mut m = VirtMachine::new(cfg).unwrap();
+    m.machine_done().unwrap();
+    assert!(m.secure_gpio().is_some());
+    let w = |m: &VirtMachine, off: u64, v: u32| {
+        assert!(m.memory_as().write(VIRT_SECURE_GPIO + off, U, &v.to_le_bytes()).is_ok());
+    };
+    // GPIODIR: pins 0 and 1 are outputs.
+    w(&m, 0x400, 3);
+    assert_eq!(m.take_request(), None);
+    w(&m, 0x3fc, 2);
+    assert_eq!(m.take_request(), Some(VirtRequest::Reset));
+    w(&m, 0x3fc, 3);
+    assert_eq!(m.take_request(), Some(VirtRequest::Shutdown));
 }

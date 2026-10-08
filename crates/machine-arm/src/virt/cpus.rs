@@ -26,6 +26,10 @@ pub(crate) const NUM_GTIMERS: usize = 5;
 /// `ARCH_TIMER_S_EL1_IRQ` and `ARCH_TIMER_NS_EL2_VIRT_IRQ`, each plus 16.
 pub(crate) const TIMER_PPIS: [u32; NUM_GTIMERS] = [30, 27, 26, 29, 28];
 
+/// The PPI (as an INTID) the PMU interrupt drives, `VIRTUAL_PMU_IRQ` plus 16, on virt and
+/// sbsa-ref alike.
+pub(crate) const PMU_PPI: u32 = 23;
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -36,6 +40,8 @@ struct CpuSlot {
     shared: Weak<CpuShared>,
     /// `gt_timer[]`: the timers that call back into the vCPU at the next deadline.
     timers: [Option<Timer>; NUM_GTIMERS],
+    /// `pmu_timer`.
+    pmu_timer: Option<Timer>,
 }
 
 /// The board side of every vCPU: `gt_timer_outputs[]` wired to the GIC PPIs, the timers
@@ -44,6 +50,8 @@ pub(crate) struct CpuHub {
     mpidrs: Vec<u64>,
     /// `gt_timer_outputs[]` by vCPU, connected to the redistributor PPIs.
     ppis: Vec<[IrqLine; NUM_GTIMERS]>,
+    /// `pmu_interrupt` by vCPU, connected to PPI [`PMU_PPI`].
+    pmu_ppis: Vec<IrqLine>,
     clock: Arc<Clock>,
     arm: OnceLock<Weak<Arm>>,
     slots: Mutex<Vec<CpuSlot>>,
@@ -64,12 +72,14 @@ impl fmt::Debug for CpuHub {
 impl CpuHub {
     pub(crate) fn new(gic: &Arc<GicV3>, mpidrs: Vec<u64>, clock: Arc<Clock>) -> CpuHub {
         let ppis = (0..mpidrs.len()).map(|cpu| TIMER_PPIS.map(|ppi| gic.ppi(cpu, ppi))).collect();
+        let pmu_ppis = (0..mpidrs.len()).map(|cpu| gic.ppi(cpu, PMU_PPI)).collect();
         let slots = (0..mpidrs.len())
-            .map(|_| CpuSlot { shared: Weak::new(), timers: Default::default() })
+            .map(|_| CpuSlot { shared: Weak::new(), timers: Default::default(), pmu_timer: None })
             .collect();
         CpuHub {
             mpidrs,
             ppis,
+            pmu_ppis,
             clock,
             arm: OnceLock::new(),
             slots: Mutex::new(slots),
@@ -103,10 +113,10 @@ impl CpuHub {
         self.mpidrs.iter().position(|&m| m == mpidr)
     }
 
-    /// `gt_timer_reset()` for the timers of vCPU `cpu`: stop them.
+    /// `gt_timer_reset()` for the timers of vCPU `cpu`, and the PMU timer: stop them.
     pub(crate) fn reset_timers(&self, cpu: usize) {
         if let Some(s) = lock(&self.slots).get_mut(cpu) {
-            for t in s.timers.iter().flatten() {
+            for t in s.timers.iter().chain(std::iter::once(&s.pmu_timer)).flatten() {
                 t.del();
             }
         }
@@ -125,7 +135,7 @@ impl CpuHub {
 
     /// `qemu_system_*_request()`: hand `req` to the handler if there is one, otherwise record
     /// it and kick every vCPU out of its loop.
-    fn request(&self, req: VirtRequest) {
+    pub(crate) fn request(&self, req: VirtRequest) {
         let handler = lock(&self.handler).clone();
         if let Some(h) = handler {
             h(req);
@@ -185,6 +195,31 @@ impl ArmBoard for CpuHub {
         if let Some(line) = self.ppis.get(shared.cpu_index).and_then(|l| l.get(timer)) {
             line.set_bool(level);
         }
+    }
+
+    fn pmu_set_level(&self, shared: &CpuShared, level: bool) {
+        if let Some(line) = self.pmu_ppis.get(shared.cpu_index) {
+            line.set_bool(level);
+        }
+    }
+
+    fn pmu_timer_anticipate(&self, shared: &CpuShared, deadline: Instant) {
+        let mut slots = lock(&self.slots);
+        let Some(slot) = slots.get_mut(shared.cpu_index) else {
+            return;
+        };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        let ns = i64::try_from(wait.as_nanos()).unwrap_or(i64::MAX);
+        let when = self.clock.get_ns().saturating_add(ns);
+        let weak = slot.shared.clone();
+        let t = slot.pmu_timer.get_or_insert_with(|| {
+            self.clock.new_timer(move || {
+                if let Some(s) = weak.upgrade() {
+                    Arm::pmu_timer_expired(&s);
+                }
+            })
+        });
+        t.modify_anticipate(when);
     }
 
     fn psci_cpu_on(&self, mpidr: u64, entry: u64, context_id: u64, target_el: u32) -> i64 {

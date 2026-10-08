@@ -125,14 +125,7 @@ fn acpi_tables_match_qemu() {
     let m = qemu_test_board(&tmp, VirtMsi::Off);
     let tables = load(&m.acpi_tables());
     assert!(table(&tables, "IORT") == expected("IORT"), "IORT differs from QEMU's");
-    let mut want = expected("APIC.its_off");
-    // The performance interrupt GSIV of the GICC, after the GICD.
-    let pmu = 44 + 24 + 20;
-    assert_eq!(u32::from_le_bytes(want[pmu..pmu + 4].try_into().unwrap()), 23);
-    want[pmu..pmu + 4].fill(0);
-    want[9] = 0;
-    want[9] = checksum(&want);
-    assert!(table(&tables, "APIC") == want, "APIC differs from QEMU's");
+    assert!(table(&tables, "APIC") == expected("APIC.its_off"), "APIC differs from QEMU's");
 }
 
 #[test]

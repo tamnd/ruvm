@@ -4,8 +4,9 @@
 //!
 //! For now this is the ICH9 AHCI controller ([`Ich9Ahci`], QEMU's `ich9-ahci`) with SATA hard
 //! disks and ATAPI CD-ROM drives, ported from QEMU's `hw/ide/ahci.c`, `hw/ide/ich.c`,
-//! `hw/ide/core.c` and `hw/ide/atapi.c`. Drives read and write a [`BlockBackend`];
-//! [`VecBackend`] keeps an image in memory.
+//! `hw/ide/core.c` and `hw/ide/atapi.c`, and the same controller as a memory mapped device
+//! ([`SysbusAhci`], QEMU's `sysbus-ahci` from `hw/ide/ahci-sysbus.c`). Drives read and write
+//! a [`BlockBackend`]; [`VecBackend`] keeps an image in memory.
 //!
 //! The [`scsi`] module has the SCSI core, `scsi-hd` and `scsi-cd`, for SCSI host adapters such
 //! as virtio-scsi. It uses the same [`BlockBackend`].
@@ -57,6 +58,7 @@
 #![forbid(unsafe_code)]
 
 mod ahci;
+mod ahci_sysbus;
 mod atapi;
 mod block;
 mod ich;
@@ -64,6 +66,7 @@ mod ide;
 pub mod scsi;
 
 pub use ahci::{AhciPortVmState, AhciVmState, DmaMemory, NcqVmState};
+pub use ahci_sysbus::{SYSBUS_AHCI_MMIO_SIZE, SysbusAhci, TYPE_SYSBUS_AHCI};
 pub use block::{BlockBackend, VecBackend};
 pub use ich::{
     ICH9_AHCI_PORTS, Ich9Ahci, Ich9AhciVmState, PCI_CLASS_STORAGE_SATA,

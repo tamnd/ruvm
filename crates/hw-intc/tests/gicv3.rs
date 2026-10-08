@@ -662,6 +662,72 @@ fn access_checks() {
     assert_eq!(r.icc_r(0, IccReg::SreEl1), 7);
 }
 
+#[test]
+fn virtual_interface() {
+    let r = rig();
+    let g = &r.gic;
+    let (virq, line) = watch();
+    g.cpu_virq(0).connect(line);
+    // As the boards do, the maintenance interrupt feeds PPI 25 of the same CPU.
+    g.maintenance_irq(0).connect(g.ppi(0, 25));
+    let hyp = IccCpuCtx { el: 2, has_el2: true, ..NS_EL1 };
+    let guest = IccCpuCtx { has_el2: true, hcr_el2: 0x18, ..NS_EL1 };
+
+    // Four list registers, five bits of virtual priority and preemption, A3V, TDS and nV4.
+    let vtr = (4 << 29) | (4 << 26) | (1 << 23) | (1 << 21) | (1 << 20) | (1 << 19) | 3;
+    assert_eq!(g.icc_read(0, IccReg::IchVtr, &hyp), vtr);
+    assert!(IccReg::IchLr(3).exists(5));
+    assert!(!IccReg::IchLr(4).exists(5));
+    assert!(!IccReg::IchAp1r(1).exists(5));
+    for reg in IccReg::ICH_ALL {
+        let (op0, op1, crn, crm, op2) = reg.encoding();
+        assert_eq!(IccReg::from_encoding(op0, op1, crn, crm, op2), Some(reg));
+        assert!(reg.name().starts_with("ICH_") && reg.is_ich());
+    }
+    assert_eq!(IccReg::IchLr(3).name(), "ICH_LR3_EL2");
+
+    // Enable the interface and virtual Group 1 with an open VPMR, then queue vINTID 27 at
+    // priority 0x80.
+    g.icc_write(0, IccReg::IchVmcr, &hyp, (0xff << 24) | 2);
+    g.icc_write(0, IccReg::IchHcr, &hyp, 1);
+    assert_eq!(virq.load(Ordering::SeqCst), 0);
+    let lr = (1 << 62) | (1 << 60) | (0x80 << 48) | 27;
+    g.icc_write(0, IccReg::IchLr(0), &hyp, lr);
+    assert_eq!(virq.load(Ordering::SeqCst), 1);
+    assert_eq!(g.icc_read(0, IccReg::IchElrsr, &hyp), 0xe);
+
+    // With HCR_EL2.IMO and FMO set, the guest's ICC accesses reach the ICV registers.
+    assert_eq!(g.icc_read(0, IccReg::Hppir1, &guest), 27);
+    assert_eq!(g.icc_read(0, IccReg::Iar1, &guest), 27);
+    assert_eq!(virq.load(Ordering::SeqCst), 0);
+    assert_eq!(g.icc_read(0, IccReg::IchLr(0), &hyp) >> 62, 2);
+    assert_eq!(g.icc_read(0, IccReg::Rpr, &guest), 0x80);
+    assert_eq!(g.icc_read(0, IccReg::IchAp1r(0), &hyp), 1 << 16);
+    g.icc_write(0, IccReg::Eoir1, &guest, 27);
+    assert_eq!(g.icc_read(0, IccReg::IchLr(0), &hyp) >> 62, 0);
+    assert_eq!(g.icc_read(0, IccReg::IchAp1r(0), &hyp), 0);
+    assert_eq!(g.icc_read(0, IccReg::Iar1, &guest), 1023);
+    // The physical interface was not touched.
+    assert_eq!(g.icc_read(0, IccReg::Rpr, &NS_EL1), 0xff);
+
+    // Underflow: with UIE and at most one valid list register, the maintenance interrupt is
+    // raised, and with it PPI 25.
+    assert_eq!(r.rr(0, GICR_ISPENDR0) & (1 << 25), 0);
+    g.icc_write(0, IccReg::IchHcr, &hyp, 3);
+    assert_eq!(g.icc_read(0, IccReg::IchMisr, &hyp), 2);
+    assert_ne!(r.rr(0, GICR_ISPENDR0) & (1 << 25), 0);
+    g.icc_write(0, IccReg::IchHcr, &hyp, 1);
+    assert_eq!(g.icc_read(0, IccReg::IchMisr, &hyp), 0);
+    assert_eq!(r.rr(0, GICR_ISPENDR0) & (1 << 25), 0);
+
+    // TALL1 traps the guest's Group 1 accesses to EL2.
+    g.icc_write(0, IccReg::IchHcr, &hyp, 1 | (1 << 12));
+    assert_eq!(g.icc_access(0, IccReg::Iar1, &guest, true), IccAccess::TrapEl2);
+    assert_eq!(g.icc_access(0, IccReg::Iar0, &guest, true), IccAccess::Ok);
+    g.cpuif_reset(0);
+    assert_eq!(g.icc_read(0, IccReg::IchHcr, &hyp), 0);
+}
+
 // LPIs and the ITS, with the GIC, the ITS and some RAM mapped the way hw/arm/virt.c maps them.
 
 const DIST_BASE: u64 = 0x0800_0000;

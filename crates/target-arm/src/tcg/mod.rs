@@ -121,9 +121,12 @@
 //! - The TLB is not tagged by VMID or ASID: TLBI by ASID or VMID and writes that change them
 //!   flush every entry of the affected regimes, and the IPAS2 forms flush nothing, as QEMU
 //!   does, since stage 2 results are only cached combined with stage 1. The traps that
-//!   MDCR_EL2, MDCR_EL3, HSTR_EL2 and HCR_EL2.TIDCP control are not checked; see `sysreg.rs`.
-//! - Self-hosted debug (breakpoints, watchpoints, single step) and the PMU are not
-//!   implemented. MDSCR_EL1 and the OS lock registers are only storage.
+//!   MDCR_EL2 and MDCR_EL3 control (other than the PMU ones), HSTR_EL2 and HCR_EL2.TIDCP are
+//!   not checked; see `sysreg.rs`.
+//! - Self-hosted debug (breakpoints, watchpoints, single step) is not implemented.
+//!   MDSCR_EL1 and the OS lock registers are only storage. The PMU (`pmu.rs`) counts
+//!   cycles in host time and its overflow interrupt goes to the board through
+//!   [`ArmBoard::pmu_set_level`].
 //! - WFE and YIELD are no-ops rather than leaving the execution loop. The pointer
 //!   authentication hints (PACIASP and friends) are no-ops on the models without FEAT_PAuth;
 //!   QEMU does the same. BTI, FlagM, LRCPC2, CSSC, MOPS, SB, WFET and the 128-bit atomics are
@@ -147,6 +150,7 @@ mod gtimer;
 mod helpers;
 mod mte;
 mod pauth;
+mod pmu;
 mod psci;
 mod ptw;
 mod semihost;
@@ -177,9 +181,9 @@ use crate::cpu::{
     EXCP_SWI, EXCP_UDEF, EXCP_VFIQ, EXCP_VIRQ, EXCP_VSERR, HCR_AMO, HCR_E2H, HCR_FMO, HCR_IMO,
     HCR_TGE, HCR_VF, HCR_VI, HCR_VSE, HFLAGS, MMU_IDX_E2, MMU_IDX_E3, MMU_IDX_E10_1,
     MMU_IDX_E10_1_PAN, MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NB_MMU_MODES, PC, PSTATE_A, PSTATE_DAIF,
-    PSTATE_F, PSTATE_I, PSTATE_IL, PSTATE_PAN, PSTATE_SP, PSTATE_TCO, PSTATE_UAO, SCR_EA, SCR_FIQ,
-    SCR_IRQ, SCTLR_A, SCTLR_ENDA, SCTLR_ENDB, SCTLR_ENIA, SCTLR_ENIB, SCTLR_SPAN, SCTLR_TCF,
-    SCTLR_TCF0,
+    PSTATE_F, PSTATE_I, PSTATE_IL, PSTATE_PAN, PSTATE_SP, PSTATE_SSBS, PSTATE_TCO, PSTATE_UAO,
+    SCR_EA, SCR_FIQ, SCR_IRQ, SCTLR_A, SCTLR_DSSBS_64, SCTLR_ENDA, SCTLR_ENDB, SCTLR_ENIA,
+    SCTLR_ENIB, SCTLR_SPAN, SCTLR_TCF, SCTLR_TCF0,
 };
 use crate::syndrome::{EC_ADVSIMDFPACCESSTRAP, fsc, syn_get_ec, syn_serror};
 
@@ -276,6 +280,20 @@ pub trait ArmBoard: Send + Sync {
     /// given last.
     fn gt_timer_set_level(&self, shared: &CpuShared, timer: usize, level: bool) {
         let _ = (shared, timer, level);
+    }
+
+    /// The PMU overflow interrupt of the vCPU `shared`, QEMU's `pmu-interrupt` GPIO output,
+    /// is now `level`.
+    fn pmu_set_level(&self, shared: &CpuShared, level: bool) {
+        let _ = (shared, level);
+    }
+
+    /// A PMU counter of the vCPU `shared` may overflow at `deadline`:
+    /// `timer_mod_anticipate()` on `pmu_timer`, so the board moves its timer to `deadline`
+    /// if that is earlier than the one it has (or it has none), and calls
+    /// [`Arm::pmu_timer_expired`] then.
+    fn pmu_timer_anticipate(&self, shared: &CpuShared, deadline: Instant) {
+        let _ = (shared, deadline);
     }
 
     /// PSCI CPU_ON, `arm_set_cpu_on()`: start the CPU whose MPIDR is `mpidr` at `entry` in
@@ -456,6 +474,12 @@ impl Arm {
         g[i].mpidr = Some(mpidr & 0xff_00ff_ffff);
     }
 
+    /// The number of vCPUs, QEMU's `core-count` default of `smp_cpus`: the highest vCPU index
+    /// the board gave an MPIDR (or that was looked at) plus one.
+    pub fn core_count(&self) -> usize {
+        self.lines.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// `arm_cpu_mp_affinity()` of the vCPU with index `cpu_index`.
     pub fn mp_affinity(&self, cpu_index: usize) -> u64 {
         let (g, i) = self.lines(cpu_index);
@@ -568,16 +592,24 @@ impl Arm {
             return;
         }
         let (mut g, i) = self.lines(shared.cpu_index);
+        let was = g[i].gic & bit != 0;
         if level {
             g[i].gic |= bit;
-            shared.cpu_interrupt(bit);
         } else {
             g[i].gic &= !bit;
+        }
+        // A halted vCPU holds its halt lock while `has_work()` takes the lines lock, so the
+        // vCPU is only kicked once the lines lock is dropped.
+        drop(g);
+        if level {
+            if !shared.test_interrupt(bit) {
+                shared.cpu_interrupt(bit);
+            }
+        } else if was {
             // The HCR_EL2 half is folded in by the vCPU itself on its next HCR_EL2 write;
             // here only a line that nothing else holds can be dropped. Ask the vCPU to
             // recompute instead of guessing.
-            let shared2 = shared;
-            shared2.async_run_on_cpu(move |cpu| {
+            shared.async_run_on_cpu(move |cpu| {
                 let ops = cpu.ops();
                 let st = CpuArmState::load(cpu.env);
                 arm_of(&ops).update_virt_lines(cpu, &st);
@@ -613,6 +645,21 @@ impl Arm {
             let arm = arm_of(&ops);
             let mut st = CpuArmState::load(cpu.env);
             gtimer::recalc(arm, cpu, &mut st, timer);
+            commit(cpu, &mut st);
+        });
+    }
+
+    /// The PMU timer of the vCPU `shared` reached the deadline the board was given:
+    /// `arm_pmu_timer_cb()` on the vCPU's thread, which updates the counters, raises the
+    /// overflow interrupt if one overflowed and gives the board the next deadline.
+    pub fn pmu_timer_expired(shared: &CpuShared) {
+        shared.async_run_on_cpu(move |cpu| {
+            let ops = cpu.ops();
+            let arm = arm_of(&ops);
+            let mut st = CpuArmState::load(cpu.env);
+            let pmu = pmu::Pmu::new(arm, cpu.core.shared());
+            pmu.op_start(&mut st);
+            pmu.op_finish(&mut st);
             commit(cpu, &mut st);
         });
     }
@@ -1005,6 +1052,8 @@ impl Arm {
     /// the EL in `exception_target_el`.
     fn do_interrupt_aarch64(&self, cpu: &mut Cpu<'_>) {
         let mut st = CpuArmState::load(cpu.env);
+        // arm_call_pre_el_change_hook().
+        pmu::Pmu::new(self, cpu.core.shared()).op_start(&mut st);
         let excp = cpu.core.exception_index;
         let new_el = st.exception_target_el;
         let ne = new_el as usize;
@@ -1067,11 +1116,15 @@ impl Arm {
         if self.features().mte >= 2 {
             new_mode |= PSTATE_TCO;
         }
+        if self.features().ssbs && st.sctlr_el[ne] & SCTLR_DSSBS_64 != 0 {
+            new_mode |= PSTATE_SSBS;
+        }
         st.pstate_write(PSTATE_DAIF | new_mode);
         st.restore_sp(new_el);
         st.pc = addr;
-        commit(cpu, &mut st);
         // arm_call_el_change_hook().
+        pmu::Pmu::new(self, cpu.core.shared()).op_finish(&mut st);
+        commit(cpu, &mut st);
         self.gic_el_change(cpu.core.shared().cpu_index, &st);
         cpu.core.shared().set_interrupt(interrupt::EXITTB);
     }

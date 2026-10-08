@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The Arm `virt` board from the command line: what `-machine virt`, `-m`, `-smp`, `-cpu`,
-//! `-kernel`, `-initrd`, `-append`, `-dtb`, `-bios`, `-drive`, `-device`, `-serial`,
-//! `-semihosting` and `-semihosting-config` turn into, and the board running on TCG.
+//! The Arm `virt` and `sbsa-ref` boards from the command line: what `-machine virt` or
+//! `-machine sbsa-ref`, `-m`, `-smp`, `-cpu`, `-kernel`, `-initrd`, `-append`, `-dtb`, `-bios`,
+//! `-drive`, `-device`, `-serial`, `-semihosting` and `-semihosting-config` turn into, and the
+//! board running on TCG.
 //!
 //! `-drive` and `-device` plug virtio devices into the PCIe root bus or the virtio-mmio
-//! transports and give the flashes their drives, see [`devices`].
+//! transports, give the flashes their drives and, on sbsa-ref, give the AHCI ports theirs,
+//! see [`devices`].
+//!
+//! On sbsa-ref, `serial_hd(0)` is the PL011 and `serial_hd(1)` and `serial_hd(2)` the two
+//! secure UARTs. Without `-smp` it has four CPUs in one socket, cluster and core, as QEMU's
+//! machine defaults give. Its CPU models are `cortex-a57`, `cortex-a72`, `neoverse-n1` and
+//! `max`, and the default is `neoverse-n1`: QEMU's default `neoverse-n2` and `neoverse-v1`
+//! are not modelled. It has no machine properties of its own, and semihosting fails with
+//! "... is not supported by ruvm yet".
 //!
 //! `-serial` (or `-nographic`) connects `serial_hd(0)` to the PL011, and a second `-serial`
 //! connects `serial_hd(1)` to the second PL011 (the secure one with `secure=on`). `-bios`
@@ -15,10 +24,11 @@
 //!
 //! Deliberate differences from QEMU:
 //!
-//! - The default CPU is `cortex-a57`, since the 32-bit `cortex-a15` QEMU picks for TCG is not
-//!   modelled. The CPU models are `cortex-a57`, `cortex-a72`, `cortex-a76` and `max`; the other
+//! - The default CPU of virt is `cortex-a57`, since the 32-bit `cortex-a15` QEMU picks for TCG
+//!   is not modelled. The CPU models are `cortex-a57`, `cortex-a72`, `cortex-a76`, `neoverse-n1`
+//!   and `max`; the other
 //!   models virt accepts fail with "... is not supported by ruvm yet", and so do the CPU
-//!   properties other than `sve-max-vq` and `pmu=off` (there is no PMU).
+//!   properties other than `sve-max-vq` and `pmu`.
 //! - The machine properties are taken only where their value describes the board that exists:
 //!   `gic-version=3`, `its`, `secure`, `virtualization`, `mte`, `ras=off`, `acpi`, `spcr`,
 //!   `x-oem-id`, `x-oem-table-id`, `iommu`, `default-bus-bypass-iommu`, `msi` other than
@@ -52,8 +62,10 @@ use ruvm_hw_char::pl011::Pl011;
 use ruvm_hw_char::serial::SerialBackend;
 use ruvm_hw_core::Clock;
 use ruvm_hw_core::timer::TimeSource;
+use ruvm_machine_arm::sbsa_ref::{SBSA_DEFAULT_CPUS, SbsaRefConfig, SbsaRefMachine};
 use ruvm_machine_arm::tcg_run::{
-    ShutdownReason, VirtEvent, VirtEventHandler, VirtRunConfig, VirtTcgMachine,
+    SbsaRefTcgMachine, ShutdownReason, TcgBoard, TcgMachine, VirtEvent, VirtEventHandler,
+    VirtRunConfig, VirtTcgMachine,
 };
 use ruvm_machine_arm::virt::memmap::check_highmem_mmio_size;
 use ruvm_machine_arm::virt::{CpuTopology, Highmem, VirtConfig, VirtIommu, VirtMachine, VirtMsi};
@@ -89,9 +101,50 @@ const VIRT_DESC: &str = "QEMU 11.1 ARM Virtual Machine";
 /// `mc->max_cpus` of virt.
 const VIRT_MAX_CPUS: u64 = 512;
 
-/// Whether `-machine type=` names the virt board.
-pub(crate) fn is_virt(name: &str) -> bool {
-    name == "virt" || name == VIRT_NAME
+/// The name of sbsa-ref.
+const SBSA_NAME: &str = "sbsa-ref";
+
+/// `mc->desc` of sbsa-ref.
+const SBSA_DESC: &str = "QEMU 'SBSA Reference' ARM Virtual Machine";
+
+/// `mc->max_cpus` of sbsa-ref.
+const SBSA_MAX_CPUS: u64 = 512;
+
+/// The Arm boards.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ArmBoard {
+    /// `virt`.
+    #[default]
+    Virt,
+    /// `sbsa-ref`.
+    SbsaRef,
+}
+
+impl ArmBoard {
+    /// The machine name the errors give.
+    fn name(self) -> &'static str {
+        match self {
+            ArmBoard::Virt => VIRT_NAME,
+            ArmBoard::SbsaRef => SBSA_NAME,
+        }
+    }
+
+    /// `mc->max_cpus`.
+    fn max_cpus(self) -> u64 {
+        match self {
+            ArmBoard::Virt => VIRT_MAX_CPUS,
+            ArmBoard::SbsaRef => SBSA_MAX_CPUS,
+        }
+    }
+}
+
+/// The Arm board `-machine type=` names, if it names one.
+pub(crate) fn board_by_name(name: &str) -> Option<ArmBoard> {
+    match name {
+        "virt" | VIRT_NAME => Some(ArmBoard::Virt),
+        SBSA_NAME => Some(ArmBoard::SbsaRef),
+        _ => None,
+    }
 }
 
 /// The `-machine help` lines of the Arm boards, as (sort key, line) pairs, the alias on the
@@ -99,7 +152,10 @@ pub(crate) fn is_virt(name: &str) -> bool {
 pub(crate) fn machine_help_lines() -> Vec<(String, String)> {
     let text =
         format!("{:<20} {VIRT_DESC} (alias of {VIRT_NAME})\n{VIRT_NAME:<20} {VIRT_DESC}\n", "virt");
-    vec![(VIRT_NAME.to_string(), text)]
+    vec![
+        (VIRT_NAME.to_string(), text),
+        (SBSA_NAME.to_string(), format!("{SBSA_NAME:<20} {SBSA_DESC}\n")),
+    ]
 }
 
 /// Where semihosting calls go, `SemihostingTarget`.
@@ -188,6 +244,8 @@ impl Semihosting {
 /// options.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BoardOptions {
+    /// The board.
+    pub board: ArmBoard,
     /// `memory.size`, rounded up to 8 KiB like `machine_set_mem()` does.
     pub ram_size: Option<u64>,
     pub cpus: u32,
@@ -305,9 +363,12 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
     }
 }
 
-/// `machine_parse_smp_config()` for virt, which knows clusters but not dies, modules, books
-/// or drawers. Gives (cpus, maxcpus) and the topology.
-pub(crate) fn parse_smp(config: &SMPConfiguration) -> Result<(u32, u32, CpuTopology)> {
+/// `machine_parse_smp_config()` for `board`, which knows clusters but not dies, modules,
+/// books or drawers. Gives (cpus, maxcpus) and the topology.
+pub(crate) fn parse_smp(
+    board: ArmBoard,
+    config: &SMPConfiguration,
+) -> Result<(u32, u32, CpuTopology)> {
     let explicit = [
         config.cpus,
         config.drawers,
@@ -387,10 +448,11 @@ pub(crate) fn parse_smp(config: &SMPConfiguration) -> Result<(u32, u32, CpuTopol
              maxcpus ({maxcpus}) < smp_cpus ({cpus})"
         )));
     }
-    if maxcpus > VIRT_MAX_CPUS {
+    if maxcpus > board.max_cpus() {
         return Err(Error::generic(format!(
-            "Invalid SMP CPUs {maxcpus}. The max CPUs supported by machine '{VIRT_NAME}' is \
-             {VIRT_MAX_CPUS}"
+            "Invalid SMP CPUs {maxcpus}. The max CPUs supported by machine '{}' is {}",
+            board.name(),
+            board.max_cpus()
         )));
     }
     // All are at most 512 now.
@@ -404,20 +466,28 @@ pub(crate) fn parse_smp(config: &SMPConfiguration) -> Result<(u32, u32, CpuTopol
     Ok((cpus as u32, maxcpus as u32, topology))
 }
 
-/// `qemu_apply_machine_options()` for virt: takes the generic properties out of `machine`
+/// `qemu_apply_machine_options()` for `board`: takes the generic properties out of `machine`
 /// (whose `type`, `accel` and `kernel-irqchip` are gone already) and checks the rest
 /// against the board.
-pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
-    let mut o = BoardOptions::default();
+pub(crate) fn take_board_options(board: ArmBoard, machine: &QDict) -> Result<BoardOptions> {
+    let mut o = BoardOptions { board, ..BoardOptions::default() };
     if let Some(mem) = visit_member::<MemorySizeConfiguration>(machine, "memory")? {
         if mem.slots.is_some_and(|s| s != 0) || mem.max_size.is_some_and(|m| Some(m) != mem.size) {
             return Err(Error::generic("memory hotplug is not supported by ruvm yet"));
         }
         o.ram_size = mem.size.map(|s| s.next_multiple_of(8192));
     }
-    let smp = visit_member::<SMPConfiguration>(machine, "smp")?.unwrap_or_default();
-    let (cpus, max_cpus, topology) = parse_smp(&smp)?;
-    (o.cpus, o.max_cpus, o.topology) = (cpus, max_cpus, Some(topology));
+    match visit_member::<SMPConfiguration>(machine, "smp")? {
+        // Without -smp, sbsa-ref has its default_cpus in one socket, cluster, core and thread.
+        None if board == ArmBoard::SbsaRef => {
+            let n = SBSA_DEFAULT_CPUS as u32;
+            (o.cpus, o.max_cpus, o.topology) = (n, n, None);
+        }
+        smp => {
+            let (cpus, max_cpus, topology) = parse_smp(board, &smp.unwrap_or_default())?;
+            (o.cpus, o.max_cpus, o.topology) = (cpus, max_cpus, Some(topology));
+        }
+    }
     for (name, value) in machine.iter_inserted() {
         match name {
             "memory" | "smp" => {}
@@ -427,6 +497,14 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
             "dtb" => o.dtb = Some(prop_string(name, value)?),
             "dumpdtb" => o.dumpdtb = Some(prop_string(name, value)?),
             "firmware" => o.firmware = Some(prop_string(name, value)?),
+            // Generic machine properties that change nothing here.
+            "dump-guest-core" | "mem-merge" | "graphics" | "suppress-vmdesc" => {}
+            // sbsa-ref has no properties of its own.
+            _ if board == ArmBoard::SbsaRef => {
+                return Err(Error::generic(format!(
+                    "Property '{SBSA_NAME}-machine.{name}' not found"
+                )));
+            }
             "secure" => o.secure = prop_bool(name, &prop_string(name, value)?)?,
             "virtualization" => o.virtualization = prop_bool(name, &prop_string(name, value)?)?,
             "mte" => o.mte = prop_bool(name, &prop_string(name, value)?)?,
@@ -496,8 +574,6 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
                 check_highmem_mmio_size(size).map_err(Error::generic)?;
                 o.highmem.mmio_size = size;
             }
-            // Generic machine properties that change nothing here.
-            "dump-guest-core" | "mem-merge" | "graphics" | "suppress-vmdesc" => {}
             _ => check_virt_prop(name, &prop_string(name, value)?)?,
         }
     }
@@ -517,17 +593,32 @@ const OTHER_VIRT_CPUS: &[&str] = &[
     "cortex-a55",
     "cortex-a710",
     "a64fx",
-    "neoverse-n1",
     "neoverse-v1",
     "neoverse-n2",
     "host",
 ];
 
-/// `-cpu model,prop=value,...` for virt (`cortex-a57` without one).
-pub(crate) fn parse_cpu(arg: Option<&str>) -> Result<ArmCpuModel> {
-    let arg = arg.unwrap_or("cortex-a57");
+/// `valid_cpu_types` of sbsa-ref.
+const SBSA_CPUS: &[&str] =
+    &["cortex-a57", "cortex-a72", "neoverse-n1", "neoverse-v1", "neoverse-n2", "max"];
+
+/// `-cpu model,prop=value,...` for `board` (`cortex-a57` on virt and `neoverse-n1` on sbsa-ref
+/// without one).
+pub(crate) fn parse_cpu(board: ArmBoard, arg: Option<&str>) -> Result<ArmCpuModel> {
+    let arg = arg.unwrap_or(match board {
+        ArmBoard::Virt => "cortex-a57",
+        ArmBoard::SbsaRef => "neoverse-n1",
+    });
     let mut parts = arg.split(',');
     let name = parts.next().unwrap_or_default();
+    // machine_run_board_init() checks the model against valid_cpu_types.
+    if board == ArmBoard::SbsaRef
+        && !SBSA_CPUS.contains(&name)
+        && (ArmCpuModel::by_name(name).is_some() || OTHER_VIRT_CPUS.contains(&name))
+    {
+        return Err(Error::generic(format!("Invalid CPU model: {name}"))
+            .hint(format!("The valid models are: {}\n", SBSA_CPUS.join(", "))));
+    }
     let Some(mut model) = ArmCpuModel::by_name(name) else {
         if OTHER_VIRT_CPUS.contains(&name) {
             return Err(Error::generic(format!("CPU model '{name}' is not supported by ruvm yet")));
@@ -564,10 +655,13 @@ pub(crate) fn parse_cpu(arg: Option<&str>) -> Result<ArmCpuModel> {
             "pauth-impdef" if name == "max" => impdef = prop_bool(prop, value)?,
             "pauth-qarma3" if name == "max" => qarma3 = prop_bool(prop, value)?,
             "pauth-qarma5" if name == "max" => qarma5 = prop_bool(prop, value)?,
-            // There is no PMU, so the device tree has no pmu node either way.
-            "pmu" if !prop_bool(prop, value)? => {}
+            "pmu" => {
+                if !prop_bool(prop, value)? {
+                    model = model.without_pmu();
+                }
+            }
             "sve" | "sme" | "sme-fa64" | "pauth" | "pauth-impdef" | "pauth-qarma3"
-            | "pauth-qarma5" | "lpa2" | "pmu" | "aarch64" | "reset-cbar" | "rvbar" | "cntfrq"
+            | "pauth-qarma5" | "lpa2" | "aarch64" | "reset-cbar" | "rvbar" | "cntfrq"
             | "has_el2" | "has_el3" | "sve128" | "sve256" | "sve512" | "sve1024" | "sve2048"
             | "sme128" | "sme256" | "sme512" | "sme1024" | "sme2048" => {
                 return Err(Error::generic(format!(
@@ -778,10 +872,17 @@ impl Frontend for SemiConsoleFrontend {
     }
 }
 
-/// The virt board running on its vCPUs, and the chardevs its devices are attached to.
+/// The board on TCG.
+#[derive(Debug)]
+enum Machine {
+    Virt(Arc<VirtTcgMachine>),
+    SbsaRef(Arc<SbsaRefTcgMachine>),
+}
+
+/// The board running on its vCPUs, and the chardevs its devices are attached to.
 #[derive(Debug)]
 pub(crate) struct Running {
-    machine: Arc<VirtTcgMachine>,
+    machine: Machine,
     console: Option<Arc<SemiConsole>>,
     _attachments: Vec<Attachment>,
 }
@@ -797,7 +898,10 @@ impl Running {
     /// Stops the vCPU and timer threads.
     pub(crate) fn quit(&self) {
         self.wake_console();
-        self.machine.quit();
+        match &self.machine {
+            Machine::Virt(m) => m.quit(),
+            Machine::SbsaRef(m) => m.quit(),
+        }
     }
 }
 
@@ -824,7 +928,7 @@ fn event_handler(vm: &Arc<Vm>) -> VirtEventHandler {
 }
 
 /// Lets the runstate start and stop the vCPUs.
-fn set_cpu_hook(vm: &Arc<Vm>, machine: &Arc<VirtTcgMachine>) {
+fn set_cpu_hook<B: TcgBoard>(vm: &Arc<Vm>, machine: &Arc<TcgMachine<B>>) {
     let weak = Arc::downgrade(machine);
     vm.runstate.set_cpu_hook(Some(Arc::new(move |run| {
         if let Some(m) = weak.upgrade() {
@@ -863,10 +967,20 @@ fn semihosting_chardev(
     }
 }
 
-/// `qemu_init_board()` and `qemu_machine_creation_done()` for virt on TCG: builds the board,
-/// connects the UART to `serial_hds[0]` and semihosting to its chardev, and puts it all on
-/// the vCPU threads, stopped until `vm_start()`. A `dumpdtb` ends the process here, as in
-/// QEMU.
+/// `handle_machine_dumpdtb()`: writes the device tree to `path` and ends the process.
+fn dumpdtb(path: &str, fdt: &[u8]) -> std::result::Result<(), Vec<Located>> {
+    if let Err(e) = std::fs::write(path, fdt) {
+        let e = Error::generic(format!("Error saving FDT to file {path}: {e}"));
+        return Err(vec![Located(None, e)]);
+    }
+    ruvm_chardev::stdio::term_exit();
+    std::process::exit(0);
+}
+
+/// `qemu_init_board()` and `qemu_machine_creation_done()` for the Arm boards on TCG: builds
+/// the board, connects the UARTs to `serial_hds` and semihosting to its chardev, and puts it
+/// all on the vCPU threads, stopped until `vm_start()`. A `dumpdtb` ends the process here, as
+/// in QEMU.
 pub(crate) fn start_board_tcg(
     vm: &Arc<Vm>,
     tcg: TcgOptions,
@@ -874,6 +988,9 @@ pub(crate) fn start_board_tcg(
     args: &ArmArgs<'_>,
     serial_hds: &[Option<Arc<Chardev>>],
 ) -> std::result::Result<Running, Vec<Located>> {
+    if opts.board == ArmBoard::SbsaRef {
+        return start_sbsa_ref_tcg(vm, tcg, opts, args, serial_hds);
+    }
     let one = |e: Error| vec![Located(None, e)];
     let semi = args.semihosting;
     let console_chr = semihosting_chardev(&vm.chardevs, semi).map_err(|e| vec![e])?;
@@ -882,8 +999,8 @@ pub(crate) fn start_board_tcg(
             "semihosting-config target=gdb is not supported by ruvm yet",
         )));
     }
-    let cpu = parse_cpu(args.cpu).map_err(one)?;
-    let plan = devices::plan(args.drives, args.devices)?;
+    let cpu = parse_cpu(ArmBoard::Virt, args.cpu).map_err(one)?;
+    let plan = devices::plan(ArmBoard::Virt, args.drives, args.devices)?;
     let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
     let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
 
@@ -939,7 +1056,7 @@ pub(crate) fn start_board_tcg(
     cfg.clock = Some(Arc::clone(&clock));
     cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
     let mut board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
-    devices::plug(&board, &plan.virtio, args.drives).map_err(|e| vec![e])?;
+    devices::plug(devices::Target::Virt(&board), &plan.virtio, args.drives).map_err(|e| vec![e])?;
 
     let mut attachments = Vec::new();
     if let Some(Some(chr)) = serial_hds.first() {
@@ -964,12 +1081,7 @@ pub(crate) fn start_board_tcg(
 
     board.machine_done().map_err(|e| one(Error::generic(e)))?;
     if let Some(path) = &opts.dumpdtb {
-        // handle_machine_dumpdtb()
-        if let Err(e) = std::fs::write(path, board.fdt().as_bytes()) {
-            return Err(one(Error::generic(format!("Error saving FDT to file {path}: {e}"))));
-        }
-        ruvm_chardev::stdio::term_exit();
-        std::process::exit(0);
+        dumpdtb(path, board.fdt().as_bytes())?;
     }
 
     let cfg = VirtRunConfig { no_reboot: args.no_reboot, tcg, backend: None };
@@ -981,14 +1093,87 @@ pub(crate) fn start_board_tcg(
     }
     let machine = Arc::new(machine);
     set_cpu_hook(vm, &machine);
-    Ok(Running { machine, console, _attachments: attachments })
+    Ok(Running { machine: Machine::Virt(machine), console, _attachments: attachments })
+}
+
+/// [`start_board_tcg`] for sbsa-ref: the UART on `serial_hds[0]` and the secure UARTs on
+/// `serial_hds[1]` and `serial_hds[2]`.
+fn start_sbsa_ref_tcg(
+    vm: &Arc<Vm>,
+    tcg: TcgOptions,
+    opts: BoardOptions,
+    args: &ArmArgs<'_>,
+    serial_hds: &[Option<Arc<Chardev>>],
+) -> std::result::Result<Running, Vec<Located>> {
+    let one = |e: Error| vec![Located(None, e)];
+    if args.semihosting.enabled {
+        return Err(one(Error::generic(
+            "semihosting with machine sbsa-ref is not supported by ruvm yet",
+        )));
+    }
+    let cpu = parse_cpu(ArmBoard::SbsaRef, args.cpu).map_err(one)?;
+    let plan = devices::plan(ArmBoard::SbsaRef, args.drives, args.devices)?;
+    let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
+    let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
+
+    let mut cfg = SbsaRefConfig::new(cpu);
+    cfg.smp = opts.cpus as usize;
+    if let Some(size) = opts.ram_size {
+        cfg.ram_size = size;
+    }
+    cfg.kernel = opts.kernel;
+    cfg.initrd = opts.initrd;
+    cfg.append = opts.append;
+    cfg.dtb = opts.dtb;
+    cfg.firmware = opts.firmware;
+    cfg.max_cpus = Some(opts.max_cpus as usize);
+    cfg.topology = opts.topology;
+    for (slot, drive) in cfg.pflash.iter_mut().zip(plan.pflash) {
+        if let Some(backing) = drive {
+            *slot = backing;
+        }
+    }
+    cfg.clock = Some(Arc::clone(&clock));
+    cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
+    let mut board = SbsaRefMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
+    devices::plug_ahci(&board, &plan.ide, args.drives).map_err(|e| vec![e])?;
+    devices::plug(devices::Target::SbsaRef(&board), &plan.virtio, args.drives)
+        .map_err(|e| vec![e])?;
+
+    let mut attachments = Vec::new();
+    let uarts = [board.uart(), board.secure_uarts()[0], board.secure_uarts()[1]].map(Arc::clone);
+    for (n, uart) in uarts.into_iter().enumerate() {
+        let Some(Some(chr)) = serial_hds.get(n) else { continue };
+        let fe = Arc::new(ChardevPl011 { uart, chr: Arc::clone(chr) });
+        match n {
+            0 => board.set_serial_backend(Some(fe.clone())),
+            _ => board.set_secure_serial_backend(n - 1, Some(fe.clone())),
+        }
+        attachments.push(chr.attach(fe).map_err(|e| vec![Located(None, e)])?);
+    }
+
+    board.machine_done().map_err(|e| one(Error::generic(e)))?;
+    if let Some(path) = &opts.dumpdtb {
+        dumpdtb(path, board.fdt().as_bytes())?;
+    }
+
+    let cfg = VirtRunConfig { no_reboot: args.no_reboot, tcg, backend: None };
+    let (machine, warnings) =
+        SbsaRefTcgMachine::new(board, vec![clock, rtc_clock], &cfg, event_handler(vm))
+            .map_err(|e| one(Error::generic(e)))?;
+    for w in &warnings {
+        warn_report(w);
+    }
+    let machine = Arc::new(machine);
+    set_cpu_hook(vm, &machine);
+    Ok(Running { machine: Machine::SbsaRef(machine), console: None, _attachments: attachments })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn smp(cpus: Option<i64>, clusters: Option<i64>, cores: Option<i64>) -> SMPConfiguration {
+    fn smp_cfg(cpus: Option<i64>, clusters: Option<i64>, cores: Option<i64>) -> SMPConfiguration {
         SMPConfiguration { cpus, clusters, cores, ..SMPConfiguration::default() }
     }
 
@@ -1002,10 +1187,16 @@ mod tests {
             has_clusters,
         };
         let flat = |n| topo(1, 1, n, 1, false);
-        assert_eq!(parse_smp(&SMPConfiguration::default()).unwrap(), (1, 1, flat(1)));
-        assert_eq!(parse_smp(&smp(Some(4), None, None)).unwrap(), (4, 4, flat(4)));
         assert_eq!(
-            parse_smp(&smp(None, Some(2), Some(2))).unwrap(),
+            parse_smp(ArmBoard::Virt, &SMPConfiguration::default()).unwrap(),
+            (1, 1, flat(1))
+        );
+        assert_eq!(
+            parse_smp(ArmBoard::Virt, &smp_cfg(Some(4), None, None)).unwrap(),
+            (4, 4, flat(4))
+        );
+        assert_eq!(
+            parse_smp(ArmBoard::Virt, &smp_cfg(None, Some(2), Some(2))).unwrap(),
             (4, 4, topo(1, 2, 2, 1, true))
         );
         let threads = SMPConfiguration {
@@ -1015,8 +1206,8 @@ mod tests {
             maxcpus: Some(8),
             ..SMPConfiguration::default()
         };
-        assert_eq!(parse_smp(&threads).unwrap(), (2, 8, topo(2, 1, 2, 2, false)));
-        let e = parse_smp(&smp(Some(3), Some(2), None)).unwrap_err();
+        assert_eq!(parse_smp(ArmBoard::Virt, &threads).unwrap(), (2, 8, topo(2, 1, 2, 2, false)));
+        let e = parse_smp(ArmBoard::Virt, &smp_cfg(Some(3), Some(2), None)).unwrap_err();
         assert_eq!(
             e.message(),
             "Invalid CPU topology: product of the hierarchy must match maxcpus: sockets (1) * \
@@ -1024,10 +1215,10 @@ mod tests {
         );
         let dies = SMPConfiguration { dies: Some(2), ..SMPConfiguration::default() };
         assert_eq!(
-            parse_smp(&dies).unwrap_err().message(),
+            parse_smp(ArmBoard::Virt, &dies).unwrap_err().message(),
             "dies > 1 not supported by this machine's CPU topology"
         );
-        let e = parse_smp(&smp(Some(513), None, None)).unwrap_err();
+        let e = parse_smp(ArmBoard::Virt, &smp_cfg(Some(513), None, None)).unwrap_err();
         assert_eq!(
             e.message(),
             "Invalid SMP CPUs 513. The max CPUs supported by machine 'virt-11.1' is 512"
@@ -1057,19 +1248,25 @@ mod tests {
 
     #[test]
     fn cpu_models() {
-        assert_eq!(parse_cpu(None).unwrap().name, "cortex-a57");
-        assert_eq!(parse_cpu(Some("max,sve-max-vq=2")).unwrap().features.sve_max_vq, 2);
+        assert_eq!(parse_cpu(ArmBoard::Virt, None).unwrap().name, "cortex-a57");
         assert_eq!(
-            parse_cpu(Some("cortex-a53")).unwrap_err().message(),
+            parse_cpu(ArmBoard::Virt, Some("max,sve-max-vq=2")).unwrap().features.sve_max_vq,
+            2
+        );
+        assert_eq!(
+            parse_cpu(ArmBoard::Virt, Some("cortex-a53")).unwrap_err().message(),
             "CPU model 'cortex-a53' is not supported by ruvm yet"
         );
-        assert_eq!(parse_cpu(Some("foo")).unwrap_err().message(), "unable to find CPU model 'foo'");
         assert_eq!(
-            parse_cpu(Some("cortex-a57,pauth-qarma5=on")).unwrap_err().message(),
+            parse_cpu(ArmBoard::Virt, Some("foo")).unwrap_err().message(),
+            "unable to find CPU model 'foo'"
+        );
+        assert_eq!(
+            parse_cpu(ArmBoard::Virt, Some("cortex-a57,pauth-qarma5=on")).unwrap_err().message(),
             "CPU property pauth-qarma5=on is not supported by ruvm yet"
         );
         assert_eq!(
-            parse_cpu(Some("max,sve-max-vq=0")).unwrap_err().message(),
+            parse_cpu(ArmBoard::Virt, Some("max,sve-max-vq=0")).unwrap_err().message(),
             "unsupported SVE vector length"
         );
     }
@@ -1081,7 +1278,7 @@ mod tests {
         m.put("gic-version", "3");
         m.put("kernel", "k");
         m.put("dtb", "d.dtb");
-        let o = take_board_options(&m).unwrap();
+        let o = take_board_options(ArmBoard::Virt, &m).unwrap();
         assert_eq!(o.kernel.as_deref(), Some("k"));
         assert_eq!(o.dtb.as_deref(), Some("d.dtb"));
         assert_eq!(o.msi, VirtMsi::Off);
@@ -1091,7 +1288,7 @@ mod tests {
             for (k, v) in props {
                 m.put(*k, *v);
             }
-            take_board_options(&m).map(|o| o.msi)
+            take_board_options(ArmBoard::Virt, &m).map(|o| o.msi)
         };
         assert_eq!(msi(&[]).unwrap(), VirtMsi::Auto);
         assert_eq!(msi(&[("msi", "off"), ("its", "on")]).unwrap(), VirtMsi::Its);
@@ -1109,7 +1306,7 @@ mod tests {
         let iommu = |v: &str| {
             let mut m = QDict::new();
             m.put("iommu", v);
-            take_board_options(&m).map(|o| o.iommu)
+            take_board_options(ArmBoard::Virt, &m).map(|o| o.iommu)
         };
         assert_eq!(iommu("smmuv3").unwrap(), VirtIommu::SmmuV3);
         assert_eq!(iommu("none").unwrap(), VirtIommu::None);
@@ -1118,40 +1315,40 @@ mod tests {
         assert_eq!(e.hint_text(), Some("Valid values are none, smmuv3.\n"));
         let mut m = QDict::new();
         m.put("default-bus-bypass-iommu", "on");
-        assert!(take_board_options(&m).unwrap().default_bus_bypass_iommu);
+        assert!(take_board_options(ArmBoard::Virt, &m).unwrap().default_bus_bypass_iommu);
         let mut m = QDict::new();
         m.put("secure", "on");
         m.put("virtualization", "on");
         m.put("firmware", "edk2.fd");
-        let o = take_board_options(&m).unwrap();
+        let o = take_board_options(ArmBoard::Virt, &m).unwrap();
         assert!(o.secure && o.virtualization);
         assert_eq!(o.firmware.as_deref(), Some("edk2.fd"));
         let mut m = QDict::new();
         m.put("mte", "on");
-        assert!(take_board_options(&m).unwrap().mte);
+        assert!(take_board_options(ArmBoard::Virt, &m).unwrap().mte);
         let mut m = QDict::new();
         m.put("ras", "on");
         assert_eq!(
-            take_board_options(&m).unwrap_err().message(),
+            take_board_options(ArmBoard::Virt, &m).unwrap_err().message(),
             "ras=on is not supported by ruvm yet"
         );
         let mut m = QDict::new();
         m.put("highmem-ecam", "off");
         m.put("compact-highmem", "off");
         m.put("highmem-mmio-size", "1T");
-        let o = take_board_options(&m).unwrap();
+        let o = take_board_options(ArmBoard::Virt, &m).unwrap();
         assert!(!o.highmem.ecam && !o.highmem.compact && o.highmem.mmio);
         assert_eq!(o.highmem.mmio_size, 1 << 40);
         let mut m = QDict::new();
         m.put("highmem-mmio-size", "1G");
         assert_eq!(
-            take_board_options(&m).unwrap_err().message(),
+            take_board_options(ArmBoard::Virt, &m).unwrap_err().message(),
             "highmem-mmio-size cannot be set to a lower value than the default (512 GiB)"
         );
         let mut m = QDict::new();
         m.put("foo", "on");
         assert_eq!(
-            take_board_options(&m).unwrap_err().message(),
+            take_board_options(ArmBoard::Virt, &m).unwrap_err().message(),
             "Property 'virt-11.1-machine.foo' not found"
         );
     }
@@ -1163,7 +1360,7 @@ mod tests {
             for (k, v) in props {
                 m.put(*k, *v);
             }
-            take_board_options(&m)
+            take_board_options(ArmBoard::Virt, &m)
         };
         let o = opts(&[]).unwrap();
         assert!(!o.acpi_off && !o.spcr_off && o.oem_id.is_none() && o.oem_table_id.is_none());
@@ -1187,5 +1384,54 @@ mod tests {
             opts(&[("x-oem-table-id", "123456789")]).unwrap_err().message(),
             "User specified oem-table-id value is bigger than 8 bytes in size"
         );
+    }
+
+    #[test]
+    fn sbsa_ref_options() {
+        let s = ArmBoard::SbsaRef;
+        assert_eq!(board_by_name("sbsa-ref"), Some(s));
+        assert_eq!(board_by_name("virt-11.1"), Some(ArmBoard::Virt));
+        assert_eq!(board_by_name("sbsa"), None);
+        // Four CPUs in one core without -smp, and the usual parsing with it.
+        let o = take_board_options(s, &QDict::new()).unwrap();
+        assert_eq!((o.board, o.cpus, o.max_cpus, o.topology), (s, 4, 4, None));
+        let mut m = QDict::new();
+        let mut smp = QDict::new();
+        smp.put("cpus", "2");
+        m.put("smp", QValue::Dict(smp));
+        let o = take_board_options(s, &m).unwrap();
+        assert_eq!((o.cpus, o.max_cpus), (2, 2));
+        assert_eq!(o.topology.map(|t| t.cores), Some(2));
+        let e = parse_smp(s, &smp_cfg(Some(513), None, None)).unwrap_err();
+        assert_eq!(
+            e.message(),
+            "Invalid SMP CPUs 513. The max CPUs supported by machine 'sbsa-ref' is 512"
+        );
+        let mut m = QDict::new();
+        m.put("firmware", "SBSA_FLASH0.fd");
+        assert_eq!(take_board_options(s, &m).unwrap().firmware.as_deref(), Some("SBSA_FLASH0.fd"));
+        let mut m = QDict::new();
+        m.put("secure", "on");
+        assert_eq!(
+            take_board_options(s, &m).unwrap_err().message(),
+            "Property 'sbsa-ref-machine.secure' not found"
+        );
+        // valid_cpu_types.
+        assert_eq!(parse_cpu(s, None).unwrap().name, "neoverse-n1");
+        assert_eq!(parse_cpu(s, Some("max")).unwrap().name, "max");
+        let e = parse_cpu(s, Some("cortex-a76")).unwrap_err();
+        assert_eq!(e.message(), "Invalid CPU model: cortex-a76");
+        assert_eq!(
+            e.hint_text(),
+            Some(
+                "The valid models are: cortex-a57, cortex-a72, neoverse-n1, neoverse-v1, neoverse-n2, max\n"
+            )
+        );
+        assert_eq!(
+            parse_cpu(s, Some("neoverse-n2")).unwrap_err().message(),
+            "CPU model 'neoverse-n2' is not supported by ruvm yet"
+        );
+        assert!(machine_help_lines().iter().any(|(k, l)| k == "sbsa-ref"
+            && l == "sbsa-ref             QEMU 'SBSA Reference' ARM Virtual Machine\n"));
     }
 }

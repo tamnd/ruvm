@@ -2,16 +2,17 @@
 
 //! The physical CPU interface, the ICC_* registers, from hw/intc/arm_gicv3_cpuif.c.
 
+use super::vcpuif::{ICH_HCR_EL2_TALL0, ICH_HCR_EL2_TALL1, ICH_HCR_EL2_TC, ICH_HCR_EL2_TDIR};
 use super::{
     BANK_NS, BANK_S, CpuState, G0, G1, G1NS, GICV3_LPI_INTID_START, GicState, INTID_NONSECURE,
-    INTID_SECURE, INTID_SPURIOUS, IccAccess, IccCpuCtx, IccReg,
+    INTID_SECURE, INTID_SPURIOUS, IccAccess, IccCpuCtx, IccReg, OUT_FIQ, OUT_IRQ,
 };
 
-const ICC_CTLR_EL1_CBPR: u64 = 1 << 0;
-const ICC_CTLR_EL1_EOIMODE: u64 = 1 << 1;
-const ICC_CTLR_EL1_PRIBITS_SHIFT: u32 = 8;
-const ICC_CTLR_EL1_IDBITS_SHIFT: u32 = 11;
-const ICC_CTLR_EL1_A3V: u64 = 1 << 15;
+pub(super) const ICC_CTLR_EL1_CBPR: u64 = 1 << 0;
+pub(super) const ICC_CTLR_EL1_EOIMODE: u64 = 1 << 1;
+pub(super) const ICC_CTLR_EL1_PRIBITS_SHIFT: u32 = 8;
+pub(super) const ICC_CTLR_EL1_IDBITS_SHIFT: u32 = 11;
+pub(super) const ICC_CTLR_EL1_A3V: u64 = 1 << 15;
 
 const ICC_CTLR_EL3_CBPR_EL1S: u64 = 1 << 0;
 const ICC_CTLR_EL3_CBPR_EL1NS: u64 = 1 << 1;
@@ -30,13 +31,13 @@ const ICC_SRE_EL2_EL3_VALUE: u64 = 0xf;
 
 const ICC_IGRPEN_ENABLE: u64 = 1;
 
-const HCR_FMO: u64 = 1 << 3;
-const HCR_IMO: u64 = 1 << 4;
+pub(super) const HCR_FMO: u64 = 1 << 3;
+pub(super) const HCR_IMO: u64 = 1 << 4;
 const SCR_IRQ: u64 = 1 << 1;
 const SCR_FIQ: u64 = 1 << 2;
 
 /// `gicv3_intid_is_special()`.
-fn intid_is_special(intid: u64) -> bool {
+pub(super) fn intid_is_special(intid: u64) -> bool {
     (INTID_SECURE..=INTID_SPURIOUS).contains(&intid)
 }
 
@@ -67,11 +68,30 @@ fn accessfn(reg: IccReg) -> AccessFn {
         IccReg::SreEl1 | IccReg::SreEl2 | IccReg::CtlrEl3 | IccReg::SreEl3 | IccReg::Igrpen1El3 => {
             AccessFn::None
         }
+        // The ICH_* registers have only their PL2 rights.
+        IccReg::IchAp0r(_)
+        | IccReg::IchAp1r(_)
+        | IccReg::IchHcr
+        | IccReg::IchVtr
+        | IccReg::IchMisr
+        | IccReg::IchEisr
+        | IccReg::IchElrsr
+        | IccReg::IchVmcr
+        | IccReg::IchLr(_) => AccessFn::None,
     }
 }
 
-/// `gicv3_irqfiq_access()`. The ICH_HCR_EL2.TC trap is absent with the virtual interface.
-fn irqfiq_access(ctx: &IccCpuCtx) -> IccAccess {
+/// Whether ICH_HCR_EL2 trap bit `trap` applies: it is set and the CPU is at Non-secure EL1.
+/// Such a trap takes priority over a possible EL3 trap.
+fn ich_trap(ctx: &IccCpuCtx, ich_hcr: u64, trap: u64) -> bool {
+    ich_hcr & trap != 0 && ctx.el == 1 && !ctx.secure_below_el3
+}
+
+/// `gicv3_irqfiq_access()`.
+fn irqfiq_access(ctx: &IccCpuCtx, ich_hcr: u64) -> IccAccess {
+    if ich_trap(ctx, ich_hcr, ICH_HCR_EL2_TC) {
+        return IccAccess::TrapEl2;
+    }
     if ctx.scr_el3 & (SCR_FIQ | SCR_IRQ) == (SCR_FIQ | SCR_IRQ) {
         match ctx.el {
             1 if ctx.hcr_el2 & (HCR_IMO | HCR_FMO) == 0 => return IccAccess::TrapEl3,
@@ -82,8 +102,11 @@ fn irqfiq_access(ctx: &IccCpuCtx) -> IccAccess {
     IccAccess::Ok
 }
 
-/// `gicv3_fiq_access()` and `gicv3_irq_access()`.
-fn one_access(ctx: &IccCpuCtx, scr_bit: u64, hcr_bit: u64) -> IccAccess {
+/// `gicv3_fiq_access()` and `gicv3_irq_access()`, with ICH_HCR_EL2.TALL0 or TALL1 as `trap`.
+fn one_access(ctx: &IccCpuCtx, ich_hcr: u64, trap: u64, scr_bit: u64, hcr_bit: u64) -> IccAccess {
+    if ich_trap(ctx, ich_hcr, trap) {
+        return IccAccess::TrapEl2;
+    }
     if ctx.scr_el3 & scr_bit != 0 {
         match ctx.el {
             1 if ctx.hcr_el2 & hcr_bit == 0 => return IccAccess::TrapEl3,
@@ -94,22 +117,28 @@ fn one_access(ctx: &IccCpuCtx, scr_bit: u64, hcr_bit: u64) -> IccAccess {
     IccAccess::Ok
 }
 
-/// The access check for `reg` from a CPU in `ctx`.
-pub(super) fn access(reg: IccReg, ctx: &IccCpuCtx) -> IccAccess {
+/// The access check for `reg` from a CPU in `ctx` whose ICH_HCR_EL2 is `ich_hcr`.
+pub(super) fn access(reg: IccReg, ctx: &IccCpuCtx, ich_hcr: u64) -> IccAccess {
     if ctx.el == 0 {
         return IccAccess::Undefined;
     }
     match accessfn(reg) {
         AccessFn::None => IccAccess::Ok,
-        AccessFn::IrqFiq | AccessFn::Dir => irqfiq_access(ctx),
-        AccessFn::Fiq => one_access(ctx, SCR_FIQ, HCR_FMO),
-        AccessFn::Irq => one_access(ctx, SCR_IRQ, HCR_IMO),
+        AccessFn::IrqFiq => irqfiq_access(ctx, ich_hcr),
+        AccessFn::Dir => {
+            if ich_trap(ctx, ich_hcr, ICH_HCR_EL2_TDIR) {
+                return IccAccess::TrapEl2;
+            }
+            irqfiq_access(ctx, ich_hcr)
+        }
+        AccessFn::Fiq => one_access(ctx, ich_hcr, ICH_HCR_EL2_TALL0, SCR_FIQ, HCR_FMO),
+        AccessFn::Irq => one_access(ctx, ich_hcr, ICH_HCR_EL2_TALL1, SCR_IRQ, HCR_IMO),
         AccessFn::Sgi => {
             // This takes priority over a possible EL3 trap.
             if ctx.el == 1 && ctx.hcr_el2 & (HCR_IMO | HCR_FMO) != 0 {
                 return IccAccess::TrapEl2;
             }
-            irqfiq_access(ctx)
+            irqfiq_access(ctx, ich_hcr)
         }
     }
 }
@@ -132,6 +161,7 @@ impl CpuState {
             | ICC_CTLR_EL3_A3V
             | (1 << ICC_CTLR_EL3_IDBITS_SHIFT)
             | (pribits << ICC_CTLR_EL3_PRIBITS_SHIFT);
+        self.ich_reset();
     }
 
     /// `icc_fullprio_mask()`: the priority bits that are implemented.
@@ -318,9 +348,9 @@ impl GicState {
                 G1 => !cs.ctx.secure || cs.ctx.el == 3,
                 _ => cs.ctx.secure,
             };
-            out = if isfiq { 2 } else { 1 };
+            out = if isfiq { OUT_FIQ } else { OUT_IRQ };
         }
-        cs.out = out;
+        cs.out = (cs.out & !(OUT_IRQ | OUT_FIQ)) | out;
         self.dirty[cpu] = true;
     }
 
@@ -348,7 +378,7 @@ impl GicState {
 
     /// `icc_deactivate_irq()`. LPIs have no active state, so there is nothing to do for them.
     /// QEMU clears a bit past the end of its SPI bitmaps there instead.
-    fn icc_deactivate_irq(&mut self, cpu: usize, irq: u32) {
+    pub(super) fn icc_deactivate_irq(&mut self, cpu: usize, irq: u32) {
         if irq >= GICV3_LPI_INTID_START {
             return;
         }
@@ -505,6 +535,9 @@ impl GicState {
 
     /// Read `reg`. Write only registers read as zero.
     pub(super) fn icc_read(&mut self, cpu: usize, reg: IccReg) -> u64 {
+        if self.cpu[cpu].icv_access(reg) {
+            return self.icv_read(cpu, reg);
+        }
         let ds = self.ds();
         match reg {
             IccReg::Pmr => {
@@ -589,11 +622,24 @@ impl GicState {
             | IccReg::Sgi0r
             | IccReg::Sgi1r
             | IccReg::Asgi1r => 0,
+            IccReg::IchAp0r(_)
+            | IccReg::IchAp1r(_)
+            | IccReg::IchHcr
+            | IccReg::IchVtr
+            | IccReg::IchMisr
+            | IccReg::IchEisr
+            | IccReg::IchElrsr
+            | IccReg::IchVmcr
+            | IccReg::IchLr(_) => self.ich_read(cpu, reg),
         }
     }
 
     /// Write `reg`. Read only registers ignore writes.
     pub(super) fn icc_write(&mut self, cpu: usize, reg: IccReg, value: u64) {
+        if self.cpu[cpu].icv_access(reg) {
+            self.icv_write(cpu, reg, value);
+            return;
+        }
         match reg {
             IccReg::Pmr => {
                 let cs = &mut self.cpu[cpu];
@@ -720,6 +766,15 @@ impl GicState {
             | IccReg::SreEl1
             | IccReg::SreEl2
             | IccReg::SreEl3 => {}
+            IccReg::IchAp0r(_)
+            | IccReg::IchAp1r(_)
+            | IccReg::IchHcr
+            | IccReg::IchVtr
+            | IccReg::IchMisr
+            | IccReg::IchEisr
+            | IccReg::IchElrsr
+            | IccReg::IchVmcr
+            | IccReg::IchLr(_) => self.ich_write(cpu, reg, value),
         }
     }
 }

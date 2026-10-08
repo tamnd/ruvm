@@ -4,7 +4,8 @@
 //! `target/arm/helper.c` (`v8_cp_reginfo`, `vmsa_cp_reginfo`, `el2_cp_reginfo`,
 //! `el3_cp_reginfo`, `generic_timer_cp_reginfo`, the VHE redirections of
 //! `define_arm_vh_e2h_redirect_aliases()`, the ID registers and the TLBI, AT and cache
-//! maintenance operations) and `debug_helper.c` that this port needs.
+//! maintenance operations) and `debug_helper.c` that this port needs, with the
+//! IMPLEMENTATION DEFINED registers of `cortex-regs.c` and `define_neoverse_n1_cp_reginfo()`.
 //!
 //! Each register is a [`Reg`]: its encoding, the static access rights QEMU keeps in
 //! `ARMCPRegInfo.access`, the trap that its `accessfn` checks at run time, and how it is read
@@ -20,8 +21,9 @@
 //!
 //! - On a CPU with EL3 but no EL2 every EL2 register reads as zero and ignores writes, where
 //!   QEMU lists the registers that do so one by one in `el3_no_el2_cp_reginfo`.
-//! - The debug registers are the few the EL1 slice had; MDCR_EL2 and MDCR_EL3 are stored but
-//!   their debug traps are not checked, nor are the HSTR_EL2 and HCR_EL2.TIDCP traps.
+//! - The debug registers are the few the EL1 slice had; of MDCR_EL2 and MDCR_EL3 only the
+//!   PMU controls take effect (see `pmu.rs`), their debug traps are not checked, nor are the
+//!   HSTR_EL2 and HCR_EL2.TIDCP traps.
 //! - TLBI IPAS2E1 and IPAS2LE1 have no effect: this port caches no stage 2 walk results
 //!   apart from the combined stage 1 and 2 entries, which the architecture requires the
 //!   hypervisor to invalidate with a stage 1 TLBI (VMALLE1 or VMALLS12E1) afterwards.
@@ -40,16 +42,18 @@ use ruvm_jit::cputlb::{
     tlb_flush, tlb_flush_by_mmuidx, tlb_flush_by_mmuidx_all_cpus_synced,
     tlb_flush_page_bits_by_mmuidx, tlb_flush_page_bits_by_mmuidx_all_cpus_synced,
 };
-use ruvm_jit::{Cpu, MmuAccessType};
+use ruvm_jit::{Cpu, MmuAccessType, interrupt};
 
+use super::pmu::{self, Pmu, PmuTrap};
 use super::{Arm, PsciConduit, arm_of, gic, gtimer, ptw, regime_has_2_ranges, vfp};
 use crate::cpu::{
     ArmCpuModel, ArmFeatures, CpuArmState, GTIMER_HYP, GTIMER_HYPVIRT, GTIMER_PHYS, GTIMER_SEC,
-    GTIMER_VIRT, HCR_APK, HCR_ATA, HCR_DC, HCR_E2H, HCR_FWB, HCR_NV, HCR_NV1, HCR_PTW, HCR_TACR,
-    HCR_TDZ, HCR_TGE, HCR_TID1, HCR_TID2, HCR_TID3, HCR_TID5, HCR_TPCP, HCR_TPU, HCR_TRVM, HCR_TSW,
-    HCR_TTLB, HCR_TVM, HCR_VM, MMU_IDX_E2, MMU_IDX_E3, MMU_IDX_E10_0, MMU_IDX_E10_1,
-    MMU_IDX_E10_1_PAN, MMU_IDX_E20_0, MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, PSTATE_DAIF, PSTATE_PAN,
-    PSTATE_SP, PSTATE_TCO, PSTATE_UAO, SCR_APK, SCR_ATA, SCR_NS, SCR_NSE, SCR_TCR2EN, SCTLR_ATA,
+    GTIMER_VIRT, HCR_AMO, HCR_APK, HCR_ATA, HCR_DC, HCR_E2H, HCR_FMO, HCR_FWB, HCR_IMO, HCR_NV,
+    HCR_NV1, HCR_PTW, HCR_TACR, HCR_TDZ, HCR_TGE, HCR_TID1, HCR_TID2, HCR_TID3, HCR_TID5, HCR_TPCP,
+    HCR_TPU, HCR_TRVM, HCR_TSW, HCR_TTLB, HCR_TVM, HCR_VM, ImpdefRegs, MMU_IDX_E2, MMU_IDX_E3,
+    MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN, MMU_IDX_E20_0, MMU_IDX_E20_2,
+    MMU_IDX_E20_2_PAN, PSTATE_A, PSTATE_DAIF, PSTATE_F, PSTATE_I, PSTATE_PAN, PSTATE_SP,
+    PSTATE_SSBS, PSTATE_TCO, PSTATE_UAO, SCR_APK, SCR_ATA, SCR_NS, SCR_NSE, SCR_TCR2EN, SCTLR_ATA,
     SCTLR_ATA0, SCTLR_DZE, SCTLR_ITFSB, SCTLR_TCF, SCTLR_TCF0, SCTLR_TCSO, SCTLR_TCSO0, SCTLR_UCI,
     SCTLR_UCT, SCTLR_UMA, env_off,
 };
@@ -157,9 +161,14 @@ pub(crate) enum Trap {
     Mte,
     /// `access_tid5()`: HCR_EL2.TID5.
     Tid5,
+    /// `access_actlr_w()`: ACTLR_EL2 and ACTLR_EL3 are constant 0, so writes below EL2 trap
+    /// to EL2 when it is enabled and writes below EL3 trap to EL3.
+    Actlr,
     /// The `accessfn` of a GICv3 CPU interface register (`gicv3_irqfiq_access()` and
     /// friends), which the interface decides: see `gic.rs`.
     Gic,
+    /// The checks of the PMU registers, see `pmu.rs`.
+    Pmu(PmuTrap),
 }
 
 /// What a run time access check decides, `CPAccessResult`.
@@ -302,6 +311,17 @@ impl Trap {
                 }
             }
             Trap::Tacr => el1_hcr(HCR_TACR),
+            Trap::Actlr => {
+                if isread {
+                    Access::Ok
+                } else if el < 2 && st.is_el2_enabled(f) {
+                    Access::TrapEl2
+                } else if el < 3 && f.el3 {
+                    Access::TrapEl3
+                } else {
+                    Access::Ok
+                }
+            }
             Trap::Ttlb => el1_hcr(HCR_TTLB),
             Trap::Tcr2 => {
                 let tvm = el1_hcr(if isread { HCR_TRVM } else { HCR_TVM });
@@ -342,6 +362,7 @@ impl Trap {
             }
             // The interface is asked by the access check helper, which knows the vCPU.
             Trap::Gic => Access::Ok,
+            Trap::Pmu(t) => t.check(f, st, isread),
         }
     }
 }
@@ -396,6 +417,14 @@ fn always(_: &ArmFeatures) -> bool {
     true
 }
 
+fn has_pmu(f: &ArmFeatures) -> bool {
+    f.pmu != 0
+}
+
+fn has_pmuv3p4(f: &ArmFeatures) -> bool {
+    f.pmu != 0 && pmu::pmuv3p4(f)
+}
+
 fn has_pan(f: &ArmFeatures) -> bool {
     f.pan
 }
@@ -434,6 +463,10 @@ fn has_tcr2(f: &ArmFeatures) -> bool {
 
 fn has_rme(f: &ArmFeatures) -> bool {
     f.rme
+}
+
+fn has_ssbs(f: &ArmFeatures) -> bool {
+    f.ssbs
 }
 
 fn has_rng(f: &ArmFeatures) -> bool {
@@ -482,6 +515,25 @@ macro_rules! r {
     };
 }
 
+/// A PMU register: its check is one of [`PmuTrap`] and it exists when the CPU has a PMU.
+macro_rules! pm {
+    ($name:literal, ($op0:expr, $op1:expr, $crn:expr, $crm:expr, $op2:expr), $access:expr,
+     $trap:ident) => {
+        pm!($name, ($op0, $op1, $crn, $crm, $op2), $access, $trap, Kind::Special, has_pmu)
+    };
+    ($name:literal, ($op0:expr, $op1:expr, $crn:expr, $crm:expr, $op2:expr), $access:expr,
+     $trap:ident, $kind:expr, $feat:expr) => {
+        Reg {
+            name: $name,
+            key: key($op0, $op1, $crn, $crm, $op2),
+            access: $access,
+            trap: Trap::Pmu(PmuTrap::$trap),
+            kind: $kind,
+            feat: $feat,
+        }
+    };
+}
+
 const fn field(off: usize) -> Kind {
     Kind::Field { off, mask: u64::MAX }
 }
@@ -492,6 +544,8 @@ const fn field32(off: usize) -> Kind {
 
 /// MIDR_EL1.
 pub(crate) const MIDR_EL1: u32 = key(3, 0, 0, 0, 0);
+/// ISR_EL1.
+const ISR_EL1: u32 = key(3, 0, 12, 1, 0);
 /// SCTLR_EL1.
 pub(crate) const SCTLR_EL1: u32 = key(3, 0, 1, 0, 0);
 /// TTBR0_EL1.
@@ -524,6 +578,10 @@ pub(crate) const PAN: u32 = key(3, 0, 4, 2, 3);
 pub(crate) const UAO: u32 = key(3, 0, 4, 2, 4);
 /// TCO.
 pub(crate) const TCO: u32 = key(3, 3, 4, 2, 7);
+/// SSBS.
+pub(crate) const SSBS: u32 = key(3, 3, 4, 2, 6);
+/// L2CTLR_EL1 of the Cortex-A57 and A72.
+pub(crate) const L2CTLR_EL1: u32 = key(3, 1, 11, 0, 2);
 pub(crate) const RNDR: u32 = key(3, 3, 2, 4, 0);
 pub(crate) const RNDRRS: u32 = key(3, 3, 2, 4, 1);
 /// MPIDR_EL1.
@@ -704,6 +762,7 @@ static REGS: &[Reg] = &[
         None,
         Kind::Field { off: off!(vbar_el[1]), mask: !0x1f }
     ),
+    r!("ISR_EL1", (3, 0, 12, 1, 0), PL1_R, None, Kind::Special),
     r!("CONTEXTIDR_EL1", (3, 0, 13, 0, 1), PL1_RW, Tvm, field32(off!(contextidr_el1))),
     r!("TPIDR_EL1", (3, 0, 13, 0, 4), PL1_RW, None, field(off!(tpidr_el[1]))),
     r!("TPIDR_EL0", (3, 3, 13, 0, 2), PL0_RW, None, field(off!(tpidr_el[0]))),
@@ -730,6 +789,39 @@ static REGS: &[Reg] = &[
     r!("OSLAR_EL1", (2, 0, 1, 0, 4), PL1_W, None, Kind::Special),
     r!("OSLSR_EL1", (2, 0, 1, 1, 4), PL1_R, None, Kind::Special),
     r!("OSDLR_EL1", (2, 0, 1, 3, 4), PL1_RW, None, Kind::Field { off: off!(osdlr_el1), mask: 1 }),
+    // Performance monitors, cpregs-pmu.c; PMEVCNTR<n>_EL0 and PMEVTYPER<n>_EL0 are found by
+    // lookup().
+    pm!("PMCR_EL0", (3, 3, 9, 12, 0), PL0_RW, Pmcr),
+    pm!("PMCNTENSET_EL0", (3, 3, 9, 12, 1), PL0_RW, Reg),
+    pm!("PMCNTENCLR_EL0", (3, 3, 9, 12, 2), PL0_RW, Reg),
+    pm!("PMOVSCLR_EL0", (3, 3, 9, 12, 3), PL0_RW, Reg),
+    pm!("PMSWINC_EL0", (3, 3, 9, 12, 4), PL0_W, Swinc),
+    pm!("PMSELR_EL0", (3, 3, 9, 12, 5), PL0_RW, Selr),
+    pm!(
+        "PMCEID0_EL0",
+        (3, 3, 9, 12, 6),
+        PL0_R,
+        Reg,
+        Kind::Model(|m| pmu::pmceid(&m.features).0),
+        has_pmu
+    ),
+    pm!(
+        "PMCEID1_EL0",
+        (3, 3, 9, 12, 7),
+        PL0_R,
+        Reg,
+        Kind::Model(|m| pmu::pmceid(&m.features).1),
+        has_pmu
+    ),
+    pm!("PMCCNTR_EL0", (3, 3, 9, 13, 0), PL0_RW, Ccntr),
+    pm!("PMXEVTYPER_EL0", (3, 3, 9, 13, 1), PL0_RW, Reg),
+    pm!("PMXEVCNTR_EL0", (3, 3, 9, 13, 2), PL0_RW, Xevcntr),
+    pm!("PMUSERENR_EL0", (3, 3, 9, 14, 0), PL0_R | PL1_RW, Tpm),
+    pm!("PMINTENSET_EL1", (3, 0, 9, 14, 1), PL1_RW, Tpm),
+    pm!("PMINTENCLR_EL1", (3, 0, 9, 14, 2), PL1_RW, Tpm),
+    pm!("PMOVSSET_EL0", (3, 3, 9, 14, 3), PL0_RW, Reg),
+    pm!("PMMIR_EL1", (3, 0, 9, 14, 6), PL1_R, Reg, Kind::Zero, has_pmuv3p4),
+    pm!("PMCCFILTR_EL0", (3, 3, 14, 15, 7), PL0_RW, Reg),
     // Cache maintenance.
     r!("IC_IALLUIS", (1, 0, 7, 1, 0), PL1_W, Pou, Kind::Nop),
     r!("IC_IALLU", (1, 0, 7, 5, 0), PL1_W, Pou, Kind::Nop),
@@ -761,6 +853,8 @@ static REGS: &[Reg] = &[
     // mte_reginfo's TCO, and mte_tco_ro_reginfo's RAZ/WI one without FEAT_MTE2 (see read()
     // and write()).
     r!("TCO", (3, 3, 4, 2, 7), PL0_RW, None, Kind::Special, has_mte_insn_reg),
+    // ssbs_reginfo.
+    r!("SSBS", (3, 3, 4, 2, 6), PL0_RW, None, Kind::Special, has_ssbs),
     // rndr_reginfo, without FEAT_RNG_TRAP.
     r!("RNDR", (3, 3, 2, 4, 0), PL0_R, None, Kind::Special, has_rng),
     r!("RNDRRS", (3, 3, 2, 4, 1), PL0_R, None, Kind::Special, has_rng),
@@ -817,7 +911,7 @@ static EL2_REGS: &[Reg] = &[
     r!("SCTLR_EL2", (3, 4, 1, 0, 0), PL2_RW, None, Kind::Special),
     r!("ACTLR_EL2", (3, 4, 1, 0, 1), PL2_RW, None, Kind::Zero),
     r!("HCR_EL2", (3, 4, 1, 1, 0), PL2_RW, None, Kind::Special),
-    r!("MDCR_EL2", (3, 4, 1, 1, 1), PL2_RW, None, field(off!(mdcr_el2))),
+    r!("MDCR_EL2", (3, 4, 1, 1, 1), PL2_RW, None, Kind::Special),
     r!("CPTR_EL2", (3, 4, 1, 1, 2), PL2_RW, Cptr, field(off!(cptr_el[2]))),
     r!("HSTR_EL2", (3, 4, 1, 1, 3), PL2_RW, None, field32(off!(hstr_el2))),
     r!("HACR_EL2", (3, 4, 1, 1, 7), PL2_RW, None, Kind::Zero),
@@ -830,6 +924,10 @@ static EL2_REGS: &[Reg] = &[
     r!("SPSR_EL2", (3, 4, 4, 0, 0), PL2_RW, None, field(off!(spsr_el[2]))),
     r!("ELR_EL2", (3, 4, 4, 0, 1), PL2_RW, None, field(off!(elr_el[2]))),
     r!("SP_EL1", (3, 4, 4, 1, 0), PL2_RW, None, field(off!(sp_el[1]))),
+    r!("SPSR_IRQ", (3, 4, 4, 3, 0), PL2_RW, None, field32(off!(spsr_aarch32[2]))),
+    r!("SPSR_ABT", (3, 4, 4, 3, 1), PL2_RW, None, field32(off!(spsr_aarch32[0]))),
+    r!("SPSR_UND", (3, 4, 4, 3, 2), PL2_RW, None, field32(off!(spsr_aarch32[1]))),
+    r!("SPSR_FIQ", (3, 4, 4, 3, 3), PL2_RW, None, field32(off!(spsr_aarch32[3]))),
     r!("AFSR0_EL2", (3, 4, 5, 1, 0), PL2_RW, None, Kind::Zero),
     r!("AFSR1_EL2", (3, 4, 5, 1, 1), PL2_RW, None, Kind::Zero),
     r!("ESR_EL2", (3, 4, 5, 2, 0), PL2_RW, None, field(off!(esr_el[2]))),
@@ -900,7 +998,7 @@ static EL3_REGS: &[Reg] = &[
     r!("ACTLR_EL3", (3, 6, 1, 0, 1), PL3_RW, None, Kind::Zero),
     r!("SCR_EL3", (3, 6, 1, 1, 0), PL3_RW, None, Kind::Special),
     r!("CPTR_EL3", (3, 6, 1, 1, 2), PL3_RW, None, field(off!(cptr_el[3]))),
-    r!("MDCR_EL3", (3, 6, 1, 3, 1), PL3_RW, None, field(off!(mdcr_el3))),
+    r!("MDCR_EL3", (3, 6, 1, 3, 1), PL3_RW, None, Kind::Special),
     r!("TTBR0_EL3", (3, 6, 2, 0, 0), PL3_RW, None, Kind::Special),
     r!("TCR_EL3", (3, 6, 2, 0, 2), PL3_RW, None, Kind::Special),
     r!("SPSR_EL3", (3, 6, 4, 0, 0), PL3_RW, None, field(off!(spsr_el[3]))),
@@ -1006,6 +1104,25 @@ pub(crate) fn lookup(key_: u32, feat: &ArmFeatures) -> Option<Reg> {
     if let Some(r) = REGS.iter().find(|r| r.key == key_ && (r.feat)(feat)) {
         return Some(*r);
     }
+    if let Some((typer, n)) = pmu::evreg(key_) {
+        // The PMEVCNTR<n>_EL0 and PMEVTYPER<n>_EL0 that define_pm_cpregs() defines, one
+        // pair per counter.
+        if feat.pmu != 0 && n < pmu::num_counters(feat) {
+            let (name, trap) = if typer {
+                ("PMEVTYPER<n>_EL0", PmuTrap::Reg)
+            } else {
+                ("PMEVCNTR<n>_EL0", PmuTrap::Xevcntr)
+            };
+            return Some(Reg {
+                name,
+                key: key_,
+                access: PL0_RW,
+                trap: Trap::Pmu(trap),
+                kind: Kind::Special,
+                feat: has_pmu,
+            });
+        }
+    }
     if feat.el2 || feat.el3 {
         if let Some(r) = EL2_REGS.iter().find(|r| r.key == key_ && (r.feat)(feat)) {
             if feat.el2 {
@@ -1025,6 +1142,14 @@ pub(crate) fn lookup(key_: u32, feat: &ArmFeatures) -> Option<Reg> {
             return Some(r);
         }
     }
+    let impdef = match feat.impdef {
+        ImpdefRegs::None => &[][..],
+        ImpdefRegs::CortexA57 => CORTEX_A57_REGS,
+        ImpdefRegs::NeoverseN1 => NEOVERSE_N1_REGS,
+    };
+    if let Some(r) = impdef.iter().find(|r| r.key == key_) {
+        return Some(*r);
+    }
     let op0 = key_ >> 14;
     let op1 = key_op1(key_);
     let crn = (key_ >> 7) & 0xf;
@@ -1042,8 +1167,45 @@ pub(crate) fn lookup(key_: u32, feat: &ArmFeatures) -> Option<Reg> {
     None
 }
 
+/// `cortex_a72_a57_a53_cp_reginfo`, the AArch64 half.
+const CORTEX_A57_REGS: &[Reg] = &[
+    r!("L2CTLR_EL1", (3, 1, 11, 0, 2), PL1_RW, None, Kind::Special),
+    r!("L2ECTLR_EL1", (3, 1, 11, 0, 3), PL1_RW, None, Kind::Zero),
+    r!("L2ACTLR", (3, 1, 15, 0, 0), PL1_RW, None, Kind::Zero),
+    r!("CPUACTLR_EL1", (3, 1, 15, 2, 0), PL1_RW, None, Kind::Zero),
+    r!("CPUECTLR_EL1", (3, 1, 15, 2, 1), PL1_RW, None, Kind::Zero),
+    r!("CPUMERRSR_EL1", (3, 1, 15, 2, 2), PL1_RW, None, Kind::Zero),
+    r!("L2MERRSR_EL1", (3, 1, 15, 2, 3), PL1_RW, None, Kind::Zero),
+];
+
+/// `neoverse_n1_cp_reginfo`. ATCR_EL1 traps like TCR_EL1; there are no fine grained traps
+/// here.
+const NEOVERSE_N1_REGS: &[Reg] = &[
+    r!("ATCR_EL1", (3, 0, 15, 7, 0), PL1_RW, Tvm, Kind::Zero),
+    r!("ATCR_EL2", (3, 4, 15, 7, 0), PL2_RW, None, Kind::Zero),
+    r!("ATCR_EL3", (3, 6, 15, 7, 0), PL3_RW, None, Kind::Zero),
+    r!("ATCR_EL12", (3, 5, 15, 7, 0), PL2_RW, None, Kind::Zero),
+    r!("AVTCR_EL2", (3, 4, 15, 7, 1), PL2_RW, None, Kind::Zero),
+    r!("CPUACTLR_EL1", (3, 0, 15, 1, 0), PL1_RW, Actlr, Kind::Zero),
+    r!("CPUACTLR2_EL1", (3, 0, 15, 1, 1), PL1_RW, Actlr, Kind::Zero),
+    r!("CPUACTLR3_EL1", (3, 0, 15, 1, 2), PL1_RW, Actlr, Kind::Zero),
+    // Report CPUCFR_EL1.SCU as 1, as we do not implement the DSU (and in particular its
+    // system registers).
+    r!("CPUCFR_EL1", (3, 0, 15, 0, 0), PL1_R, None, Kind::Model(|_| 4)),
+    r!("CPUECTLR_EL1", (3, 0, 15, 1, 4), PL1_RW, Actlr, Kind::Model(|_| 0x9_6156_3010)),
+    r!("CPUPCR_EL3", (3, 6, 15, 8, 1), PL3_RW, None, Kind::Zero),
+    r!("CPUPMR_EL3", (3, 6, 15, 8, 3), PL3_RW, None, Kind::Zero),
+    r!("CPUPOR_EL3", (3, 6, 15, 8, 2), PL3_RW, None, Kind::Zero),
+    r!("CPUPSELR_EL3", (3, 6, 15, 8, 0), PL3_RW, None, Kind::Zero),
+    r!("CPUPWRCTLR_EL1", (3, 0, 15, 2, 7), PL1_RW, Actlr, Kind::Zero),
+    r!("ERXPFGCDN_EL1", (3, 0, 15, 2, 2), PL1_RW, Actlr, Kind::Zero),
+    r!("ERXPFGCTL_EL1", (3, 0, 15, 2, 1), PL1_RW, Actlr, Kind::Zero),
+    r!("ERXPFGF_EL1", (3, 0, 15, 2, 0), PL1_RW, Actlr, Kind::Zero),
+];
+
 /// The GICv3 CPU interface register with encoding `key_`, as `gicv3_init_cpuif()` defines
-/// them for a CPU whose interface has `feat.gic_prebits` preemption bits.
+/// them for a CPU whose interface has `feat.gic_prebits` preemption bits. The ICH registers
+/// exist only with EL2.
 fn icc_lookup(key_: u32, feat: &ArmFeatures) -> Option<Reg> {
     // We don't support IRQ/FIQ bypass and system registers are always enabled, so all the
     // SRE bits are RAZ/WI or RAO/WI.
@@ -1062,6 +1224,19 @@ fn icc_lookup(key_: u32, feat: &ArmFeatures) -> Option<Reg> {
         _ => {}
     }
     let enc = gic::encoding(key_);
+    if feat.el2 {
+        if let Some(r) = gic::ICH_REGS.iter().find(|r| r.enc == enc) {
+            let (name, access) = (r.name, r.access);
+            return Some(Reg {
+                name,
+                key: key_,
+                access,
+                trap: Trap::None,
+                kind: Kind::Special,
+                feat: always,
+            });
+        }
+    }
     let r = gic::ICC_REGS.iter().find(|r| r.enc == enc && r.prebits <= feat.gic_prebits)?;
     // The EL3 registers have no accessfn.
     let trap = if r.access == PL3_RW { Trap::None } else { Trap::Gic };
@@ -1134,6 +1309,12 @@ pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
     if let Some(v) = arm.gic_read(cpu.core.shared().cpu_index, key_, &st) {
         return v;
     }
+    if pmu::is_pmu_key(key_) {
+        let mut st = st;
+        let v = Pmu::new(arm, cpu.core.shared()).read(&mut st, key_);
+        super::commit(cpu, &mut st);
+        return v;
+    }
     let el1_with_el2 = st.current_el() == 1 && st.is_el2_enabled(f);
     match key_ {
         MIDR_EL1 => {
@@ -1142,6 +1323,26 @@ pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
             } else {
                 model.midr
             }
+        }
+        // isr_read() without FEAT_NMI: the pending physical or virtual IRQ, FIQ and SError.
+        ISR_EL1 => {
+            let hcr = if st.current_el() == 1 { st.hcr_el2_eff(f) } else { 0 };
+            let pending = cpu.core.shared().interrupt_request();
+            let (irq, fiq) = (
+                if hcr & HCR_IMO != 0 { super::INTERRUPT_VIRQ } else { interrupt::HARD },
+                if hcr & HCR_FMO != 0 { super::INTERRUPT_VFIQ } else { super::INTERRUPT_FIQ },
+            );
+            let mut v = 0;
+            if pending & irq != 0 {
+                v |= u64::from(PSTATE_I);
+            }
+            if pending & fiq != 0 {
+                v |= u64::from(PSTATE_F);
+            }
+            if hcr & HCR_AMO != 0 && pending & super::INTERRUPT_VSERR != 0 {
+                v |= u64::from(PSTATE_A);
+            }
+            v
         }
         MPIDR_EL1 => {
             if el1_with_el2 {
@@ -1182,6 +1383,9 @@ pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
         UAO => u64::from(st.pstate & PSTATE_UAO),
         TCO if f.mte >= 2 => u64::from(st.pstate & PSTATE_TCO),
         TCO => 0,
+        SSBS => u64::from(st.pstate & PSTATE_SSBS),
+        // l2ctlr_read(): the number of cores less one in bits 25:24.
+        L2CTLR_EL1 => (arm.core_count().clamp(1, 4) as u64 - 1) << 24,
         RNDR | RNDRRS => {
             // rndr_readfn(): NZCV is 0b0000 for a good number; getting one never fails here.
             let mut st = st;
@@ -1214,6 +1418,11 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
         return;
     }
     if arm.gic_write(cpu.core.shared().cpu_index, key_, &st, value) {
+        return;
+    }
+    if pmu::is_pmu_key(key_) {
+        Pmu::new(arm, cpu.core.shared()).write(&mut st, key_, value);
+        super::commit(cpu, &mut st);
         return;
     }
     match key_ {
@@ -1373,6 +1582,12 @@ pub(crate) fn write(cpu: &mut Cpu<'_>, key_: u32, value: u64) {
             st.pstate = (st.pstate & !PSTATE_UAO) | (value as u32 & PSTATE_UAO);
             super::commit(cpu, &mut st);
         }
+        SSBS => {
+            st.pstate = (st.pstate & !PSTATE_SSBS) | (value as u32 & PSTATE_SSBS);
+            super::commit(cpu, &mut st);
+        }
+        // arm_cp_write_ignore.
+        L2CTLR_EL1 => {}
         TCO if f.mte < 2 => {}
         TCO => {
             st.pstate = (st.pstate & !PSTATE_TCO) | (value as u32 & PSTATE_TCO);
@@ -1510,7 +1725,10 @@ fn tlbi(cpu: &mut Cpu<'_>, f: &ArmFeatures, st: &CpuArmState, key_: u32, value: 
 
 #[cfg(test)]
 mod tests {
-    use super::{EL2_REGS, EL3_REGS, REGS, TCR2_EL1, TCR2_EL2, key, lookup};
+    use super::{
+        CORTEX_A57_REGS, EL2_REGS, EL3_REGS, NEOVERSE_N1_REGS, REGS, TCR2_EL1, TCR2_EL2, key,
+        lookup,
+    };
     use crate::cpu::ArmCpuModel;
 
     #[test]
@@ -1530,6 +1748,31 @@ mod tests {
             assert!(lookup(k, &max).is_some());
             assert!(lookup(k, &a76).is_none());
         }
+    }
+
+    #[test]
+    fn impdef_registers() {
+        let a57 = ArmCpuModel::cortex_a57().features;
+        let n1 = ArmCpuModel::neoverse_n1().features;
+        let max = ArmCpuModel::max().features;
+        // CPUECTLR_EL1 of the A57 and of the N1.
+        let a57_ectlr = key(3, 1, 15, 2, 1);
+        let n1_ectlr = key(3, 0, 15, 1, 4);
+        assert!(lookup(a57_ectlr, &a57).is_some());
+        assert!(lookup(a57_ectlr, &n1).is_none());
+        assert!(lookup(n1_ectlr, &n1).is_some());
+        assert!(lookup(n1_ectlr, &a57).is_none());
+        assert!(lookup(n1_ectlr, &max).is_none());
+        for t in [CORTEX_A57_REGS, NEOVERSE_N1_REGS] {
+            for (i, a) in t.iter().enumerate() {
+                for b in &t[i + 1..] {
+                    assert!(a.key != b.key, "{} and {} share an encoding", a.name, b.name);
+                }
+            }
+        }
+        // SSBS.
+        assert!(lookup(key(3, 3, 4, 2, 6), &n1).is_some());
+        assert!(lookup(key(3, 3, 4, 2, 6), &a57).is_none());
     }
 
     #[test]

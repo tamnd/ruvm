@@ -39,8 +39,9 @@ const SATA_CAP_REV: usize = 0x02;
 const SATA_CAP_BAR: usize = 0x04;
 const AHCI_PROGMODE_MAJOR_REV_1: u8 = 1;
 
-/// QEMU numbers drives from one global counter, two per IDE bus. Each AHCI port is a bus.
-static DRIVE_SERIAL: AtomicU32 = AtomicU32::new(1);
+/// QEMU numbers drives from one global counter, two per IDE bus. Each AHCI port is a bus, on
+/// this controller and on `sysbus-ahci`.
+pub(crate) static DRIVE_SERIAL: AtomicU32 = AtomicU32::new(1);
 
 /// DMA that only reaches memory while the function is a bus master.
 struct GatedDma {

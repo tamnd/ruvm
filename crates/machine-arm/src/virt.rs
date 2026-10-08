@@ -21,19 +21,20 @@
 //! and `secure=on` keeps EL3 and adds the secure UART at 0x09040000 and the secure RAM at
 //! 0x0e000000. PSCI goes through HVC, or SMC with `virtualization=on`, and is left to the
 //! firmware when `secure=on` has a firmware or the boot EL is at or above the conduit's EL, as
-//! hw/arm/virt.c and hw/arm/boot.c decide. The device tree is built with the same libfdt calls in the
-//! same order as QEMU, so apart from the nodes of the missing devices listed below it matches
-//! `-M virt,dumpdtb=` byte for byte. `-kernel` takes an arm64 Image (raw, gzipped or EFI zboot
-//! with gzip) or an AArch64 ELF, with `-initrd`, `-append` and `-dtb`, as hw/arm/boot.c loads
-//! them, and the ROM list is checked for overlaps and copied into RAM at every reset. With
-//! firmware in the first flash, `-kernel`, `-initrd` and `-append` go to the firmware through
-//! fw_cfg instead, the kernel inflated if it is gzip.
+//! hw/arm/virt.c and hw/arm/boot.c decide. The device tree is built with the same libfdt calls
+//! in the same order as QEMU, so it matches `-M virt,dumpdtb=` byte for byte. `-kernel` takes
+//! an arm64 Image (raw, gzipped or EFI zboot with gzip) or an AArch64 ELF, with `-initrd`,
+//! `-append` and `-dtb`, as hw/arm/boot.c loads them, and the ROM list is checked for overlaps
+//! and copied into RAM at every reset. With firmware in the first flash, `-kernel`, `-initrd`
+//! and `-append` go to the firmware through fw_cfg instead, the kernel inflated if it is gzip.
 //!
 //! Unless `acpi=off`, `etc/acpi/tables`, `etc/table-loader`, an empty `etc/tpm/log` and
 //! `etc/acpi/rsdp` in fw_cfg carry the tables of hw/arm/virt-acpi-build.c (see
 //! [`ruvm_firmware::acpi::arm_virt`]): DSDT, FADT, MADT, PPTT, GTDT, MCFG, SPCR, DBG2 and IORT.
 //! When firmware boots with ACPI, the ACPI GED at 0x09080000 (SPI 9) carries the power down
-//! and error events.
+//! and error events. Otherwise the PL061 GPIO at 0x09030000 (SPI 7) has the power key
+//! (`gpio-keys`) on pin 3. `secure=on` adds the secure PL061 at 0x090b0000, whose pins 0 and 1
+//! power the machine off and reset it (`gpio-pwr`).
 //!
 //! # Using it
 //!
@@ -59,10 +60,7 @@
 //!   and WDAT, TPM2, VIOT, CEDT, NFIT, the PPTT cache nodes of `smp-cache`, the memory and
 //!   ACPI PCI hotplug AML, and SRAT and SLIT, since there is no `-numa`.
 //!
-//! Also missing: the PL061 GPIO with `gpio-keys` and the poweroff key and the secure PL061
-//! (so a board without the GED has no power button, though its DSDT still describes the
-//! PL061 as QEMU's does), the GED's memory hotplug container at 0x09070000, the PMU, NUMA,
-//! GICv2 and GICv5, the GICv3 virtual interface (`ICH_*`) and its maintenance interrupt, the
+//! Also missing: the GED's memory hotplug container at 0x09070000, NUMA, GICv2 and GICv5, the
 //! tag memory of the secure RAM with `mte=on` (only the RAM has tags), `-shim`, uImage and
 //! u-boot ramdisks, zstd EFI zboot payloads, big-endian and ELF32 kernels, memory hotplug and
 //! device memory, and `dtb-randomness` (the board behaves as with `dtb-randomness=off`: no
@@ -71,7 +69,8 @@
 //! # Differences from QEMU
 //!
 //! - There is one address space, so the secure-only devices of `secure=on` (the first flash,
-//!   the secure UART and the secure RAM) are visible to non-secure accesses too.
+//!   the secure UART, the secure RAM and the secure PL061) are visible to non-secure accesses
+//!   too.
 //! - Errors come back as `Err` strings without the `qemu-system-aarch64: ` prefix instead of
 //!   exiting. Messages QEMU prints and carries on after go to standard error and are kept in
 //!   [`VirtMachine::messages`].
@@ -82,8 +81,8 @@
 //! - Cache sizes in the CPU nodes come from the legacy CCSIDR layout of each model, which is
 //!   what the four models use.
 
-mod boot;
-mod cpus;
+pub(crate) mod boot;
+pub(crate) mod cpus;
 mod dt;
 pub mod memmap;
 
@@ -116,6 +115,8 @@ use ruvm_hw_intc::gicv3::{
     ITS_TRANS_SIZE,
 };
 use ruvm_hw_iommu::{SMMU_SIZE, SmmuStage, SmmuV3};
+use ruvm_hw_misc::pl061::PL061_MMIO_SIZE;
+use ruvm_hw_misc::{GpioKey, Pl061, Pl061Props};
 use ruvm_hw_pci::regs::PCI_NUM_PINS;
 use ruvm_hw_pci::{GpexConfig, GpexHost, GpexWindow, MsiTrigger};
 use ruvm_hw_timer::pl031::{PL031_MMIO_SIZE, Pl031};
@@ -164,8 +165,10 @@ pub const VIRT_UART1: u64 = 0x0904_0000;
 pub const VIRT_RTC: u64 = 0x0901_0000;
 /// The size of the RTC window.
 pub const VIRT_RTC_SIZE: u64 = 0x1000;
-/// `VIRT_GPIO`, where the PL061 would be.
+/// `VIRT_GPIO`, the PL061 with the power key.
 pub const VIRT_GPIO: u64 = 0x0903_0000;
+/// `VIRT_SECURE_GPIO`, the secure PL061 of `secure=on`.
+pub const VIRT_SECURE_GPIO: u64 = 0x090b_0000;
 /// The size of the GPIO window.
 pub const VIRT_GPIO_SIZE: u64 = 0x1000;
 /// `VIRT_ACPI_GED`.
@@ -210,6 +213,8 @@ pub const VIRT_UART1_IRQ: u32 = 8;
 pub const VIRT_MMIO_IRQ: u32 = 16;
 /// The SPI of the PL061 GPIO.
 pub const VIRT_GPIO_IRQ: u32 = 7;
+/// The SPI of the secure PL061, 0 since `VIRT_SECURE_GPIO` has no entry in the IRQ map.
+pub const VIRT_SECURE_GPIO_IRQ: u32 = 0;
 /// The SPI of the ACPI GED.
 pub const VIRT_ACPI_GED_IRQ: u32 = 9;
 /// The first of the four SPIs of the SMMUv3.
@@ -430,7 +435,7 @@ pub enum VirtRequest {
 /// Receives the [`VirtRequest`]s on the thread of the vCPU that made them.
 pub type VirtRequestHandler = Arc<dyn Fn(VirtRequest) + Send + Sync>;
 
-fn err<E: fmt::Display>(e: E) -> String {
+pub(crate) fn err<E: fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
@@ -449,7 +454,7 @@ impl DmaMemory for WeakDma {
 }
 
 /// Guest memory for virtio devices, weak for the same reason as [`WeakDma`].
-struct WeakGuestMemory(Weak<AddressSpace>);
+pub(crate) struct WeakGuestMemory(pub(crate) Weak<AddressSpace>);
 
 impl GuestMemory for WeakGuestMemory {
     fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryError> {
@@ -469,7 +474,7 @@ impl GuestMemory for WeakGuestMemory {
 
 /// The DMA of a PCI function behind the SMMU with `iommu_platform` on: its own address space,
 /// which only exists once the function has its devfn, through a weak reference.
-struct LateGuestMemory(Arc<OnceLock<Weak<AddressSpace>>>);
+pub(crate) struct LateGuestMemory(pub(crate) Arc<OnceLock<Weak<AddressSpace>>>);
 
 impl LateGuestMemory {
     fn space(&self) -> Option<Arc<AddressSpace>> {
@@ -533,24 +538,34 @@ impl MmioOps for VirtioSlot {
     }
 }
 
-/// The PCIe part of `create_pcie()`: the generic host bridge with the ECAM of `memmap`, the
+/// Where a board puts the generic PCIe host bridge.
+pub(crate) struct PcieLayout {
+    pub(crate) ecam: MemMapEntry,
+    pub(crate) mmio: MemMapEntry,
+    pub(crate) high_mmio: Option<MemMapEntry>,
+    pub(crate) pio: MemMapEntry,
+    /// The SPI of INTA, followed by those of INTB, INTC and INTD.
+    pub(crate) irq: u32,
+}
+
+/// The PCIe part of `create_pcie()`: the generic host bridge with the ECAM of `layout`, the
 /// low MMIO window mapped 1:1, the high one when there is one, the I/O port window, and its
-/// INTx lines on SPIs `VIRT_PCIE_IRQ` to `VIRT_PCIE_IRQ + 3`.
-fn create_pcie(
+/// INTx lines on four SPIs from `layout.irq`.
+pub(crate) fn create_pcie(
     mem: &Arc<MemorySystem>,
     system: RegionId,
-    memmap: &VirtMemmap,
+    layout: &PcieLayout,
     gic: &Arc<GicV3>,
     memory_as: &Arc<AddressSpace>,
 ) -> Result<GpexHost, String> {
-    let ecam = memmap.ecam;
+    let w = |e: MemMapEntry| GpexWindow { base: e.base, size: e.size };
+    let ecam = layout.ecam;
+    let mmio = layout.mmio;
     let config = GpexConfig {
-        ecam: GpexWindow { base: ecam.base, size: ecam.size },
-        mmio32: GpexWindow { base: VIRT_PCIE_MMIO, size: VIRT_PCIE_MMIO_SIZE },
-        mmio64: memmap
-            .high_mmio
-            .map_or(GpexWindow::default(), |h| GpexWindow { base: h.base, size: h.size }),
-        pio: GpexWindow { base: VIRT_PCIE_PIO, size: VIRT_PCIE_PIO_SIZE },
+        ecam: w(ecam),
+        mmio32: w(mmio),
+        mmio64: layout.high_mmio.map_or(GpexWindow::default(), w),
+        pio: w(layout.pio),
         ..GpexConfig::default()
     };
     let gpex = GpexHost::new(Arc::clone(mem), system, config).map_err(err)?;
@@ -561,18 +576,18 @@ fn create_pcie(
     // address in PCI memory space as in the system's.
     let mut aliases = vec![
         ("pcie-ecam", gpex.ecam(), 0, ecam.base, ecam.size),
-        ("pcie-mmio", gpex.mmio_window(), VIRT_PCIE_MMIO, VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE),
+        ("pcie-mmio", gpex.mmio_window(), mmio.base, mmio.base, mmio.size),
     ];
-    if let Some(h) = memmap.high_mmio {
+    if let Some(h) = layout.high_mmio {
         aliases.push(("pcie-mmio-high", gpex.mmio_window(), h.base, h.base, h.size));
     }
     for (name, target, offset, addr, size) in aliases {
         let alias = mem.new_alias(name, target, offset, size.into()).map_err(err)?;
         mem.add_subregion(system, addr, alias).map_err(err)?;
     }
-    mem.add_subregion(system, VIRT_PCIE_PIO, gpex.ioport_window()).map_err(err)?;
+    mem.add_subregion(system, layout.pio.base, gpex.ioport_window()).map_err(err)?;
     for i in 0..PCI_NUM_PINS {
-        let irq = VIRT_PCIE_IRQ + i as u32;
+        let irq = layout.irq + i as u32;
         if let Some(pin) = gpex.irq(i) {
             pin.connect(gic.spi(irq));
         }
@@ -590,13 +605,119 @@ fn create_pcie(
 
 /// A message signaled interrupt as `address_space_stl_le()` into `memory_as` sends it, through a
 /// weak reference so that the bus does not keep the address space alive.
-fn msi_store(memory_as: &Arc<AddressSpace>) -> impl Fn(u64, u32) + Send + Sync + 'static {
+pub(crate) fn msi_store(
+    memory_as: &Arc<AddressSpace>,
+) -> impl Fn(u64, u32) + Send + Sync + 'static {
     let weak = Arc::downgrade(memory_as);
     move |address, data| {
         if let Some(a) = weak.upgrade() {
             let _ = a.store(address, 4, data.into(), Endian::Little, MemTxAttrs::UNSPECIFIED);
         }
     }
+}
+
+/// What plugging a PCI function needs from the board: the PCIe host, and the SMMU in front of
+/// its root bus with the address spaces it gives the functions.
+pub(crate) struct PciPlug<'a> {
+    pub(crate) mem: &'a Arc<MemorySystem>,
+    pub(crate) memory_as: &'a Arc<AddressSpace>,
+    pub(crate) gpex: &'a GpexHost,
+    /// The SMMU, unless there is none or the root bus bypasses it.
+    pub(crate) smmu: Option<&'a Arc<SmmuV3>>,
+    pub(crate) iommu_spaces: &'a Mutex<Vec<Arc<AddressSpace>>>,
+}
+
+impl PciPlug<'_> {
+    /// Plug a virtio device into a new function on the root bus, at `devfn` or the first free
+    /// slot. As in `virtio_bus_device_plugged()`, only a device with `iommu_platform` on does
+    /// its DMA through the SMMU; the others use system memory, and only their MSIs go through
+    /// the SMMU.
+    pub(crate) fn virtio_pci(
+        &self,
+        class: Box<dyn VirtioDeviceClass>,
+        devfn: Option<u8>,
+        props: &VirtioPciProps,
+        iommu_platform: bool,
+    ) -> Result<VirtioPci, String> {
+        // pci_device_iommu_address_space(): the SMMU unless the root bus bypasses it.
+        let smmu = self.smmu;
+        let late = Arc::new(OnceLock::new());
+        let memory: Arc<dyn GuestMemory + Send + Sync> = match smmu {
+            Some(_) if iommu_platform => Arc::new(LateGuestMemory(Arc::clone(&late))),
+            _ => Arc::new(WeakGuestMemory(Arc::downgrade(self.memory_as))),
+        };
+        let mut backend = VirtioBackend::new(class, memory).map_err(err)?;
+        if iommu_platform {
+            backend.vdev_mut().set_host_feature(VIRTIO_F_IOMMU_PLATFORM, true);
+        }
+        let dev = VirtioPci::new(self.gpex.bus(), devfn, backend, props).map_err(err)?;
+        let mut memory_as = Arc::downgrade(self.memory_as);
+        if let Some(smmu) = smmu {
+            // smmu_find_add_as(): an IOMMU region and an address space of the same name for
+            // the function, whose stream ID is its requester ID on bus 0.
+            let devfn = dev.pci_dev().devfn();
+            let mut spaces = self.iommu_spaces.lock().unwrap_or_else(PoisonError::into_inner);
+            let name = format!("smmuv3-iommu-memory-region-{devfn}-{}", spaces.len());
+            let ops = smmu.device_ops(u32::from(devfn));
+            let r = self.mem.new_iommu(&name, 1 << 64, ops).map_err(err)?;
+            let space = self.mem.address_space_init(r, &name).map_err(err)?;
+            memory_as = Arc::downgrade(&space);
+            let _ = late.set(Arc::downgrade(&space));
+            spaces.push(space);
+        }
+        // msi_send_message() stores with the function's requester ID, which is the device ID
+        // the ITS translates, into the function's address space.
+        let pci_dev = Arc::downgrade(dev.pci_dev());
+        dev.pci_dev().set_msi_trigger(Some(Arc::new(move |address, data| {
+            let (Some(d), Some(a)) = (pci_dev.upgrade(), memory_as.upgrade()) else { return };
+            let attrs = MemTxAttrs::new().with_requester_id(d.requester_id());
+            let _ = a.store(address, 4, data.into(), Endian::Little, attrs);
+        })));
+        Ok(dev)
+    }
+}
+
+/// The RAM ranges the system address space renders to, for the ROM copies and semihosting.
+pub(crate) fn ram_ranges(mem: &MemorySystem, system: RegionId) -> Result<Vec<RamRange>, String> {
+    let view = mem.render(system).map_err(err)?;
+    Ok(view
+        .ranges()
+        .iter()
+        .filter_map(|r| {
+            let block = r.ram_block()?.clone();
+            Some(RamRange {
+                addr: r.addr(),
+                size: u64::try_from(r.size()).unwrap_or(u64::MAX),
+                readonly: r.readonly(),
+                block,
+                offset: r.offset_in_region(),
+                rom_device: r.region_type() == RegionType::RomDevice,
+            })
+        })
+        .collect())
+}
+
+/// Connect the four GIC outputs of CPU `i` to the vCPU `shared`, and its maintenance interrupt
+/// to its PPI 25, as QEMU does for a GICv3 on both virt and sbsa-ref.
+pub(crate) fn wire_cpu(gic: &Arc<GicV3>, arm: &Arc<Arm>, i: usize, shared: &Arc<CpuShared>) {
+    type SetLine = fn(&Arm, &CpuShared, bool);
+    let lines: [(&ruvm_hw_core::IrqPin, SetLine); 4] = [
+        (gic.cpu_irq(i), Arm::set_irq),
+        (gic.cpu_fiq(i), Arm::set_fiq),
+        (gic.cpu_virq(i), Arm::set_virq),
+        (gic.cpu_vfiq(i), Arm::set_vfiq),
+    ];
+    for (pin, set) in lines {
+        let arm = Arc::downgrade(arm);
+        let cpu = Arc::downgrade(shared);
+        pin.connect(IrqLine::from_fn(move |level| {
+            if let (Some(a), Some(c)) = (arm.upgrade(), cpu.upgrade()) {
+                set(&a, &c, level != 0);
+            }
+        }));
+    }
+    // The maintenance interrupt of the virtual CPU interface goes to its own PPI.
+    gic.maintenance_irq(i).connect(gic.ppi(i, 16 + dt::ARCH_GIC_MAINT_IRQ));
 }
 
 /// `virt_cpu_mp_affinity()` for a GICv3: 16 CPUs per Aff1 cluster.
@@ -638,6 +759,10 @@ pub struct VirtMachine {
     /// Whether UART1 is the non-secure second UART.
     uart1_ns: bool,
     ged: Option<Arc<AcpiGed>>,
+    /// The PL061 and its power key, there when the GED is not.
+    gpio: Option<(Arc<Pl061>, Arc<GpioKey>)>,
+    /// The secure PL061 of `secure=on`.
+    secure_gpio: Option<Arc<Pl061>>,
     rtc: Arc<Pl031>,
     memmap: VirtMemmap,
     gpex: GpexHost,
@@ -849,6 +974,9 @@ impl VirtMachine {
         } else {
             (None, None)
         };
+        if model.features.pmu != 0 {
+            dt::add_pmu_node(&mut fdt)?;
+        }
 
         // arm_load_kernel(), which decides the PSCI conduit the CPUs are created with.
         let mut loader = Loader::default();
@@ -947,7 +1075,14 @@ impl VirtMachine {
         dt::create_rtc(&mut fdt, clock_phandle)?;
 
         // create_pcie(), with the msi-map to the ITS.
-        let gpex = create_pcie(&mem, system, &memmap, &gic, &memory_as)?;
+        let layout = PcieLayout {
+            ecam: memmap.ecam,
+            mmio: MemMapEntry { base: VIRT_PCIE_MMIO, size: VIRT_PCIE_MMIO_SIZE },
+            high_mmio: memmap.high_mmio,
+            pio: MemMapEntry { base: VIRT_PCIE_PIO, size: VIRT_PCIE_PIO_SIZE },
+            irq: VIRT_PCIE_IRQ,
+        };
+        let gpex = create_pcie(&mem, system, &layout, &gic, &memory_as)?;
         dt::create_pcie(&mut fdt, &memmap, gic_phandle, msi_phandle, VIRT_PCIE_IRQ)?;
         // create_smmu(), with the stage property set to nested as on every virt version that
         // has the SMMU. It reads its tables from system memory, and the functions on the root
@@ -963,8 +1098,8 @@ impl VirtMachine {
             None
         };
 
-        // create_acpi_ged(), for firmware that boots with ACPI. Without it QEMU creates the
-        // PL061 GPIO with the poweroff key, which ruvm does not have.
+        // create_acpi_ged(), for firmware that boots with ACPI, or else the PL061 with the
+        // power key.
         let acpi = cfg.acpi;
         let ged = if firmware_loaded && acpi {
             let ged = AcpiGed::new(AcpiGedProps {
@@ -976,6 +1111,44 @@ impl VirtMachine {
             mem.add_subregion(system, VIRT_ACPI_GED, r.map_err(err)?).map_err(err)?;
             ged.irq().connect(gic.spi(VIRT_ACPI_GED_IRQ));
             Some(ged)
+        } else {
+            None
+        };
+        let make_gpio = |fdt: &mut Fdt, base, irq, secure| -> Result<Arc<Pl061>, String> {
+            // Pull lines down to 0 if not driven by the PL061.
+            let pl061 = Pl061::new(Pl061Props { pullups: 0, pulldowns: 0xff })?;
+            let r = mem.new_io("pl061", PL061_MMIO_SIZE.into(), pl061.clone()).map_err(err)?;
+            mem.add_subregion(system, base, r).map_err(err)?;
+            pl061.irq().connect(gic.spi(irq));
+            dt::create_gpio(fdt, clock_phandle, base, irq, secure)?;
+            Ok(pl061)
+        };
+        let gpio = if ged.is_none() {
+            let pl061 = make_gpio(&mut fdt, VIRT_GPIO, VIRT_GPIO_IRQ, false)?;
+            // create_gpio_keys().
+            let key = GpioKey::new(clock.clone());
+            key.irq().connect(pl061.gpio_in(dt::GPIO_PIN_POWER_BUTTON));
+            Some((pl061, key))
+        } else {
+            None
+        };
+        // create_secure_gpio_pwr(): the secure PL061 drives the gpio-pwr device, which asks
+        // for a reset or a shutdown when its line goes high. There is one address space, so
+        // this PL061 is in the system memory too.
+        let secure_gpio = if cfg.secure {
+            let pl061 = make_gpio(&mut fdt, VIRT_SECURE_GPIO, VIRT_SECURE_GPIO_IRQ, true)?;
+            for (pin, req) in [
+                (dt::SECURE_GPIO_RESET, VirtRequest::Reset),
+                (dt::SECURE_GPIO_POWEROFF, VirtRequest::Shutdown),
+            ] {
+                let hub = Arc::downgrade(&hub);
+                pl061.out(pin as usize).connect(IrqLine::from_fn(move |level| {
+                    if let (true, Some(h)) = (level != 0, hub.upgrade()) {
+                        h.request(req);
+                    }
+                }));
+            }
+            Some(pl061)
         } else {
             None
         };
@@ -1054,6 +1227,8 @@ impl VirtMachine {
             redist2,
             uart1_ns,
             ged,
+            gpio,
+            secure_gpio,
             rtc,
             memmap,
             gpex,
@@ -1135,40 +1310,14 @@ impl VirtMachine {
         if self.done {
             return Err("PCI devices must be plugged before machine_done".to_string());
         }
-        // pci_device_iommu_address_space(): the SMMU unless the root bus bypasses it.
-        let smmu = self.smmu.as_ref().filter(|_| !self.iommu_bypass);
-        let late = Arc::new(OnceLock::new());
-        let memory: Arc<dyn GuestMemory + Send + Sync> = match smmu {
-            Some(_) if iommu_platform => Arc::new(LateGuestMemory(Arc::clone(&late))),
-            _ => Arc::new(WeakGuestMemory(Arc::downgrade(&self.memory_as))),
+        let plug = PciPlug {
+            mem: &self.mem,
+            memory_as: &self.memory_as,
+            gpex: &self.gpex,
+            smmu: self.smmu.as_ref().filter(|_| !self.iommu_bypass),
+            iommu_spaces: &self.iommu_spaces,
         };
-        let mut backend = VirtioBackend::new(class, memory).map_err(err)?;
-        if iommu_platform {
-            backend.vdev_mut().set_host_feature(VIRTIO_F_IOMMU_PLATFORM, true);
-        }
-        let dev = VirtioPci::new(self.gpex.bus(), devfn, backend, props).map_err(err)?;
-        let mut memory_as = Arc::downgrade(&self.memory_as);
-        if let Some(smmu) = smmu {
-            // smmu_find_add_as(): an IOMMU region and an address space of the same name for
-            // the function, whose stream ID is its requester ID on bus 0.
-            let devfn = dev.pci_dev().devfn();
-            let mut spaces = self.iommu_spaces.lock().unwrap_or_else(PoisonError::into_inner);
-            let name = format!("smmuv3-iommu-memory-region-{devfn}-{}", spaces.len());
-            let ops = smmu.device_ops(u32::from(devfn));
-            let r = self.mem.new_iommu(&name, 1 << 64, ops).map_err(err)?;
-            let space = self.mem.address_space_init(r, &name).map_err(err)?;
-            memory_as = Arc::downgrade(&space);
-            let _ = late.set(Arc::downgrade(&space));
-            spaces.push(space);
-        }
-        // msi_send_message() stores with the function's requester ID, which is the device ID
-        // the ITS translates, into the function's address space.
-        let pci_dev = Arc::downgrade(dev.pci_dev());
-        dev.pci_dev().set_msi_trigger(Some(Arc::new(move |address, data| {
-            let (Some(d), Some(a)) = (pci_dev.upgrade(), memory_as.upgrade()) else { return };
-            let attrs = MemTxAttrs::new().with_requester_id(d.requester_id());
-            let _ = a.store(address, 4, data.into(), Endian::Little, attrs);
-        })));
+        let dev = plug.virtio_pci(class, devfn, props, iommu_platform)?;
         self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).push(dev.clone());
         Ok(dev)
     }
@@ -1224,8 +1373,8 @@ impl VirtMachine {
             ),
             has_clusters: topo.has_clusters,
             threads: topo.threads,
-            // No PMU.
-            pmu_irq: 0,
+            // The GICC performance interrupt, when the CPU has a PMU.
+            pmu_irq: if self.model.features.pmu != 0 { cpus::PMU_PPI } else { 0 },
             virtualization: self.virtualization,
             ns_el2_virt_timer: self.ns_el2_virt_timer_irq,
             psci: match self.vms_conduit {
@@ -1253,12 +1402,24 @@ impl VirtMachine {
         self.ged.as_ref()
     }
 
-    /// `virt_powerdown_req()` through the GED: the power button event for ACPI. Without the
-    /// GED, QEMU presses the PL061 poweroff key, which ruvm does not have, so nothing happens.
+    /// `virt_powerdown_req()`: the power button event of the GED for ACPI, or else a press
+    /// of the PL061 power key.
     pub fn system_powerdown(&self) {
         if let Some(g) = &self.ged {
             g.power_down();
+        } else if let Some((_, key)) = &self.gpio {
+            key.press();
         }
+    }
+
+    /// The PL061 GPIO, there when the GED is not.
+    pub fn gpio(&self) -> Option<&Arc<Pl061>> {
+        self.gpio.as_ref().map(|(p, _)| p)
+    }
+
+    /// The secure PL061 of `secure=on`.
+    pub fn secure_gpio(&self) -> Option<&Arc<Pl061>> {
+        self.secure_gpio.as_ref()
     }
 
     /// The PCIe host bridge.
@@ -1311,7 +1472,7 @@ impl VirtMachine {
             fwc.add_file(TPMLOG_FILE, Vec::new()).map_err(err)?;
             fwc.add_file(RSDP_FILE, tables.rsdp).map_err(err)?;
         }
-        self.ram = self.ram_ranges_now()?;
+        self.ram = ram_ranges(&self.mem, self.system)?;
         // common_semi_find_bases(): the largest gap in the largest RAM region.
         let mut best: Option<&RamRange> = None;
         for r in self.ram.iter().filter(|r| !r.readonly && !r.rom_device) {
@@ -1331,25 +1492,6 @@ impl VirtMachine {
         self.system_reset()
     }
 
-    fn ram_ranges_now(&self) -> Result<Vec<RamRange>, String> {
-        let view = self.mem.render(self.system).map_err(err)?;
-        Ok(view
-            .ranges()
-            .iter()
-            .filter_map(|r| {
-                let block = r.ram_block()?.clone();
-                Some(RamRange {
-                    addr: r.addr(),
-                    size: u64::try_from(r.size()).unwrap_or(u64::MAX),
-                    readonly: r.readonly(),
-                    block,
-                    offset: r.offset_in_region(),
-                    rom_device: r.region_type() == RegionType::RomDevice,
-                })
-            })
-            .collect())
-    }
-
     /// `qemu_system_reset()` for the devices and the ROMs. Each vCPU is reset separately with
     /// [`VirtMachine::reset_cpu`] on its own thread.
     pub fn system_reset(&mut self) -> Result<(), String> {
@@ -1363,6 +1505,13 @@ impl VirtMachine {
         }
         for f in &self.flash {
             f.reset();
+        }
+        if let Some((pl061, key)) = &self.gpio {
+            pl061.reset();
+            key.reset();
+        }
+        if let Some(pl061) = &self.secure_gpio {
+            pl061.reset();
         }
         for s in &self.virtio {
             s.current().reset();
@@ -1392,32 +1541,12 @@ impl VirtMachine {
             if shared.cpu_index != i {
                 return Err(format!("vCPU {i} got index {}", shared.cpu_index));
             }
-            self.wire(i, &shared);
+            wire_cpu(&self.gic, &self.arm, i, &shared);
             self.hub.register(i, &shared);
             self.reset_cpu(&mut v.cpu());
             vcpus.push(v);
         }
         Ok(vcpus)
-    }
-
-    /// Connect the four GIC outputs of CPU `i` to the vCPU `shared`.
-    fn wire(&self, i: usize, shared: &Arc<CpuShared>) {
-        type SetLine = fn(&Arm, &CpuShared, bool);
-        let lines: [(&ruvm_hw_core::IrqPin, SetLine); 4] = [
-            (self.gic.cpu_irq(i), Arm::set_irq),
-            (self.gic.cpu_fiq(i), Arm::set_fiq),
-            (self.gic.cpu_virq(i), Arm::set_virq),
-            (self.gic.cpu_vfiq(i), Arm::set_vfiq),
-        ];
-        for (pin, set) in lines {
-            let arm = Arc::downgrade(&self.arm);
-            let cpu = Arc::downgrade(shared);
-            pin.connect(IrqLine::from_fn(move |level| {
-                if let (Some(a), Some(c)) = (arm.upgrade(), cpu.upgrade()) {
-                    set(&a, &c, level != 0);
-                }
-            }));
-        }
     }
 
     /// `arm_cpu_reset_hold()` and `do_cpu_reset()` for the vCPU `cpu`: the register reset,

@@ -684,6 +684,7 @@ name = "ruvm-hw-storage"
 version = "0.4.5"
 dependencies = [
  "ruvm-base",
+ "ruvm-hw-core",
  "ruvm-hw-pci",
  "ruvm-mem",
 ]
@@ -827,7 +828,9 @@ dependencies = [
  "ruvm-hw-core",
  "ruvm-hw-intc",
  "ruvm-hw-iommu",
+ "ruvm-hw-misc",
  "ruvm-hw-pci",
+ "ruvm-hw-storage",
  "ruvm-hw-timer",
  "ruvm-hw-virtio",
  "ruvm-jit",
