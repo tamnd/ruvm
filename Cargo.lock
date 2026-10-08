@@ -817,6 +817,8 @@ dependencies = [
  "flate2",
  "ruvm-accel",
  "ruvm-base",
+ "ruvm-firmware",
+ "ruvm-hw-acpi",
  "ruvm-hw-char",
  "ruvm-hw-core",
  "ruvm-hw-intc",

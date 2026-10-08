@@ -8,12 +8,12 @@
 use ruvm_target_arm::cpu::ArmCpuModel;
 
 use super::{
-    MemMapEntry, VIRT_FLASH, VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE, VIRT_GIC_DIST,
-    VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GIC_REDIST_SIZE, VIRT_MMIO, VIRT_MMIO_IRQ, VIRT_MMIO_SIZE,
-    VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE, VIRT_PLATFORM_BUS,
-    VIRT_PLATFORM_BUS_SIZE, VIRT_RTC, VIRT_RTC_IRQ, VIRT_RTC_SIZE, VIRT_SECURE_MEM,
-    VIRT_SECURE_MEM_SIZE, VIRT_UART, VIRT_UART_IRQ, VIRT_UART_SIZE, VIRT_UART1, VIRT_UART1_IRQ,
-    VIRTIO_TRANSPORTS, VirtMemmap,
+    CpuTopology, MemMapEntry, VIRT_FLASH, VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE,
+    VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GIC_REDIST_SIZE, VIRT_MMIO, VIRT_MMIO_IRQ,
+    VIRT_MMIO_SIZE, VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE,
+    VIRT_PLATFORM_BUS, VIRT_PLATFORM_BUS_SIZE, VIRT_RTC, VIRT_RTC_IRQ, VIRT_RTC_SIZE,
+    VIRT_SECURE_MEM, VIRT_SECURE_MEM_SIZE, VIRT_UART, VIRT_UART_IRQ, VIRT_UART_SIZE, VIRT_UART1,
+    VIRT_UART1_IRQ, VIRTIO_TRANSPORTS, VirtMemmap,
 };
 use crate::fdt::{Fdt, sized_cells};
 use ruvm_hw_intc::gicv3::{GICV3_DIST_SIZE, ITS_SIZE};
@@ -158,13 +158,14 @@ fn virt_get_caches(model: &ArmCpuModel) -> Result<Vec<Option<Cache>>, String> {
     Ok(caches)
 }
 
-/// `fdt_add_cpu_nodes()` for the default topology (one socket, one cluster, a core per CPU,
-/// no `smp-cache`), which describes only the L1 caches.
+/// `fdt_add_cpu_nodes()` without `smp-cache`, which describes only the L1 caches, and the
+/// cpu-map of the `-smp` topology.
 pub(crate) fn add_cpu_nodes(
     fdt: &mut Fdt,
     model: &ArmCpuModel,
     mpidrs: &[u64],
     psci: bool,
+    topo: &CpuTopology,
 ) -> Result<(), String> {
     let smp_cpus = mpidrs.len();
     let caches = virt_get_caches(model)?;
@@ -209,7 +210,23 @@ pub(crate) fn add_cpu_nodes(
 
     fdt.add_subnode("/cpus/cpu-map")?;
     for cpu in (0..smp_cpus).rev() {
-        let map_path = format!("/cpus/cpu-map/socket0/cluster0/core{cpu}");
+        let (cl, co, th) = (topo.clusters as usize, topo.cores as usize, topo.threads as usize);
+        let map_path = if th > 1 {
+            format!(
+                "/cpus/cpu-map/socket{}/cluster{}/core{}/thread{}",
+                cpu / (cl * co * th),
+                (cpu / (co * th)) % cl,
+                (cpu / th) % co,
+                cpu % th
+            )
+        } else {
+            format!(
+                "/cpus/cpu-map/socket{}/cluster{}/core{}",
+                cpu / (cl * co),
+                (cpu / co) % cl,
+                cpu % co
+            )
+        };
         fdt.add_path(&map_path)?;
         fdt.setprop_cell(&map_path, "cpu", phandles[cpu])?;
     }

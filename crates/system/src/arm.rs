@@ -20,9 +20,9 @@
 //!   models virt accepts fail with "... is not supported by ruvm yet", and so do the CPU
 //!   properties other than `sve-max-vq` and `pmu=off` (there is no PMU).
 //! - The machine properties are taken only where their value describes the board that exists:
-//!   `gic-version=3`, `its`, `secure`, `virtualization`, `mte`, `ras=off`, `acpi=off` or
-//!   `auto`, `iommu=none`, `msi` other than `gicv2m`, 32 virtio-mmio transports and the
-//!   `highmem*` properties. Other values fail with "... is not supported by ruvm yet". The
+//!   `gic-version=3`, `its`, `secure`, `virtualization`, `mte`, `ras=off`, `acpi`, `spcr`,
+//!   `x-oem-id`, `x-oem-table-id`, `iommu=none`, `msi` other than `gicv2m`, 32 virtio-mmio
+//!   transports and the `highmem*` properties. Other values fail with "... is not supported by ruvm yet". The
 //!   board behaves as with `dtb-randomness=off` whatever that property says.
 //! - `-semihosting-config target=gdb` fails, since there is no gdbstub; `auto` and `native`
 //!   both mean native.
@@ -55,7 +55,7 @@ use ruvm_machine_arm::tcg_run::{
     ShutdownReason, VirtEvent, VirtEventHandler, VirtRunConfig, VirtTcgMachine,
 };
 use ruvm_machine_arm::virt::memmap::check_highmem_mmio_size;
-use ruvm_machine_arm::virt::{Highmem, VirtConfig, VirtMachine, VirtMsi};
+use ruvm_machine_arm::virt::{CpuTopology, Highmem, VirtConfig, VirtMachine, VirtMsi};
 use ruvm_qapi::events::event_reset;
 use ruvm_qapi::opts::{QemuOptDesc, QemuOptType, QemuOptsList};
 use ruvm_qapi::types::{
@@ -210,6 +210,16 @@ pub(crate) struct BoardOptions {
     pub msi: VirtMsi,
     /// `dumpdtb`: write the device tree there and exit.
     pub dumpdtb: Option<String>,
+    /// `acpi=off`: no ACPI tables in fw_cfg and no GED.
+    pub acpi_off: bool,
+    /// `spcr=off`: no SPCR among the ACPI tables.
+    pub spcr_off: bool,
+    /// `x-oem-id`.
+    pub oem_id: Option<String>,
+    /// `x-oem-table-id`.
+    pub oem_table_id: Option<String>,
+    /// The `-smp` topology.
+    pub topology: Option<CpuTopology>,
 }
 
 /// Visits `name` of `machine` as a `T`, the way the machine property setter does.
@@ -254,6 +264,14 @@ fn prop_bool(name: &str, value: &str) -> Result<bool> {
     }
 }
 
+/// `visit_type_OnOffAuto()` of the keyval input visitor.
+fn on_off_auto<'a>(name: &str, value: &'a str) -> Result<&'a str> {
+    match value {
+        "on" | "off" | "auto" => Ok(value),
+        _ => Err(Error::generic(format!("Parameter '{name}' does not accept value '{value}'"))),
+    }
+}
+
 fn not_supported(name: &str, value: &str) -> Error {
     Error::generic(format!("{name}={value} is not supported by ruvm yet"))
 }
@@ -270,17 +288,11 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
         "default-bus-bypass-iommu" | "dtb-randomness" | "dtb-kaslr-seed" => {
             prop_bool(name, value).map(drop)
         }
-        "x-oem-id" | "x-oem-table-id" => Ok(()),
         "gic-version" => match value {
             "3" => Ok(()),
             "2" | "4" | "5" | "host" | "max" => Err(not_supported(name, value)),
             _ => Err(Error::generic("Invalid gic-version value".to_string())
                 .hint("Valid values are 2, 3, 4, 5, host, and max.\n")),
-        },
-        "acpi" => match value {
-            "off" | "auto" => Ok(()),
-            "on" => Err(not_supported(name, value)),
-            _ => Err(Error::generic(format!("Parameter '{name}' does not accept value '{value}'"))),
         },
         "iommu" => match value {
             "none" => Ok(()),
@@ -298,8 +310,8 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
 }
 
 /// `machine_parse_smp_config()` for virt, which knows clusters but not dies, modules, books
-/// or drawers. Gives (cpus, maxcpus).
-pub(crate) fn parse_smp(config: &SMPConfiguration) -> Result<(u32, u32)> {
+/// or drawers. Gives (cpus, maxcpus) and the topology.
+pub(crate) fn parse_smp(config: &SMPConfiguration) -> Result<(u32, u32, CpuTopology)> {
     let explicit = [
         config.cpus,
         config.drawers,
@@ -385,8 +397,15 @@ pub(crate) fn parse_smp(config: &SMPConfiguration) -> Result<(u32, u32)> {
              {VIRT_MAX_CPUS}"
         )));
     }
-    // Both are at most 512 now.
-    Ok((cpus as u32, maxcpus as u32))
+    // All are at most 512 now.
+    let topology = CpuTopology {
+        sockets: sockets as u32,
+        clusters: clusters as u32,
+        cores: cores as u32,
+        threads: threads as u32,
+        has_clusters: config.clusters.is_some(),
+    };
+    Ok((cpus as u32, maxcpus as u32, topology))
 }
 
 /// `qemu_apply_machine_options()` for virt: takes the generic properties out of `machine`
@@ -401,7 +420,8 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
         o.ram_size = mem.size.map(|s| s.next_multiple_of(8192));
     }
     let smp = visit_member::<SMPConfiguration>(machine, "smp")?.unwrap_or_default();
-    (o.cpus, o.max_cpus) = parse_smp(&smp)?;
+    let (cpus, max_cpus, topology) = parse_smp(&smp)?;
+    (o.cpus, o.max_cpus, o.topology) = (cpus, max_cpus, Some(topology));
     for (name, value) in machine.iter_inserted() {
         match name {
             "memory" | "smp" => {}
@@ -437,6 +457,27 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
             "its" => {
                 let on = prop_bool(name, &prop_string(name, value)?)?;
                 o.msi = if on { VirtMsi::Its } else { VirtMsi::Off };
+            }
+            "acpi" => o.acpi_off = on_off_auto(name, &prop_string(name, value)?)? == "off",
+            "spcr" => o.spcr_off = !prop_bool(name, &prop_string(name, value)?)?,
+            // virt_set_oem_id() and virt_set_oem_table_id().
+            "x-oem-id" => {
+                let v = prop_string(name, value)?;
+                if v.len() > 6 {
+                    return Err(Error::generic(
+                        "User specified oem-id value is bigger than 6 bytes in size",
+                    ));
+                }
+                o.oem_id = Some(v);
+            }
+            "x-oem-table-id" => {
+                let v = prop_string(name, value)?;
+                if v.len() > 8 {
+                    return Err(Error::generic(
+                        "User specified oem-table-id value is bigger than 8 bytes in size",
+                    ));
+                }
+                o.oem_table_id = Some(v);
             }
             "highmem-ecam" => o.highmem.ecam = prop_bool(name, &prop_string(name, value)?)?,
             "highmem-mmio" => o.highmem.mmio = prop_bool(name, &prop_string(name, value)?)?,
@@ -862,6 +903,15 @@ pub(crate) fn start_board_tcg(
     cfg.msi = opts.msi;
     // machvirt_init() checks maxcpus against the redistributor space.
     cfg.max_cpus = Some(opts.max_cpus as usize);
+    cfg.topology = opts.topology;
+    cfg.acpi = !opts.acpi_off;
+    cfg.spcr = !opts.spcr_off;
+    if let Some(id) = opts.oem_id {
+        cfg.oem_id = id;
+    }
+    if let Some(id) = opts.oem_table_id {
+        cfg.oem_table_id = id;
+    }
     for (slot, drive) in cfg.pflash.iter_mut().zip(plan.pflash) {
         if let Some(backing) = drive {
             *slot = backing;
@@ -932,9 +982,28 @@ mod tests {
 
     #[test]
     fn smp_topologies() {
-        assert_eq!(parse_smp(&SMPConfiguration::default()).unwrap(), (1, 1));
-        assert_eq!(parse_smp(&smp(Some(4), None, None)).unwrap(), (4, 4));
-        assert_eq!(parse_smp(&smp(None, Some(2), Some(2))).unwrap(), (4, 4));
+        let topo = |sockets, clusters, cores, threads, has_clusters| CpuTopology {
+            sockets,
+            clusters,
+            cores,
+            threads,
+            has_clusters,
+        };
+        let flat = |n| topo(1, 1, n, 1, false);
+        assert_eq!(parse_smp(&SMPConfiguration::default()).unwrap(), (1, 1, flat(1)));
+        assert_eq!(parse_smp(&smp(Some(4), None, None)).unwrap(), (4, 4, flat(4)));
+        assert_eq!(
+            parse_smp(&smp(None, Some(2), Some(2))).unwrap(),
+            (4, 4, topo(1, 2, 2, 1, true))
+        );
+        let threads = SMPConfiguration {
+            cpus: Some(2),
+            sockets: Some(2),
+            threads: Some(2),
+            maxcpus: Some(8),
+            ..SMPConfiguration::default()
+        };
+        assert_eq!(parse_smp(&threads).unwrap(), (2, 8, topo(2, 1, 2, 2, false)));
         let e = parse_smp(&smp(Some(3), Some(2), None)).unwrap_err();
         assert_eq!(
             e.message(),
@@ -1058,6 +1127,39 @@ mod tests {
         assert_eq!(
             take_board_options(&m).unwrap_err().message(),
             "Property 'virt-11.1-machine.foo' not found"
+        );
+    }
+
+    #[test]
+    fn acpi_properties() {
+        let opts = |props: &[(&str, &str)]| {
+            let mut m = QDict::new();
+            for (k, v) in props {
+                m.put(*k, *v);
+            }
+            take_board_options(&m)
+        };
+        let o = opts(&[]).unwrap();
+        assert!(!o.acpi_off && !o.spcr_off && o.oem_id.is_none() && o.oem_table_id.is_none());
+        assert!(opts(&[("acpi", "off")]).unwrap().acpi_off);
+        for acpi in ["on", "auto"] {
+            let o = opts(&[("acpi", acpi), ("spcr", "off")]).unwrap();
+            assert!(!o.acpi_off && o.spcr_off);
+        }
+        assert_eq!(
+            opts(&[("acpi", "maybe")]).unwrap_err().message(),
+            "Parameter 'acpi' does not accept value 'maybe'"
+        );
+        let o = opts(&[("x-oem-id", "RUVM"), ("x-oem-table-id", "RUVMTBL")]).unwrap();
+        assert_eq!(o.oem_id.as_deref(), Some("RUVM"));
+        assert_eq!(o.oem_table_id.as_deref(), Some("RUVMTBL"));
+        assert_eq!(
+            opts(&[("x-oem-id", "1234567")]).unwrap_err().message(),
+            "User specified oem-id value is bigger than 6 bytes in size"
+        );
+        assert_eq!(
+            opts(&[("x-oem-table-id", "123456789")]).unwrap_err().message(),
+            "User specified oem-table-id value is bigger than 8 bytes in size"
         );
     }
 }

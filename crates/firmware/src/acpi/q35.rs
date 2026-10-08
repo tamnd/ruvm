@@ -413,7 +413,7 @@ fn lpc_aml(scope: &mut Aml, isa: &[IsaDevice]) {
 }
 
 /// `build_append_pci_bus_devices()` for the root bus.
-fn pci_bus_devices(scope: &mut Aml, devices: &[PciDevice]) {
+pub fn pci_bus_devices(scope: &mut Aml, devices: &[PciDevice]) {
     for d in devices {
         let adr = u64::from(d.devfn >> 3) << 16 | u64::from(d.devfn & 7);
         let mut dev = aml::device(&format!("S{:02X}", d.devfn));

@@ -4,6 +4,7 @@
 //! and the per machine table sets.
 
 pub mod aml;
+pub mod arm_virt;
 pub mod cpuhp;
 pub mod devices;
 pub mod gpex;
