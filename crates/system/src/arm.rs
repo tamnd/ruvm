@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The Arm `virt` board from the command line: what `-machine virt`, `-m`, `-smp`, `-cpu`,
-//! `-kernel`, `-initrd`, `-append`, `-dtb`, `-bios`, `-serial`, `-semihosting` and
-//! `-semihosting-config` turn into, and the board running on TCG.
+//! `-kernel`, `-initrd`, `-append`, `-dtb`, `-bios`, `-drive`, `-device`, `-serial`,
+//! `-semihosting` and `-semihosting-config` turn into, and the board running on TCG.
+//!
+//! `-drive` and `-device` plug virtio devices into the PCIe root bus or the virtio-mmio
+//! transports and give the flashes their drives, see [`devices`].
 //!
 //! `-serial` (or `-nographic`) connects `serial_hd(0)` to the PL011, and a second `-serial`
 //! connects `serial_hd(1)` to the second PL011 (the secure one with `secure=on`). `-bios`
@@ -18,10 +21,10 @@
 //!   properties other than `sve-max-vq` and `pmu=off` (there is no PMU).
 //! - The machine properties are taken only where their value describes the board that exists:
 //!   `gic-version=3`, `its=off`, `secure`, `virtualization`, `mte`, `ras=off`,
-//!   `acpi=off` or `auto`, `iommu=none`, `msi=off` or `auto` and 32 virtio-mmio transports.
-//!   Other values fail with "... is not supported by ruvm yet". The board has no ITS, where
-//!   QEMU's default is `its=on`, and it behaves as with `dtb-randomness=off` whatever that
-//!   property says.
+//!   `acpi=off` or `auto`, `iommu=none`, `msi=off` or `auto`, 32 virtio-mmio transports and
+//!   the `highmem*` properties. Other values fail with "... is not supported by ruvm yet".
+//!   The board has no ITS, where QEMU's default is `its=on`, and it behaves as with
+//!   `dtb-randomness=off` whatever that property says.
 //! - `-semihosting-config target=gdb` fails, since there is no gdbstub; `auto` and `native`
 //!   both mean native.
 //! - SYS_EXIT asks the main loop to quit with the guest's status (`shutdown_request` with the
@@ -29,8 +32,10 @@
 //!   event first.
 //! - A vCPU waiting in SYS_READC or SYS_READ from the console blocks its thread rather than
 //!   halting, so `stop` on the monitor waits until the console has input.
-//! - `-drive` (so `if=pflash`) and `-device` do not exist for virt yet, and `-bios` takes a
-//!   path: the name is not looked up in the firmware directories as `qemu_find_file()` does.
+//! - `-bios` takes a path: the name is not looked up in the firmware directories as
+//!   `qemu_find_file()` does.
+//! - There is no default NIC: QEMU plugs a `virtio-net-pci` with user networking unless
+//!   `-nodefaults` or a network option says otherwise.
 //! - With `secure=on` the secure-only devices are in the one address space, visible to
 //!   non-secure accesses too.
 
@@ -40,7 +45,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use ruvm_accel::tcg::TcgOptions;
-use ruvm_base::report::warn_report;
+use ruvm_base::report::{Location, warn_report};
 use ruvm_base::{ClockType, Error, Result};
 use ruvm_chardev::{Attachment, Chardev, Chardevs, Connection, Frontend};
 use ruvm_hw_char::pl011::Pl011;
@@ -50,7 +55,8 @@ use ruvm_hw_core::timer::TimeSource;
 use ruvm_machine_arm::tcg_run::{
     ShutdownReason, VirtEvent, VirtEventHandler, VirtRunConfig, VirtTcgMachine,
 };
-use ruvm_machine_arm::virt::{VIRT_GICV3_MAX_CPUS, VirtConfig, VirtMachine};
+use ruvm_machine_arm::virt::memmap::check_highmem_mmio_size;
+use ruvm_machine_arm::virt::{Highmem, VIRT_GICV3_MAX_CPUS, VirtConfig, VirtMachine};
 use ruvm_qapi::events::event_reset;
 use ruvm_qapi::opts::{QemuOptDesc, QemuOptType, QemuOptsList};
 use ruvm_qapi::types::{
@@ -63,7 +69,11 @@ use ruvm_target_arm::tcg::SemihostingHost;
 
 use crate::runstate::Runstate;
 use crate::vl::Vm;
-use crate::x86::Located;
+use crate::x86::{Drive, Located};
+
+mod devices;
+
+pub(crate) use devices::parse_drives;
 
 /// Whether `target` is one the Arm boards exist for.
 pub(crate) fn is_arm(target: &str) -> bool {
@@ -194,6 +204,9 @@ pub(crate) struct BoardOptions {
     pub virtualization: bool,
     /// `mte`.
     pub mte: bool,
+    /// `highmem`, `compact-highmem`, `highmem-redists`, `highmem-ecam`, `highmem-mmio` and
+    /// `highmem-mmio-size`.
+    pub highmem: Highmem,
     /// `dumpdtb`: write the device tree there and exit.
     pub dumpdtb: Option<String>,
 }
@@ -209,6 +222,18 @@ fn visit_member<T: Visit>(machine: &QDict, name: &str) -> Result<Option<T>> {
     let r = T::visit(&mut v, Some(name), &mut t).and_then(|()| v.check_struct());
     v.end_struct();
     r.map(|()| Some(t))
+}
+
+/// A keyval size, as `visit_type_size()` of the keyval input visitor parses it.
+fn prop_size(name: &str, value: &str) -> Result<u64> {
+    let mut root = QDict::new();
+    root.put(name, QValue::Str(value.to_string()));
+    let mut v = QObjectInputVisitor::new_keyval(QValue::Dict(root));
+    v.start_struct(None)?;
+    let mut size = 0;
+    let r = v.type_size(Some(name), &mut size);
+    v.end_struct();
+    r.map(|()| size)
 }
 
 /// The keyval value of a `-machine` property as a string.
@@ -239,17 +264,12 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
     };
     match name {
         "ras" | "its" | "usb" => want_bool(false),
-        // These change nothing on a board without high memory devices, and the board always
-        // behaves as with dtb-randomness=off.
-        "highmem"
-        | "compact-highmem"
-        | "highmem-redists"
-        | "highmem-ecam"
-        | "highmem-mmio"
-        | "default-bus-bypass-iommu"
-        | "dtb-randomness"
-        | "dtb-kaslr-seed" => prop_bool(name, value).map(drop),
-        "highmem-mmio-size" | "x-oem-id" | "x-oem-table-id" => Ok(()),
+        // There is no IOMMU for the root bus to bypass, and the board always behaves as with
+        // dtb-randomness=off.
+        "default-bus-bypass-iommu" | "dtb-randomness" | "dtb-kaslr-seed" => {
+            prop_bool(name, value).map(drop)
+        }
+        "x-oem-id" | "x-oem-table-id" => Ok(()),
         "gic-version" => match value {
             "3" => Ok(()),
             "2" | "4" | "5" | "host" | "max" => Err(not_supported(name, value)),
@@ -399,6 +419,20 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
             "secure" => o.secure = prop_bool(name, &prop_string(name, value)?)?,
             "virtualization" => o.virtualization = prop_bool(name, &prop_string(name, value)?)?,
             "mte" => o.mte = prop_bool(name, &prop_string(name, value)?)?,
+            "highmem" => o.highmem.highmem = prop_bool(name, &prop_string(name, value)?)?,
+            "compact-highmem" => {
+                o.highmem.compact = prop_bool(name, &prop_string(name, value)?)?;
+            }
+            "highmem-redists" => {
+                o.highmem.redists = prop_bool(name, &prop_string(name, value)?)?;
+            }
+            "highmem-ecam" => o.highmem.ecam = prop_bool(name, &prop_string(name, value)?)?,
+            "highmem-mmio" => o.highmem.mmio = prop_bool(name, &prop_string(name, value)?)?,
+            "highmem-mmio-size" => {
+                let size = prop_size(name, &prop_string(name, value)?)?;
+                check_highmem_mmio_size(size).map_err(Error::generic)?;
+                o.highmem.mmio_size = size;
+            }
             // Generic machine properties that change nothing here.
             "dump-guest-core" | "mem-merge" | "graphics" | "suppress-vmdesc" => {}
             _ => check_virt_prop(name, &prop_string(name, value)?)?,
@@ -748,6 +782,10 @@ pub(crate) struct ArmArgs<'a> {
     /// `-no-reboot`.
     pub no_reboot: bool,
     pub semihosting: &'a Semihosting,
+    /// `-device`.
+    pub devices: &'a [(String, Option<Location>)],
+    /// `-drive`, from [`parse_drives`].
+    pub drives: &'a [Drive],
 }
 
 /// `qemu_semihosting_chardev_init()`: the chardev of `-semihosting-config chardev=`.
@@ -782,6 +820,7 @@ pub(crate) fn start_board_tcg(
         )));
     }
     let cpu = parse_cpu(args.cpu).map_err(one)?;
+    let plan = devices::plan(args.drives, args.devices)?;
     let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
     let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
 
@@ -807,6 +846,12 @@ pub(crate) fn start_board_tcg(
     cfg.secure = opts.secure;
     cfg.virtualization = opts.virtualization;
     cfg.mte = opts.mte;
+    cfg.highmem = opts.highmem;
+    for (slot, drive) in cfg.pflash.iter_mut().zip(plan.pflash) {
+        if let Some(backing) = drive {
+            *slot = backing;
+        }
+    }
     // serial_hd(1) makes the second UART exist; its chardev is connected once it does.
     let serial1 = serial_hds.get(1).cloned().flatten();
     if serial1.is_some() {
@@ -825,6 +870,7 @@ pub(crate) fn start_board_tcg(
         ))));
     }
     let mut board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
+    devices::plug(&board, &plan.virtio, args.drives).map_err(|e| vec![e])?;
 
     let mut attachments = Vec::new();
     if let Some(Some(chr)) = serial_hds.first() {
@@ -965,6 +1011,19 @@ mod tests {
         assert_eq!(
             take_board_options(&m).unwrap_err().message(),
             "ras=on is not supported by ruvm yet"
+        );
+        let mut m = QDict::new();
+        m.put("highmem-ecam", "off");
+        m.put("compact-highmem", "off");
+        m.put("highmem-mmio-size", "1T");
+        let o = take_board_options(&m).unwrap();
+        assert!(!o.highmem.ecam && !o.highmem.compact && o.highmem.mmio);
+        assert_eq!(o.highmem.mmio_size, 1 << 40);
+        let mut m = QDict::new();
+        m.put("highmem-mmio-size", "1G");
+        assert_eq!(
+            take_board_options(&m).unwrap_err().message(),
+            "highmem-mmio-size cannot be set to a lower value than the default (512 GiB)"
         );
         let mut m = QDict::new();
         m.put("foo", "on");

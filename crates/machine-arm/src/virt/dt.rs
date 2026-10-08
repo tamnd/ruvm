@@ -9,10 +9,11 @@ use ruvm_target_arm::cpu::ArmCpuModel;
 
 use super::{
     VIRT_FLASH, VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE, VIRT_GIC_DIST, VIRT_GIC_REDIST,
-    VIRT_GIC_REDIST_SIZE, VIRT_MMIO, VIRT_MMIO_IRQ, VIRT_MMIO_SIZE, VIRT_PLATFORM_BUS,
+    VIRT_GIC_REDIST_SIZE, VIRT_MMIO, VIRT_MMIO_IRQ, VIRT_MMIO_SIZE, VIRT_PCIE_MMIO,
+    VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE, VIRT_PLATFORM_BUS,
     VIRT_PLATFORM_BUS_SIZE, VIRT_RTC, VIRT_RTC_IRQ, VIRT_RTC_SIZE, VIRT_SECURE_MEM,
     VIRT_SECURE_MEM_SIZE, VIRT_UART, VIRT_UART_IRQ, VIRT_UART_SIZE, VIRT_UART1, VIRT_UART1_IRQ,
-    VIRTIO_TRANSPORTS,
+    VIRTIO_TRANSPORTS, VirtMemmap,
 };
 use crate::fdt::{Fdt, sized_cells};
 use ruvm_hw_intc::gicv3::GICV3_DIST_SIZE;
@@ -355,6 +356,96 @@ pub(crate) fn create_rtc(fdt: &mut Fdt, clock: u32) -> Result<(), String> {
     )?;
     fdt.setprop_cell(&nodename, "clocks", clock)?;
     fdt.setprop_string(&nodename, "clock-names", "apb_pclk")
+}
+
+/// `FDT_PCI_RANGE_IOPORT`, `FDT_PCI_RANGE_MMIO` and `FDT_PCI_RANGE_MMIO_64BIT`, the space
+/// code in the first cell of a PCI `ranges` entry.
+const FDT_PCI_RANGE_IOPORT: u64 = 0x0100_0000;
+const FDT_PCI_RANGE_MMIO: u64 = 0x0200_0000;
+const FDT_PCI_RANGE_MMIO_64BIT: u64 = 0x0300_0000;
+
+/// `create_pcie_irq_map()`: INTx of each pin of slots 0 to 3 to a GIC SPI from `first_irq`,
+/// swizzled by slot. The mask keeps the slot, so the map repeats every 4 slots.
+fn create_pcie_irq_map(
+    fdt: &mut Fdt,
+    gic_phandle: u32,
+    first_irq: u32,
+    nodename: &str,
+) -> Result<(), String> {
+    let mut full_irq_map = Vec::with_capacity(4 * 4 * 10 * 4);
+    for devfn in (0..=0x18u32).step_by(8) {
+        for pin in 0..4u32 {
+            let irq_nr = first_irq + (pin + (devfn >> 3)) % 4;
+            let map = [
+                devfn << 8,
+                0,
+                0,
+                pin + 1,
+                gic_phandle,
+                0,
+                0,
+                GIC_FDT_IRQ_TYPE_SPI,
+                irq_nr,
+                GIC_FDT_IRQ_FLAGS_LEVEL_HI,
+            ];
+            for cell in map {
+                full_irq_map.extend_from_slice(&cell.to_be_bytes());
+            }
+        }
+    }
+    fdt.setprop(nodename, "interrupt-map", &full_irq_map)?;
+    // QEMU passes the slot mask through cpu_to_be16(), which on a little-endian host turns
+    // PCI_DEVFN(3, 0), 0x18, into 0x1800: the devfn << 8 of the map entries.
+    fdt.setprop_cells(nodename, "interrupt-map-mask", &[0x1800, 0, 0, 0x7])
+}
+
+/// The FDT part of `create_pcie()`: the `pci-host-ecam-generic` node for the ECAM, the MMIO
+/// windows and the I/O port window of `memmap`, its INTx lines on the SPIs from `first_irq`.
+/// `msi_phandle` is the MSI controller, if there is one.
+pub(crate) fn create_pcie(
+    fdt: &mut Fdt,
+    memmap: &VirtMemmap,
+    gic_phandle: u32,
+    msi_phandle: Option<u32>,
+    first_irq: u32,
+) -> Result<(), String> {
+    let (base_mmio, size_mmio) = (VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE);
+    let (base_pio, size_pio) = (VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE);
+    let nr_pcie_buses = memmap.nr_pcie_buses() as u32;
+    let nodename = format!("/pcie@{base_mmio:x}");
+    fdt.add_subnode(&nodename)?;
+    fdt.setprop_string(&nodename, "compatible", "pci-host-ecam-generic")?;
+    fdt.setprop_string(&nodename, "device_type", "pci")?;
+    fdt.setprop_cell(&nodename, "#address-cells", 3)?;
+    fdt.setprop_cell(&nodename, "#size-cells", 2)?;
+    fdt.setprop_cell(&nodename, "linux,pci-domain", 0)?;
+    fdt.setprop_cells(&nodename, "bus-range", &[0, nr_pcie_buses - 1])?;
+    fdt.setprop(&nodename, "dma-coherent", &[])?;
+    if let Some(msi) = msi_phandle {
+        fdt.setprop_cells(&nodename, "msi-map", &[0, msi, 0, 0x10000])?;
+    }
+    setprop_sized_cells(fdt, &nodename, "reg", &[(2, memmap.ecam.base), (2, memmap.ecam.size)])?;
+    let mut ranges = vec![
+        (1, FDT_PCI_RANGE_IOPORT),
+        (2, 0),
+        (2, base_pio),
+        (2, size_pio),
+        (1, FDT_PCI_RANGE_MMIO),
+        (2, base_mmio),
+        (2, base_mmio),
+        (2, size_mmio),
+    ];
+    if let Some(high) = memmap.high_mmio {
+        ranges.extend([
+            (1, FDT_PCI_RANGE_MMIO_64BIT),
+            (2, high.base),
+            (2, high.base),
+            (2, high.size),
+        ]);
+    }
+    setprop_sized_cells(fdt, &nodename, "ranges", &ranges)?;
+    fdt.setprop_cell(&nodename, "#interrupt-cells", 1)?;
+    create_pcie_irq_map(fdt, gic_phandle, first_irq, &nodename)
 }
 
 /// The FDT part of `create_virtio_devices()`. The nodes go in from the highest address down

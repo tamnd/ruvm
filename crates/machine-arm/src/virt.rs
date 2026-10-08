@@ -6,9 +6,12 @@
 //!
 //! RAM (`mach-virt.ram`) at 0x40000000, the GICv3 distributor at 0x08000000 and one
 //! redistributor region at 0x080a0000, the generic timers wired to their PPIs, the PL011 UART at
-//! 0x09000000 (SPI 1), the PL031 RTC at 0x09010000 (SPI 2), fw_cfg with DMA at 0x09020000, 32
-//! virtio-mmio transports from 0x0a000000 (SPIs 16 to 47) and an empty platform bus window at
-//! 0x0c000000, and the two CFI flashes at 0 and 0x04000000, the first one holding `-bios`. A
+//! 0x09000000 (SPI 1), the PL031 RTC at 0x09010000 (SPI 2), the generic PCIe host bridge
+//! (`gpex-pcihost`) with its MMIO window at 0x10000000, its I/O port window at 0x3eff0000, its
+//! ECAM and its high MMIO window above RAM (see [`memmap`]) and INTx on SPIs 3 to 6, fw_cfg
+//! with DMA at 0x09020000, 32 virtio-mmio transports from 0x0a000000 (SPIs 16 to 47) and an
+//! empty platform bus window at 0x0c000000, and the two CFI flashes at 0 and 0x04000000, the
+//! first one holding `-bios`. A
 //! second `-serial` adds the second PL011 at 0x09040000 (SPI 8). `virtualization=on` keeps EL2
 //! and `secure=on` keeps EL3 and adds the secure UART at 0x09040000 and the secure RAM at
 //! 0x0e000000. PSCI goes through HVC, or SMC with `virtualization=on`, and is left to the
@@ -22,7 +25,8 @@
 //! # Using it
 //!
 //! [`VirtMachine::new`] builds the board and loads the kernel. Plug virtio devices with
-//! [`VirtMachine::attach_virtio`], then call [`VirtMachine::machine_done`], which finishes and
+//! [`VirtMachine::attach_virtio`] (virtio-mmio) or [`VirtMachine::attach_virtio_pci`] (a PCI
+//! function on the root bus), then call [`VirtMachine::machine_done`], which finishes and
 //! loads the device tree and resets the board. [`VirtMachine::create_vcpus`] then makes the
 //! vCPUs on a [`Jit`], wired to the GIC, and resets them. On a guest reset request
 //! ([`VirtMachine::take_request`]) the runner calls [`VirtMachine::system_reset`] and, on each
@@ -33,14 +37,17 @@
 //!
 //! These leave a seam for M6:
 //!
-//! - ITS (`its=on`): no `/intc/its` node and no MSI controller.
+//! - ITS (`its=on`): no `/intc/its` node and no MSI controller, so the PCIe node has no
+//!   `msi-map` and the guest uses INTx. PCI functions still get their MSI-X capability, as in
+//!   QEMU, where `msi_nonbroken` is always set (see `create_pcie()`).
 //! - SMMUv3 (`iommu=smmuv3`).
-//! - PCIe (the `pcie@10000000` host bridge, its ECAM and the high MMIO window) and CXL.
-//!   The low MMIO and I/O port windows are there, empty, reading as all ones as gpex's do.
+//! - CXL, so the empty `cxl_host_reg` container QEMU maps above the redistributors is not
+//!   there either.
 //! - ACPI (`virt_acpi_setup()`, the GED device) and SMBIOS (`virt_build_smbios()`), so
 //!   `virt_machine_done()` stops after `arm_load_dtb()`. Firmware that wants ACPI tables
 //!   finds none in fw_cfg.
-//! - The high memory redistributor region (`highmem-redists`), so at most 123 CPUs.
+//! - The high memory redistributor region: its place is worked out, but the GIC only uses the
+//!   low one, so at most 123 CPUs.
 //!
 //! Also missing: the PL061 GPIO with `gpio-keys` and the poweroff key and the secure PL061,
 //! the PMU, NUMA, GICv2 and GICv5, the GICv3 virtual interface (`ICH_*`) and its maintenance
@@ -70,6 +77,7 @@
 mod boot;
 mod cpus;
 mod dt;
+pub mod memmap;
 
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
@@ -85,9 +93,11 @@ use ruvm_hw_core::fw_cfg::{
 use ruvm_hw_core::timer::TimeSource;
 use ruvm_hw_core::{Clock, IrqLine};
 use ruvm_hw_intc::gicv3::{GICV3_DIST_SIZE, GICV3_REDIST_SIZE, GicV3, GicV3Props};
+use ruvm_hw_pci::regs::PCI_NUM_PINS;
+use ruvm_hw_pci::{GpexConfig, GpexHost, GpexWindow, MsiTrigger};
 use ruvm_hw_timer::pl031::{PL031_MMIO_SIZE, Pl031};
 use ruvm_hw_virtio::mmio::{VIRTIO_MMIO_FORCE_LEGACY_DEFAULT, VIRTIO_MMIO_REGION_SIZE};
-use ruvm_hw_virtio::{VirtioBackend, VirtioDeviceClass, VirtioMmio};
+use ruvm_hw_virtio::{VirtioBackend, VirtioDeviceClass, VirtioMmio, VirtioPci, VirtioPciProps};
 use ruvm_jit::{Cpu, CpuShared, Jit, Vcpu};
 use ruvm_mem::{
     AccessConstraints, AccessCtx, AccessSize, AddressSpace, Endian, MemResult, MemTxAttrs,
@@ -98,6 +108,7 @@ use ruvm_target_arm::tcg::{Arm, PsciConduit, SemihostingHost, TagMemory, create_
 use ruvm_virtio_queue::{GuestMemory, MemoryError};
 
 pub use boot::{BootInfo, RamRange, Rom};
+pub use memmap::{Highmem, MemMapEntry, VirtMemmap};
 
 use crate::fdt::Fdt;
 use crate::pflash::{Pflash, PflashBacking, PflashProps};
@@ -155,6 +166,8 @@ pub const VIRT_PCIE_PIO: u64 = 0x3eff_0000;
 pub const VIRT_PCIE_PIO_SIZE: u64 = 0x1_0000;
 /// The SPI of the UART.
 pub const VIRT_UART_IRQ: u32 = 1;
+/// The SPI of PCIe INTA, followed by those of INTB, INTC and INTD.
+pub const VIRT_PCIE_IRQ: u32 = 3;
 /// The SPI of the RTC.
 pub const VIRT_RTC_IRQ: u32 = 2;
 /// The SPI of the second UART.
@@ -197,6 +210,8 @@ pub struct VirtConfig {
     pub secure: bool,
     /// `mte=on`: the RAM gets tag memory, which makes the CPU's FEAT_MTE a full one.
     pub mte: bool,
+    /// The `highmem*` properties, which place the regions above RAM.
+    pub highmem: Highmem,
     /// `-bios`: the firmware image, loaded into the first flash.
     pub firmware: Option<String>,
     /// The drives of the two flashes, `pflash0` and `pflash1` (`-drive if=pflash`).
@@ -231,6 +246,7 @@ impl fmt::Debug for VirtConfig {
             .field("virtualization", &self.virtualization)
             .field("secure", &self.secure)
             .field("mte", &self.mte)
+            .field("highmem", &self.highmem)
             .field("firmware", &self.firmware)
             .field("pflash", &self.pflash)
             .field("serial", &self.serial.is_some())
@@ -255,6 +271,7 @@ impl VirtConfig {
             virtualization: false,
             secure: false,
             mte: false,
+            highmem: Highmem::default(),
             firmware: None,
             pflash: [PflashBacking::None, PflashBacking::None],
             serial: None,
@@ -363,6 +380,69 @@ impl MmioOps for VirtioSlot {
     }
 }
 
+/// The PCIe part of `create_pcie()`: the generic host bridge with the ECAM of `memmap`, the
+/// low MMIO window mapped 1:1, the high one when there is one, the I/O port window, and its
+/// INTx lines on SPIs `VIRT_PCIE_IRQ` to `VIRT_PCIE_IRQ + 3`.
+fn create_pcie(
+    mem: &Arc<MemorySystem>,
+    system: RegionId,
+    memmap: &VirtMemmap,
+    gic: &Arc<GicV3>,
+    memory_as: &Arc<AddressSpace>,
+) -> Result<GpexHost, String> {
+    let ecam = memmap.ecam;
+    let config = GpexConfig {
+        ecam: GpexWindow { base: ecam.base, size: ecam.size },
+        mmio32: GpexWindow { base: VIRT_PCIE_MMIO, size: VIRT_PCIE_MMIO_SIZE },
+        mmio64: memmap
+            .high_mmio
+            .map_or(GpexWindow::default(), |h| GpexWindow { base: h.base, size: h.size }),
+        pio: GpexWindow { base: VIRT_PCIE_PIO, size: VIRT_PCIE_PIO_SIZE },
+        ..GpexConfig::default()
+    };
+    let gpex = GpexHost::new(Arc::clone(mem), system, config).map_err(err)?;
+    // Map only the first size_ecam bytes of ECAM space, and the MMIO windows at the same
+    // address in PCI memory space as in the system's.
+    let mut aliases = vec![
+        ("pcie-ecam", gpex.ecam(), 0, ecam.base, ecam.size),
+        ("pcie-mmio", gpex.mmio_window(), VIRT_PCIE_MMIO, VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE),
+    ];
+    if let Some(h) = memmap.high_mmio {
+        aliases.push(("pcie-mmio-high", gpex.mmio_window(), h.base, h.base, h.size));
+    }
+    for (name, target, offset, addr, size) in aliases {
+        let alias = mem.new_alias(name, target, offset, size.into()).map_err(err)?;
+        mem.add_subregion(system, addr, alias).map_err(err)?;
+    }
+    mem.add_subregion(system, VIRT_PCIE_PIO, gpex.ioport_window()).map_err(err)?;
+    for i in 0..PCI_NUM_PINS {
+        let irq = VIRT_PCIE_IRQ + i as u32;
+        if let Some(pin) = gpex.irq(i) {
+            pin.connect(gic.spi(irq));
+        }
+        gpex.set_irq_num(i, irq as i32).map_err(err)?;
+    }
+    // msi_nonbroken is a global in QEMU, and in a qemu-system-aarch64 with the Aspeed boards
+    // built in, the class init of aspeed-pcie-rc sets it before the machine is even chosen. So
+    // functions on this bus get their MSI-X capability with or without an MSI controller. A
+    // message is a plain 32 bit store into system memory, msi_send_message(), which goes nowhere
+    // unless something is mapped at its address.
+    let msi: MsiTrigger = Arc::new(msi_store(memory_as));
+    gpex.bus().set_msi_handler(Some(msi));
+    Ok(gpex)
+}
+
+/// A message signaled interrupt as `address_space_stl_le()` into `memory_as` sends it, through a
+/// weak reference so that the bus does not keep the address space alive.
+fn msi_store(memory_as: &Arc<AddressSpace>) -> impl Fn(u64, u32) + Send + Sync + 'static {
+    let weak = Arc::downgrade(memory_as);
+    move |address, data| {
+        if let Some(a) = weak.upgrade() {
+            let _ = a.store(address, 4, data.into(), Endian::Little, MemTxAttrs::UNSPECIFIED);
+        }
+    }
+}
+
 /// `virt_cpu_mp_affinity()` for a GICv3: 16 CPUs per Aff1 cluster.
 pub fn virt_cpu_mp_affinity(idx: usize) -> u64 {
     let idx = idx as u64;
@@ -389,6 +469,9 @@ pub struct VirtMachine {
     /// `arm_load_kernel()` adjusted it.
     secondaries_off: bool,
     rtc: Arc<Pl031>,
+    memmap: VirtMemmap,
+    gpex: GpexHost,
+    pci_devices: Mutex<Vec<VirtioPci>>,
     virtio: Vec<Arc<VirtioSlot>>,
     fw_cfg: FwCfgMem,
     fdt: Fdt,
@@ -410,34 +493,6 @@ impl fmt::Debug for VirtMachine {
             .field("roms", &self.loader.roms)
             .field("done", &self.done)
             .finish_non_exhaustive()
-    }
-}
-
-/// `unassigned_io_ops`, behind the PCIe windows: reads as all ones, writes are ignored.
-#[derive(Debug)]
-struct UnassignedIo;
-
-impl MmioOps for UnassignedIo {
-    fn read(&self, _cx: &AccessCtx, _offset: u64, _size: AccessSize) -> MemResult<u64> {
-        Ok(u64::MAX)
-    }
-
-    fn write(
-        &self,
-        _cx: &AccessCtx,
-        _offset: u64,
-        _size: AccessSize,
-        _value: u64,
-    ) -> MemResult<()> {
-        Ok(())
-    }
-
-    fn valid(&self) -> AccessConstraints {
-        AccessConstraints::any_size(1, 4)
-    }
-
-    fn impl_constraints(&self) -> AccessConstraints {
-        AccessConstraints::any_size(1, 4)
     }
 }
 
@@ -465,15 +520,7 @@ impl VirtMachine {
         let smp = cfg.smp;
         let ram_size = cfg.ram_size;
 
-        // virt_set_memmap().
-        let pa_bits = model.pamax();
-        let memtop = (VIRT_MEM + ram_size).div_ceil(1 << 30) * (1 << 30);
-        if pa_bits < 64 && memtop > 1u64 << pa_bits {
-            return Err(format!(
-                "Addressing limited to {pa_bits} bits, but memory exceeds it by {} bytes",
-                memtop - (1u64 << pa_bits)
-            ));
-        }
+        let memmap = memmap::virt_set_memmap(VIRT_MEM, ram_size, model.pamax(), &cfg.highmem)?;
 
         let mem = Arc::new(MemorySystem::new());
         let system = mem.new_container("system", 1 << 64).map_err(err)?;
@@ -557,7 +604,7 @@ impl VirtMachine {
             .new_io("gicv3_redist_region[0]", gic.redist_region_size(0).into(), gic.redist_ops(0))
             .map_err(err)?;
         mem.add_subregion(system, VIRT_GIC_REDIST, r).map_err(err)?;
-        dt::add_gic_node(&mut fdt, cfg.virtualization)?;
+        let gic_phandle = dt::add_gic_node(&mut fdt, cfg.virtualization)?;
 
         // arm_load_kernel(), which decides the PSCI conduit the CPUs are created with.
         let mut loader = Loader::default();
@@ -660,15 +707,9 @@ impl VirtMachine {
         rtc.irq().connect(gic.spi(VIRT_RTC_IRQ));
         dt::create_rtc(&mut fdt, clock_phandle)?;
 
-        // create_pcie(), without the host bridge: the gpex MMIO and I/O port windows with
-        // nothing mapped in them, which read as all ones and ignore writes.
-        for (name, base, size) in [
-            ("gpex_mmio_window", VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE),
-            ("gpex_ioport_window", VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE),
-        ] {
-            let r = mem.new_io(name, size.into(), Arc::new(UnassignedIo)).map_err(err)?;
-            mem.add_subregion(system, base, r).map_err(err)?;
-        }
+        // create_pcie(). There is no MSI controller yet, so the device tree has no msi-map.
+        let gpex = create_pcie(&mem, system, &memmap, &gic, &memory_as)?;
+        dt::create_pcie(&mut fdt, &memmap, gic_phandle, None, VIRT_PCIE_IRQ)?;
 
         // create_virtio_devices().
         let mut virtio = Vec::with_capacity(VIRTIO_TRANSPORTS);
@@ -728,6 +769,9 @@ impl VirtMachine {
             flash: [flash0, flash1],
             secondaries_off: vms_conduit != PsciConduit::Disabled,
             rtc,
+            memmap,
+            gpex,
+            pci_devices: Mutex::new(Vec::new()),
             virtio,
             fw_cfg,
             fdt,
@@ -776,6 +820,40 @@ impl VirtMachine {
         *slot.transport.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(t);
         *slot.plugged.write().unwrap_or_else(PoisonError::into_inner) = true;
         Ok(())
+    }
+
+    /// Plug a virtio device into a new function on the PCIe root bus, as
+    /// `-device virtio-*-pci` does, at `devfn` or the first free slot. Gives the function.
+    pub fn attach_virtio_pci(
+        &self,
+        class: Box<dyn VirtioDeviceClass>,
+        devfn: Option<u8>,
+        props: &VirtioPciProps,
+    ) -> Result<VirtioPci, String> {
+        if self.done {
+            return Err("PCI devices must be plugged before machine_done".to_string());
+        }
+        let memory: Arc<dyn GuestMemory + Send + Sync> =
+            Arc::new(WeakGuestMemory(Arc::downgrade(&self.memory_as)));
+        let backend = VirtioBackend::new(class, memory).map_err(err)?;
+        let dev = VirtioPci::new(self.gpex.bus(), devfn, backend, props).map_err(err)?;
+        self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).push(dev.clone());
+        Ok(dev)
+    }
+
+    /// The PCIe host bridge.
+    pub fn gpex(&self) -> &GpexHost {
+        &self.gpex
+    }
+
+    /// The virtio PCI functions plugged with [`VirtMachine::attach_virtio_pci`].
+    pub fn pci_devices(&self) -> Vec<VirtioPci> {
+        self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Where the regions above RAM went.
+    pub fn memmap(&self) -> &VirtMemmap {
+        &self.memmap
     }
 
     /// Connect the chardev of the UART.
@@ -855,6 +933,7 @@ impl VirtMachine {
         for s in &self.virtio {
             s.current().reset();
         }
+        self.gpex.reset();
         let fwc = self.fw_cfg.state();
         fwc.reset();
         fwc.machine_reset(Vec::new(), Vec::new()).map_err(err)?;

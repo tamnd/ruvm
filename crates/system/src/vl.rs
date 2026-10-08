@@ -1021,14 +1021,9 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         }
     }
     // configure_blockdev(): the -drive options, which need to know the machine.
-    if virt && !rv_virt && !cfg.x86.drives.is_empty() {
-        return Err(fail_msg("-drive is not supported with this machine by ruvm yet"));
-    }
-    if virt && !rv_virt && !cfg.x86.devices.is_empty() {
-        return Err(fail_msg("-device is not supported with this machine by ruvm yet"));
-    }
-    let drives = if rv_virt {
-        riscv::parse_drives(&cfg.x86.drives).map_err(|e| {
+    let drives = if virt {
+        let parse = if rv_virt { riscv::parse_drives } else { arm::parse_drives };
+        parse(&cfg.x86.drives).map_err(|e| {
             e.report();
             Exit(1)
         })?
@@ -1141,6 +1136,8 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             cpu: cfg.x86.cpu.as_deref(),
             no_reboot: cfg.x86.no_reboot,
             semihosting: &cfg.semihosting,
+            devices: &cfg.x86.devices,
+            drives: &drives,
         };
         let running =
             arm::start_board_tcg(&vm, tcg, opts, &args, &serial_hds).map_err(|errors| {

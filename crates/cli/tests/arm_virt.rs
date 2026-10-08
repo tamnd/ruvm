@@ -81,6 +81,29 @@ fn virt_errors() {
         ),
         (&["-M", "virt,foo=on"], format!("{p}Property 'virt-11.1-machine.foo' not found\n")),
         (
+            &["-M", "virt,highmem-mmio-size=1G"],
+            format!(
+                "{p}highmem-mmio-size cannot be set to a lower value than the default (512 GiB)\n"
+            ),
+        ),
+        (
+            &["-M", "virt,highmem=off", "-m", "4G"],
+            format!(
+                "{p}Addressing limited to 32 bits, but memory exceeds it by 1073741824 bytes\n"
+            ),
+        ),
+        (
+            &["-M", "virt", "-device", "virtio-blk-pci"],
+            format!("{p}-device virtio-blk-pci: drive property not set\n"),
+        ),
+        (
+            &["-M", "virt", "-drive", "file=/dev/null,format=raw,if=ide"],
+            format!(
+                "{p}-drive file=/dev/null,format=raw,if=ide: machine type does not support \
+                 if=ide,bus=0,unit=0\n"
+            ),
+        ),
+        (
             &["-M", "virt", "-smp", "124"],
             format!(
                 "{p}Number of SMP CPUs requested (124) exceeds max CPUs supported by machine \

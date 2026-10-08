@@ -8,12 +8,13 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use ruvm_hw_virtio::VirtioPciProps;
 use ruvm_hw_virtio::rng::{RandomFile, VirtioRng, VirtioRngConf};
 use ruvm_jit::cpu_exec::cpu_exec;
 use ruvm_jit::{Vcpu, excp};
 use ruvm_machine_arm::virt::{
-    VIRT_FW_CFG, VIRT_GIC_DIST, VIRT_MEM, VIRT_MMIO, VIRT_RTC, VIRT_UART, VirtConfig, VirtMachine,
-    VirtRequest,
+    VIRT_FW_CFG, VIRT_GIC_DIST, VIRT_MEM, VIRT_MMIO, VIRT_PCIE_MMIO, VIRT_PCIE_PIO, VIRT_RTC,
+    VIRT_UART, VirtConfig, VirtMachine, VirtRequest,
 };
 use ruvm_mem::MemTxAttrs;
 use ruvm_target_arm::cpu::ArmCpuModel;
@@ -192,16 +193,10 @@ fn parse(blob: &[u8]) -> Vec<Node> {
     out
 }
 
-/// The nodes QEMU's dumps have for devices the board does not model: PCIe, the PL061 with
-/// its key, and the secure PL061 of `secure=on` with its poweroff and restart lines.
-const MISSING: [&str; 6] = [
-    "/pcie@10000000",
-    "/pl061@9030000",
-    "/gpio-keys",
-    "/pl061@90b0000",
-    "/gpio-poweroff",
-    "/gpio-restart",
-];
+/// The nodes QEMU's dumps have for devices the board does not model: the PL061 with its key,
+/// and the secure PL061 of `secure=on` with its poweroff and restart lines.
+const MISSING: [&str; 5] =
+    ["/pl061@9030000", "/gpio-keys", "/pl061@90b0000", "/gpio-poweroff", "/gpio-restart"];
 
 fn strip(nodes: Vec<Node>) -> Vec<Node> {
     nodes
@@ -631,6 +626,55 @@ fn virtio_plugging() {
         m.attach_virtio(rng()).unwrap_err(),
         "virtio-mmio devices must be plugged before machine_done"
     );
+}
+
+#[test]
+fn pcie_host() {
+    let rng =
+        || Box::new(VirtioRng::new(Box::new(RandomFile::default()), VirtioRngConf::default()));
+    let mut m = VirtMachine::new(VirtConfig::default()).unwrap();
+    let ecam = m.memmap().ecam;
+    assert_eq!((ecam.base, ecam.size), (0x40_1000_0000, 256 * MIB));
+    let props = VirtioPciProps::default();
+    m.attach_virtio_pci(rng(), Some(2 << 3), &props).unwrap();
+    m.attach_virtio_pci(rng(), None, &props).unwrap();
+    m.machine_done().unwrap();
+    // The root function at 00:00.0 is gpex-root, 1b36:0008, and the two rng functions are
+    // the transitional virtio entropy device, 1af4:1005, at 00:02.0 and the first free slot.
+    assert_eq!(r32(&m, ecam.base), 0x0008_1b36);
+    assert_eq!(r32(&m, ecam.base + (2 << 15)), 0x1005_1af4);
+    assert_eq!(r32(&m, ecam.base + (1 << 15)), 0x1005_1af4);
+    assert_eq!(r32(&m, ecam.base + (3 << 15)), u32::MAX);
+    // The config space of 00:01.0 as QEMU 11.1 shows it with `xp /44wx 0x4010008000` before
+    // the guest runs: the BARs, the virtio vendor capabilities from 0x40 and the MSI-X
+    // capability at 0x98, which is there without an MSI controller too.
+    let want: [u32; 44] = [
+        0x10051af4, 0x00100000, 0x00ff0000, 0x00000000, 0x00000001, 0x00000000, 0x00000000,
+        0x00000000, 0x0000000c, 0x00000000, 0x00000000, 0x00041af4, 0x00000000, 0x00000098,
+        0x00000000, 0x00000100, 0x01100009, 0x00000004, 0x00000000, 0x00001000, 0x03104009,
+        0x00000004, 0x00001000, 0x00001000, 0x04105009, 0x00000004, 0x00002000, 0x00001000,
+        0x02146009, 0x00000004, 0x00003000, 0x00001000, 0x00000004, 0x05147009, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00018411, 0x00000001, 0x00000801, 0x00000000,
+        0x00000000, 0x00000000,
+    ];
+    let got: Vec<u32> = (0..44).map(|i| r32(&m, ecam.base + (1 << 15) + 4 * i)).collect();
+    assert_eq!(got, want);
+    // Nothing is mapped in the windows yet, which read as all ones.
+    assert_eq!(r32(&m, VIRT_PCIE_MMIO), u32::MAX);
+    assert_eq!(r32(&m, VIRT_PCIE_PIO), u32::MAX);
+    assert_eq!(r32(&m, 0x80_0000_0000), u32::MAX);
+
+    // highmem-ecam=off: the 16 bus ECAM below 4 GiB.
+    let mut cfg = a57();
+    cfg.highmem.ecam = false;
+    let mut m = VirtMachine::new(cfg).unwrap();
+    m.machine_done().unwrap();
+    assert_eq!(m.memmap().ecam.base, 0x3f00_0000);
+    assert_eq!(r32(&m, 0x3f00_0000), 0x0008_1b36);
+    let pcie = parse(m.fdt().as_bytes()).into_iter().find(|n| n.path == "/pcie@10000000");
+    let pcie = pcie.unwrap();
+    let bus_range = pcie.props.iter().find(|(n, _)| n == "bus-range").unwrap();
+    assert_eq!(bus_range.1, [0, 0, 0, 0, 0, 0, 0, 15]);
 }
 
 fn movz(rd: u32, imm: u32, hw: u32) -> u32 {
