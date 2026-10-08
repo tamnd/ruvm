@@ -749,6 +749,7 @@ dependencies = [
  "ruvm-jit-aarch64",
  "ruvm-jit-core",
  "ruvm-jit-interp",
+ "ruvm-jit-riscv64",
  "ruvm-jit-x86_64",
  "ruvm-mem",
  "ruvm-sys",
@@ -786,6 +787,11 @@ version = "0.4.4"
 [[package]]
 name = "ruvm-jit-riscv64"
 version = "0.4.4"
+dependencies = [
+ "libc",
+ "ruvm-jit-core",
+ "ruvm-jit-interp",
+]
 
 [[package]]
 name = "ruvm-jit-s390x"

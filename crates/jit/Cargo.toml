@@ -31,5 +31,8 @@ ruvm-jit-aarch64.workspace = true
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 ruvm-jit-x86_64.workspace = true
 
+[target.'cfg(all(target_os = "linux", target_arch = "riscv64"))'.dependencies]
+ruvm-jit-riscv64.workspace = true
+
 [lints]
 workspace = true
