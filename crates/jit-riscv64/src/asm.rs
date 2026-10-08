@@ -140,6 +140,98 @@ pub(crate) mod fence {
     pub(crate) const ST_ST: u32 = 0x01100000;
 }
 
+/// The vector instructions, `RISCVInsn` from `OPC_VSETVLI` on. The `.vv`, `.vx` and `.vi`
+/// forms of an operation differ only in the `V_OP*` bits, so most are given once and combined
+/// with [`vop::IVV`], [`vop::IVX`] or [`vop::IVI`].
+pub(crate) mod vop {
+    /// `V_OPIVV`, `V_OPMVV`, `V_OPIVI` and `V_OPIVX`.
+    pub(crate) const IVV: u32 = 0x0 << 12;
+    pub(crate) const MVV: u32 = 0x2 << 12;
+    pub(crate) const IVI: u32 = 0x3 << 12;
+    pub(crate) const IVX: u32 = 0x4 << 12;
+
+    pub(crate) const VSETVLI: u32 = 0x7057;
+    pub(crate) const VSETIVLI: u32 = 0xc0007057;
+
+    /// `vle8.v` to `vle64.v` and `vse8.v` to `vse64.v`, by element size.
+    pub(crate) const VLE: [u32; 4] = [0x7, 0x5007, 0x6007, 0x7007];
+    pub(crate) const VSE: [u32; 4] = [0x27, 0x5027, 0x6027, 0x7027];
+    /// `vl1re8.v` and `vs1r.v`; the count of registers less one goes in bits 29 to 31.
+    pub(crate) const VL1RE8: u32 = 0x2800007;
+    pub(crate) const VS1R: u32 = 0x2800027;
+
+    pub(crate) const VADD: u32 = 0x57;
+    pub(crate) const VSUB: u32 = 0x8000057;
+    pub(crate) const VRSUB: u32 = 0xc000057;
+    pub(crate) const VAND: u32 = 0x24000057;
+    pub(crate) const VOR: u32 = 0x28000057;
+    pub(crate) const VXOR: u32 = 0x2c000057;
+    /// With [`MVV`].
+    pub(crate) const VMUL: u32 = 0x94000057;
+    pub(crate) const VSADD: u32 = 0x84000057;
+    pub(crate) const VSSUB: u32 = 0x8c000057;
+    pub(crate) const VSADDU: u32 = 0x80000057;
+    pub(crate) const VSSUBU: u32 = 0x88000057;
+    pub(crate) const VMAX: u32 = 0x1c000057;
+    pub(crate) const VMAXU: u32 = 0x18000057;
+    pub(crate) const VMIN: u32 = 0x14000057;
+    pub(crate) const VMINU: u32 = 0x10000057;
+    pub(crate) const VMSEQ: u32 = 0x60000057;
+    pub(crate) const VMSNE: u32 = 0x64000057;
+    pub(crate) const VMSLTU: u32 = 0x68000057;
+    pub(crate) const VMSLT: u32 = 0x6c000057;
+    pub(crate) const VMSLEU: u32 = 0x70000057;
+    pub(crate) const VMSLE: u32 = 0x74000057;
+    pub(crate) const VMSGTU: u32 = 0x78000057;
+    pub(crate) const VMSGT: u32 = 0x7c000057;
+    pub(crate) const VSLL: u32 = 0x94000057;
+    pub(crate) const VSRL: u32 = 0xa0000057;
+    pub(crate) const VSRA: u32 = 0xa4000057;
+    /// `vmerge`, always masked by v0.
+    pub(crate) const VMERGE: u32 = 0x5c000057;
+    /// `vmv.v.v`, `vmv.v.i` and `vmv.v.x`: [`VMERGE`] unmasked.
+    pub(crate) const VMV_V: u32 = 0x5e000057;
+    /// `vmv<n>r.v`, with [`IVI`] and the count of registers less one as the immediate.
+    pub(crate) const VMVNR: u32 = 0x9e000057;
+}
+
+/// The vector registers v0 to v31 are registers 32 to 63 of the allocator.
+pub(crate) const V0: Reg = 32;
+
+/// `encode_v`: a vector instruction with `d`, `s1` in the `vs1`/`rs1` field and `s2` in the
+/// `vs2` field. `vm` is set for an unmasked instruction.
+pub(crate) fn encode_v(op: u32, d: Reg, s1: Reg, s2: Reg, vm: bool) -> u32 {
+    op | (d as u32 & 0x1f) << 7
+        | (s1 as u32 & 0x1f) << 15
+        | (s2 as u32 & 0x1f) << 20
+        | (vm as u32) << 25
+}
+
+/// `encode_vi`: as [`encode_v`] with a 5-bit immediate in the `vs1` field.
+pub(crate) fn encode_vi(op: u32, d: Reg, imm: i64, s2: Reg, vm: bool) -> u32 {
+    op | (d as u32 & 0x1f) << 7
+        | (imm as u32 & 0x1f) << 15
+        | (s2 as u32 & 0x1f) << 20
+        | (vm as u32) << 25
+}
+
+/// `encode_vtype` with the tail and mask agnostic, as QEMU always sets them: element size
+/// `vsew` (0 for 8 bits to 3 for 64), and `lmul` registers per group as a base 2 logarithm,
+/// negative for a fraction of one.
+pub(crate) fn encode_vtype(vsew: u32, lmul: i32) -> u32 {
+    1 << 7 | 1 << 6 | vsew << 3 | (lmul as u32 & 7)
+}
+
+/// `encode_vset`: `vsetvli rd, rs1, vtype`.
+pub(crate) fn encode_vset(rd: Reg, rs1: Reg, vtype: u32) -> u32 {
+    vop::VSETVLI | (rd as u32 & 0x1f) << 7 | (rs1 as u32 & 0x1f) << 15 | (vtype & 0x7ff) << 20
+}
+
+/// `encode_vseti`: `vsetivli rd, uimm, vtype`.
+pub(crate) fn encode_vseti(rd: Reg, uimm: u32, vtype: u32) -> u32 {
+    vop::VSETIVLI | (rd as u32 & 0x1f) << 7 | (uimm & 0x1f) << 15 | (vtype & 0x3ff) << 20
+}
+
 /// `sextreg(v, 0, bits)`.
 pub(crate) fn sext(v: i64, bits: u32) -> i64 {
     (v << (64 - bits)) >> (64 - bits)
@@ -648,6 +740,43 @@ impl Asm {
         self.i(opc::ADDIW, rd, rs, 0);
     }
 
+    /// `tcg_out_opc_vv`: `vd = vs2 op vs1`.
+    pub(crate) fn vv(&mut self, op: u32, vd: Reg, vs2: Reg, vs1: Reg) {
+        self.emit(encode_v(op, vd, vs1, vs2, true));
+    }
+
+    /// `tcg_out_opc_vx`: `vd = vs2 op rs1`, with the general register `rs1`.
+    pub(crate) fn vx(&mut self, op: u32, vd: Reg, vs2: Reg, rs1: Reg) {
+        self.emit(encode_v(op, vd, rs1, vs2, true));
+    }
+
+    /// `tcg_out_opc_vi`: `vd = vs2 op imm`.
+    pub(crate) fn vi(&mut self, op: u32, vd: Reg, vs2: Reg, imm: i64) {
+        self.emit(encode_vi(op, vd, imm, vs2, true));
+    }
+
+    /// `tcg_out_opc_vvm_mask`: `vd = v0.mask ? vs1 : vs2` for `vmerge.vvm`.
+    pub(crate) fn vvm(&mut self, op: u32, vd: Reg, vs2: Reg, vs1: Reg) {
+        self.emit(encode_v(op, vd, vs1, vs2, false));
+    }
+
+    /// `tcg_out_opc_vim_mask`: `vd = v0.mask ? imm : vs2` for `vmerge.vim`.
+    pub(crate) fn vim(&mut self, op: u32, vd: Reg, vs2: Reg, imm: i64) {
+        self.emit(encode_vi(op, vd, imm, vs2, false));
+    }
+
+    /// A unit stride or whole register vector load or store `insn` of `data` at `base + off`,
+    /// `tcg_out_vec_ldst`. The address goes in TMP0 unless `off` is 0.
+    pub(crate) fn vldst(&mut self, insn: u32, data: Reg, base: Reg, off: i64) {
+        let addr = if off != 0 {
+            self.addi(TMP0, base, off);
+            TMP0
+        } else {
+            base
+        };
+        self.emit(encode_v(insn, data, addr, 0, true));
+    }
+
     /// `tcg_out_mb` for the `TCG_MO_*` bits of `mo`.
     pub(crate) fn mb(&mut self, mo: u32) {
         use ruvm_jit_core::types::mo;
@@ -714,6 +843,36 @@ mod tests {
         assert_eq!(one(|a| a.emit(encode_sb(opc::BLTU, 9, TMP0, -4096))), [0x81f4e063]);
         assert_eq!(jal_word(1048574), Some(0x7ffff06f));
         assert_eq!(jal_word(1048576), None);
+    }
+
+    #[test]
+    fn vector_encodings_match_gnu_as() {
+        // Reference words from `riscv64-linux-gnu-as -march=rv64gcv`.
+        let v = |n: Reg| V0 + n;
+        assert_eq!(one(|a| a.emit(encode_vseti(ZERO, 16, encode_vtype(0, 0)))), [0xcc087057]);
+        assert_eq!(one(|a| a.emit(encode_vset(TMP0, ZERO, encode_vtype(3, 1)))), [0x0d907fd7]);
+        assert_eq!(one(|a| a.emit(encode_vset(ZERO, TMP0, encode_vtype(0, -1)))), [0x0c7ff057]);
+        assert_eq!(one(|a| a.vv(vop::VADD | vop::IVV, v(1), v(2), v(3))), [0x022180d7]);
+        assert_eq!(one(|a| a.vi(vop::VADD | vop::IVI, v(4), v(5), -16)), [0x02583257]);
+        assert_eq!(one(|a| a.vv(vop::VSUB | vop::IVV, v(1), v(2), v(3))), [0x0a2180d7]);
+        assert_eq!(one(|a| a.vi(vop::VRSUB | vop::IVI, V0, v(8), 0)), [0x0e803057]);
+        assert_eq!(one(|a| a.vv(vop::VMUL | vop::MVV, v(2), v(4), v(6))), [0x96432157]);
+        assert_eq!(one(|a| a.vx(vop::VSLL | vop::IVX, v(1), v(2), TMP0)), [0x962fc0d7]);
+        assert_eq!(one(|a| a.vi(vop::VSRA | vop::IVI, v(6), v(7), 31)), [0xa67fb357]);
+        assert_eq!(one(|a| a.vv(vop::VMSLT | vop::IVV, V0, v(2), v(3))), [0x6e218057]);
+        assert_eq!(one(|a| a.vi(vop::VMSGTU | vop::IVI, V0, v(2), 15)), [0x7a27b057]);
+        assert_eq!(one(|a| a.vvm(vop::VMERGE | vop::IVV, v(4), v(2), v(3))), [0x5c218257]);
+        assert_eq!(one(|a| a.vim(vop::VMERGE | vop::IVI, v(4), v(2), -1)), [0x5c2fb257]);
+        assert_eq!(one(|a| a.vx(vop::VMV_V | vop::IVX, v(8), V0, TMP0)), [0x5e0fc457]);
+        assert_eq!(one(|a| a.vi(vop::VMV_V | vop::IVI, v(8), V0, -16)), [0x5e083457]);
+        assert_eq!(one(|a| a.vv(vop::VMV_V | vop::IVV, v(8), V0, v(4))), [0x5e020457]);
+        assert_eq!(one(|a| a.vi(vop::VMVNR | vop::IVI, v(2), v(4), 1)), [0x9e40b157]);
+        assert_eq!(one(|a| a.vldst(vop::VLE[0], v(2), TMP0, 0)), [0x020f8107]);
+        assert_eq!(one(|a| a.vldst(vop::VSE[3], v(2), 8, 0)), [0x02047127]);
+        assert_eq!(one(|a| a.vldst(vop::VL1RE8 | 1 << 29, v(4), TMP0, 0)), [0x228f8207]);
+        assert_eq!(one(|a| a.vldst(vop::VS1R | 3 << 29, v(4), TMP0, 0)), [0x628f8227]);
+        assert_eq!(one(|a| a.vv(vop::VSSUBU | vop::IVV, v(1), v(2), v(3))), [0x8a2180d7]);
+        assert_eq!(one(|a| a.vv(vop::VMINU | vop::IVV, v(1), v(2), v(3))), [0x122180d7]);
     }
 
     #[test]

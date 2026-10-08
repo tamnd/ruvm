@@ -3,7 +3,8 @@
 //! The instruction set extensions the backend may use, QEMU's `cpuinfo` bits that
 //! `cpuinfo_init` in `util/cpuinfo-riscv.c` sets: from the `riscv_hwprobe` system call, and
 //! for what that does not report, by running one instruction of the extension and catching
-//! `SIGILL`.
+//! `SIGILL`. The vector extension is only taken from `riscv_hwprobe`, as in QEMU, and the
+//! vector register length from the `vlenb` CSR.
 
 /// Optional RISC-V extensions. RV64GC is the baseline and always used.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -17,15 +18,27 @@ pub struct HostFeatures {
     pub zbs: bool,
     /// Zicond: `czero.eqz` and `czero.nez`, `CPUINFO_ZICOND`.
     pub zicond: bool,
+    /// The vector extension, at least Zve64x, `CPUINFO_ZVE64X`.
+    pub zve64x: bool,
+    /// The base 2 logarithm of the vector register length in bytes, `riscv_lg2_vlenb`: 3 for
+    /// 64-bit registers, 4 for 128-bit ones. Only meaningful with [`HostFeatures::zve64x`].
+    pub lg2_vlenb: u8,
 }
 
 impl HostFeatures {
     /// Plain RV64GC.
-    pub const BASELINE: HostFeatures =
-        HostFeatures { zba: false, zbb: false, zbs: false, zicond: false };
+    pub const BASELINE: HostFeatures = HostFeatures {
+        zba: false,
+        zbb: false,
+        zbs: false,
+        zicond: false,
+        zve64x: false,
+        lg2_vlenb: 0,
+    };
 
-    /// Every extension the backend knows about.
-    pub const ALL: HostFeatures = HostFeatures { zba: true, zbb: true, zbs: true, zicond: true };
+    /// Every extension the backend knows about, with 128-bit vector registers.
+    pub const ALL: HostFeatures =
+        HostFeatures { zba: true, zbb: true, zbs: true, zicond: true, zve64x: true, lg2_vlenb: 4 };
 
     /// The extensions of the CPU this runs on; [`HostFeatures::BASELINE`] on other hosts.
     pub fn detect() -> HostFeatures {
@@ -39,10 +52,16 @@ impl HostFeatures {
         }
     }
 
-    /// The same set: no extension here depends on another. Kept so that every backend's
-    /// feature set has the same shape.
+    /// The same set, without vectors when the register length is less than the 64 bits
+    /// Zve64x guarantees, and with no register length when there are no vectors.
     pub fn normalized(self) -> HostFeatures {
-        self
+        let zve64x = self.zve64x && self.lg2_vlenb >= 3;
+        HostFeatures { zve64x, lg2_vlenb: if zve64x { self.lg2_vlenb } else { 0 }, ..self }
+    }
+
+    /// The same set without the vector extension.
+    pub fn without_vectors(self) -> HostFeatures {
+        HostFeatures { zve64x: false, lg2_vlenb: 0, ..self }
     }
 
     /// The extensions in both sets.
@@ -52,6 +71,9 @@ impl HostFeatures {
             zbb: self.zbb && other.zbb,
             zbs: self.zbs && other.zbs,
             zicond: self.zicond && other.zicond,
+            // Code for one vector register length is wrong for another.
+            zve64x: self.zve64x && other.zve64x && self.lg2_vlenb == other.lg2_vlenb,
+            lg2_vlenb: self.lg2_vlenb,
         }
         .normalized()
     }
@@ -73,6 +95,8 @@ mod probe {
     const EXT_ZBB: u64 = 1 << 4;
     const EXT_ZBS: u64 = 1 << 5;
     const EXT_ZICOND: u64 = 1 << 35;
+    /// `RISCV_HWPROBE_IMA_V`: for RV64, V is Zve64d, a superset of Zve64x.
+    const IMA_V: u64 = 1 << 2;
 
     /// `struct riscv_hwprobe`.
     #[repr(C)]
@@ -98,6 +122,7 @@ mod probe {
             f.zbb = pair.value & EXT_ZBB != 0;
             f.zbs = pair.value & EXT_ZBS != 0;
             f.zicond = pair.value & EXT_ZICOND != 0;
+            f.zve64x = pair.value & IMA_V != 0;
             left_zb = false;
         }
         // A kernel older than the Zicond bit reports it clear, as QEMU's build against old
@@ -105,7 +130,28 @@ mod probe {
         if left_zb || !f.zicond {
             sigill_probe(&mut f, left_zb);
         }
+        // Vectors are only detected with hwprobe: every kernel that lets user code use them
+        // has the system call.
+        if f.zve64x {
+            let vlenb = vlenb();
+            // RVV 1.0 makes the length a power of 2, and Zve64x makes it at least 64 bits.
+            if vlenb.is_power_of_two() && vlenb >= 8 {
+                f.lg2_vlenb = vlenb.trailing_zeros() as u8;
+            } else {
+                f.zve64x = false;
+            }
+        }
         f.normalized()
+    }
+
+    /// `csrr vlenb`, the vector register length in bytes.
+    fn vlenb() -> u64 {
+        let v: u64;
+        // SAFETY: reading the CSR has no side effects, and hwprobe reported the vector
+        // extension, which has it. The encoding is used because the assembler only knows the
+        // CSR's name with the extension enabled.
+        unsafe { core::arch::asm!(".insn i 0x73, 0x2, {0}, zero, -990", out(reg) v) };
+        v
     }
 
     extern "C" fn on_sigill(_sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut libc::c_void) {
@@ -177,13 +223,21 @@ mod tests {
 
     #[test]
     fn intersect_keeps_common_extensions() {
-        let a = HostFeatures { zba: true, zbb: true, zbs: false, zicond: true };
-        let b = HostFeatures { zba: true, zbb: false, zbs: true, zicond: true };
-        assert_eq!(
-            a.intersect(b),
-            HostFeatures { zba: true, zbb: false, zbs: false, zicond: true }
-        );
+        let a = HostFeatures { zbs: false, ..HostFeatures::ALL };
+        let b = HostFeatures { zbb: false, ..HostFeatures::ALL };
+        assert_eq!(a.intersect(b), HostFeatures { zbb: false, zbs: false, ..HostFeatures::ALL });
         assert_eq!(HostFeatures::ALL.intersect(HostFeatures::BASELINE), HostFeatures::BASELINE);
+        let wide = HostFeatures { lg2_vlenb: 5, ..HostFeatures::ALL };
+        assert_eq!(HostFeatures::ALL.intersect(wide), HostFeatures::ALL.without_vectors());
+    }
+
+    #[test]
+    fn vectors_need_64_bit_registers() {
+        let narrow = HostFeatures { lg2_vlenb: 2, ..HostFeatures::ALL };
+        assert_eq!(narrow.normalized(), HostFeatures::ALL.without_vectors());
+        assert_eq!(HostFeatures::ALL.normalized(), HostFeatures::ALL);
+        let d = HostFeatures::detect();
+        assert!(!d.zve64x || d.lg2_vlenb >= 3);
     }
 
     #[test]
