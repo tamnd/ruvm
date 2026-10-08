@@ -344,6 +344,11 @@ impl PciBus {
         self.root().allow_0_address.store(allow, Ordering::Relaxed);
     }
 
+    /// Whether BARs may be mapped at address 0, as [`Self::set_allow_0_address`] set it.
+    pub fn allows_0_address(&self) -> bool {
+        self.root().allow_0_address.load(Ordering::Relaxed)
+    }
+
     /// Marks the root bus as PCI Express, so the 4 KiB extended config space is reachable
     /// through [`crate::pci_host_config_read_common`]. `PCI_BUS_EXTENDED_CONFIG_SPACE`.
     pub fn set_extended_config_space(&self, on: bool) {
