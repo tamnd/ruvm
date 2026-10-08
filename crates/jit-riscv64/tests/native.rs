@@ -3,11 +3,14 @@
 //! The backend against the reference interpreter. Random scalar blocks, blocks with more live
 //! values than host registers, and hand written ones for helpers, guest memory, exits and
 //! errors, are run both ways, before and after the optimizer, and must leave the same CPU state,
-//! guest memory and exit. A hot loop is timed both ways. Blocks with vector ops are refused for
-//! now, so that the caller runs them in the interpreter.
+//! guest memory and exit, and so must random vector blocks with V64, V128 and V256 temps. A hot
+//! loop, scalar and with a vector add, is timed both ways.
 //!
-//! Every block is compiled for two sets of host extensions: what the CPU has, and plain RV64GC
-//! with none of Zba, Zbb, Zbs or Zicond, so that every fallback is exercised.
+//! Every block is compiled for the sets of host extensions in [`tiers`]: what the CPU has, the
+//! same without vectors, where vector blocks must be refused so that the caller runs them in the
+//! interpreter, and plain RV64GC with none of Zba, Zbb, Zbs or Zicond, so that every fallback is
+//! exercised. Off a riscv64 host, where code is only generated, vector registers of 64 and 256
+//! bits are added, for the register groups and fractions of a register they need.
 //!
 //! Generated code only runs on a riscv64 Linux host; elsewhere these tests check that every block
 //! compiles, for every set of extensions.
@@ -36,9 +39,18 @@ const NATIVE: bool = cfg!(all(target_os = "linux", target_arch = "riscv64"));
 /// code is only generated, so the first set is every extension.
 fn tiers() -> Vec<(&'static str, HostFeatures)> {
     let host = if NATIVE { HostFeatures::detect() } else { HostFeatures::ALL };
-    let mut out: Vec<(&'static str, HostFeatures)> = vec![("host", host)];
-    if host != HostFeatures::BASELINE {
-        out.push(("rv64gc", HostFeatures::BASELINE));
+    let mut cand = vec![("host", host)];
+    if !NATIVE {
+        cand.push(("vlen 64", HostFeatures { lg2_vlenb: 3, ..host }));
+        cand.push(("vlen 256", HostFeatures { lg2_vlenb: 5, ..host }));
+    }
+    cand.push(("no v", host.without_vectors()));
+    cand.push(("rv64gc", HostFeatures::BASELINE));
+    let mut out: Vec<(&'static str, HostFeatures)> = Vec::new();
+    for (name, t) in cand {
+        if !out.iter().any(|(_, u)| *u == t) {
+            out.push((name, t));
+        }
     }
     out
 }
@@ -98,7 +110,7 @@ fn check(
         for g in [f, &opt] {
             let tb = match r.compile(g) {
                 Ok(tb) => tb,
-                Err(GenCodeError::Unsupported(s)) if is_vector(&s) => continue,
+                Err(GenCodeError::Unsupported(s)) if !feat.zve64x && is_vector(&s) => continue,
                 Err(e) => panic!("compile ({name}): {e}\n{}", g.dump_ops(false)),
             };
             for (slot, on) in linked.iter().enumerate() {
@@ -1089,6 +1101,11 @@ impl VGen<'_> {
     }
 }
 
+/// A random vector block with `n64` V64 and `n128` V128 temps.
+fn build_vec(seed: u64, n64: usize, n128: usize) -> Func {
+    build_vec_with(seed, n64, n128, 0)
+}
+
 /// A random vector block with `n64` V64, `n128` V128 and `n256` V256 temps.
 fn build_vec_with(seed: u64, n64: usize, n128: usize, n256: usize) -> Func {
     let mut f = Func::new(FuncConfig::default());
@@ -1153,22 +1170,98 @@ fn random_env(rng: &mut Rng) -> Vec<u8> {
 }
 
 #[test]
-fn vector_blocks_are_refused() {
+fn random_vector_blocks_match_the_interpreter() {
     let mut rng = Rng::new(0x7ec);
     let reg = HelperRegistry::new();
     let mem = FlatMemory::new(MEM_BASE, 16);
-    for _ in 0..20 {
+    for _ in 0..1500 {
         let seed = rng.next();
         let env = random_env(&mut rng);
-        let f = build_vec_with(seed, 1, 2, 1);
-        for (name, feat) in tiers() {
-            match region_with(feat).compile(&f) {
-                Err(GenCodeError::Unsupported(s)) if is_vector(&s) => {}
-                other => panic!("{name}: {:?}", other.map(|_| ())),
-            }
-        }
+        let f = build_vec(seed, 2, 3);
         let (x, _, _) = check(&f, &env, &mem, &reg, [false; 2]);
         assert_eq!(x, Ok(Exit::ExitTb(0)), "seed {seed:#x}");
+    }
+}
+
+#[test]
+fn random_256_bit_vector_blocks_match_the_interpreter() {
+    let mut rng = Rng::new(0x256);
+    let reg = HelperRegistry::new();
+    let mem = FlatMemory::new(MEM_BASE, 16);
+    for _ in 0..1000 {
+        let seed = rng.next();
+        let env = random_env(&mut rng);
+        let f = build_vec_with(seed, 1, 2, 3);
+        let (x, _, _) = check(&f, &env, &mem, &reg, [false; 2]);
+        assert_eq!(x, Ok(Exit::ExitTb(0)), "seed {seed:#x}");
+    }
+}
+
+#[test]
+fn vector_blocks_are_refused_without_vectors() {
+    let mut rng = Rng::new(0x7ef);
+    for _ in 0..20 {
+        let f = build_vec_with(rng.next(), 1, 2, 1);
+        for (name, feat) in tiers() {
+            match region_with(feat).compile(&f) {
+                Err(GenCodeError::Unsupported(s)) if is_vector(&s) => assert!(!feat.zve64x),
+                other => assert!(feat.zve64x, "{name}: {:?}", other.map(|_| ())),
+            }
+        }
+    }
+}
+
+#[test]
+fn vector_values_are_exact() {
+    let mut f = Func::new(FuncConfig::default());
+    let env = f.env();
+    let (a, b) = (f.temp_new_vec(Type::V128), f.temp_new_vec(Type::V128));
+    let r = f.temp_new_vec(Type::V128);
+    f.gen_ld_vec(a, env, VEC);
+    f.gen_ld_vec(b, env, VEC + 16);
+    f.gen_add_vec(0, r, a, b);
+    f.gen_st_vec(r, env, VEC + 32);
+    f.gen_mul_vec(3, r, a, b);
+    f.gen_st_vec(r, env, VEC + 48);
+    f.gen_umin_vec(3, r, a, b);
+    f.gen_st_vec(r, env, VEC + 64);
+    f.gen_exit_tb(0, 0);
+    let mut e = vec![0u8; ENV_SIZE];
+    let va: [u64; 2] = [0x01ff_0203_0405_0607, 0x8000_0000_0000_0003];
+    let vb: [u64; 2] = [0x0101_0101_0101_01ff, 0x0000_0000_0000_0005];
+    for k in 0..2 {
+        let (o, p) = (VEC as usize + 8 * k, VEC as usize + 16 + 8 * k);
+        e[o..o + 8].copy_from_slice(&va[k].to_le_bytes());
+        e[p..p + 8].copy_from_slice(&vb[k].to_le_bytes());
+    }
+    let mem = FlatMemory::new(MEM_BASE, 16);
+    let (x, e, _) = check(&f, &e, &mem, &HelperRegistry::new(), [false; 2]);
+    assert_eq!(x, Ok(Exit::ExitTb(0)));
+    let base = VEC as usize;
+    assert_eq!(rd64(&e, base + 32), 0x0200_0304_0506_0706);
+    assert_eq!(rd64(&e, base + 48 + 8), 0x8000_0000_0000_000f);
+    assert_eq!(rd64(&e, base + 64), 0x0101_0101_0101_01ff);
+}
+
+#[test]
+fn vector_access_through_a_pointer() {
+    let mut f = Func::new(FuncConfig::default());
+    let env = f.env();
+    let base = f.global_mem_new_ptr(env, 0x0, "base");
+    let (v, w) = (f.temp_new_vec(Type::V128), f.temp_new_vec(Type::V64));
+    f.gen_ld_vec(v, base, 0x10);
+    f.gen_dup_mem_vec(1, w, base, 0x2);
+    f.gen_st_vec(v, base, 0x20);
+    f.gen_st_vec(w, env, 0x8);
+    f.gen_exit_tb(0, 0);
+    let mem = FlatMemory::new(MEM_BASE, 16);
+    let reg = HelperRegistry::new();
+    let mut rng = Rng::new(0xbee);
+    let mut e = random_env(&mut rng);
+    for (p, ok) in [(0x100u64, true), (0x3d0, true), (0x3e0, false), (u64::MAX - 8, false)] {
+        e[0..8].copy_from_slice(&p.to_le_bytes());
+        let (x, _, _) = check(&f, &e, &mem, &reg, [false; 2]);
+        assert_eq!(x.is_ok(), ok, "{p:#x}: {x:?}");
     }
 }
 
@@ -1192,15 +1285,24 @@ fn register_pressure_spills_match_the_interpreter() {
         let f = build_with(seed, 30, call);
         let (x, _, _) = check(&f, &env, &mem, &reg, [false; 2]);
         assert!(matches!(x, Ok(Exit::ExitTb(_))), "seed {seed:#x}: {x:?}");
+        // More live vectors than the 31 vector registers, or the 15 or 7 groups of a V256.
+        let f = build_vec(seed, 12, 24);
+        let (x, _, _) = check(&f, &env, &mem, &reg, [false; 2]);
+        assert_eq!(x, Ok(Exit::ExitTb(0)), "seed {seed:#x}");
+        let f = build_vec_with(seed, 4, 6, 8);
+        let (x, _, _) = check(&f, &env, &mem, &reg, [false; 2]);
+        assert_eq!(x, Ok(Exit::ExitTb(0)), "seed {seed:#x}");
     }
 }
 
-/// A counted loop: a multiply, add and shift chain on two globals per iteration.
-fn hot_loop(iters: i64) -> Func {
+/// A counted loop: a multiply, add and shift chain on two globals per iteration, and with
+/// `vec` a 128-bit vector add too.
+fn hot_loop(iters: i64, vec: bool) -> Func {
     let mut f = Func::new(FuncConfig::default());
     let env = f.env();
     let n = f.global_mem_new_i64(env, G64, "n");
     let acc = f.global_mem_new_i64(env, G64 + 8, "acc");
+    let (v, w) = (f.temp_new_vec(Type::V128), f.temp_new_vec(Type::V128));
     let t = f.temp_new_i64();
     f.gen_movi_i64(n, iters);
     let top = f.new_label();
@@ -1209,6 +1311,13 @@ fn hot_loop(iters: i64) -> Func {
     f.gen_add_i64(acc, acc, n);
     f.gen_shri_i64(t, acc, 29);
     f.gen_xor_i64(acc, acc, t);
+    if vec {
+        // Vector temps do not live across a label, so the sum goes through the CPU state.
+        f.gen_ld_vec(v, env, VEC + 32);
+        f.gen_ld_vec(w, env, VEC + 16);
+        f.gen_add_vec(2, v, v, w);
+        f.gen_st_vec(v, env, VEC + 32);
+    }
     f.gen_subi_i64(n, n, 1);
     f.gen_brcondi_i64(Cond::Ne, n, 0, top);
     f.gen_exit_tb(0, 0);
@@ -1218,31 +1327,37 @@ fn hot_loop(iters: i64) -> Func {
 #[test]
 fn hot_loop_native_vs_interpreter() {
     let iters = 100_000;
-    let f = hot_loop(iters);
-    let mut opt = f.clone();
-    opt.gen_code(true, LogMask::default());
-    let mut rng = Rng::new(0x100b);
-    let env = random_env(&mut rng);
-    let mem = FlatMemory::new(MEM_BASE, 16);
-    let reg = HelperRegistry::new();
-    let t0 = std::time::Instant::now();
-    let want = interp(&opt, &env, &mem, &reg, [false; 2]);
-    let t_interp = t0.elapsed();
-    assert_eq!(want.0, Ok(Exit::ExitTb(0)));
-    for (name, feat) in tiers() {
-        let tb = compile(&region_with(feat), &opt);
-        if !NATIVE {
-            continue;
-        }
+    for vec in [false, true] {
+        let f = hot_loop(iters, vec);
+        let mut opt = f.clone();
+        opt.gen_code(true, LogMask::default());
+        let mut rng = Rng::new(0x100b);
+        let env = random_env(&mut rng);
+        let mem = FlatMemory::new(MEM_BASE, 16);
+        let reg = HelperRegistry::new();
         let t0 = std::time::Instant::now();
-        let got = native(&tb, &env, &mem, &reg);
-        let t_native = t0.elapsed();
-        assert!(got.0 == want.0 && got.1 == want.1 && got.2 == want.2, "hot loop differs");
-        println!(
-            "hot loop ({name}: {feat:?}), {iters} iterations: interpreter {t_interp:?}, \
-             native {t_native:?}, speedup {:.1}x",
-            t_interp.as_secs_f64() / t_native.as_secs_f64().max(1e-9)
-        );
+        let want = interp(&opt, &env, &mem, &reg, [false; 2]);
+        let t_interp = t0.elapsed();
+        assert_eq!(want.0, Ok(Exit::ExitTb(0)));
+        for (name, feat) in tiers() {
+            if vec && !feat.zve64x {
+                continue;
+            }
+            let tb = compile(&region_with(feat), &opt);
+            if !NATIVE {
+                continue;
+            }
+            let t0 = std::time::Instant::now();
+            let got = native(&tb, &env, &mem, &reg);
+            let t_native = t0.elapsed();
+            assert!(got.0 == want.0 && got.1 == want.1 && got.2 == want.2, "hot loop differs");
+            println!(
+                "hot loop{} ({name}: {feat:?}), {iters} iterations: interpreter {t_interp:?}, \
+                 native {t_native:?}, speedup {:.1}x",
+                if vec { " with vectors" } else { "" },
+                t_interp.as_secs_f64() / t_native.as_secs_f64().max(1e-9)
+            );
+        }
     }
 }
 

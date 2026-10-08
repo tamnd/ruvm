@@ -12,7 +12,11 @@
 //! - s4 to s11, t0 to t2 and a0 to a7 hold temps, callee-saved ones first in the allocation
 //!   order;
 //! - t6, t5 and t4 are scratch (`TCG_REG_TMP0`, `TMP1` and `TMP2`), and t3 is a fourth scratch
-//!   for the expansions of this port, and the carry between two adjacent carry ops.
+//!   for the expansions of this port, and the carry between two adjacent carry ops;
+//! - with the vector extension, v1 to v31 hold vector temps and v0 is the mask and a scratch,
+//!   as in QEMU. With registers shorter than 256 bits, a V256 needs a group of two or four of
+//!   them, and then only the first register of each such group is used, as in QEMU, so that
+//!   every vector type fits in every register in use.
 //!
 //! I32 values are kept sign extended to 64 bits in registers, as QEMU does on this host: every
 //! I32 op leaves its result that way, mostly through the `*w` instructions, so that comparisons
@@ -33,6 +37,12 @@
 //!
 //! Zba, Zbb, Zbs and Zicond are used as [`HostFeatures`] allows, each with the fallback QEMU
 //! has, or an inline expansion where QEMU leaves the op to the generic expanders.
+//!
+//! Vector ops use RVV 1.0 (Zve64x is enough) as QEMU does: each op sets `vl` to the elements of
+//! its type with `vsetivli` or `vsetvli`, LMUL being the type's size over the register length,
+//! and the setting is remembered so that the next op of the same type and element size needs
+//! none. Without the vector extension, blocks with vector ops are refused, so that the caller
+//! runs them in the interpreter.
 //!
 //! Differences from QEMU:
 //!
@@ -80,14 +90,31 @@
 //! - A 32-bit load of the `icount_decr` word at the offset the runtime gives reads the shared
 //!   atomic through a pointer in the run context, so that exit requests from other threads
 //!   are seen without leaving generated code. In QEMU the word is part of the CPU state.
-//! - Vector ops are refused, so blocks with them run in the interpreter. QEMU uses RVV.
+//! - `andc`, `orc`, `nand`, `nor`, `eqv`, `abs` and `bitsel` on vectors, and vector compares
+//!   with `tsteq`, `tstne`, `never` and `always`, are expanded inline with v0 as the scratch.
+//!   QEMU leaves them to the generic expanders.
+//! - `sssub`, `ussub`, `smin`, `umin`, `smax` and `umax` on vectors take no immediate operand:
+//!   RVV 1.0 has no `.vi` form of them, so QEMU's `vK` constraint there would give reserved
+//!   encodings. A vector immediate must also be the same in every element of the op's size,
+//!   and `and`, `or` and `xor` with one set the op's element size, which QEMU leaves as it was.
+//! - `dupm` loads the element alone with a scalar load of its size; QEMU loads 8 bytes.
+//! - Whole register vector loads use byte elements (`vl<n>re8.v`), so that they need no
+//!   alignment; QEMU uses `vl<n>re64.v`.
+//! - A fraction of a register is used for a vector smaller than one only where the
+//!   specification guarantees it with 64-bit elements at most, instead of probing with
+//!   `vsetvl` at startup; otherwise a whole register is set with a shorter `vl`, as QEMU does
+//!   when the probe fails.
+//! - The remembered vector setting is forgotten at the start of the block, after every call
+//!   and guest access with a slow path, as in QEMU, and also at every label, since paths that
+//!   meet there may have left different settings. A vector move with no setting known sets
+//!   one first, since `vmv<n>r.v` is illegal while the host's setting is invalid.
 
 use ruvm_jit_core::ir::{Func, HelperType, Op, OpId, Temp};
 use ruvm_jit_core::memory_model::{FenceMapping, ldst_flags};
 use ruvm_jit_core::opcode::Opcode;
 use ruvm_jit_core::regalloc::{self, Letter, RegSet, Target};
 use ruvm_jit_core::types::{
-    Cond, INSN_START_WORDS, MemOp, MemOpIdx, TempKind, Type, bswap, call_flags, mo, opf,
+    Cond, INSN_START_WORDS, MemOp, MemOpIdx, TempKind, Type, bswap, call_flags, dup_const, mo, opf,
 };
 use ruvm_jit_interp::HelperRegistry;
 use ruvm_jit_interp::fast_tlb::{
@@ -95,7 +122,8 @@ use ruvm_jit_interp::fast_tlb::{
 };
 
 use crate::asm::{
-    self, A0, A1, A2, Asm, AsmError, RA, Reg, SP, TMP0, TMP1, TMP2, TMP3, ZERO, is_imm12, opc,
+    self, A0, A1, A2, Asm, AsmError, RA, Reg, SP, TMP0, TMP1, TMP2, TMP3, V0, ZERO, is_imm12, opc,
+    vop,
 };
 use crate::features::HostFeatures;
 
@@ -284,11 +312,21 @@ pub(crate) fn ic_way(pc: u64) -> usize {
 
 /// The general registers the allocator may use: t0 to t2, a0 to a7 and s4 to s11.
 const GPRS: RegSet = RegSet(0x7 << 5 | 0xff << 10 | 0xff << 20);
-/// `tcg_target_reg_alloc_order`: callee-saved registers first, so values survive calls.
-const ALLOC_ORDER: [Reg; 19] =
-    [20, 21, 22, 23, 24, 25, 26, 27, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17];
-/// The registers a call to Rust may change: ra, t0 to t6 and a0 to a7.
-const CALL_CLOBBER: RegSet = RegSet(1 << 1 | 0x7 << 5 | 0xff << 10 | 0xf << 28);
+/// Every vector register, `ALL_VECTOR_REGS`.
+const VECS: u64 = 0xffff_ffff << 32;
+/// The first registers of groups of two and of four, `ALL_DVECTOR_REG_GROUPS` and
+/// `ALL_QVECTOR_REG_GROUPS`.
+const VEC_PAIRS: u64 = 0x5555_5555 << 32;
+const VEC_QUADS: u64 = 0x1111_1111 << 32;
+/// `tcg_target_reg_alloc_order`: callee-saved registers first, so values survive calls, then
+/// v1 to v31.
+const ALLOC_ORDER: [Reg; 50] = [
+    20, 21, 22, 23, 24, 25, 26, 27, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 33, 34, 35, 36, 37,
+    38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
+    62, 63,
+];
+/// The registers a call to Rust may change: ra, t0 to t6, a0 to a7 and every vector register.
+const CALL_CLOBBER: RegSet = RegSet(1 << 1 | 0x7 << 5 | 0xff << 10 | 0xf << 28 | VECS);
 /// Never allocated: zero, ra, sp, gp, tp, the fixed registers and the scratch registers.
 const RESERVED: RegSet = RegSet(0x1f | 0x3 << 8 | 0x3 << 18 | 0xf << 28);
 
@@ -301,6 +339,47 @@ mod ctc {
     /// A value from -0x7ff to 0x7ff, so that it and its negation are immediates,
     /// `TCG_CT_CONST_M12`.
     pub(super) const M12: u32 = 0x200;
+    /// A vector element from -16 to 15, the `.vi` immediate, `TCG_CT_CONST_S5`.
+    pub(super) const S5: u32 = 0x800;
+    /// A vector element the `.vi` compare for the op's condition can take,
+    /// `TCG_CT_CONST_CMP_VI`.
+    pub(super) const CMP_VI: u32 = 0x1000;
+}
+
+/// `tcg_cmpcond_to_rvv_vv`: the compare instruction for `c` between two vectors, and whether
+/// its operands go the other way round.
+fn cmp_vv(c: Cond) -> Option<(u32, bool)> {
+    Some(match c {
+        Cond::Eq => (vop::VMSEQ, false),
+        Cond::Ne => (vop::VMSNE, false),
+        Cond::Lt => (vop::VMSLT, false),
+        Cond::Ge => (vop::VMSLE, true),
+        Cond::Gt => (vop::VMSLT, true),
+        Cond::Le => (vop::VMSLE, false),
+        Cond::Ltu => (vop::VMSLTU, false),
+        Cond::Geu => (vop::VMSLEU, true),
+        Cond::Gtu => (vop::VMSLTU, true),
+        Cond::Leu => (vop::VMSLEU, false),
+        _ => return None,
+    })
+}
+
+/// `tcg_cmpcond_to_rvv_vi`: the compare instruction for `c` with an immediate, the range of
+/// immediates it takes, and what to subtract from the immediate to encode it.
+fn cmp_vi(c: Cond) -> Option<(u32, i64, i64, i64)> {
+    Some(match c {
+        Cond::Eq => (vop::VMSEQ, -16, 15, 0),
+        Cond::Ne => (vop::VMSNE, -16, 15, 0),
+        Cond::Gt => (vop::VMSGT, -16, 15, 0),
+        Cond::Le => (vop::VMSLE, -16, 15, 0),
+        Cond::Lt => (vop::VMSLE, -15, 16, 1),
+        Cond::Ge => (vop::VMSGT, -15, 16, 1),
+        Cond::Leu => (vop::VMSLEU, 0, 15, 0),
+        Cond::Gtu => (vop::VMSGTU, 0, 15, 0),
+        Cond::Ltu => (vop::VMSLEU, 1, 16, 1),
+        Cond::Geu => (vop::VMSGTU, 1, 16, 1),
+        _ => return None,
+    })
 }
 
 /// `TCG_TARGET_HAS_*` style decision: the flags an op gets on top of its definition.
@@ -314,10 +393,13 @@ fn extra_flags(f: &Func, op: &Op) -> u32 {
         | Opcode::Ld32u
         | Opcode::Ld32s
         | Opcode::Ld
+        | Opcode::LdVec
+        | Opcode::DupmVec
         | Opcode::St8
         | Opcode::St16
         | Opcode::St32
-        | Opcode::St => may_fault(f, op, 1),
+        | Opcode::St
+        | Opcode::StVec => may_fault(f, op, 1),
         _ => 0,
     }
 }
@@ -352,7 +434,7 @@ pub(crate) fn generate(
     feat: HostFeatures,
     opts: &GenOptions<'_>,
 ) -> R<Generated> {
-    check_types(f)?;
+    check_types(f, feat.normalized())?;
     let (prepared, live) = regalloc::prepare_live(f, &extra_flags);
     let f: &Func = &prepared;
     let c = &f.config;
@@ -380,6 +462,7 @@ pub(crate) fn generate(
         ic_sites: Vec::new(),
         helpers: opts.helpers,
         slow_paths: Vec::new(),
+        vtype: None,
     };
     g.exit = g.a.new_label();
     g.bounds = g.a.new_label();
@@ -489,18 +572,23 @@ pub(crate) fn generate(
     })
 }
 
-/// Refuse temps of types this backend has no registers for, vector ops, and calls with more
-/// arguments than the run context holds.
-fn check_types(f: &Func) -> R<()> {
+/// Refuse temps of types this backend has no registers for, vector ops without the vector
+/// extension, and calls with more arguments than the run context holds.
+fn check_types(f: &Func, feat: HostFeatures) -> R<()> {
+    let ok = |ty: Type| match ty {
+        Type::I32 | Type::I64 => true,
+        Type::V64 | Type::V128 | Type::V256 => feat.zve64x,
+        _ => false,
+    };
     for (_, op) in f.ops() {
         let n = op.nb_oargs() + op.nb_iargs();
         for k in 0..n {
             let ty = f.temp(op.arg_temp(k)).ty;
-            if !matches!(ty, Type::I32 | Type::I64) {
+            if !ok(ty) {
                 return Err(GenCodeError::Unsupported(format!("{}: {ty:?} temps", op.opc.name())));
             }
         }
-        if op.opc.def().flags & opf::VECTOR != 0 {
+        if op.opc.def().flags & opf::VECTOR != 0 && !(op.ty.is_vector() && ok(op.ty)) {
             return Err(GenCodeError::Unsupported(format!("{}: {:?}", op.opc.name(), op.ty)));
         }
         if op.opc == Opcode::Call && (op.calli as usize > NARGS || op.callo > 2) {
@@ -580,6 +668,9 @@ struct Gen<'h> {
     helpers: Option<&'h HelperRegistry>,
     /// The miss paths of guest accesses whose hit path is inline, emitted after the block.
     slow_paths: Vec<SlowPath>,
+    /// The vector type and element size `vl` was last set for, `riscv_cur_type` and
+    /// `riscv_cur_vsew`, or `None` where it is not known.
+    vtype: Option<(Type, u32)>,
 }
 
 /// The miss path of one `qemu_ld` or `qemu_st`, kept until the end of the block as QEMU's
@@ -618,6 +709,16 @@ const C_R_0_RZ: &[&str] = &["r", "0", "rz"];
 const C_R_R_R_R: &[&str] = &["r", "r", "r", "r"];
 const C_R5: &[&str] = &["r", "r", "r", "r", "r"];
 const C_MOVCOND: &[&str] = &["r", "r", "rI", "rM", "rM"];
+const C_V_R: &[&str] = &["v", "r"];
+const C_V_RI: &[&str] = &["v", "ri"];
+const C_V_V: &[&str] = &["v", "v"];
+const C_V_V_R: &[&str] = &["v", "v", "r"];
+const C_V_V_V: &[&str] = &["v", "v", "v"];
+const C_V_V_VK: &[&str] = &["v", "v", "vK"];
+const C_V_VK_V: &[&str] = &["v", "vK", "v"];
+const C_V_V_VL: &[&str] = &["v", "v", "vL"];
+const C_V4: &[&str] = &["v", "v", "v", "v"];
+const C_CMPSEL: &[&str] = &["v", "v", "vL", "vK", "vK"];
 const C_NONE: &[&str] = &[];
 
 impl Gen<'_> {
@@ -740,6 +841,7 @@ impl Gen<'_> {
         self.a.movi(Type::I64, A1, (idx as u64 | site | tag << 32) as i64);
         self.a.movi(Type::I64, A2, self.meta as i64);
         self.a.call_abs(routine);
+        self.vtype = None;
         if let Some(w) = after {
             self.a.emit(w);
         }
@@ -759,6 +861,7 @@ impl Gen<'_> {
             self.a.ld(Type::I64, A0 + k as Reg, CTX, 8 * k as i64);
         }
         self.a.call_abs(addr);
+        self.vtype = None;
         if ret != HelperType::Void {
             self.a.st(Type::I64, A0, CTX, 0);
         }
@@ -1683,6 +1786,8 @@ impl Gen<'_> {
             self.ldst_slow(&sp);
             self.a.bind(sp.done);
         }
+        // The miss path calls Rust, which may change the vector setting.
+        self.vtype = None;
     }
 
     /// The guest address in `addr` as a 64-bit value: zero extended into TMP3 for 32-bit
@@ -1781,6 +1886,385 @@ impl Gen<'_> {
     }
 }
 
+/// The element of the vector constant `val`, which repeats it in every `bits`-bit element.
+fn vec_elem(val: u64, bits: u32) -> i64 {
+    asm::sext(val as i64, bits)
+}
+
+/// The vector half of the code generator, QEMU's `tcg_out_vec_op` and the helpers it uses.
+impl Gen<'_> {
+    /// LMUL for `ty` as a base 2 logarithm, negative when `ty` is smaller than a register.
+    fn lmul(&self, ty: Type) -> i32 {
+        ty.size().trailing_zeros() as i32 - self.feat().lg2_vlenb as i32
+    }
+
+    /// `set_vtype`: set `vl` to the elements of `8 << vsew` bits in `ty`. May change TMP0.
+    fn set_vtype(&mut self, ty: Type, vsew: u32) {
+        self.vtype = Some((ty, vsew));
+        let avl = ty.size() >> vsew;
+        let mut lmul = self.lmul(ty);
+        let mut exact = true;
+        // A fraction of a register is only certain to work for elements of up to that fraction
+        // of 64 bits; for others, and below an eighth, use a whole register with a shorter vl.
+        // QEMU probes with `vsetvl` instead, see `probe_frac_lmul_1`.
+        if lmul < 0 && (lmul < -3 || 8u32 << vsew > 64u32 >> -lmul) {
+            lmul = 0;
+            exact = false;
+        }
+        let vtype = asm::encode_vtype(vsew, lmul);
+        if avl < 32 {
+            self.a.emit(asm::encode_vseti(ZERO, avl, vtype));
+        } else if exact {
+            // rd != 0 and rs1 == 0 sets vl to the most elements.
+            self.a.emit(asm::encode_vset(TMP0, ZERO, vtype));
+        } else {
+            self.a.addi(TMP0, ZERO, avl as i64);
+            self.a.emit(asm::encode_vset(ZERO, TMP0, vtype));
+        }
+    }
+
+    /// `set_vtype_len`: set `vl` to cover `ty` with any element size, keeping the element size
+    /// already set for `ty`. Returns the element size.
+    fn set_vtype_len(&mut self, ty: Type) -> u32 {
+        match self.vtype {
+            Some((t, vsew)) if t == ty => vsew,
+            _ => {
+                self.set_vtype(ty, 3);
+                3
+            }
+        }
+    }
+
+    /// `set_vtype_len_sew`.
+    fn set_vtype_len_sew(&mut self, ty: Type, vsew: u32) {
+        if self.vtype != Some((ty, vsew)) {
+            self.set_vtype(ty, vsew);
+        }
+    }
+
+    /// The instruction that loads or stores a `ty` register, as `tcg_out_ld` and `tcg_out_st`
+    /// pick it. May set `vl`, and so change TMP0.
+    fn vec_insn(&mut self, ty: Type, store: bool) -> u32 {
+        let lmul = self.lmul(ty);
+        if lmul >= 0 {
+            let insn = if store { vop::VS1R } else { vop::VL1RE8 };
+            insn | ((1u32 << lmul) - 1) << 29
+        } else {
+            let vsew = self.set_vtype_len(ty) as usize;
+            if store { vop::VSE[vsew] } else { vop::VLE[vsew] }
+        }
+    }
+
+    /// `tcg_out_mov` for vectors: `vmv<n>r.v`, which copies whole registers.
+    fn vmov(&mut self, ty: Type, d: Reg, s: Reg) {
+        if d == s {
+            return;
+        }
+        // The copy ignores vl, but not a vtype the host left unusable.
+        if self.vtype.is_none() {
+            self.set_vtype_len(ty);
+        }
+        let nf = 1i64 << self.lmul(ty).max(0);
+        self.a.vi(vop::VMVNR | vop::IVI, d, s, nf - 1);
+    }
+
+    /// `tcg_out_dupi_vec`: every element of `d` set to the element of `val`.
+    fn vdupi(&mut self, ty: Type, vece: u32, d: Reg, val: u64) {
+        let e = vec_elem(val, 8 << vece);
+        // Setting vl may change TMP0, so it comes first.
+        if e == 0 || e == -1 {
+            self.set_vtype_len(ty);
+        } else {
+            self.set_vtype_len_sew(ty, vece);
+        }
+        if (-16..16).contains(&e) {
+            self.a.vi(vop::VMV_V | vop::IVI, d, 0, e);
+        } else {
+            self.a.movi(Type::I64, TMP0, e);
+            self.a.vx(vop::VMV_V | vop::IVX, d, 0, TMP0);
+        }
+    }
+
+    /// `tcg_out_opc_vv_vi`: `d = a op b`, `b` being a register or an immediate element.
+    fn vv_vi(&mut self, op: u32, d: Reg, a: Reg, b: u64, b_const: bool, bits: u32) {
+        if b_const {
+            self.a.vi(op | vop::IVI, d, a, vec_elem(b, bits));
+        } else {
+            self.a.vv(op | vop::IVV, d, a, b as Reg);
+        }
+    }
+
+    /// `tcg_out_vshifti`: shift by a constant, through TMP0 when it does not fit the immediate.
+    fn vshifti(&mut self, op: u32, d: Reg, s: Reg, n: u32) {
+        if n < 32 {
+            self.a.vi(op | vop::IVI, d, s, n as i64);
+        } else {
+            self.a.movi(Type::I32, TMP0, n as i64);
+            self.a.vx(op | vop::IVX, d, s, TMP0);
+        }
+    }
+
+    /// Compare `a` with `b` for `c` into the mask in v0, with `vl` already set for the elements.
+    fn vcmp(&mut self, c: Cond, a: Reg, b: u64, b_const: bool, bits: u32) -> R<()> {
+        if c.is_tst() {
+            // The constraint gives `b` a register for these.
+            self.a.vv(vop::VAND | vop::IVV, V0, a, b as Reg);
+            let op = if c == Cond::TstEq { vop::VMSEQ } else { vop::VMSNE };
+            self.a.vi(op | vop::IVI, V0, V0, 0);
+        } else if b_const {
+            let (op, _, _, adjust) = cmp_vi(c).ok_or_else(|| self.bad_cond(c))?;
+            self.a.vi(op | vop::IVI, V0, a, vec_elem(b, bits) - adjust);
+        } else {
+            let (op, swap) = cmp_vv(c).ok_or_else(|| self.bad_cond(c))?;
+            let (x, y) = if swap { (b as Reg, a) } else { (a, b as Reg) };
+            self.a.vv(op | vop::IVV, V0, x, y);
+        }
+        Ok(())
+    }
+
+    fn bad_cond(&self, c: Cond) -> GenCodeError {
+        GenCodeError::BadOp(format!("vector compare with {c:?}"))
+    }
+
+    /// `tcg_out_cmpsel`: `d = a c b ? v1 : v2`, each of `b`, `v1` and `v2` a register or an
+    /// immediate element.
+    #[allow(clippy::too_many_arguments)]
+    fn cmpsel(
+        &mut self,
+        ty: Type,
+        vece: u32,
+        mut c: Cond,
+        d: Reg,
+        a: Reg,
+        b: (u64, bool),
+        v1: (u64, bool),
+        v2: (u64, bool),
+    ) -> R<()> {
+        let bits = 8 << vece;
+        self.set_vtype_len_sew(ty, vece);
+        if matches!(c, Cond::Never | Cond::Always) {
+            let (v, k) = if c == Cond::Always { v1 } else { v2 };
+            if k {
+                self.a.vi(vop::VMV_V | vop::IVI, d, 0, vec_elem(v, bits));
+            } else if d != v as Reg {
+                self.a.vv(vop::VMV_V | vop::IVV, d, 0, v as Reg);
+            }
+            return Ok(());
+        }
+        let (mut v1, mut v2) = (v1, v2);
+        // Use only `vmerge.vim` where possible, by inverting the test.
+        if v2.1 && !v1.1 {
+            std::mem::swap(&mut v1, &mut v2);
+            c = c.invert();
+        }
+        self.vcmp(c, a, b.0, b.1, bits)?;
+        if v1.1 {
+            let mut src = v2.0 as Reg;
+            if v2.1 {
+                self.a.vi(vop::VMV_V | vop::IVI, d, 0, vec_elem(v2.0, bits));
+                src = d;
+            }
+            // d[i] = v0.mask[i] ? imm : src[i]
+            self.a.vim(vop::VMERGE | vop::IVI, d, src, vec_elem(v1.0, bits));
+        } else {
+            // d[i] = v0.mask[i] ? v1[i] : v2[i]
+            self.a.vvm(vop::VMERGE | vop::IVV, d, v2.0 as Reg, v1.0 as Reg);
+        }
+        Ok(())
+    }
+
+    /// `tcg_out_vec_op`, and `tcg_out_dup_vec` and `tcg_out_dupm_vec`.
+    fn out_vector(&mut self, f: &Func, op: &Op, args: &[u64], const_args: &[bool]) -> R<()> {
+        let ty = op.ty;
+        let vece = op.vece as u32;
+        let bits = 8u32 << vece;
+        let r = |k: usize| args[k] as Reg;
+        let d = r(0);
+        match op.opc {
+            Opcode::LdVec | Opcode::StVec => {
+                // Setting vl may change TMP0, so it comes before the address.
+                let insn = self.vec_insn(ty, op.opc == Opcode::StVec);
+                match self.host_addr(f, op, args, const_args, 1, ty.size() as u64) {
+                    Addr::Static(off) => self.a.vldst(insn, d, ENV, off),
+                    Addr::Dyn => {
+                        self.a.r(opc::ADD, TMP0, ENV, TMP0);
+                        self.a.vldst(insn, d, TMP0, 0);
+                    }
+                }
+            }
+            Opcode::DupmVec => {
+                let addr = self.host_addr(f, op, args, const_args, 1, 1 << vece);
+                let insn = [opc::LBU, opc::LHU, opc::LWU, opc::LD][vece as usize];
+                self.host_access(addr, insn, TMP1);
+                self.set_vtype_len_sew(ty, vece);
+                self.a.vx(vop::VMV_V | vop::IVX, d, 0, TMP1);
+            }
+            Opcode::DupVec => {
+                self.set_vtype_len_sew(ty, vece);
+                let mut s = r(1);
+                // An I32 is sign extended in its register, and dup_vec zero extends it.
+                if vece == 3 && f.temp(op.arg_temp(1)).ty == Type::I32 {
+                    self.a.ext32u(TMP0, s);
+                    s = TMP0;
+                }
+                self.a.vx(vop::VMV_V | vop::IVX, d, 0, s);
+            }
+            Opcode::AddVec | Opcode::SsaddVec | Opcode::UsaddVec => {
+                let insn = match op.opc {
+                    Opcode::AddVec => vop::VADD,
+                    Opcode::SsaddVec => vop::VSADD,
+                    _ => vop::VSADDU,
+                };
+                self.set_vtype_len_sew(ty, vece);
+                self.vv_vi(insn, d, r(1), args[2], const_args[2], bits);
+            }
+            Opcode::AndVec | Opcode::OrVec | Opcode::XorVec => {
+                let insn = match op.opc {
+                    Opcode::AndVec => vop::VAND,
+                    Opcode::OrVec => vop::VOR,
+                    _ => vop::VXOR,
+                };
+                // The immediate is sign extended from the element size, so that must be set.
+                if const_args[2] {
+                    self.set_vtype_len_sew(ty, vece);
+                } else {
+                    self.set_vtype_len(ty);
+                }
+                self.vv_vi(insn, d, r(1), args[2], const_args[2], bits);
+            }
+            Opcode::SubVec => {
+                self.set_vtype_len_sew(ty, vece);
+                if const_args[1] {
+                    self.a.vi(vop::VRSUB | vop::IVI, d, r(2), vec_elem(args[1], bits));
+                } else {
+                    self.a.vv(vop::VSUB | vop::IVV, d, r(1), r(2));
+                }
+            }
+            Opcode::MulVec => {
+                self.set_vtype_len_sew(ty, vece);
+                self.a.vv(vop::VMUL | vop::MVV, d, r(1), r(2));
+            }
+            Opcode::SssubVec
+            | Opcode::UssubVec
+            | Opcode::SminVec
+            | Opcode::UminVec
+            | Opcode::SmaxVec
+            | Opcode::UmaxVec
+            | Opcode::ShlvVec
+            | Opcode::ShrvVec
+            | Opcode::SarvVec => {
+                let insn = match op.opc {
+                    Opcode::SssubVec => vop::VSSUB,
+                    Opcode::UssubVec => vop::VSSUBU,
+                    Opcode::SminVec => vop::VMIN,
+                    Opcode::UminVec => vop::VMINU,
+                    Opcode::SmaxVec => vop::VMAX,
+                    Opcode::UmaxVec => vop::VMAXU,
+                    Opcode::ShlvVec => vop::VSLL,
+                    Opcode::ShrvVec => vop::VSRL,
+                    _ => vop::VSRA,
+                };
+                self.set_vtype_len_sew(ty, vece);
+                self.a.vv(insn | vop::IVV, d, r(1), r(2));
+            }
+            Opcode::NegVec => {
+                self.set_vtype_len_sew(ty, vece);
+                self.a.vi(vop::VRSUB | vop::IVI, d, r(1), 0);
+            }
+            Opcode::AbsVec => {
+                self.set_vtype_len_sew(ty, vece);
+                self.a.vi(vop::VRSUB | vop::IVI, V0, r(1), 0);
+                self.a.vv(vop::VMAX | vop::IVV, d, r(1), V0);
+            }
+            Opcode::NotVec => {
+                self.set_vtype_len(ty);
+                self.a.vi(vop::VXOR | vop::IVI, d, r(1), -1);
+            }
+            Opcode::AndcVec | Opcode::OrcVec => {
+                let insn = if op.opc == Opcode::AndcVec { vop::VAND } else { vop::VOR };
+                self.set_vtype_len(ty);
+                self.a.vi(vop::VXOR | vop::IVI, V0, r(2), -1);
+                self.a.vv(insn | vop::IVV, d, r(1), V0);
+            }
+            Opcode::NandVec | Opcode::NorVec | Opcode::EqvVec => {
+                let insn = match op.opc {
+                    Opcode::NandVec => vop::VAND,
+                    Opcode::NorVec => vop::VOR,
+                    _ => vop::VXOR,
+                };
+                self.set_vtype_len(ty);
+                self.a.vv(insn | vop::IVV, V0, r(1), r(2));
+                self.a.vi(vop::VXOR | vop::IVI, d, V0, -1);
+            }
+            Opcode::BitselVec => {
+                // d = c ^ ((b ^ c) & a), which is (a & b) | (!a & c).
+                self.set_vtype_len(ty);
+                self.a.vv(vop::VXOR | vop::IVV, V0, r(2), r(3));
+                self.a.vv(vop::VAND | vop::IVV, V0, V0, r(1));
+                self.a.vv(vop::VXOR | vop::IVV, d, V0, r(3));
+            }
+            Opcode::ShliVec | Opcode::ShriVec | Opcode::SariVec => {
+                let insn = match op.opc {
+                    Opcode::ShliVec => vop::VSLL,
+                    Opcode::ShriVec => vop::VSRL,
+                    _ => vop::VSRA,
+                };
+                self.set_vtype_len_sew(ty, vece);
+                self.vshifti(insn, d, r(1), args[2] as u32 & (bits - 1));
+            }
+            Opcode::RotliVec => {
+                let n = args[2] as u32 & (bits - 1);
+                self.set_vtype_len_sew(ty, vece);
+                self.vshifti(vop::VSLL, V0, r(1), n);
+                self.vshifti(vop::VSRL, d, r(1), n.wrapping_neg() & (bits - 1));
+                self.a.vv(vop::VOR | vop::IVV, d, d, V0);
+            }
+            Opcode::ShlsVec | Opcode::ShrsVec | Opcode::SarsVec => {
+                let insn = match op.opc {
+                    Opcode::ShlsVec => vop::VSLL,
+                    Opcode::ShrsVec => vop::VSRL,
+                    _ => vop::VSRA,
+                };
+                self.set_vtype_len_sew(ty, vece);
+                self.a.vx(insn | vop::IVX, d, r(1), r(2));
+            }
+            Opcode::RotlsVec => {
+                self.set_vtype_len_sew(ty, vece);
+                self.a.vx(vop::VSLL | vop::IVX, V0, r(1), r(2));
+                self.a.r(opc::SUBW, TMP0, ZERO, r(2));
+                self.a.vx(vop::VSRL | vop::IVX, d, r(1), TMP0);
+                self.a.vv(vop::VOR | vop::IVV, d, d, V0);
+            }
+            Opcode::RotlvVec | Opcode::RotrvVec => {
+                let (first, second) = if op.opc == Opcode::RotlvVec {
+                    (vop::VSRL, vop::VSLL)
+                } else {
+                    (vop::VSLL, vop::VSRL)
+                };
+                self.set_vtype_len_sew(ty, vece);
+                self.a.vi(vop::VRSUB | vop::IVI, V0, r(2), 0);
+                self.a.vv(first | vop::IVV, V0, r(1), V0);
+                self.a.vv(second | vop::IVV, d, r(1), r(2));
+                self.a.vv(vop::VOR | vop::IVV, d, d, V0);
+            }
+            Opcode::CmpVec => {
+                let c = cond_arg(op, 3)?;
+                let b = (args[2], const_args[2]);
+                self.cmpsel(ty, vece, c, d, r(1), b, (u64::MAX, true), (0, true))?;
+            }
+            Opcode::CmpselVec => {
+                let c = cond_arg(op, 5)?;
+                let b = (args[2], const_args[2]);
+                let v1 = (args[3], const_args[3]);
+                let v2 = (args[4], const_args[4]);
+                self.cmpsel(ty, vece, c, d, r(1), b, v1, v2)?;
+            }
+            other => return Err(GenCodeError::Unsupported(other.name().to_string())),
+        }
+        Ok(())
+    }
+}
+
 impl Target for Gen<'_> {
     type Error = GenCodeError;
 
@@ -1795,12 +2279,29 @@ impl Target for Gen<'_> {
     fn available_regs(&self, ty: Type) -> RegSet {
         match ty {
             Type::I32 | Type::I64 => GPRS,
+            // `tcg_target_init`: a type that needs a group of registers gets the first ones.
+            Type::V64 | Type::V128 | Type::V256 if self.feat().zve64x => match self.lmul(ty) {
+                ..=0 => RegSet(VECS),
+                1 => RegSet(VEC_PAIRS),
+                _ => RegSet(VEC_QUADS),
+            },
             _ => RegSet::EMPTY,
         }
     }
 
     fn reserved_regs(&self) -> RegSet {
-        RESERVED
+        let feat = self.feat();
+        if !feat.zve64x {
+            return RegSet(RESERVED.0 | VECS);
+        }
+        // v0 is the mask and scratch. The rest of each group the largest type needs is never
+        // used, so that a register of any type can be any vector register left.
+        let rest = match feat.lg2_vlenb {
+            3 => VECS & !VEC_QUADS,
+            4 => VECS & !VEC_PAIRS,
+            _ => 0,
+        };
+        RegSet(RESERVED.0 | 1 << V0 | rest)
     }
 
     fn call_clobber_regs(&self) -> RegSet {
@@ -1811,7 +2312,7 @@ impl Target for Gen<'_> {
         Some(ZERO)
     }
 
-    fn op_constraints(&self, _f: &Func, op: &Op) -> R<&'static [&'static str]> {
+    fn op_constraints(&self, f: &Func, op: &Op) -> R<&'static [&'static str]> {
         Ok(match op.opc {
             Opcode::SetLabel
             | Opcode::Br
@@ -1881,6 +2382,48 @@ impl Target for Gen<'_> {
             Opcode::QemuLd2 => C_R_R_R,
             Opcode::QemuSt => C_RZ_R,
             Opcode::QemuSt2 => C_RZ_RZ_R,
+            Opcode::LdVec | Opcode::StVec | Opcode::DupmVec => C_V_RI,
+            Opcode::DupVec => {
+                if f.temp(op.arg_temp(1)).ty.is_vector() {
+                    return Err(GenCodeError::Unsupported("dup_vec of a vector".into()));
+                }
+                C_V_R
+            }
+            Opcode::AddVec
+            | Opcode::AndVec
+            | Opcode::OrVec
+            | Opcode::XorVec
+            | Opcode::SsaddVec
+            | Opcode::UsaddVec => C_V_V_VK,
+            Opcode::SubVec => C_V_VK_V,
+            Opcode::MulVec
+            | Opcode::SssubVec
+            | Opcode::UssubVec
+            | Opcode::SminVec
+            | Opcode::UminVec
+            | Opcode::SmaxVec
+            | Opcode::UmaxVec
+            | Opcode::AndcVec
+            | Opcode::OrcVec
+            | Opcode::NandVec
+            | Opcode::NorVec
+            | Opcode::EqvVec
+            | Opcode::ShlvVec
+            | Opcode::ShrvVec
+            | Opcode::SarvVec
+            | Opcode::RotlvVec
+            | Opcode::RotrvVec => C_V_V_V,
+            Opcode::NegVec
+            | Opcode::AbsVec
+            | Opcode::NotVec
+            | Opcode::ShliVec
+            | Opcode::ShriVec
+            | Opcode::SariVec
+            | Opcode::RotliVec => C_V_V,
+            Opcode::ShlsVec | Opcode::ShrsVec | Opcode::SarsVec | Opcode::RotlsVec => C_V_V_R,
+            Opcode::BitselVec => C_V4,
+            Opcode::CmpVec => C_V_V_VL,
+            Opcode::CmpselVec => C_CMPSEL,
             other => return Err(GenCodeError::Unsupported(other.name().to_string())),
         })
     }
@@ -1891,13 +2434,28 @@ impl Target for Gen<'_> {
             'I' => Letter::Const(ctc::S12),
             'J' => Letter::Const(ctc::N12),
             'M' => Letter::Const(ctc::M12),
+            'v' => Letter::Regs(RegSet(VECS)),
+            'K' => Letter::Const(ctc::S5),
+            'L' => Letter::Const(ctc::CMP_VI),
             _ => return None,
         })
     }
 
-    fn const_match(&self, val: i64, ct: u32, ty: Type, _cond: Cond, _vece: u32) -> bool {
+    fn const_match(&self, val: i64, ct: u32, ty: Type, cond: Cond, vece: u32) -> bool {
         if ct & regalloc::ct::CONST != 0 {
             return true;
+        }
+        if ty.is_vector() {
+            // An immediate is one element, so the constant must repeat it.
+            let e = vec_elem(val as u64, 8 << vece);
+            if dup_const(vece, e as u64) != val as u64 {
+                return false;
+            }
+            if ct & ctc::S5 != 0 && (-16..16).contains(&e) {
+                return true;
+            }
+            return ct & ctc::CMP_VI != 0
+                && cmp_vi(cond).is_some_and(|(_, lo, hi, _)| (lo..=hi).contains(&e));
         }
         let val = if ty == Type::I32 { val as i32 as i64 } else { val };
         if ct & ctc::S12 != 0 && is_imm12(val) {
@@ -1937,8 +2495,12 @@ impl Target for Gen<'_> {
         }
     }
 
-    fn out_mov(&mut self, _ty: Type, dst: Reg, src: Reg) -> bool {
-        self.a.mov(dst, src);
+    fn out_mov(&mut self, ty: Type, dst: Reg, src: Reg) -> bool {
+        match (dst >= V0, src >= V0) {
+            (false, false) => self.a.mov(dst, src),
+            (true, true) => self.vmov(ty, dst, src),
+            _ => return false,
+        }
         true
     }
 
@@ -1946,16 +2508,26 @@ impl Target for Gen<'_> {
         self.a.movi(ty, dst, val);
     }
 
-    fn out_dupi_vec(&mut self, _ty: Type, _vece: u32, _dst: Reg, _val: u64) {
-        self.err.get_or_insert_with(|| GenCodeError::Unsupported("vector constants".into()));
+    fn out_dupi_vec(&mut self, ty: Type, vece: u32, dst: Reg, val: u64) {
+        self.vdupi(ty, vece, dst, val);
     }
 
     fn out_ld(&mut self, ty: Type, dst: Reg, base: Reg, off: i64) {
-        self.a.ld(ty, dst, base, off);
+        if ty.is_vector() {
+            let insn = self.vec_insn(ty, false);
+            self.a.vldst(insn, dst, base, off);
+        } else {
+            self.a.ld(ty, dst, base, off);
+        }
     }
 
     fn out_st(&mut self, ty: Type, src: Reg, base: Reg, off: i64) {
-        self.a.st(ty, src, base, off);
+        if ty.is_vector() {
+            let insn = self.vec_insn(ty, true);
+            self.a.vldst(insn, src, base, off);
+        } else {
+            self.a.st(ty, src, base, off);
+        }
     }
 
     fn out_sti(&mut self, ty: Type, val: i64, base: Reg, off: i64) -> bool {
@@ -1977,6 +2549,8 @@ impl Target for Gen<'_> {
             Opcode::SetLabel => {
                 let l = self.label(op, 0)?;
                 self.a.bind(l);
+                // Paths that meet here may have left different vector settings.
+                self.vtype = None;
             }
             Opcode::Br => {
                 let l = self.label(op, 0)?;
@@ -2004,6 +2578,9 @@ impl Target for Gen<'_> {
                     Cond::Always => self.a.j_label(l),
                     _ => self.brcond(c, args[0] as Reg, args[1] as Reg, l),
                 }
+            }
+            _ if op.opc.def().flags & opf::VECTOR != 0 => {
+                self.out_vector(f, op, args, const_args)?;
             }
             _ => self.out_scalar(f, id, op, args, const_args)?,
         }
