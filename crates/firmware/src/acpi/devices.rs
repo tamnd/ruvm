@@ -26,6 +26,20 @@ pub fn fw_cfg_x86(scope: &mut Aml) {
     scope.append(&dev);
 }
 
+/// `fw_cfg_acpi_dsdt_add()` from hw/nvram/fw_cfg-acpi.c, the MMIO fw_cfg device of the Arm
+/// and RISC-V `virt` boards at `base`, `size` bytes long.
+pub fn fw_cfg_mmio(scope: &mut Aml, base: u64, size: u64) {
+    let mut dev = aml::device("FWCF");
+    dev.append(&aml::name_decl("_HID", &aml::string("QEMU0002")));
+    // Present, functioning, decoding, not shown in UI.
+    dev.append(&aml::name_decl("_STA", &aml::int(0xB)));
+    dev.append(&aml::name_decl("_CCA", &aml::int(1)));
+    let mut crs = aml::resource_template();
+    crs.append(&aml::memory32_fixed(base as u32, size as u32, aml::ReadWrite::ReadWrite));
+    dev.append(&aml::name_decl("_CRS", &crs));
+    scope.append(&dev);
+}
+
 /// `serial_isa_build_aml()`. `index` is the zero based `index` property, so COM1 is 0.
 pub fn serial_isa(scope: &mut Aml, index: u32, iobase: u16, isairq: u8) {
     let mut crs = aml::resource_template();

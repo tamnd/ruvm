@@ -12,7 +12,8 @@
 //! (`virtio-*-device`). The other virtio types fail with "... is not supported with this
 //! machine by ruvm yet". The PCI types take `addr`, `bus=pcie.0`, `disable-legacy`,
 //! `disable-modern` and `vectors`; the virtio-mmio ones take `bus=virtio-mmio-bus.<n>`.
-//! `-drive if=pflash` is not wired to the flash devices yet and fails the same way.
+//! `-drive if=pflash` with unit 0 or 1 on bus 0 is the drive of the flash of that number, as
+//! `pflash_cfi01_legacy_drive()` takes it.
 
 use std::collections::HashSet;
 
@@ -23,6 +24,7 @@ use ruvm_hw_virtio::{
     RandomFile, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass, VirtioPciProps,
     VirtioRng, VirtioRngConf,
 };
+use ruvm_machine_arm::pflash::PflashBacking;
 use ruvm_machine_riscv::virt::{GenericLoader, VirtMachine};
 use ruvm_machine_x86::FileBackend;
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
@@ -92,6 +94,8 @@ pub(crate) struct Plan {
     pub loaders: Vec<GenericLoader>,
     /// The virtio devices, `-device` first and then the ones `-drive if=virtio` adds.
     pub virtio: Vec<Plug>,
+    /// The drives of the two flashes, `None` where there is no `-drive if=pflash`.
+    pub pflash: [Option<PflashBacking>; 2],
 }
 
 /// `drive_new()` for each `-drive`, with virt's default interface.
@@ -250,6 +254,25 @@ pub(crate) fn plan(
         p.virtio.push(plug);
     }
 
+    // pflash_cfi01_legacy_drive() for the two flashes. The flash reads the image itself and
+    // checks its size; a drive without a medium leaves the flash empty.
+    for (i, d) in drives.iter().enumerate() {
+        if d.iface != DriveIf::Pflash || d.bus != 0 || d.unit >= 2 {
+            continue;
+        }
+        used.insert(i);
+        let backing = match &d.file {
+            Some(file) => {
+                if d.probed && !d.read_only {
+                    eprint!("{}", probe_warning(file));
+                }
+                PflashBacking::File { path: file.into(), read_only: d.read_only }
+            }
+            None => PflashBacking::None,
+        };
+        p.pflash[d.unit as usize] = Some(backing);
+    }
+
     let orphans: Vec<Located> = drives
         .iter()
         .enumerate()
@@ -257,16 +280,12 @@ pub(crate) fn plan(
             !used.contains(i) && !matches!(d.iface, DriveIf::None | DriveIf::Virtio | DriveIf::Xen)
         })
         .map(|(_, d)| {
-            let msg = if d.iface == DriveIf::Pflash {
-                "-drive if=pflash is not supported with this machine by ruvm yet".to_string()
-            } else {
-                format!(
-                    "machine type does not support if={},bus={},unit={}",
-                    d.iface.name(),
-                    d.bus,
-                    d.unit
-                )
-            };
+            let msg = format!(
+                "machine type does not support if={},bus={},unit={}",
+                d.iface.name(),
+                d.bus,
+                d.unit
+            );
             Located::new(&d.loc, msg)
         })
         .collect();
@@ -382,10 +401,32 @@ mod tests {
     }
 
     #[test]
+    fn pflash_drives() {
+        let d = parse_drives(&[
+            dev("if=pflash,unit=0,format=raw,file=code.fd,readonly=on"),
+            dev("if=pflash,unit=1,format=raw,file=vars.fd"),
+        ])
+        .unwrap();
+        let p = plan(&d, &[]).unwrap();
+        assert_eq!(
+            p.pflash,
+            [
+                Some(PflashBacking::File { path: "code.fd".into(), read_only: true }),
+                Some(PflashBacking::File { path: "vars.fd".into(), read_only: false }),
+            ]
+        );
+        let p = plan(&[], &[]).unwrap();
+        assert_eq!(p.pflash, [None, None]);
+    }
+
+    #[test]
     fn orphaned_drives() {
         let d = parse_drives(&[dev("file=a.img,if=ide")]).unwrap();
         let e = plan(&d, &[]).unwrap_err();
         assert_eq!(e[0].1.message(), "machine type does not support if=ide,bus=0,unit=0");
+        let d = parse_drives(&[dev("file=a.img,if=pflash,unit=2,format=raw")]).unwrap();
+        let e = plan(&d, &[]).unwrap_err();
+        assert_eq!(e[0].1.message(), "machine type does not support if=pflash,bus=0,unit=2");
         let d = parse_drives(&[dev("file=a.img,if=none,id=x")]).unwrap();
         let devs = [dev("virtio-blk,drive=x"), dev("virtio-blk-device,drive=x")];
         assert_eq!(

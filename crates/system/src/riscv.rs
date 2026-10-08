@@ -23,12 +23,12 @@
 //!   The other models, a profile CPU that needs such an extension, and a property that turns
 //!   one on fail with "... is not supported by ruvm yet".
 //! - The machine properties are taken only where their value describes the board that
-//!   exists: `aclint=off`, `acpi=off` or `auto` (there are no ACPI tables either way) and
-//!   `iommu-sys=off` or `auto`. Other values fail with "... is not supported by ruvm yet".
-//!   `aia` and `aia-guests` take all of QEMU's values.
+//!   exists: `aclint=off` and `iommu-sys=off` or `auto`. Other values fail with "... is not
+//!   supported by ruvm yet". `aia`, `aia-guests`, `acpi` and `spcr` take all of QEMU's
+//!   values. The `pflash0` and `pflash1` properties (block node names) are not there; use
+//!   `-drive if=pflash`.
 //! - Every hart is in one socket: `-smp sockets=` above 1 fails.
-//! - `-device` knows `loader` and the virtio block, RNG and serial devices only, and
-//!   `-drive if=pflash` is not wired to the flash yet.
+//! - `-device` knows `loader` and the virtio block, RNG and serial devices only.
 //! - SYS_EXIT and the SiFive test finishers ask the main loop to quit with the guest's
 //!   status (`shutdown_request` with the code) rather than calling `exit()` on the vCPU
 //!   thread, so QMP clients see a SHUTDOWN event first.
@@ -113,6 +113,10 @@ pub(crate) struct BoardOptions {
     pub aia: VirtAia,
     /// `aia-guests`: the guest interrupt files of each S level IMSIC.
     pub aia_guests: u32,
+    /// `acpi=off`: no ACPI tables in fw_cfg.
+    pub acpi_off: bool,
+    /// `spcr=off`: no SPCR among the ACPI tables.
+    pub spcr_off: bool,
 }
 
 /// Visits `name` of `machine` as a `T`, the way the machine property setter does.
@@ -208,10 +212,10 @@ fn check_virt_prop(o: &mut BoardOptions, name: &str, value: &str) -> Result<()> 
             o.aia_guests = n as u32;
             Ok(())
         }
-        "acpi" => match on_off_auto(name, value)? {
-            "on" => Err(not_supported(name, value)),
-            _ => Ok(()),
-        },
+        "acpi" => {
+            o.acpi_off = on_off_auto(name, value)? == "off";
+            Ok(())
+        }
         "iommu-sys" => match on_off_auto(name, value)? {
             "on" => Err(not_supported(name, value)),
             _ => Ok(()),
@@ -337,6 +341,7 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
             "firmware" => o.firmware = Some(prop_string(name, value)?),
             // Generic machine properties that change nothing here.
             "dump-guest-core" | "mem-merge" | "graphics" | "suppress-vmdesc" => {}
+            "spcr" => o.spcr_off = !prop_bool(name, &prop_string(name, value)?)?,
             _ => check_virt_prop(&mut o, name, &prop_string(name, value)?)?,
         }
     }
@@ -750,6 +755,13 @@ pub(crate) fn start_board_tcg(
     cfg.cpu = cpu;
     cfg.aia = opts.aia;
     cfg.aia_guests = opts.aia_guests;
+    cfg.acpi = !opts.acpi_off;
+    cfg.spcr = !opts.spcr_off;
+    for (slot, drive) in cfg.pflash.iter_mut().zip(plan.pflash) {
+        if let Some(backing) = drive {
+            *slot = backing;
+        }
+    }
     cfg.loaders = plan.loaders;
     cfg.semihosting = console.clone().map(|c| c as Arc<dyn SemihostingHost>);
     cfg.semihosting_userspace = semi.userspace;
@@ -871,6 +883,14 @@ mod tests {
         assert_eq!(o.kernel.as_deref(), Some("k"));
         assert_eq!(o.firmware.as_deref(), Some("none"));
         assert_eq!(o.aia, VirtAia::None);
+        assert!(o.acpi_off && !o.spcr_off);
+        for acpi in ["on", "auto"] {
+            let mut m = QDict::new();
+            m.put("acpi", acpi);
+            m.put("spcr", "off");
+            let o = take_board_options(&m).unwrap();
+            assert!(!o.acpi_off && o.spcr_off);
+        }
         let mut m = QDict::new();
         m.put("aia", "aplic-imsic");
         m.put("aia-guests", "3");
