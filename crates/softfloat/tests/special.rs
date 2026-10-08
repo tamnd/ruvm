@@ -31,10 +31,7 @@ fn default_nans() {
         FloatX80::default_nan(&FloatStatus::x87()),
         FloatX80::new(0xffff, 0xc000_0000_0000_0000)
     );
-    assert_eq!(
-        Float128::default_nan(&FloatStatus::arm()),
-        Float128::new(0x7fff_8000_0000_0000, 0)
-    );
+    assert_eq!(Float128::default_nan(&FloatStatus::arm()), Float128::new(0x7fff_8000_0000_0000, 0));
 }
 
 #[test]
@@ -266,7 +263,10 @@ fn min_max_family() {
     assert_eq!(F32_SNAN.maximum_number(F32_ONE, &mut s), F32_ONE);
 
     // The generic entry point with flags.
-    assert_eq!(F32_ONE.minmax(neg_two, &mut s, minmax::ISMIN | minmax::ISNUM | minmax::ISMAG), F32_ONE);
+    assert_eq!(
+        F32_ONE.minmax(neg_two, &mut s, minmax::ISMIN | minmax::ISNUM | minmax::ISMAG),
+        F32_ONE
+    );
 }
 
 #[test]
