@@ -221,6 +221,15 @@ pub fn power_button(scope: &mut Aml) {
     scope.append(&dev);
 }
 
+/// `aml_error_device()`, the device that generic error sources notify (ACPI 5.0b,
+/// 18.3.2.6.2).
+pub fn error_device(scope: &mut Aml) {
+    let mut dev = aml::device(APEI_ERROR_DEVICE);
+    dev.append(&aml::name_decl("_HID", &aml::string("PNP0C33")));
+    dev.append(&aml::name_decl("_UID", &aml::int(0)));
+    scope.append(&dev);
+}
+
 /// `virtio_acpi_dsdt_add()`: `num` virtio-mmio transports starting at transport `start_index`,
 /// each `size` bytes after the previous one with the next interrupt line.
 pub fn virtio_mmio(

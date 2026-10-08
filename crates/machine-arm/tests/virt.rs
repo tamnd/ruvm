@@ -698,6 +698,11 @@ fn pcie_host() {
     assert_eq!(r32(&m, VIRT_PCIE_MMIO), u32::MAX);
     assert_eq!(r32(&m, VIRT_PCIE_PIO), u32::MAX);
     assert_eq!(r32(&m, 0x80_0000_0000), u32::MAX);
+    // EDK2 puts the I/O BAR of the first function at port 0, which the board allows. Legacy
+    // register 12 is then the size of the selected queue, 8 for virtio-rng.
+    w(&m, ecam.base + (1 << 15) + 0x10, 4, 0);
+    w(&m, ecam.base + (1 << 15) + 4, 2, 0x1);
+    assert_eq!(read(&m, VIRT_PCIE_PIO + 12, 2), [8, 0]);
 
     // highmem-ecam=off: the 16 bus ECAM below 4 GiB.
     let mut cfg = a57();

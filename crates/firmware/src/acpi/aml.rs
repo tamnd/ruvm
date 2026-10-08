@@ -664,6 +664,61 @@ pub fn irq(irq: u8, trigger: Trigger, polarity: Polarity, shared: Shared) -> Aml
     Aml::raw(buf)
 }
 
+/// `AmlPinConfig`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PinConfig {
+    Default = 0,
+    PullUp = 1,
+    PullDown = 2,
+    None = 3,
+}
+
+/// `aml_gpio_int()`, a GPIO Connection descriptor of the interrupt type.
+#[allow(clippy::too_many_arguments)]
+pub fn gpio_int(
+    con: ConsumerProducer,
+    trigger: Trigger,
+    polarity: Polarity,
+    shared: Shared,
+    pin_config: PinConfig,
+    debounce_timeout: u16,
+    pins: &[u16],
+    resource_source_name: &str,
+    vendor_data: &[u8],
+) -> Aml {
+    const MIN_DESC_LEN: usize = 0x16;
+    let flags = trigger as u16 | (polarity as u16) << 1 | (shared as u16) << 3;
+    // QEMU sizes the name by its string length and leaves the pins out of the length.
+    let resource_source_name_len = resource_source_name.len() + 1;
+    let length = MIN_DESC_LEN + resource_source_name_len + vendor_data.len();
+    let pin_table_offset = MIN_DESC_LEN + 1;
+    let resource_source_name_offset = pin_table_offset + pins.len() * 2;
+    let vendor_data_offset = resource_source_name_offset + resource_source_name_len;
+
+    let mut buf = vec![0x8C]; // GPIO Connection Descriptor
+    append_int_noprefix(&mut buf, length as u64, 2);
+    buf.push(1); // Revision ID
+    buf.push(0); // GPIO Connection Type: interrupt
+    append_int_noprefix(&mut buf, con as u64, 2); // General Flags
+    append_int_noprefix(&mut buf, flags.into(), 2); // Interrupt and IO Flags
+    buf.push(pin_config as u8);
+    append_int_noprefix(&mut buf, 0, 2); // Output Drive Strength
+    append_int_noprefix(&mut buf, debounce_timeout.into(), 2);
+    append_int_noprefix(&mut buf, pin_table_offset as u64, 2);
+    buf.push(0); // Resource Source Index
+    append_int_noprefix(&mut buf, resource_source_name_offset as u64, 2);
+    append_int_noprefix(&mut buf, vendor_data_offset as u64, 2);
+    append_int_noprefix(&mut buf, vendor_data.len() as u64, 2);
+    for pin in pins {
+        append_int_noprefix(&mut buf, (*pin).into(), 2);
+    }
+    append_namestring(&mut buf, resource_source_name);
+    buf.push(0);
+    buf.extend_from_slice(vendor_data);
+    Aml::raw(buf)
+}
+
 /// `aml_lnot()`.
 pub fn lnot(arg: &Aml) -> Aml {
     with_args(0x92, &[arg])

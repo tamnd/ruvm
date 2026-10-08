@@ -23,7 +23,15 @@
 //! same order as QEMU, so apart from the nodes of the missing devices listed below it matches
 //! `-M virt,dumpdtb=` byte for byte. `-kernel` takes an arm64 Image (raw, gzipped or EFI zboot
 //! with gzip) or an AArch64 ELF, with `-initrd`, `-append` and `-dtb`, as hw/arm/boot.c loads
-//! them, and the ROM list is checked for overlaps and copied into RAM at every reset.
+//! them, and the ROM list is checked for overlaps and copied into RAM at every reset. With
+//! firmware in the first flash, `-kernel`, `-initrd` and `-append` go to the firmware through
+//! fw_cfg instead, the kernel inflated if it is gzip.
+//!
+//! Unless `acpi=off`, `etc/acpi/tables`, `etc/table-loader`, an empty `etc/tpm/log` and
+//! `etc/acpi/rsdp` in fw_cfg carry the tables of hw/arm/virt-acpi-build.c (see
+//! [`ruvm_firmware::acpi::arm_virt`]): DSDT, FADT, MADT, PPTT, GTDT, MCFG, SPCR, DBG2 and IORT.
+//! When firmware boots with ACPI, the ACPI GED at 0x09080000 (SPI 9) carries the power down
+//! and error events.
 //!
 //! # Using it
 //!
@@ -45,15 +53,16 @@
 //! - SMMUv3 (`iommu=smmuv3`).
 //! - CXL, so the empty `cxl_host_reg` container QEMU maps above the redistributors is not
 //!   there either.
-//! - ACPI (`virt_acpi_setup()`, the GED device) and SMBIOS (`virt_build_smbios()`), so
-//!   `virt_machine_done()` stops after `arm_load_dtb()`. Firmware that wants ACPI tables
-//!   finds none in fw_cfg.
+//! - SMBIOS (`virt_build_smbios()`), so firmware finds no SMBIOS tables in fw_cfg.
+//! - The ACPI tables of the missing devices: HEST (`ras=on`), HMAT, the watchdog's GTDT entry
+//!   and WDAT, TPM2, VIOT, CEDT, NFIT, the PPTT cache nodes of `smp-cache`, the memory and
+//!   ACPI PCI hotplug AML, and SRAT and SLIT, since there is no `-numa`.
 //!
-//! Also missing: the PL061 GPIO with `gpio-keys` and the poweroff key and the secure PL061,
-//! the PMU, NUMA, GICv2 and GICv5, the GICv3 virtual interface (`ICH_*`) and its maintenance
-//! interrupt, the tag memory of the secure RAM with `mte=on` (only the RAM has tags), `-kernel`
-//! together with firmware (the fw_cfg kernel path of
-//! `arm_setup_firmware_boot()`), uImage and
+//! Also missing: the PL061 GPIO with `gpio-keys` and the poweroff key and the secure PL061
+//! (so a board without the GED has no power button, though its DSDT still describes the
+//! PL061 as QEMU's does), the GED's memory hotplug container at 0x09070000, the PMU, NUMA,
+//! GICv2 and GICv5, the GICv3 virtual interface (`ICH_*`) and its maintenance interrupt, the
+//! tag memory of the secure RAM with `mte=on` (only the RAM has tags), `-shim`, uImage and
 //! u-boot ramdisks, zstd EFI zboot payloads, big-endian and ELF32 kernels, memory hotplug and
 //! device memory, and `dtb-randomness` (the board behaves as with `dtb-randomness=off`: no
 //! `kaslr-seed` and no `rng-seed`).
@@ -82,6 +91,17 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ruvm_base::ClockType;
+use ruvm_firmware::acpi::BuildTables;
+use ruvm_firmware::acpi::arm_virt::{
+    self, ArmVirtAcpi, PsciConduit as AcpiPsci, VirtIrqs, VirtMemmap as AcpiMemmap,
+};
+use ruvm_firmware::acpi::gpex::Window;
+use ruvm_firmware::acpi::q35::{PciDevice as AcpiPciDevice, PciDeviceAml};
+use ruvm_firmware::acpi::table::{
+    APPNAME6, APPNAME8, LOADER_FILE, RSDP_FILE, TABLE_FILE, TPMLOG_FILE,
+};
+use ruvm_hw_acpi::ged::{ACPI_GED_ERROR_EVT, ACPI_GED_EVT_SEL_LEN, ACPI_GED_PWR_DOWN_EVT};
+use ruvm_hw_acpi::{AcpiGed, AcpiGedProps};
 use ruvm_hw_char::pl011::{PL011_MMIO_SIZE, Pl011};
 use ruvm_hw_char::serial::SerialBackend;
 use ruvm_hw_core::fw_cfg::{
@@ -141,6 +161,12 @@ pub const VIRT_UART1: u64 = 0x0904_0000;
 pub const VIRT_RTC: u64 = 0x0901_0000;
 /// The size of the RTC window.
 pub const VIRT_RTC_SIZE: u64 = 0x1000;
+/// `VIRT_GPIO`, where the PL061 would be.
+pub const VIRT_GPIO: u64 = 0x0903_0000;
+/// The size of the GPIO window.
+pub const VIRT_GPIO_SIZE: u64 = 0x1000;
+/// `VIRT_ACPI_GED`.
+pub const VIRT_ACPI_GED: u64 = 0x0908_0000;
 /// `VIRT_FW_CFG`.
 pub const VIRT_FW_CFG: u64 = 0x0902_0000;
 /// The size of the fw_cfg window: data, control and DMA.
@@ -177,6 +203,12 @@ pub const VIRT_RTC_IRQ: u32 = 2;
 pub const VIRT_UART1_IRQ: u32 = 8;
 /// The SPI of the first virtio-mmio transport.
 pub const VIRT_MMIO_IRQ: u32 = 16;
+/// The SPI of the PL061 GPIO.
+pub const VIRT_GPIO_IRQ: u32 = 7;
+/// The SPI of the ACPI GED.
+pub const VIRT_ACPI_GED_IRQ: u32 = 9;
+/// `ARM_SPI_BASE`, the INTID of SPI 0.
+pub const ARM_SPI_BASE: u32 = 32;
 /// The first SPI of the platform bus.
 pub const VIRT_PLATFORM_BUS_IRQ: u32 = 112;
 /// `NUM_VIRTIO_TRANSPORTS`.
@@ -202,9 +234,32 @@ pub enum VirtMsi {
     Off,
 }
 
+/// The `-smp` topology, `ms->smp`, which the possible CPUs are numbered by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuTopology {
+    pub sockets: u32,
+    pub clusters: u32,
+    pub cores: u32,
+    pub threads: u32,
+    /// `smp_props.has_clusters`: `-smp` named the clusters.
+    pub has_clusters: bool,
+}
+
+impl CpuTopology {
+    /// The topology `-smp N,maxcpus=M` gives: one socket of `max_cpus` cores.
+    pub fn flat(max_cpus: u32) -> CpuTopology {
+        CpuTopology { sockets: 1, clusters: 1, cores: max_cpus, threads: 1, has_clusters: false }
+    }
+
+    /// The number of possible CPUs.
+    pub fn max_cpus(&self) -> u32 {
+        self.sockets * self.clusters * self.cores * self.threads
+    }
+}
+
 /// What the board is built from: the `-cpu`, `-smp`, `-m`, `-kernel`, `-initrd`, `-append`,
-/// `-dtb`, `-bios`, `-serial` and `-semihosting` options and the `secure`, `virtualization`
-/// and `msi` machine properties.
+/// `-dtb`, `-bios`, `-serial` and `-semihosting` options and the `secure`, `virtualization`,
+/// `msi`, `acpi`, `spcr`, `x-oem-id` and `x-oem-table-id` machine properties.
 #[derive(Clone)]
 pub struct VirtConfig {
     /// The CPU model.
@@ -253,6 +308,17 @@ pub struct VirtConfig {
     pub rtc_clock: Option<Arc<Clock>>,
     /// The machine options fw_cfg exposes.
     pub fw_cfg: FwCfgMachineConfig,
+    /// `acpi`: off leaves out the ACPI tables and the GED. `auto`, the default, is the same as
+    /// `on`.
+    pub acpi: bool,
+    /// `spcr`: off leaves the SPCR out of the ACPI tables.
+    pub spcr: bool,
+    /// `x-oem-id`, at most 6 bytes.
+    pub oem_id: String,
+    /// `x-oem-table-id`, at most 8 bytes.
+    pub oem_table_id: String,
+    /// The `-smp` topology. `None` is one socket with a core for each possible CPU.
+    pub topology: Option<CpuTopology>,
 }
 
 impl fmt::Debug for VirtConfig {
@@ -277,6 +343,11 @@ impl fmt::Debug for VirtConfig {
             .field("serial1", &self.serial1.is_some())
             .field("semihosting", &self.semihosting.is_some())
             .field("semihosting_userspace", &self.semihosting_userspace)
+            .field("acpi", &self.acpi)
+            .field("spcr", &self.spcr)
+            .field("oem_id", &self.oem_id)
+            .field("oem_table_id", &self.oem_table_id)
+            .field("topology", &self.topology)
             .finish_non_exhaustive()
     }
 }
@@ -307,6 +378,11 @@ impl VirtConfig {
             clock: None,
             rtc_clock: None,
             fw_cfg: FwCfgMachineConfig::default(),
+            acpi: true,
+            spcr: true,
+            oem_id: APPNAME6.to_string(),
+            oem_table_id: APPNAME8.to_string(),
+            topology: None,
         }
     }
 }
@@ -427,6 +503,9 @@ fn create_pcie(
         ..GpexConfig::default()
     };
     let gpex = GpexHost::new(Arc::clone(mem), system, config).map_err(err)?;
+    // `mc->pci_allow_0_address`: EDK2 puts the first I/O BAR at port 0, so a BAR at address 0
+    // has to be mapped. It only affects functions plugged after this.
+    gpex.bus().set_allow_0_address(true);
     // Map only the first size_ecam bytes of ECAM space, and the MMIO windows at the same
     // address in PCI memory space as in the system's.
     let mut aliases = vec![
@@ -495,6 +574,19 @@ pub struct VirtMachine {
     /// Whether the secondaries start powered off, from the conduit the board picked before
     /// `arm_load_kernel()` adjusted it.
     secondaries_off: bool,
+    /// The PSCI conduit before `arm_load_kernel()` adjusted it, `vms->psci_conduit`.
+    vms_conduit: PsciConduit,
+    acpi: bool,
+    spcr: bool,
+    oem_id: String,
+    oem_table_id: String,
+    topology: CpuTopology,
+    ns_el2_virt_timer_irq: bool,
+    virtualization: bool,
+    redist2: Option<MemMapEntry>,
+    /// Whether UART1 is the non-secure second UART.
+    uart1_ns: bool,
+    ged: Option<Arc<AcpiGed>>,
     rtc: Arc<Pl031>,
     memmap: VirtMemmap,
     gpex: GpexHost,
@@ -615,6 +707,22 @@ impl VirtMachine {
                 "Invalid SMP CPUs 0. The min CPUs supported by machine 'virt' is 1".to_string()
             );
         }
+        let topology = cfg.topology.unwrap_or_else(|| CpuTopology::flat(max_cpus as u32));
+        if topology.max_cpus() as usize != max_cpus {
+            return Err(format!(
+                "Invalid CPU topology: product of the hierarchy must match maxcpus: sockets \
+                 ({}) * clusters ({}) * cores ({}) * threads ({}) != maxcpus ({max_cpus})",
+                topology.sockets, topology.clusters, topology.cores, topology.threads
+            ));
+        }
+        if cfg.oem_id.len() > 6 {
+            return Err("User specified oem-id value is bigger than 6 bytes in size".to_string());
+        }
+        if cfg.oem_table_id.len() > 8 {
+            return Err(
+                "User specified oem-table-id value is bigger than 8 bytes in size".to_string()
+            );
+        }
 
         let mut fdt = Fdt::new();
         let clock_phandle = dt::create_fdt(&mut fdt, cfg.secure)?;
@@ -623,7 +731,8 @@ impl VirtMachine {
         // ns_el2_virt_timer_present().
         let ns_el2_virt_timer_irq = model.features.el2 && model.features.vh;
         dt::add_timer_nodes(&mut fdt, ns_el2_virt_timer_irq)?;
-        dt::add_cpu_nodes(&mut fdt, &model, &mpidrs, vms_conduit != PsciConduit::Disabled)?;
+        let psci = vms_conduit != PsciConduit::Disabled;
+        dt::add_cpu_nodes(&mut fdt, &model, &mpidrs, psci, &topology)?;
 
         let ram = mem.new_ram(VIRT_RAM_ID, ram_size).map_err(err)?;
         mem.add_subregion(system, VIRT_MEM, ram).map_err(err)?;
@@ -687,13 +796,8 @@ impl VirtMachine {
         // arm_load_kernel(), which decides the PSCI conduit the CPUs are created with.
         let mut loader = Loader::default();
         let mut info = BootInfo { loader_start: VIRT_MEM, ram_size, ..BootInfo::default() };
-        if firmware_loaded && cfg.kernel.is_some() {
-            return Err("loading -kernel through fw_cfg for the firmware is not supported by \
-                        ruvm yet"
-                .to_string());
-        }
         let files = BootFiles { kernel: cfg.kernel.as_deref(), initrd: cfg.initrd.as_deref() };
-        boot::arm_load_kernel(&mut loader, &mut info, files)?;
+        boot::arm_load_kernel(&mut loader, &mut info, files, firmware_loaded)?;
         // Boot into the highest EL, except that Linux boots in EL2 or EL1. Disable the PSCI
         // conduit if it targets the same or a lower EL than that.
         let f = &model.features;
@@ -789,6 +893,23 @@ impl VirtMachine {
         let gpex = create_pcie(&mem, system, &memmap, &gic, &memory_as)?;
         dt::create_pcie(&mut fdt, &memmap, gic_phandle, msi_phandle, VIRT_PCIE_IRQ)?;
 
+        // create_acpi_ged(), for firmware that boots with ACPI. Without it QEMU creates the
+        // PL061 GPIO with the poweroff key, which ruvm does not have.
+        let acpi = cfg.acpi;
+        let ged = if firmware_loaded && acpi {
+            let ged = AcpiGed::new(AcpiGedProps {
+                ged_event: ACPI_GED_PWR_DOWN_EVT | ACPI_GED_ERROR_EVT,
+                pci_hotplug: false,
+            })
+            .map_err(err)?;
+            let r = mem.new_io("acpi-ged", ACPI_GED_EVT_SEL_LEN.into(), ged.evt_ops());
+            mem.add_subregion(system, VIRT_ACPI_GED, r.map_err(err)?).map_err(err)?;
+            ged.irq().connect(gic.spi(VIRT_ACPI_GED_IRQ));
+            Some(ged)
+        } else {
+            None
+        };
+
         // create_virtio_devices().
         let mut virtio = Vec::with_capacity(VIRTIO_TRANSPORTS);
         for i in 0..VIRTIO_TRANSPORTS {
@@ -821,6 +942,10 @@ impl VirtMachine {
             mem.add_subregion(system, dma_addr, r).map_err(err)?;
         }
         dt::add_fw_cfg_node(&mut fdt)?;
+        if firmware_loaded {
+            // The rest of arm_setup_firmware_boot(), now that fw_cfg exists.
+            boot::arm_setup_firmware_boot(&mut loader, fw_cfg.state(), files, &cmdline)?;
+        }
 
         // create_platform_bus(): the window, with nothing on it yet.
         let pbus = mem.new_container("platform bus", VIRT_PLATFORM_BUS_SIZE.into()).map_err(err)?;
@@ -830,6 +955,7 @@ impl VirtMachine {
             gic.arm_linux_init(false);
         }
 
+        let uart1_ns = !cfg.secure && uart1.is_some();
         Ok(VirtMachine {
             model,
             smp,
@@ -846,7 +972,18 @@ impl VirtMachine {
             uart,
             uart1,
             flash: [flash0, flash1],
-            secondaries_off: vms_conduit != PsciConduit::Disabled,
+            secondaries_off: psci,
+            vms_conduit,
+            acpi,
+            spcr: cfg.spcr,
+            oem_id: cfg.oem_id,
+            oem_table_id: cfg.oem_table_id,
+            topology,
+            ns_el2_virt_timer_irq,
+            virtualization: cfg.virtualization,
+            redist2,
+            uart1_ns,
+            ged,
             rtc,
             memmap,
             gpex,
@@ -929,6 +1066,87 @@ impl VirtMachine {
         Ok(dev)
     }
 
+    /// `virt_acpi_build()`: the ACPI tables of the board as it is now.
+    pub fn acpi_tables(&self) -> BuildTables {
+        let w = |base, size| Window { base, size };
+        let e = |m: MemMapEntry| w(m.base, m.size);
+        let spi = |irq| irq + ARM_SPI_BASE;
+        let topo = &self.topology;
+        let pci_devices = self
+            .gpex
+            .bus()
+            .devices()
+            .iter()
+            .map(|d| AcpiPciDevice { devfn: d.devfn(), acpi_index: None, aml: PciDeviceAml::Plain })
+            .collect();
+        let acpi = ArmVirtAcpi {
+            oem_id: self.oem_id.clone(),
+            oem_table_id: self.oem_table_id.clone(),
+            memmap: AcpiMemmap {
+                uart0: w(VIRT_UART, VIRT_UART_SIZE),
+                uart1: self.uart1_ns.then_some(w(VIRT_UART1, VIRT_UART_SIZE)),
+                fw_cfg: w(VIRT_FW_CFG, VIRT_FW_CFG_SIZE),
+                virtio: w(VIRT_MMIO, VIRT_MMIO_SIZE),
+                ecam: e(self.memmap.ecam),
+                pcie_mmio: w(VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE),
+                pcie_pio: w(VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE),
+                pcie_mmio_high: self.memmap.high_mmio.map_or(Window::default(), e),
+                gic_dist: VIRT_GIC_DIST,
+                gic_redist: w(VIRT_GIC_REDIST, VIRT_GIC_REDIST_SIZE),
+                gic_redist2: self.redist2.map(e),
+                gic_its: self.its.as_ref().map(|_| VIRT_GIC_ITS),
+                acpi_ged: VIRT_ACPI_GED,
+                gpio: w(VIRT_GPIO, VIRT_GPIO_SIZE),
+                mem: VIRT_MEM,
+            },
+            irqs: VirtIrqs {
+                uart0: spi(VIRT_UART_IRQ),
+                uart1: spi(VIRT_UART1_IRQ),
+                virtio: spi(VIRT_MMIO_IRQ),
+                pcie: spi(VIRT_PCIE_IRQ),
+                acpi_ged: spi(VIRT_ACPI_GED_IRQ),
+                gpio: spi(VIRT_GPIO_IRQ),
+            },
+            virtio_count: VIRTIO_TRANSPORTS as u32,
+            mpidrs: (0..self.smp).map(virt_cpu_mp_affinity).collect(),
+            possible_cpus: arm_virt::possible_cpus(
+                topo.sockets,
+                topo.clusters,
+                topo.cores,
+                topo.threads,
+            ),
+            has_clusters: topo.has_clusters,
+            threads: topo.threads,
+            // No PMU.
+            pmu_irq: 0,
+            virtualization: self.virtualization,
+            ns_el2_virt_timer: self.ns_el2_virt_timer_irq,
+            psci: match self.vms_conduit {
+                PsciConduit::Disabled => AcpiPsci::Disabled,
+                PsciConduit::Hvc => AcpiPsci::Hvc,
+                PsciConduit::Smc => AcpiPsci::Smc,
+            },
+            ged_events: self.ged.as_ref().map(|g| g.ged_event_bitmap()),
+            spcr: self.spcr,
+            pci_devices,
+            numa: Vec::new(),
+        };
+        arm_virt::build(&acpi)
+    }
+
+    /// The ACPI GED, there when firmware boots with ACPI.
+    pub fn ged(&self) -> Option<&Arc<AcpiGed>> {
+        self.ged.as_ref()
+    }
+
+    /// `virt_powerdown_req()` through the GED: the power button event for ACPI. Without the
+    /// GED, QEMU presses the PL061 poweroff key, which ruvm does not have, so nothing happens.
+    pub fn system_powerdown(&self) {
+        if let Some(g) = &self.ged {
+            g.power_down();
+        }
+    }
+
     /// The PCIe host bridge.
     pub fn gpex(&self) -> &GpexHost {
         &self.gpex
@@ -967,6 +1185,17 @@ impl VirtMachine {
             self.arm.psci_conduit(),
         )? {
             self.fdt = fdt;
+        }
+        // virt_acpi_setup(). The tables never change, so unlike QEMU they are not rebuilt
+        // when the firmware first reads them.
+        if self.acpi {
+            let tables = self.acpi_tables();
+            let fwc = self.fw_cfg.state();
+            fwc.add_file(TABLE_FILE, tables.table_data).map_err(err)?;
+            fwc.add_file(LOADER_FILE, tables.linker.cmd_blob().to_vec()).map_err(err)?;
+            // The TPM log, empty without a TPM.
+            fwc.add_file(TPMLOG_FILE, Vec::new()).map_err(err)?;
+            fwc.add_file(RSDP_FILE, tables.rsdp).map_err(err)?;
         }
         self.ram = self.ram_ranges_now()?;
         // common_semi_find_bases(): the largest gap in the largest RAM region.

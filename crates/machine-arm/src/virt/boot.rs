@@ -13,6 +13,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use flate2::{Decompress, FlushDecompress, Status};
+use ruvm_hw_core::fw_cfg::{
+    FW_CFG_CMDLINE_DATA, FW_CFG_CMDLINE_SIZE, FW_CFG_INITRD_DATA, FW_CFG_INITRD_SIZE,
+    FW_CFG_KERNEL_DATA, FW_CFG_KERNEL_SIZE, FwCfgState,
+};
 use ruvm_mem::RamBlock;
 use ruvm_target_arm::tcg::PsciConduit;
 
@@ -594,21 +598,64 @@ pub(crate) struct BootFiles<'a> {
     pub(crate) initrd: Option<&'a str>,
 }
 
-/// `arm_load_kernel()` without the DTB, which the board loads at machine_done.
+/// `arm_load_kernel()` without the DTB, which the board loads at machine_done. With firmware
+/// the board hands the kernel over with [`arm_setup_firmware_boot`] once fw_cfg exists.
 pub(crate) fn arm_load_kernel(
     ld: &mut Loader,
     info: &mut BootInfo,
     files: BootFiles<'_>,
+    firmware_loaded: bool,
 ) -> Result<(), String> {
     info.dtb_limit = 0;
     match files.kernel {
-        None => {
+        Some(k) if !firmware_loaded => arm_setup_direct_kernel_boot(ld, info, k, files.initrd),
+        _ => {
             // arm_setup_firmware_boot(): the DTB goes to the base of RAM for the firmware.
             info.dtb_start = info.loader_start;
             Ok(())
         }
-        Some(k) => arm_setup_direct_kernel_boot(ld, info, k, files.initrd),
     }
+}
+
+/// `load_image_to_fw_cfg()`: the file in the size and data items `keys`, inflated first if
+/// `try_decompress` and it is gzip.
+fn load_image_to_fw_cfg(
+    ld: &mut Loader,
+    fw_cfg: &FwCfgState,
+    keys: (u16, u16),
+    filename: Option<&str>,
+    try_decompress: bool,
+) -> Result<(), String> {
+    let Some(filename) = filename else {
+        return Ok(());
+    };
+    let raw = std::fs::read(filename).map_err(|_| format!("failed to load \"{filename}\""))?;
+    let data = if try_decompress { load_gzipped(ld, filename, &raw) } else { None };
+    let data = data.unwrap_or(raw);
+    fw_cfg.add_i32(keys.0, data.len() as u32);
+    fw_cfg.add_bytes(keys.1, data);
+    Ok(())
+}
+
+/// The fw_cfg half of `arm_setup_firmware_boot()`: the kernel, the initrd and the command
+/// line for the firmware, untouched apart from inflating a gzip kernel.
+pub(crate) fn arm_setup_firmware_boot(
+    ld: &mut Loader,
+    fw_cfg: &FwCfgState,
+    files: BootFiles<'_>,
+    cmdline: &str,
+) -> Result<(), String> {
+    if files.kernel.is_none() {
+        return Ok(());
+    }
+    let kernel_keys = (FW_CFG_KERNEL_SIZE, FW_CFG_KERNEL_DATA);
+    load_image_to_fw_cfg(ld, fw_cfg, kernel_keys, files.kernel, true)?;
+    let initrd_keys = (FW_CFG_INITRD_SIZE, FW_CFG_INITRD_DATA);
+    load_image_to_fw_cfg(ld, fw_cfg, initrd_keys, files.initrd, false)?;
+    // virt passes an empty command line when there is no -append, never none.
+    fw_cfg.add_i32(FW_CFG_CMDLINE_SIZE, cmdline.len() as u32 + 1);
+    fw_cfg.add_string(FW_CFG_CMDLINE_DATA, cmdline);
+    Ok(())
 }
 
 /// `arm_setup_direct_kernel_boot()` for an AArch64 CPU.
