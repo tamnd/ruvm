@@ -173,12 +173,19 @@ pub struct MicrovmConfig {
     /// `kvm_pit_in_kernel()`: KVM emulates the PIT (and the speaker port), so the board leaves
     /// its own out.
     pub pit_in_kernel: bool,
+    /// The RAM of `-machine memory-backend=`, used instead of a block of the board's own,
+    /// with the backend's name. It has to be `ram_size` long.
+    pub memdev: Option<Arc<RamBlock>>,
+    /// `-machine aux-ram-share=`: the RAM and ROM the board makes are shared memory.
+    pub aux_ram_share: bool,
 }
 
 impl fmt::Debug for MicrovmConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MicrovmConfig")
             .field("ram_size", &self.ram_size)
+            .field("memdev", &self.memdev.as_ref().map(|b| b.name()))
+            .field("aux_ram_share", &self.aux_ram_share)
             .field("cpus", &self.cpus)
             .field("max_cpus", &self.max_cpus)
             .field("kvm", &self.kvm)
@@ -213,6 +220,8 @@ impl Default for MicrovmConfig {
             rtc_clock: Clock::manual(ClockType::Host),
             rtc_date: SystemTime::now(),
             pit_in_kernel: false,
+            memdev: None,
+            aux_ram_share: false,
         }
     }
 }
@@ -391,6 +400,8 @@ impl Microvm {
             rtc_clock,
             rtc_date,
             pit_in_kernel,
+            memdev,
+            aux_ram_share,
         } = cfg;
 
         // machine_parse_smp_config(), for a topology given as a CPU count.
@@ -419,6 +430,7 @@ impl Microvm {
 
         // microvm_memory_init()
         let mem = Arc::new(MemorySystem::new());
+        mem.set_aux_ram_share(aux_ram_share);
         let system = mem.new_container("system", 1 << 64).map_err(err)?;
         let io = mem.new_io("io", 1 << 16, Arc::new(UnassignedIo)).map_err(err)?;
         let memory_as = mem.address_space_init(system, "memory").map_err(err)?;
@@ -429,7 +441,12 @@ impl Microvm {
         } else {
             (ram_size, 0)
         };
-        let ram = mem.new_ram(MICROVM_RAM_ID, ram_size).map_err(err)?;
+        // machine_consume_memdev(): the backend's region, named after the backend.
+        let ram = match memdev {
+            Some(block) => mem.new_ram_from_block(block),
+            None => mem.new_ram(MICROVM_RAM_ID, ram_size),
+        }
+        .map_err(err)?;
         let below = mem.new_alias("ram-below-4g", ram, 0, below_4g_mem_size.into()).map_err(err)?;
         mem.add_subregion(system, 0, below).map_err(err)?;
         let mut e820 = E820Table::new();

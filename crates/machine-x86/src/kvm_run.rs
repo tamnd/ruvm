@@ -88,6 +88,8 @@ pub fn init_error_lines(e: &KvmError) -> [String; 2] {
         | KvmError::SplitIrqchip(e)
         | KvmError::CreateIrqchip(e)
         | KvmError::Ioctl(_, e) => strerror(e),
+        // kvm_dirty_ring_init() gives -EIO whatever the ioctl said.
+        KvmError::DirtyRing(_) | KvmError::DirtyRingBitmap(_) => "Input/output error".to_string(),
         _ => "Invalid argument".to_string(),
     };
     [e.to_string(), format!("failed to initialize kvm: {errno}")]

@@ -812,6 +812,20 @@ impl TcgMachine {
         self.shared.request_reset();
     }
 
+    /// `qemu_system_reset(SHUTDOWN_CAUSE_SNAPSHOT_LOAD)`: resets the devices and every CPU
+    /// right away, without a `RESET` event, and leaves the vCPUs stopped. For `loadvm`, with
+    /// the machine stopped.
+    pub fn reset_now(&self) -> Result<(), String> {
+        self.vcpus.pause_all();
+        let res = self.board.lock().unwrap_or_else(PoisonError::into_inner).system_reset();
+        self.vcpus.jit().tb_flush_exclusive_or_serial();
+        self.vcpus.run_on_each(reset_vcpu);
+        for (i, a) in self.apics.iter().enumerate() {
+            a.reset(i == 0);
+        }
+        res
+    }
+
     /// Stops every thread and waits for them. Must not be called from a vCPU thread or from
     /// the [`EventHandler`].
     pub fn quit(&self) {

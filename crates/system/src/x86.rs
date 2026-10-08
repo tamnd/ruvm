@@ -54,6 +54,7 @@ use ruvm_machine_x86::{
     BoardKind, BoardSpec, FileBackend, FirmwareSearch, KernelFiles, MicrovmProps, PflashBacking,
     Q35Props, X86Board, build_board,
 };
+use ruvm_mem::RamBlock;
 use ruvm_migration::Migration;
 use ruvm_qapi::events::{event_guest_panicked, event_reset};
 use ruvm_qapi::opts::{QemuOptsList, is_help_option};
@@ -61,7 +62,7 @@ use ruvm_qapi::types::{
     GuestPanicAction, GuestPanickedArg, MemorySizeConfiguration, ResetArg, RunState,
     SMPConfiguration, ShutdownCause,
 };
-use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor, VisitorExt};
+use ruvm_qapi::visit::{QObjectInputVisitor, StringInputVisitor, Visit, Visitor, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
 
 use crate::net::{Network, NicPort};
@@ -230,6 +231,52 @@ pub(crate) struct BoardOptions {
     pub props: Vec<(String, String)>,
     /// The machine type name, `pc-q35-11.0` say, with an alias resolved.
     pub machine_type: &'static str,
+    /// `aux-ram-share`: RAM other than memory backends is shared memory, for CPR.
+    pub aux_ram_share: bool,
+    /// `memory-backend`: the backend whose RAM is the guest's main memory.
+    pub memdev: Option<MemdevRam>,
+}
+
+/// The RAM of the memory backend a board takes as its main memory. Two are equal when they
+/// are the same block.
+#[derive(Clone, Debug)]
+pub(crate) struct MemdevRam(pub Arc<RamBlock>);
+
+impl PartialEq for MemdevRam {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for MemdevRam {}
+
+/// `qemu_resolve_machine_memdev()` and `machine_consume_memdev()` for an x86 board: the RAM of
+/// the memory backend `id`, which is the board's from now on.
+pub(crate) fn consume_memdev(vm: &Vm, id: &str) -> Result<MemdevRam> {
+    let (backend, _) = vm.registry.resolve_path_type(id, "memory-backend");
+    let Some(backend) = backend else {
+        return Err(Error::generic(format!("Memory backend '{id}' not found")));
+    };
+    if ruvm_hostmem::is_mapped(&backend) {
+        return Err(Error::generic(format!("memory backend {id} can't be used multiple times.")));
+    }
+    let Some(block) = ruvm_hostmem::backend_ram_block(&backend) else {
+        return Err(Error::generic(format!("memory backend {id} has no memory")));
+    };
+    ruvm_hostmem::set_mapped(&backend, true);
+    Ok(MemdevRam(block))
+}
+
+/// A boolean `-machine` property, with the error the property setter gives.
+fn prop_bool(name: &str, value: &QValue) -> Result<bool> {
+    let mut root = QDict::new();
+    root.put(name, value.clone());
+    let mut v = QObjectInputVisitor::new_keyval(QValue::Dict(root));
+    v.start_struct(None)?;
+    let mut b = false;
+    let r = v.type_bool(Some(name), &mut b);
+    v.end_struct();
+    r.map(|()| b)
 }
 
 /// The largest `-smp maxcpus` of each board, `mc->max_cpus`.
@@ -406,6 +453,7 @@ pub(crate) fn take_board_options(kind: BoardKind, machine: &QDict) -> Result<Boa
             }
             // Generic machine properties that change nothing here.
             "dump-guest-core" | "mem-merge" => {}
+            "aux-ram-share" => o.aux_ram_share = prop_bool(name, value)?,
             // Only q35 has a use for graphics=, but every machine has the property.
             "graphics" if kind == BoardKind::Microvm => {}
             _ => {
@@ -1238,6 +1286,17 @@ pub(crate) fn tcg_init(
     Ok(opts)
 }
 
+/// The `dirty-ring-size` property of the kvm accelerator, `kvm_set_dirty_ring_size()`.
+#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+pub(crate) fn parse_dirty_ring_size(value: &str) -> Result<u32> {
+    let mut n = 0;
+    StringInputVisitor::new(value).type_uint32(Some("dirty-ring-size"), &mut n)?;
+    if n & n.wrapping_sub(1) != 0 {
+        return Err(Error::generic("dirty-ring-size must be a power of two."));
+    }
+    Ok(n)
+}
+
 /// The machine the vCPUs run, on either accelerator.
 #[derive(Debug)]
 enum RunningMachine {
@@ -1487,6 +1546,8 @@ fn build(
         serial_hds: serial_hds.iter().map(Option::is_some).collect(),
         clock: Arc::clone(&clock),
         rtc_clock: Arc::clone(&rtc_clock),
+        memdev: opts.memdev.map(|m| m.0),
+        aux_ram_share: opts.aux_ram_share,
     };
     let (mut board, warnings) = build_board(spec).map_err(|e| one(Located::bare(e)))?;
     for w in warnings.iter().chain(board.warnings()) {
@@ -1713,17 +1774,28 @@ pub(crate) fn start_board_tcg(
 /// an x86 board (q35 or microvm) on TCG.
 fn init_migration(
     vm: &Arc<Vm>,
-    machine: &TcgMachine,
+    machine: &Arc<TcgMachine>,
     machine_type: &str,
     uuid: Option<[u8; 16]>,
 ) -> std::result::Result<(), String> {
     let q = x86_savevm(machine, machine_type, uuid)?;
+    let (reset, clock) = (Arc::downgrade(machine), Arc::downgrade(machine));
+    let hooks = crate::migration::SnapshotHooks {
+        reset: Box::new(move || match reset.upgrade() {
+            Some(m) => m.reset_now(),
+            None => Ok(()),
+        }),
+        vm_clock_ns: Box::new(move || {
+            clock.upgrade().map_or(0, |m| m.virtual_clock().get_ns().max(0) as u64)
+        }),
+    };
     let host = crate::migration::Host::new(
         vm.runstate.clone(),
         vm.qmp.clone(),
         q.global_state,
         vm.autostart.clone(),
-    );
+    )
+    .with_snapshot_hooks(hooks);
     let m = Migration::new(Arc::new(Mutex::new(q.savevm)), Some(q.ram_stats), Arc::new(host));
     let _ = vm.migration.set(m);
     Ok(())
@@ -1766,6 +1838,10 @@ mod kvm {
             match k.as_str() {
                 "kernel-irqchip" => opts.kernel_irqchip = Some(parse(v)?),
                 "device" => opts.device = Some(v.into()),
+                "dirty-ring-size" => {
+                    opts.dirty_ring_size =
+                        super::parse_dirty_ring_size(v).map_err(AccelInitError::Fatal)?;
+                }
                 _ => {
                     return Err(AccelInitError::Fatal(Error::generic(format!(
                         "Property 'kvm-accel.{k}' not found"
@@ -1773,7 +1849,11 @@ mod kvm {
                 }
             }
         }
-        open_accel(&opts, default_split).map_err(AccelInitError::Failed)
+        let accel = open_accel(&opts, default_split).map_err(AccelInitError::Failed)?;
+        for w in accel.warnings() {
+            warn_report(w);
+        }
+        Ok(accel)
     }
 
     /// `qemu_init_board()`, `qemu_create_cli_devices()` and `qemu_machine_creation_done()`
@@ -1818,6 +1898,18 @@ mod tests {
 
     fn machine(arg: &str) -> QDict {
         keyval_parse(arg, Some("type"), None).unwrap()
+    }
+
+    #[test]
+    fn dirty_ring_size_takes_powers_of_two() {
+        assert_eq!(parse_dirty_ring_size("0").unwrap(), 0);
+        assert_eq!(parse_dirty_ring_size("1024").unwrap(), 1024);
+        assert_eq!(parse_dirty_ring_size("0x100").unwrap(), 256);
+        let msg = |v: &str| parse_dirty_ring_size(v).unwrap_err().to_string();
+        assert_eq!(msg("abc"), "Parameter 'dirty-ring-size' expects uint64");
+        assert_eq!(msg("3"), "dirty-ring-size must be a power of two.");
+        assert_eq!(msg("4294967296"), "Parameter 'dirty-ring-size' expects uint32_t");
+        assert_eq!(msg("-1"), "Parameter 'dirty-ring-size' expects uint32_t");
     }
 
     #[test]

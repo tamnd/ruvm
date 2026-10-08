@@ -120,7 +120,7 @@ impl Vm {
         if let Some(uri) = &self.incoming {
             if uri != "defer" {
                 let res = match self.migration.get() {
-                    Some(m) => m.incoming(Some(uri), None, true),
+                    Some(m) => crate::migration::start_incoming(m, uri),
                     None => Err(Error::generic(
                         "migration is not supported with this machine by ruvm yet",
                     )),
@@ -231,6 +231,8 @@ struct Config {
     autostart: bool,
     /// `-incoming`: the main channel, or `defer`.
     incoming: Option<String>,
+    /// `-incoming` with the `cpr` channel.
+    incoming_cpr: Option<ruvm_qapi::types::MigrationChannel>,
     preconfig: bool,
     qtest: Option<String>,
     qtest_log: Option<String>,
@@ -263,6 +265,7 @@ impl Config {
             accelerators: None,
             autostart: true,
             incoming: None,
+            incoming_cpr: None,
             preconfig: false,
             qtest: None,
             qtest_log: None,
@@ -528,15 +531,15 @@ fn parse_options(
 }
 
 /// `qemu_validate_options()`.
-/// `incoming_option_parse()`: a URI or `defer`. The JSON form of a channel is not taken yet.
+/// `incoming_option_parse()`: `defer`, a URI or a channel, each replacing the one of its type
+/// given before.
 fn incoming_option_parse(cfg: &mut Config, arg: &str) -> Flow<()> {
-    if arg != "defer" {
-        if arg.starts_with('{') {
-            return Err(fail_msg("-incoming with a JSON channel is not supported by ruvm yet"));
+    match crate::migration::incoming_channel(arg).map_err(|e| fail(&e))? {
+        Some(c) if c.channel_type == ruvm_qapi::types::MigrationChannelType::Cpr => {
+            cfg.incoming_cpr = Some(c);
         }
-        ruvm_migration::parse_uri(arg).map_err(|e| fail(&e))?;
+        _ => cfg.incoming = Some(arg.to_string()),
     }
-    cfg.incoming = Some(arg.to_string());
     Ok(())
 }
 
@@ -1003,6 +1006,10 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             (None, Some(vm.machine.get_or_init(|| machine)))
         }
     };
+    // cpr_state_load(): before any device, which may need the descriptors.
+    if let Some(c) = &cfg.incoming_cpr {
+        ruvm_migration::cpr::state_load(&c.addr).map_err(|e| fail(&e))?;
+    }
 
     // C-a x on a mux.
     chardevs.set_mux_quit_handler(mux_quit_hook(&runstate));
@@ -1035,7 +1042,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     let memdev = apply_legacy_machine_options(&mut cfg)?;
     let mut virt_opts = None;
     let mut rv_virt_opts = None;
-    let board_opts = match (kind, machine) {
+    let mut board_opts = match (kind, machine) {
         (None, None) if virt => {
             if memdev.is_some() {
                 return Err(fail_msg("memory-backend is not supported by ruvm yet"));
@@ -1049,9 +1056,6 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             None
         }
         (Some(kind), _) => {
-            if memdev.is_some() {
-                return Err(fail_msg("memory-backend is not supported by ruvm yet"));
-            }
             let mut opts = x86::take_board_options(kind, &cfg.machine).map_err(|e| fail(&e))?;
             opts.machine_type = machine_type;
             Some(opts)
@@ -1102,6 +1106,9 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
 
     if let (Some(id), Some(machine)) = (&memdev, machine) {
         resolve_machine_memdev(&vm, machine, &cfg, id)?;
+    }
+    if let (Some(id), Some(opts)) = (&memdev, board_opts.as_mut()) {
+        opts.memdev = Some(x86::consume_memdev(&vm, id).map_err(|e| fail(&e))?);
     }
 
     let mut keep =

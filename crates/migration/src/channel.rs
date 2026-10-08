@@ -171,6 +171,41 @@ pub fn parse_input(
     }
 }
 
+/// `migration_channel_parse_input()` for `migrate`, which also takes a `cpr` channel: the main
+/// address and the `cpr` one, if there is one. `cpr_transfer` is whether the migration mode is
+/// `cpr-transfer`, which needs the `cpr` channel.
+pub fn parse_input_cpr(
+    uri: Option<&str>,
+    channels: Option<&[MigrationChannel]>,
+    cpr_transfer: bool,
+) -> Result<(MigrationAddr, Option<MigrationAddr>)> {
+    let channels = match (uri, channels) {
+        // QEMU asserts on a URI in cpr-transfer mode, which has no way to name the cpr channel.
+        (Some(_), None) if cpr_transfer => bail!("missing 'cpr' migration channel"),
+        (Some(uri), None) => return Ok((parse_uri(uri)?, None)),
+        (None, Some(channels)) => channels,
+        _ => bail!("need either 'uri' or 'channels' argument"),
+    };
+    let (mut main, mut cpr) = (None, None);
+    for c in channels {
+        let (slot, name) = match c.channel_type {
+            MigrationChannelType::Main => (&mut main, "main"),
+            MigrationChannelType::Cpr => (&mut cpr, "cpr"),
+        };
+        if slot.is_some() {
+            bail!("Channel list has more than one {} entry", name);
+        }
+        *slot = Some(c.addr.clone());
+    }
+    if cpr_transfer && cpr.is_none() {
+        bail!("missing 'cpr' migration channel");
+    }
+    match main {
+        Some(main) => Ok((main, cpr)),
+        None => bail!("Channel list has no main entry"),
+    }
+}
+
 /// The URI form of an address, for messages.
 pub fn addr_to_string(addr: &MigrationAddr) -> String {
     match &addr.u {
@@ -266,9 +301,226 @@ fn exec_command(args: &[String]) -> Result<Command> {
     Ok(c)
 }
 
+/// A socket channel, which can carry the return path back from the destination
+/// (`qemu_file_get_return_path()`).
+#[derive(Debug)]
+pub enum Socket {
+    /// A TCP connection.
+    Tcp(TcpStream),
+    /// A Unix socket, or a socket the monitor passed as `fd:`.
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl Socket {
+    /// Another handle on the same connection, for the other direction.
+    pub fn try_clone(&self) -> io::Result<Socket> {
+        Ok(match self {
+            Socket::Tcp(s) => Socket::Tcp(s.try_clone()?),
+            #[cfg(unix)]
+            Socket::Unix(s) => Socket::Unix(s.try_clone()?),
+        })
+    }
+
+    /// `qemu_file_shutdown()`: shuts both directions down, which wakes a thread blocked on it.
+    pub fn shutdown(&self) {
+        let _ = match self {
+            Socket::Tcp(s) => s.shutdown(std::net::Shutdown::Both),
+            #[cfg(unix)]
+            Socket::Unix(s) => s.shutdown(std::net::Shutdown::Both),
+        };
+    }
+}
+
+impl Read for Socket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Socket::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
+            Socket::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Socket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Socket::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
+            Socket::Unix(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A file descriptor from the monitor as a socket, if it is one.
+#[cfg(unix)]
+fn fd_socket(fd: std::os::fd::OwnedFd) -> std::result::Result<Socket, File> {
+    use std::os::unix::fs::FileTypeExt;
+    let file = File::from(fd);
+    if file.metadata().is_ok_and(|m| m.file_type().is_socket()) {
+        Ok(Socket::Unix(std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(file))))
+    } else {
+        Err(file)
+    }
+}
+
+/// `qio_channel_file_new_path()` for one more handle on a `file:` channel, a multifd channel
+/// with mapped-ram. `direct` adds `O_DIRECT`.
+pub fn open_file(path: &str, write: bool, direct: bool) -> Result<File> {
+    let mut o = OpenOptions::new();
+    o.read(!write).write(write);
+    if direct {
+        #[cfg(unix)]
+        if let Some(flag) = ruvm_sys::directio::o_direct() {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.custom_flags(flag);
+        }
+    }
+    o.open(path).map_err(|e| Error::from_io(format!("Could not open '{path}'"), e))
+}
+
+/// The seekable side of a `file:` channel: the file offset of the stream, and reads and writes
+/// at a given offset that leave the stream where it is (`qemu_get_offset()`,
+/// `qemu_put_buffer_at()` and their kin).
+#[derive(Debug)]
+pub struct FileChannel {
+    path: String,
+    // Shares its position with the handle the stream goes through.
+    seek: File,
+    // For the positioned reads and writes. Windows moves the file position on those, so there
+    // it is a handle of its own.
+    pio: File,
+}
+
+impl FileChannel {
+    fn new(path: &str, stream: &File, write: bool) -> Result<Self> {
+        let seek = stream.try_clone().map_err(|e| Error::from_io("Could not dup the file", e))?;
+        #[cfg(unix)]
+        let pio = stream.try_clone().map_err(|e| Error::from_io("Could not dup the file", e))?;
+        #[cfg(not(unix))]
+        let pio = open_file(path, write, false)?;
+        let _ = write;
+        Ok(FileChannel { path: path.to_string(), seek, pio })
+    }
+
+    /// The file name, for the handles of the multifd channels.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// `qio_channel_io_seek(SEEK_CUR)`: where the stream is in the file, with everything
+    /// written so far flushed.
+    pub fn offset(&self) -> Result<u64> {
+        (&self.seek)
+            .stream_position()
+            .map_err(|e| Error::from_io("Unable to seek to offset 0 whence 1 in file", e))
+    }
+
+    /// `qio_channel_io_seek(SEEK_SET)`.
+    pub fn set_offset(&self, off: u64) -> Result<()> {
+        (&self.seek).seek(SeekFrom::Start(off)).map(|_| ()).map_err(|e| {
+            Error::from_io(format!("Unable to seek to offset {off} whence 0 in file"), e)
+        })
+    }
+
+    /// `qio_channel_pwrite_all()`.
+    pub fn write_at(&self, buf: &[u8], off: u64) -> Result<()> {
+        write_all_at(&self.pio, buf, off)
+    }
+
+    /// `qio_channel_pread_all()`.
+    pub fn read_at(&self, buf: &mut [u8], off: u64) -> Result<()> {
+        read_exact_at(&self.pio, buf, off)
+    }
+}
+
+/// `qio_channel_pwrite_all()` on any file handle.
+pub fn write_all_at(file: &File, buf: &[u8], off: u64) -> Result<()> {
+    #[cfg(unix)]
+    let ret = std::os::unix::fs::FileExt::write_all_at(file, buf, off);
+    #[cfg(windows)]
+    let ret = {
+        let (mut done, mut ret) = (0, Ok(()));
+        while done < buf.len() {
+            match std::os::windows::fs::FileExt::seek_write(file, &buf[done..], off + done as u64) {
+                Ok(0) => {
+                    ret = Err(io::ErrorKind::WriteZero.into());
+                    break;
+                }
+                Ok(n) => done += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    ret = Err(e);
+                    break;
+                }
+            }
+        }
+        ret
+    };
+    ret.map_err(|e| Error::from_io("Unable to write to file", e))
+}
+
+/// `qio_channel_pread_all()` on any file handle. Running into the end of the file is an error.
+pub fn read_exact_at(file: &File, buf: &mut [u8], off: u64) -> Result<()> {
+    #[cfg(unix)]
+    let ret = std::os::unix::fs::FileExt::read_exact_at(file, buf, off);
+    #[cfg(windows)]
+    let ret = {
+        let (mut done, mut ret) = (0, Ok(()));
+        while done < buf.len() {
+            match std::os::windows::fs::FileExt::seek_read(
+                file,
+                &mut buf[done..],
+                off + done as u64,
+            ) {
+                Ok(0) => {
+                    ret = Err(io::ErrorKind::UnexpectedEof.into());
+                    break;
+                }
+                Ok(n) => done += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    ret = Err(e);
+                    break;
+                }
+            }
+        }
+        ret
+    };
+    ret.map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => {
+            Error::generic("Unexpected end-of-file before all data were read")
+        }
+        _ => Error::from_io("Unable to read from file", e),
+    })
+}
+
 /// The sending side of a channel.
 #[derive(Debug)]
 pub struct Channel;
+
+/// A channel [`Channel::connect_socket`] opened.
+pub struct Connection {
+    /// Where the stream goes.
+    pub out: Outgoing,
+    /// For a socket, a second handle on it to read the return path from.
+    pub socket: Option<Socket>,
+    /// For a file, its seekable side.
+    pub file: Option<std::sync::Arc<FileChannel>>,
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("socket", &self.socket)
+            .field("file", &self.file)
+            .finish()
+    }
+}
 
 /// What `migrate` writes the stream into.
 pub type Outgoing = Box<dyn Write + Send>;
@@ -279,6 +531,82 @@ pub type Incoming = Box<dyn Read + Send>;
 impl Channel {
     /// `migration_connect_outgoing()`: connects, or opens, the channel at `addr`.
     pub fn connect(addr: &MigrationAddr, fds: Option<&FdResolver>) -> Result<Outgoing> {
+        Self::connect_socket(addr, fds).map(|c| c.out)
+    }
+
+    /// [`connect`](Self::connect), and for a socket also a second handle on it to read the
+    /// return path from, for a file its seekable side.
+    pub fn connect_socket(addr: &MigrationAddr, fds: Option<&FdResolver>) -> Result<Connection> {
+        let with_socket = |s: Socket| -> Result<Connection> {
+            let socket = s.try_clone().ok();
+            Ok(Connection {
+                out: Box::new(io::BufWriter::with_capacity(1 << 16, s)),
+                socket,
+                file: None,
+            })
+        };
+        let out: Outgoing = match &addr.u {
+            MigrationAddressU::Socket(s) => match &s.u {
+                SocketAddressU::Inet(_) => return with_socket(Self::connect_raw(addr)?),
+                #[cfg(unix)]
+                SocketAddressU::Unix(_) => return with_socket(Self::connect_raw(addr)?),
+                SocketAddressU::Fd(f) => {
+                    let Some(fds) = fds else { bail!("No file descriptor named {} found", f.str) };
+                    #[cfg(unix)]
+                    let file = match fd_socket(fds(&f.str)?) {
+                        Ok(s) => return with_socket(s),
+                        Err(file) => file,
+                    };
+                    #[cfg(not(unix))]
+                    let file = fds(&f.str)?;
+                    if file.metadata().is_ok_and(|m| m.is_file()) {
+                        bail!("fd: migration to a file is not supported. Use file: instead.");
+                    }
+                    Box::new(file)
+                }
+                _ => bail!("uri is not a valid migration protocol"),
+            },
+            MigrationAddressU::Exec(e) => {
+                let mut child = exec_command(&e.args)?
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .map_err(|err| Error::from_io("Failed to start the migration command", err))?;
+                let stdin = child.stdin.take();
+                Box::new(ExecWriter { stdin, child })
+            }
+            MigrationAddressU::File(f) => {
+                // file_connect_outgoing()
+                let mut o = OpenOptions::new();
+                o.create(true).write(true).truncate(false);
+                #[cfg(unix)]
+                std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+                let mut file = o
+                    .open(&f.filename)
+                    .map_err(|e| Error::from_io(format!("Could not open '{}'", f.filename), e))?;
+                file.set_len(f.offset).map_err(|e| {
+                    Error::from_io(
+                        format!("failed to truncate migration file to offset {:x}", f.offset),
+                        e,
+                    )
+                })?;
+                file.seek(SeekFrom::Start(f.offset))
+                    .map_err(|e| Error::from_io("Unable to seek the migration file", e))?;
+                let fc = FileChannel::new(&f.filename, &file, true)?;
+                // QemuFile buffers already, and the file position has to follow its flushes.
+                return Ok(Connection {
+                    out: Box::new(file),
+                    socket: None,
+                    file: Some(std::sync::Arc::new(fc)),
+                });
+            }
+            MigrationAddressU::Rdma(_) => bail!("RDMA migration is not supported by ruvm"),
+        };
+        Ok(Connection { out, socket: None, file: None })
+    }
+
+    /// `socket_send_channel_create()`: one more connection to a socket address, for a multifd
+    /// channel.
+    pub fn connect_raw(addr: &MigrationAddr) -> Result<Socket> {
         match &addr.u {
             MigrationAddressU::Socket(s) => match &s.u {
                 SocketAddressU::Inet(inet) => {
@@ -287,7 +615,7 @@ impl Channel {
                         match TcpStream::connect(a) {
                             Ok(s) => {
                                 let _ = s.set_nodelay(true);
-                                return Ok(Box::new(io::BufWriter::with_capacity(1 << 16, s)));
+                                return Ok(Socket::Tcp(s));
                             }
                             Err(e) => last = Some(e),
                         }
@@ -300,44 +628,11 @@ impl Channel {
                     let s = std::os::unix::net::UnixStream::connect(&u.path).map_err(|e| {
                         Error::from_io(format!("Failed to connect to '{}'", u.path), e)
                     })?;
-                    Ok(Box::new(io::BufWriter::with_capacity(1 << 16, s)))
+                    Ok(Socket::Unix(s))
                 }
-                SocketAddressU::Fd(f) => {
-                    let Some(fds) = fds else { bail!("No file descriptor named {} found", f.str) };
-                    let file = File::from(fds(&f.str)?);
-                    if file.metadata().is_ok_and(|m| m.is_file()) {
-                        bail!("fd: migration to a file is not supported. Use file: instead.");
-                    }
-                    Ok(Box::new(file))
-                }
-                _ => bail!("uri is not a valid migration protocol"),
+                _ => bail!("Migration requires multi-channel URIs (e.g. tcp)"),
             },
-            MigrationAddressU::Exec(e) => {
-                let mut child = exec_command(&e.args)?
-                    .stdin(Stdio::piped())
-                    .spawn()
-                    .map_err(|err| Error::from_io("Failed to start the migration command", err))?;
-                let stdin = child.stdin.take();
-                Ok(Box::new(ExecWriter { stdin, child }))
-            }
-            MigrationAddressU::File(f) => {
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&f.filename)
-                    .map_err(|e| Error::from_io(format!("Could not open '{}'", f.filename), e))?;
-                file.set_len(f.offset).map_err(|e| {
-                    Error::from_io(
-                        format!("failed to truncate migration file to offset {:x}", f.offset),
-                        e,
-                    )
-                })?;
-                file.seek(SeekFrom::Start(f.offset))
-                    .map_err(|e| Error::from_io("Unable to seek the migration file", e))?;
-                Ok(Box::new(io::BufWriter::with_capacity(1 << 16, file)))
-            }
-            MigrationAddressU::Rdma(_) => bail!("RDMA migration is not supported by ruvm"),
+            _ => bail!("Migration requires multi-channel URIs (e.g. tcp)"),
         }
     }
 
@@ -366,8 +661,13 @@ impl Channel {
                 }
                 SocketAddressU::Fd(f) => {
                     let Some(fds) = fds else { bail!("No file descriptor named {} found", f.str) };
-                    let file = File::from(fds(&f.str)?);
-                    ListenerKind::Ready(Box::new(file))
+                    #[cfg(unix)]
+                    match fd_socket(fds(&f.str)?) {
+                        Ok(s) => ListenerKind::Socket(s),
+                        Err(file) => ListenerKind::Ready(Box::new(file)),
+                    }
+                    #[cfg(not(unix))]
+                    ListenerKind::Ready(Box::new(fds(&f.str)?))
                 }
                 _ => bail!("unknown migration protocol"),
             },
@@ -388,11 +688,17 @@ impl Channel {
                     file.seek(SeekFrom::Start(f.offset))
                         .map_err(|e| Error::from_io("Unable to seek the migration file", e))?;
                 }
-                ListenerKind::Ready(Box::new(io::BufReader::with_capacity(1 << 16, file)))
+                // The stream reader buffers already, and mapped-ram moves the file position
+                // under it.
+                let fc = FileChannel::new(&f.filename, &file, false)?;
+                return Ok(Listener {
+                    kind: ListenerKind::Ready(Box::new(file)),
+                    file: Some(std::sync::Arc::new(fc)),
+                });
             }
             MigrationAddressU::Rdma(_) => bail!("RDMA migration is not supported by ruvm"),
         };
-        Ok(Listener { kind })
+        Ok(Listener { kind, file: None })
     }
 }
 
@@ -400,12 +706,54 @@ enum ListenerKind {
     Tcp(TcpListener),
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixListener, String),
+    #[cfg(unix)]
+    Socket(Socket),
     Ready(Incoming),
+    // A one-shot channel that was handed out already.
+    Used,
+}
+
+/// One connection [`Listener::accept_next`] took.
+pub enum Accepted {
+    /// A socket, which says itself what it carries.
+    Socket(Socket),
+    /// A stream that cannot be peeked at, so it is the main channel.
+    Stream(Incoming),
+}
+
+impl std::fmt::Debug for Accepted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Accepted::Socket(s) => f.debug_tuple("Socket").field(s).finish(),
+            Accepted::Stream(_) => f.write_str("Stream"),
+        }
+    }
+}
+
+/// `transport_supports_multi_channels()`: socket addresses can open more than one channel, and
+/// a file can with `mapped_ram`, since each channel then writes its pages at their own place.
+pub fn supports_multi_channels(addr: &MigrationAddr, mapped_ram: bool) -> bool {
+    match &addr.u {
+        MigrationAddressU::Socket(s) => {
+            matches!(
+                s.u,
+                SocketAddressU::Inet(_) | SocketAddressU::Unix(_) | SocketAddressU::Vsock(_)
+            )
+        }
+        MigrationAddressU::File(_) => mapped_ram,
+        _ => false,
+    }
+}
+
+/// `transport_supports_seeking()`.
+pub fn supports_seeking(addr: &MigrationAddr) -> bool {
+    matches!(addr.u, MigrationAddressU::File(_))
 }
 
 /// An incoming channel waiting for its source.
 pub struct Listener {
     kind: ListenerKind,
+    file: Option<std::sync::Arc<FileChannel>>,
 }
 
 impl std::fmt::Debug for Listener {
@@ -433,24 +781,64 @@ impl Listener {
                     ..Default::default()
                 }),
             }),
-            ListenerKind::Ready(_) => None,
+            #[cfg(unix)]
+            ListenerKind::Socket(_) => None,
+            ListenerKind::Ready(_) | ListenerKind::Used => None,
         }
+    }
+
+    /// The seekable side of a `file:` channel.
+    pub fn file(&self) -> Option<std::sync::Arc<FileChannel>> {
+        self.file.clone()
     }
 
     /// Waits for the source to connect, and returns the stream.
     pub fn accept(self) -> Result<Incoming> {
-        match self.kind {
+        self.accept_socket().map(|(r, _)| r)
+    }
+
+    /// [`accept`](Self::accept), and for a socket also a second handle on it for the return
+    /// path.
+    pub fn accept_socket(mut self) -> Result<(Incoming, Option<Socket>)> {
+        Ok(match self.accept_next()? {
+            Accepted::Socket(s) => {
+                let back = s.try_clone().ok();
+                (Box::new(s), back)
+            }
+            Accepted::Stream(r) => (r, None),
+        })
+    }
+
+    /// Waits for the next connection. A listening socket can take any number of them, the other
+    /// kinds have just the one.
+    pub fn accept_next(&mut self) -> Result<Accepted> {
+        match &self.kind {
             ListenerKind::Tcp(l) => {
                 let (s, _) = l.accept().map_err(|e| Error::from_io("Failed to accept", e))?;
-                Ok(Box::new(s))
+                let _ = s.set_nodelay(true);
+                return Ok(Accepted::Socket(Socket::Tcp(s)));
             }
             #[cfg(unix)]
-            ListenerKind::Unix(l, path) => {
-                let r = l.accept().map_err(|e| Error::from_io("Failed to accept", e));
-                let _ = std::fs::remove_file(path);
-                Ok(Box::new(r?.0))
+            ListenerKind::Unix(l, _) => {
+                let (s, _) = l.accept().map_err(|e| Error::from_io("Failed to accept", e))?;
+                return Ok(Accepted::Socket(Socket::Unix(s)));
             }
-            ListenerKind::Ready(r) => Ok(r),
+            _ => {}
+        }
+        match std::mem::replace(&mut self.kind, ListenerKind::Used) {
+            #[cfg(unix)]
+            ListenerKind::Socket(s) => Ok(Accepted::Socket(s)),
+            ListenerKind::Ready(r) => Ok(Accepted::Stream(r)),
+            _ => bail!("non-peekable channel used without multifd"),
+        }
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let ListenerKind::Unix(_, path) = &self.kind {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -482,6 +870,37 @@ mod tests {
             parse_input(None, None).unwrap_err().message(),
             "need either 'uri' or 'channels' argument"
         );
+    }
+
+    #[test]
+    fn cpr_channels() {
+        let ch = |t, uri| MigrationChannel { channel_type: t, addr: parse_uri(uri).unwrap() };
+        let main = ch(MigrationChannelType::Main, "unix:/m.sock");
+        let cpr = ch(MigrationChannelType::Cpr, "unix:/c.sock");
+        let (m, c) = parse_input_cpr(None, Some(&[cpr.clone(), main.clone()]), true).unwrap();
+        assert_eq!(addr_to_string(&m), "unix:/m.sock");
+        assert_eq!(addr_to_string(&c.unwrap()), "unix:/c.sock");
+        let (_, c) = parse_input_cpr(Some("unix:/m.sock"), None, false).unwrap();
+        assert!(c.is_none());
+        let err = |uri, chans: Option<&[MigrationChannel]>, cpr| {
+            parse_input_cpr(uri, chans, cpr).unwrap_err().message().to_string()
+        };
+        assert_eq!(err(Some("unix:/m.sock"), None, true), "missing 'cpr' migration channel");
+        assert_eq!(
+            err(None, Some(std::slice::from_ref(&main)), true),
+            "missing 'cpr' migration channel"
+        );
+        assert_eq!(
+            err(None, Some(&[main.clone(), main.clone()]), false),
+            "Channel list has more than one main entry"
+        );
+        assert_eq!(
+            err(None, Some(std::slice::from_ref(&cpr)), false),
+            "Channel list has no main entry"
+        );
+        // The missing cpr channel is found before the missing main one.
+        assert_eq!(err(None, Some(&[]), true), "missing 'cpr' migration channel");
+        assert_eq!(err(None, None, false), "need either 'uri' or 'channels' argument");
     }
 
     #[test]
@@ -517,6 +936,42 @@ mod tests {
         let mut v = Vec::new();
         r.read_to_end(&mut v).unwrap();
         assert_eq!(v, b"stream");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_offsets() {
+        let path = std::env::temp_dir().join(format!("ruvm-mig-at-{}", std::process::id()));
+        let uri = format!("file:{},offset=16", path.display());
+        let c = Channel::connect_socket(&parse_uri(&uri).unwrap(), None).unwrap();
+        let (mut w, fc) = (c.out, c.file.unwrap());
+        assert_eq!(fc.offset().unwrap(), 16);
+        w.write_all(b"head").unwrap();
+        assert_eq!(fc.offset().unwrap(), 20);
+        // A write at an offset leaves the stream where it is.
+        fc.write_at(b"far", 100).unwrap();
+        assert_eq!(fc.offset().unwrap(), 20);
+        fc.set_offset(103).unwrap();
+        w.write_all(b"tail").unwrap();
+        let extra = open_file(fc.path(), true, false).unwrap();
+        write_all_at(&extra, b"mid", 50).unwrap();
+        drop((w, fc, extra));
+
+        let l = Channel::listen(&parse_uri(&uri).unwrap(), None).unwrap();
+        let fc = l.file().unwrap();
+        assert_eq!(fc.offset().unwrap(), 16);
+        let mut b = [0u8; 3];
+        fc.read_at(&mut b, 50).unwrap();
+        assert_eq!(&b, b"mid");
+        let mut b = [0u8; 7];
+        fc.read_at(&mut b, 100).unwrap();
+        assert_eq!(&b, b"fartail");
+        let err = fc.read_at(&mut b, 105).unwrap_err();
+        assert_eq!(err.message(), "Unexpected end-of-file before all data were read");
+        let mut r = l.accept().unwrap();
+        let mut v = [0u8; 4];
+        r.read_exact(&mut v).unwrap();
+        assert_eq!(&v, b"head");
         let _ = std::fs::remove_file(path);
     }
 }

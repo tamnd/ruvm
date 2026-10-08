@@ -92,6 +92,8 @@ fn register_migration(vm: &Arc<Vm>, cmds: &mut Commands) {
     register_migrate_continue(cmds, move |_: &MonitorQmp, arg| {
         migration(&v)?.continue_from(arg.state)
     });
+    let v = vm.clone();
+    register_migrate_start_postcopy(cmds, move |_: &MonitorQmp| migration(&v)?.start_postcopy());
 }
 
 /// Registers every command in this module with `vm`'s dispatcher.
@@ -141,15 +143,13 @@ pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
     let v = vm.clone();
     register_blockdev_del(cmds, move |_: &MonitorQmp, arg| v.block.blockdev_del(&arg.node_name));
     register_migration(vm, cmds);
-    // qmp_migrate_pause(): there is no postcopy, so it is never in a postcopy state.
+    // qmp_migrate_pause(): ruvm has no postcopy recovery, so there is nothing to pause into.
     register_migrate_pause(cmds, |_: &MonitorQmp| {
         Err(Error::generic(
             "migrate-pause is currently only supported during postcopy-active or postcopy-recover state",
         ))
     });
-    register_human_monitor_command(cmds, |_: &MonitorQmp, _| {
-        Err(Error::generic("ruvm has no human monitor yet"))
-    });
+    crate::snapshot::register(vm, cmds);
 
     let v = vm.clone();
     register_chardev_add(cmds, move |_: &MonitorQmp, arg| {

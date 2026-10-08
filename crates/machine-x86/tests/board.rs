@@ -157,6 +157,8 @@ fn spec(kind: BoardKind, firmware: FirmwareSearch) -> BoardSpec {
         machine_type: if kind == BoardKind::Q35 { "pc-q35-11.1" } else { "microvm" },
         props: Vec::new(),
         ram_size: Some(256 << 20),
+        memdev: None,
+        aux_ram_share: false,
         cpus: 1,
         max_cpus: 0,
         kvm: true,
@@ -204,4 +206,32 @@ fn builds_boards_with_firmware_from_the_search_path() {
     let mut s = spec(BoardKind::Microvm, fw);
     s.props = vec![("bogus".into(), "on".into())];
     assert_eq!(build_board(s).unwrap_err(), "Property 'microvm-machine.bogus' not found");
+}
+
+#[test]
+fn boards_take_the_memory_backend_as_their_ram() {
+    let t = TempDir::new("memdev");
+    t.file("bios-256k.bin", &[0xf4; 256 * 1024]);
+    t.file("bios-microvm.bin", &[0xf4; 128 * 1024]);
+    let fw = FirmwareSearch::from_dirs(vec![t.path().to_path_buf()]);
+    for kind in [BoardKind::Q35, BoardKind::Microvm] {
+        let block = std::sync::Arc::new(ruvm_mem::RamBlock::new("mem0", 64 << 20, 12).unwrap());
+        let mut s = spec(kind, fw.clone());
+        s.ram_size = None;
+        s.memdev = Some(block.clone());
+        let (m, _) = build_board(s).unwrap();
+        // Without -m the RAM is the backend's size, and the board's RAM is the backend's.
+        assert_eq!(m.ram_size(), 64 << 20);
+        let mut b = [0];
+        block.write(0x1000, &[0x5a]).unwrap();
+        let r = m.memory_as().read(0x1000, ruvm_mem::MemTxAttrs::default(), &mut b);
+        assert_eq!((r, b), (ruvm_mem::MemTxResult::OK, [0x5a]));
+
+        let mut s = spec(kind, fw.clone());
+        s.memdev = Some(block);
+        assert_eq!(
+            build_board(s).unwrap_err(),
+            "Machine memory size does not match the size of the memory backend"
+        );
+    }
 }
