@@ -647,6 +647,10 @@ dependencies = [
 [[package]]
 name = "ruvm-hw-iommu"
 version = "0.4.5"
+dependencies = [
+ "ruvm-hw-core",
+ "ruvm-mem",
+]
 
 [[package]]
 name = "ruvm-hw-misc"
@@ -822,6 +826,7 @@ dependencies = [
  "ruvm-hw-char",
  "ruvm-hw-core",
  "ruvm-hw-intc",
+ "ruvm-hw-iommu",
  "ruvm-hw-pci",
  "ruvm-hw-timer",
  "ruvm-hw-virtio",

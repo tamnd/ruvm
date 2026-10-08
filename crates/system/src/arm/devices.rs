@@ -85,6 +85,8 @@ pub(crate) struct Plug {
     devfn: Option<u8>,
     /// `bus=virtio-mmio-bus.<n>` of a virtio-mmio device.
     mmio_bus: Option<usize>,
+    /// `iommu_platform` of a PCI function: its DMA goes through the SMMU.
+    iommu_platform: bool,
     props: VirtioPciProps,
     loc: Option<Location>,
 }
@@ -155,6 +157,7 @@ fn plan_virtio(
         serial: None,
         devfn: None,
         mmio_bus: None,
+        iommu_platform: false,
         props: VirtioPciProps::default(),
         loc: loc.clone(),
     };
@@ -184,6 +187,9 @@ fn plan_virtio(
             }
             "disable-modern" if pci => {
                 plug.props.disable_modern = prop_bool(k, v).map_err(|_| bad_value(k, v))?;
+            }
+            "iommu_platform" if pci => {
+                plug.iommu_platform = prop_bool(k, v).map_err(|_| bad_value(k, v))?;
             }
             "vectors" if pci => {
                 plug.props.vectors = Some(v.parse().map_err(|_| bad_value(k, v))?);
@@ -337,7 +343,8 @@ pub(crate) fn plug(board: &VirtMachine, plugs: &[Plug], drives: &[Drive]) -> Res
         };
         match (plug.transport, plug.mmio_bus) {
             (Transport::Pci, _) => {
-                board.attach_virtio_pci(class, plug.devfn, &plug.props).map_err(at)?;
+                let (devfn, iommu) = (plug.devfn, plug.iommu_platform);
+                board.attach_virtio_pci_with(class, devfn, &plug.props, iommu).map_err(at)?;
             }
             (Transport::Mmio, Some(n)) => {
                 board.attach_virtio_at(n, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT).map_err(at)?;
@@ -384,6 +391,8 @@ mod tests {
         assert_eq!(p.virtio[0].props.disable_legacy, Some(true));
         assert_eq!(p.virtio[0].props.vectors, Some(0));
         assert_eq!(p.virtio[0].devfn, Some(0xff));
+        let p = plan(&[], &[dev("virtio-rng-pci,iommu_platform=on")]).unwrap();
+        assert!(p.virtio[0].iommu_platform);
 
         let err = |args: &[&str]| {
             let devs: Vec<_> = args.iter().map(|a| dev(a)).collect();

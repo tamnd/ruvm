@@ -21,7 +21,8 @@
 //!   properties other than `sve-max-vq` and `pmu=off` (there is no PMU).
 //! - The machine properties are taken only where their value describes the board that exists:
 //!   `gic-version=3`, `its`, `secure`, `virtualization`, `mte`, `ras=off`, `acpi`, `spcr`,
-//!   `x-oem-id`, `x-oem-table-id`, `iommu=none`, `msi` other than `gicv2m`, 32 virtio-mmio
+//!   `x-oem-id`, `x-oem-table-id`, `iommu`, `default-bus-bypass-iommu`, `msi` other than
+//!   `gicv2m`, 32 virtio-mmio
 //!   transports and the `highmem*` properties. Other values fail with "... is not supported by ruvm yet". The
 //!   board behaves as with `dtb-randomness=off` whatever that property says.
 //! - `-semihosting-config target=gdb` fails, since there is no gdbstub; `auto` and `native`
@@ -55,7 +56,7 @@ use ruvm_machine_arm::tcg_run::{
     ShutdownReason, VirtEvent, VirtEventHandler, VirtRunConfig, VirtTcgMachine,
 };
 use ruvm_machine_arm::virt::memmap::check_highmem_mmio_size;
-use ruvm_machine_arm::virt::{CpuTopology, Highmem, VirtConfig, VirtMachine, VirtMsi};
+use ruvm_machine_arm::virt::{CpuTopology, Highmem, VirtConfig, VirtIommu, VirtMachine, VirtMsi};
 use ruvm_qapi::events::event_reset;
 use ruvm_qapi::opts::{QemuOptDesc, QemuOptType, QemuOptsList};
 use ruvm_qapi::types::{
@@ -208,6 +209,10 @@ pub(crate) struct BoardOptions {
     pub highmem: Highmem,
     /// `msi`, or `its`, whichever came last.
     pub msi: VirtMsi,
+    /// `iommu`.
+    pub iommu: VirtIommu,
+    /// `default-bus-bypass-iommu`.
+    pub default_bus_bypass_iommu: bool,
     /// `dumpdtb`: write the device tree there and exit.
     pub dumpdtb: Option<String>,
     /// `acpi=off`: no ACPI tables in fw_cfg and no GED.
@@ -283,22 +288,13 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
     };
     match name {
         "ras" | "usb" => want_bool(false),
-        // There is no IOMMU for the root bus to bypass, and the board always behaves as with
-        // dtb-randomness=off.
-        "default-bus-bypass-iommu" | "dtb-randomness" | "dtb-kaslr-seed" => {
-            prop_bool(name, value).map(drop)
-        }
+        // The board always behaves as with dtb-randomness=off.
+        "dtb-randomness" | "dtb-kaslr-seed" => prop_bool(name, value).map(drop),
         "gic-version" => match value {
             "3" => Ok(()),
             "2" | "4" | "5" | "host" | "max" => Err(not_supported(name, value)),
             _ => Err(Error::generic("Invalid gic-version value".to_string())
                 .hint("Valid values are 2, 3, 4, 5, host, and max.\n")),
-        },
-        "iommu" => match value {
-            "none" => Ok(()),
-            "smmuv3" => Err(not_supported(name, value)),
-            _ => Err(Error::generic("Invalid iommu value".to_string())
-                .hint("Valid values are none, smmuv3.\n")),
         },
         "virtio-mmio-transports" => match value.parse::<u8>() {
             Ok(32) => Ok(()),
@@ -457,6 +453,20 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
             "its" => {
                 let on = prop_bool(name, &prop_string(name, value)?)?;
                 o.msi = if on { VirtMsi::Its } else { VirtMsi::Off };
+            }
+            // virt_set_iommu().
+            "iommu" => {
+                o.iommu = match prop_string(name, value)?.as_str() {
+                    "smmuv3" => VirtIommu::SmmuV3,
+                    "none" => VirtIommu::None,
+                    _ => {
+                        return Err(Error::generic("Invalid iommu value")
+                            .hint("Valid values are none, smmuv3.\n"));
+                    }
+                };
+            }
+            "default-bus-bypass-iommu" => {
+                o.default_bus_bypass_iommu = prop_bool(name, &prop_string(name, value)?)?;
             }
             "acpi" => o.acpi_off = on_off_auto(name, &prop_string(name, value)?)? == "off",
             "spcr" => o.spcr_off = !prop_bool(name, &prop_string(name, value)?)?,
@@ -901,6 +911,8 @@ pub(crate) fn start_board_tcg(
     cfg.mte = opts.mte;
     cfg.highmem = opts.highmem;
     cfg.msi = opts.msi;
+    cfg.iommu = opts.iommu;
+    cfg.default_bus_bypass_iommu = opts.default_bus_bypass_iommu;
     // machvirt_init() checks maxcpus against the redistributor space.
     cfg.max_cpus = Some(opts.max_cpus as usize);
     cfg.topology = opts.topology;
@@ -1093,6 +1105,20 @@ mod tests {
             msi(&[("msi", "gicv2m")]).unwrap_err().message(),
             "msi=gicv2m is not supported by ruvm yet"
         );
+        // virt_set_iommu().
+        let iommu = |v: &str| {
+            let mut m = QDict::new();
+            m.put("iommu", v);
+            take_board_options(&m).map(|o| o.iommu)
+        };
+        assert_eq!(iommu("smmuv3").unwrap(), VirtIommu::SmmuV3);
+        assert_eq!(iommu("none").unwrap(), VirtIommu::None);
+        let e = iommu("virtio").unwrap_err();
+        assert_eq!(e.message(), "Invalid iommu value");
+        assert_eq!(e.hint_text(), Some("Valid values are none, smmuv3.\n"));
+        let mut m = QDict::new();
+        m.put("default-bus-bypass-iommu", "on");
+        assert!(take_board_options(&m).unwrap().default_bus_bypass_iommu);
         let mut m = QDict::new();
         m.put("secure", "on");
         m.put("virtualization", "on");
