@@ -3,8 +3,8 @@
 //! The physical CPU interface, the ICC_* registers, from hw/intc/arm_gicv3_cpuif.c.
 
 use super::{
-    BANK_NS, BANK_S, CpuState, G0, G1, G1NS, GicState, INTID_NONSECURE, INTID_SECURE,
-    INTID_SPURIOUS, IccAccess, IccCpuCtx, IccReg,
+    BANK_NS, BANK_S, CpuState, G0, G1, G1NS, GICV3_LPI_INTID_START, GicState, INTID_NONSECURE,
+    INTID_SECURE, INTID_SPURIOUS, IccAccess, IccCpuCtx, IccReg,
 };
 
 const ICC_CTLR_EL1_CBPR: u64 = 1 << 0;
@@ -336,15 +336,22 @@ impl GicState {
             cs.gicr_iactiver0 |= 1 << irq;
             cs.gicr_ipendr0 &= !(1 << irq);
             self.redist_update(cpu);
-        } else {
+        } else if irq < GICV3_LPI_INTID_START {
             super::bmp_replace(&mut self.active, irq, true);
             super::bmp_replace(&mut self.pending, irq, false);
             self.update(irq, 1);
+        } else {
+            // LPIs have no active state. Acknowledging one just clears its pending bit.
+            self.lpi_pending(cpu, irq, false);
         }
     }
 
-    /// `icc_deactivate_irq()`.
+    /// `icc_deactivate_irq()`. LPIs have no active state, so there is nothing to do for them.
+    /// QEMU clears a bit past the end of its SPI bitmaps there instead.
     fn icc_deactivate_irq(&mut self, cpu: usize, irq: u32) {
+        if irq >= GICV3_LPI_INTID_START {
+            return;
+        }
         if irq < super::GIC_INTERNAL {
             self.cpu[cpu].gicr_iactiver0 &= !(1 << irq);
             self.redist_update(cpu);
@@ -374,7 +381,7 @@ impl GicState {
     /// `icc_eoir_write()`.
     fn icc_eoir_write(&mut self, cpu: usize, is_eoir0: bool, value: u64) {
         let irq = (value & 0xff_ffff) as u32;
-        if irq >= self.num_irq {
+        if irq >= self.num_irq && !(self.lpi_enable && irq >= GICV3_LPI_INTID_START) {
             return;
         }
         let ds = self.ds();

@@ -267,14 +267,14 @@ impl GicState {
                 }
             }
             GICD_TYPER => {
-                // No1N, A3V, IDbits 0xf, SecurityExtn and ITLinesNumber. DVIS, LPIS and NMI
-                // are 0.
+                // No1N, A3V, IDbits 0xf, LPIS, SecurityExtn and ITLinesNumber. NMI is 0.
                 let itlinesnumber = self.num_irq / 32 - 1;
                 let sec_extn = u32::from(!self.ds());
                 let dvis = u32::from(self.revision >= 4);
                 (1 << 25)
                     | (1 << 24)
                     | (dvis << 18)
+                    | (u32::from(self.lpi_enable) << 17)
                     | (sec_extn << 10)
                     | (0xf << 19)
                     | itlinesnumber

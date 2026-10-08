@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ruvm_machine_arm::virt::{VirtConfig, VirtMachine};
+use ruvm_machine_arm::virt::{VirtConfig, VirtMachine, VirtMsi};
 
 fn ruvm() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ruvm"))
@@ -104,12 +104,17 @@ fn virt_errors() {
             ),
         ),
         (
-            &["-M", "virt", "-smp", "124"],
+            &["-M", "virt,highmem-redists=off", "-smp", "124"],
             format!(
                 "{p}Number of SMP CPUs requested (124) exceeds max CPUs supported by machine \
-                 'mach-virt' (123)\n"
+                 'mach-virt' (123)\nTry 'highmem-redists=on' for more CPUs\n"
             ),
         ),
+        (
+            &["-M", "virt,msi=foo"],
+            format!("{p}Invalid msi value\nValid values are auto, gicv2m, its, off\n"),
+        ),
+        (&["-M", "virt,msi=gicv2m"], format!("{p}msi=gicv2m is not supported by ruvm yet\n")),
         (
             &["-M", "virt", "-smp", "dies=2"],
             format!("{p}dies > 1 not supported by this machine's CPU topology\n"),
@@ -157,13 +162,27 @@ fn virt_dumpdtb() {
         system(&["-nodefaults", "-display", "none", "-M", &m, "-cpu", "cortex-a57,pmu=off"]);
     assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
     let cpu = ruvm_target_arm::cpu::ArmCpuModel::by_name("cortex-a57").unwrap();
-    let mut board = VirtMachine::new(VirtConfig::new(cpu)).unwrap();
+    let mut cfg = VirtConfig::new(cpu.clone());
+    cfg.msi = VirtMsi::Off;
+    let mut board = VirtMachine::new(cfg).unwrap();
     board.machine_done().unwrap();
     let want = board.fdt().as_bytes();
     let got = std::fs::read(&dtb).unwrap();
     assert!(got == want, "the device tree differs from the board's");
     // The full buffer, as QEMU writes it.
     assert_eq!(got.len(), gunzip(&arm_data("virt-a57.dtb.gz")).len());
+
+    // With the ITS and two redistributor regions, which -smp 130 needs.
+    let m = format!("virt,gic-version=3,dtb-randomness=off,dumpdtb={dtb}");
+    let args = ["-nodefaults", "-display", "none", "-M", &m, "-cpu", "cortex-a57,pmu=off"];
+    let (code, out, err) = system(&[&args[..], &["-smp", "130"]].concat());
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    let mut cfg = VirtConfig::new(cpu);
+    cfg.smp = 130;
+    let mut board = VirtMachine::new(cfg).unwrap();
+    board.machine_done().unwrap();
+    let got = std::fs::read(&dtb).unwrap();
+    assert!(got == board.fdt().as_bytes(), "the device tree differs from the board's");
 }
 
 /// Runs test kernel `name` the way `make check-tcg` does, with `extra` options. Gives the exit
