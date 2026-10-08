@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Host code generation: a [`Backend`] on top of `ruvm-jit-aarch64` or `ruvm-jit-x86_64`,
-//! whichever matches the host, and the choice between it and the interpreter.
+//! Host code generation: a [`Backend`] on top of `ruvm-jit-aarch64`, `ruvm-jit-x86_64` or
+//! `ruvm-jit-riscv64`, whichever matches the host, and the choice between it and the
+//! interpreter.
 //!
 //! [`host_backend`] picks the backend for a new runtime. It is the native one when the host has
 //! one, the interpreter otherwise. The `RUVM_JIT_BACKEND` environment variable overrides the
@@ -128,10 +129,24 @@ struct Ran {
 }
 
 /// `lookup_and_goto_ptr` for native code: the runtime's `helper_lookup_tb_ptr()`.
-#[cfg_attr(not(any(all(unix, target_arch = "aarch64"), target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        all(unix, target_arch = "aarch64"),
+        target_arch = "x86_64",
+        all(target_os = "linux", target_arch = "riscv64")
+    )),
+    allow(dead_code)
+)]
 struct TbChain;
 
-#[cfg_attr(not(any(all(unix, target_arch = "aarch64"), target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        all(unix, target_arch = "aarch64"),
+        target_arch = "x86_64",
+        all(target_os = "linux", target_arch = "riscv64")
+    )),
+    allow(dead_code)
+)]
 impl TbChain {
     fn lookup(he: &mut HelperEnv<'_>) -> Result<Option<Arc<Tb>>, Unwind> {
         let Some(mut cpu) = Cpu::from_helper_env(he) else { return Ok(None) };
@@ -169,7 +184,14 @@ impl TbChain {
     }
 }
 
-#[cfg_attr(not(any(all(unix, target_arch = "aarch64"), target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        all(unix, target_arch = "aarch64"),
+        target_arch = "x86_64",
+        all(target_os = "linux", target_arch = "riscv64")
+    )),
+    allow(dead_code)
+)]
 fn as_tb(b: Option<Arc<dyn Any + Send + Sync>>) -> Option<Arc<Tb>> {
     b.and_then(|b| b.downcast::<Tb>().ok())
 }
@@ -636,8 +658,112 @@ mod host {
     }
 }
 
+#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+mod host {
+    use std::any::Any;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, Weak};
+
+    use ruvm_jit_core::{FenceMapping, Func};
+    use ruvm_jit_interp::{GuestMemory, HelperEnv, HelperRegistry, InterpError, Unwind};
+    use ruvm_jit_riscv64::{Chain, CompileOptions};
+
+    pub(super) use ruvm_jit_riscv64::{CodeRegion, CompiledTb, Found, GenCodeError};
+
+    use super::{Ran, TbChain, as_tb};
+    use crate::ENV_ICOUNT_DECR_OFFSET;
+
+    pub(super) const AVAILABLE: bool = true;
+    pub(super) const NAME: &str = "riscv64";
+    /// `TCG_TARGET_DEFAULT_MO` of `tcg/riscv64`: no ordering, so the front ends emit the
+    /// barriers a stronger guest needs.
+    pub(super) const TARGET_DEFAULT_MO: u32 = 0;
+
+    pub(super) fn new_region(size: usize) -> Option<Arc<CodeRegion>> {
+        CodeRegion::new(size).ok()
+    }
+
+    pub(super) fn next_region(r: &Arc<CodeRegion>, size: usize) -> Option<Arc<CodeRegion>> {
+        r.successor(size).ok()
+    }
+
+    pub(super) fn compile(
+        r: &Arc<CodeRegion>,
+        f: &Func,
+        helpers: &HelperRegistry,
+    ) -> Result<CompiledTb, GenCodeError> {
+        let opts = CompileOptions {
+            helpers: Some(helpers),
+            icount_decr_offset: Some(ENV_ICOUNT_DECR_OFFSET),
+            tlb_page_bits: f.config.tlb_page_bits,
+        };
+        r.compile_with(f, &opts)
+    }
+
+    pub(super) fn set_goto_tb_target(c: &CompiledTb, n: u32, dest: &CompiledTb) -> bool {
+        c.set_goto_tb_target(n, Some(dest))
+    }
+
+    pub(super) fn set_owner(c: &CompiledTb, owner: Weak<dyn Any + Send + Sync>) {
+        c.set_owner(owner);
+    }
+
+    pub(super) fn set_ic_key(c: &CompiledTb, pc: u64, key: [u64; 2]) {
+        c.set_ic_key(pc, key);
+    }
+
+    pub(super) fn clear_ic(c: &CompiledTb) {
+        c.clear_ic();
+    }
+
+    pub(super) fn clear_region_ic(r: &CodeRegion) {
+        r.clear_ic();
+    }
+
+    impl Chain for TbChain {
+        fn lookup_tb_ptr(
+            &self,
+            he: &mut HelperEnv<'_>,
+        ) -> Result<Option<Arc<dyn Any + Send + Sync>>, Unwind> {
+            Ok(TbChain::lookup(he)?.map(|t| t as Arc<dyn Any + Send + Sync>))
+        }
+
+        fn code<'a>(&self, block: &'a (dyn Any + Send + Sync)) -> Option<&'a CompiledTb> {
+            TbChain::code(block)
+        }
+
+        fn lookup_code(
+            &self,
+            he: &mut HelperEnv<'_>,
+            key: [u64; 2],
+            jump: &mut dyn FnMut(&CompiledTb) -> Option<u64>,
+        ) -> Result<Found, Unwind> {
+            TbChain::lookup_code(he, key, jump)
+        }
+    }
+
+    pub(super) fn run(
+        c: &CompiledTb,
+        env: &mut [u8],
+        mem: &mut dyn GuestMemory,
+        helpers: &HelperRegistry,
+        icount_decr: &AtomicU32,
+    ) -> Result<Ran, InterpError> {
+        let x = c.run_chained(env, mem, helpers, &TbChain, icount_decr)?;
+        Ok(Ran { exit: x.exit, block: as_tb(x.block), next: as_tb(x.next) })
+    }
+
+    pub(super) fn fence_mapping(_guest_mo: u32) -> FenceMapping {
+        FenceMapping::Qemu
+    }
+}
+
 /// A host without a native backend: nothing here can be made.
-#[cfg(not(any(all(unix, target_arch = "aarch64"), target_arch = "x86_64")))]
+#[cfg(not(any(
+    all(unix, target_arch = "aarch64"),
+    target_arch = "x86_64",
+    all(target_os = "linux", target_arch = "riscv64")
+)))]
 mod host {
     use std::any::Any;
     use std::sync::atomic::AtomicU32;
