@@ -150,9 +150,8 @@ fn virt_errors() {
     assert_eq!((code, out.as_str()), (0, "Accelerators supported in QEMU binary:\ntcg\n"));
 }
 
-/// `-M virt,dumpdtb=` writes the board's device tree and exits. The board's tree is compared
-/// with QEMU's in ruvm-machine-arm's tests (QEMU's has nodes for devices the board does not
-/// have yet), so this checks that the options reach the board.
+/// `-M virt,dumpdtb=` writes the board's device tree and exits. The tree has to be the one QEMU
+/// writes, and the board's own, so this checks that the options (`pmu=off` too) reach it.
 #[test]
 fn virt_dumpdtb() {
     let dir = TempDir::new("dumpdtb");
@@ -161,7 +160,7 @@ fn virt_dumpdtb() {
     let (code, out, err) =
         system(&["-nodefaults", "-display", "none", "-M", &m, "-cpu", "cortex-a57,pmu=off"]);
     assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
-    let cpu = ruvm_target_arm::cpu::ArmCpuModel::by_name("cortex-a57").unwrap();
+    let cpu = ruvm_target_arm::cpu::ArmCpuModel::by_name("cortex-a57").unwrap().without_pmu();
     let mut cfg = VirtConfig::new(cpu.clone());
     cfg.msi = VirtMsi::Off;
     let mut board = VirtMachine::new(cfg).unwrap();
@@ -169,8 +168,7 @@ fn virt_dumpdtb() {
     let want = board.fdt().as_bytes();
     let got = std::fs::read(&dtb).unwrap();
     assert!(got == want, "the device tree differs from the board's");
-    // The full buffer, as QEMU writes it.
-    assert_eq!(got.len(), gunzip(&arm_data("virt-a57.dtb.gz")).len());
+    assert!(got == gunzip(&arm_data("virt-a57.dtb.gz")), "the device tree differs from QEMU's");
 
     // With the ITS and two redistributor regions, which -smp 130 needs.
     let m = format!("virt,gic-version=3,dtb-randomness=off,dumpdtb={dtb}");
