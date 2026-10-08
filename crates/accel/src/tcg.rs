@@ -17,8 +17,9 @@
 //!
 //! Deliberate differences from QEMU:
 //!
-//! - `tb-size=0`, the default, means the runtime's default code buffer of 32 MiB rather than
-//!   QEMU's 1 GiB. Any other value is taken in MiB as in QEMU, with QEMU's 1 MiB minimum.
+//! - With `tb-size=0`, the default, the code buffer is QEMU's: an eighth of the host's memory,
+//!   at most 1 GiB. The host's memory is `MemTotal` of `/proc/meminfo`, so off Linux it is
+//!   unknown and the buffer is 1 GiB, as QEMU makes it when `sysconf()` fails.
 //! - `split-wx=on` fails with "jit split-wx not supported", as it does on QEMU hosts without
 //!   split mappings: the code regions here are never mapped twice.
 //! - There is no big QEMU lock. Pausing sets each vCPU's `stop` flag, kicks it and polls
@@ -41,6 +42,33 @@ pub const TYPE_TCG_ACCEL: &str = "tcg-accel";
 
 /// `MIN_CODE_GEN_BUFFER_SIZE`.
 const MIN_CODE_GEN_BUFFER_SIZE: usize = 1 << 20;
+
+/// `DEFAULT_CODE_GEN_BUFFER_SIZE` of system emulation.
+const DEFAULT_CODE_GEN_BUFFER_SIZE: usize = 1 << 30;
+
+/// `qemu_get_host_physmem()`: the host's memory in bytes, 0 when it is not known.
+fn host_physmem() -> usize {
+    std::fs::read_to_string("/proc/meminfo").map_or(0, |s| physmem_of_meminfo(&s))
+}
+
+/// The `MemTotal` line of `/proc/meminfo` text in bytes, 0 when there is none.
+fn physmem_of_meminfo(s: &str) -> usize {
+    s.lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.trim().strip_suffix("kB"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(0, |kb| kb.saturating_mul(1024))
+}
+
+/// The code buffer of `tb-size=0` on a host with `phys_mem` bytes of memory, 0 for unknown.
+fn default_code_gen_buffer_size(phys_mem: usize) -> usize {
+    if phys_mem == 0 {
+        DEFAULT_CODE_GEN_BUFFER_SIZE
+    } else {
+        // QEMU_ALIGN_DOWN(phys_mem / 8, page_size)
+        ((phys_mem / 8) & !0xfff).clamp(MIN_CODE_GEN_BUFFER_SIZE, DEFAULT_CODE_GEN_BUFFER_SIZE)
+    }
+}
 
 /// `thread=`: one host thread per vCPU, or one for all of them.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -126,10 +154,10 @@ impl TcgOptions {
         }
     }
 
-    /// The code buffer size `tcg_init()` uses, `size_code_gen_buffer()`.
-    pub fn code_gen_buffer_size(&self, default: usize) -> usize {
+    /// The code buffer size `tcg_region_init()` picks for `tb-size`.
+    pub fn code_gen_buffer_size(&self) -> usize {
         if self.tb_size == 0 {
-            default
+            default_code_gen_buffer_size(host_physmem())
         } else {
             (self.tb_size as usize).saturating_mul(1 << 20).max(MIN_CODE_GEN_BUFFER_SIZE)
         }
@@ -149,7 +177,7 @@ impl TcgOptions {
         let config = JitConfig {
             mttcg,
             one_insn_per_tb: self.one_insn_per_tb || base.one_insn_per_tb,
-            code_gen_buffer_size: self.code_gen_buffer_size(base.code_gen_buffer_size),
+            code_gen_buffer_size: self.code_gen_buffer_size(),
             ..base
         };
         Ok((config, warning.map(str::to_string).into_iter().collect()))
@@ -341,11 +369,23 @@ mod tests {
         assert_eq!(c.code_gen_buffer_size, 16 << 20);
         assert_eq!(c.page_bits, 12);
         assert_eq!(c.nb_mmu_modes, 8);
-        // tb-size=0 keeps the default.
+        // tb-size=0 sizes the buffer for the host as QEMU does.
         let (c, _) = TcgOptions::default().jit_config(base.clone(), false).unwrap();
         assert!(!c.mttcg);
-        assert_eq!(c.code_gen_buffer_size, base.code_gen_buffer_size);
+        assert_eq!(c.code_gen_buffer_size, default_code_gen_buffer_size(host_physmem()));
         let wx = TcgOptions { split_wx: true, ..TcgOptions::default() };
         assert_eq!(wx.jit_config(base, true).unwrap_err(), "jit split-wx not supported");
+    }
+
+    #[test]
+    fn default_code_buffer_follows_the_host_memory() {
+        // Unknown memory, a small host and a big one.
+        assert_eq!(default_code_gen_buffer_size(0), 1 << 30);
+        assert_eq!(default_code_gen_buffer_size(2 << 30), 256 << 20);
+        assert_eq!(default_code_gen_buffer_size(64 << 30), 1 << 30);
+        assert_eq!(default_code_gen_buffer_size(4 << 20), 1 << 20);
+        let m = "MemTotal:       16318956 kB\nMemFree:          612340 kB\n";
+        assert_eq!(physmem_of_meminfo(m), 16318956 * 1024);
+        assert_eq!(physmem_of_meminfo("MemFree: 1 kB\n"), 0);
     }
 }

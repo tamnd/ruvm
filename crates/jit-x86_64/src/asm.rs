@@ -309,7 +309,14 @@ const fn low(r: Reg) -> u8 {
 
 impl Asm {
     pub(crate) fn new() -> Asm {
-        Asm::default()
+        // Room for a typical block, so the buffers rarely grow and copy while assembling.
+        Asm {
+            code: Vec::with_capacity(4096),
+            labels: Vec::with_capacity(64),
+            fixups: Vec::with_capacity(64),
+            pool: Vec::new(),
+            pool_refs: Vec::new(),
+        }
     }
 
     /// The offset of the next byte.

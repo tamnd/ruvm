@@ -25,14 +25,15 @@ use ruvm_jit_core::types::call_flags::NO_RWG_SE;
 use ruvm_jit_core::{HelperInfo, HelperType, MemOp, MemOpIdx};
 use ruvm_jit_interp::{HelperEnv, HelperRegistry, Unwind};
 
-use super::{csr, mmu_index, set_mode, swap_hypervisor_regs};
+use super::{csr, ld64, mmu_index, set_mode, swap_hypervisor_regs};
 use crate::cpu::{
     BADADDR, CpuRiscvState, EXCP_ILLEGAL_INST, EXCP_INST_ACCESS_FAULT, EXCP_INST_ADDR_MIS,
-    EXCP_STORE_AMO_ADDR_MIS, EXCP_VIRT_INSTRUCTION_FAULT, HSTATUS_HU, HSTATUS_SPV, HSTATUS_SPVP,
-    HSTATUS_VTSR, HSTATUS_VTVM, HSTATUS_VTW, MENVCFG_CBCFE, MENVCFG_CBIE, MENVCFG_CBZE,
-    MMU_2STAGE_BIT, MMU_IDX_S_SUM, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPRV,
-    MSTATUS_MPV, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_SUM, MSTATUS_TSR, MSTATUS_TVM,
-    MSTATUS_TW, PRV_M, PRV_S, PRV_U, RVS, RVU, RiscvCfg, get_field, set_field,
+    EXCP_STORE_AMO_ADDR_MIS, EXCP_VIRT_INSTRUCTION_FAULT, HENVCFG, HSTATUS_HU, HSTATUS_SPV,
+    HSTATUS_SPVP, HSTATUS_VTSR, HSTATUS_VTVM, HSTATUS_VTW, MENVCFG, MENVCFG_CBCFE, MENVCFG_CBIE,
+    MENVCFG_CBZE, MMU_2STAGE_BIT, MMU_IDX_S_SUM, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP,
+    MSTATUS_MPRV, MSTATUS_MPV, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_SUM, MSTATUS_TSR,
+    MSTATUS_TVM, MSTATUS_TW, PRIV, PRV_M, PRV_S, PRV_U, RVS, RVU, RiscvCfg, SENVCFG, VIRT_ENABLED,
+    get_field, set_field,
 };
 
 type R<T> = Result<T, CpuLoopExit>;
@@ -479,7 +480,8 @@ fn h_sc_probe_write(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
 /// `cfg.cbom_blocksize` and `cfg.cboz_blocksize` of the vCPU. The properties take a power
 /// of 2 from 8 to 4096 only, so a block is whole 8 byte words in one page.
 fn cbo_blocksizes(cpu: &Cpu<'_>) -> (u64, u64) {
-    let cfg = riscv_cfg(cpu);
+    let ops = cpu.ops();
+    let cfg = super::riscv_of(&ops).cfg();
     (u64::from(cfg.cbom_blocksize), u64::from(cfg.cboz_blocksize))
 }
 
@@ -495,23 +497,31 @@ fn host_ticks(cpu: &Cpu<'_>) -> u64 {
     super::riscv_of(&ops).host_ticks()
 }
 
-/// `check_zicbo_envcfg()`.
+/// `check_zicbo_envcfg()`. It reads the few registers it needs from `env` rather than
+/// loading the whole state, as every `cbo.zero` runs it.
 fn check_zicbo_envcfg(cpu: &mut Cpu<'_>, envbits: u64) -> R<()> {
-    let st = CpuRiscvState::load(cpu.env);
-    if st.priv_lvl < PRV_M && get_field(st.menvcfg, envbits) == 0 {
+    let priv_lvl = ld64(cpu.env, PRIV);
+    let menvcfg = ld64(cpu.env, MENVCFG);
+    let senvcfg = ld64(cpu.env, SENVCFG);
+    let henvcfg = ld64(cpu.env, HENVCFG);
+    let virt = ld64(cpu.env, VIRT_ENABLED) != 0;
+    if priv_lvl < PRV_M && get_field(menvcfg, envbits) == 0 {
         return Err(illegal(cpu));
     }
-    if st.virt()
-        && ((st.priv_lvl <= PRV_S && get_field(st.henvcfg, envbits) == 0)
-            || (st.priv_lvl < PRV_S && get_field(st.senvcfg, envbits) == 0))
+    if virt
+        && ((priv_lvl <= PRV_S && get_field(henvcfg, envbits) == 0)
+            || (priv_lvl < PRV_S && get_field(senvcfg, envbits) == 0))
     {
         return Err(virt_fault(cpu));
     }
-    if st.priv_lvl < PRV_S && get_field(st.senvcfg, envbits) == 0 {
+    if priv_lvl < PRV_S && get_field(senvcfg, envbits) == 0 {
         return Err(illegal(cpu));
     }
     Ok(())
 }
+
+/// The largest `cboz_blocksize` of zeros.
+static ZEROS: [u8; 4096] = [0; 4096];
 
 /// `HELPER(cbo_zero)`.
 fn h_cbo_zero(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
@@ -524,10 +534,11 @@ fn h_cbo_zero(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
         // cbo.zero requires MMU_DATA_STORE access. Do a probe_write() to raise any
         // exceptions, including PMP.
         probe_access(cpu, address, cbozlen as usize, MmuAccessType::DataStore, idx, Ra::Tb)?;
-        let oi = MemOpIdx::new(MemOp::LEUQ, idx as u32);
-        for i in (0..cbozlen).step_by(8) {
-            cpu_st_mmu(cpu, address + i, 0, oi, Ra::Tb)?;
-        }
+        // QEMU memsets the block through the host pointer probe_write() gives, or stores
+        // bytes to an I/O page. The block is in one page, so one store of all of it does
+        // either.
+        let oi = MemOpIdx::new(MemOp::UB, idx as u32);
+        cputlb::do_st_bytes(cpu, address, &ZEROS[..cbozlen as usize], oi, Ra::Tb)?;
         Ok(0)
     })
 }
