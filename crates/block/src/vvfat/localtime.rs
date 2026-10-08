@@ -9,7 +9,7 @@
 
 /// The fields of a `struct tm` that FAT timestamps use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Tm {
+pub(crate) struct Tm {
     pub sec: i64,
     pub min: i64,
     pub hour: i64,
@@ -41,7 +41,7 @@ struct PosixTz {
 
 /// A time zone: TZif transitions with a POSIX TZ string for later times, or just the string.
 #[derive(Debug, Clone, Default)]
-pub(super) struct Zone {
+pub(crate) struct Zone {
     transitions: Vec<(i64, usize)>,
     /// The UTC offsets of the local time types.
     types: Vec<i64>,
@@ -50,7 +50,7 @@ pub(super) struct Zone {
 
 impl Zone {
     /// The zone `localtime_r()` would use in this process.
-    pub(super) fn local() -> Zone {
+    pub(crate) fn local() -> Zone {
         if cfg!(windows) {
             return Zone::default();
         }
@@ -109,7 +109,7 @@ impl Zone {
     }
 
     /// `localtime_r()`.
-    pub(super) fn localtime(&self, t: i64) -> Tm {
+    pub(crate) fn localtime(&self, t: i64) -> Tm {
         let local = t + self.offset(t);
         let days = local.div_euclid(86400);
         let secs = local.rem_euclid(86400);

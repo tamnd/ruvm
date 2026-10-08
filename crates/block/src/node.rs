@@ -710,6 +710,10 @@ pub(crate) trait ParentOps: Send + Sync {
     fn stay_at_node(&self) -> bool {
         false
     }
+    /// Whether the parent is a block backend, `c->klass == &child_root`.
+    fn is_backend(&self) -> bool {
+        false
+    }
 }
 
 /// One parent of a node and what it holds, a `BdrvChild` seen from the child.
