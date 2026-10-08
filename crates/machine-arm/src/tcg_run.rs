@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Running the virt board on TCG: the parts of accel/tcg/tcg-accel-ops*.c, system/cpus.c and
-//! system/runstate.c that put a [`VirtMachine`] on the vCPUs of the AArch64 front end
-//! (`ruvm-target-arm`) running on `ruvm-jit`.
+//! Running an Arm board on TCG: the parts of accel/tcg/tcg-accel-ops*.c, system/cpus.c and
+//! system/runstate.c that put a board ([`TcgBoard`]: the [`VirtMachine`] or the
+//! [`SbsaRefMachine`]) on the vCPUs of the AArch64 front end (`ruvm-target-arm`) running on
+//! `ruvm-jit`.
 //!
-//! [`VirtTcgMachine::new`] takes a board with its devices plugged. It creates the runtime with
+//! [`TcgMachine::new`] takes a board with its devices plugged. It creates the runtime with
 //! the `-accel tcg` options ([`TcgOptions`]), finishes the board with `machine_done()`, makes
 //! one vCPU per CPU (the secondaries powered off, for PSCI CPU_ON to start) and starts the
 //! vCPU threads stopped: `CPU n/TCG` with MTTCG (`thread=multi`, the default, as AArch64
 //! supports it) and `ALL CPUs/TCG` in round robin mode (`thread=single`).
-//! [`VirtTcgMachine::start`] lets them run. A thread fires the
+//! [`TcgMachine::start`] lets them run. A thread fires the
 //! timers of the board clocks (the generic timers and the RTC).
 //!
-//! PSCI SYSTEM_RESET stops every vCPU, resets the board, drops all translated code, resets each
-//! vCPU on its own thread and lets them go again, as `qemu_system_reset()` does from the main
-//! loop. With `-no-reboot` it is a shutdown instead. PSCI SYSTEM_OFF is reported to the
+//! PSCI SYSTEM_RESET (or any other reset request of the board) stops every vCPU, resets the
+//! board, drops all translated code, resets each vCPU on its own thread and lets them go again,
+//! as `qemu_system_reset()` does from the main loop. With `-no-reboot` it is a shutdown
+//! instead. PSCI SYSTEM_OFF (or the board's other shutdown requests) is reported to the
 //! [`VirtEventHandler`] the caller gives.
 //!
 //! Deliberate differences from QEMU:
@@ -36,14 +38,15 @@ use std::time::Duration;
 use ruvm_accel::VcpuControl;
 use ruvm_accel::tcg::{TcgOptions, TcgVcpus};
 use ruvm_hw_core::Clock;
-use ruvm_jit::Jit;
 use ruvm_jit::cputlb::tlb_flush;
 use ruvm_jit::native::{BackendKind, backend_of_kind};
+use ruvm_jit::{Cpu, Jit, Vcpu};
 use ruvm_target_arm::tcg::{helper_registry, jit_config};
 
-use ruvm_mem::MemoryListener;
+use ruvm_mem::{AddressSpace, MemoryListener, MemorySystem};
 
-use crate::virt::{VirtMachine, VirtRequest};
+use crate::sbsa_ref::SbsaRefMachine;
+use crate::virt::{VirtMachine, VirtRequest, VirtRequestHandler};
 
 /// The longest the timer thread sleeps. Arming a timer that becomes the first to fire wakes it
 /// through the clock's notify hook, as `timerlist_notify()` kicks QEMU's main loop, so this only
@@ -123,11 +126,66 @@ impl Shared {
     }
 }
 
-fn lock_board(board: &Mutex<VirtMachine>) -> MutexGuard<'_, VirtMachine> {
+/// What the run loop needs from a board.
+pub trait TcgBoard: Send + 'static {
+    /// Send the shutdown and reset requests to `handler`, on the thread that made them.
+    fn set_request_handler(&self, handler: Option<VirtRequestHandler>);
+    /// Finish the board and reset it.
+    fn machine_done(&mut self) -> Result<(), String>;
+    /// Make the vCPUs on `jit`, wired to the board, and reset them.
+    fn create_vcpus(&self, jit: &Arc<Jit>) -> Result<Vec<Vcpu>, String>;
+    /// The memory system.
+    fn memory_system(&self) -> &Arc<MemorySystem>;
+    /// The address space the vCPUs see.
+    fn memory_as(&self) -> &Arc<AddressSpace>;
+    /// `qemu_system_reset()` for the devices and the ROMs.
+    fn system_reset(&mut self) -> Result<(), String>;
+    /// The reset of one vCPU, on its own thread.
+    fn reset_cpu(&self, cpu: &mut Cpu<'_>);
+}
+
+macro_rules! tcg_board {
+    ($t:ty) => {
+        impl TcgBoard for $t {
+            fn set_request_handler(&self, handler: Option<VirtRequestHandler>) {
+                <$t>::set_request_handler(self, handler)
+            }
+
+            fn machine_done(&mut self) -> Result<(), String> {
+                <$t>::machine_done(self)
+            }
+
+            fn create_vcpus(&self, jit: &Arc<Jit>) -> Result<Vec<Vcpu>, String> {
+                <$t>::create_vcpus(self, jit)
+            }
+
+            fn memory_system(&self) -> &Arc<MemorySystem> {
+                <$t>::memory_system(self)
+            }
+
+            fn memory_as(&self) -> &Arc<AddressSpace> {
+                <$t>::memory_as(self)
+            }
+
+            fn system_reset(&mut self) -> Result<(), String> {
+                <$t>::system_reset(self)
+            }
+
+            fn reset_cpu(&self, cpu: &mut Cpu<'_>) {
+                <$t>::reset_cpu(self, cpu)
+            }
+        }
+    };
+}
+
+tcg_board!(VirtMachine);
+tcg_board!(SbsaRefMachine);
+
+fn lock_board<B>(board: &Mutex<B>) -> MutexGuard<'_, B> {
     board.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn control_loop(shared: Arc<Shared>, vcpus: Arc<TcgVcpus>, board: Arc<Mutex<VirtMachine>>) {
+fn control_loop<B: TcgBoard>(shared: Arc<Shared>, vcpus: Arc<TcgVcpus>, board: Arc<Mutex<B>>) {
     loop {
         let mut c = shared.lock();
         while !c.reset_pending && !c.quit {
@@ -199,17 +257,23 @@ impl MemoryListener for TlbCommit {
     }
 }
 
-/// The virt board running on TCG.
-pub struct VirtTcgMachine {
+/// A board running on TCG.
+pub struct TcgMachine<B: TcgBoard> {
     shared: Arc<Shared>,
-    board: Arc<Mutex<VirtMachine>>,
+    board: Arc<Mutex<B>>,
     vcpus: Arc<TcgVcpus>,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
-impl fmt::Debug for VirtTcgMachine {
+/// The virt board running on TCG.
+pub type VirtTcgMachine = TcgMachine<VirtMachine>;
+
+/// The sbsa-ref board running on TCG.
+pub type SbsaRefTcgMachine = TcgMachine<SbsaRefMachine>;
+
+impl<B: TcgBoard> fmt::Debug for TcgMachine<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VirtTcgMachine")
+        f.debug_struct("TcgMachine")
             .field("vcpus", &self.vcpus.vcpu_count())
             .field("mttcg", &self.mttcg())
             .finish_non_exhaustive()
@@ -223,17 +287,17 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> Result<JoinHandle<()>
         .map_err(|e| format!("could not create thread: {e}"))
 }
 
-impl VirtTcgMachine {
+impl<B: TcgBoard> TcgMachine<B> {
     /// Creates the runtime for `cfg`, finishes the board, makes its vCPUs and starts their
-    /// threads stopped. `clocks` are the clocks the board's timers run on (the board's
+    /// threads stopped. `clocks` are the clocks the board's timers run on (such as
     /// [`VirtMachine::clock`] and the RTC clock); a thread fires them. Also gives the warnings
     /// to print, such as QEMU's for `thread=multi` on a guest without MTTCG.
     pub fn new(
-        board: VirtMachine,
+        board: B,
         clocks: Vec<Arc<Clock>>,
         cfg: &VirtRunConfig,
         handler: VirtEventHandler,
-    ) -> Result<(VirtTcgMachine, Vec<String>), String> {
+    ) -> Result<(TcgMachine<B>, Vec<String>), String> {
         let mut board = board;
         let (config, warnings) = cfg.tcg.jit_config(jit_config(), ARM_SUPPORTS_MTTCG)?;
         let backend = match cfg.backend {
@@ -280,12 +344,12 @@ impl VirtTcgMachine {
             spawn("timers", move || timer_loop(s, clocks))?
         };
         let machine =
-            VirtTcgMachine { shared, board, vcpus, threads: Mutex::new(vec![control, timers]) };
+            TcgMachine { shared, board, vcpus, threads: Mutex::new(vec![control, timers]) };
         Ok((machine, warnings))
     }
 
     /// The board, for the monitor and for device access.
-    pub fn board(&self) -> &Arc<Mutex<VirtMachine>> {
+    pub fn board(&self) -> &Arc<Mutex<B>> {
         &self.board
     }
 
@@ -344,7 +408,7 @@ impl VirtTcgMachine {
     }
 }
 
-impl Drop for VirtTcgMachine {
+impl<B: TcgBoard> Drop for TcgMachine<B> {
     fn drop(&mut self) {
         self.quit();
     }

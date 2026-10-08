@@ -11,11 +11,13 @@
 //! `accessfn` checks (`gicv3_irqfiq_access()` and friends) are asked of the interface.
 //!
 //! ICC_SRE_EL1 (SRE, DFB and DIB set, 0x7) and ICC_SRE_EL2 and ICC_SRE_EL3 (Enable too,
-//! 0xf) are constants, as in QEMU. The ICH and ICV registers of the virtualization extension
-//! and ICC_NMIAR1_EL1 are not defined, so the ICC registers are never redirected to ICV by
-//! HCR_EL2.IMO and FMO.
+//! 0xf) are constants, as in QEMU. A CPU with EL2 also gets the ICH registers of the
+//! virtualization extension, for QEMU's default shape of 4 list registers and 5 bits of
+//! virtual priority and preemption, which every CPU modelled here has. Like QEMU's, they have
+//! no `accessfn`. The interface redirects ICC accesses to their ICV twins under HCR_EL2.IMO
+//! and FMO. ICC_NMIAR1_EL1 is not defined.
 
-use super::sysreg::{PL1_R, PL1_RW, PL1_W, PL3_RW};
+use super::sysreg::{PL1_R, PL1_RW, PL1_W, PL2_R, PL2_RW, PL3_RW};
 use super::{Arm, is_secure};
 use crate::cpu::{ArmFeatures, CpuArmState};
 
@@ -141,6 +143,23 @@ pub(crate) const ICC_REGS: &[IccReg] = &[
     IccReg { name: "ICC_IGRPEN1_EL3", enc: (3, 6, 12, 12, 7), access: PL3_RW, prebits: 0 },
 ];
 
+/// The ICH registers `gicv3_init_cpuif()` adds to a CPU with EL2: `gicv3_cpuif_hcr_reginfo`
+/// and the list registers, for 4 list registers and 5 bits of virtual preemption.
+pub(crate) const ICH_REGS: &[IccReg] = &[
+    IccReg { name: "ICH_AP0R0_EL2", enc: (3, 4, 12, 8, 0), access: PL2_RW, prebits: 0 },
+    IccReg { name: "ICH_AP1R0_EL2", enc: (3, 4, 12, 9, 0), access: PL2_RW, prebits: 0 },
+    IccReg { name: "ICH_HCR_EL2", enc: (3, 4, 12, 11, 0), access: PL2_RW, prebits: 0 },
+    IccReg { name: "ICH_VTR_EL2", enc: (3, 4, 12, 11, 1), access: PL2_R, prebits: 0 },
+    IccReg { name: "ICH_MISR_EL2", enc: (3, 4, 12, 11, 2), access: PL2_R, prebits: 0 },
+    IccReg { name: "ICH_EISR_EL2", enc: (3, 4, 12, 11, 3), access: PL2_R, prebits: 0 },
+    IccReg { name: "ICH_ELRSR_EL2", enc: (3, 4, 12, 11, 5), access: PL2_R, prebits: 0 },
+    IccReg { name: "ICH_VMCR_EL2", enc: (3, 4, 12, 11, 7), access: PL2_RW, prebits: 0 },
+    IccReg { name: "ICH_LR0_EL2", enc: (3, 4, 12, 12, 0), access: PL2_RW, prebits: 0 },
+    IccReg { name: "ICH_LR1_EL2", enc: (3, 4, 12, 12, 1), access: PL2_RW, prebits: 0 },
+    IccReg { name: "ICH_LR2_EL2", enc: (3, 4, 12, 12, 2), access: PL2_RW, prebits: 0 },
+    IccReg { name: "ICH_LR3_EL2", enc: (3, 4, 12, 12, 3), access: PL2_RW, prebits: 0 },
+];
+
 /// The encoding of a system register key.
 pub(crate) fn encoding(key: u32) -> IccEncoding {
     (key >> 14, (key >> 11) & 7, (key >> 7) & 0xf, (key >> 3) & 0xf, key & 7)
@@ -156,7 +175,8 @@ impl Arm {
     fn icc(&self, key: u32) -> Option<(&dyn GicCpuInterface, IccEncoding)> {
         let gic = self.gic.as_deref()?;
         let enc = encoding(key);
-        ICC_REGS.iter().any(|r| r.enc == enc).then_some((gic, enc))
+        let ich = self.features().el2 && ICH_REGS.iter().any(|r| r.enc == enc);
+        (ich || ICC_REGS.iter().any(|r| r.enc == enc)).then_some((gic, enc))
     }
 
     /// Read the ICC register `key` of the vCPU `cpu_index`, or `None` if it is not one.

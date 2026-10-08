@@ -14,7 +14,10 @@
 //! - Output and input addresses are at most 48 bits: FEAT_LPA, FEAT_LPA2 and FEAT_LVA
 //!   (52 bit addresses) are not implemented, and neither is FEAT_TTST.
 //! - Secure and Non-secure accesses go to the same address space, and the NS bits of the
-//!   descriptors are ignored.
+//!   descriptors are ignored. The accesses carry the secure attribute and the address space
+//!   of the translation regime (Secure or Root at EL3 and in Secure state), which is what
+//!   the GIC banks its registers on. The EL1&0 TLB entries are shared by the two security
+//!   states, so a Secure EL1 payload would see the attributes of whichever state filled them.
 //! - With FEAT_RME the granule protection check (`arm_granule_protection_check()`) sees
 //!   the physical address space of the translation regime: Root for EL3, and otherwise
 //!   the one SCR_EL3.NS and NSE select. The NS and NSE bits of the descriptors do not
@@ -28,6 +31,7 @@
 //! - Stage 2 data aborts are reported without instruction syndrome (ISV is clear), as
 //!   QEMU does for accesses made by helpers.
 
+use ruvm_jit::cputlb::tlb_set_page_with_attrs;
 use ruvm_jit::{Cpu, CpuLoopExit, MmuAccessType, Ra, page};
 use ruvm_mem::{AddressSpace, Endian, MemTxAttrs, MemTxResult};
 
@@ -972,12 +976,27 @@ pub(crate) fn tlb_fill(
     probe: bool,
     ra: Ra,
 ) -> Result<bool, CpuLoopExit> {
-    match get_phys_addr(arm, cpu, address, access, mmu_idx, false, false) {
+    let st = CpuArmState::load_system(cpu.env);
+    let as_ = cpu.core.address_space().clone();
+    let w = Walker { arm, st: &st, as_: &as_ };
+    match w.get_phys_addr(address, access, mmu_idx, false, false) {
         Ok(t) => {
             // Map at least a target page; a larger page or block is recorded so that a
             // flush of any address in it flushes the whole of it.
             let size = t.page_size.max(4096);
-            cpu.tlb_set_page(address & !0xfff, t.pa & !0xfff, t.prot, mmu_idx, size);
+            let space = w.space_of(mmu_idx);
+            let attrs = MemTxAttrs::default()
+                .with_secure(matches!(space, SS_SECURE | SS_ROOT))
+                .with_space(space);
+            tlb_set_page_with_attrs(
+                cpu,
+                address & !0xfff,
+                t.pa & !0xfff,
+                attrs,
+                t.prot,
+                mmu_idx,
+                size,
+            );
             Ok(true)
         }
         Err(_) if probe => Ok(false),

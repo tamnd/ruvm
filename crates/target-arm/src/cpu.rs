@@ -4,11 +4,11 @@
 //! `cpu.c`, `cpu64.c` and `cpu-max.c` this crate needs, including the EL2 and EL3 state, the
 //! HCR_EL2 and SCR_EL3 write masks and `arm_hcr_el2_eff()`.
 //!
-//! The models are `cortex-a57`, `cortex-a72` and `cortex-a76` with their QEMU ID register
-//! values (the A57 reports the 4K granule only, which this crate walks; the A72 adds 64K
-//! and the A76, which has VHE, has all three). They start without EL2 and EL3, the virt
-//! board's default, and [`ArmCpuModel::with_el2`] and [`ArmCpuModel::with_el3`] add them as
-//! `virtualization=on` and `secure=on` do.
+//! The models are `cortex-a57`, `cortex-a72`, `cortex-a76` and `neoverse-n1` with their QEMU
+//! ID register values (the A57 reports the 4K granule only, which this crate walks; the A72
+//! adds 64K and the A76 and N1, which have VHE, have all three). They start without EL2 and
+//! EL3, the virt board's default, and [`ArmCpuModel::with_el2`] and [`ArmCpuModel::with_el3`]
+//! add them as `virtualization=on` and `secure=on` do.
 //!
 //! [`CpuArmState`] is a plain struct with `#[repr(C)]`, so `offset_of!` gives the offset of
 //! every field. The runtime keeps the state of a vCPU in a byte buffer (`env`), with the
@@ -128,6 +128,9 @@ arm_state! {
         pub elr_el: [u64; 4],
         /// SPSR_ELx.
         pub spsr_el: [u64; 4],
+        /// SPSR_ABT, SPSR_UND, SPSR_IRQ and SPSR_FIQ, QEMU's `banked_spsr` entries for the
+        /// AArch32 modes, which AArch64 code at EL2 and EL3 can still read and write.
+        pub spsr_aarch32: [u64; 4],
         /// SCTLR_ELx.
         pub sctlr_el: [u64; 4],
         /// TCR_ELx.
@@ -189,6 +192,32 @@ arm_state! {
         pub mdcr_el2: u64,
         /// MDCR_EL3.
         pub mdcr_el3: u64,
+        /// PMCR_EL0, QEMU's `c9_pmcr`. N is the model's and read only.
+        pub pmcr: u64,
+        /// The counters PMCNTENSET_EL0 and PMCNTENCLR_EL0 enable, `c9_pmcnten`.
+        pub pmcnten: u64,
+        /// The overflow flags of PMOVSSET_EL0 and PMOVSCLR_EL0, `c9_pmovsr`.
+        pub pmovsr: u64,
+        /// PMUSERENR_EL0.
+        pub pmuserenr: u64,
+        /// The overflow interrupt enables of PMINTENSET_EL1 and PMINTENCLR_EL1,
+        /// `c9_pminten`.
+        pub pminten: u64,
+        /// PMSELR_EL0.
+        pub pmselr: u64,
+        /// PMCCNTR_EL0 as the guest last saw it, `c15_ccnt`. While the counter runs it is
+        /// the cycle count less `ccnt_delta`, see `tcg::pmu`.
+        pub ccnt: u64,
+        /// `c15_ccnt_delta`.
+        pub ccnt_delta: u64,
+        /// PMCCFILTR_EL0.
+        pub pmccfiltr: u64,
+        /// PMEVCNTR<n>_EL0, `c14_pmevcntr`, kept like `ccnt`.
+        pub pmevcntr: [u64; 31],
+        /// `c14_pmevcntr_delta`.
+        pub pmevcntr_delta: [u64; 31],
+        /// PMEVTYPER<n>_EL0.
+        pub pmevtyper: [u64; 31],
         /// HSTR_EL2.
         pub hstr_el2: u64,
         /// HACR_EL2 is constant zero; this is VPIDR_EL2.
@@ -350,6 +379,8 @@ pub const PSTATE_A: u32 = 1 << 8;
 pub const PSTATE_D: u32 = 1 << 9;
 /// `PSTATE_DAIF`.
 pub const PSTATE_DAIF: u32 = PSTATE_D | PSTATE_A | PSTATE_I | PSTATE_F;
+/// `PSTATE_SSBS`: speculative store bypass safe.
+pub const PSTATE_SSBS: u32 = 1 << 12;
 /// `PSTATE_IL`.
 pub const PSTATE_IL: u32 = 1 << 20;
 /// `PSTATE_SS`.
@@ -395,6 +426,8 @@ pub const SCTLR_NTWI: u64 = 1 << 16;
 pub const SCTLR_WXN: u64 = 1 << 19;
 /// `SCTLR_SPAN`.
 pub const SCTLR_SPAN: u64 = 1 << 23;
+/// `SCTLR_DSSBS_64`: the PSTATE.SSBS value on exception entry.
+pub const SCTLR_DSSBS_64: u64 = 1 << 44;
 /// `SCTLR_UCI`: EL0 access to cache maintenance by VA.
 pub const SCTLR_UCI: u64 = 1 << 26;
 /// `SCTLR_EnDB`: the DB key is enabled.
@@ -894,6 +927,13 @@ impl CpuArmState {
             s.scr_write(f, 0);
         }
         s.cntfrq_el0 = model.cntfrq;
+        if f.pmu != 0 {
+            s.pmcr = model.reset_pmcr_el0;
+        }
+        if f.el2 {
+            // MDCR_EL2.HPMN resets to the number of counters, with or without the PMU.
+            s.mdcr_el2 = (model.reset_pmcr_el0 >> 11) & 0x1f;
+        }
         s.exclusive_addr = u64::MAX;
         // The OS lock is locked out of reset.
         s.oslsr_el1 = 10;
@@ -1041,6 +1081,31 @@ pub struct ArmFeatures {
     pub rme: bool,
     /// FEAT_RNG: RNDR and RNDRRS.
     pub rng: bool,
+    /// FEAT_SSBS: PSTATE.SSBS, the SSBS register and `MSR SSBS, #imm` (`aa64_ssbs`).
+    pub ssbs: bool,
+    /// The PMU, `ARM_FEATURE_PMU` with ID_AA64DFR0_EL1.PMUVer: 0 without one, 1 for
+    /// PMUv3, 4 for FEAT_PMUv3p1, 5 for FEAT_PMUv3p4 and 6 for FEAT_PMUv3p5.
+    pub pmu: u8,
+    /// The number of PMU event counters, PMCR_EL0.N of [`ArmCpuModel::reset_pmcr_el0`],
+    /// which decides which PMEVCNTR<n>_EL0 and PMEVTYPER<n>_EL0 exist.
+    pub pmu_counters: u8,
+    /// The IMPLEMENTATION DEFINED registers of the model.
+    pub impdef: ImpdefRegs,
+}
+
+/// Which IMPLEMENTATION DEFINED system registers a model has, the `define_*_cp_reginfo()`
+/// call of its QEMU init function. They all read as constants and ignore writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImpdefRegs {
+    /// None, as for `max`.
+    #[default]
+    None,
+    /// `define_cortex_a72_a57_a53_cp_reginfo()`: L2CTLR_EL1, L2ECTLR_EL1, L2ACTLR,
+    /// CPUACTLR_EL1, CPUECTLR_EL1, CPUMERRSR_EL1 and L2MERRSR_EL1.
+    CortexA57,
+    /// `define_neoverse_n1_cp_reginfo()`: the ATCR, CPUACTLR, CPUECTLR, CPUPWRCTLR and
+    /// power control registers.
+    NeoverseN1,
 }
 
 /// `PauthFeat_EPAC`.
@@ -1098,6 +1163,9 @@ pub struct ArmCpuModel {
     pub id_aa64pfr1: u64,
     /// ID_AA64DFR0_EL1.
     pub id_aa64dfr0: u64,
+    /// PMCR_EL0 out of reset, QEMU's `reset_pmcr_el0`: its N field is the number of event
+    /// counters.
+    pub reset_pmcr_el0: u64,
     /// ID_AA64ZFR0_EL1.
     pub id_aa64zfr0: u64,
     /// ID_AA64ISAR0_EL1.
@@ -1173,7 +1241,10 @@ impl ArmCpuModel {
             gic_pribits: 5,
             id_aa64pfr0: PFR0_EL01,
             id_aa64pfr1: 0,
-            id_aa64dfr0: 0x6,
+            // DebugVer 6 and PMUVer 1. QEMU's 0x10305106 also counts breakpoints and
+            // watchpoints, which are not modelled here.
+            id_aa64dfr0: 0x106,
+            reset_pmcr_el0: 0x4101_3000,
             id_aa64zfr0: 0,
             // AES 2 (with PMULL), SHA1 1, SHA2 1 and CRC32 1, QEMU's 0x00011120.
             id_aa64isar0: 0x0001_1120,
@@ -1191,6 +1262,9 @@ impl ArmCpuModel {
                 pmull: true,
                 sha1: true,
                 sha256: true,
+                pmu: 1,
+                pmu_counters: 6,
+                impdef: ImpdefRegs::CortexA57,
                 ..ArmFeatures::default()
             },
         }
@@ -1198,7 +1272,7 @@ impl ArmCpuModel {
 
     /// `cortex-a76`: ARMv8.2 with LSE, PAN, UAO, LOR, LRCPC and hardware access flag and
     /// dirty state management, half precision FP, RDM, the dot product and the AES, PMULL,
-    /// SHA1 and SHA256 crypto extensions.
+    /// SHA1 and SHA256 crypto extensions, and FEAT_SSBS.
     pub fn cortex_a76() -> ArmCpuModel {
         ArmCpuModel {
             name: "cortex-a76",
@@ -1224,8 +1298,12 @@ impl ArmCpuModel {
             gic_pribits: 5,
             // CSV2 and CSV3 as in QEMU; RAS is not modelled.
             id_aa64pfr0: 0x1100_0000_0000_0000 | PFR0_FP16 | PFR0_EL01,
-            id_aa64pfr1: 0,
-            id_aa64dfr0: 0x6,
+            // SSBS 1.
+            id_aa64pfr1: 0x10,
+            // DebugVer 6 and PMUVer 4 (FEAT_PMUv3p1), without the breakpoint and watchpoint
+            // counts of QEMU's 0x10305408.
+            id_aa64dfr0: 0x406,
+            reset_pmcr_el0: 0x410b_3000,
             id_aa64zfr0: 0,
             // DP 1, RDM 1, Atomic 2, CRC32 1, SHA2 1, SHA1 1 and AES 2, QEMU's
             // 0x0000100010211120.
@@ -1262,8 +1340,44 @@ impl ArmCpuModel {
                 vh: true,
                 tgran16: true,
                 tgran64: true,
+                ssbs: true,
+                pmu: 4,
+                pmu_counters: 6,
                 ..ArmFeatures::default()
             },
+        }
+    }
+
+    /// `neoverse-n1`: the `cortex-a76` feature set with the N1's MIDR, its 1 MiB L2 and a 48
+    /// bit physical address range, which the `sbsa-ref` board needs for its RAM above 1 TiB.
+    /// It has QEMU's N1 IMPLEMENTATION DEFINED registers, which trusted firmware writes, and
+    /// FEAT_SSBS2. Like the A76 here it leaves out what QEMU's N1 has and this crate does not
+    /// model: RAS, 16 bit VMIDs, the second PAN level, XNX and the AArch32 ID registers.
+    pub fn neoverse_n1() -> ArmCpuModel {
+        let a76 = ArmCpuModel::cortex_a76();
+        ArmCpuModel {
+            name: "neoverse-n1",
+            // r4p1.
+            midr: 0x414f_d0c1,
+            // 64 KiB L1 D, 64 KiB L1 I and 1 MiB L2.
+            ccsidr: [
+                make_ccsidr(4, 64, 64 * KIB, 7),
+                make_ccsidr(4, 64, 64 * KIB, 2),
+                make_ccsidr(8, 64, MIB, 7),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            dtb_compatible: "arm,neoverse-n1",
+            // PARange 5, 48 bits, and all three granules: QEMU's 0x00101125 without BigEnd.
+            id_aa64mmfr0: 0x0010_1025,
+            // SSBS 2, FEAT_SSBS2.
+            id_aa64pfr1: 0x20,
+            reset_pmcr_el0: 0x410c_3000,
+            features: ArmFeatures { impdef: ImpdefRegs::NeoverseN1, ..a76.features },
+            ..a76
         }
     }
 
@@ -1295,6 +1409,7 @@ impl ArmCpuModel {
             id_aa64pfr0: PFR0_EL01,
             id_aa64pfr1: 0,
             id_aa64dfr0: 0x1030_5106,
+            reset_pmcr_el0: 0x4102_3000,
             id_aa64zfr0: 0,
             id_aa64isar0: 0x0001_1120,
             id_aa64isar1: 0,
@@ -1313,6 +1428,9 @@ impl ArmCpuModel {
                 sha1: true,
                 sha256: true,
                 tgran64: true,
+                pmu: 1,
+                pmu_counters: 6,
+                impdef: ImpdefRegs::CortexA57,
                 ..ArmFeatures::default()
             },
         }
@@ -1361,10 +1479,15 @@ impl ArmCpuModel {
             // ID_AA64ISAR1_EL1.XS = 1, and API = 5 (FEAT_FPACCOMBINED) with GPI = 1: PAuth
             // with the IMPLEMENTATION DEFINED algorithm, QEMU's default.
             id_aa64isar1: a76.id_aa64isar1 | (1 << 56) | (5 << 8) | (1 << 28),
-            // ID_AA64PFR1_EL1.MTE = 1: the MTE instructions without tag storage, which is
+            // ID_AA64PFR1_EL1.SSBS = 2 (FEAT_SSBS2) and MTE = 1: the MTE instructions
+            // without tag storage, which is
             // what QEMU's `max` (MTE 3) is reduced to without `mte=on`; see
             // `Arm::with_tag_memory`.
-            id_aa64pfr1: a76.id_aa64pfr1 | (1 << 8),
+            id_aa64pfr1: (a76.id_aa64pfr1 & !0xf0) | 0x20 | (1 << 8),
+            // ID_AA64DFR0_EL1.PMUVer = 6, FEAT_PMUv3p5, with the A57's PMCR_EL0 that `max`
+            // starts from.
+            id_aa64dfr0: (a76.id_aa64dfr0 & !0xf00) | 0x600,
+            reset_pmcr_el0: 0x4101_3000,
             // ID_AA64MMFR3_EL1.TCRX = 1.
             id_aa64mmfr3: 1,
             // ID_AA64MMFR4_EL1.ASID2 = 1.
@@ -1389,6 +1512,8 @@ impl ArmCpuModel {
                 pauth_alg: PauthAlg::Impdef,
                 mte: 1,
                 rng: true,
+                pmu: 6,
+                pmu_counters: 6,
                 ..a76.features
             },
             ..a76
@@ -1429,6 +1554,14 @@ impl ArmCpuModel {
         self
     }
 
+    /// The model without its PMU, `pmu=off`: ID_AA64DFR0_EL1.PMUVer reads as zero and the
+    /// PMU registers UNDEF.
+    pub fn without_pmu(mut self) -> ArmCpuModel {
+        self.features.pmu = 0;
+        self.id_aa64dfr0 &= !0xf00;
+        self
+    }
+
     /// The model with EL2 implemented (AArch64 only), as the virt board's
     /// `virtualization=on` leaves `ARM_FEATURE_EL2` set. The models start without EL2 and
     /// EL3, as the virt board's defaults leave them.
@@ -1453,13 +1586,15 @@ impl ArmCpuModel {
         self
     }
 
-    /// The model called `name`, `cortex-a57`, `cortex-a72`, `cortex-a76` or `max`.
+    /// The model called `name`, `cortex-a57`, `cortex-a72`, `cortex-a76`, `neoverse-n1` or
+    /// `max`.
     pub fn by_name(name: &str) -> Option<ArmCpuModel> {
         match name {
             "max" => Some(ArmCpuModel::max()),
             "cortex-a57" => Some(ArmCpuModel::cortex_a57()),
             "cortex-a72" => Some(ArmCpuModel::cortex_a72()),
             "cortex-a76" => Some(ArmCpuModel::cortex_a76()),
+            "neoverse-n1" => Some(ArmCpuModel::neoverse_n1()),
             _ => None,
         }
     }
@@ -1480,5 +1615,24 @@ pub fn pa_range_bits(parange: u32) -> u32 {
         4 => 44,
         5 => 48,
         _ => 52,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neoverse_n1_model() {
+        let n1 = ArmCpuModel::by_name("neoverse-n1").unwrap();
+        assert_eq!(n1.midr, 0x414f_d0c1);
+        assert_eq!(n1.dtb_compatible, "arm,neoverse-n1");
+        assert_eq!(n1.pamax(), 48);
+        assert_eq!(n1.ccsidr[2], make_ccsidr(8, 64, MIB, 7));
+        let a76 = ArmCpuModel::cortex_a76().features;
+        assert_eq!(n1.features, ArmFeatures { impdef: ImpdefRegs::NeoverseN1, ..a76 });
+        assert!(n1.features.ssbs);
+        assert_eq!(n1.id_aa64pfr1, 0x20);
+        assert!(ArmCpuModel::by_name("neoverse-n2").is_none());
     }
 }

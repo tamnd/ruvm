@@ -48,7 +48,7 @@ use crate::cpu::{
     ArmCpuModel, CF, EXCLUSIVE_ADDR, EXCLUSIVE_HIGH, EXCLUSIVE_VAL, EXCP_BKPT, EXCP_HVC,
     EXCP_SEMIHOST, EXCP_SMC, EXCP_SWI, EXCP_UDEF, MMU_IDX_E10_0, MMU_IDX_E10_1, MMU_IDX_E10_1_PAN,
     MMU_IDX_E20_0, MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NF, PC, PSTATE, PSTATE_PAN, PSTATE_SP,
-    PSTATE_TCO, PSTATE_UAO, VF, ZF, xreg_off,
+    PSTATE_SSBS, PSTATE_TCO, PSTATE_UAO, VF, ZF, xreg_off,
 };
 use crate::syndrome::{
     syn_aa64_bkpt, syn_aa64_hvc, syn_aa64_smc, syn_aa64_svc, syn_aa64_sysregtrap, syn_illegalstate,
@@ -2457,6 +2457,16 @@ impl DisasA64 for S<'_, '_> {
             return false;
         }
         self.msr_i_helper(&helpers::MSR_I_SPSEL, a.imm & PSTATE_SP as i32);
+        self.b.is_jmp = DisasJumpType::TooMany;
+        true
+    }
+
+    fn trans_MSR_i_SBSS(&mut self, a: &mut arg_i) -> bool {
+        if !self.feat().ssbs {
+            return false;
+        }
+        // QEMU does not rebuild the TB flags since SSBS is a nop; doing so is harmless.
+        self.pstate_bit(PSTATE_SSBS, a.imm & 1 != 0);
         self.b.is_jmp = DisasJumpType::TooMany;
         true
     }

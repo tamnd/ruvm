@@ -761,8 +761,8 @@ enum MachineChoice {
     Qom(String),
     /// One of the x86 boards, and its machine type name with an alias resolved.
     X86(BoardKind, &'static str),
-    /// The Arm virt board.
-    ArmVirt,
+    /// One of the Arm boards.
+    ArmVirt(arm::ArmBoard),
     /// The RISC-V virt board.
     RiscvVirt,
 }
@@ -784,8 +784,8 @@ fn select_machine(target: &str, cfg: &mut Config) -> Flow<MachineChoice> {
             return Ok(MachineChoice::X86(kind, name));
         }
     }
-    if arm::is_arm(target) && arm::is_virt(&ty) {
-        return Ok(MachineChoice::ArmVirt);
+    if let Some(board) = arm::board_by_name(&ty).filter(|_| arm::is_arm(target)) {
+        return Ok(MachineChoice::ArmVirt(board));
     }
     if riscv::is_riscv(target) && riscv::is_virt(&ty) {
         return Ok(MachineChoice::RiscvVirt);
@@ -992,14 +992,18 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
 
     let choice = select_machine(p.target, &mut cfg)?;
     let rv_virt = matches!(choice, MachineChoice::RiscvVirt);
-    let virt = matches!(choice, MachineChoice::ArmVirt) || rv_virt;
+    let arm_board = match choice {
+        MachineChoice::ArmVirt(board) => Some(board),
+        _ => None,
+    };
+    let virt = arm_board.is_some() || rv_virt;
     let mut machine_type = "";
     let (kind, machine) = match choice {
         MachineChoice::X86(kind, name) => {
             machine_type = name;
             (Some(kind), None)
         }
-        MachineChoice::ArmVirt | MachineChoice::RiscvVirt => (None, None),
+        MachineChoice::ArmVirt(_) | MachineChoice::RiscvVirt => (None, None),
         MachineChoice::Qom(typename) => {
             let machine =
                 create_machine(&vm.registry, &typename, &vm.regions).map_err(|e| fail(&e))?;
@@ -1029,8 +1033,11 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     }
     // configure_blockdev(): the -drive options, which need to know the machine.
     let drives = if virt {
-        let parse = if rv_virt { riscv::parse_drives } else { arm::parse_drives };
-        parse(&cfg.x86.drives).map_err(|e| {
+        let parsed = match arm_board {
+            Some(board) => arm::parse_drives(board, &cfg.x86.drives),
+            None => riscv::parse_drives(&cfg.x86.drives),
+        };
+        parsed.map_err(|e| {
             e.report();
             Exit(1)
         })?
@@ -1047,11 +1054,12 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             if memdev.is_some() {
                 return Err(fail_msg("memory-backend is not supported by ruvm yet"));
             }
-            if rv_virt {
+            if let Some(board) = arm_board {
+                let opts = arm::take_board_options(board, &cfg.machine).map_err(|e| fail(&e))?;
+                virt_opts = Some(opts);
+            } else {
                 let opts = riscv::take_board_options(&cfg.machine).map_err(|e| fail(&e))?;
                 rv_virt_opts = Some(opts);
-            } else {
-                virt_opts = Some(arm::take_board_options(&cfg.machine).map_err(|e| fail(&e))?);
             }
             None
         }

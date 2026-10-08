@@ -9,11 +9,11 @@ use ruvm_target_arm::cpu::ArmCpuModel;
 
 use super::{
     CpuTopology, MemMapEntry, VIRT_FLASH, VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE,
-    VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GIC_REDIST_SIZE, VIRT_MMIO, VIRT_MMIO_IRQ,
-    VIRT_MMIO_SIZE, VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE,
-    VIRT_PLATFORM_BUS, VIRT_PLATFORM_BUS_SIZE, VIRT_RTC, VIRT_RTC_IRQ, VIRT_RTC_SIZE,
-    VIRT_SECURE_MEM, VIRT_SECURE_MEM_SIZE, VIRT_SMMU, VIRT_SMMU_IRQ, VIRT_UART, VIRT_UART_IRQ,
-    VIRT_UART_SIZE, VIRT_UART1, VIRT_UART1_IRQ, VIRTIO_TRANSPORTS, VirtMemmap,
+    VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GIC_REDIST_SIZE, VIRT_GPIO_SIZE, VIRT_MMIO,
+    VIRT_MMIO_IRQ, VIRT_MMIO_SIZE, VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO,
+    VIRT_PCIE_PIO_SIZE, VIRT_PLATFORM_BUS, VIRT_PLATFORM_BUS_SIZE, VIRT_RTC, VIRT_RTC_IRQ,
+    VIRT_RTC_SIZE, VIRT_SECURE_MEM, VIRT_SECURE_MEM_SIZE, VIRT_SMMU, VIRT_SMMU_IRQ, VIRT_UART,
+    VIRT_UART_IRQ, VIRT_UART_SIZE, VIRT_UART1, VIRT_UART1_IRQ, VIRTIO_TRANSPORTS, VirtMemmap,
 };
 use crate::fdt::{Fdt, sized_cells};
 use ruvm_hw_intc::gicv3::{GICV3_DIST_SIZE, ITS_SIZE};
@@ -36,7 +36,7 @@ const ARCH_TIMER_NS_EL2_IRQ: u32 = 10;
 /// `ARCH_TIMER_NS_EL2_VIRT_IRQ` as a PPI number.
 const ARCH_TIMER_NS_EL2_VIRT_IRQ: u32 = 12;
 /// `ARCH_GIC_MAINT_IRQ` as a PPI number.
-const ARCH_GIC_MAINT_IRQ: u32 = 9;
+pub(crate) const ARCH_GIC_MAINT_IRQ: u32 = 9;
 /// `ARM_AFF3_MASK`.
 const ARM_AFF3_MASK: u64 = 0xff << 32;
 /// `CLIDR_CTYPE_MAX_CACHE_LEVEL`, also the mask of one Ctype field.
@@ -324,6 +324,17 @@ pub(crate) fn add_its_node(fdt: &mut Fdt) -> Result<u32, String> {
     Ok(msi)
 }
 
+/// `fdt_add_pmu_nodes()` for a CPU with a PMU: its interrupt is PPI `VIRTUAL_PMU_IRQ`.
+pub(crate) fn add_pmu_node(fdt: &mut Fdt) -> Result<(), String> {
+    fdt.add_subnode("/pmu")?;
+    fdt.setprop_string("/pmu", "compatible", "arm,armv8-pmuv3")?;
+    fdt.setprop_cells(
+        "/pmu",
+        "interrupts",
+        &[GIC_FDT_IRQ_TYPE_PPI, super::cpus::PMU_PPI - 16, GIC_FDT_IRQ_FLAGS_LEVEL_HI],
+    )
+}
+
 /// Which UART [`create_uart`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Uart {
@@ -391,6 +402,67 @@ pub(crate) fn create_rtc(fdt: &mut Fdt, clock: u32) -> Result<(), String> {
     )?;
     fdt.setprop_cell(&nodename, "clocks", clock)?;
     fdt.setprop_string(&nodename, "clock-names", "apb_pclk")
+}
+
+/// `GPIO_PIN_POWER_BUTTON`, the PL061 pin of the power key.
+pub(crate) const GPIO_PIN_POWER_BUTTON: u32 = 3;
+/// `SECURE_GPIO_POWEROFF` and `SECURE_GPIO_RESET`, the secure PL061 pins of `gpio-pwr`.
+pub(crate) const SECURE_GPIO_POWEROFF: u32 = 0;
+pub(crate) const SECURE_GPIO_RESET: u32 = 1;
+/// `KEY_POWER`, the Linux input code of the power key.
+const KEY_POWER: u32 = 116;
+
+/// The FDT part of `create_gpio_devices()` and of its child devices: the PL061 at `base` on
+/// SPI `irq`, then `create_gpio_keys()` for the normal world one or `create_secure_gpio_pwr()`
+/// for the secure one.
+pub(crate) fn create_gpio(
+    fdt: &mut Fdt,
+    clock: u32,
+    base: u64,
+    irq: u32,
+    secure: bool,
+) -> Result<(), String> {
+    let phandle = fdt.alloc_phandle();
+    let nodename = format!("/pl061@{base:x}");
+    fdt.add_subnode(&nodename)?;
+    setprop_sized_cells(fdt, &nodename, "reg", &[(2, base), (2, VIRT_GPIO_SIZE)])?;
+    fdt.setprop(&nodename, "compatible", b"arm,pl061\0arm,primecell\0")?;
+    fdt.setprop_cell(&nodename, "#gpio-cells", 2)?;
+    fdt.setprop(&nodename, "gpio-controller", &[])?;
+    fdt.setprop_cells(
+        &nodename,
+        "interrupts",
+        &[GIC_FDT_IRQ_TYPE_SPI, irq, GIC_FDT_IRQ_FLAGS_LEVEL_HI],
+    )?;
+    fdt.setprop_cell(&nodename, "clocks", clock)?;
+    fdt.setprop_string(&nodename, "clock-names", "apb_pclk")?;
+    fdt.setprop_cell(&nodename, "phandle", phandle)?;
+    if !secure {
+        fdt.add_subnode("/gpio-keys")?;
+        fdt.setprop_string("/gpio-keys", "compatible", "gpio-keys")?;
+        fdt.add_subnode("/gpio-keys/poweroff")?;
+        fdt.setprop_string("/gpio-keys/poweroff", "label", "GPIO Key Poweroff")?;
+        fdt.setprop_cell("/gpio-keys/poweroff", "linux,code", KEY_POWER)?;
+        return fdt.setprop_cells(
+            "/gpio-keys/poweroff",
+            "gpios",
+            &[phandle, GPIO_PIN_POWER_BUTTON, 0],
+        );
+    }
+    // Mark as not usable by the normal world.
+    fdt.setprop_string(&nodename, "status", "disabled")?;
+    fdt.setprop_string(&nodename, "secure-status", "okay")?;
+    for (node, compat, pin) in [
+        ("/gpio-poweroff", "gpio-poweroff", SECURE_GPIO_POWEROFF),
+        ("/gpio-restart", "gpio-restart", SECURE_GPIO_RESET),
+    ] {
+        fdt.add_subnode(node)?;
+        fdt.setprop_string(node, "compatible", compat)?;
+        fdt.setprop_cells(node, "gpios", &[phandle, pin, 0])?;
+        fdt.setprop_string(node, "status", "disabled")?;
+        fdt.setprop_string(node, "secure-status", "okay")?;
+    }
+    Ok(())
 }
 
 /// `FDT_PCI_RANGE_IOPORT`, `FDT_PCI_RANGE_MMIO` and `FDT_PCI_RANGE_MMIO_64BIT`, the space

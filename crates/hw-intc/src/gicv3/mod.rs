@@ -5,7 +5,8 @@
 //! hw/intc/gicv3_internal.h and include/hw/intc/arm_gicv3_common.h.
 //!
 //! The model has the distributor, one redistributor per CPU spread over one or more MMIO regions,
-//! and the physical CPU interface (the ICC_* system registers). Affinity routing is always on, as
+//! the physical CPU interface (the ICC_* system registers) and the virtual CPU interface (the
+//! ICH_* and ICV_* registers). Affinity routing is always on, as
 //! in QEMU, so the legacy GICv2 style registers (GICD_ITARGETSR, GICD_SGIR, GICD_CPENDSGIR and
 //! GICD_SPENDSGIR) read as zero and ignore writes.
 //!
@@ -13,8 +14,9 @@
 //!
 //! [`GicV3::gpio_in`] numbers the inputs like QEMU's GPIO array: SPIs first (input `n` is INTID
 //! `n + 32`), then 32 inputs per CPU for its PPIs. [`GicV3::spi`] and [`GicV3::ppi`] are the same
-//! lines by a friendlier name. Each CPU has four output pins, IRQ, FIQ, vIRQ and vFIQ. The two
-//! virtual pins exist so the board can wire them, but nothing drives them yet.
+//! lines by a friendlier name. Each CPU has four output pins to the CPU, IRQ, FIQ, vIRQ and vFIQ,
+//! and the maintenance interrupt of its virtual interface ([`GicV3::maintenance_irq`]), which a
+//! board wires back to one of the CPU's PPIs as QEMU's `gicv3-maintenance-interrupt` output is.
 //!
 //! The output pins are always driven after the state lock is dropped, so a pin handler may call
 //! back into the GIC. Each CPU's wanted levels are published with a sequence number before the
@@ -38,6 +40,12 @@
 //! CPU's outputs are recomputed first, as the hook would have done. Before any of that, the
 //! stored context is EL1 Non-secure if the GIC has no security extensions and EL3 Secure if it
 //! has them, matching where a CPU of that kind comes out of reset.
+//!
+//! The ICH_* registers go through the same three calls, as [`IccReg`] values. They exist only
+//! for a CPU with EL2, which target-arm decides. With HCR_EL2.IMO or FMO set, an access from
+//! Non-secure EL1 to an ICC_* register reaches its ICV_* twin, as in QEMU. The virtual
+//! interface has QEMU's default shape, which every CPU modelled here uses: 4 list registers and
+//! 5 bits of virtual priority and preemption.
 //!
 //! The CPU interface state belongs to the CPU's reset domain, as in QEMU, so [`GicV3::reset`]
 //! leaves it alone and [`GicV3::cpuif_reset`] (QEMU's `icc_reset`) resets it.
@@ -82,8 +90,7 @@
 //!
 //! # Not done yet (M6 seams)
 //!
-//! - The virtual CPU interface (ICH_* and ICV_*). HCR_EL2.IMO and FMO do not redirect EL1 accesses
-//!   to ICV registers, the ICH_HCR_EL2 traps are absent and the vIRQ and vFIQ pins stay low.
+//! - vLPIs and the GICv4 parts of the virtual interface.
 //! - NMI (FEAT_GICv3_NMI): GICD_INMIR and GICR_INMIR0 read as zero, ICC_NMIAR1_EL1 is absent and
 //!   no NMI pin exists.
 //! - GICv4 and its VLPI redistributor frames.
@@ -93,10 +100,11 @@ mod cpuif;
 mod dist;
 mod its;
 mod redist;
+mod vcpuif;
 
 use std::cell::Cell;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use ruvm_hw_core::irq::{IrqLine, IrqPin};
@@ -156,6 +164,15 @@ const GICV3_IIDR: u32 = 0x43b;
 const GICV3_PIDR0_DIST: u32 = 0x92;
 const GICV3_PIDR0_REDIST: u32 = 0x93;
 
+// The bits of a CPU's wanted output levels, `CpuState::out`.
+const OUT_IRQ: u64 = 1 << 0;
+const OUT_FIQ: u64 = 1 << 1;
+const OUT_VIRQ: u64 = 1 << 2;
+const OUT_VFIQ: u64 = 1 << 3;
+const OUT_MAINT: u64 = 1 << 4;
+/// Where the sequence number starts in [`GicV3::out`].
+const OUT_SEQ_SHIFT: u32 = 8;
+
 /// Words in a bitmap with one bit per interrupt.
 const BMP_WORDS: usize = 32;
 
@@ -197,7 +214,8 @@ impl Default for GicV3Props {
     }
 }
 
-/// The ICC_* system registers of the physical CPU interface.
+/// The ICC_* system registers of the physical CPU interface and the ICH_* registers of the
+/// virtual one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IccReg {
     Pmr,
@@ -226,10 +244,41 @@ pub enum IccReg {
     CtlrEl3,
     SreEl3,
     Igrpen1El3,
+    /// ICH_AP0R<n>_EL2, n in 0..4.
+    IchAp0r(u8),
+    /// ICH_AP1R<n>_EL2, n in 0..4.
+    IchAp1r(u8),
+    IchHcr,
+    IchVtr,
+    IchMisr,
+    IchEisr,
+    IchElrsr,
+    IchVmcr,
+    /// ICH_LR<n>_EL2, n in 0..16.
+    IchLr(u8),
 }
 
+const ICH_LR_NAMES: [&str; 16] = [
+    "ICH_LR0_EL2",
+    "ICH_LR1_EL2",
+    "ICH_LR2_EL2",
+    "ICH_LR3_EL2",
+    "ICH_LR4_EL2",
+    "ICH_LR5_EL2",
+    "ICH_LR6_EL2",
+    "ICH_LR7_EL2",
+    "ICH_LR8_EL2",
+    "ICH_LR9_EL2",
+    "ICH_LR10_EL2",
+    "ICH_LR11_EL2",
+    "ICH_LR12_EL2",
+    "ICH_LR13_EL2",
+    "ICH_LR14_EL2",
+    "ICH_LR15_EL2",
+];
+
 impl IccReg {
-    /// Every register, in the order of QEMU's `gicv3_cpuif_reginfo` with the extra APR
+    /// Every ICC register, in the order of QEMU's `gicv3_cpuif_reginfo` with the extra APR
     /// registers after their first one.
     pub const ALL: [IccReg; 30] = [
         IccReg::Pmr,
@@ -264,6 +313,57 @@ impl IccReg {
         IccReg::Igrpen1El3,
     ];
 
+    /// Every ICH register an implementation can have, in the order of QEMU's
+    /// `gicv3_cpuif_hcr_reginfo`, then the extra APR registers and the list registers.
+    pub const ICH_ALL: [IccReg; 30] = [
+        IccReg::IchAp0r(0),
+        IccReg::IchAp1r(0),
+        IccReg::IchHcr,
+        IccReg::IchVtr,
+        IccReg::IchMisr,
+        IccReg::IchEisr,
+        IccReg::IchElrsr,
+        IccReg::IchVmcr,
+        IccReg::IchAp0r(1),
+        IccReg::IchAp1r(1),
+        IccReg::IchAp0r(2),
+        IccReg::IchAp0r(3),
+        IccReg::IchAp1r(2),
+        IccReg::IchAp1r(3),
+        IccReg::IchLr(0),
+        IccReg::IchLr(1),
+        IccReg::IchLr(2),
+        IccReg::IchLr(3),
+        IccReg::IchLr(4),
+        IccReg::IchLr(5),
+        IccReg::IchLr(6),
+        IccReg::IchLr(7),
+        IccReg::IchLr(8),
+        IccReg::IchLr(9),
+        IccReg::IchLr(10),
+        IccReg::IchLr(11),
+        IccReg::IchLr(12),
+        IccReg::IchLr(13),
+        IccReg::IchLr(14),
+        IccReg::IchLr(15),
+    ];
+
+    /// Whether this is an ICH_* register of the virtual interface.
+    pub fn is_ich(self) -> bool {
+        matches!(
+            self,
+            IccReg::IchAp0r(_)
+                | IccReg::IchAp1r(_)
+                | IccReg::IchHcr
+                | IccReg::IchVtr
+                | IccReg::IchMisr
+                | IccReg::IchEisr
+                | IccReg::IchElrsr
+                | IccReg::IchVmcr
+                | IccReg::IchLr(_)
+        )
+    }
+
     /// The register with the AArch64 encoding `op0, op1, CRn, CRm, op2`.
     pub fn from_encoding(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> Option<IccReg> {
         let reg = match (op0, op1, crn, crm, op2) {
@@ -291,6 +391,15 @@ impl IccReg {
             (3, 6, 12, 12, 4) => IccReg::CtlrEl3,
             (3, 6, 12, 12, 5) => IccReg::SreEl3,
             (3, 6, 12, 12, 7) => IccReg::Igrpen1El3,
+            (3, 4, 12, 8, n @ 0..=3) => IccReg::IchAp0r(n as u8),
+            (3, 4, 12, 9, n @ 0..=3) => IccReg::IchAp1r(n as u8),
+            (3, 4, 12, 11, 0) => IccReg::IchHcr,
+            (3, 4, 12, 11, 1) => IccReg::IchVtr,
+            (3, 4, 12, 11, 2) => IccReg::IchMisr,
+            (3, 4, 12, 11, 3) => IccReg::IchEisr,
+            (3, 4, 12, 11, 5) => IccReg::IchElrsr,
+            (3, 4, 12, 11, 7) => IccReg::IchVmcr,
+            (3, 4, 12, crm @ 12..=13, op2 @ 0..=7) => IccReg::IchLr(((crm - 12) * 8 + op2) as u8),
             _ => return None,
         };
         Some(reg)
@@ -323,15 +432,30 @@ impl IccReg {
             IccReg::CtlrEl3 => (3, 6, 12, 12, 4),
             IccReg::SreEl3 => (3, 6, 12, 12, 5),
             IccReg::Igrpen1El3 => (3, 6, 12, 12, 7),
+            IccReg::IchAp0r(n) => (3, 4, 12, 8, u32::from(n & 3)),
+            IccReg::IchAp1r(n) => (3, 4, 12, 9, u32::from(n & 3)),
+            IccReg::IchHcr => (3, 4, 12, 11, 0),
+            IccReg::IchVtr => (3, 4, 12, 11, 1),
+            IccReg::IchMisr => (3, 4, 12, 11, 2),
+            IccReg::IchEisr => (3, 4, 12, 11, 3),
+            IccReg::IchElrsr => (3, 4, 12, 11, 5),
+            IccReg::IchVmcr => (3, 4, 12, 11, 7),
+            IccReg::IchLr(n) => (3, 4, 12, 12 + u32::from((n >> 3) & 1), u32::from(n & 7)),
         }
     }
 
     /// Whether the register exists for a CPU with `pribits` bits of priority (zero means 5).
     /// ICC_AP*R1 need 6 or more preemption bits and ICC_AP*R2/3 need 7, as in
-    /// `gicv3_init_cpuif`. Registers of a missing EL are the caller's business.
+    /// `gicv3_init_cpuif`. Of the ICH registers, ICH_AP*R0_EL2 and ICH_LR0_EL2 to
+    /// ICH_LR3_EL2 exist, for the 5 bits of virtual preemption and 4 list registers.
+    /// Registers of a missing EL are the caller's business.
     pub fn exists(self, pribits: u8) -> bool {
         let prebits = prebits_for(pribits);
         match self {
+            IccReg::IchAp0r(n) | IccReg::IchAp1r(n) => {
+                usize::from(n) < 1 << (vcpuif::ICH_VPREBITS - 5)
+            }
+            IccReg::IchLr(n) => usize::from(n) < vcpuif::ICH_NUM_LRS,
             IccReg::Ap0r(n) | IccReg::Ap1r(n) => match n {
                 0 => true,
                 1 => prebits >= 6,
@@ -375,6 +499,21 @@ impl IccReg {
             IccReg::CtlrEl3 => "ICC_CTLR_EL3",
             IccReg::SreEl3 => "ICC_SRE_EL3",
             IccReg::Igrpen1El3 => "ICC_IGRPEN1_EL3",
+            IccReg::IchAp0r(0) => "ICH_AP0R0_EL2",
+            IccReg::IchAp0r(1) => "ICH_AP0R1_EL2",
+            IccReg::IchAp0r(2) => "ICH_AP0R2_EL2",
+            IccReg::IchAp0r(_) => "ICH_AP0R3_EL2",
+            IccReg::IchAp1r(0) => "ICH_AP1R0_EL2",
+            IccReg::IchAp1r(1) => "ICH_AP1R1_EL2",
+            IccReg::IchAp1r(2) => "ICH_AP1R2_EL2",
+            IccReg::IchAp1r(_) => "ICH_AP1R3_EL2",
+            IccReg::IchHcr => "ICH_HCR_EL2",
+            IccReg::IchVtr => "ICH_VTR_EL2",
+            IccReg::IchMisr => "ICH_MISR_EL2",
+            IccReg::IchEisr => "ICH_EISR_EL2",
+            IccReg::IchElrsr => "ICH_ELRSR_EL2",
+            IccReg::IchVmcr => "ICH_VMCR_EL2",
+            IccReg::IchLr(n) => ICH_LR_NAMES[usize::from(n & 15)],
         }
     }
 }
@@ -457,6 +596,15 @@ struct CpuState {
     pribits: u8,
     prebits: u8,
 
+    // Virtual CPU interface.
+    ich_apr: [[u64; 4]; 3],
+    ich_hcr_el2: u64,
+    ich_vmcr_el2: u64,
+    ich_lr_el2: [u64; 16],
+    num_list_regs: usize,
+    vpribits: u8,
+    vprebits: u8,
+
     hppi: Pending,
     /// The best pending LPI, `hpplpi`.
     hpplpi: Pending,
@@ -464,7 +612,8 @@ struct CpuState {
 
     /// The last CPU context seen for this CPU.
     ctx: IccCpuCtx,
-    /// The IRQ (bit 0) and FIQ (bit 1) levels the last `gicv3_cpuif_update` wanted.
+    /// The output levels last worked out (the `OUT_*` bits): IRQ and FIQ by
+    /// `gicv3_cpuif_update`, vIRQ, vFIQ and the maintenance interrupt by the virtual updates.
     out: u64,
 }
 
@@ -580,6 +729,13 @@ impl CpuState {
             icc_ctlr_el3: 0,
             pribits,
             prebits: prebits_for(pribits),
+            ich_apr: [[0; 4]; 3],
+            ich_hcr_el2: 0,
+            ich_vmcr_el2: 0,
+            ich_lr_el2: [0; 16],
+            num_list_regs: vcpuif::ICH_NUM_LRS,
+            vpribits: vcpuif::ICH_VPRIBITS,
+            vprebits: vcpuif::ICH_VPREBITS,
             hppi: Pending { irq: 0, prio: 0xff, grp: G0 },
             hpplpi: Pending { irq: 0, prio: 0xff, grp: G0 },
             seenbetter: false,
@@ -991,12 +1147,16 @@ pub struct GicV3 {
     /// The first CPU and the CPU count of each redistributor region.
     regions: Vec<(usize, u32)>,
     state: Mutex<GicState>,
-    /// Per CPU: the wanted IRQ (bit 0) and FIQ (bit 1) levels, above a sequence number.
+    /// Per CPU: the wanted levels (the `OUT_*` bits), below a sequence number.
     out: Vec<AtomicU64>,
     cpu_irq: Vec<IrqPin>,
     cpu_fiq: Vec<IrqPin>,
     cpu_virq: Vec<IrqPin>,
     cpu_vfiq: Vec<IrqPin>,
+    maint: Vec<IrqPin>,
+    /// The level last driven on each maintenance pin. The pin feeds a PPI of this GIC, so it is
+    /// only driven when its level changes, or every update it causes would drive it again.
+    maint_level: Vec<AtomicBool>,
 }
 
 impl fmt::Debug for GicV3 {
@@ -1138,6 +1298,8 @@ impl GicV3 {
             cpu_fiq: pins(),
             cpu_virq: pins(),
             cpu_vfiq: pins(),
+            maint: pins(),
+            maint_level: (0..props.num_cpu).map(|_| AtomicBool::new(false)).collect(),
         }))
     }
 
@@ -1159,7 +1321,7 @@ impl GicV3 {
             s.dirty[cpu] = false;
             // Publish under the lock so the sequence numbers follow the order of the updates.
             let old = self.out[cpu].load(Ordering::Relaxed);
-            let next = ((old >> 2).wrapping_add(1) << 2) | s.cpu[cpu].out;
+            let next = ((old >> OUT_SEQ_SHIFT).wrapping_add(1) << OUT_SEQ_SHIFT) | s.cpu[cpu].out;
             self.out[cpu].store(next, Ordering::Release);
             touched.push(cpu);
         }
@@ -1176,8 +1338,14 @@ impl GicV3 {
     fn drive(&self, cpu: usize) {
         loop {
             let v = self.out[cpu].load(Ordering::Acquire);
-            self.cpu_fiq[cpu].set_bool(v & 2 != 0);
-            self.cpu_irq[cpu].set_bool(v & 1 != 0);
+            self.cpu_fiq[cpu].set_bool(v & OUT_FIQ != 0);
+            self.cpu_irq[cpu].set_bool(v & OUT_IRQ != 0);
+            self.cpu_vfiq[cpu].set_bool(v & OUT_VFIQ != 0);
+            self.cpu_virq[cpu].set_bool(v & OUT_VIRQ != 0);
+            let maint = v & OUT_MAINT != 0;
+            if self.maint_level[cpu].swap(maint, Ordering::AcqRel) != maint {
+                self.maint[cpu].set_bool(maint);
+            }
             if self.out[cpu].load(Ordering::Acquire) == v {
                 break;
             }
@@ -1256,14 +1424,20 @@ impl GicV3 {
         &self.cpu_fiq[cpu]
     }
 
-    /// The virtual IRQ output of `cpu`. Never driven until ICH_* is modelled.
+    /// The virtual IRQ output of `cpu`.
     pub fn cpu_virq(&self, cpu: usize) -> &IrqPin {
         &self.cpu_virq[cpu]
     }
 
-    /// The virtual FIQ output of `cpu`. Never driven until ICH_* is modelled.
+    /// The virtual FIQ output of `cpu`.
     pub fn cpu_vfiq(&self, cpu: usize) -> &IrqPin {
         &self.cpu_vfiq[cpu]
+    }
+
+    /// The maintenance interrupt of the virtual interface of `cpu`, QEMU's
+    /// `gicv3-maintenance-interrupt` CPU output. Boards wire it to a PPI of the same CPU.
+    pub fn maintenance_irq(&self, cpu: usize) -> &IrqPin {
+        &self.maint[cpu]
     }
 
     /// The distributor registers, [`GICV3_DIST_SIZE`] bytes.
@@ -1306,6 +1480,7 @@ impl GicV3 {
         self.with_state(|s| {
             s.cpu[cpu].icc_reset();
             s.cpuif_update(cpu);
+            s.cpuif_virt_update(cpu);
         });
     }
 
@@ -1316,7 +1491,8 @@ impl GicV3 {
         if !reg.exists(self.pribits) {
             return IccAccess::Undefined;
         }
-        cpuif::access(reg, ctx)
+        let ich_hcr = self.lock().cpu[cpu].ich_hcr_el2;
+        cpuif::access(reg, ctx, ich_hcr)
     }
 
     /// Read `reg` for `cpu`, which is running in `ctx`.
@@ -1341,6 +1517,7 @@ impl GicV3 {
         self.with_state(|s| {
             s.cpu[cpu].ctx = *ctx;
             s.cpuif_update(cpu);
+            s.cpuif_virt_irq_fiq_update(cpu);
         });
     }
 }
@@ -1465,7 +1642,7 @@ mod tests {
 
     #[test]
     fn encodings_round_trip() {
-        for reg in IccReg::ALL {
+        for reg in IccReg::ALL.into_iter().chain(IccReg::ICH_ALL) {
             let (op0, op1, crn, crm, op2) = reg.encoding();
             assert_eq!(IccReg::from_encoding(op0, op1, crn, crm, op2), Some(reg), "{reg:?}");
         }
