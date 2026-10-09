@@ -19,9 +19,14 @@ ruvm-base.workspace = true
 ruvm-crypto.workspace = true
 ruvm-hw-core.workspace = true
 ruvm-qapi.workspace = true
+sdl2 = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
+
+[features]
+# -display sdl, over the system's SDL2 library.
+ui-sdl = ["dep:sdl2", "ruvm-qapi/ui-sdl"]
 
 [lints]
 workspace = true

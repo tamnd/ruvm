@@ -19,11 +19,16 @@
 //!
 //! It also connects the input layer of ui/input.c: the i8042 of q35, the clock `send-key` paces
 //! its keys on, and the `query-mice`, `send-key` and `input-send-event` commands.
+//!
+//! The local displays are here too: `-display`, `-nographic` and `-full-screen` as `dpy` of
+//! QEMU's system/vl.c, the default display, `query-display-options` and opening the display.
+//! The only local display is SDL, with the `ui-sdl` feature. Without it the default is `none`,
+//! where QEMU would also open VNC on localhost:0.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use ruvm_base::report::{Location, warn_report};
+use ruvm_base::report::{Location, error_report, warn_report};
 use ruvm_base::{Error, Result};
 use ruvm_hw_core::Clock;
 use ruvm_hw_core::fw_cfg::{DmaMemory, FwCfgState};
@@ -43,16 +48,18 @@ use ruvm_machine_x86::{FirmwareSearch, VirtioHandle, X86Board};
 use ruvm_mem::AddressSpace;
 use ruvm_monitor::{Commands, MonitorQmp};
 use ruvm_qapi::commands::{
-    register_input_send_event, register_query_mice, register_screendump, register_send_key,
+    register_input_send_event, register_query_display_options, register_query_mice,
+    register_screendump, register_send_key,
 };
 use ruvm_qapi::opts::QemuOpts;
-use ruvm_qapi::types::ImageFormat;
+use ruvm_qapi::types::{DisplayGLMode, DisplayOptions, DisplayOptionsU, ImageFormat};
 use ruvm_qapi::visit::{QObjectInputVisitor, Visitor, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
 use ruvm_ui::console::{ConsoleDevice, DisplayState};
 use ruvm_ui::input::InputState;
 use ruvm_ui::{keymaps, screendump};
 
+use crate::vl::Vm;
 use crate::x86::Located;
 
 /// `vga_interfaces[]`: the `-vga` name, the description, and whether ruvm has the device.
@@ -118,6 +125,121 @@ pub(crate) fn check_vga_created(vga: Option<VgaInterface>) {
         warn_report(
             "A -vga option was passed but this machine type does not use that option; No VGA device has been created",
         );
+    }
+}
+
+/// `dpy` of QEMU's system/vl.c: the last `-display`, with `-nographic` and `-full-screen`.
+static DPY: Mutex<Option<DisplayOptions>> = Mutex::new(None);
+
+fn dpy() -> MutexGuard<'static, Option<DisplayOptions>> {
+    DPY.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `qemu_display_help()`.
+pub(crate) fn display_help() -> String {
+    let mut types = String::from("none\n");
+    if cfg!(feature = "ui-sdl") {
+        types.push_str("sdl\n");
+    }
+    format!(
+        "Available display backend types:\n{types}\nSome display backends support suboptions, which can be set with\n   -display backend,option=value,option=value...\nFor a short list of the suboptions for each display, see the top-level -help output; more detail is in the documentation.\n"
+    )
+}
+
+/// `parse_display_qapi()`: a `-display` replaces the options before it.
+pub(crate) fn set_display(opts: DisplayOptions) {
+    *dpy() = Some(opts);
+}
+
+/// `-nographic`, which keeps the other options of an earlier `-display`.
+pub(crate) fn set_display_none() {
+    dpy().get_or_insert_default().u = DisplayOptionsU::None;
+}
+
+/// `-full-screen`.
+pub(crate) fn set_full_screen() {
+    dpy().get_or_insert_default().full_screen = Some(true);
+}
+
+/// `qemu_setup_display()` with the display checks of `qemu_create_early_backends()`, then
+/// `qemu_display_init()`. The error is the exit status.
+pub(crate) fn init_displays(vm: &Vm) -> std::result::Result<(), u8> {
+    let opts = {
+        let mut guard = dpy();
+        let d = guard.get_or_insert_default();
+        if d.u == DisplayOptionsU::Default && !ruvm_ui::vnc::configured() {
+            d.u = default_display();
+        }
+        if d.u == DisplayOptionsU::Default {
+            d.u = DisplayOptionsU::None;
+        }
+        d.clone()
+    };
+    if opts.window_close.is_some() && !is_sdl(&opts) {
+        error_report("window-close is only valid for GTK and SDL, ignoring option");
+    }
+    if opts.gl.is_some_and(|gl| gl != DisplayGLMode::Off) {
+        error_report("OpenGL support was not enabled in this build of QEMU");
+        return Err(1);
+    }
+    open_display(vm, &opts)
+}
+
+/// `qemu_display_find_default()`: the first of GTK, SDL and Cocoa that is built in.
+#[cfg(feature = "ui-sdl")]
+fn default_display() -> DisplayOptionsU {
+    DisplayOptionsU::Sdl(Default::default())
+}
+
+#[cfg(not(feature = "ui-sdl"))]
+fn default_display() -> DisplayOptionsU {
+    DisplayOptionsU::Default
+}
+
+#[cfg(feature = "ui-sdl")]
+fn is_sdl(opts: &DisplayOptions) -> bool {
+    matches!(opts.u, DisplayOptionsU::Sdl(_))
+}
+
+#[cfg(not(feature = "ui-sdl"))]
+fn is_sdl(_opts: &DisplayOptions) -> bool {
+    false
+}
+
+#[cfg(feature = "ui-sdl")]
+fn open_display(vm: &Vm, opts: &DisplayOptions) -> std::result::Result<(), u8> {
+    if !is_sdl(opts) {
+        return Ok(());
+    }
+    let hooks = Arc::new(SdlHooks(Arc::downgrade(&vm.runstate)));
+    ruvm_ui::sdl::init(
+        DisplayState::global(),
+        InputState::global(),
+        opts,
+        vm.name.as_deref(),
+        hooks,
+    )
+}
+
+#[cfg(not(feature = "ui-sdl"))]
+fn open_display(_vm: &Vm, _opts: &DisplayOptions) -> std::result::Result<(), u8> {
+    Ok(())
+}
+
+/// What the SDL window needs from the machine.
+#[cfg(feature = "ui-sdl")]
+struct SdlHooks(Weak<crate::runstate::Runstate>);
+
+#[cfg(feature = "ui-sdl")]
+impl ruvm_ui::sdl::Hooks for SdlHooks {
+    fn is_running(&self) -> bool {
+        self.0.upgrade().is_some_and(|r| r.is_running())
+    }
+
+    fn close(&self) {
+        if let Some(r) = self.0.upgrade() {
+            r.shutdown_request(ruvm_qapi::types::ShutdownCause::HostUi);
+        }
     }
 }
 
@@ -713,6 +835,7 @@ pub(crate) fn register(cmds: &mut Commands) {
         let ds = DisplayState::global();
         screendump::screendump(&ds, &arg.filename, arg.device.as_deref(), arg.head, format)
     });
+    register_query_display_options(cmds, |_: &MonitorQmp| Ok(dpy().clone().unwrap_or_default()));
     register_query_mice(cmds, |_: &MonitorQmp| Ok(InputState::global().query_mice()));
     register_send_key(cmds, |_: &MonitorQmp, arg| InputState::global().qmp_send_key(arg));
     register_input_send_event(cmds, |_: &MonitorQmp, arg| {

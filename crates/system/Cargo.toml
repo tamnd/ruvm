@@ -52,5 +52,9 @@ ruvm-accel-kvm.workspace = true
 [build-dependencies]
 ruvm-qapi-gen.workspace = true
 
+[features]
+# -display sdl, over the system's SDL2 library.
+ui-sdl = ["ruvm-qapi/ui-sdl", "ruvm-ui/ui-sdl"]
+
 [lints]
 workspace = true

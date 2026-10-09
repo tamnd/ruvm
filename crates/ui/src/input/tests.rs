@@ -79,6 +79,11 @@ fn keycode_maps() {
     assert_eq!(linux_to_scancode(103, false), [0xe0, 0xc8]);
     assert_eq!(linux_to_scancode(119, true), [0xe1, 0x1d, 0x45]);
     assert_eq!(linux_to_scancode(119, false), [0xe1, 0x9d, 0xc5]);
+    // USB usage 4 is A, 0x28 Return and 0xe0 the left Control. The table stops at 252.
+    assert_eq!(usb_to_linux(4), Some(30));
+    assert_eq!(usb_to_linux(0x28), Some(28));
+    assert_eq!(usb_to_linux(0xe0), Some(29));
+    assert_eq!(usb_to_linux(252), None);
 }
 
 #[test]

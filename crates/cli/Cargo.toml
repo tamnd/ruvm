@@ -32,5 +32,9 @@ ruvm-machine-arm.workspace = true
 ruvm-qapi.workspace = true
 ruvm-target-arm.workspace = true
 
+[features]
+# -display sdl, over the system's SDL2 library.
+ui-sdl = ["ruvm-system/ui-sdl"]
+
 [lints]
 workspace = true

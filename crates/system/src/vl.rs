@@ -500,6 +500,7 @@ fn parse_options(
             Opt::Nographic => {
                 cfg.machine.put("graphics", "off");
                 cfg.x86.nographic = true;
+                crate::display::set_display_none();
             }
             Opt::Drive => cfg.x86.drives.push((arg.to_string(), current_location())),
             Opt::Device => {
@@ -527,6 +528,7 @@ fn parse_options(
                 cfg.x86.default_serial = false;
                 cfg.x86.default_monitor = false;
             }
+            Opt::FullScreen => crate::display::set_full_screen(),
             Opt::Display => parse_display(arg)?,
             Opt::Vnc => crate::vnc::parse(arg).map_err(Exit)?,
             Opt::Audiodev => crate::audio::parse_audiodev(arg).map_err(Exit)?,
@@ -708,9 +710,7 @@ fn machine_help(target: &str) -> String {
 /// `parse_display()`. The build has no display backends.
 fn parse_display(arg: &str) -> Flow<()> {
     if is_help_option(arg) {
-        print!(
-            "Available display backend types:\nnone\n\nSome display backends support suboptions, which can be set with\n   -display backend,option=value,option=value...\nFor a short list of the suboptions for each display, see the top-level -help output; more detail is in the documentation.\n"
-        );
+        print!("{}", crate::display::display_help());
         return Err(Exit(0));
     }
     if let Some(rest) = arg.strip_prefix("vnc") {
@@ -722,9 +722,8 @@ fn parse_display(arg: &str) -> Flow<()> {
     let dict = keyval_parse(arg, Some("type"), None).map_err(|e| fail(&e))?;
     let mut v = QObjectInputVisitor::new_keyval(QValue::Dict(dict));
     let mut dpy = DisplayOptions::default();
-    // Only default and none are in the schema, and with no display built in the default is
-    // none as well.
     DisplayOptions::visit(&mut v, None, &mut dpy).map_err(|e| fail(&e))?;
+    crate::display::set_display(dpy);
     Ok(())
 }
 
@@ -1203,6 +1202,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     } else {
         vm.exit_preconfig().map_err(|e| fail(&e))?;
     }
+    crate::display::init_displays(&vm).map_err(Exit)?;
     crate::vnc::init(&vm).map_err(Exit)?;
     // The main loop starts here, and with it the frontends.
     chardevs.release();

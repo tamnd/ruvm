@@ -23,5 +23,9 @@ ruvm-qapi-gen.workspace = true
 [dev-dependencies]
 ruvm-qapi-gen.workspace = true
 
+[features]
+# The types and commands of -display sdl.
+ui-sdl = []
+
 [lints]
 workspace = true

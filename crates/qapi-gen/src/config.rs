@@ -18,6 +18,8 @@ pub enum Rule {
     On,
     /// Not set until ruvm has the feature behind it.
     Off,
+    /// Set when the crate whose build script asks has this cargo feature.
+    Feature(&'static str),
 }
 
 const CONDITIONS: &[(&str, Rule)] = &[
@@ -53,7 +55,7 @@ const CONDITIONS: &[(&str, Rule)] = &[
     ("CONFIG_QATZIP", Rule::Off),
     ("CONFIG_QPL", Rule::Off),
     ("CONFIG_REPLICATION", Rule::Off),
-    ("CONFIG_SDL", Rule::Off),
+    ("CONFIG_SDL", Rule::Feature("ui-sdl")),
     ("CONFIG_SECRET_KEYRING", Rule::Off),
     ("CONFIG_SLIRP", Rule::Off),
     ("CONFIG_SPICE", Rule::Off),
@@ -97,17 +99,30 @@ pub fn rule(sym: &str) -> Option<Rule> {
 pub struct Config {
     os: String,
     unix: bool,
+    features: Vec<String>,
 }
 
 impl Config {
     pub fn new(os: &str, unix: bool) -> Self {
-        Config { os: os.to_string(), unix }
+        Config { os: os.to_string(), unix, features: Vec::new() }
+    }
+
+    /// The same conditions with these cargo features on.
+    pub fn with_features(mut self, features: &[&str]) -> Self {
+        self.features = features.iter().map(|f| f.to_string()).collect();
+        self
     }
 
     /// The target of the build script calling this, from the variables cargo sets.
     pub fn from_cargo_env() -> Self {
         let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-        Config::new(&os, std::env::var("CARGO_CFG_UNIX").is_ok())
+        let features: Vec<String> = std::env::vars()
+            .filter_map(|(k, _)| {
+                k.strip_prefix("CARGO_FEATURE_").map(|f| f.to_lowercase().replace('_', "-"))
+            })
+            .collect();
+        let features: Vec<&str> = features.iter().map(String::as_str).collect();
+        Config::new(&os, std::env::var("CARGO_CFG_UNIX").is_ok()).with_features(&features)
     }
 
     /// Whether `sym` is set. Unknown symbols are not, and [`rule`] is how a caller finds them
@@ -117,6 +132,7 @@ impl Config {
             Some(Rule::On) => true,
             Some(Rule::Unix) => self.unix,
             Some(Rule::Os(list)) => list.contains(&self.os.as_str()),
+            Some(Rule::Feature(f)) => self.features.iter().any(|x| x == f),
             Some(Rule::Off) | None => false,
         }
     }

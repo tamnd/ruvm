@@ -81,6 +81,12 @@ pub fn parse(arg: &str) -> std::result::Result<(), u8> {
     Ok(())
 }
 
+/// Whether there is a `-vnc` option, which is what `display_remote` counts in QEMU's
+/// system/vl.c when it picks the default display.
+pub fn configured() -> bool {
+    !lock(&OPTS).locs.is_empty()
+}
+
 /// `vnc_init_func()` over every `-vnc`: opens the displays in order and reports the first
 /// failure where its option came from. `name` is `-name`, for the desktop name.
 pub fn init(name: Option<&str>, hooks: Arc<dyn Hooks>) -> std::result::Result<(), u8> {
