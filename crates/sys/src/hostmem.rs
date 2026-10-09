@@ -233,7 +233,8 @@ impl HostMemory {
     }
 
     /// Replaces `len` bytes at `offset`, page aligned, with a new mapping: zero pages without
-    /// `fd`, or else the bytes of `fd` from `file_off`, copy on write unless `shared`. This is
+    /// `fd`, or else the bytes of `fd` from `file_off`, copy on write unless `shared`. Shared
+    /// zero pages stay shared with the children of a later `fork()`. This is
     /// how a user mode guest's `mmap()` and `munmap()` land in the memory from
     /// [`reserve`](Self::reserve).
     ///
@@ -280,7 +281,12 @@ impl HostMemory {
             parts.push((offset, file_len, flags, raw));
         }
         if file_len < len {
-            parts.push((offset + file_len, len - file_len, private | libc::MAP_ANONYMOUS, -1));
+            let flags = if shared && fd.is_none() {
+                libc::MAP_SHARED | libc::MAP_FIXED | libc::MAP_NORESERVE
+            } else {
+                private
+            };
+            parts.push((offset + file_len, len - file_len, flags | libc::MAP_ANONYMOUS, -1));
         }
         for (off, l, flags, raw) in parts {
             let file_off = if raw < 0 { 0 } else { file_off as libc::off_t };

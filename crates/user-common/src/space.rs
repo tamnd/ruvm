@@ -19,8 +19,8 @@
 //! - QEMU only reserves the guest space for 64-bit guests with `-R`; here it is always
 //!   reserved, as large as the host allows up to [`DEFAULT_RESERVE`]. Addresses therefore
 //!   follow QEMU's `-R` layout, not that of a plain `qemu-x86_64`.
-//! - `MAP_SHARED` anonymous memory is private to the process, and a shared file mapping the
-//!   guest cannot write is a private one, which only differs if someone else writes the file.
+//! - A shared file mapping the guest cannot write is a private one, which only differs if
+//!   someone else writes the file.
 //! - Pages of a file mapping past the end of the file read as zero where Linux raises SIGBUS.
 
 use std::collections::BTreeMap;
@@ -53,7 +53,7 @@ pub mod page {
     pub const RWX: u32 = READ | WRITE | EXEC;
     /// `PAGE_ANON`: anonymous memory.
     pub const ANON: u32 = 0x80;
-    /// A shared file mapping.
+    /// A `MAP_SHARED` mapping, of a file or anonymous.
     pub const SHARED: u32 = 0x100;
 }
 
@@ -414,13 +414,13 @@ impl GuestSpace {
             start = self.find_vma(start, len, PAGE_SIZE).ok_or(ENOMEM)?;
         }
         let file = if kind.anon { None } else { Some(fd.ok_or(9)?) };
-        let host_shared = kind.shared && !kind.anon && prot & page::WRITE != 0;
+        let host_shared = kind.shared && (kind.anon || prot & page::WRITE != 0);
         self.replace(start, len, file, if kind.anon { 0 } else { offset }, host_shared)?;
         let mut flags = prot;
         if kind.anon {
             flags |= page::ANON;
         }
-        if kind.shared && !kind.anon {
+        if kind.shared {
             flags |= page::SHARED;
         }
         self.set_flags(start, len, flags);
@@ -682,6 +682,26 @@ mod tests {
         assert_eq!(s.mmap(s.size(), PAGE_SIZE, page::READ, k, None, 0), Err(ENOMEM));
         // The two ranges merged.
         assert_eq!(s.ranges().len(), 1);
+    }
+
+    #[test]
+    fn shared_anon_is_shared() {
+        let s = space();
+        let k = MapKind { shared: true, ..ANON };
+        let a = s.mmap(0, PAGE_SIZE, page::READ | page::WRITE, k, None, 0).unwrap();
+        assert_eq!(s.page_flags(a), page::READ | page::WRITE | page::ANON | page::SHARED);
+        // The host's mapping behind it is shared, so a fork() keeps it so.
+        let h = s.g2h(a) as u64;
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let line = maps
+            .lines()
+            .find(|l| {
+                let (lo, hi) = l.split_once(' ').unwrap().0.split_once('-').unwrap();
+                u64::from_str_radix(lo, 16).unwrap() <= h
+                    && h < u64::from_str_radix(hi, 16).unwrap()
+            })
+            .unwrap();
+        assert_eq!(&line.split(' ').nth(1).unwrap()[3..], "s", "{line}");
     }
 
     #[test]
