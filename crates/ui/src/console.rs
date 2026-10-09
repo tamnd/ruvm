@@ -149,6 +149,9 @@ struct DsInner {
     update_interval: u64,
     last_update: Option<Instant>,
     refresh: Option<Arc<RefreshThread>>,
+    /// `DisplayState.refreshing`: a refresh pass is running, so a listener changing its
+    /// interval does not rearm the timer, the end of the pass picks the change up.
+    refreshing: bool,
 }
 
 /// `DisplayState` together with the console list, which QEMU keeps in file scope statics.
@@ -183,6 +186,7 @@ impl DisplayState {
                 update_interval: 0,
                 last_update: None,
                 refresh: None,
+                refreshing: false,
             }),
             next_listener: AtomicU64::new(1),
         })
@@ -340,7 +344,11 @@ impl DisplayState {
             if let Some(l) = inner.listeners.iter_mut().find(|l| l.id == id) {
                 l.update_interval = interval;
             }
-            if inner.update_interval > interval { inner.refresh.clone() } else { None }
+            if !inner.refreshing && inner.update_interval > interval {
+                inner.refresh.clone()
+            } else {
+                None
+            }
         };
         if let Some(r) = refresh {
             r.kick();
@@ -358,22 +366,28 @@ impl DisplayState {
 
     /// `gui_update()`: one refresh of every listener. Returns the interval until the next one.
     pub fn gui_update(&self) -> Duration {
-        let listeners: Vec<(QemuConsole, Arc<dyn DisplayChangeListener>, u64)> = lock(&self.inner)
-            .listeners
-            .iter()
-            .map(|l| (l.con.clone(), Arc::clone(&l.ops), l.update_interval))
-            .collect();
-        let mut interval = GUI_REFRESH_INTERVAL_IDLE;
-        for (con, ops, _) in &listeners {
+        let listeners: Vec<(QemuConsole, Arc<dyn DisplayChangeListener>)> = {
+            let mut inner = lock(&self.inner);
+            inner.refreshing = true;
+            inner.listeners.iter().map(|l| (l.con.clone(), Arc::clone(&l.ops))).collect()
+        };
+        for (con, ops) in &listeners {
             if ops.has_refresh() {
                 ops.refresh(con);
             }
         }
-        for (_, _, dcl_interval) in &listeners {
-            let i = if *dcl_interval != 0 { *dcl_interval } else { GUI_REFRESH_INTERVAL_DEFAULT };
+        // The intervals as the refresh callbacks left them.
+        let mut inner = lock(&self.inner);
+        inner.refreshing = false;
+        let mut interval = GUI_REFRESH_INTERVAL_IDLE;
+        for l in &inner.listeners {
+            let i = if l.update_interval != 0 {
+                l.update_interval
+            } else {
+                GUI_REFRESH_INTERVAL_DEFAULT
+            };
             interval = interval.min(i);
         }
-        let mut inner = lock(&self.inner);
         inner.update_interval = interval;
         inner.last_update = Some(Instant::now());
         Duration::from_millis(interval)
@@ -666,6 +680,17 @@ impl QemuConsole {
         let mut g = lock(&self.inner.dump.generation);
         while g.0 == start {
             g = self.inner.dump.cv.wait(g).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// `graphic_hw_update()`: asks the device for a fresh frame without waiting for it.
+    pub fn hw_update_nowait(&self) {
+        let Some(ops) = self.hw_ops() else {
+            self.hw_update_done();
+            return;
+        };
+        if !ops.has_gfx_update() || ops.gfx_update(self) {
+            self.hw_update_done();
         }
     }
 

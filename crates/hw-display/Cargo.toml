@@ -17,8 +17,10 @@ unsafe-budget = 0
 ruvm-base.workspace = true
 ruvm-hw-core.workspace = true
 ruvm-hw-pci.workspace = true
+ruvm-hw-virtio.workspace = true
 ruvm-mem.workspace = true
 ruvm-ui.workspace = true
+ruvm-virtio-queue.workspace = true
 
 [lints]
 workspace = true

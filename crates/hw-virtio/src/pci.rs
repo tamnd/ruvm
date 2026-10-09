@@ -252,6 +252,8 @@ fn device_table(id: u16) -> (Option<u16>, u16, Option<&'static str>) {
         5 => (Some(PCI_DEVICE_ID_VIRTIO_BALLOON), PCI_CLASS_OTHERS, Some("virtio-balloon")),
         8 => (Some(PCI_DEVICE_ID_VIRTIO_SCSI), PCI_CLASS_STORAGE_SCSI, Some("virtio-scsi")),
         9 => (Some(PCI_DEVICE_ID_VIRTIO_9P), PCI_BASE_CLASS_NETWORK, Some("virtio-9p")),
+        // virtio-gpu-pci sets its class in its class_init instead of the table.
+        16 => (None, PCI_CLASS_DISPLAY_OTHER, Some("virtio-gpu")),
         19 => (None, PCI_CLASS_COMMUNICATION_OTHER, Some("vhost-vsock")),
         20 => (None, PCI_CLASS_OTHERS, Some("virtio-crypto")),
         26 => (None, PCI_CLASS_STORAGE_OTHER, Some("vhost-user-fs")),
@@ -916,6 +918,27 @@ pub struct VirtioPci {
     inner: Arc<Inner>,
 }
 
+/// A handle to a [`VirtioPci`] that does not keep it alive, for callbacks the device itself
+/// holds.
+#[derive(Clone)]
+pub struct WeakVirtioPci {
+    pci: Weak<PciDevice>,
+    inner: Weak<Inner>,
+}
+
+impl WeakVirtioPci {
+    /// The function, if it still exists.
+    pub fn upgrade(&self) -> Option<VirtioPci> {
+        Some(VirtioPci { pci: self.pci.upgrade()?, inner: self.inner.upgrade()? })
+    }
+}
+
+impl fmt::Debug for WeakVirtioPci {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WeakVirtioPci").finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for VirtioPci {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VirtioPci")
@@ -1173,6 +1196,11 @@ impl VirtioPci {
     }
 
     /// The PCI function.
+    /// A handle that does not keep the function alive.
+    pub fn downgrade(&self) -> WeakVirtioPci {
+        WeakVirtioPci { pci: Arc::downgrade(&self.pci), inner: Arc::downgrade(&self.inner) }
+    }
+
     pub fn pci_dev(&self) -> &Arc<PciDevice> {
         &self.pci
     }

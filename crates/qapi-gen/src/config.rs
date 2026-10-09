@@ -67,7 +67,7 @@ const CONDITIONS: &[(&str, Rule)] = &[
     ("CONFIG_VHOST_CRYPTO", Rule::Off),
     ("CONFIG_VHOST_USER_BLK_SERVER", Rule::Off),
     ("CONFIG_VMNET", Rule::Off),
-    ("CONFIG_VNC", Rule::Off),
+    ("CONFIG_VNC", Rule::On),
     ("CONFIG_WIN32", Rule::Os(&["windows"])),
     ("CONFIG_ZSTD", Rule::Off),
     ("EMSCRIPTEN", Rule::Os(&["emscripten"])),

@@ -15,5 +15,4 @@ CONFIG_REPLICATION        the replication block driver and the COLO commands
 CONFIG_SPICE_PROTOCOL     the qemu-vdagent chardev
 CONFIG_TPM                the TPM commands and types
 CONFIG_VMNET              the vmnet netdevs
-CONFIG_VNC                the VNC commands, events and display options
 CONFIG_ZSTD               zstd compression for qcow2 and multifd migration

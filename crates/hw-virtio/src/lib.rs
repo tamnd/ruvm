@@ -52,6 +52,7 @@ pub use mmio::{VirtioMmio, VirtioMmioQueueVmState, VirtioMmioVmState};
 pub use net::{NetPeer, RxOutcome, VirtioNet, VirtioNetConf, VirtioNetHdr, VirtioNetVmState};
 pub use pci::{
     VirtioPci, VirtioPciProps, VirtioPciQueueVmState, VirtioPciVariant, VirtioPciVmState,
+    WeakVirtioPci,
 };
 pub use rng::{EntropySource, RandomFile, VirtioRng, VirtioRngConf};
 pub use scsi::{VirtioScsi, VirtioScsiConf};
