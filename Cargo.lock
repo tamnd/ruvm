@@ -1414,7 +1414,7 @@ dependencies = [
  "cipher",
  "des",
  "digest",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hmac",
  "md-5",
  "ripemd",
