@@ -359,7 +359,7 @@ impl DisplayState {
         lock(&self.inner)
             .listeners
             .iter()
-            .filter(|l| l.con.same(con))
+            .filter(|l| l.con.ptr_eq(con))
             .map(|l| Arc::clone(&l.ops))
             .collect()
     }
@@ -514,7 +514,8 @@ impl fmt::Debug for QemuConsole {
 }
 
 impl QemuConsole {
-    fn same(&self, other: &QemuConsole) -> bool {
+    /// Whether both are the same console.
+    pub fn ptr_eq(&self, other: &QemuConsole) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 

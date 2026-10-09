@@ -13,6 +13,11 @@
 //! lines are driven after the device lock is dropped, so their handlers may call back into
 //! the device, for example to reset it.
 //!
+//! [`I8042::register_input`] registers the keyboard and the mouse with the input layer, as
+//! "QEMU PS/2 Keyboard" and "QEMU PS/2 Mouse", the way `ps2_kbd_realize()` and
+//! `ps2_mouse_realize()` do. LED changes go to the input layer after the device lock is
+//! dropped too.
+//!
 //! [`I8042::vmstate_save`] and [`I8042::vmstate_load`] move what the `pckbd` VMState carries,
 //! as an [`I8042VmState`]; the `kbd_` and `mouse_` variants do the same for the PS/2 devices.
 //!
@@ -20,11 +25,16 @@
 //! message for unknown commands, and the `i8042-mmio` variant.
 
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use ruvm_base::{Result, bail, warn_report};
 use ruvm_hw_core::{Clock, IrqPin, Timer};
 use ruvm_mem::{AccessConstraints, AccessCtx, AccessSize, MemResult, MmioOps};
+use ruvm_ui::console::QemuConsole;
+use ruvm_ui::input::{
+    HandlerId, INPUT_EVENT_MASK_BTN, INPUT_EVENT_MASK_KEY, INPUT_EVENT_MASK_REL, InputHandler,
+    InputState, QemuInputEvent,
+};
 
 use crate::ps2::{InputAxis, InputButton, Ps2Kbd, Ps2KbdVmState, Ps2Mouse, Ps2MouseVmState};
 
@@ -204,6 +214,8 @@ struct KbdState {
 struct Deferred {
     a20: Option<bool>,
     reset: bool,
+    /// A new keyboard LED state for the input layer.
+    leds: Option<u8>,
 }
 
 /// A snapshot of the controller registers, for tests and the monitor.
@@ -273,6 +285,8 @@ pub struct I8042 {
     reset_out: IrqPin,
     clock: Arc<Clock>,
     throttle_timer: Option<Timer>,
+    /// The input layer and the keyboard's handler in it, once registered.
+    input: OnceLock<(Arc<InputState>, HandlerId)>,
 }
 
 impl fmt::Debug for I8042 {
@@ -339,6 +353,7 @@ impl I8042 {
                 reset_out: IrqPin::new(),
                 clock: clock.clone(),
                 throttle_timer,
+                input: OnceLock::new(),
             }
         });
         s.reset();
@@ -484,7 +499,12 @@ impl I8042 {
 
     /// See [`Ps2Kbd::vmstate_load`].
     pub fn kbd_vmstate_load(&self, v: &Ps2KbdVmState) {
-        self.lock().kbd.vmstate_load(v);
+        let leds = {
+            let mut st = self.lock();
+            st.kbd.vmstate_load(v);
+            st.kbd.take_leds_update()
+        };
+        self.fire(Deferred { leds, ..Deferred::default() });
     }
 
     /// The mouse state `vmstate_ps2_mouse` sends.
@@ -652,6 +672,9 @@ impl I8042 {
         if out.reset {
             self.reset_out.pulse();
         }
+        if let (Some(leds), Some((input, id))) = (out.leds, self.input.get()) {
+            input.set_leds_mask(*id, u32::from(leds));
+        }
     }
 
     /// `kbd_write_command()`: port 0x64 writes.
@@ -784,6 +807,7 @@ impl I8042 {
                 _ => {}
             }
             st.ctrl.write_cmd = 0;
+            out.leds = st.kbd.take_leds_update();
         }
         self.fire(out);
     }
@@ -809,6 +833,22 @@ impl I8042 {
         // The exit phases.
         self.update_kbd_irq(ctrl, false);
         self.update_aux_irq(ctrl, false);
+    }
+
+    /// The virtual clock the controller was made with.
+    pub fn clock(&self) -> &Arc<Clock> {
+        &self.clock
+    }
+
+    /// Registers the keyboard and the mouse with `input`, `ps2_kbd_realize()` and
+    /// `ps2_mouse_realize()`. Only the first call does anything.
+    pub fn register_input(self: &Arc<Self>, input: &Arc<InputState>) {
+        if self.input.get().is_some() {
+            return;
+        }
+        let kbd = input.register(Arc::new(Ps2KbdHandler(Arc::downgrade(self))));
+        input.register(Arc::new(Ps2MouseHandler(Arc::downgrade(self))));
+        let _ = self.input.set((Arc::clone(input), kbd));
     }
 
     /// A key went up or down, by Linux keycode. See [`Ps2Kbd::keyboard_event`].
@@ -843,6 +883,23 @@ impl I8042 {
         mouse.sync(&mut |l| self.update_aux_irq(ctrl, l));
     }
 
+    /// A mouse button went up or down. Nothing is sent until [`I8042::mouse_sync`].
+    pub fn mouse_button(&self, button: InputButton, down: bool) {
+        self.lock().mouse.button_event(button, down);
+    }
+
+    /// Relative mouse movement. Nothing is sent until [`I8042::mouse_sync`].
+    pub fn mouse_rel(&self, axis: InputAxis, value: i32) {
+        self.lock().mouse.rel_event(axis, value);
+    }
+
+    /// `ps2_mouse_sync()`.
+    pub fn mouse_sync(&self) {
+        let mut st = self.lock();
+        let KbdState { ctrl, mouse, .. } = &mut *st;
+        mouse.sync(&mut |l| self.update_aux_irq(ctrl, l));
+    }
+
     /// `i8042_isa_mouse_fake_event()`.
     pub fn mouse_fake_event(&self) {
         let mut st = self.lock();
@@ -858,6 +915,55 @@ impl I8042 {
     /// The command port as a region, `i8042_cmd_ops`, for port 0x64.
     pub fn cmd_io(self: &Arc<Self>) -> Arc<I8042Cmd> {
         Arc::new(I8042Cmd(self.clone()))
+    }
+}
+
+/// `ps2_keyboard_handler`.
+struct Ps2KbdHandler(Weak<I8042>);
+
+impl InputHandler for Ps2KbdHandler {
+    fn name(&self) -> &str {
+        "QEMU PS/2 Keyboard"
+    }
+
+    fn mask(&self) -> u32 {
+        INPUT_EVENT_MASK_KEY
+    }
+
+    fn event(&self, _src: Option<&QemuConsole>, evt: &QemuInputEvent) {
+        if let (Some(s), QemuInputEvent::Key { key, down }) = (self.0.upgrade(), evt) {
+            // Linux keycodes stop below `KEY_CNT`, 0x300.
+            s.key_event(*key as u16, *down);
+        }
+    }
+}
+
+/// `ps2_mouse_handler`.
+struct Ps2MouseHandler(Weak<I8042>);
+
+impl InputHandler for Ps2MouseHandler {
+    fn name(&self) -> &str {
+        "QEMU PS/2 Mouse"
+    }
+
+    fn mask(&self) -> u32 {
+        INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_REL
+    }
+
+    fn event(&self, _src: Option<&QemuConsole>, evt: &QemuInputEvent) {
+        let Some(s) = self.0.upgrade() else { return };
+        match evt {
+            QemuInputEvent::Btn(b) => s.mouse_button(b.button, b.down),
+            // `mouse_dx` is an int in QEMU too.
+            QemuInputEvent::Rel(m) => s.mouse_rel(m.axis, m.value as i32),
+            _ => {}
+        }
+    }
+
+    fn sync(&self) {
+        if let Some(s) = self.0.upgrade() {
+            s.mouse_sync();
+        }
     }
 }
 

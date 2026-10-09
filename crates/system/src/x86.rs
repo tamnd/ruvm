@@ -1799,6 +1799,7 @@ fn build(
     // pc_vga_init() comes before the -device functions, which take slots in order.
     let firmware = cmd.firmware();
     crate::display::realize_x86_vga(&mut board, cmd.vga, &firmware).map_err(one)?;
+    crate::display::connect_x86_input(&board, &clock, &firmware);
     let mut display = p.display.iter().peekable();
     for (i, plug) in p.virtio.into_iter().enumerate() {
         while let Some((_, d)) = display.next_if(|(at, _)| *at == i) {

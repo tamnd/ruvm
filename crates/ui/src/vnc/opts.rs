@@ -16,6 +16,8 @@ use ruvm_qapi::opts::{
 };
 
 use crate::console::DisplayState;
+use crate::input::InputState;
+use crate::keymaps::{self, KbdLayout};
 
 use super::net::{self, ListenAddr, Listener};
 use super::{Auth, Config, Hooks, SharePolicy, VncDisplay, lock, register_display};
@@ -87,7 +89,8 @@ pub fn init(name: Option<&str>, hooks: Arc<dyn Hooks>) -> std::result::Result<()
         let _guard = loc.clone().map(push_location);
         let Some(opts) = p.list.get(*handle) else { continue };
         let id = opts.id().unwrap_or_default().to_string();
-        if let Err(e) = open(opts, &id, name, DisplayState::global(), Arc::clone(&hooks)) {
+        let ds = DisplayState::global();
+        if let Err(e) = open(opts, &id, name, ds, InputState::global(), Arc::clone(&hooks)) {
             report_error(&e);
             return Err(1);
         }
@@ -170,8 +173,11 @@ pub(crate) fn open(
     id: &str,
     name: Option<&str>,
     ds: Arc<DisplayState>,
+    input: Arc<InputState>,
     hooks: Arc<dyn Hooks>,
 ) -> Result<Arc<VncDisplay>> {
+    // vnc_display_new() loads the layout before anything else.
+    let layout = KbdLayout::new(keymaps::keyboard_layout().as_deref().unwrap_or("en-us"))?;
     let reverse = opts.get_bool("reverse", false);
     let addrs = get_addresses(opts)?;
 
@@ -184,9 +190,8 @@ pub(crate) fn open(
         }
         None => (opts.get_bool("password", false), None),
     };
-    // lock-key-sync and key-delay-ms only matter to the keyboard, which is not wired up.
-    let _ = opts.get_bool("lock-key-sync", true);
-    let _ = opts.get_number("key-delay-ms", 10);
+    let lock_key_sync = opts.get_bool("lock-key-sync", true);
+    let key_delay_ms = opts.get_number("key-delay-ms", 10) as u32;
     if opts.get_bool("sasl", false) {
         return Err(not_yet("SASL auth is"));
     }
@@ -236,8 +241,10 @@ pub(crate) fn open(
         connections_limit,
         power_control,
         lossy: false,
+        lock_key_sync,
+        key_delay_ms,
     };
-    let vd = VncDisplay::new(id, cfg, name, ds, con, hooks);
+    let vd = VncDisplay::new(id, cfg, layout, name, ds, con, input, hooks);
     if !listeners.is_empty() {
         vd.listen(listeners);
         if opts.get("to").is_some() {

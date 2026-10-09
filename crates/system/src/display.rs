@@ -16,12 +16,16 @@
 //!   realized, after the properties are checked, instead of before. On x86 it takes no `bus`.
 //! - virtio-gpu takes the properties listed in [`plan`]. `hostmem`, `outputs` and the generic
 //!   virtio and PCI ones such as `ats` or `rombar` are not there.
+//!
+//! It also connects the input layer of ui/input.c: the i8042 of q35, the clock `send-key` paces
+//! its keys on, and the `query-mice`, `send-key` and `input-send-event` commands.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use ruvm_base::report::{Location, warn_report};
 use ruvm_base::{Error, Result};
+use ruvm_hw_core::Clock;
 use ruvm_hw_core::fw_cfg::{DmaMemory, FwCfgState};
 use ruvm_hw_display::bochs_display::{BOCHS_DISPLAY_ROMFILE, BochsDisplay, BochsDisplayProps};
 use ruvm_hw_display::edid::EdidInfo;
@@ -38,13 +42,16 @@ use ruvm_machine_arm::virt::VirtMachine;
 use ruvm_machine_x86::{FirmwareSearch, VirtioHandle, X86Board};
 use ruvm_mem::AddressSpace;
 use ruvm_monitor::{Commands, MonitorQmp};
-use ruvm_qapi::commands::register_screendump;
+use ruvm_qapi::commands::{
+    register_input_send_event, register_query_mice, register_screendump, register_send_key,
+};
 use ruvm_qapi::opts::QemuOpts;
 use ruvm_qapi::types::ImageFormat;
 use ruvm_qapi::visit::{QObjectInputVisitor, Visitor, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
 use ruvm_ui::console::{ConsoleDevice, DisplayState};
-use ruvm_ui::screendump;
+use ruvm_ui::input::InputState;
+use ruvm_ui::{keymaps, screendump};
 
 use crate::x86::Located;
 
@@ -608,6 +615,20 @@ pub(crate) fn realize_x86_vga(
     realize_x86(board, &DisplayPlug::new(DisplayModel::Vga, None), firmware)
 }
 
+/// Connects an x86 board to the input layer: the i8042 handlers `ps2_kbd_realize()` and
+/// `ps2_mouse_realize()` register, the virtual clock the key queue runs on, and the data
+/// directories the keyboard layouts are looked for in.
+pub(crate) fn connect_x86_input(board: &X86Board, clock: &Arc<Clock>, firmware: &FirmwareSearch) {
+    let input = InputState::global();
+    input.set_clock(clock);
+    keymaps::set_data_dirs(firmware.dirs().to_vec());
+    if let X86Board::Q35(m, _) = board {
+        if let Some(i8042) = m.i8042() {
+            i8042.register_input(&input);
+        }
+    }
+}
+
 /// Realizes a planned display device on an x86 board.
 pub(crate) fn realize_x86(
     board: &mut X86Board,
@@ -691,6 +712,11 @@ pub(crate) fn register(cmds: &mut Commands) {
         });
         let ds = DisplayState::global();
         screendump::screendump(&ds, &arg.filename, arg.device.as_deref(), arg.head, format)
+    });
+    register_query_mice(cmds, |_: &MonitorQmp| Ok(InputState::global().query_mice()));
+    register_send_key(cmds, |_: &MonitorQmp, arg| InputState::global().qmp_send_key(arg));
+    register_input_send_event(cmds, |_: &MonitorQmp, arg| {
+        InputState::global().qmp_input_send_event(&DisplayState::global(), arg)
     });
     crate::vnc::register(cmds);
 }

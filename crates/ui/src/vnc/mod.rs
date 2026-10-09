@@ -13,8 +13,9 @@
 //! and sends raw, hextile, zlib and tight (without JPEG) rectangles, desktop size changes in
 //! both forms and WMVi pixel format changes. Where it differs from QEMU:
 //!
-//! - Key, pointer and cut text messages are read and dropped, as ruvm has no input layer yet.
-//!   The pointer is reported as relative and the LED state as zero.
+//! - Cut text messages are read and dropped, as ruvm has no clipboard yet.
+//! - The Ctrl+Alt+1 to 9 keys move the keyboard to that console, but the picture stays on the
+//!   display's own console. With the one graphic console ruvm has, the two are the same.
 //! - ZRLE, ZYWRLE, tight PNG, the extended clipboard and audio are not built in, so the
 //!   client's choice falls to its next encoding, as with a QEMU built without them.
 //! - The XVP shutdown and reset actions answer with an XVP failure, as ruvm has no powerdown
@@ -28,7 +29,9 @@
 //!
 //! Each client has a reader and a writer thread. The reader feeds the protocol handlers under
 //! the display's lock, and the writer drains what they queued. The device side is only called
-//! once the lock is dropped, see [`Deferred`].
+//! once the lock is dropped, see [`Deferred`]. Key and pointer input are worked out under the
+//! lock too, keeping the keyboard state of `ui/kbd-state.c` there, and go to the input layer
+//! afterwards.
 
 mod client;
 mod hextile;
@@ -50,12 +53,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ruvm_base::{Error, ErrorClass, Result};
 use ruvm_qapi::types::{
-    ChangeVncPasswordArg, ExpirePasswordOptions, ExpirePasswordOptionsU, SetPasswordAction,
-    SetPasswordOptions, SetPasswordOptionsU, VncClientInfo, VncConnectedArg, VncDisconnectedArg,
-    VncInfo, VncInfo2, VncInitializedArg, VncPrimaryAuth, VncServerInfo, VncServerInfo2,
+    ChangeVncPasswordArg, ExpirePasswordOptions, ExpirePasswordOptionsU, InputAxis, InputButton,
+    SetPasswordAction, SetPasswordOptions, SetPasswordOptionsU, VncClientInfo, VncConnectedArg,
+    VncDisconnectedArg, VncInfo, VncInfo2, VncInitializedArg, VncPrimaryAuth, VncServerInfo,
+    VncServerInfo2,
 };
 
 use crate::console::{DisplayChangeListener, DisplayState, ListenerId, QemuConsole, QemuUiInfo};
+use crate::input::InputState;
+use crate::kbd_state::{self, KbdOut, KbdState};
+use crate::keymaps::KbdLayout;
 use crate::pixman::{self, A8R8G8B8, PixelFormat, X8R8G8B8};
 use crate::surface::DisplaySurface;
 
@@ -307,6 +314,8 @@ pub(crate) struct Config {
     pub(crate) connections_limit: u64,
     pub(crate) power_control: bool,
     pub(crate) lossy: bool,
+    pub(crate) lock_key_sync: bool,
+    pub(crate) key_delay_ms: u32,
 }
 
 /// A QMP event a display wants sent.
@@ -345,7 +354,41 @@ pub(crate) enum Deferred {
     SetUiInfo(u32, u32),
     XvpPowerdown(u64),
     XvpReset(u64),
+    /// Keys from the keyboard state, in order.
+    Keys(Vec<KbdOut>),
+    /// `pointer_event()`: the buttons that changed, the motion and a sync.
+    Pointer {
+        old: u8,
+        new: u8,
+        motion: Motion,
+    },
 }
+
+/// The pointer motion of `pointer_event()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Motion {
+    None,
+    /// A position on a server surface of `width` by `height`.
+    Abs {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    Rel {
+        dx: i64,
+        dy: i64,
+    },
+}
+
+/// The `bmap` of `pointer_event()`.
+const POINTER_BMAP: [(InputButton, u32); 5] = [
+    (InputButton::Left, 0x01),
+    (InputButton::Middle, 0x02),
+    (InputButton::Right, 0x04),
+    (InputButton::WheelUp, 0x08),
+    (InputButton::WheelDown, 0x10),
+];
 
 /// The guest surface as the display last saw it in `dpy_gfx_switch`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,6 +416,8 @@ pub(crate) struct VdState {
     pub(crate) clients: Vec<Client>,
     pub(crate) interval: u64,
     pub(crate) ledstate: u8,
+    /// `vd->kbd`.
+    pub(crate) kbd: KbdState,
     pub(crate) deferred: Vec<Deferred>,
 }
 
@@ -519,6 +564,8 @@ pub struct VncDisplay {
     listeners: OnceLock<Vec<AddrInfo>>,
     ticker: Ticker,
     pub(crate) cfg: Config,
+    pub(crate) layout: KbdLayout,
+    input: Arc<InputState>,
     hooks: Arc<dyn Hooks>,
     next_client: std::sync::atomic::AtomicU64,
     state: Mutex<VdState>,
@@ -544,13 +591,17 @@ fn display_find(id: Option<&str>) -> Option<Arc<VncDisplay>> {
 
 impl VncDisplay {
     /// The display half of `vnc_display_new()` and `vnc_display_open()`, after the options
-    /// were read: picks up the console and starts watching it. The caller listens.
+    /// were read: picks up the console, starts watching it and hooks into the input layer. The
+    /// caller listens.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: &str,
         cfg: Config,
+        layout: KbdLayout,
         name: Option<&str>,
         ds: Arc<DisplayState>,
         con: Option<QemuConsole>,
+        input: Arc<InputState>,
         hooks: Arc<dyn Hooks>,
     ) -> Arc<VncDisplay> {
         let fallback = DisplaySurface::placeholder(
@@ -559,6 +610,9 @@ impl VncDisplay {
             if con.is_some() { NOT_ACTIVE_MSG } else { NODEV_MSG },
         );
         let password = cfg.password.clone();
+        let mut kbd = KbdState::new(con.clone());
+        kbd.set_delay(cfg.key_delay_ms);
+        let lock_key_sync = cfg.lock_key_sync;
         let vd = Arc::new_cyclic(|me| VncDisplay {
             id: id.to_string(),
             me: me.clone(),
@@ -570,6 +624,8 @@ impl VncDisplay {
             listeners: OnceLock::new(),
             ticker: Ticker { kicked: Mutex::new(false), cv: Condvar::new() },
             cfg,
+            layout,
+            input,
             hooks,
             next_client: std::sync::atomic::AtomicU64::new(1),
             state: Mutex::new(VdState {
@@ -582,8 +638,24 @@ impl VncDisplay {
                 clients: Vec::new(),
                 interval: 0,
                 ledstate: 0,
+                kbd,
                 deferred: Vec::new(),
             }),
+        });
+        if lock_key_sync {
+            let me = Arc::downgrade(&vd);
+            vd.input.add_led_notifier(move || {
+                if let Some(vd) = me.upgrade() {
+                    vd.kbd_leds();
+                }
+            });
+        }
+        // Each client's `mouse_mode_notifier`, one for all of them.
+        let me = Arc::downgrade(&vd);
+        vd.input.add_mouse_mode_notifier(move || {
+            if let Some(vd) = me.upgrade() {
+                vd.check_pointer_type_change();
+            }
         });
         match &vd.con {
             Some(con) => {
@@ -662,8 +734,54 @@ impl VncDisplay {
                         self.with_state(|st| client::xvp_fail(st, id));
                     }
                 }
+                Deferred::Keys(out) => kbd_state::send(&self.input, out),
+                Deferred::Pointer { old, new, motion } => {
+                    let con = self.con.as_ref();
+                    self.input.update_buttons(con, &POINTER_BMAP, u32::from(old), u32::from(new));
+                    match motion {
+                        Motion::None => {}
+                        Motion::Abs { x, y, width, height } => {
+                            self.input.queue_abs(con, InputAxis::X, x, 0, width);
+                            self.input.queue_abs(con, InputAxis::Y, y, 0, height);
+                        }
+                        Motion::Rel { dx, dy } => {
+                            self.input.queue_rel(con, InputAxis::X, dx);
+                            self.input.queue_rel(con, InputAxis::Y, dy);
+                        }
+                    }
+                    self.input.event_sync();
+                }
             }
         }
+    }
+
+    /// `qemu_input_is_absolute()` for the display's console, as `vs->absolute` holds it.
+    pub(crate) fn is_absolute(&self) -> i32 {
+        i32::from(self.input.is_absolute(self.con.as_ref()))
+    }
+
+    /// `check_pointer_type_change()` for every client, on a mouse mode change.
+    fn check_pointer_type_change(&self) {
+        let absolute = self.is_absolute();
+        self.with_state(|st| {
+            for i in 0..st.clients.len() {
+                client::check_pointer_type_change(st, i, absolute);
+            }
+        });
+    }
+
+    /// `kbd_leds()`: the guest's keyboard LEDs changed.
+    fn kbd_leds(&self) {
+        let ledstate = self.input.get_leds_mask(self.con.as_ref()) as u8;
+        self.with_state(|st| {
+            if ledstate == st.ledstate {
+                return;
+            }
+            st.ledstate = ledstate;
+            for i in 0..st.clients.len() {
+                client::led_state_change(st, i);
+            }
+        });
     }
 
     /// Runs `f` on the guest surface.

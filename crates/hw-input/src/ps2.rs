@@ -9,16 +9,18 @@
 //! the `PS2_DEVICE_IRQ` output line: it gets `true` for `qemu_set_irq(irq, 1)` and `false` for
 //! `qemu_set_irq(irq, 0)`, one call per call QEMU makes.
 //!
-//! Input comes in through methods instead of the `QemuInputHandler` callbacks:
-//! [`Ps2Kbd::keyboard_event`] takes a Linux keycode, [`Ps2Kbd::put_keycode`] takes a raw
-//! scancode, and the mouse has [`Ps2Mouse::rel_event`], [`Ps2Mouse::button_event`] and
-//! [`Ps2Mouse::sync`].
+//! Input comes in through methods: [`Ps2Kbd::keyboard_event`] takes a Linux keycode,
+//! [`Ps2Kbd::put_keycode`] takes a raw scancode, and the mouse has [`Ps2Mouse::rel_event`],
+//! [`Ps2Mouse::button_event`] and [`Ps2Mouse::sync`]. The controller registers the
+//! `QemuInputHandler`s that call them, and passes the LED state on to the input layer when
+//! [`Ps2Kbd::take_leds_update`] has one.
 //!
 //! `vmstate_save` and `vmstate_load` on both devices move what the `ps2kbd` and `ps2mouse`
 //! VMStates carry, as [`Ps2KbdVmState`] and [`Ps2MouseVmState`].
 //!
-//! Not ported: trace points, QOM registration, the wakeup requests and the LED notification to
-//! the UI (the LED state is readable with [`Ps2Kbd::ledstate`]).
+//! Not ported: trace points, QOM registration and the wakeup requests.
+
+pub use ruvm_qapi::types::{InputAxis, InputButton};
 
 use crate::keymap::{LINUX_TO_ATSET1, LINUX_TO_ATSET2, LINUX_TO_ATSET3};
 
@@ -476,6 +478,8 @@ pub struct Ps2Kbd {
     need_high_bit: bool,
     /// `MOD_*` bits.
     modifiers: u32,
+    /// Set where QEMU calls `qemu_input_handler_set_leds_mask()`.
+    leds_update: bool,
 }
 
 impl Default for Ps2Kbd {
@@ -495,6 +499,7 @@ impl Ps2Kbd {
             ledstate: 0,
             need_high_bit: false,
             modifiers: 0,
+            leds_update: false,
         };
         s.reset_hold();
         s
@@ -538,6 +543,10 @@ impl Ps2Kbd {
         self.scancode_set = v.scancode_set;
         self.ledstate = v.ledstate as u8;
         self.need_high_bit = v.need_high_bit;
+        // The post_load of `ps2kbd/ledstate`, which is only sent when the state is not zero.
+        if v.ledstate != 0 {
+            self.leds_update = true;
+        }
     }
 
     /// Whether the keyboard sends scancodes, cleared by [`KBD_CMD_RESET_DISABLE`].
@@ -559,6 +568,12 @@ impl Ps2Kbd {
     /// bit 2 caps lock.
     pub fn ledstate(&self) -> u8 {
         self.ledstate
+    }
+
+    /// The LED state, if it was set since the last call. The owner passes it on to
+    /// `qemu_input_handler_set_leds_mask()` once its lock is dropped.
+    pub fn take_leds_update(&mut self) -> Option<u8> {
+        std::mem::take(&mut self.leds_update).then_some(self.ledstate)
     }
 
     /// The output queue.
@@ -738,6 +753,7 @@ impl Ps2Kbd {
     /// `ps2_set_ledstate()`.
     fn set_ledstate(&mut self, ledstate: u8) {
         self.ledstate = ledstate;
+        self.leds_update = true;
     }
 
     /// `ps2_reset_keyboard()`, what the reset commands do. Unlike a device reset it keeps the
@@ -773,9 +789,9 @@ impl Ps2Kbd {
                 ps2.write_cmd = -1;
             }
             c if c == i32::from(KBD_CMD_SET_LEDS) => {
-                self.ledstate = val;
                 ps2.cqueue(&[KBD_REPLY_ACK], irq);
                 ps2.write_cmd = -1;
+                self.set_ledstate(val);
             }
             c if c == i32::from(KBD_CMD_SET_RATE) => {
                 ps2.cqueue(&[KBD_REPLY_ACK], irq);
@@ -824,40 +840,16 @@ impl Ps2Kbd {
     }
 }
 
-/// A mouse button, `InputButton` from qapi/ui.json.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum InputButton {
-    Left,
-    Middle,
-    Right,
-    WheelUp,
-    WheelDown,
-    Side,
-    Extra,
-    WheelLeft,
-    WheelRight,
-    Touch,
-}
-
-impl InputButton {
-    /// The `bmap` table of `ps2_mouse_event()`. Wheels and touch have no button bit.
-    fn ps2_bit(self) -> u8 {
-        match self {
-            InputButton::Left => PS2_MOUSE_BUTTON_LEFT,
-            InputButton::Middle => PS2_MOUSE_BUTTON_MIDDLE,
-            InputButton::Right => PS2_MOUSE_BUTTON_RIGHT,
-            InputButton::Side => PS2_MOUSE_BUTTON_SIDE,
-            InputButton::Extra => PS2_MOUSE_BUTTON_EXTRA,
-            _ => 0,
-        }
+/// The `bmap` table of `ps2_mouse_event()`. Wheels and touch have no button bit.
+fn ps2_bit(button: InputButton) -> u8 {
+    match button {
+        InputButton::Left => PS2_MOUSE_BUTTON_LEFT,
+        InputButton::Middle => PS2_MOUSE_BUTTON_MIDDLE,
+        InputButton::Right => PS2_MOUSE_BUTTON_RIGHT,
+        InputButton::Side => PS2_MOUSE_BUTTON_SIDE,
+        InputButton::Extra => PS2_MOUSE_BUTTON_EXTRA,
+        _ => 0,
     }
-}
-
-/// A relative axis, `InputAxis` from qapi/ui.json.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum InputAxis {
-    X,
-    Y,
 }
 
 /// `PS2MouseState`, the `ps2-mouse` device. It speaks plain PS/2 and turns into an
@@ -1089,7 +1081,7 @@ impl Ps2Mouse {
             return;
         }
         if down {
-            self.mouse_buttons |= button.ps2_bit();
+            self.mouse_buttons |= ps2_bit(button);
             if button == InputButton::WheelUp {
                 self.mouse_dz -= 1;
             } else if button == InputButton::WheelDown {
@@ -1102,7 +1094,7 @@ impl Ps2Mouse {
                 self.mouse_dw += 1;
             }
         } else {
-            self.mouse_buttons &= !button.ps2_bit();
+            self.mouse_buttons &= !ps2_bit(button);
         }
     }
 

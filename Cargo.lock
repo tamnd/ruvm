@@ -649,6 +649,8 @@ dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
  "ruvm-mem",
+ "ruvm-qapi",
+ "ruvm-ui",
 ]
 
 [[package]]
@@ -1227,6 +1229,7 @@ dependencies = [
  "rustix",
  "ruvm-base",
  "ruvm-crypto",
+ "ruvm-hw-core",
  "ruvm-qapi",
 ]
 

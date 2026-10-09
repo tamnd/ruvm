@@ -7,8 +7,9 @@
 //! response, ClientInit and then client messages for good. A handler that needs more bytes
 //! than it was given returns the count it wants and is called again once they are there.
 //!
-//! Key, pointer and cut text messages are read in full and dropped, as ruvm has no input layer
-//! to hand them to yet.
+//! Key and pointer messages update the display's keyboard state and the client's pointer
+//! state here, and queue what goes to the input layer as [`Deferred`] work. Cut text messages
+//! are read in full and dropped.
 
 use std::sync::Arc;
 
@@ -16,6 +17,10 @@ use ruvm_base::report::error_report;
 use ruvm_qapi::types::{
     VncBasicInfo, VncClientInfo, VncConnectedArg, VncDisconnectedArg, VncInitializedArg,
 };
+
+use crate::input::key_number_to_linux;
+use crate::kbd_state::QKbdModifier;
+use crate::keymaps::{self, SCANCODE_KEYMASK, keycode_is_keypad, keysym_is_numlock};
 
 use super::net::{AddrInfo, ClientIo};
 use super::pixels::{PixelWriter, VncPixelFormat};
@@ -26,8 +31,8 @@ use super::{
     ENCODING_AUDIO, ENCODING_COMPRESSLEVEL0, ENCODING_DESKTOP_RESIZE_EXT, ENCODING_DESKTOPRESIZE,
     ENCODING_EXT_KEY_EVENT, ENCODING_HEXTILE, ENCODING_LED_STATE, ENCODING_POINTER_TYPE_CHANGE,
     ENCODING_QUALITYLEVEL0, ENCODING_RAW, ENCODING_RICH_CURSOR, ENCODING_TIGHT, ENCODING_WMVI,
-    ENCODING_XVP, ENCODING_ZLIB, Fb, REFRESH_INTERVAL_BASE, SharePolicy, VdState, VncDisplay,
-    VncEvent, auth, framebuffer_update, hextile, raw, set_area_dirty, tight, zlib,
+    ENCODING_XVP, ENCODING_ZLIB, Fb, Motion, REFRESH_INTERVAL_BASE, SharePolicy, VdState,
+    VncDisplay, VncEvent, auth, framebuffer_update, hextile, raw, set_area_dirty, tight, zlib,
 };
 
 /// Server to client message types.
@@ -51,6 +56,11 @@ const XVP_CODE_FAIL: u8 = 0;
 const XVP_CODE_INIT: u8 = 1;
 const XVP_ACTION_SHUTDOWN: u8 = 2;
 const XVP_ACTION_RESET: u8 = 4;
+
+const KEY_1: u32 = 2;
+const KEY_9: u32 = 10;
+const KEY_CAPSLOCK: u32 = 58;
+const KEY_NUMLOCK: u32 = 69;
 
 /// `VNC_AUTH_INVALID`.
 const AUTH_INVALID: u32 = 0;
@@ -149,6 +159,9 @@ pub(crate) struct Client {
     features: u32,
     encoding: i32,
     absolute: i32,
+    last_x: i32,
+    last_y: i32,
+    last_bmask: u8,
     tight: Tight,
     zlib: Option<ZStream>,
     throttle_output_offset: usize,
@@ -374,6 +387,9 @@ pub(crate) fn connect(
         features: 0,
         encoding: ENCODING_RAW,
         absolute: -1,
+        last_x: -1,
+        last_y: -1,
+        last_bmask: 0,
         tight: Tight::default(),
         zlib: None,
         throttle_output_offset: 0,
@@ -414,6 +430,11 @@ pub(crate) fn disconnect_finish(vd: &VncDisplay, st: &mut VdState, i: usize) {
             .push(Deferred::Event(VncEvent::Disconnected(VncDisconnectedArg { server, client })));
     }
     c.io.close();
+    let mut keys = Vec::new();
+    st.kbd.lift_all_keys(&mut keys);
+    if !keys.is_empty() {
+        st.deferred.push(Deferred::Keys(keys));
+    }
     if st.clients.is_empty() {
         st.update_server_surface();
     }
@@ -719,7 +740,6 @@ pub(crate) fn desktop_resize(st: &mut VdState, i: usize) {
 /// `set_encodings()`.
 fn set_encodings(vd: &VncDisplay, st: &mut VdState, i: usize, encodings: &[i32]) {
     let (sw, sh) = st.server_dims();
-    let ledstate = st.ledstate;
     let c = &mut st.clients[i];
     c.features = 0;
     c.encoding = 0;
@@ -776,19 +796,125 @@ fn set_encodings(vd: &VncDisplay, st: &mut VdState, i: usize, encodings: &[i32])
         }
     }
     desktop_resize(st, i);
-    // check_pointer_type_change(): ruvm has no absolute pointer device yet.
+    check_pointer_type_change(st, i, vd.is_absolute());
+    led_state_change(st, i);
+}
+
+/// `check_pointer_type_change()` with `qemu_input_is_absolute()` already asked.
+pub(crate) fn check_pointer_type_change(st: &mut VdState, i: usize, absolute: i32) {
+    let (sw, sh) = st.server_dims();
     let c = &mut st.clients[i];
-    let absolute = 0;
     if c.has_feature(FEATURE_POINTER_TYPE_CHANGE) && c.absolute != absolute {
         c.write_one_rect(absolute as usize, 0, sw, sh, ENCODING_POINTER_TYPE_CHANGE);
         c.flush();
     }
     c.absolute = absolute;
-    // vnc_led_state_change()
+}
+
+/// `vnc_led_state_change()`.
+pub(crate) fn led_state_change(st: &mut VdState, i: usize) {
+    let ledstate = st.ledstate;
+    let c = &mut st.clients[i];
     if c.has_feature(FEATURE_LED_STATE) {
         c.write_one_rect(0, 0, 1, 1, ENCODING_LED_STATE);
         c.write_u8(ledstate);
         c.flush();
+    }
+}
+
+/// `pointer_event()`.
+fn pointer_event(st: &mut VdState, i: usize, button_mask: u8, x: u16, y: u16) {
+    let (width, height) = st.server_dims();
+    let c = &mut st.clients[i];
+    let old = c.last_bmask;
+    c.last_bmask = button_mask;
+    let (x, y) = (i32::from(x), i32::from(y));
+    // A client that never sent its encodings has -1 here, which counts as absolute.
+    let motion = if c.absolute != 0 {
+        Motion::Abs { x, y, width: width as i32, height: height as i32 }
+    } else if c.has_feature(FEATURE_POINTER_TYPE_CHANGE) {
+        Motion::Rel { dx: i64::from(x - 0x7FFF), dy: i64::from(y - 0x7FFF) }
+    } else {
+        let m = if c.last_x != -1 {
+            Motion::Rel { dx: i64::from(x - c.last_x), dy: i64::from(y - c.last_y) }
+        } else {
+            Motion::None
+        };
+        c.last_x = x;
+        c.last_y = y;
+        m
+    };
+    st.deferred.push(Deferred::Pointer { old, new: button_mask, motion });
+}
+
+/// `press_key()`.
+fn press_key(st: &mut VdState, lnx: u32, out: &mut Vec<super::KbdOut>) {
+    st.kbd.key_event(lnx, true, out);
+    st.kbd.key_event(lnx, false, out);
+}
+
+/// `do_key_event()`: `keycode` is a QEMU key number, `sym` the keysym the client sent.
+fn do_key_event(vd: &VncDisplay, st: &mut VdState, i: usize, down: bool, keycode: u32, sym: u32) {
+    let lnx = key_number_to_linux(i64::from(keycode));
+    let mut out = Vec::new();
+
+    // The console switch keys.
+    if (KEY_1..=KEY_9).contains(&lnx)
+        && down
+        && st.kbd.modifier_get(QKbdModifier::Ctrl)
+        && st.kbd.modifier_get(QKbdModifier::Alt)
+    {
+        if let Some(con) = vd.ds.lookup_by_index(lnx - KEY_1) {
+            st.kbd.switch_console(Some(con), &mut out);
+            st.deferred.push(Deferred::Keys(out));
+        }
+        return;
+    }
+
+    // A client with the LED state extension keeps the lock keys in step itself.
+    let sync = down && vd.cfg.lock_key_sync && !st.clients[i].has_feature(FEATURE_LED_STATE);
+    if sync && keycode_is_keypad(keycode) {
+        // Press numlock first when it changed while the VNC window was not looking.
+        let numlock = st.kbd.modifier_get(QKbdModifier::NumLock);
+        if keysym_is_numlock(sym & 0xFFFF) != numlock {
+            press_key(st, KEY_NUMLOCK, &mut out);
+        }
+    }
+    let upper = (u32::from(b'A')..=u32::from(b'Z')).contains(&sym);
+    let lower = (u32::from(b'a')..=u32::from(b'z')).contains(&sym);
+    if sync && (upper || lower) {
+        // The same for capslock.
+        let shift = st.kbd.modifier_get(QKbdModifier::Shift);
+        let capslock = st.kbd.modifier_get(QKbdModifier::CapsLock);
+        if capslock == (upper == shift) {
+            press_key(st, KEY_CAPSLOCK, &mut out);
+        }
+    }
+
+    // Every console is graphic, so there is no text console emulation to feed.
+    st.kbd.key_event(lnx, down, &mut out);
+    if !out.is_empty() {
+        st.deferred.push(Deferred::Keys(out));
+    }
+}
+
+/// `key_event()`: a keysym, mapped through the display's layout.
+fn key_event(vd: &VncDisplay, st: &mut VdState, i: usize, down: bool, sym: u32) {
+    let mut lsym = sym;
+    if (u32::from(b'A')..=u32::from(b'Z')).contains(&lsym) {
+        lsym = lsym - u32::from(b'A') + u32::from(b'a');
+    }
+    let keycode = vd.layout.keysym2scancode(lsym & 0xFFFF, Some(&st.kbd), down) & SCANCODE_KEYMASK;
+    do_key_event(vd, st, i, down, keycode, sym);
+}
+
+/// `ext_key_event()`: the QEMU extended key event, which carries the key number too.
+fn ext_key_event(vd: &VncDisplay, st: &mut VdState, i: usize, down: bool, sym: u32, keycode: u32) {
+    // A layout given with -k always wins.
+    if keymaps::keyboard_layout().is_some() {
+        key_event(vd, st, i, down, sym);
+    } else {
+        do_key_event(vd, st, i, down, keycode, sym);
     }
 }
 
@@ -827,6 +953,10 @@ fn read_s32(data: &[u8], at: usize) -> i32 {
     i32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
 }
 
+fn read_u32(data: &[u8], at: usize) -> u32 {
+    read_s32(data, at) as u32
+}
+
 /// `protocol_client_msg()`.
 fn protocol_client_msg(vd: &VncDisplay, st: &mut VdState, i: usize, data: &[u8]) -> usize {
     let len = data.len();
@@ -862,11 +992,13 @@ fn protocol_client_msg(vd: &VncDisplay, st: &mut VdState, i: usize, data: &[u8])
             if len == 1 {
                 return 8;
             }
+            key_event(vd, st, i, data[1] != 0, read_u32(data, 4));
         }
         MSG_CLIENT_POINTER_EVENT => {
             if len == 1 {
                 return 6;
             }
+            pointer_event(st, i, data[1], read_u16(data, 2), read_u16(data, 4));
         }
         MSG_CLIENT_CUT_TEXT => {
             if len == 1 {
@@ -925,6 +1057,8 @@ fn protocol_client_msg(vd: &VncDisplay, st: &mut VdState, i: usize, data: &[u8])
                     if len == 2 {
                         return 12;
                     }
+                    let down = read_u16(data, 2) != 0;
+                    ext_key_event(vd, st, i, down, read_u32(data, 4), read_u32(data, 8));
                 }
                 1 => {
                     let op = data.get(2).copied().unwrap_or(0);
