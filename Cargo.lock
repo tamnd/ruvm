@@ -1027,6 +1027,7 @@ dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
  "ruvm-hw-pci",
+ "ruvm-hw-timer",
  "ruvm-mem",
  "ruvm-qapi",
 ]

@@ -11,8 +11,8 @@ use ruvm_audio::{AudioBackend, model, registry};
 use ruvm_base::report::{Location, error_report, push_location, report_error};
 use ruvm_base::{Error, Result};
 use ruvm_hw_audio::{
-    Ac97, HdaCodecKind, IntelHda, TYPE_AC97, TYPE_HDA_DUPLEX, TYPE_HDA_MICRO, TYPE_HDA_OUTPUT,
-    TYPE_ICH9_INTEL_HDA, TYPE_INTEL_HDA,
+    Ac97, HdaCodecKind, IntelHda, PcSpkAudio, TYPE_AC97, TYPE_HDA_DUPLEX, TYPE_HDA_MICRO,
+    TYPE_HDA_OUTPUT, TYPE_ICH9_INTEL_HDA, TYPE_INTEL_HDA,
 };
 use ruvm_hw_core::fw_cfg::DmaMemory;
 use ruvm_machine_x86::X86Board;
@@ -446,5 +446,22 @@ pub(crate) fn realize_x86(board: &X86Board, plug: &AudioPlug) -> std::result::Re
     if let Some(codec) = &plug.codec {
         realize_x86(board, codec)?;
     }
+    Ok(())
+}
+
+/// The audio half of `pcspk_realizefn()`: with `-machine pcspk-audiodev=`, the speaker port
+/// of a q35 board plays on that backend. A board without a PIT has no speaker.
+pub(crate) fn realize_pcspk(board: &X86Board, audiodev: Option<&str>) -> Result<()> {
+    let Some(name) = audiodev else {
+        return Ok(());
+    };
+    let X86Board::Q35(m, _) = board else {
+        return Ok(());
+    };
+    let Some(spk) = m.pcspk() else {
+        return Ok(());
+    };
+    let audio = PcSpkAudio::new(Arc::clone(spk.pit()), registry::be_by_name(name)?);
+    spk.set_audio(Box::new(move |gate, data_on| audio.io_write(gate, data_on)));
     Ok(())
 }

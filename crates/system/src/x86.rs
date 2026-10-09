@@ -269,6 +269,8 @@ pub(crate) struct BoardOptions {
     pub aux_ram_share: bool,
     /// `memory-backend`: the backend whose RAM is the guest's main memory.
     pub memdev: Option<MemdevRam>,
+    /// `pcspk-audiodev` (q35): the backend the PC speaker plays on.
+    pub pcspk_audiodev: Option<String>,
 }
 
 /// The RAM of the memory backend a board takes as its main memory. Two are equal when they
@@ -488,6 +490,12 @@ pub(crate) fn take_board_options(kind: BoardKind, machine: &QDict) -> Result<Boa
             // Generic machine properties that change nothing here.
             "dump-guest-core" | "mem-merge" => {}
             "aux-ram-share" => o.aux_ram_share = prop_bool(name, value)?,
+            // The alias of the speaker's audiodev, which looks the backend up when set.
+            "pcspk-audiodev" if kind == BoardKind::Q35 => {
+                let v = prop_string(name, value)?;
+                ruvm_audio::registry::be_by_name(&v)?;
+                o.pcspk_audiodev = Some(v);
+            }
             // Only q35 has a use for graphics=, but every machine has the property.
             "graphics" if kind == BoardKind::Microvm => {}
             _ => {
@@ -1807,6 +1815,8 @@ fn build(
     }
     let net = Arc::new(Network::new(&cmd.netdevs, &clock).map_err(one)?);
     ruvm_audio::registry::attach_clock(&clock);
+    crate::audio::realize_pcspk(&board, opts.pcspk_audiodev.as_deref())
+        .map_err(|e| one(Located(None, e)))?;
     let env = ClassEnv { drives, net: &net, ram_size: board.ram_size() };
     // pc_vga_init() comes before the -device functions, which take slots in order.
     let firmware = cmd.firmware();

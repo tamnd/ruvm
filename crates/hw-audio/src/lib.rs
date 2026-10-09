@@ -5,17 +5,19 @@
 //! The models talk to the host only through [`ruvm_audio::AudioBackend`]: each opens voices
 //! on the backend its `audiodev` property names and moves samples in the voice callbacks the
 //! backend's timer drives. So far there are the AC97 controller and the Intel HDA controllers
-//! with QEMU's three HDA codecs.
+//! with QEMU's three HDA codecs, and the sound of the PC speaker.
 
 #![forbid(unsafe_code)]
 
 pub mod ac97;
 pub mod hda_codec;
 pub mod intel_hda;
+pub mod pcspk;
 
 pub use ac97::{Ac97, TYPE_AC97};
 pub use hda_codec::{HdaCodecKind, TYPE_HDA_DUPLEX, TYPE_HDA_MICRO, TYPE_HDA_OUTPUT};
 pub use intel_hda::{IntelHda, TYPE_ICH9_INTEL_HDA, TYPE_INTEL_HDA};
+pub use pcspk::PcSpkAudio;
 
 /// `PCI_VENDOR_ID_INTEL`.
 pub(crate) const PCI_VENDOR_ID_INTEL: u16 = 0x8086;
