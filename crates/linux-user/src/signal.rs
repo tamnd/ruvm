@@ -347,6 +347,8 @@ pub(crate) struct Task {
     sync: Option<Info>,
     /// `child_tidptr`: cleared and woken when the thread exits.
     pub(crate) child_tidptr: u64,
+    /// `start_boottime`, in clock ticks since boot.
+    pub(crate) start_boottime: u64,
 }
 
 impl Task {
@@ -366,6 +368,7 @@ impl Task {
             altstack: (0, 0),
             sync: None,
             child_tidptr: 0,
+            start_boottime: boottime_ticks(),
         }
     }
 
@@ -388,6 +391,17 @@ impl Task {
     pub(crate) fn run_mask(&self) -> u64 {
         self.signal_mask & !bit(libc::SIGSEGV) & !bit(libc::SIGBUS)
     }
+}
+
+/// `CLOCK_BOOTTIME` in clock ticks, of which Linux has 100 a second.
+fn boottime_ticks() -> u64 {
+    let mut ts = [0u64; 2];
+    if host::sys(libc::SYS_clock_gettime, &[libc::CLOCK_BOOTTIME as u64, ts.as_mut_ptr() as u64])
+        != 0
+    {
+        return 0;
+    }
+    ts[0] * 100 + ts[1] * 100 / 1_000_000_000
 }
 
 /// `signal_init()`: the conversion tables, the guest's initial dispositions from the host's,

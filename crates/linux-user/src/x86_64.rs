@@ -41,6 +41,7 @@ use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page};
 use crate::elf::{self, Arch, Creds, Exec};
 use crate::host;
 use crate::opts::{self, Exit};
+use crate::procfs::Image;
 use crate::signal::{self, Sigaction, Task, get32, get64, put32, put64};
 use crate::syscall::{
     self, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_LOCK, CLONE_PARENT_SETTID, CLONE_SETTLS,
@@ -937,12 +938,19 @@ pub(crate) fn main(argv0: &str, args: &[String]) -> ExitCode {
     let mut v = jit.create_vcpu(ops, as_, env::ENV_SIZE);
     v.core.tcg_cflags &= !cf::PARALLEL;
     env::load_state(&mut v.env, &state);
+    let image = Image {
+        argv,
+        stack_limit: info.stack_limit,
+        brk: info.brk,
+        start_stack: info.start_stack,
+        auxv: (info.saved_auxv, info.auxv_len),
+    };
     let proc = Arc::new(Proc::new(
         Arc::clone(&space),
-        info.brk,
         real_exec_path,
         o.uname_release.clone(),
         o.ld_prefix.clone(),
+        image,
     ));
     let mut cpu = v.cpu();
     signal::signal_init(prog);
