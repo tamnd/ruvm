@@ -105,13 +105,20 @@ pub fn target_big_endian(target: &str) -> bool {
 #[derive(Debug)]
 struct NoneMachine {
     big_endian: bool,
-    clock: Arc<VirtualClock>,
+    /// The virtual clock the qtest accelerator drives, or `None` when another accelerator runs
+    /// the machine and the test only drives it, where `qtest_enabled()` is false and the
+    /// clock commands do not exist.
+    clock: Option<Arc<VirtualClock>>,
     memory: Arc<AddressSpace>,
     io: Arc<AddressSpace>,
 }
 
 impl QtestBackend for NoneMachine {
     type Device = ();
+
+    fn qtest_enabled(&self) -> bool {
+        self.clock.is_some()
+    }
 
     fn big_endian(&self) -> bool {
         self.big_endian
@@ -147,15 +154,15 @@ impl QtestBackend for NoneMachine {
     }
 
     fn clock_get_ns(&mut self) -> i64 {
-        self.clock.get_ns()
+        self.clock.as_ref().map_or(0, |c| c.get_ns())
     }
 
     fn clock_deadline_ns_all(&mut self) -> i64 {
-        self.clock.deadline_ns()
+        self.clock.as_ref().map_or(-1, |c| c.deadline_ns())
     }
 
     fn clock_advance_virtual_time(&mut self, dest: i64) -> i64 {
-        self.clock.advance_to(dest)
+        self.clock.as_ref().map_or(0, |c| c.advance_to(dest))
     }
 
     fn resolve_device(&mut self, _path: &str) -> Option<()> {
@@ -199,7 +206,7 @@ impl Frontend for QtestFrontend {
 }
 
 /// `qtest_server_init()`: a chardev called `qtest` from the old style `-qtest` string, and the
-/// protocol server on it.
+/// protocol server on it, for the `none` machine on the qtest accelerator.
 pub fn server_init(
     chardevs: &Chardevs,
     chrdev: &str,
@@ -207,6 +214,36 @@ pub fn server_init(
     target: &str,
     clock: Arc<VirtualClock>,
     machine: &Machine,
+) -> Result<Attachment> {
+    let machine = NoneMachine {
+        big_endian: target_big_endian(target),
+        clock: Some(clock),
+        memory: machine.address_space_memory.clone(),
+        io: machine.address_space_io.clone(),
+    };
+    serve(chardevs, chrdev, log, machine)
+}
+
+/// `qtest_server_init()` for a board that a real accelerator runs, with its system memory and
+/// I/O address spaces. The test reads and writes guest memory and ports through the protocol,
+/// but the clock commands are not there, as in QEMU when `qtest_enabled()` is false.
+pub fn server_init_board(
+    chardevs: &Chardevs,
+    chrdev: &str,
+    log: Option<&str>,
+    target: &str,
+    memory: Arc<AddressSpace>,
+    io: Arc<AddressSpace>,
+) -> Result<Attachment> {
+    let machine = NoneMachine { big_endian: target_big_endian(target), clock: None, memory, io };
+    serve(chardevs, chrdev, log, machine)
+}
+
+fn serve(
+    chardevs: &Chardevs,
+    chrdev: &str,
+    log: Option<&str>,
+    machine: NoneMachine,
 ) -> Result<Attachment> {
     let failed = || Error::generic(format!("Failed to initialize device for qtest: \"{chrdev}\""));
     let mut list = chardev_opts();
@@ -220,12 +257,6 @@ pub fn server_init(
     let handle = parse_compat(&mut list, "qtest", chrdev, false).map_err(reported)?;
     let opts = list.get(handle).expect("just parsed");
     let chr = chardevs.new_from_opts(opts).map_err(|e| reported(Some(e)))?.ok_or_else(failed)?;
-    let machine = NoneMachine {
-        big_endian: target_big_endian(target),
-        clock,
-        memory: machine.address_space_memory.clone(),
-        io: machine.address_space_io.clone(),
-    };
     let qtest = Qtest::new(machine);
     qtest.set_log(open_log(log));
     chr.attach(Arc::new(QtestFrontend(qtest)))

@@ -253,7 +253,12 @@ pub struct HdGeometry {
 /// followed by `hd_bios_chs_auto_trans()`.
 pub fn hd_geometry_guess(nb_sectors: u64) -> HdGeometry {
     let cylinders = (nb_sectors / (16 * 63)).clamp(2, 16383) as u32;
-    let (heads, sectors) = (16, 63);
+    hd_geometry(cylinders, 16, 63)
+}
+
+/// A geometry with the translation `hd_bios_chs_auto_trans()` picks for it, which is what a
+/// drive whose geometry was set gets from `blkconf_geometry()`.
+pub fn hd_geometry(cylinders: u32, heads: u32, sectors: u32) -> HdGeometry {
     let translation = if cylinders <= 1024 && heads <= 16 && sectors <= 63 {
         BiosAtaTranslation::None
     } else {

@@ -20,7 +20,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -330,6 +330,9 @@ pub struct SourceRp {
     pub package_loaded: AtomicBool,
     /// Bumped on every `PONG`, `rp_pong_acks`.
     pub pongs: AtomicU64,
+    /// `switchover_ack_pending_num`: the acknowledgements the destination still owes before
+    /// the source may switch over.
+    pub switchover_ack_pending: AtomicU32,
 }
 
 /// Reads exactly `buf.len()` bytes, or as many as come before the end of the stream. Returns
@@ -438,8 +441,12 @@ pub fn source_return_path(
                     bail!("illegal resume_ack value {}", v);
                 }
             }
-            // switchover-ack is not on, so nothing is pending.
-            rp::SWITCHOVER_ACK => bail!("Switchover ack pending num underflowed"),
+            rp::SWITCHOVER_ACK => {
+                let left = state.switchover_ack_pending.fetch_sub(1, Ordering::AcqRel);
+                if left == 0 {
+                    bail!("Switchover ack pending num underflowed");
+                }
+            }
             _ => {}
         }
     }

@@ -96,8 +96,9 @@ fn register_migration(vm: &Arc<Vm>, cmds: &mut Commands) {
     register_migrate_start_postcopy(cmds, move |_: &MonitorQmp| migration(&v)?.start_postcopy());
 }
 
-/// Registers every command in this module with `vm`'s dispatcher.
-pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
+/// Registers every command in this module with `vm`'s dispatcher. `target` is the one of the
+/// personality, which decides the machines `query-machines` lists.
+pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
     crate::display::register(cmds);
     let v = vm.clone();
     register_query_status(cmds, move |_: &MonitorQmp| Ok(v.runstate.status()));
@@ -123,9 +124,11 @@ pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
     register_x_exit_preconfig(cmds, move |_: &MonitorQmp| v.exit_preconfig());
     // Machine "none" has no CPUs.
     register_query_cpus_fast(cmds, |_: &MonitorQmp| Ok(Vec::new()));
-    // `qmp_query_machines()` over the one machine ruvm has, with the values QEMU gives `none`.
-    register_query_machines(cmds, |_: &MonitorQmp, arg| {
-        Ok(vec![MachineInfo {
+    // `qmp_query_machines()`: `none` with the values QEMU gives it, and the x86 boards on an x86
+    // target.
+    let target = target.to_string();
+    register_query_machines(cmds, move |_: &MonitorQmp, arg| {
+        let mut out = vec![MachineInfo {
             name: "none".into(),
             alias: None,
             is_default: None,
@@ -137,7 +140,11 @@ pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
             default_ram_id: Some("ram".into()),
             acpi: false,
             compat_props: arg.compat_props.unwrap_or(false).then(Vec::new),
-        }])
+        }];
+        if crate::x86::is_x86(&target) {
+            out.extend(crate::x86::machine_infos(&target, arg.compat_props.unwrap_or(false)));
+        }
+        Ok(out)
     });
     let v = vm.clone();
     register_blockdev_add(cmds, move |_: &MonitorQmp, opts| v.block.blockdev_add(opts));

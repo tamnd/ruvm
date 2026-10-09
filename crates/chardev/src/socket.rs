@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The socket chardev, chardev/char-socket.c, for Unix and TCP sockets.
+//! The socket chardev, chardev/char-socket.c, for Unix and TCP sockets and for a socket passed
+//! in by number with `fd=`, which a server puts into the listening state first.
 //!
 //! A client connects when the chardev is opened, and a server with `wait` accepts its first
 //! client then. Either way the connection is kept until a frontend is attached, so bytes the
@@ -20,11 +21,11 @@ use std::time::Duration;
 
 use ruvm_base::report::info_report;
 use ruvm_base::{Error, Result};
-#[cfg(unix)]
-use ruvm_qapi::types::UnixSocketAddress;
 use ruvm_qapi::types::{
     ChardevSocket, InetSocketAddress, SocketAddress, SocketAddressLegacyU, SocketAddressU,
 };
+#[cfg(unix)]
+use ruvm_qapi::types::{FdSocketAddress, UnixSocketAddress};
 
 use crate::conn::{Connection, POLL_INTERVAL, Stream};
 
@@ -41,6 +42,9 @@ enum Addr {
         host: String,
         port: String,
     },
+    /// `fd=`: the descriptor number as the user gave it.
+    #[cfg(unix)]
+    Fd(String),
 }
 
 #[derive(Debug)]
@@ -118,6 +122,18 @@ fn validate(sock: &ChardevSocket) -> Result<()> {
             return Err(Error::generic(
                 "'tls_creds' option is incompatible with 'vsock' address type",
             ));
+        }
+        SocketAddressLegacyU::Fd(_) => {
+            if sock.reconnect_ms.is_some() {
+                return Err(Error::generic(
+                    "'reconnect-ms' option is incompatible with 'fd' address type",
+                ));
+            }
+            if tls && sock.server != Some(true) {
+                return Err(Error::generic(
+                    "'tls_creds' option is incompatible with 'fd' address type as client",
+                ));
+            }
         }
         _ => {}
     }
@@ -200,6 +216,9 @@ impl SocketChardev {
             SocketAddressLegacyU::Vsock(_) => {
                 return Err(Error::generic("socket family AF_VSOCK unsupported"));
             }
+            #[cfg(unix)]
+            SocketAddressLegacyU::Fd(f) => Addr::Fd(f.data.str.clone()),
+            #[cfg(not(unix))]
             SocketAddressLegacyU::Fd(_) => return Err(not_supported("A socket chardev on an fd")),
         };
         let mut chr = SocketChardev {
@@ -271,6 +290,19 @@ impl SocketChardev {
                     Addr::Inet { host: numeric(local.ip()), port: local.port().to_string() };
                 self.listener = Some(Listener::Tcp(l));
             }
+            #[cfg(unix)]
+            Addr::Fd(fdstr) => {
+                // socket_listen() moves the socket into the listening state, or only updates
+                // the backlog when it is there already.
+                let fd = crate::fd::socket_get_fd(fdstr)?;
+                rustix::net::listen(&fd, 1)
+                    .map_err(|e| Error::from_io("Failed to listen on fd socket", e.into()))?;
+                self.listener = Some(match unix_path(&fd) {
+                    // socket_listen_cleanup() unlinks the path the socket is bound to.
+                    Some(path) => Listener::Unix(UnixListener::from(fd), path.into()),
+                    None => Listener::Tcp(TcpListener::from(fd)),
+                });
+            }
         }
         Ok(())
     }
@@ -287,6 +319,14 @@ impl SocketChardev {
                     .map(Stream::Tcp)
                     .map_err(|e| Error::from_io(format!("Failed to connect to '{host}:{port}'"), e))
             }
+            #[cfg(unix)]
+            Addr::Fd(fdstr) => {
+                let fd = crate::fd::socket_get_fd(fdstr)?;
+                Ok(match unix_path(&fd) {
+                    Some(_) => Stream::Unix(UnixStream::from(fd)),
+                    None => Stream::Tcp(TcpStream::from(fd)),
+                })
+            }
         }
     }
 
@@ -294,8 +334,17 @@ impl SocketChardev {
     fn connected(&self, stream: Stream) -> Result<()> {
         let peer = match &stream {
             #[cfg(unix)]
-            Stream::Unix(_) => {
-                let Addr::Unix(path) = &self.addr else { unreachable!("a Unix stream") };
+            Stream::Unix(s) => {
+                let path = match &self.addr {
+                    Addr::Unix(path) => path.clone(),
+                    // tcp_chr_compute_filename() takes the path off the socket, which for a
+                    // socketpair() has none.
+                    _ => s
+                        .local_addr()
+                        .ok()
+                        .and_then(|a| a.as_pathname().map(PathBuf::from))
+                        .unwrap_or_default(),
+                };
                 let server = if self.listen { ",server=on" } else { "" };
                 format!("unix:{}{server}", path.display())
             }
@@ -346,6 +395,8 @@ impl SocketChardev {
             Addr::Inet { host, port } => {
                 format!("disconnected:{}:{host}:{port}{server}", self.protocol())
             }
+            #[cfg(unix)]
+            Addr::Fd(fdstr) => format!("disconnected:fd:{fdstr}{server}"),
         }
     }
 
@@ -373,6 +424,8 @@ impl SocketChardev {
                     ..Default::default()
                 })
             }
+            #[cfg(unix)]
+            Addr::Fd(fdstr) => SocketAddressU::Fd(FdSocketAddress { str: fdstr.clone() }),
         };
         SocketAddress { u }
     }
@@ -466,6 +519,20 @@ impl SocketChardev {
             }
         }
     }
+}
+
+/// The path a Unix socket is bound to, empty for an unnamed one, or `None` when the socket is
+/// not a Unix socket.
+#[cfg(unix)]
+fn unix_path(fd: &std::os::fd::OwnedFd) -> Option<String> {
+    let addr = rustix::net::getsockname(fd).ok()?;
+    if addr.address_family() != rustix::net::AddressFamily::UNIX {
+        return None;
+    }
+    let path = rustix::net::SocketAddrUnix::try_from(addr)
+        .ok()
+        .and_then(|u| u.path().map(|p| p.to_string_lossy().into_owned()));
+    Some(path.unwrap_or_default())
 }
 
 fn sleep_unless(stop: &AtomicBool, total: Duration) {

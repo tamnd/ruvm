@@ -664,6 +664,13 @@ pub struct MachineConfig {
     pub uuid: Option<[u8; 16]>,
 }
 
+/// The version a versioned machine type name ends in, `(11, 0)` for `pc-q35-11.0`, or `None`
+/// for a name without one, such as `microvm`.
+fn machine_version(name: &str) -> Option<(u32, u32)> {
+    let (major, minor) = name.rsplit('-').next()?.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
 /// What the stream said about the source, kept after a load.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadInfo {
@@ -727,6 +734,12 @@ impl SaveVm {
     /// The machine configuration.
     pub fn config(&self) -> &MachineConfig {
         &self.config
+    }
+
+    /// `migrate_switchover_ack_legacy()`. `hw_compat_11_0` turns `switchover-ack-legacy` on, so
+    /// a machine type older than 11.1 acknowledges the switchover once for all devices.
+    pub fn switchover_ack_legacy(&self) -> bool {
+        machine_version(&self.config.name).is_some_and(|v| v < (11, 1))
     }
 
     /// `calculate_new_instance_id()`.
@@ -1297,6 +1310,8 @@ impl SaveVm {
             ps: AtomicU8::new(ps::NONE),
             device: AtomicBool::new(false),
             info: Mutex::new(LoadInfo::default()),
+            switchover_ack_legacy: self.capabilities.contains(&MigrationCapability::SwitchoverAck)
+                && self.switchover_ack_legacy(),
         };
         let params = LoadParams {
             multifd: opts.multifd,
@@ -1411,6 +1426,8 @@ struct LoadCtx<'a> {
     // Whether the state went to postcopy-device, which `RUN` moves on to postcopy-active.
     device: AtomicBool,
     info: Mutex<LoadInfo>,
+    // switchover-ack is on and the machine type acknowledges the old way, once for all devices.
+    switchover_ack_legacy: bool,
 }
 
 impl LoadCtx<'_> {
@@ -1613,10 +1630,15 @@ impl Loader<'_, '_> {
                     return Ok(None);
                 }
                 let sock = lock(&ctx.socket).as_ref().and_then(|s| s.try_clone().ok());
-                match sock.and_then(|s| ReturnPath::new(s).ok()) {
-                    Some(r) => *rp = Some(Arc::new(r)),
-                    None => bail!("CMD_OPEN_RETURN_PATH failed"),
+                let Some(r) = sock.and_then(|s| ReturnPath::new(s).ok()) else {
+                    bail!("CMD_OPEN_RETURN_PATH failed");
+                };
+                // loadvm_switchover_ack_no_users_legacy(): no device here waits to approve the
+                // switchover, so the one acknowledgement goes at once.
+                if ctx.switchover_ack_legacy && r.send(postcopy::rp::SWITCHOVER_ACK, &[]).is_err() {
+                    bail!("Could not send switchover ack RP MSG");
                 }
+                *rp = Some(Arc::new(r));
                 Ok(None)
             }
             cmd::PING => {
@@ -2157,6 +2179,15 @@ mod tests {
             },
         );
         s
+    }
+
+    #[test]
+    fn machine_versions() {
+        assert_eq!(machine_version("pc-q35-11.0"), Some((11, 0)));
+        assert_eq!(machine_version("pc-i440fx-10.2"), Some((10, 2)));
+        assert_eq!(machine_version("microvm"), None);
+        assert_eq!(machine_version("q35"), None);
+        assert!(machine_version("pc-q35-10.2") < Some((11, 1)));
     }
 
     #[test]

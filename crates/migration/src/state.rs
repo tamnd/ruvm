@@ -20,7 +20,7 @@
 //! [`IncomingHooks`].
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -29,7 +29,7 @@ use ruvm_base::{Error, Result, bail, error_report};
 use ruvm_qapi::types::{
     MigMode, MigrationAddressU, MigrationCapability, MigrationCapabilityStatus, MigrationChannel,
     MigrationInfo, MigrationParameters, MigrationRAMStats, MigrationStatus, MultiFDCompression,
-    SocketAddress, StrOrNull, XBZRLECacheStats, ZeroPageDetection,
+    SocketAddress, SocketAddressU, StrOrNull, XBZRLECacheStats, ZeroPageDetection,
 };
 use ruvm_vmstate::StreamReader;
 
@@ -143,6 +143,7 @@ const SUPPORTED_CAPS: &[MigrationCapability] = &[
     MigrationCapability::Xbzrle,
     MigrationCapability::MappedRam,
     MigrationCapability::BackgroundSnapshot,
+    MigrationCapability::SwitchoverAck,
 ];
 
 /// `check_caps_background_snapshot`: what `background-snapshot` cannot go with.
@@ -532,7 +533,14 @@ fn open_return_path(
     requests: Option<Arc<PageRequests>>,
 ) -> Result<RpHandle> {
     let ctl = sock.try_clone().map_err(|e| Error::from_io("Unable to open return-path", e))?;
-    let state = Arc::new(SourceRp::default());
+    // migrate_init(): switchover-ack the old way waits for one acknowledgement for all devices.
+    // The new way counts the devices that ask for one, and none here does.
+    let ack = lock(&inner.shared).caps.contains(&MigrationCapability::SwitchoverAck);
+    let legacy = ack && lock(&inner.savevm).switchover_ack_legacy();
+    let state = Arc::new(SourceRp {
+        switchover_ack_pending: AtomicU32::new(u32::from(legacy)),
+        ..SourceRp::default()
+    });
     let (rp_inner, rp_state, rp_requests) = (inner.clone(), state.clone(), requests.clone());
     let thread = std::thread::Builder::new()
         .name("mig/src/rp-thr".to_string())
@@ -553,6 +561,7 @@ fn open_return_path(
 }
 
 /// A writer that fails once the migration is cancelled, so the thread stops at its next write.
+/// The error must not be `Interrupted`, which `write_all()` retries for ever.
 struct CancelWriter {
     inner: Box<dyn Write + Send>,
     cancel: Arc<AtomicBool>,
@@ -561,14 +570,14 @@ struct CancelWriter {
 impl Write for CancelWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.cancel.load(Ordering::Relaxed) {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "migration cancelled"));
+            return Err(io::Error::other("migration cancelled"));
         }
         self.inner.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "migration cancelled"));
+            return Err(io::Error::other("migration cancelled"));
         }
         self.inner.flush()
     }
@@ -848,6 +857,11 @@ impl Migration {
         let multifd = MigrationCapability::Multifd;
         if new.contains(&multifd) && !s.caps.contains(&multifd) && s.incoming_started {
             bail!("Multifd must be set before incoming starts");
+        }
+        if new.contains(&MigrationCapability::SwitchoverAck)
+            && !new.contains(&MigrationCapability::ReturnPath)
+        {
+            bail!("Capability 'switchover-ack' requires capability 'return-path'");
         }
         if new.contains(&multifd) && new.contains(&MigrationCapability::Xbzrle) {
             bail!("Multifd is not compatible with xbzrle");
@@ -1147,8 +1161,21 @@ impl Migration {
         inner.set_state(Some(MigrationStatus::None), MigrationStatus::Setup);
 
         let Some(cpr_addr) = cpr_addr.filter(|_| mode == MigMode::CprTransfer) else {
-            let out =
-                connect_outgoing(inner, addr, mode).inspect_err(|e| connect_error(inner, e))?;
+            // socket_start_outgoing_migration() connects a TCP or Unix socket in the background,
+            // so a destination that is not there fails the migration but not the command.
+            let in_background = matches!(
+                &addr.u,
+                MigrationAddressU::Socket(SocketAddress {
+                    u: SocketAddressU::Inet(_) | SocketAddressU::Unix(_)
+                })
+            );
+            let out = match connect_outgoing(inner, addr, mode) {
+                Ok(out) => out,
+                Err(e) => {
+                    connect_error(inner, &e);
+                    return if in_background { Ok(()) } else { Err(e) };
+                }
+            };
             let thread_inner = inner.clone();
             let handle = std::thread::Builder::new()
                 .name(out.thread_name().to_string())
@@ -1567,6 +1594,21 @@ impl Thread<'_> {
         }
     }
 
+    /// `migration_can_switchover()`: whether the destination has acknowledged the switchover,
+    /// when switchover-ack asks it to.
+    fn can_switchover(&self) -> bool {
+        if !lock(&self.inner.shared).caps.contains(&MigrationCapability::SwitchoverAck) {
+            return true;
+        }
+        // There is no reason to wait for the acknowledgement when the guest is stopped.
+        if !self.inner.host.is_running() {
+            return true;
+        }
+        self.rp
+            .as_ref()
+            .is_none_or(|rp| rp.state.switchover_ack_pending.load(Ordering::Acquire) == 0)
+    }
+
     /// `migration_iteration_run()` before the switchover. Returns true once the migration is
     /// complete.
     fn precopy_iteration(&mut self, vm: &mut SaveVm, budget: u64) -> Result<bool> {
@@ -1593,15 +1635,19 @@ impl Thread<'_> {
         }
         let total = pre + post;
         lock(&self.inner.shared).pending_bytes = total;
+        let can_switchover = self.can_switchover();
         // postcopy_should_start()
-        if pre <= self.threshold && self.inner.start_postcopy.load(Ordering::Relaxed) {
+        if can_switchover
+            && pre <= self.threshold
+            && self.inner.start_postcopy.load(Ordering::Relaxed)
+        {
             if let Err(e) = self.postcopy_start(vm) {
                 error_report(e.message());
                 return Err(e);
             }
             return Ok(false);
         }
-        if total <= self.threshold {
+        if can_switchover && total <= self.threshold {
             self.complete(vm)?;
             return Ok(true);
         }
@@ -2081,6 +2127,7 @@ fn bg_run(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2092,7 +2139,7 @@ mod tests {
         MigrationStatus, MultiFDCompression, SocketAddress, SocketAddressU,
     };
 
-    use super::{Migration, MigrationHost};
+    use super::{CancelWriter, Migration, MigrationHost};
     use crate::ram::{NoHooks, RamSection};
     use crate::savevm::{EntryInfo, MachineConfig, SaveVm};
 
@@ -2136,11 +2183,15 @@ mod tests {
     }
 
     fn machine(pages: u64, host: Arc<Host>) -> (Migration, Arc<RamBlock>) {
+        machine_named("pc-q35-11.1", pages, host)
+    }
+
+    fn machine_named(name: &str, pages: u64, host: Arc<Host>) -> (Migration, Arc<RamBlock>) {
         let block = Arc::new(RamBlock::new("pc.ram", pages << 12, 12).unwrap());
         let ram = RamSection::new(vec![block.clone()], NoHooks);
         let stats = ram.stats();
         let config = MachineConfig {
-            name: "pc-q35-11.1".to_string(),
+            name: name.to_string(),
             page_bits: 12,
             legacy_page_bits: 12,
             uuid: None,
@@ -2644,6 +2695,66 @@ mod tests {
         if ok {
             mapped_ram_over_file(true, true);
         }
+    }
+
+    /// A migration with switchover-ack on both sides. A machine type older than 11.1 makes the
+    /// source wait for the one acknowledgement the destination sends when the return path
+    /// opens; with 11.1 no device asks for one and nothing waits.
+    fn switchover_ack(name: &str) {
+        const PAGES: u64 = 16;
+        let ack = [MigrationCapability::ReturnPath, MigrationCapability::SwitchoverAck];
+        let dst_host = Arc::new(Host::default());
+        dst_host.incoming.store(true, Ordering::Relaxed);
+        let (dst, _) = machine_named(name, PAGES, dst_host);
+        caps(&dst, &ack);
+        dst.incoming(Some("tcp:127.0.0.1:0"), None, true).unwrap();
+        let uri = format!("tcp:127.0.0.1:{}", port_of(&dst));
+        let src_host = Arc::new(Host::default());
+        src_host.running.store(true, Ordering::Relaxed);
+        let (src, _) = machine_named(name, PAGES, src_host);
+        caps(&src, &ack);
+        src.migrate(Some(&uri), None).unwrap();
+        src.join();
+        dst.join();
+        assert_eq!(src.status(), MigrationStatus::Completed, "{:?}", src.query().error_desc);
+        assert_eq!(dst.incoming_status(), MigrationStatus::Completed);
+    }
+
+    #[test]
+    fn switchover_ack_old_and_new() {
+        switchover_ack("pc-q35-11.0");
+        switchover_ack("pc-q35-11.1");
+        let (m, _) = machine(4, Arc::new(Host::default()));
+        let only = [MigrationCapabilityStatus {
+            capability: MigrationCapability::SwitchoverAck,
+            state: true,
+        }];
+        assert_eq!(
+            m.set_capabilities(&only).unwrap_err().message(),
+            "Capability 'switchover-ack' requires capability 'return-path'"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_write_fails_rather_than_retrying() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut w = CancelWriter { inner: Box::new(io::sink()), cancel: cancel.clone() };
+        w.write_all(b"before").unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(w.write_all(b"after").unwrap_err().to_string(), "migration cancelled");
+        assert!(w.flush().is_err());
+    }
+
+    #[test]
+    fn a_destination_that_is_not_there_fails_the_migration_not_the_command() {
+        let host = Arc::new(Host::default());
+        let (m, _) = machine(4, host);
+        // A listener that is closed again leaves a port that nothing listens on.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        m.migrate(Some(&format!("tcp:127.0.0.1:{port}")), None).unwrap();
+        assert_eq!(m.status(), MigrationStatus::Failed);
+        let why = m.query().error_desc.unwrap();
+        assert!(why.starts_with("Failed to connect to '127.0.0.1:"), "{why}");
     }
 
     #[test]

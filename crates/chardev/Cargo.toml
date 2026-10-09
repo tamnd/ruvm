@@ -11,7 +11,8 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+# The unsafe items are the descriptor adoption in fd.rs.
+unsafe-budget = 2
 
 [dependencies]
 ruvm-base.workspace = true

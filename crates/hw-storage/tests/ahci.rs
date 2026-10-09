@@ -578,6 +578,27 @@ fn default_serial_numbers() {
     assert_eq!(serials[1], serials[0] + 2);
 }
 
+/// IDENTIFY words 1, 3 and 6 and 54 to 56: the guessed geometry, or the one that was set.
+#[test]
+fn geometry() {
+    let env = Env::bare();
+    let d0 = VecBackend::new(512);
+    let d1 = VecBackend::new(512);
+    let config = DriveConfig { geometry: Some((1, 1, 1)), ..DriveConfig::hd() };
+    env.ahci.attach_drive(0, DriveConfig::hd(), Some(Arc::new(d0))).unwrap();
+    env.ahci.attach_drive(1, config, Some(Arc::new(d1))).unwrap();
+    env.boot();
+    let mut got = Vec::new();
+    for port in 0..2 {
+        env.start_port(port);
+        let buf = env.alloc(512, 2);
+        env.issue(port, 0, &Cmd::ata(CMD_IDENTIFY, 0, 0), buf, 512);
+        let id = env.memread(buf, 512);
+        got.push([1, 3, 6, 54, 55, 56].map(|w| word(&id, w)));
+    }
+    assert_eq!(got, [[2, 16, 63, 2, 16, 63], [1, 1, 1, 1, 1, 1]]);
+}
+
 #[test]
 fn dma_round_trip() {
     let (env, disk) = Env::new();

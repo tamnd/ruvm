@@ -32,6 +32,24 @@ pub type FdResolver = dyn Fn(&str) -> Result<std::os::fd::OwnedFd> + Send + Sync
 #[cfg(not(unix))]
 pub type FdResolver = dyn Fn(&str) -> Result<File> + Send + Sync;
 
+/// Opens `/dev/fdset/N` with the given flags, `monitor_fdset_dup_fd_add()`: a duplicate of a
+/// member of fd set N whose access mode matches. The fd sets are the monitor's.
+#[cfg(unix)]
+pub type FdsetOpener =
+    dyn Fn(i64, rustix::fs::OFlags) -> Result<std::os::fd::OwnedFd> + Send + Sync;
+
+/// The fd sets `/dev/fdset/N` paths open from. QEMU has one `mon_fdsets` for the process, so
+/// this is not part of a migration.
+#[cfg(unix)]
+static FDSET_OPENER: std::sync::RwLock<Option<std::sync::Arc<FdsetOpener>>> =
+    std::sync::RwLock::new(None);
+
+/// Sets where `/dev/fdset/N` paths of `file:` channels come from.
+#[cfg(unix)]
+pub fn set_fdset_opener(open: std::sync::Arc<FdsetOpener>) {
+    *FDSET_OPENER.write().unwrap_or_else(|e| e.into_inner()) = Some(open);
+}
+
 /// `qemu_strtosz()` for the `offset=` option: a number with an optional size suffix.
 fn parse_size(s: &str) -> Option<u64> {
     let (num, mult) = match s.char_indices().last() {
@@ -371,12 +389,41 @@ fn fd_socket(fd: std::os::fd::OwnedFd) -> std::result::Result<Socket, File> {
 /// `qio_channel_file_new_path()` for one more handle on a `file:` channel, a multifd channel
 /// with mapped-ram. `direct` adds `O_DIRECT`.
 pub fn open_file(path: &str, write: bool, direct: bool) -> Result<File> {
+    qemu_open(path, write, false, direct)
+}
+
+/// `qemu_open()`: opens `path` read-only or write-only, creating it with mode 0600 if `create`
+/// is set. A `/dev/fdset/N` path duplicates a descriptor of fd set N instead.
+fn qemu_open(path: &str, write: bool, create: bool, direct: bool) -> Result<File> {
+    #[cfg(unix)]
+    let o_direct = if direct { ruvm_sys::directio::o_direct() } else { None };
+    #[cfg(not(unix))]
+    let _ = direct;
+    #[cfg(unix)]
+    if let Some(id) = path.strip_prefix("/dev/fdset/") {
+        use rustix::fs::OFlags;
+        // qemu_parse_fdset()
+        let Ok(id) = id.parse::<i32>() else { bail!("Could not parse fdset {path}") };
+        let open = FDSET_OPENER.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(open) = open else { bail!("Failed to find fdset {path}") };
+        let mut flags = if write { OFlags::WRONLY } else { OFlags::RDONLY };
+        if create {
+            flags |= OFlags::CREATE;
+        }
+        if let Some(flag) = o_direct {
+            flags |= OFlags::from_bits_retain(flag as _);
+        }
+        return open(i64::from(id), flags).map(File::from);
+    }
     let mut o = OpenOptions::new();
-    o.read(!write).write(write);
-    if direct {
-        #[cfg(unix)]
-        if let Some(flag) = ruvm_sys::directio::o_direct() {
-            use std::os::unix::fs::OpenOptionsExt;
+    o.read(!write).write(write).create(create).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if create {
+            o.mode(0o600);
+        }
+        if let Some(flag) = o_direct {
             o.custom_flags(flag);
         }
     }
@@ -575,14 +622,8 @@ impl Channel {
                 Box::new(ExecWriter { stdin, child })
             }
             MigrationAddressU::File(f) => {
-                // file_connect_outgoing()
-                let mut o = OpenOptions::new();
-                o.create(true).write(true).truncate(false);
-                #[cfg(unix)]
-                std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-                let mut file = o
-                    .open(&f.filename)
-                    .map_err(|e| Error::from_io(format!("Could not open '{}'", f.filename), e))?;
+                // file_start_outgoing_migration()
+                let mut file = qemu_open(&f.filename, true, true, false)?;
                 file.set_len(f.offset).map_err(|e| {
                     Error::from_io(
                         format!("failed to truncate migration file to offset {:x}", f.offset),
@@ -682,8 +723,7 @@ impl Channel {
                 ListenerKind::Ready(Box::new(ExecReader { stdout, child }))
             }
             MigrationAddressU::File(f) => {
-                let mut file = File::open(&f.filename)
-                    .map_err(|e| Error::from_io(format!("Could not open '{}'", f.filename), e))?;
+                let mut file = qemu_open(&f.filename, false, false, false)?;
                 if f.offset != 0 {
                     file.seek(SeekFrom::Start(f.offset))
                         .map_err(|e| Error::from_io("Unable to seek the migration file", e))?;
@@ -936,6 +976,35 @@ mod tests {
         let mut v = Vec::new();
         r.read_to_end(&mut v).unwrap();
         assert_eq!(v, b"stream");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fdset_paths() {
+        use rustix::fs::OFlags;
+        let path = std::env::temp_dir().join(format!("ruvm-mig-fdset-{}", std::process::id()));
+        let p = path.clone();
+        set_fdset_opener(std::sync::Arc::new(move |id, flags| {
+            if id != 7 {
+                bail!("Failed to find fdset /dev/fdset/{id}");
+            }
+            let write = flags & OFlags::ACCMODE == OFlags::WRONLY;
+            let f = OpenOptions::new().read(!write).write(write).create(write).open(&p).unwrap();
+            Ok(f.into())
+        }));
+        let err = open_file("/dev/fdset/x", false, false).unwrap_err();
+        assert_eq!(err.message(), "Could not parse fdset /dev/fdset/x");
+        let err = open_file("/dev/fdset/2", false, false).unwrap_err();
+        assert_eq!(err.message(), "Failed to find fdset /dev/fdset/2");
+        let uri = "file:/dev/fdset/7,offset=8";
+        let mut w = Channel::connect(&parse_uri(uri).unwrap(), None).unwrap();
+        w.write_all(b"fdset").unwrap();
+        drop(w);
+        let mut r = Channel::listen(&parse_uri(uri).unwrap(), None).unwrap().accept().unwrap();
+        let mut v = Vec::new();
+        r.read_to_end(&mut v).unwrap();
+        assert_eq!(v, b"fdset");
         let _ = std::fs::remove_file(path);
     }
 

@@ -132,10 +132,13 @@ fn tcp_server_serves_one_client_after_another() {
 
 #[cfg(unix)]
 mod unix {
+    use std::os::fd::IntoRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
 
-    use ruvm_qapi::types::{UnixSocketAddress, UnixSocketAddressWrapper};
+    use ruvm_qapi::types::{
+        FdSocketAddress, FdSocketAddressWrapper, UnixSocketAddress, UnixSocketAddressWrapper,
+    };
 
     use super::*;
 
@@ -191,5 +194,61 @@ mod unix {
         drop(chr);
         chardevs.remove("srv").unwrap();
         assert!(!p.exists());
+    }
+
+    fn fd(n: i32) -> SocketAddressLegacyU {
+        SocketAddressLegacyU::Fd(FdSocketAddressWrapper {
+            data: FdSocketAddress { str: n.to_string() },
+        })
+    }
+
+    /// What the Python QEMU machine class does: one end of a socketpair() goes in as
+    /// `-chardev socket,fd=N` and the chardev is a client already connected on it.
+    #[test]
+    fn client_on_a_socketpair() {
+        let (mut peer, ours) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let n = ours.into_raw_fd();
+        let chardevs = Chardevs::new();
+        let chr = chardevs.add("mon", &socket(fd(n), false)).unwrap();
+        assert_eq!(chr.filename(), "unix:");
+        let _fe = chr.attach(Arc::new(Echo("> "))).unwrap();
+        peer.write_all(b"hi").unwrap();
+        assert_eq!(read_exact(&mut peer, 4), "> hi");
+    }
+
+    #[test]
+    fn server_on_a_bound_socket() {
+        let p = path("fd-server");
+        let n = UnixListener::bind(&p).unwrap().into_raw_fd();
+        let chardevs = Chardevs::new();
+        let chr = chardevs.add("srv", &socket(fd(n), true)).unwrap();
+        assert_eq!(chr.filename(), format!("disconnected:fd:{n},server=on"));
+        let fe = chr.attach(Arc::new(Echo(""))).unwrap();
+        let mut c = UnixStream::connect(&p).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c.write_all(b"x").unwrap();
+        assert_eq!(read_exact(&mut c, 1), "x");
+        assert_eq!(chr.filename(), format!("unix:{},server=on", p.display()));
+        fe.join();
+        drop(chr);
+        chardevs.remove("srv").unwrap();
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn fd_options_are_checked() {
+        let chardevs = Chardevs::new();
+        let mut b = socket(fd(0), false);
+        if let ChardevBackendU::Socket(s) = &mut b.u {
+            s.data.reconnect_ms = Some(10);
+        }
+        let e = chardevs.add("s", &b).unwrap_err();
+        assert_eq!(
+            e.message(),
+            "Failed to add chardev 's': 'reconnect-ms' option is incompatible with 'fd' address type"
+        );
+        let e = chardevs.add("s", &socket(fd(-1), false)).unwrap_err();
+        assert_eq!(e.message(), "Failed to add chardev 's': File descriptor '-1' is not a socket");
     }
 }
