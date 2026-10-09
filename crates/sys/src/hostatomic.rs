@@ -75,6 +75,18 @@ fn with<R>(mem: &[AtomicU8], f: impl FnOnce(&dyn Cell) -> R) -> Option<R> {
     }
 }
 
+/// The bytes as an unaligned head, the naturally aligned 8-byte words after it and an unaligned
+/// tail shorter than a word, the split `<[T]>::align_to()` makes. Bulk copies, fills and zero
+/// checks go through the words a whole word at a time, as QEMU's `memcpy()` and
+/// `buffer_is_zero()` do on guest RAM, instead of one byte at a time.
+pub fn words(mem: &[AtomicU8]) -> (&[AtomicU8], &[AtomicU64], &[AtomicU8]) {
+    // SAFETY: `AtomicU64` has the size of eight `AtomicU8` and no invalid bit patterns, so any
+    // eight aligned bytes are a valid `AtomicU64`, and `align_to` only hands out the part of the
+    // slice that is aligned for it. Both types are reached only through atomic operations, so
+    // the words are no more of a data race than the bytes they came from.
+    unsafe { mem.align_to::<AtomicU64>() }
+}
+
 /// A single-copy atomic load of 1, 2, 4 or 8 aligned bytes, `qatomic_read`.
 pub fn load(mem: &[AtomicU8]) -> Option<u64> {
     with(mem, |c| c.load(Ordering::Relaxed))
@@ -255,6 +267,19 @@ mod tests {
         assert_eq!(load(&b.0[15..16]), Some(1));
         assert!(store(&b.0[4..8], 0xdead_beef_1234_5678));
         assert_eq!(bytes(&b, 4, 4), [0x78, 0x56, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn words_cover_the_aligned_middle() {
+        let b = buf();
+        let (head, middle, tail) = words(&b.0[3..61]);
+        assert_eq!(head.len() + 8 * middle.len() + tail.len(), 58);
+        assert_eq!(middle.len(), 6);
+        middle[0].store(u64::from_ne_bytes([1, 2, 3, 4, 5, 6, 7, 8]), Ordering::Relaxed);
+        assert_eq!(bytes(&b, 3 + head.len(), 8), [1, 2, 3, 4, 5, 6, 7, 8]);
+        let (head, middle, tail) = words(&b.0[8..13]);
+        assert_eq!(head.len() + tail.len(), 5);
+        assert!(middle.is_empty());
     }
 
     #[test]

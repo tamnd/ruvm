@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use ruvm_base::{Error, Result, bail, error_report, warn_report};
-use ruvm_mem::{DirtyClient, RamBlock};
+use ruvm_mem::{DirtyClient, RamBlock, buffer_is_zero};
 use ruvm_qapi::types::ZeroPageDetection;
 use ruvm_vmstate::StreamReader;
 
@@ -489,7 +489,7 @@ impl RamSection {
         block.read(offset, buf).map_err(|e| {
             Error::generic(format!("Failed to read RAM block {}: {e}", block.name()))
         })?;
-        let zero = check_zero && buf.iter().all(|&x| x == 0);
+        let zero = check_zero && buffer_is_zero(buf);
         if let Some(m) = multifd {
             if !zero {
                 self.page_count += 1;
@@ -1430,13 +1430,10 @@ impl LiveState for RamSection {
                         // ram_handle_zero(): a page that is already zero is left alone, so the
                         // host does not have to back it.
                         let block = &self.blocks[i];
-                        block.read(addr, &mut buf).map_err(|e| {
-                            Error::generic(format!("Illegal RAM offset {addr:x}: {e}"))
-                        })?;
-                        if buf.iter().any(|&b| b != 0) {
-                            block.fill(addr, PAGE_SIZE as u64, 0).map_err(|e| {
-                                Error::generic(format!("Illegal RAM offset {addr:x}: {e}"))
-                            })?;
+                        let illegal =
+                            |e| Error::generic(format!("Illegal RAM offset {addr:x}: {e}"));
+                        if !block.is_zero(addr, PAGE_SIZE as u64).map_err(illegal)? {
+                            block.fill(addr, PAGE_SIZE as u64, 0).map_err(illegal)?;
                         }
                     }
                 }
