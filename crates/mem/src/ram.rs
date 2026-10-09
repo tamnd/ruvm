@@ -3,11 +3,12 @@
 //! RAM blocks, the backing of RAM, ROM and ROM device regions.
 //!
 //! A block's bytes are an anonymous host mapping from ruvm-sys, seen as an array of `AtomicU8`,
-//! and every access copies through relaxed atomic loads and stores. That keeps this crate free of
-//! unsafe code while still being sound when vCPU threads, the kernel and device threads touch the
-//! same guest memory at once. The mapping is page aligned and has a stable address, so
-//! accelerators can hand it to the hypervisor. Memfd and file backed blocks and the opaque copy
-//! routines from spec/05 replace the storage later without changing this interface.
+//! and every access copies through relaxed atomic loads and stores, of whole aligned words where
+//! it can. That keeps this crate free of unsafe code while still being sound when vCPU threads,
+//! the kernel and device threads touch the same guest memory at once. The mapping is page
+//! aligned and has a stable address, so accelerators can hand it to the hypervisor. Memfd and
+//! file backed blocks and the opaque copy routines from spec/05 replace the storage later without
+//! changing this interface.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -17,7 +18,22 @@ use std::sync::Arc;
 
 use crate::dirty::{DirtyBitmap, DirtyClient, DirtyMask, DirtySnapshot};
 use crate::error::MemError;
-use ruvm_sys::HostMemory;
+use ruvm_sys::{HostMemory, hostatomic};
+
+/// The bytes of the words bulk accesses go through.
+const WORD: usize = 8;
+
+/// The words in a 64 byte cache line, the unit [`RamBlock::is_zero`] tests at once.
+const LINE_WORDS: usize = 8;
+
+/// `buffer_is_zero()`: whether every byte of `buf` is zero. The bytes are or-ed together a
+/// cache line at a time, which the compiler turns into vector code, and the answer comes at the
+/// first line that is not zero.
+pub fn buffer_is_zero(buf: &[u8]) -> bool {
+    let mut lines = buf.chunks_exact(LINE_WORDS * WORD);
+    lines.all(|l| l.iter().fold(0, |acc, &b| acc | b) == 0)
+        && lines.remainder().iter().all(|&b| b == 0)
+}
 
 /// One contiguous piece of guest RAM, `RAMBlock`.
 pub struct RamBlock {
@@ -135,21 +151,33 @@ impl RamBlock {
         self.bytes().get(start..end).ok_or(MemError::OutOfRange)
     }
 
-    /// Copies bytes at `offset` into `buf`.
+    /// Copies bytes at `offset` into `buf`, a word at a time where the bytes are aligned.
     pub fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), MemError> {
-        let src = self.range(offset, buf.len())?;
-        for (d, s) in buf.iter_mut().zip(src) {
+        let (head, words, tail) = hostatomic::words(self.range(offset, buf.len())?);
+        let (h, rest) = buf.split_at_mut(head.len());
+        let (w, t) = rest.split_at_mut(words.len() * WORD);
+        for (d, s) in h.iter_mut().zip(head).chain(t.iter_mut().zip(tail)) {
             *d = s.load(Ordering::Relaxed);
+        }
+        for (d, s) in w.chunks_exact_mut(WORD).zip(words) {
+            d.copy_from_slice(&s.load(Ordering::Relaxed).to_ne_bytes());
         }
         Ok(())
     }
 
-    /// Copies `buf` to `offset`. This does not mark anything dirty; see
-    /// [`RamBlock::set_dirty`].
+    /// Copies `buf` to `offset`, a word at a time where the bytes are aligned. This does not
+    /// mark anything dirty; see [`RamBlock::set_dirty`].
     pub fn write(&self, offset: u64, buf: &[u8]) -> Result<(), MemError> {
-        let dst = self.range(offset, buf.len())?;
-        for (d, s) in dst.iter().zip(buf) {
+        let (head, words, tail) = hostatomic::words(self.range(offset, buf.len())?);
+        let (h, rest) = buf.split_at(head.len());
+        let (w, t) = rest.split_at(words.len() * WORD);
+        for (d, s) in head.iter().zip(h).chain(tail.iter().zip(t)) {
             d.store(*s, Ordering::Relaxed);
+        }
+        for (d, s) in words.iter().zip(w.chunks_exact(WORD)) {
+            let mut b = [0; WORD];
+            b.copy_from_slice(s);
+            d.store(u64::from_ne_bytes(b), Ordering::Relaxed);
         }
         Ok(())
     }
@@ -157,10 +185,29 @@ impl RamBlock {
     /// Sets `len` bytes at `offset` to `byte`.
     pub fn fill(&self, offset: u64, len: u64, byte: u8) -> Result<(), MemError> {
         let len = usize::try_from(len).map_err(|_| MemError::OutOfRange)?;
-        for d in self.range(offset, len)? {
+        let (head, words, tail) = hostatomic::words(self.range(offset, len)?);
+        for d in head.iter().chain(tail) {
             d.store(byte, Ordering::Relaxed);
         }
+        let word = u64::from_ne_bytes([byte; WORD]);
+        for d in words {
+            d.store(word, Ordering::Relaxed);
+        }
         Ok(())
+    }
+
+    /// Whether the `len` bytes at `offset` are all zero, `buffer_is_zero()` on guest RAM. The
+    /// words are looked at a cache line at a time, and the answer comes at the first line that
+    /// is not zero.
+    pub fn is_zero(&self, offset: u64, len: u64) -> Result<bool, MemError> {
+        let len = usize::try_from(len).map_err(|_| MemError::OutOfRange)?;
+        let (head, words, tail) = hostatomic::words(self.range(offset, len)?);
+        if head.iter().chain(tail).any(|b| b.load(Ordering::Relaxed) != 0) {
+            return Ok(false);
+        }
+        Ok(words
+            .chunks(LINE_WORDS)
+            .all(|line| line.iter().fold(0, |acc, w| acc | w.load(Ordering::Relaxed)) == 0))
     }
 
     fn pages(&self, offset: u64, len: u64) -> Option<(u64, u64)> {
@@ -323,6 +370,52 @@ mod tests {
         b.fill(0, 2, 0xaa).unwrap();
         b.read(0, &mut out[..2]).unwrap();
         assert_eq!(out[..2], [0xaa, 0xaa]);
+    }
+
+    #[test]
+    fn bulk_copies_match_byte_copies_at_any_alignment() {
+        let b = RamBlock::new("ram", 0x1000, 12).unwrap();
+        let data: Vec<u8> = (0..300u32).map(|i| (i * 7 + 1) as u8).collect();
+        for start in 0..9u64 {
+            for len in [0, 1, 7, 8, 9, 63, 64, 65, 300] {
+                b.fill(0, 0x400, 0).unwrap();
+                b.write(start, &data[..len]).unwrap();
+                let mut out = vec![0; len + 16];
+                b.read(start, &mut out[..len]).unwrap();
+                assert_eq!(out[..len], data[..len], "start {start} len {len}");
+                // Nothing around the copy changed.
+                let mut around = vec![0; 0x400];
+                b.read(0, &mut around).unwrap();
+                let s = start as usize;
+                assert!(around[..s].iter().chain(&around[s + len..]).all(|&x| x == 0));
+                b.fill(start, len as u64, 0x5a).unwrap();
+                b.read(0, &mut around).unwrap();
+                assert!(around[s..s + len].iter().all(|&x| x == 0x5a));
+                assert!(around[..s].iter().chain(&around[s + len..]).all(|&x| x == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn zero_checks_see_every_byte() {
+        let b = RamBlock::new("ram", 0x2000, 12).unwrap();
+        assert_eq!(b.is_zero(0, 0x2000), Ok(true));
+        assert_eq!(b.is_zero(0x1fff, 2), Err(MemError::OutOfRange));
+        for at in [0u64, 1, 7, 8, 63, 64, 0x7ff, 0xfff] {
+            b.write(at, &[1]).unwrap();
+            assert_eq!(b.is_zero(0, 0x1000), Ok(false), "byte {at}");
+            assert_eq!(b.is_zero(at + 1, 0x1000 - at - 1), Ok(true), "after {at}");
+            b.write(at, &[0]).unwrap();
+        }
+        let mut page = vec![0u8; 0x1000];
+        assert!(buffer_is_zero(&page));
+        assert!(buffer_is_zero(&[]));
+        for at in [0, 63, 64, 0xffe, 0xfff] {
+            page[at] = 0x80;
+            assert!(!buffer_is_zero(&page), "byte {at}");
+            assert!(!buffer_is_zero(&page[..=at]), "short, byte {at}");
+            page[at] = 0;
+        }
     }
 
     #[test]

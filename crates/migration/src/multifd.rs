@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use flate2::{Compress, Decompress, FlushCompress, FlushDecompress, Status};
 use ruvm_base::{Error, Result, bail};
-use ruvm_mem::RamBlock;
+use ruvm_mem::{RamBlock, buffer_is_zero};
 
 use crate::channel::{Accepted, Incoming, Listener, Socket, read_exact_at, write_all_at};
 use crate::mapped_ram::{AlignedBuf, FileBlock};
@@ -395,7 +395,7 @@ impl SendChannel {
         let (mut i, mut j) = (0usize, n);
         while i < j {
             let s = slot[i];
-            if self.pages[s * PAGE_SIZE..(s + 1) * PAGE_SIZE].iter().any(|&b| b != 0) {
+            if !buffer_is_zero(&self.pages[s * PAGE_SIZE..(s + 1) * PAGE_SIZE]) {
                 i += 1;
                 continue;
             }
@@ -993,12 +993,9 @@ impl RecvChannel {
         // multifd_recv_zero_page_process(): a page that is already zero is left alone, so the
         // host does not have to back it.
         if let Some(b) = block {
-            let mut page = [0u8; PAGE_SIZE];
             for &o in &p.zero {
-                let write = cfg.postcopy_ram || {
-                    b.read(o, &mut page).map_err(|e| werr(b, o, e))?;
-                    page.iter().any(|&x| x != 0)
-                };
+                let write = cfg.postcopy_ram
+                    || !b.is_zero(o, PAGE_SIZE as u64).map_err(|e| werr(b, o, e))?;
                 if write {
                     b.fill(o, PAGE_SIZE as u64, 0).map_err(|e| werr(b, o, e))?;
                 }

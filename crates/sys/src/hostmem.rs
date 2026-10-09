@@ -104,6 +104,16 @@ impl HostMemory {
         if p == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
+        // ram_block_add() asks for transparent huge pages on every RAM block. A huge page
+        // takes one fault where small ones take 512, and a page nobody wrote reads from the
+        // huge zero page. A missing page in a range registered with userfaultfd still goes
+        // to the handler first, so postcopy sees the same faults.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // SAFETY: advice on the mapping just made, which nothing else uses yet; it only
+        // changes how the kernel backs the pages, never their contents.
+        unsafe {
+            libc::madvise(p, len, libc::MADV_HUGEPAGE);
+        }
         let ptr = std::ptr::NonNull::new(p.cast::<AtomicU8>()).expect("mmap never returns null");
         Ok(HostMemory { ptr, len, fd })
     }

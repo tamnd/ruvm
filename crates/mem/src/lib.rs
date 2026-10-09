@@ -73,7 +73,7 @@ pub use error::MemError;
 pub use flatview::{EYTZINGER_THRESHOLD, FlatRange, FlatView};
 pub use iommu::{IommuAccessFlags, IommuOps, IommuTlbEntry};
 pub use listener::{ListenerId, MemoryListener};
-pub use ram::RamBlock;
+pub use ram::{RamBlock, buffer_is_zero};
 pub use region::{RegionId, RegionInfo, RegionType};
 pub use system::{
     GLOBAL_DIRTY_DIRTY_RATE, GLOBAL_DIRTY_LIMIT, GLOBAL_DIRTY_MIGRATION, MemoryConfig,
