@@ -1202,6 +1202,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     } else {
         vm.exit_preconfig().map_err(|e| fail(&e))?;
     }
+    crate::display::set_qemu_uuid(cfg.x86.uuid);
     crate::display::init_displays(&vm).map_err(Exit)?;
     crate::vnc::init(&vm).map_err(Exit)?;
     // The main loop starts here, and with it the frontends.

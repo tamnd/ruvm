@@ -37,6 +37,8 @@ ruvm-target-arm.workspace = true
 ui-sdl = ["ruvm-system/ui-sdl"]
 # -display gtk, over the system's GTK 4 library.
 ui-gtk = ["ruvm-system/ui-gtk"]
+# -display dbus, over the zbus crate.
+ui-dbus = ["ruvm-system/ui-dbus"]
 
 [lints]
 workspace = true

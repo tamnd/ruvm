@@ -38,7 +38,7 @@ const CONDITIONS: &[(&str, Rule)] = &[
     ("CONFIG_BRLAPI", Rule::Off),
     ("CONFIG_COCOA", Rule::Off),
     ("CONFIG_CURSES", Rule::Off),
-    ("CONFIG_DBUS_DISPLAY", Rule::Off),
+    ("CONFIG_DBUS_DISPLAY", Rule::Feature("ui-dbus")),
     ("CONFIG_EBPF", Rule::Off),
     ("CONFIG_FDT", Rule::On),
     ("CONFIG_FUSE", Rule::Off),

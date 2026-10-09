@@ -225,6 +225,7 @@ impl DisplayState {
             st.head = head;
             st.hw_ops = Some(hw_ops);
             st.device = dev;
+            st.device_address.clear();
         }
         con.set_surface(Some(DisplaySurface::placeholder(width as usize, height as usize, NOINIT)));
         con
@@ -242,6 +243,7 @@ impl DisplayState {
                     index,
                     head: 0,
                     device: None,
+                    device_address: String::new(),
                     hw_ops: None,
                     surface: None,
                     ui_info: QemuUiInfo::default(),
@@ -486,6 +488,8 @@ struct ConsoleState {
     index: u32,
     head: u32,
     device: Option<ConsoleDevice>,
+    /// What `qemu_console_fill_device_address()` gives for the device, or empty.
+    device_address: String,
     hw_ops: Option<Arc<dyn GraphicHwOps>>,
     surface: Option<DisplaySurface>,
     ui_info: QemuUiInfo,
@@ -536,6 +540,18 @@ impl QemuConsole {
     /// The device behind the console.
     pub fn device(&self) -> Option<ConsoleDevice> {
         lock(&self.inner.state).device.clone()
+    }
+
+    /// `qemu_console_fill_device_address()`: `pci/0000/SS.F` for a PCI display function, with
+    /// the bridges above it in front, or empty for any other device.
+    pub fn device_address(&self) -> String {
+        lock(&self.inner.state).device_address.clone()
+    }
+
+    /// Sets the address [`QemuConsole::device_address`] gives. The board does this once the
+    /// device that took the console is plugged, since the console does not know the bus.
+    pub fn set_device_address(&self, address: String) {
+        lock(&self.inner.state).device_address = address;
     }
 
     /// `qemu_console_is_graphic()`: every console here is.
@@ -749,6 +765,7 @@ impl QemuConsole {
         {
             let mut st = lock(&self.inner.state);
             st.device = None;
+            st.device_address.clear();
             st.hw_ops = None;
         }
         self.set_surface(Some(DisplaySurface::placeholder(w as usize, h as usize, UNPLUGGED)));
