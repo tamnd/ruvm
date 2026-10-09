@@ -4,7 +4,7 @@
 
 use ruvm_qapi::types::{KeyValue, KeyValueU, QKeyCode};
 
-use super::tables::{LINUX_TO_QCODE, LINUX_TO_QNUM, QCODE_TO_LINUX, QNUM_TO_LINUX};
+use super::tables::{LINUX_TO_QCODE, LINUX_TO_QNUM, QCODE_TO_LINUX, QNUM_TO_LINUX, USB_TO_LINUX};
 
 /// `KEY_PAUSE`.
 const KEY_PAUSE: u32 = 119;
@@ -31,6 +31,12 @@ pub fn qcode_to_linux(qcode: QKeyCode) -> u32 {
 pub fn key_number_to_linux(nr: i64) -> u32 {
     // The C code takes the number as unsigned, so a negative one is out of range too.
     usize::try_from(nr).ok().and_then(|i| QNUM_TO_LINUX.get(i)).map_or(0, |&l| u32::from(l))
+}
+
+/// `qemu_input_map_usb_to_linux[]`: the Linux keycode of a USB HID keyboard usage, None past
+/// the end of the table as the length check of `sdl2_process_key()` has it.
+pub fn usb_to_linux(usage: u32) -> Option<u32> {
+    USB_TO_LINUX.get(usage as usize).map(|&l| u32::from(l))
 }
 
 /// `qemu_input_key_number_to_qcode()`.

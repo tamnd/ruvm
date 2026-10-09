@@ -7,7 +7,8 @@
 //! ([`console`]), the VGA font ([`vgafont`]), the QMP `screendump` command ([`screendump`]) and
 //! the VNC server ([`vnc`]). The input layer of `ui/input.c` is in [`input`], with the keyboard
 //! state of `ui/kbd-state.c` in [`kbd_state`] and the keysym layouts of `ui/keymaps.c` in
-//! [`keymaps`]. The other front ends come later. The plan for this crate is in
+//! [`keymaps`]. With the `ui-sdl` feature, `sdl` is the window of `-display sdl` over the
+//! system's SDL2 library. The other front ends come later. The plan for this crate is in
 //! `spec/24-workspace-layout.md`.
 
 pub mod console;
@@ -16,6 +17,8 @@ pub mod kbd_state;
 pub mod keymaps;
 pub mod pixman;
 pub mod screendump;
+#[cfg(feature = "ui-sdl")]
+pub mod sdl;
 pub mod surface;
 pub mod vgafont;
 pub mod vnc;
