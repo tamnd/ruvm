@@ -14,6 +14,8 @@ publish = false
 unsafe-budget = 0
 
 [dependencies]
+alsa = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 ruvm-base.workspace = true
 ruvm-hw-core.workspace = true
 ruvm-qapi.workspace = true
@@ -21,6 +23,8 @@ ruvm-qapi.workspace = true
 [features]
 # The dbus audiodev type, which comes with -display dbus.
 ui-dbus = ["ruvm-qapi/ui-dbus"]
+# The alsa audiodev type, over the system's ALSA library.
+audio-alsa = ["dep:alsa", "dep:libc", "ruvm-qapi/audio-alsa"]
 
 [lints]
 workspace = true

@@ -16,6 +16,8 @@ use ruvm_qapi::types::{
     AudioFormat, Audiodev, AudiodevDriver, AudiodevPerDirectionOptions, AudiodevU,
 };
 
+#[cfg(feature = "audio-alsa")]
+use crate::alsa::AlsaDriver;
 use crate::engine::AudioBackend;
 use crate::none::NoneDriver;
 use crate::pcm::{Driver, Pdo};
@@ -55,29 +57,79 @@ fn driver_for(driver: AudiodevDriver) -> Option<Box<dyn Driver>> {
         // The audio of the D-Bus display is not there, so dbus is not a driver of this build.
         #[cfg(feature = "ui-dbus")]
         AudiodevDriver::Dbus => None,
+        #[cfg(feature = "audio-alsa")]
+        AudiodevDriver::Alsa => Some(Box::new(AlsaDriver)),
     }
 }
 
-/// The `in` and `out` options of an audiodev, whatever its driver.
-fn pdos_mut(
-    u: &mut AudiodevU,
-) -> (&mut Option<AudiodevPerDirectionOptions>, &mut Option<AudiodevPerDirectionOptions>) {
-    match u {
-        AudiodevU::None(o) => (&mut o.in_, &mut o.out),
-        AudiodevU::Wav(o) => (&mut o.in_, &mut o.out),
-        #[cfg(feature = "ui-dbus")]
-        AudiodevU::Dbus(o) => (&mut o.in_, &mut o.out),
+/// The per-direction options of a driver. Some drivers extend `AudiodevPerDirectionOptions`
+/// with members of their own, and qapi-gen flattens the base into those types, so the base
+/// members are copied out and back where QEMU would take a pointer to the base.
+trait PerDirection: Default {
+    fn base(&self) -> AudiodevPerDirectionOptions;
+    fn set_base(&mut self, b: AudiodevPerDirectionOptions);
+}
+
+impl PerDirection for AudiodevPerDirectionOptions {
+    fn base(&self) -> AudiodevPerDirectionOptions {
+        self.clone()
+    }
+
+    fn set_base(&mut self, b: AudiodevPerDirectionOptions) {
+        *self = b;
     }
 }
 
+// Only the drivers a build has use it.
+#[allow(unused_macros)]
+macro_rules! per_direction {
+    ($t:ty) => {
+        impl PerDirection for $t {
+            fn base(&self) -> AudiodevPerDirectionOptions {
+                AudiodevPerDirectionOptions {
+                    mixing_engine: self.mixing_engine,
+                    fixed_settings: self.fixed_settings,
+                    frequency: self.frequency,
+                    channels: self.channels,
+                    voices: self.voices,
+                    format: self.format,
+                    buffer_length: self.buffer_length,
+                }
+            }
+
+            fn set_base(&mut self, b: AudiodevPerDirectionOptions) {
+                self.mixing_engine = b.mixing_engine;
+                self.fixed_settings = b.fixed_settings;
+                self.frequency = b.frequency;
+                self.channels = b.channels;
+                self.voices = b.voices;
+                self.format = b.format;
+                self.buffer_length = b.buffer_length;
+            }
+        }
+    };
+}
+
+#[cfg(feature = "audio-alsa")]
+per_direction!(ruvm_qapi::types::AudiodevAlsaPerDirectionOptions);
+
+/// The base `in` and `out` options of an audiodev, whatever its driver.
 fn pdos(
     u: &AudiodevU,
-) -> (Option<&AudiodevPerDirectionOptions>, Option<&AudiodevPerDirectionOptions>) {
+) -> (Option<AudiodevPerDirectionOptions>, Option<AudiodevPerDirectionOptions>) {
+    fn base<P: PerDirection>(
+        i: &Option<P>,
+        o: &Option<P>,
+    ) -> (Option<AudiodevPerDirectionOptions>, Option<AudiodevPerDirectionOptions>) {
+        (i.as_ref().map(P::base), o.as_ref().map(P::base))
+    }
     match u {
-        AudiodevU::None(o) => (o.in_.as_ref(), o.out.as_ref()),
-        AudiodevU::Wav(o) => (o.in_.as_ref(), o.out.as_ref()),
+        AudiodevU::None(o) => base(&o.in_, &o.out),
+        AudiodevU::Wav(o) => base(&o.in_, &o.out),
         #[cfg(feature = "ui-dbus")]
-        AudiodevU::Dbus(o) => (o.in_.as_ref(), o.out.as_ref()),
+        AudiodevU::Dbus(o) => base(&o.in_, &o.out),
+        #[cfg(feature = "audio-alsa")]
+        AudiodevU::Alsa(o) => base(&o.in_, &o.out),
     }
 }
 
@@ -104,9 +156,23 @@ fn validate_per_direction_opts(pdo: &mut AudiodevPerDirectionOptions) -> Result<
 
 /// `audio_validate_opts()`: fills in every default, the way `query-audiodevs` shows them.
 pub fn validate_opts(dev: &mut Audiodev) -> Result<()> {
-    let (in_, out) = pdos_mut(&mut dev.u);
-    validate_per_direction_opts(in_.get_or_insert_with(Default::default))?;
-    validate_per_direction_opts(out.get_or_insert_with(Default::default))?;
+    fn validate<P: PerDirection>(in_: &mut Option<P>, out: &mut Option<P>) -> Result<()> {
+        for p in [in_, out] {
+            let p = p.get_or_insert_with(Default::default);
+            let mut b = p.base();
+            validate_per_direction_opts(&mut b)?;
+            p.set_base(b);
+        }
+        Ok(())
+    }
+    match &mut dev.u {
+        AudiodevU::None(o) => validate(&mut o.in_, &mut o.out)?,
+        AudiodevU::Wav(o) => validate(&mut o.in_, &mut o.out)?,
+        #[cfg(feature = "ui-dbus")]
+        AudiodevU::Dbus(o) => validate(&mut o.in_, &mut o.out)?,
+        #[cfg(feature = "audio-alsa")]
+        AudiodevU::Alsa(o) => validate(&mut o.in_, &mut o.out)?,
+    }
     dev.timer_period.get_or_insert(10000);
     Ok(())
 }
@@ -148,8 +214,8 @@ fn be_new(dev: Audiodev, clock: Option<&Arc<Clock>>, running: bool) -> Result<Ar
         return Err(Error::generic(format!("Unknown audio driver `{}'", drv.as_str())));
     };
     let (pin, pout) = pdos(&dev.u);
-    let pdo_in = Pdo::from_qapi(&pin.cloned().unwrap_or_default());
-    let pdo_out = Pdo::from_qapi(&pout.cloned().unwrap_or_default());
+    let pdo_in = Pdo::from_qapi(&pin.unwrap_or_default());
+    let pdo_out = Pdo::from_qapi(&pout.unwrap_or_default());
     let be = AudioBackend::new(dev, pdo_in, pdo_out, driver, running);
     if let Some(c) = clock {
         be.attach_clock(c);

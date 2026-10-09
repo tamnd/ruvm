@@ -6,10 +6,13 @@
 //! ([`registry`]), the backend devices open voices on ([`engine`]), the integer mixing engine
 //! and resampler ([`mixeng`]), the layer host drivers plug into ([`pcm`]) and the drivers
 //! themselves. The `none` driver plays nothing and records silence, and the `wav` driver writes
-//! what the guest plays to a file, which is how the sound cards are checked against QEMU.
+//! what the guest plays to a file, which is how the sound cards are checked against QEMU. The
+//! host drivers sit behind cargo features: `audio-alsa` adds `alsa`.
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "audio-alsa")]
+pub mod alsa;
 pub mod engine;
 pub mod mixeng;
 pub mod model;
