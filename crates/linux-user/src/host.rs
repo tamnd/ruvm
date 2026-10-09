@@ -217,6 +217,13 @@ pub(crate) fn random16() -> [u8; 16] {
     b
 }
 
+/// `sysconf(_SC_NPROCESSORS_ONLN)`, the processors `/proc/cpuinfo` lists.
+pub(crate) fn online_cpus() -> u64 {
+    // SAFETY: sysconf has no preconditions.
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    u64::try_from(n).unwrap_or(1).max(1)
+}
+
 /// The end of `dump_core_and_abort()`: no host core dump, then `sig` with its default action.
 pub(crate) fn die_with_signal(sig: i32) -> ! {
     let core = libc::RLIMIT_CORE as u64;

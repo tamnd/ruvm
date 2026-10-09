@@ -58,13 +58,18 @@ pub(crate) fn fake_open(p: &Proc, t: &Task, name: &[u8]) -> Option<i64> {
         .map(|r| r.into_os_string().into_vec())
         .filter(|r| r.starts_with(b"/proc/"));
     let path = real.as_deref().unwrap_or(name);
-    let entry = FAKES.iter().find(|e| is_proc_myself(path, e))?;
-    let data = match *entry {
-        "maps" => maps(p, false),
-        "smaps" => maps(p, true),
-        "stat" => stat(p, t),
-        "auxv" => auxv(p),
-        _ => cmdline(p),
+    let cpuinfo = crate::guest::guest().cpuinfo.filter(|_| path == b"/proc/cpuinfo");
+    let data = if let Some(cpuinfo) = cpuinfo {
+        cpuinfo().into_bytes()
+    } else {
+        let entry = FAKES.iter().find(|e| is_proc_myself(path, e))?;
+        match *entry {
+            "maps" => maps(p, false),
+            "smaps" => maps(p, true),
+            "stat" => stat(p, t),
+            "auxv" => auxv(p),
+            _ => cmdline(p),
+        }
     };
     let fd = sys(libc::SYS_memfd_create, &[c"qemu-open".as_ptr() as u64, 0]);
     if fd < 0 {

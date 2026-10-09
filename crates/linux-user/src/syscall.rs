@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ruvm_jit::cputlb::tlb_flush;
-use ruvm_jit::{Cpu, CpuShared};
+use ruvm_jit::{Cpu, CpuShared, ENV_TARGET_OFFSET, cf};
 use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page, page_align};
 
+use crate::guest::{self, guest};
 use crate::host::{self, sys};
 use crate::procfs::{self, Image};
 use crate::signal::{self, Task, guest_sys, guest_syscall};
@@ -668,6 +669,79 @@ const THREAD_FLAGS: u64 =
 /// `CLONE_IGNORED_FLAGS`.
 const IGNORED_FLAGS: u64 = CLONE_DETACHED | CLONE_IO;
 
+/// The host stack of a guest thread, which only the emulator runs on.
+const THREAD_STACK: usize = 8 << 20;
+
+/// The `CLONE_VM` half of `do_fork()`: a copy of the vCPU, run by a new host thread. `flags`
+/// were checked already.
+fn new_thread(
+    p: &Arc<Proc>,
+    t: &Task,
+    cpu: &mut Cpu<'_>,
+    flags: u64,
+    [newsp, ptid, ctid, tls]: [u64; 4],
+) -> i64 {
+    let g = guest();
+    // Grab a mutex so that thread setup appears atomic.
+    let clone = lock(&CLONE_LOCK);
+    let jit = cpu.jit();
+    // begin_parallel_context(): code for one vCPU does not do for several.
+    if cpu.core.tcg_cflags & cf::PARALLEL == 0 {
+        jit.tb_flush_exclusive_or_serial();
+        cpu.core.tcg_cflags |= cf::PARALLEL;
+    }
+    // cpu_copy() and cpu_clone_regs_child().
+    let mut v = jit.create_vcpu(cpu.ops(), Arc::clone(cpu.core.address_space()), g.env_size);
+    v.core.tcg_cflags = cpu.core.tcg_cflags;
+    v.env[ENV_TARGET_OFFSET..].copy_from_slice(&cpu.env[ENV_TARGET_OFFSET..]);
+    {
+        let mut c = v.cpu();
+        (g.clone_regs)(&mut c, newsp);
+        if flags & CLONE_SETTLS != 0 {
+            (g.set_tls)(&mut c, tls);
+        }
+    }
+    let mask = t.signal_mask;
+    let p = Arc::clone(p);
+    let (tx, rx) = std::sync::mpsc::channel();
+    // It is not safe to deliver signals until the child has finished initializing.
+    let old = host::set_mask(!0);
+    let spawned = std::thread::Builder::new().stack_size(THREAD_STACK).spawn(move || {
+        let mut v = v;
+        let mut cpu = v.cpu();
+        let tid = sys(libc::SYS_gettid, &[]) as u32;
+        let mut task = Task::new(mask, cpu.shared());
+        if flags & CLONE_CHILD_CLEARTID != 0 {
+            task.child_tidptr = ctid;
+        }
+        if flags & CLONE_CHILD_SETTID != 0 {
+            let _ = p.put(ctid, &tid.to_le_bytes());
+        }
+        if flags & CLONE_PARENT_SETTID != 0 {
+            let _ = p.put(ptid, &tid.to_le_bytes());
+        }
+        host::set_mask(task.run_mask());
+        let _ = tx.send(tid);
+        // Wait until the parent has finished.
+        drop(lock(&CLONE_LOCK));
+        (g.cpu_loop)(&p, &mut task, &mut cpu);
+        task.exit_thread();
+    });
+    host::set_mask(old);
+    let r = match spawned {
+        Ok(_) => match rx.recv() {
+            Ok(tid) => {
+                THREADS.fetch_add(1, Ordering::AcqRel);
+                i64::from(tid)
+            }
+            Err(_) => -i64::from(libc::EAGAIN),
+        },
+        Err(e) => -i64::from(e.raw_os_error().unwrap_or(libc::EAGAIN)),
+    };
+    drop(clone);
+    r
+}
+
 /// `do_fork()`: a thread on a new vCPU with `CLONE_VM`, a host fork otherwise.
 fn do_fork(
     p: &Arc<Proc>,
@@ -692,7 +766,7 @@ fn do_fork(
         if flags & THREAD_FLAGS != THREAD_FLAGS || flags & !ok != 0 {
             return -EINVAL;
         }
-        return x86_64::new_thread(p, t, cpu, flags, [newsp, ptid, ctid, tls]);
+        return new_thread(p, t, cpu, flags, [newsp, ptid, ctid, tls]);
     }
     let ok = CSIGNAL
         | CLONE_SETTLS
@@ -728,15 +802,13 @@ fn do_fork(
         return r;
     }
     if r == 0 {
-        if newsp != 0 {
-            x86_64::set_reg(cpu, x86_64::RSP, newsp);
-        }
+        (guest().clone_regs)(cpu, newsp);
         if flags & CLONE_CHILD_SETTID != 0 {
             let tid = sys(libc::SYS_gettid, &[]) as u32;
             let _ = p.put(ctid, &tid.to_le_bytes());
         }
         if flags & CLONE_SETTLS != 0 {
-            x86_64::set_tls(cpu, tls);
+            (guest().set_tls)(cpu, tls);
         }
         if flags & CLONE_CHILD_CLEARTID != 0 {
             t.child_tidptr = ctid;
@@ -794,10 +866,14 @@ fn do_prctl(p: &Proc, a: [u64; 6]) -> i64 {
     p.generic(libc::SYS_prctl, a, s)
 }
 
-/// `uname()`, with `-r`.
+/// `uname()`, with the target's machine and `-r`.
 fn do_uname(p: &Proc, a: [u64; 6]) -> i64 {
     let r = p.generic(libc::SYS_uname, a, &[W(390)]);
     if r == 0 {
+        let mut m = [0u8; 65];
+        let machine = guest().machine.as_bytes();
+        m[..machine.len()].copy_from_slice(machine);
+        let _ = p.put(a[0] + 260, &m);
         if let Some(rel) = &p.uname_release {
             let mut b = [0u8; 65];
             let n = rel.len().min(64);
@@ -845,6 +921,118 @@ fn do_pselect6(p: &Proc, t: &mut Task, a: [u64; 6]) -> i64 {
     })
 }
 
+/// `host_to_target_stat()` into the `asm-generic` `struct stat` from the host's.
+fn stat_to_generic(h: &[u8; 144]) -> [u8; 128] {
+    let mut g = [0u8; 128];
+    // st_dev and st_ino.
+    g[..16].copy_from_slice(&h[..16]);
+    // st_mode, then st_nlink, which the host has as a long after st_ino.
+    g[16..20].copy_from_slice(&h[24..28]);
+    g[20..24].copy_from_slice(&h[16..20]);
+    // st_uid, st_gid, st_rdev.
+    g[24..32].copy_from_slice(&h[28..36]);
+    g[32..40].copy_from_slice(&h[40..48]);
+    // st_size, then st_blksize as an int.
+    g[48..56].copy_from_slice(&h[48..56]);
+    g[56..60].copy_from_slice(&h[56..60]);
+    // st_blocks and the times.
+    g[64..120].copy_from_slice(&h[64..120]);
+    g
+}
+
+/// The size of the target's `struct epoll_event`, which is not packed as the host's is.
+const EPOLL_EVENT_SIZE: u64 = 16;
+
+/// The calls of a target whose structures or flags are not the host's: `struct stat` and
+/// `struct epoll_event` of `asm-generic`, and the `O_` flags. `None` goes on with the host's
+/// call, with the flags in `a` converted.
+fn do_target_abi(p: &Proc, t: &mut Task, n: i64, a: &mut [u64; 6]) -> Option<i64> {
+    let g = guest();
+    let r = match n {
+        libc::SYS_fstat | libc::SYS_newfstatat if g.generic_abi => {
+            let mut st = [0u8; 144];
+            let h = st.as_mut_ptr() as u64;
+            let r = if n == libc::SYS_fstat {
+                p.generic(n, [a[0], h, 0, 0, 0, 0], &[V, V])
+            } else {
+                p.generic(n, [a[0], a[1], h, a[3], 0, 0], &[V, P, V, V])
+            };
+            let at = if n == libc::SYS_fstat { a[1] } else { a[2] };
+            if r == 0 && p.put(at, &stat_to_generic(&st)).is_err() {
+                return Some(-EFAULT);
+            }
+            r
+        }
+        libc::SYS_epoll_ctl if g.generic_abi => {
+            const EPOLL_CTL_DEL: u64 = 2;
+            let mut ev = [0u8; 12];
+            if a[3] != 0 && a[1] != EPOLL_CTL_DEL {
+                let mut b = [0u8; EPOLL_EVENT_SIZE as usize];
+                if !p.space.read(a[3], &mut b) {
+                    return Some(-EFAULT);
+                }
+                ev[..4].copy_from_slice(&b[..4]);
+                ev[4..].copy_from_slice(&b[8..]);
+            }
+            let h = if a[3] != 0 { ev.as_ptr() as u64 } else { 0 };
+            guest_sys(n, &[a[0], a[1], a[2], h])
+        }
+        libc::SYS_epoll_pwait if g.generic_abi => {
+            let max = a[2] as i32;
+            if max <= 0 || max as u64 > i32::MAX as u64 / EPOLL_EVENT_SIZE {
+                return Some(-EINVAL);
+            }
+            let len = max as u64 * EPOLL_EVENT_SIZE;
+            if p.buf(a[1], len, page::WRITE).is_err() {
+                return Some(-EFAULT);
+            }
+            let mut ev = vec![0u8; max as usize * 12];
+            let space = Arc::clone(&p.space);
+            let r = signal::with_sigmask(&space, t, a[4], a[5], |m| {
+                guest_syscall(n, [a[0], ev.as_mut_ptr() as u64, a[2], a[3], m, 8])
+            });
+            if r > 0 {
+                let mut out = vec![0u8; r as usize * EPOLL_EVENT_SIZE as usize];
+                for (i, e) in ev.chunks_exact(12).take(r as usize).enumerate() {
+                    out[16 * i..16 * i + 4].copy_from_slice(&e[..4]);
+                    out[16 * i + 8..16 * i + 16].copy_from_slice(&e[4..]);
+                }
+                if p.put(a[1], &out).is_err() {
+                    return Some(-EFAULT);
+                }
+            }
+            r
+        }
+        libc::SYS_openat => {
+            a[2] = guest::open_flags_to_host(a[2]);
+            return None;
+        }
+        libc::SYS_pipe2 => {
+            a[1] = guest::open_flags_to_host(a[1]);
+            return None;
+        }
+        libc::SYS_fcntl => {
+            const F_GETFL: u64 = 3;
+            const F_SETFL: u64 = 4;
+            match a[1] & 0xffff_ffff {
+                F_SETFL => a[2] = guest::open_flags_to_host(a[2]),
+                F_GETFL => {
+                    let r = do_fcntl(p, *a);
+                    return Some(if r < 0 {
+                        r
+                    } else {
+                        guest::open_flags_to_target(r as u64) as i64
+                    });
+                }
+                _ => {}
+            }
+            return None;
+        }
+        _ => return None,
+    };
+    Some(r)
+}
+
 /// `do_syscall()`.
 pub(crate) fn do_syscall(
     p: &Arc<Proc>,
@@ -854,8 +1042,12 @@ pub(crate) fn do_syscall(
     a: [u64; 6],
 ) -> i64 {
     let n = n as i64;
-    let sp = x86_64::reg(cpu, x86_64::RSP);
+    let sp = (guest().sp)(cpu);
     if let Some(r) = signal::do_signal_syscall(&p.space, t, sp, n, a) {
+        return r;
+    }
+    let mut a = a;
+    if let Some(r) = do_target_abi(p, t, n, &mut a) {
         return r;
     }
     match n {
@@ -943,7 +1135,7 @@ pub(crate) fn do_syscall(
                 return signal::ERESTARTSYS;
             }
             let space = Arc::clone(&p.space);
-            x86_64::do_rt_sigreturn(&space, t, cpu)
+            (guest().rt_sigreturn)(&space, t, cpu)
         }
         libc::SYS_execve => do_execve(p, None, a),
         libc::SYS_execveat => do_execve(p, Some(a[0]), a),

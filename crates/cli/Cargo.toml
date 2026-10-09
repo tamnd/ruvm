@@ -39,8 +39,6 @@ ui-sdl = ["ruvm-system/ui-sdl"]
 ui-gtk = ["ruvm-system/ui-gtk"]
 # -display dbus, over the zbus crate.
 ui-dbus = ["ruvm-system/ui-dbus"]
-# -audiodev alsa, over the system's ALSA library.
-audio-alsa = ["ruvm-system/audio-alsa"]
 # -display cocoa on macOS, over the system's AppKit.
 ui-cocoa = ["ruvm-system/ui-cocoa"]
 

@@ -1091,6 +1091,9 @@ pub struct ArmFeatures {
     pub pmu_counters: u8,
     /// The IMPLEMENTATION DEFINED registers of the model.
     pub impdef: ImpdefRegs,
+    /// `CONFIG_USER_ONLY`: the CPU runs one program at EL0 under the user mode emulator,
+    /// which is its kernel. See [`crate::tcg::user`].
+    pub user_only: bool,
 }
 
 /// Which IMPLEMENTATION DEFINED system registers a model has, the `define_*_cp_reginfo()`

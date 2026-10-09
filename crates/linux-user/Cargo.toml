@@ -18,6 +18,7 @@ libc.workspace = true
 ruvm-jit.workspace = true
 ruvm-jit-core.workspace = true
 ruvm-mem.workspace = true
+ruvm-target-arm.workspace = true
 ruvm-target-x86.workspace = true
 ruvm-user-common.workspace = true
 
