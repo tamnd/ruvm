@@ -25,7 +25,9 @@
 //! The local displays are GTK, with the `ui-gtk` feature, and SDL, with `ui-sdl`. Without either
 //! the default is `none`, where QEMU would also open VNC on localhost:0. With `ui-dbus` there is
 //! also `-display dbus`, which gets `-name`, `-uuid` and the PCI address of each display function
-//! from here.
+//! from here. With `ui-cocoa` on macOS there is `-display cocoa`, the default when neither GTK
+//! nor SDL is built in, which leaves [`take_ui_main`] behind for vl.rs to hand the main thread
+//! to.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -146,6 +148,9 @@ pub(crate) fn display_help() -> String {
     if cfg!(feature = "ui-sdl") {
         types.push_str("sdl\n");
     }
+    if cfg!(all(feature = "ui-cocoa", target_os = "macos")) {
+        types.push_str("cocoa\n");
+    }
     if cfg!(all(feature = "ui-dbus", unix)) {
         types.push_str("dbus\n");
     }
@@ -170,8 +175,9 @@ pub(crate) fn set_full_screen() {
 }
 
 /// `qemu_setup_display()` with the display checks of `qemu_create_early_backends()`, then
-/// `qemu_display_init()`. The error is the exit status.
-pub(crate) fn init_displays(vm: &Vm) -> std::result::Result<(), u8> {
+/// `qemu_display_init()`. `version` is what `-version` prints, for the About panel of Cocoa.
+/// The error is the exit status.
+pub(crate) fn init_displays(vm: &Vm, version: &str) -> std::result::Result<(), u8> {
     let opts = {
         let mut guard = dpy();
         let d = guard.get_or_insert_default();
@@ -194,7 +200,7 @@ pub(crate) fn init_displays(vm: &Vm) -> std::result::Result<(), u8> {
         error_report("OpenGL support was not enabled in this build of QEMU");
         return Err(1);
     }
-    open_display(vm, &opts)
+    open_display(vm, &opts, version)
 }
 
 /// `qemu_display_find_default()`: the first of GTK, SDL and Cocoa that is built in.
@@ -203,7 +209,17 @@ fn default_display() -> DisplayOptionsU {
     return DisplayOptionsU::Gtk(Default::default());
     #[cfg(all(feature = "ui-sdl", not(feature = "ui-gtk")))]
     return DisplayOptionsU::Sdl(Default::default());
-    #[cfg(not(any(feature = "ui-gtk", feature = "ui-sdl")))]
+    #[cfg(all(
+        feature = "ui-cocoa",
+        target_os = "macos",
+        not(any(feature = "ui-gtk", feature = "ui-sdl"))
+    ))]
+    return DisplayOptionsU::Cocoa(Default::default());
+    #[cfg(not(any(
+        feature = "ui-gtk",
+        feature = "ui-sdl",
+        all(feature = "ui-cocoa", target_os = "macos")
+    )))]
     DisplayOptionsU::Default
 }
 
@@ -227,6 +243,11 @@ fn is_sdl(_opts: &DisplayOptions) -> bool {
     false
 }
 
+#[cfg(all(feature = "ui-cocoa", target_os = "macos"))]
+fn is_cocoa(opts: &DisplayOptions) -> bool {
+    matches!(opts.u, DisplayOptionsU::Cocoa(_))
+}
+
 #[cfg(all(feature = "ui-dbus", unix))]
 fn is_dbus(opts: &DisplayOptions) -> bool {
     matches!(opts.u, DisplayOptionsU::Dbus(_))
@@ -245,11 +266,25 @@ pub(crate) fn set_qemu_uuid(uuid: Option<[u8; 16]>) {
     *QEMU_UUID.lock().unwrap_or_else(PoisonError::into_inner) = uuid;
 }
 
+/// What the main thread runs instead of the machine's main loop, which then moves to another
+/// thread: `qemu_main` of QEMU, which Cocoa sets.
+static UI_MAIN: Mutex<Option<fn() -> !>> = Mutex::new(None);
+
+/// The function the main thread hands itself to once the machine is up, if a display wants it.
+pub(crate) fn take_ui_main() -> Option<fn() -> !> {
+    UI_MAIN.lock().unwrap_or_else(PoisonError::into_inner).take()
+}
+
 #[cfg_attr(
-    not(any(feature = "ui-gtk", feature = "ui-sdl", all(feature = "ui-dbus", unix))),
+    not(any(
+        feature = "ui-gtk",
+        feature = "ui-sdl",
+        all(feature = "ui-cocoa", target_os = "macos"),
+        all(feature = "ui-dbus", unix)
+    )),
     allow(unused_variables)
 )]
-fn open_display(vm: &Vm, opts: &DisplayOptions) -> std::result::Result<(), u8> {
+fn open_display(vm: &Vm, opts: &DisplayOptions, version: &str) -> std::result::Result<(), u8> {
     #[cfg(feature = "ui-gtk")]
     if is_gtk(opts) {
         let hooks = Arc::new(GtkHooks(Arc::downgrade(&vm.runstate)));
@@ -272,6 +307,20 @@ fn open_display(vm: &Vm, opts: &DisplayOptions) -> std::result::Result<(), u8> {
             hooks,
         );
     }
+    #[cfg(all(feature = "ui-cocoa", target_os = "macos"))]
+    if is_cocoa(opts) {
+        let hooks = Arc::new(CocoaHooks(Arc::downgrade(&vm.runstate)));
+        ruvm_ui::cocoa::init(
+            DisplayState::global(),
+            InputState::global(),
+            opts,
+            vm.name.as_deref(),
+            version,
+            hooks,
+        )?;
+        *UI_MAIN.lock().unwrap_or_else(PoisonError::into_inner) = Some(ruvm_ui::cocoa::run);
+        return Ok(());
+    }
     #[cfg(all(feature = "ui-dbus", unix))]
     if is_dbus(opts) {
         let (a, b, c) = ruvm_monitor::control::QEMU_VERSION;
@@ -285,15 +334,18 @@ fn open_display(vm: &Vm, opts: &DisplayOptions) -> std::result::Result<(), u8> {
 /// A system reset request, `qemu_system_reset_request()`.
 type ResetRequest = Arc<dyn Fn() + Send + Sync>;
 
-/// The reset the `Machine` menu of the GTK window asks for, which the machine sets.
+/// The reset the `Machine` menu of the GTK and Cocoa windows asks for, which the machine sets.
 static RESET: Mutex<Option<ResetRequest>> = Mutex::new(None);
 
-/// Sets what the GTK window's `Reset` item does.
+/// Sets what the `Reset` item of the GTK and Cocoa windows does.
 pub(crate) fn set_reset_request(f: ResetRequest) {
     *RESET.lock().unwrap_or_else(PoisonError::into_inner) = Some(f);
 }
 
-#[cfg_attr(not(feature = "ui-gtk"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "ui-gtk", all(feature = "ui-cocoa", target_os = "macos"))),
+    allow(dead_code)
+)]
 fn reset_request() -> Option<ResetRequest> {
     RESET.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
@@ -354,6 +406,49 @@ impl ruvm_ui::sdl::Hooks for SdlHooks {
     }
 
     fn close(&self) {
+        if let Some(r) = self.0.upgrade() {
+            r.shutdown_request(ruvm_qapi::types::ShutdownCause::HostUi);
+        }
+    }
+}
+
+/// What the Cocoa window needs from the machine.
+#[cfg(all(feature = "ui-cocoa", target_os = "macos"))]
+struct CocoaHooks(Weak<crate::runstate::Runstate>);
+
+#[cfg(all(feature = "ui-cocoa", target_os = "macos"))]
+impl ruvm_ui::cocoa::Hooks for CocoaHooks {
+    fn stop(&self) {
+        if let Some(r) = self.0.upgrade() {
+            let _ = r.qmp_stop();
+        }
+    }
+
+    fn cont(&self) {
+        if let Some(r) = self.0.upgrade() {
+            let _ = r.qmp_cont();
+        }
+    }
+
+    fn can_reset(&self) -> bool {
+        reset_request().is_some()
+    }
+
+    fn reset(&self) {
+        if let Some(f) = reset_request() {
+            f();
+        }
+    }
+
+    fn can_powerdown(&self) -> bool {
+        false
+    }
+
+    fn powerdown(&self) {}
+
+    /// There is no `-no-shutdown` or `-action shutdown=pause`, so the shutdown action is
+    /// `poweroff` already.
+    fn quit(&self) {
         if let Some(r) = self.0.upgrade() {
             r.shutdown_request(ruvm_qapi::types::ShutdownCause::HostUi);
         }

@@ -374,14 +374,35 @@ fn resolve(
     Ok(out)
 }
 
+/// `qemu_socket()`: a stream socket that is closed on exec.
+#[cfg(unix)]
+fn stream_socket(family: rustix::net::AddressFamily) -> io::Result<rustix::fd::OwnedFd> {
+    use rustix::net::SocketType;
+    #[cfg(not(target_vendor = "apple"))]
+    let fd = rustix::net::socket_with(
+        family,
+        SocketType::STREAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )?;
+    // There is no SOCK_CLOEXEC on macOS, so the flag goes on afterwards, as QEMU does there.
+    #[cfg(target_vendor = "apple")]
+    let fd = {
+        let fd = rustix::net::socket(family, SocketType::STREAM, None)?;
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+        fd
+    };
+    Ok(fd)
+}
+
 #[cfg(unix)]
 fn socket_for(addr: &SocketAddr) -> io::Result<rustix::fd::OwnedFd> {
-    use rustix::net::{AddressFamily, SocketFlags, SocketType};
+    use rustix::net::AddressFamily;
     let family = match addr {
         SocketAddr::V4(_) => AddressFamily::INET,
         SocketAddr::V6(_) => AddressFamily::INET6,
     };
-    let fd = rustix::net::socket_with(family, SocketType::STREAM, SocketFlags::CLOEXEC, None)?;
+    let fd = stream_socket(family)?;
     rustix::net::sockopt::set_socket_reuseaddr(&fd, true)?;
     Ok(fd)
 }
@@ -501,15 +522,8 @@ fn listen_unix(path: &str) -> Result<Listener> {
             )));
         }
     }
-    let fd = rustix::net::socket_with(
-        rustix::net::AddressFamily::UNIX,
-        rustix::net::SocketType::STREAM,
-        rustix::net::SocketFlags::CLOEXEC,
-        None,
-    )
-    .map_err(|e| {
-        Error::generic(format!("Failed to create Unix socket: {}", strerror(&e.into())))
-    })?;
+    let fd = stream_socket(rustix::net::AddressFamily::UNIX)
+        .map_err(|e| Error::generic(format!("Failed to create Unix socket: {}", strerror(&e))))?;
     let addr = rustix::net::SocketAddrUnix::new(path).map_err(|e| {
         Error::generic(format!("Failed to bind socket to {path}: {}", strerror(&e.into())))
     })?;

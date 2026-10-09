@@ -20,6 +20,9 @@ pub enum Rule {
     Off,
     /// Set when the crate whose build script asks has this cargo feature.
     Feature(&'static str),
+    /// Set when the crate whose build script asks has this cargo feature and builds for one of
+    /// these `target_os` values.
+    FeatureOs(&'static str, &'static [&'static str]),
 }
 
 const CONDITIONS: &[(&str, Rule)] = &[
@@ -36,7 +39,7 @@ const CONDITIONS: &[(&str, Rule)] = &[
     ("CONFIG_BLKIO", Rule::Off),
     ("CONFIG_BLKIO_VHOST_VDPA_FD", Rule::Off),
     ("CONFIG_BRLAPI", Rule::Off),
-    ("CONFIG_COCOA", Rule::Off),
+    ("CONFIG_COCOA", Rule::FeatureOs("ui-cocoa", &["macos"])),
     ("CONFIG_CURSES", Rule::Off),
     ("CONFIG_DBUS_DISPLAY", Rule::Feature("ui-dbus")),
     ("CONFIG_EBPF", Rule::Off),
@@ -133,6 +136,9 @@ impl Config {
             Some(Rule::Unix) => self.unix,
             Some(Rule::Os(list)) => list.contains(&self.os.as_str()),
             Some(Rule::Feature(f)) => self.features.iter().any(|x| x == f),
+            Some(Rule::FeatureOs(f, list)) => {
+                self.features.iter().any(|x| x == f) && list.contains(&self.os.as_str())
+            }
             Some(Rule::Off) | None => false,
         }
     }

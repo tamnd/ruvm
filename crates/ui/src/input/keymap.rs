@@ -4,7 +4,9 @@
 
 use ruvm_qapi::types::{KeyValue, KeyValueU, QKeyCode};
 
-use super::tables::{LINUX_TO_QCODE, LINUX_TO_QNUM, QCODE_TO_LINUX, QNUM_TO_LINUX, USB_TO_LINUX};
+use super::tables::{
+    LINUX_TO_QCODE, LINUX_TO_QNUM, OSX_TO_LINUX, QCODE_TO_LINUX, QNUM_TO_LINUX, USB_TO_LINUX,
+};
 
 /// `KEY_PAUSE`.
 const KEY_PAUSE: u32 = 119;
@@ -37,6 +39,12 @@ pub fn key_number_to_linux(nr: i64) -> u32 {
 /// the end of the table as the length check of `sdl2_process_key()` has it.
 pub fn usb_to_linux(usage: u32) -> Option<u32> {
     USB_TO_LINUX.get(usage as usize).map(|&l| u32::from(l))
+}
+
+/// `qemu_input_map_osx_to_linux[]`: the Linux keycode of a macOS virtual keycode, None past the
+/// end of the table as the length check of `cocoa_keycode_to_linux()` has it.
+pub fn osx_to_linux(keycode: u32) -> Option<u32> {
+    OSX_TO_LINUX.get(keycode as usize).map(|&l| u32::from(l))
 }
 
 /// `qemu_input_key_number_to_qcode()`.

@@ -351,6 +351,21 @@ fn run(p: &Personality<'_>, args: &[String]) -> Flow<u8> {
     let mut cfg = Config::new();
     parse_options(p, &registry, args, &mut cfg)?;
     let vm = start(p, Backends { registry, qmp, chardevs, regions }, cfg)?;
+    if let Some(ui_main) = crate::display::take_ui_main() {
+        // qemu_main of a display that needs the main thread, which is Cocoa: the main loop
+        // moves to a thread of that name and the display never gives the main thread back.
+        let spawned = std::thread::Builder::new().name("qemu_main".into()).spawn(move || {
+            let status = main_loop(&vm.0, &vm.1);
+            drop(vm.1);
+            ruvm_chardev::stdio::term_exit();
+            std::process::exit(i32::from(status));
+        });
+        if let Err(e) = spawned {
+            error_report(&format!("failed to create qemu_main thread: {e}"));
+            return Err(Exit(1));
+        }
+        ui_main();
+    }
     let status = main_loop(&vm.0, &vm.1);
     drop(vm.1);
     Ok(status)
@@ -1203,7 +1218,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         vm.exit_preconfig().map_err(|e| fail(&e))?;
     }
     crate::display::set_qemu_uuid(cfg.x86.uuid);
-    crate::display::init_displays(&vm).map_err(Exit)?;
+    crate::display::init_displays(&vm, p.version_text).map_err(Exit)?;
     crate::vnc::init(&vm).map_err(Exit)?;
     // The main loop starts here, and with it the frontends.
     chardevs.release();
