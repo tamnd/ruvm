@@ -19,6 +19,7 @@ ruvm-jit-core.workspace = true
 ruvm-jit-interp.workspace = true
 ruvm-mem.workspace = true
 ruvm-softfloat.workspace = true
+ruvm-sys.workspace = true
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 ruvm-accel-kvm.workspace = true

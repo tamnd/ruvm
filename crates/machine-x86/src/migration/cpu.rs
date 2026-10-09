@@ -624,19 +624,14 @@ pub(crate) fn get_cpu(shared: &CpuShared, side: &SideStore) -> Result<CpuMig> {
     })
 }
 
-/// Loads `c` into the vCPU behind `shared` and keeps it in the side store. `tsc_adjust` goes on
-/// top of the incoming `tsc_offset`: what the source's `cpu_get_ticks()` was ahead of ours, so
-/// the guest's TSC carries on from where it stopped.
-pub(crate) fn put_cpu(
-    shared: &CpuShared,
-    side: &SideStore,
-    c: CpuMig,
-    tsc_adjust: i64,
-) -> Result<()> {
+/// Loads `c` into the vCPU behind `shared` and keeps it in the side store. The `tsc_offset`
+/// goes in as it came: the `timer` section set `cpu_get_ticks()` to the source's, so the
+/// guest's TSC carries on from where it stopped.
+pub(crate) fn put_cpu(shared: &CpuShared, side: &SideStore, c: CpuMig) -> Result<()> {
     let side = Arc::clone(side);
     on_cpu(shared, move |cpu| {
         env::load_state(cpu.env, &c.s);
-        env::st64(cpu.env, env::TSC_OFFSET, c.tsc_offset.wrapping_add(tsc_adjust as u64));
+        env::st64(cpu.env, env::TSC_OFFSET, c.tsc_offset);
         *side.lock().unwrap_or_else(PoisonError::into_inner) = Some(c);
         tlb_flush(cpu);
     })

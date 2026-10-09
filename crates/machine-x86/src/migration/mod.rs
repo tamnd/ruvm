@@ -121,16 +121,14 @@ pub fn x86_savevm(
 }
 
 /// The sections every board starts with, from migration_object_init() and the timers: the
-/// `timer` section, RAM and the dirty bitmaps. Gives the TSC ticks for the vCPUs and the RAM
-/// counters.
+/// `timer` section, RAM and the dirty bitmaps. Gives the RAM counters.
 fn register_common(
     savevm: &mut SaveVm,
     machine: &TcgMachine,
     mem: &Arc<MemorySystem>,
     blocks: Vec<Arc<RamBlock>>,
-) -> (Arc<timer::Ticks>, Arc<RamStats>) {
-    let ticks = timer::Ticks::new(machine.tsc_base());
-    timer::register(savevm, machine.virtual_clock(), &ticks);
+) -> Arc<RamStats> {
+    timer::register(savevm, machine.virtual_clock(), machine.ticks());
     let ram = RamSection::new(
         blocks,
         TcgHooks { vcpus: Arc::downgrade(machine.vcpus()), mem: Arc::downgrade(mem) },
@@ -139,11 +137,11 @@ fn register_common(
     savevm.register_live(EntryInfo::new("ram", 4).instance(0), ram);
     // "dirty-bitmap": ruvm has no block dirty bitmaps to migrate.
     savevm.reserve_section_id();
-    (ticks, ram_stats)
+    ram_stats
 }
 
 /// Each vCPU with its APIC; the first APIC brings kvmvapic along.
-fn register_cpus(savevm: &mut SaveVm, machine: &TcgMachine, ticks: &Arc<timer::Ticks>) {
+fn register_cpus(savevm: &mut SaveVm, machine: &TcgMachine) {
     for (n, shared) in machine.vcpus().cpus().iter().enumerate() {
         let index = shared.cpu_index as u32;
         let (get, put) = (Arc::clone(shared), Arc::clone(shared));
@@ -157,13 +155,12 @@ fn register_cpus(savevm: &mut SaveVm, machine: &TcgMachine, ticks: &Arc<timer::T
         let side = cpu::SideStore::default();
         let (get, put) = (Arc::clone(shared), Arc::clone(shared));
         let get_side = Arc::clone(&side);
-        let put_ticks = Arc::clone(ticks);
         savevm.register_vmsd(
             "",
             Some(index),
             &cpu::VMSTATE_X86_CPU,
             move || cpu::get_cpu(&get, &get_side),
-            move |c| cpu::put_cpu(&put, &side, c, put_ticks.tsc_adjust()),
+            move |c| cpu::put_cpu(&put, &side, c),
         );
         if n == 0 {
             skip::register_vapic(savevm);
@@ -182,9 +179,9 @@ fn register_q35(
     q35: &Q35,
     devs: &[VirtioPci],
 ) -> Arc<RamStats> {
-    let (ticks, ram_stats) =
+    let ram_stats =
         register_common(savevm, machine, q35.memory_system(), q35.migratable_ram_blocks());
-    register_cpus(savevm, machine, &ticks);
+    register_cpus(savevm, machine);
 
     // pc_q35_init(): fw_cfg, the host bridge and its bus, then the ISA bridge and the devices
     // on it in the order pc_basic_device_init() and pc_q35_init() create them.
@@ -245,10 +242,9 @@ fn register_q35(
 /// PIT, the RTC and the serial port. The virtio-mmio transports have no section of their own;
 /// the devices plugged into them come last, as -device creates them after the board.
 fn register_microvm(savevm: &mut SaveVm, machine: &TcgMachine, m: &Microvm) -> Arc<RamStats> {
-    let (ticks, ram_stats) =
-        register_common(savevm, machine, m.memory_system(), m.migratable_ram_blocks());
+    let ram_stats = register_common(savevm, machine, m.memory_system(), m.migratable_ram_blocks());
     fw_cfg::register(savevm, m.fw_cfg());
-    register_cpus(savevm, machine, &ticks);
+    register_cpus(savevm, machine);
     ioapic::register(savevm, 0, m.ioapic());
     if let Some(io2) = m.ioapic2() {
         ioapic::register(savevm, 1, io2);

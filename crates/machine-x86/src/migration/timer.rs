@@ -4,18 +4,18 @@
 //!
 //! It goes out while the machine is stopped, when `cpu_ticks_offset` holds `cpu_get_ticks()`
 //! and `cpu_clock_offset` holds `QEMU_CLOCK_VIRTUAL`. Loading it sets the virtual clock, so the
-//! timer deadlines in the device sections that follow keep their distance from now, and keeps
-//! the ticks for the vCPUs: a vCPU's TSC is `cpu_get_ticks()` plus its `tsc_offset`, and the
-//! destination's ticks count from somewhere else.
+//! timer deadlines in the device sections that follow keep their distance from now, and sets
+//! `cpu_get_ticks()`: a vCPU's TSC is that plus its `tsc_offset`, so the guest's TSC goes on
+//! from where it stopped on the source once the destination starts.
 //!
 //! The icount subsections are parsed and dropped: ruvm does not run with icount.
 
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::time::Instant;
+use std::sync::{Arc, LazyLock};
 
 use ruvm_base::Result;
 use ruvm_hw_core::Clock;
 use ruvm_migration::SaveVm;
+use ruvm_sys::hostticks::Ticks;
 use ruvm_vmstate::{VmStateDescription, VmStateField};
 
 /// The part of `TimersState` that goes on the wire.
@@ -64,37 +64,9 @@ pub(crate) static VMSTATE_TIMERS: LazyLock<Vmsd> = LazyLock::new(|| {
         .subsection(&ICOUNT)
 });
 
-/// `cpu_get_ticks()` of a TCG machine and what an incoming stream said it was.
-#[derive(Debug)]
-pub(crate) struct Ticks {
-    base: Instant,
-    incoming: Mutex<Option<i64>>,
-}
-
-impl Ticks {
-    pub(crate) fn new(base: Instant) -> Arc<Self> {
-        Arc::new(Ticks { base, incoming: Mutex::new(None) })
-    }
-
-    /// `cpu_get_ticks()`: nanoseconds since the base, as the vCPUs' `rdtsc` counts.
-    pub(crate) fn now(&self) -> i64 {
-        self.base.elapsed().as_nanos() as i64
-    }
-
-    /// What to add to the `tsc_offset` an incoming vCPU section carries, so its TSC carries on
-    /// from the source's: the source's ticks minus ours. 0 when no `timer` section came in.
-    pub(crate) fn tsc_adjust(&self) -> i64 {
-        let incoming = *self.incoming.lock().unwrap_or_else(PoisonError::into_inner);
-        incoming.map_or(0, |t| t.wrapping_sub(self.now()))
-    }
-
-    fn set_incoming(&self, ticks: i64) {
-        *self.incoming.lock().unwrap_or_else(PoisonError::into_inner) = Some(ticks);
-    }
-}
-
-/// Registers the `timer` section over `clock`, `QEMU_CLOCK_VIRTUAL`, and `ticks`. QEMU
-/// registers it first, so it gets section id 0.
+/// Registers the `timer` section over `clock`, `QEMU_CLOCK_VIRTUAL`, and `ticks`,
+/// `cpu_get_ticks()`. QEMU registers it first, so it gets section id 0. Both are stopped while
+/// the section is saved or loaded, so the guest's TSC goes on from the count it carries.
 pub(crate) fn register(savevm: &mut SaveVm, clock: &Arc<Clock>, ticks: &Arc<Ticks>) {
     let (get_clock, put_clock) = (Arc::clone(clock), Arc::clone(clock));
     let (get_ticks, put_ticks) = (Arc::clone(ticks), Arc::clone(ticks));
@@ -104,13 +76,13 @@ pub(crate) fn register(savevm: &mut SaveVm, clock: &Arc<Clock>, ticks: &Arc<Tick
         &VMSTATE_TIMERS,
         move || -> Result<TimersState> {
             Ok(TimersState {
-                cpu_ticks_offset: get_ticks.now(),
+                cpu_ticks_offset: get_ticks.get() as i64,
                 cpu_clock_offset: get_clock.get_ns(),
             })
         },
         move |s| {
             put_clock.set_ns(s.cpu_clock_offset);
-            put_ticks.set_incoming(s.cpu_ticks_offset);
+            put_ticks.set(s.cpu_ticks_offset as u64);
             Ok(())
         },
     );
@@ -122,6 +94,7 @@ mod tests {
     use ruvm_base::ClockType;
     use ruvm_hw_core::timer::TimeSource;
     use ruvm_vmstate::{StreamReader, StreamWriter};
+    use std::time::Instant;
 
     #[test]
     fn timer_section_layout() {
@@ -143,8 +116,7 @@ mod tests {
     fn loading_sets_the_clock_and_the_ticks() {
         let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
         clock.stop();
-        let ticks = Ticks::new(Instant::now());
-        assert_eq!(ticks.tsc_adjust(), 0);
+        let ticks = Ticks::new();
         let mut s = TimersState { cpu_ticks_offset: 1 << 40, cpu_clock_offset: 1 << 41 };
         let mut f = StreamWriter::new();
         VMSTATE_TIMERS.save(&mut f, &mut s).unwrap();
@@ -153,9 +125,12 @@ mod tests {
         let mut back = TimersState::default();
         VMSTATE_TIMERS.load(&mut StreamReader::new(&bytes), &mut back, 2).unwrap();
         clock.set_ns(back.cpu_clock_offset);
-        ticks.set_incoming(back.cpu_ticks_offset);
+        ticks.set(back.cpu_ticks_offset as u64);
         assert_eq!(clock.get_ns(), 1 << 41);
-        let adjust = ticks.tsc_adjust();
-        assert!(adjust <= 1 << 40 && adjust > (1 << 40) - 1_000_000_000);
+        // The count stays put until the machine starts, and then goes on from there.
+        assert_eq!(ticks.get(), 1 << 40);
+        ticks.enable();
+        let now = ticks.get();
+        assert!(((1 << 40)..(1 << 40) + (1 << 36)).contains(&now), "{now}");
     }
 }
