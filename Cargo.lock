@@ -594,6 +594,14 @@ dependencies = [
 [[package]]
 name = "ruvm-hw-audio"
 version = "0.5.1"
+dependencies = [
+ "ruvm-audio",
+ "ruvm-base",
+ "ruvm-hw-core",
+ "ruvm-hw-pci",
+ "ruvm-mem",
+ "ruvm-qapi",
+]
 
 [[package]]
 name = "ruvm-hw-char"
@@ -1089,6 +1097,7 @@ dependencies = [
  "ruvm-chardev",
  "ruvm-firmware",
  "ruvm-hostmem",
+ "ruvm-hw-audio",
  "ruvm-hw-char",
  "ruvm-hw-core",
  "ruvm-hw-display",

@@ -345,6 +345,7 @@ fn run(p: &Personality<'_>, args: &[String]) -> Flow<u8> {
     qtest::register_types(&registry);
     ruvm_chardev::qom::register_types(&registry);
     register_accel_types(&registry, p.target);
+    crate::audio::register_models(p.target);
     chardevs.set_registry(&registry);
     chardevs.hold();
     let mut cfg = Config::new();
