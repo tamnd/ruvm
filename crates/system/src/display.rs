@@ -23,7 +23,9 @@
 //! The local displays are here too: `-display`, `-nographic` and `-full-screen` as `dpy` of
 //! QEMU's system/vl.c, the default display, `query-display-options` and opening the display.
 //! The local displays are GTK, with the `ui-gtk` feature, and SDL, with `ui-sdl`. Without either
-//! the default is `none`, where QEMU would also open VNC on localhost:0.
+//! the default is `none`, where QEMU would also open VNC on localhost:0. With `ui-dbus` there is
+//! also `-display dbus`, which gets `-name`, `-uuid` and the PCI address of each display function
+//! from here.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -144,6 +146,9 @@ pub(crate) fn display_help() -> String {
     if cfg!(feature = "ui-sdl") {
         types.push_str("sdl\n");
     }
+    if cfg!(all(feature = "ui-dbus", unix)) {
+        types.push_str("dbus\n");
+    }
     format!(
         "Available display backend types:\n{types}\nSome display backends support suboptions, which can be set with\n   -display backend,option=value,option=value...\nFor a short list of the suboptions for each display, see the top-level -help output; more detail is in the documentation.\n"
     )
@@ -182,6 +187,10 @@ pub(crate) fn init_displays(vm: &Vm) -> std::result::Result<(), u8> {
         error_report("window-close is only valid for GTK and SDL, ignoring option");
     }
     if opts.gl.is_some_and(|gl| gl != DisplayGLMode::Off) {
+        // early_dbus_init() only warns, and the check below fails.
+        if is_dbus(&opts) {
+            error_report("dbus: GL rendering is not supported");
+        }
         error_report("OpenGL support was not enabled in this build of QEMU");
         return Err(1);
     }
@@ -218,7 +227,28 @@ fn is_sdl(_opts: &DisplayOptions) -> bool {
     false
 }
 
-#[cfg_attr(not(any(feature = "ui-gtk", feature = "ui-sdl")), allow(unused_variables))]
+#[cfg(all(feature = "ui-dbus", unix))]
+fn is_dbus(opts: &DisplayOptions) -> bool {
+    matches!(opts.u, DisplayOptionsU::Dbus(_))
+}
+
+#[cfg(not(all(feature = "ui-dbus", unix)))]
+fn is_dbus(_opts: &DisplayOptions) -> bool {
+    false
+}
+
+/// `qemu_uuid`, which `-display dbus` shows.
+static QEMU_UUID: Mutex<Option<[u8; 16]>> = Mutex::new(None);
+
+/// Sets the `qemu_uuid` the displays see, from `-uuid` or `-smbios type=1,uuid=`.
+pub(crate) fn set_qemu_uuid(uuid: Option<[u8; 16]>) {
+    *QEMU_UUID.lock().unwrap_or_else(PoisonError::into_inner) = uuid;
+}
+
+#[cfg_attr(
+    not(any(feature = "ui-gtk", feature = "ui-sdl", all(feature = "ui-dbus", unix))),
+    allow(unused_variables)
+)]
 fn open_display(vm: &Vm, opts: &DisplayOptions) -> std::result::Result<(), u8> {
     #[cfg(feature = "ui-gtk")]
     if is_gtk(opts) {
@@ -241,6 +271,13 @@ fn open_display(vm: &Vm, opts: &DisplayOptions) -> std::result::Result<(), u8> {
             vm.name.as_deref(),
             hooks,
         );
+    }
+    #[cfg(all(feature = "ui-dbus", unix))]
+    if is_dbus(opts) {
+        let (a, b, c) = ruvm_monitor::control::QEMU_VERSION;
+        let name = vm.name.clone().unwrap_or_else(|| format!("QEMU {a}.{b}.{c}"));
+        let uuid = QEMU_UUID.lock().unwrap_or_else(PoisonError::into_inner).unwrap_or_default();
+        return ruvm_ui::dbus::init(DisplayState::global(), InputState::global(), opts, name, uuid);
     }
     Ok(())
 }
@@ -696,7 +733,8 @@ fn realize_pci(
 ) -> std::result::Result<(Arc<PciDevice>, &'static str), Located> {
     let ds = DisplayState::global();
     let at = |e: Error| Located(plug.loc.clone(), e);
-    match plug.model {
+    let taken: Vec<bool> = ds.consoles().iter().map(|c| c.device().is_some()).collect();
+    let (dev, rom_name) = match plug.model {
         DisplayModel::Vga => {
             let props = VgaPciProps {
                 id: plug.id.clone(),
@@ -709,7 +747,7 @@ fn realize_pci(
                 big_endian: plug.big_endian,
             };
             let vga = VgaPci::realize(bus, plug.devfn, &props, &ds).map_err(at)?;
-            Ok((Arc::clone(vga.pci_device()), "vga"))
+            (Arc::clone(vga.pci_device()), "vga")
         }
         DisplayModel::BochsDisplay => {
             let props = BochsDisplayProps {
@@ -721,12 +759,21 @@ fn realize_pci(
             };
             // pci_bus_is_express(): both q35's pcie.0 and the GPEX root bus are.
             let dev = BochsDisplay::realize(bus, plug.devfn, true, &props, &ds).map_err(at)?;
-            Ok((Arc::clone(dev.pci_device()), "bochs-display"))
+            (Arc::clone(dev.pci_device()), "bochs-display")
         }
         DisplayModel::Ramfb | DisplayModel::VirtioGpuPci | DisplayModel::VirtioGpuDevice => {
             unreachable!("{} is not realized here", plug.typename())
         }
+    };
+    // qemu_console_fill_device_address() for the consoles the function took. The display
+    // functions sit on a root bus, so there is no bridge in front.
+    let devfn = dev.devfn();
+    for (i, con) in ds.consoles().iter().enumerate() {
+        if con.device().is_some() && !taken.get(i).copied().unwrap_or(false) {
+            con.set_device_address(format!("pci/0000/{:02x}.{:x}", devfn >> 3, devfn & 7));
+        }
     }
+    Ok((dev, rom_name))
 }
 
 /// Raises the config interrupt for a UI size change through the PCI function, which the

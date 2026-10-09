@@ -18,5 +18,9 @@ ruvm-base.workspace = true
 ruvm-hw-core.workspace = true
 ruvm-qapi.workspace = true
 
+[features]
+# The dbus audiodev type, which comes with -display dbus.
+ui-dbus = ["ruvm-qapi/ui-dbus"]
+
 [lints]
 workspace = true

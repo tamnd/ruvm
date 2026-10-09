@@ -52,6 +52,9 @@ fn driver_for(driver: AudiodevDriver) -> Option<Box<dyn Driver>> {
     match driver {
         AudiodevDriver::None => Some(Box::new(NoneDriver)),
         AudiodevDriver::Wav => Some(Box::new(WavDriver)),
+        // The audio of the D-Bus display is not there, so dbus is not a driver of this build.
+        #[cfg(feature = "ui-dbus")]
+        AudiodevDriver::Dbus => None,
     }
 }
 
@@ -62,6 +65,8 @@ fn pdos_mut(
     match u {
         AudiodevU::None(o) => (&mut o.in_, &mut o.out),
         AudiodevU::Wav(o) => (&mut o.in_, &mut o.out),
+        #[cfg(feature = "ui-dbus")]
+        AudiodevU::Dbus(o) => (&mut o.in_, &mut o.out),
     }
 }
 
@@ -71,6 +76,8 @@ fn pdos(
     match u {
         AudiodevU::None(o) => (o.in_.as_ref(), o.out.as_ref()),
         AudiodevU::Wav(o) => (o.in_.as_ref(), o.out.as_ref()),
+        #[cfg(feature = "ui-dbus")]
+        AudiodevU::Dbus(o) => (o.in_.as_ref(), o.out.as_ref()),
     }
 }
 

@@ -57,6 +57,8 @@ ruvm-qapi-gen.workspace = true
 ui-sdl = ["ruvm-qapi/ui-sdl", "ruvm-ui/ui-sdl"]
 # -display gtk, over the system's GTK 4 library.
 ui-gtk = ["ruvm-qapi/ui-gtk", "ruvm-ui/ui-gtk"]
+# -display dbus, over the zbus crate.
+ui-dbus = ["ruvm-audio/ui-dbus", "ruvm-qapi/ui-dbus", "ruvm-ui/ui-dbus"]
 
 [lints]
 workspace = true
