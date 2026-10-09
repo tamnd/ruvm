@@ -55,6 +55,8 @@ ruvm-qapi-gen.workspace = true
 [features]
 # -display sdl, over the system's SDL2 library.
 ui-sdl = ["ruvm-qapi/ui-sdl", "ruvm-ui/ui-sdl"]
+# -display gtk, over the system's GTK 4 library.
+ui-gtk = ["ruvm-qapi/ui-gtk", "ruvm-ui/ui-gtk"]
 
 [lints]
 workspace = true
