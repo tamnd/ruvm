@@ -39,7 +39,7 @@ use ruvm_monitor::object::{TYPE_MONITOR_HMP, TYPE_MONITOR_QMP, monitor_compat_id
 use ruvm_qapi::keyval::{keyval_merge, keyval_parse, keyval_parse_into};
 use ruvm_qapi::opts::{OptsHandle, QemuOptDesc, QemuOptType, QemuOptsList, is_help_option};
 use ruvm_qapi::types::{
-    Audiodev, DisplayOptions, MonitorMode, MonitorOptions, ObjectOptions, RunState, ShutdownCause,
+    DisplayOptions, MonitorMode, MonitorOptions, ObjectOptions, RunState, ShutdownCause,
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit};
 use ruvm_qapi::{QDict, QValue, json};
@@ -527,7 +527,8 @@ fn parse_options(
             }
             Opt::Display => parse_display(arg)?,
             Opt::Vnc => crate::vnc::parse(arg).map_err(Exit)?,
-            Opt::Audio => parse_audio(arg)?,
+            Opt::Audiodev => crate::audio::parse_audiodev(arg).map_err(Exit)?,
+            Opt::Audio => crate::audio::parse_audio(arg).map_err(Exit)?,
             Opt::Qtest => cfg.qtest = Some(arg.to_string()),
             Opt::QtestLog => cfg.qtest_log = Some(arg.to_string()),
             #[cfg(unix)]
@@ -722,27 +723,6 @@ fn parse_display(arg: &str) -> Flow<()> {
     // Only default and none are in the schema, and with no display built in the default is
     // none as well.
     DisplayOptions::visit(&mut v, None, &mut dpy).map_err(|e| fail(&e))?;
-    Ok(())
-}
-
-/// The `-audio` case of the option loop. Nothing plays sound yet, so this only checks the
-/// options the way QEMU does.
-fn parse_audio(arg: &str) -> Flow<()> {
-    let mut help = false;
-    let mut dict = keyval_parse(arg, Some("driver"), Some(&mut help)).map_err(|e| fail(&e))?;
-    if help || dict.get_str("driver").is_some_and(is_help_option) {
-        println!("Available audio drivers:\nnone\nwav");
-        return Err(Exit(0));
-    }
-    if !dict.contains_key("id") {
-        dict.put("id", "audiodev0");
-    }
-    if dict.contains_key("model") {
-        return Err(fail_msg("audio models are not supported by ruvm yet"));
-    }
-    let mut v = QObjectInputVisitor::new_keyval(QValue::Dict(dict));
-    let mut dev = Audiodev::default();
-    Audiodev::visit(&mut v, None, &mut dev).map_err(|e| fail(&e))?;
     Ok(())
 }
 
@@ -1073,6 +1053,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     } else {
         parse_drives(kind, &cfg.x86.drives)?
     };
+    crate::audio::create_early_backends(cfg.x86.has_defaults).map_err(|e| fail(&e))?;
 
     // qemu_apply_legacy_machine_options() and qemu_apply_machine_options()
     let memdev = apply_legacy_machine_options(&mut cfg)?;
@@ -1383,6 +1364,7 @@ fn main_loop(vm: &Arc<Vm>, keep: &Keep) -> u8 {
         vm.runstate.set_cpu_hook(None);
         board.quit();
     }
+    ruvm_audio::cleanup();
     vm.registry.user_creatable_cleanup();
     // exit() keeps the low eight bits of the status.
     vm.runstate.exit_code() as u8

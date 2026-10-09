@@ -473,6 +473,11 @@ dependencies = [
 [[package]]
 name = "ruvm-audio"
 version = "0.5.0"
+dependencies = [
+ "ruvm-base",
+ "ruvm-hw-core",
+ "ruvm-qapi",
+]
 
 [[package]]
 name = "ruvm-base"
@@ -1067,6 +1072,7 @@ dependencies = [
  "ruvm-accel",
  "ruvm-accel-kvm",
  "ruvm-accel-qtest",
+ "ruvm-audio",
  "ruvm-base",
  "ruvm-block",
  "ruvm-chardev",
