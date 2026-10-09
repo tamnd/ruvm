@@ -98,6 +98,7 @@ fn register_migration(vm: &Arc<Vm>, cmds: &mut Commands) {
 
 /// Registers every command in this module with `vm`'s dispatcher.
 pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
+    crate::display::register(cmds);
     let v = vm.clone();
     register_query_status(cmds, move |_: &MonitorQmp| Ok(v.runstate.status()));
     let v = vm.clone();

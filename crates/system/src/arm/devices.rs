@@ -107,6 +107,9 @@ pub(crate) struct Plan {
     pub pflash: [Option<PflashBacking>; 2],
     /// The AHCI ports of sbsa-ref with a drive, as (port, index into the drives).
     pub ide: Vec<(usize, usize)>,
+    /// The display devices of `-device` on virt, each with the number of virtio plugs before
+    /// it, so they take PCI slots in command line order.
+    pub display: Vec<(usize, crate::display::DisplayPlug)>,
 }
 
 /// `drive_new()` for each `-drive`, with the default interface of `board`.
@@ -293,6 +296,14 @@ pub(crate) fn plan(
             let msg = "-device loader is not supported with this machine by ruvm yet";
             return Err(vec![Located::new(loc, msg)]);
         }
+        if let Some(plug) = crate::display::plan_device(driver, opts, loc, true, true) {
+            let plug = plug.map_err(|e| vec![e])?;
+            if board == ArmBoard::SbsaRef {
+                return Err(vec![Located::new(loc, sbsa_ref_display(plug.typename()))]);
+            }
+            p.display.push((p.virtio.len(), plug));
+            continue;
+        }
         let mmio = board == ArmBoard::Virt;
         let plug = plan_virtio(drives, &mut used, driver, opts, loc, mmio).map_err(|e| vec![e])?;
         p.virtio.push(plug);
@@ -365,10 +376,27 @@ impl Target<'_> {
     }
 }
 
-/// `qdev_device_add()` for the planned virtio devices: builds each one and plugs it into its
-/// bus.
-pub(crate) fn plug(board: Target<'_>, plugs: &[Plug], drives: &[Drive]) -> Result<(), Located> {
-    for plug in plugs {
+/// The error for a display device on sbsa-ref, whose display devices ruvm does not build yet.
+fn sbsa_ref_display(typename: &str) -> String {
+    format!("-device {typename} is not supported with machine sbsa-ref by ruvm yet")
+}
+
+/// `qdev_device_add()` for the planned devices: builds each one and plugs it into its bus.
+pub(crate) fn plug(
+    board: Target<'_>,
+    plugs: &[Plug],
+    display: &[(usize, crate::display::DisplayPlug)],
+    drives: &[Drive],
+) -> Result<(), Located> {
+    let realize = |d: &crate::display::DisplayPlug| match board {
+        Target::Virt(b) => crate::display::realize_virt(b, d),
+        Target::SbsaRef(_) => Err(Located::new(&d.loc, sbsa_ref_display(d.typename()))),
+    };
+    let mut display = display.iter().peekable();
+    for (i, plug) in plugs.iter().enumerate() {
+        while let Some((_, d)) = display.next_if(|(at, _)| *at == i) {
+            realize(d)?;
+        }
         let at = |e: String| Located::new(&plug.loc, e);
         let class: Box<dyn VirtioDeviceClass> = match plug.model {
             Model::Blk => {
@@ -416,6 +444,9 @@ pub(crate) fn plug(board: Target<'_>, plugs: &[Plug], drives: &[Drive]) -> Resul
                 )));
             }
         }
+    }
+    for (_, d) in display {
+        realize(d)?;
     }
     Ok(())
 }
@@ -520,7 +551,7 @@ mod tests {
             ..ruvm_machine_arm::virt::VirtConfig::default()
         };
         let board = VirtMachine::new(cfg).unwrap();
-        plug(Target::Virt(&board), &p.virtio, &d).unwrap();
+        plug(Target::Virt(&board), &p.virtio, &p.display, &d).unwrap();
         let _ = std::fs::remove_file(&path);
         let vectors: Vec<u32> = board.pci_devices().iter().map(|f| f.nvectors()).collect();
         assert_eq!(vectors, [2, 3]);
@@ -600,6 +631,12 @@ mod tests {
             "Bus 'virtio-mmio-bus.0' not found"
         );
         assert_eq!(plan(S, &[], &[dev("virtio-rng")]).unwrap().virtio.len(), 1);
+        let e = plan(S, &[], &[dev("VGA")]).unwrap_err();
+        let msg = "-device VGA is not supported with machine sbsa-ref by ruvm yet";
+        assert_eq!(e[0].1.message(), msg);
+        let p = plan(V, &[], &[dev("virtio-rng-pci"), dev("ramfb"), dev("VGA")]).unwrap();
+        let at: Vec<usize> = p.display.iter().map(|(at, _)| *at).collect();
+        assert_eq!((p.virtio.len(), at), (1, vec![1, 1]));
     }
 
     #[test]

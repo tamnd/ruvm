@@ -1056,7 +1056,8 @@ pub(crate) fn start_board_tcg(
     cfg.clock = Some(Arc::clone(&clock));
     cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
     let mut board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
-    devices::plug(devices::Target::Virt(&board), &plan.virtio, args.drives).map_err(|e| vec![e])?;
+    devices::plug(devices::Target::Virt(&board), &plan.virtio, &plan.display, args.drives)
+        .map_err(|e| vec![e])?;
 
     let mut attachments = Vec::new();
     if let Some(Some(chr)) = serial_hds.first() {
@@ -1137,7 +1138,7 @@ fn start_sbsa_ref_tcg(
     cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
     let mut board = SbsaRefMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
     devices::plug_ahci(&board, &plan.ide, args.drives).map_err(|e| vec![e])?;
-    devices::plug(devices::Target::SbsaRef(&board), &plan.virtio, args.drives)
+    devices::plug(devices::Target::SbsaRef(&board), &plan.virtio, &plan.display, args.drives)
         .map_err(|e| vec![e])?;
 
     let mut attachments = Vec::new();

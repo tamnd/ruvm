@@ -150,6 +150,10 @@ pub(crate) struct Cmdline {
     pub uuid: Option<[u8; 16]>,
     /// `-smbios`, parsed as it comes like `smbios_entry_add()` does.
     pub smbios: SmbiosOptions,
+    /// `-vga`, the last one.
+    pub vga_model: Option<String>,
+    /// What `select_vgahw()` made of `vga_model`.
+    pub vga: Option<crate::display::VgaInterface>,
 }
 
 impl Default for Cmdline {
@@ -169,6 +173,8 @@ impl Default for Cmdline {
             no_reboot: false,
             uuid: None,
             smbios: SmbiosOptions::new(),
+            vga_model: None,
+            vga: None,
         }
     }
 }
@@ -832,6 +838,9 @@ pub(crate) struct Plan {
     pub virtio: Vec<Plug>,
     /// The ISA devices of `-device`, in order.
     pub isa: Vec<IsaPlug>,
+    /// The display devices of `-device`, each with the number of virtio plugs before it, so
+    /// they take PCI slots in command line order.
+    pub display: Vec<(usize, crate::display::DisplayPlug)>,
 }
 
 /// One `-device`, planned.
@@ -840,6 +849,7 @@ enum Planned {
     Isa(IsaPlug),
     ScsiDisk(ScsiPlug),
     Console,
+    Display(crate::display::DisplayPlug),
 }
 
 /// The drives of the q35 system flashes: `-machine pflashN=` names a drive by id, and
@@ -929,6 +939,7 @@ pub(crate) fn plan(
         match plan_device(kind, drives, &mut used, arg, loc).map_err(|e| vec![e])? {
             Planned::Virtio(plug) => p.virtio.push(plug),
             Planned::Isa(plug) => p.isa.push(plug),
+            Planned::Display(plug) => p.display.push((p.virtio.len(), plug)),
             Planned::Console => {
                 if !p.virtio.iter().any(|v| v.model == VirtioModel::Serial) {
                     return Err(vec![Located::new(
@@ -1007,6 +1018,10 @@ fn plan_device(
             return Err(Located::new(loc, format!("Property '{TYPE_VIRTCONSOLE}.{k}' not found")));
         }
         return Ok(Planned::Console);
+    }
+    let (pci, sysbus) = (kind == Some(BoardKind::Q35), kind.is_some());
+    if let Some(plug) = crate::display::plan_device(driver, opts, loc, pci, sysbus) {
+        return plug.map(Planned::Display);
     }
     let alias = DEVICE_ALIASES.iter().find(|(a, _)| *a == driver).map(|(_, t)| *t);
     let name = alias.unwrap_or(driver);
@@ -1579,7 +1594,14 @@ fn build(
     }
     let net = Arc::new(Network::new(&cmd.netdevs, &clock).map_err(one)?);
     let env = ClassEnv { drives, net: &net, ram_size: board.ram_size() };
-    for plug in p.virtio {
+    // pc_vga_init() comes before the -device functions, which take slots in order.
+    let firmware = cmd.firmware();
+    crate::display::realize_x86_vga(&mut board, cmd.vga, &firmware).map_err(one)?;
+    let mut display = p.display.iter().peekable();
+    for (i, plug) in p.virtio.into_iter().enumerate() {
+        while let Some((_, d)) = display.next_if(|(at, _)| *at == i) {
+            crate::display::realize_x86(&mut board, d, &firmware).map_err(one)?;
+        }
         let (class, nic) = virtio_class(&plug, &env).map_err(one)?;
         let handle = board.attach_virtio(class).map_err(|e| {
             let msg = if e.starts_with("No 'virtio-bus' bus found for device") {
@@ -1603,6 +1625,9 @@ fn build(
         if let Some(nic) = nic {
             nic.connect(handle);
         }
+    }
+    for (_, d) in display {
+        crate::display::realize_x86(&mut board, d, &firmware).map_err(one)?;
     }
     let mut attachments = Vec::new();
     for plug in &p.isa {

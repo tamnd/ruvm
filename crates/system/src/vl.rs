@@ -497,6 +497,7 @@ fn parse_options(
             Opt::NoReboot => cfg.x86.no_reboot = true,
             Opt::Uuid => cfg.x86.set_uuid(arg).map_err(|e| fail_msg(&e))?,
             Opt::Smbios => cfg.x86.add_smbios(arg).map_err(|e| fail_msg(&e))?,
+            Opt::Vga => cfg.x86.vga_model = Some(arg.to_string()),
             Opt::Name => {
                 if cfg.name.parse_noisily(arg, true).is_none() {
                     return Err(Exit(1));
@@ -520,6 +521,13 @@ fn parse_options(
         }
     }
     validate_options(cfg)?;
+    if let Some(model) = &cfg.x86.vga_model {
+        match crate::display::select_vgahw(model) {
+            Ok(Some(vga)) => cfg.x86.vga = Some(vga),
+            Ok(None) => return Err(Exit(0)),
+            Err(e) => return Err(fail_msg(&e)),
+        }
+    }
     parse_memory_options(cfg)?;
     if cfg.x86.list_data_dirs {
         for dir in cfg.x86.firmware().dirs() {
@@ -1175,6 +1183,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             _ => keep._accel = Some(accel),
         }
     }
+    crate::display::check_vga_created(cfg.x86.vga);
 
     if cfg.preconfig {
         qmp.set_machine_ready(false);

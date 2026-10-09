@@ -11,7 +11,6 @@ CONFIG_AUDIO_COREAUDIO    the coreaudio audiodev driver
 CONFIG_COCOA              the cocoa display
 CONFIG_CURSES             the curses display
 CONFIG_DBUS_DISPLAY       the dbus display and the dbus chardev
-CONFIG_PIXMAN             screendump and the pixman based display types
 CONFIG_REPLICATION        the replication block driver and the COLO commands
 CONFIG_SPICE_PROTOCOL     the qemu-vdagent chardev
 CONFIG_TPM                the TPM commands and types
