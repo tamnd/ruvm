@@ -23,7 +23,9 @@ ruvm-firmware.workspace = true
 ruvm-hostmem.workspace = true
 ruvm-hw-char.workspace = true
 ruvm-hw-core.workspace = true
+ruvm-hw-display.workspace = true
 ruvm-hw-misc.workspace = true
+ruvm-hw-pci.workspace = true
 ruvm-hw-storage.workspace = true
 ruvm-hw-virtio.workspace = true
 ruvm-machine-arm.workspace = true
@@ -37,6 +39,7 @@ ruvm-qapi.workspace = true
 ruvm-qom.workspace = true
 ruvm-target-arm.workspace = true
 ruvm-target-riscv.workspace = true
+ruvm-ui.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 ruvm-sys.workspace = true

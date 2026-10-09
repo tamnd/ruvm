@@ -48,7 +48,7 @@ const CONDITIONS: &[(&str, Rule)] = &[
     ("CONFIG_NETMAP", Rule::Off),
     ("CONFIG_OPENGL", Rule::Off),
     ("CONFIG_PASST", Rule::Off),
-    ("CONFIG_PIXMAN", Rule::Off),
+    ("CONFIG_PIXMAN", Rule::On),
     ("CONFIG_POSIX", Rule::Unix),
     ("CONFIG_QATZIP", Rule::Off),
     ("CONFIG_QPL", Rule::Off),

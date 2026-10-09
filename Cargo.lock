@@ -616,6 +616,13 @@ version = "0.4.6"
 [[package]]
 name = "ruvm-hw-display"
 version = "0.4.6"
+dependencies = [
+ "ruvm-base",
+ "ruvm-hw-core",
+ "ruvm-hw-pci",
+ "ruvm-mem",
+ "ruvm-ui",
+]
 
 [[package]]
 name = "ruvm-hw-i2c"
@@ -1063,7 +1070,9 @@ dependencies = [
  "ruvm-hostmem",
  "ruvm-hw-char",
  "ruvm-hw-core",
+ "ruvm-hw-display",
  "ruvm-hw-misc",
+ "ruvm-hw-pci",
  "ruvm-hw-storage",
  "ruvm-hw-virtio",
  "ruvm-machine-arm",
@@ -1079,6 +1088,7 @@ dependencies = [
  "ruvm-sys",
  "ruvm-target-arm",
  "ruvm-target-riscv",
+ "ruvm-ui",
 ]
 
 [[package]]
@@ -1192,6 +1202,10 @@ version = "0.4.6"
 [[package]]
 name = "ruvm-ui"
 version = "0.4.6"
+dependencies = [
+ "flate2",
+ "ruvm-base",
+]
 
 [[package]]
 name = "ruvm-user-common"
