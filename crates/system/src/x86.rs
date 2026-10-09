@@ -1009,7 +1009,10 @@ pub(crate) fn plan(
             Planned::Virtio(plug) => p.virtio.push(plug),
             Planned::Isa(plug) => p.isa.push(plug),
             Planned::Display(plug) => p.display.push((p.virtio.len(), plug)),
-            Planned::Audio(plug) => p.audio.push((p.virtio.len(), p.display.len(), plug)),
+            Planned::Audio(plug) => {
+                crate::audio::add_plug(&mut p.audio, p.virtio.len(), p.display.len(), plug)
+                    .map_err(|e| vec![e])?;
+            }
             Planned::Console => {
                 if !p.virtio.iter().any(|v| v.model == VirtioModel::Serial) {
                     return Err(vec![Located::new(

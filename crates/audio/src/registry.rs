@@ -242,6 +242,12 @@ pub fn query_audiodevs() -> Vec<Audiodev> {
     reg().audiodevs.iter().rev().cloned().collect()
 }
 
+/// The machine's virtual clock, once [`attach_clock`] has run. Devices that pace themselves,
+/// such as the HDA codecs, put their timers on it.
+pub fn clock() -> Option<Arc<Clock>> {
+    reg().clock.clone()
+}
+
 /// Paces every backend, now and later, by the machine's virtual clock.
 pub fn attach_clock(clock: &Arc<Clock>) {
     let backends = {
