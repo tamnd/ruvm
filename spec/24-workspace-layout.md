@@ -277,6 +277,7 @@ External crates are welcome where they are mature, small in surface, and license
 | Testing | proptest, loom, shuttle, criterion |
 | Tracing | tracing, tracing-subscriber |
 | D-Bus | zbus, behind the `ui-dbus` feature of ruvm-ui, for `-display dbus` |
+| Audio | alsa, behind the `audio-alsa` feature of ruvm-audio, for `-audiodev alsa` |
 | macOS UI | objc2, objc2-foundation, objc2-app-kit, objc2-core-graphics, objc2-core-foundation, dispatch2, behind the `ui-cocoa` feature of ruvm-ui, for `-display cocoa` |
 
 vm-memory appears only through `ruvm-mem-vmm`, the adapter that implements its traits over ruvm address spaces. ruvm ships its own ring and vhost crates (ruvm-virtio-queue and ruvm-vhost, document 13) because they need QEMU's exact VMState layouts and legacy transport quirks, but the adapter lets rust-vmm code run against ruvm memory in tests and lets our permissive crates interoperate with rust-vmm projects. The VMM itself does not use vm-memory as its guest memory model; QEMU's `MemoryRegion` semantics (priorities, aliases, IOMMU regions, per-device address spaces, MMIO dispatch) are a superset of what vm-memory models, and adapting one to the other in the hot path costs more than writing `ruvm-mem`. Document 05 has the detail.
