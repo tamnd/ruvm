@@ -481,6 +481,7 @@ fn parse_options(
                 }
                 cfg.x86.cpu = Some(arg.to_string());
             }
+            Opt::LowerK => ruvm_ui::keymaps::set_keyboard_layout(Some(arg.to_string())),
             Opt::L => {
                 if is_help_option(arg) {
                     cfg.x86.list_data_dirs = true;

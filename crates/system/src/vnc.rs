@@ -13,6 +13,7 @@ use ruvm_qapi::commands::{
     register_query_vnc_servers, register_set_password,
 };
 use ruvm_qapi::events::{event_vnc_connected, event_vnc_disconnected, event_vnc_initialized};
+use ruvm_ui::input::InputState;
 use ruvm_ui::vnc::{self, Hooks, VncEvent};
 
 use crate::vl::Vm;
@@ -40,7 +41,13 @@ impl Hooks for QmpHooks {
 }
 
 /// `qemu_opts_foreach(qemu_find_opts("vnc"), vnc_init_func, ...)` in `qemu_init_displays()`.
+///
+/// Before that it gives the input layer the run state check of `qmp_input_send_event()`.
 pub(crate) fn init(vm: &Vm) -> Result<(), u8> {
+    let runstate = Arc::downgrade(&vm.runstate);
+    InputState::global().set_runstate_check(move || {
+        runstate.upgrade().is_some_and(|r| crate::runstate::is_live(r.get()))
+    });
     vnc::init(vm.name.as_deref(), Arc::new(QmpHooks(Arc::clone(&vm.qmp))))
 }
 

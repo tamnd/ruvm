@@ -415,9 +415,18 @@ impl Hooks for TestHooks {
 }
 
 fn open_str(arg: &str, id: &str, hooks: Arc<TestHooks>) -> Result<Arc<VncDisplay>> {
+    open_with_input(arg, id, InputState::new(), hooks)
+}
+
+fn open_with_input(
+    arg: &str,
+    id: &str,
+    input: Arc<InputState>,
+    hooks: Arc<TestHooks>,
+) -> Result<Arc<VncDisplay>> {
     let mut list = opts::opts_list();
     let o = list.parse_noisily(arg, true).expect("options parse");
-    opts::open(o, id, Some("test"), DisplayState::new(), hooks)
+    opts::open(o, id, Some("test"), DisplayState::new(), input, hooks)
 }
 
 fn connect(vd: &VncDisplay) -> TcpStream {
@@ -515,6 +524,92 @@ fn handshake_and_update_over_loopback() {
     drop(s);
     wait_for(&hooks, "disconnected");
     assert_eq!(*hooks.0.lock().unwrap(), ["connected", "initialized", "disconnected"]);
+}
+
+/// An input handler that writes down what it gets.
+struct Rec {
+    mask: u32,
+    log: Mutex<Vec<String>>,
+}
+
+impl crate::input::InputHandler for Rec {
+    fn name(&self) -> &str {
+        "rec"
+    }
+
+    fn mask(&self) -> u32 {
+        self.mask
+    }
+
+    fn event(&self, _src: Option<&QemuConsole>, evt: &crate::input::QemuInputEvent) {
+        use crate::input::QemuInputEvent as E;
+        let s = match evt {
+            E::Key { key, down } => format!("key {key} {down}"),
+            E::Btn(b) => format!("btn {} {}", b.button.as_str(), b.down),
+            E::Rel(m) => format!("rel {} {}", m.axis.as_str(), m.value),
+            E::Abs(m) => format!("abs {} {}", m.axis.as_str(), m.value),
+            E::Mtt(_) => "mtt".to_string(),
+        };
+        self.log.lock().unwrap().push(s);
+    }
+
+    fn sync(&self) {
+        self.log.lock().unwrap().push("sync".to_string());
+    }
+}
+
+/// Waits for `want` in the log of `rec` and clears it.
+fn expect_log(rec: &Rec, want: &[&str]) {
+    let start = Instant::now();
+    while rec.log.lock().unwrap().len() < want.len() {
+        assert!(start.elapsed() < Duration::from_secs(10), "log {:?}", rec.log.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(std::mem::take(&mut *rec.log.lock().unwrap()), want);
+}
+
+#[test]
+fn keys_and_pointer_reach_the_input_layer() {
+    use crate::input::{INPUT_EVENT_MASK_BTN, INPUT_EVENT_MASK_KEY, INPUT_EVENT_MASK_REL};
+    let input = InputState::new();
+    let kbd = Arc::new(Rec { mask: INPUT_EVENT_MASK_KEY, log: Mutex::new(Vec::new()) });
+    let mask = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_REL;
+    let mouse = Arc::new(Rec { mask, log: Mutex::new(Vec::new()) });
+    input.register(kbd.clone());
+    input.register(mouse.clone());
+    let hooks = Arc::new(TestHooks::default());
+    let vd = open_with_input("127.0.0.1:102,to=899", "t-input", input, Arc::clone(&hooks))
+        .unwrap_or_else(|e| panic!("{}", e.message()));
+    let mut s = connect(&vd);
+    read_n(&mut s, 12);
+    s.write_all(b"RFB 003.008\n").unwrap();
+    read_n(&mut s, 2);
+    s.write_all(&[1]).unwrap();
+    read_u32(&mut s);
+    server_init(&mut s);
+    let mut msg = vec![2, 0, 0, 1];
+    msg.extend_from_slice(&ENCODING_RAW.to_be_bytes());
+    s.write_all(&msg).unwrap();
+
+    // "a" down and up, through the en-us layout.
+    s.write_all(&[4, 1, 0, 0, 0, 0, 0, b'a', 4, 0, 0, 0, 0, 0, 0, b'a']).unwrap();
+    expect_log(&kbd, &["key 30 true", "sync", "key 30 false", "sync"]);
+    // "A" without shift held presses capslock first.
+    s.write_all(&[4, 1, 0, 0, 0, 0, 0, b'A']).unwrap();
+    let caps = ["key 58 true", "sync", "key 58 false", "sync"];
+    expect_log(&kbd, &[&caps[..], &["key 30 true", "sync"]].concat());
+
+    // The mouse is relative, so the first position only sets where the pointer is.
+    s.write_all(&[5, 1, 0, 10, 0, 10]).unwrap();
+    expect_log(&mouse, &["btn left true", "sync"]);
+    s.write_all(&[5, 4, 0, 15, 0, 7]).unwrap();
+    let want = ["btn left false", "btn right true", "rel x 5", "rel y -3", "sync"];
+    expect_log(&mouse, &want);
+
+    // The key still down goes up when the client leaves.
+    drop(s);
+    wait_for(&hooks, "disconnected");
+    expect_log(&kbd, &["key 30 false", "sync"]);
 }
 
 #[test]

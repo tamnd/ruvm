@@ -781,3 +781,39 @@ fn port_regions() {
     assert_eq!(I8042_DATA_PORT, 0x60);
     assert_eq!(I8042_CMD_PORT, 0x64);
 }
+
+#[test]
+fn input_layer_handlers_and_leds() {
+    use ruvm_ui::input::{InputState, QEMU_CAPS_LOCK_LED, QEMU_NUM_LOCK_LED};
+
+    let r = Rig::new();
+    let input = InputState::new();
+    r.kbc.register_input(&input);
+    r.kbc.register_input(&input);
+    let mice = input.query_mice();
+    assert_eq!(mice.len(), 1);
+    assert_eq!(
+        (mice[0].name.as_str(), mice[0].current, mice[0].absolute),
+        ("QEMU PS/2 Mouse", true, false)
+    );
+
+    // A key through the input layer comes out in set 2, untranslated in this mode.
+    input.send_key_linux(None, 30, true);
+    assert_eq!(r.drain(), [0x1c]);
+
+    r.enable_mouse();
+    input.queue_btn(None, InputButton::Left, true);
+    input.queue_rel(None, InputAxis::X, 5);
+    input.queue_rel(None, InputAxis::Y, -3);
+    input.event_sync();
+    assert_eq!(r.drain(), [0x09, 5, 3]);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (i2, s2) = (Arc::clone(&input), Arc::clone(&seen));
+    input.add_led_notifier(move || s2.lock().unwrap().push(i2.get_leds_mask(None)));
+    assert_eq!(r.kbd_send(&[KBD_CMD_SET_LEDS, 0x06]), [KBD_REPLY_ACK, KBD_REPLY_ACK]);
+    assert_eq!(input.get_leds_mask(None), QEMU_NUM_LOCK_LED | QEMU_CAPS_LOCK_LED);
+    r.outb(KBD_CMD_RESET);
+    r.drain();
+    assert_eq!(*seen.lock().unwrap(), [6, 0]);
+}

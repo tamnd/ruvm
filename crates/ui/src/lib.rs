@@ -5,10 +5,15 @@
 //! So far this holds the console core of QEMU's `ui/`: pixman style pixel formats and images
 //! ([`pixman`]), display surfaces ([`surface`]), consoles with their device and listener hooks
 //! ([`console`]), the VGA font ([`vgafont`]), the QMP `screendump` command ([`screendump`]) and
-//! the VNC server ([`vnc`]). The other front ends come later. The plan for this crate is in
+//! the VNC server ([`vnc`]). The input layer of `ui/input.c` is in [`input`], with the keyboard
+//! state of `ui/kbd-state.c` in [`kbd_state`] and the keysym layouts of `ui/keymaps.c` in
+//! [`keymaps`]. The other front ends come later. The plan for this crate is in
 //! `spec/24-workspace-layout.md`.
 
 pub mod console;
+pub mod input;
+pub mod kbd_state;
+pub mod keymaps;
 pub mod pixman;
 pub mod screendump;
 pub mod surface;

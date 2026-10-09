@@ -17,6 +17,8 @@ unsafe-budget = 0
 ruvm-base.workspace = true
 ruvm-hw-core.workspace = true
 ruvm-mem.workspace = true
+ruvm-qapi.workspace = true
+ruvm-ui.workspace = true
 
 [lints]
 workspace = true
