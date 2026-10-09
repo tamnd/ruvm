@@ -1,24 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The x86_64 target: `linux-user/i386/cpu_loop.c`, `target_cpu_copy_regs()`, the user mode
-//! parts of `x86_cpu_reset_hold()` and `do_arch_prctl()`, and `main()` for `qemu-x86_64`.
+//! parts of `x86_cpu_reset_hold()`, `do_arch_prctl()` and the signal frames of
+//! `linux-user/i386/signal.c`.
 
 use std::fmt;
-use std::fs::File;
-use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use ruvm_jit::cpu_exec::{cpu_exec_step_atomic, tcg_cpu_exec};
 use ruvm_jit::cputlb::tlb_set_page;
 use ruvm_jit::translate::TbBuild;
 use ruvm_jit::{
-    Cpu, CpuLoopExit, CpuOps, ENV_TARGET_OFFSET, Jit, MmuAccessType, Ra, Tb, TbCpuState,
-    Watchpoint, cf, excp,
+    Cpu, CpuLoopExit, CpuOps, Jit, JitConfig, MmuAccessType, Ra, Tb, TbCpuState, Vcpu, Watchpoint,
+    excp,
 };
 use ruvm_jit_core::Type;
 use ruvm_jit_core::types::INSN_START_WORDS;
-use ruvm_mem::{MemTxAttrs, MemTxResult, MemorySystem};
+use ruvm_mem::{AddressSpace, MemTxAttrs, MemTxResult};
 use ruvm_target_x86::cpuid::{Accel, X86Cpu};
 use ruvm_target_x86::state::{
     CR0_PE_MASK, CR0_PG_MASK, CR0_WP_MASK, CR4_FSGSBASE_MASK, CR4_OSFXSR_MASK, CR4_OSXSAVE_MASK,
@@ -38,15 +36,11 @@ use ruvm_target_x86::tcg::{
 };
 use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page};
 
-use crate::elf::{self, Arch, Creds, Exec};
-use crate::host;
-use crate::opts::{self, Exit};
-use crate::procfs::Image;
+use crate::elf::{Arch, ImageInfo};
+use crate::guest::Guest;
 use crate::signal::{self, Sigaction, Task, get32, get64, put32, put64};
-use crate::syscall::{
-    self, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_LOCK, CLONE_PARENT_SETTID, CLONE_SETTLS,
-    Proc, THREAD_EXIT, THREADS, lock,
-};
+use crate::start;
+use crate::syscall::{self, Proc, THREAD_EXIT};
 
 /// `TASK_UNMAPPED_BASE` for x86_64, `TASK_SIZE / 3` page aligned.
 const TASK_UNMAPPED_BASE: u64 = 0x2aaa_aaaa_b000;
@@ -253,9 +247,6 @@ pub(crate) fn set_reg(cpu: &mut Cpu<'_>, n: usize, v: u64) {
     env::st64(cpu.env, REGS + 8 * n, v);
 }
 
-/// `RSP`.
-pub(crate) const RSP: usize = R_ESP;
-
 /// `do_arch_prctl()`.
 pub(crate) fn arch_prctl(space: &GuestSpace, cpu: &mut Cpu<'_>, code: u64, addr: u64) -> i64 {
     const ARCH_SET_GS: u64 = 0x1001;
@@ -283,7 +274,7 @@ pub(crate) fn arch_prctl(space: &GuestSpace, cpu: &mut Cpu<'_>, code: u64, addr:
 }
 
 /// Sets the FS base of a new thread or process, `CLONE_SETTLS`.
-pub(crate) fn set_tls(cpu: &mut Cpu<'_>, tls: u64) {
+fn set_tls(cpu: &mut Cpu<'_>, tls: u64) {
     env::st64(cpu.env, SEGS + R_FS * SEG_SIZE + SEG_BASE, tls);
 }
 
@@ -448,7 +439,7 @@ fn fpstate_size(cpu: &Cpu<'_>, xsave: bool) -> u64 {
 
 /// `setup_rt_frame()`: the frame for the handler of `sig` on the guest stack, and the
 /// registers that enter it. `old` is the guest mask to return to.
-pub(crate) fn setup_rt_frame(
+fn setup_rt_frame(
     space: &GuestSpace,
     t: &mut Task,
     cpu: &mut Cpu<'_>,
@@ -572,7 +563,7 @@ fn restore_fpstate(space: &GuestSpace, cpu: &mut Cpu<'_>, fp: u64) -> bool {
 }
 
 /// `do_rt_sigreturn()`.
-pub(crate) fn do_rt_sigreturn(space: &GuestSpace, t: &mut Task, cpu: &mut Cpu<'_>) -> i64 {
+fn do_rt_sigreturn(space: &GuestSpace, t: &mut Task, cpu: &mut Cpu<'_>) -> i64 {
     let frame = reg(cpu, R_ESP).wrapping_sub(8);
     let mut f = [0u8; FRAME_SIZE as usize];
     if !space.read(frame, &mut f) {
@@ -606,83 +597,8 @@ pub(crate) fn do_rt_sigreturn(space: &GuestSpace, t: &mut Task, cpu: &mut Cpu<'_
     signal::ESIGRETURN
 }
 
-/// The host stack of a guest thread, which only the emulator runs on.
-const THREAD_STACK: usize = 8 << 20;
-
-/// The `CLONE_VM` half of `do_fork()`: a copy of the vCPU, run by a new host thread. `flags`
-/// were checked already.
-pub(crate) fn new_thread(
-    p: &Arc<Proc>,
-    t: &Task,
-    cpu: &mut Cpu<'_>,
-    flags: u64,
-    [newsp, ptid, ctid, tls]: [u64; 4],
-) -> i64 {
-    // Grab a mutex so that thread setup appears atomic.
-    let clone = lock(&CLONE_LOCK);
-    let jit = cpu.jit();
-    // begin_parallel_context(): code for one vCPU does not do for several.
-    if cpu.core.tcg_cflags & cf::PARALLEL == 0 {
-        jit.tb_flush_exclusive_or_serial();
-        cpu.core.tcg_cflags |= cf::PARALLEL;
-    }
-    // cpu_copy() and cpu_clone_regs_child().
-    let mut v = jit.create_vcpu(cpu.ops(), Arc::clone(cpu.core.address_space()), env::ENV_SIZE);
-    v.core.tcg_cflags = cpu.core.tcg_cflags;
-    v.env[ENV_TARGET_OFFSET..].copy_from_slice(&cpu.env[ENV_TARGET_OFFSET..]);
-    {
-        let mut c = v.cpu();
-        if newsp != 0 {
-            set_reg(&mut c, R_ESP, newsp);
-        }
-        set_reg(&mut c, R_EAX, 0);
-        if flags & CLONE_SETTLS != 0 {
-            set_tls(&mut c, tls);
-        }
-    }
-    let mask = t.signal_mask;
-    let p = Arc::clone(p);
-    let (tx, rx) = std::sync::mpsc::channel();
-    // It is not safe to deliver signals until the child has finished initializing.
-    let old = host::set_mask(!0);
-    let spawned = std::thread::Builder::new().stack_size(THREAD_STACK).spawn(move || {
-        let mut v = v;
-        let mut cpu = v.cpu();
-        let tid = host::sys(libc::SYS_gettid, &[]) as u32;
-        let mut task = Task::new(mask, cpu.shared());
-        if flags & CLONE_CHILD_CLEARTID != 0 {
-            task.child_tidptr = ctid;
-        }
-        if flags & CLONE_CHILD_SETTID != 0 {
-            let _ = p.put(ctid, &tid.to_le_bytes());
-        }
-        if flags & CLONE_PARENT_SETTID != 0 {
-            let _ = p.put(ptid, &tid.to_le_bytes());
-        }
-        host::set_mask(task.run_mask());
-        let _ = tx.send(tid);
-        // Wait until the parent has finished.
-        drop(lock(&CLONE_LOCK));
-        cpu_loop(&p, &mut task, &mut cpu);
-        task.exit_thread();
-    });
-    host::set_mask(old);
-    let r = match spawned {
-        Ok(_) => match rx.recv() {
-            Ok(tid) => {
-                THREADS.fetch_add(1, Ordering::AcqRel);
-                i64::from(tid)
-            }
-            Err(_) => -i64::from(libc::EAGAIN),
-        },
-        Err(e) => -i64::from(e.raw_os_error().unwrap_or(libc::EAGAIN)),
-    };
-    drop(clone);
-    r
-}
-
 /// `cpu_loop()`, until the thread calls `exit` with others left.
-fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
+pub(crate) fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
     loop {
         let trapnr = tcg_cpu_exec(cpu);
         cpu.process_queued_cpu_work();
@@ -752,215 +668,92 @@ fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
     }
 }
 
-/// The host side of the auxiliary vector.
-fn creds() -> Creds {
-    let id = |nr| host::sys(nr, &[]) as u64;
-    Creds {
-        ids: [
-            id(libc::SYS_getuid),
-            id(libc::SYS_geteuid),
-            id(libc::SYS_getgid),
-            id(libc::SYS_getegid),
-        ],
-        clktck: 100,
-        secure: 0,
-        random: host::random16(),
+/// The x86_64 target.
+pub(crate) static GUEST: Guest = Guest {
+    machine: "x86_64",
+    minsigstksz: 2048,
+    env_size: env::ENV_SIZE,
+    generic_abi: false,
+    open_flags: &[],
+    cpuinfo: None,
+    sp: |cpu| reg(cpu, R_ESP),
+    clone_regs: |cpu, newsp| {
+        if newsp != 0 {
+            set_reg(cpu, R_ESP, newsp);
+        }
+        set_reg(cpu, R_EAX, 0);
+    },
+    set_tls,
+    cpu_loop,
+    setup_rt_frame,
+    rt_sigreturn: do_rt_sigreturn,
+};
+
+/// `qemu-x86_64`: the model `-cpu` names.
+#[derive(Default)]
+pub(crate) struct Target {
+    model: Option<X86Cpu>,
+}
+
+impl Target {
+    fn model(&self) -> &X86Cpu {
+        self.model.as_ref().expect("the CPU is selected first")
     }
 }
 
-/// `prepare_binprm()` and the format check of `loader_exec()`: whether `file` is a regular,
-/// executable file starting with the ELF magic. Every failure is `ENOEXEC` to the user.
-fn is_exec(file: &File) -> bool {
-    use std::os::unix::fs::{FileExt, PermissionsExt};
-    let Ok(m) = file.metadata() else { return false };
-    if !m.is_file() || m.permissions().mode() & 0o111 == 0 {
-        return false;
+impl start::Target for Target {
+    fn guest(&self) -> &'static Guest {
+        &GUEST
     }
-    let mut head = [0u8; 4];
-    matches!(file.read_at(&mut head, 0), Ok(4)) && elf::is_elf(&head)
-}
 
-/// `main()` of `qemu-x86_64`.
-pub(crate) fn main(argv0: &str, args: &[String]) -> ExitCode {
-    // Signals stay blocked until the guest runs, here and in any thread started meanwhile.
-    let host_mask = host::set_mask(!0);
-    let prog = argv0.rsplit('/').next().unwrap_or(argv0);
-    let env: Vec<(String, String)> = std::env::vars_os()
-        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
-        .collect();
-    let mut stack_size = opts::DEFAULT_STACK_SIZE;
-    if let Some(cur) = host::stack_rlimit() {
-        stack_size = stack_size.max(cur);
+    fn name(&self) -> &'static str {
+        "x86_64"
     }
-    let mut o = match opts::parse("x86_64", env, args) {
-        Ok(o) => o,
-        Err(Exit::Usage(text, code)) => {
-            print!("{text}");
-            return code;
-        }
-        Err(Exit::Error(msg)) => {
-            eprintln!("{msg}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if o.stack_size == opts::DEFAULT_STACK_SIZE {
-        o.stack_size = stack_size;
-    }
-    host::reset_sigpipe();
 
-    let cpu_name = o.cpu.clone().unwrap_or_else(|| "max".to_string());
-    let (model_name, features) = match cpu_name.split_once(',') {
-        Some((m, f)) => (m.to_string(), f.to_string()),
-        None => (cpu_name.clone(), String::new()),
-    };
-    let model = X86Cpu::new(&model_name, Accel::Tcg).and_then(|mut c| {
+    fn layout(&self) -> (u64, u64) {
+        (TASK_UNMAPPED_BASE, ELF_ET_DYN_BASE)
+    }
+
+    fn select_cpu(&mut self, cpu: &str) -> Result<(), String> {
+        let (model_name, features) = cpu.split_once(',').unwrap_or((cpu, ""));
+        let mut c = X86Cpu::new(model_name, Accel::Tcg).map_err(|e| e.to_string())?;
         if !features.is_empty() {
-            c.parse_features(&features)?;
+            c.parse_features(features).map_err(|e| e.to_string())?;
         }
-        c.realize()?;
-        Ok(c)
-    });
-    let model = match model {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("{prog}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let file = match File::open(&o.exec_path) {
-        Ok(f) => f,
-        Err(e) => {
-            println!("Error while loading {}: {}", o.exec_path, crate::strerror_of(&e));
-            return ExitCode::FAILURE;
-        }
-    };
-    // real_exec_path, what /proc/self/exe names.
-    let real_exec_path = match std::fs::canonicalize(&o.exec_path) {
-        Ok(p) => p.to_string_lossy().into_owned(),
-        Err(_) => {
-            println!("Could not resolve {}", o.exec_path);
-            o.exec_path.clone()
-        }
-    };
-    if !is_exec(&file) {
-        println!("Error while loading {}: {}", o.exec_path, crate::strerror(libc::ENOEXEC));
-        return ExitCode::FAILURE;
+        c.realize().map_err(|e| e.to_string())?;
+        self.model = Some(c);
+        Ok(())
     }
 
-    let want =
-        if o.reserved_va != 0 { o.reserved_va } else { ruvm_user_common::space::DEFAULT_RESERVE };
-    let space = match GuestSpace::new(want, TASK_UNMAPPED_BASE, ELF_ET_DYN_BASE) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("{prog}: Unable to reserve guest address space: {}", crate::strerror_of(&e));
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let arch = Arch {
-        machine: EM_X86_64,
-        platform: Some("x86_64"),
-        hwcap: u64::from(cpuid(&model, 1, 0)[3]),
-    };
-    let argv: Vec<Vec<u8>> = o.args.iter().map(|a| a.clone().into_bytes()).collect();
-    let envp: Vec<Vec<u8>> = o.env.iter().map(|a| a.clone().into_bytes()).collect();
-    let exec = Exec {
-        arch,
-        filename: &o.exec_path,
-        file: &file,
-        argv: &argv,
-        envp: &envp,
-        stack_size: o.stack_size,
-        ld_prefix: &o.ld_prefix,
-        creds: creds(),
-    };
-    let info = match elf::load_elf_binary(&space, &exec) {
-        Ok(i) => i,
-        Err(e) => {
-            // error_reportf_err() and exit(-1).
-            eprintln!("{prog}: {e}");
-            return ExitCode::from(255);
-        }
-    };
-    drop(file);
-
-    let state = match initial_state(&model, &space, info.entry, info.start_stack) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let mut config = jit_config();
-    config.user_only = true;
-    // Every guest thread has a vCPU and a host thread; the first runs serial code until there
-    // is a second.
-    config.mttcg = true;
-    if let Some(mb) = o.tb_size {
-        if mb != 0 {
-            config.code_gen_buffer_size = usize::try_from(mb << 20).unwrap_or(usize::MAX);
+    fn arch(&self) -> Arch {
+        Arch {
+            machine: EM_X86_64,
+            platform: Some("x86_64"),
+            hwcap: u64::from(cpuid(self.model(), 1, 0)[3]),
+            hwcap2: None,
         }
     }
-    if o.one_insn_per_tb {
-        config.one_insn_per_tb = true;
-    }
-    let backend = ruvm_jit::host_backend(helper_registry(), config.code_gen_buffer_size);
-    let jit = Jit::new(config, backend);
 
-    let ms = MemorySystem::new();
-    let as_ = (|| {
-        let root = ms.new_container("system", 1u128 << 64)?;
-        let ram = ms.new_ram_from_block(Arc::clone(space.block()))?;
-        ms.add_subregion(root, 0, ram)?;
-        ms.address_space_init(root, "memory")
-    })();
-    let as_ = match as_ {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("{prog}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    {
-        let j = Arc::downgrade(&jit);
-        let block = Arc::clone(space.block());
-        space.set_code_hook(Box::new(move |s, l| {
-            if let Some(j) = j.upgrade() {
-                j.tb_invalidate_phys_block(&block, s, l);
-            }
-        }));
+    fn new_jit(&self, config: &dyn Fn(&mut JitConfig)) -> Arc<Jit> {
+        let mut c = jit_config();
+        config(&mut c);
+        let backend = ruvm_jit::host_backend(helper_registry(), c.code_gen_buffer_size);
+        Jit::new(c, backend)
     }
 
-    let x86 = Arc::new(X86::new(model).with_user_mode());
-    let ops = Arc::new(UserCpu { x86, space: Arc::clone(&space) });
-    let mut v = jit.create_vcpu(ops, as_, env::ENV_SIZE);
-    v.core.tcg_cflags &= !cf::PARALLEL;
-    env::load_state(&mut v.env, &state);
-    let image = Image {
-        argv,
-        stack_limit: info.stack_limit,
-        brk: info.brk,
-        start_stack: info.start_stack,
-        auxv: (info.saved_auxv, info.auxv_len),
-    };
-    let proc = Arc::new(Proc::new(
-        Arc::clone(&space),
-        real_exec_path,
-        o.uname_release.clone(),
-        o.ld_prefix.clone(),
-        image,
-    ));
-    let mut cpu = v.cpu();
-    signal::signal_init(prog);
-    let mut task = Task::new(host_mask, cpu.shared());
-    host::set_mask(task.run_mask());
-    cpu_loop(&proc, &mut task, &mut cpu);
-    // The main thread called exit with others left: it ends, and the process with the last.
-    task.exit_thread();
-    drop(v);
-    loop {
-        host::sys(libc::SYS_exit, &[0]);
+    fn create_vcpu(
+        &mut self,
+        jit: &Arc<Jit>,
+        space: &Arc<GuestSpace>,
+        as_: Arc<AddressSpace>,
+        info: &ImageInfo,
+    ) -> Result<Vcpu, String> {
+        let model = self.model.take().expect("the CPU is selected first");
+        let state = initial_state(&model, space, info.entry, info.start_stack)?;
+        let x86 = Arc::new(X86::new(model).with_user_mode());
+        let ops = Arc::new(UserCpu { x86, space: Arc::clone(space) });
+        let mut v = jit.create_vcpu(ops, as_, env::ENV_SIZE);
+        env::load_state(&mut v.env, &state);
+        Ok(v)
     }
 }

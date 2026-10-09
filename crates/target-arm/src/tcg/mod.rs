@@ -159,6 +159,7 @@ mod sve_fp;
 mod sve_helper;
 mod sysreg;
 mod translate;
+pub mod user;
 mod vec_helper;
 mod vfp;
 
@@ -435,6 +436,18 @@ impl Arm {
             self.model.id_aa64pfr1 = (self.model.id_aa64pfr1 & !0xf00) | 0x300;
         }
         self.tag_memory = Some(tags);
+        self
+    }
+
+    /// The same CPU for the user mode emulator, `CONFIG_USER_ONLY`: it runs one program at
+    /// EL0 without EL2 or EL3, its system registers read as Linux shows them to EL0, WFI is a
+    /// NOP, and the counter is the host's realtime clock. Start it from
+    /// [`user::user_reset`].
+    pub fn with_user_mode(mut self) -> Arm {
+        let f = &mut self.model.features;
+        f.user_only = true;
+        f.el2 = false;
+        f.el3 = false;
         self
     }
 

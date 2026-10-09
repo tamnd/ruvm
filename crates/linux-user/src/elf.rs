@@ -40,6 +40,8 @@ pub struct Arch {
     pub platform: Option<&'static str>,
     /// `ELF_HWCAP`.
     pub hwcap: u64,
+    /// `ELF_HWCAP2`, if the target has it.
+    pub hwcap2: Option<u64>,
 }
 
 /// The parts of `struct image_info` the loader fills in.
@@ -417,6 +419,9 @@ fn create_elf_tables(
     if arch.platform.is_some() {
         size += 2;
     }
+    if arch.hwcap2.is_some() {
+        size += 2;
+    }
     info.auxv_len = size * N;
     size += envc + argc + 2;
     size += 1;
@@ -447,6 +452,9 @@ fn create_elf_tables(
     aux(25, u_rand_bytes); // AT_RANDOM
     aux(23, creds.secure); // AT_SECURE
     aux(31, info.file_string); // AT_EXECFN
+    if let Some(h) = arch.hwcap2 {
+        aux(26, h); // AT_HWCAP2
+    }
     if u_platform != 0 {
         aux(15, u_platform); // AT_PLATFORM
     }

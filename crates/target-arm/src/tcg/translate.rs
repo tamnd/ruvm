@@ -1452,7 +1452,12 @@ impl S<'_, '_> {
             self.unallocated_encoding();
             return;
         };
-        let Some(ri) = sysreg::lookup(key, &feat) else {
+        let ri = if feat.user_only {
+            sysreg::lookup_user(key, &self.d.model).unwrap_or_else(|| sysreg::lookup(key, &feat))
+        } else {
+            sysreg::lookup(key, &feat)
+        };
+        let Some(ri) = ri else {
             // Unknown register; this might be a guest error or a QEMU unimplemented feature.
             // Without FEAT_IDST this is an uncategorized UNDEF.
             self.unallocated_encoding();
@@ -1551,6 +1556,12 @@ impl S<'_, '_> {
             Kind::Zero => {
                 if isread {
                     let t = self.c64(0);
+                    self.set_reg(rt, t);
+                }
+            }
+            Kind::Const(v) => {
+                if isread {
+                    let t = self.c64(v as i64);
                     self.set_reg(rt, t);
                 }
             }
@@ -2391,6 +2402,10 @@ impl DisasA64 for S<'_, '_> {
     }
 
     fn trans_WFI(&mut self, _a: &mut arg_disas_a6432) -> bool {
+        // WFI in user-mode emulation is a NOP, helper_wfi() returns at once.
+        if self.feat().user_only {
+            return true;
+        }
         self.b.is_jmp = DISAS_WFI;
         true
     }
@@ -2521,7 +2536,12 @@ impl DisasA64 for S<'_, '_> {
     }
 
     fn trans_BRK(&mut self, a: &mut arg_i) -> bool {
-        // gen_exception_bkpt_insn(); the debug target EL is EL1.
+        // gen_exception_bkpt_insn(); the debug target EL is EL1. FAR is UNKNOWN, so
+        // helper_exception_bkpt_insn() clears vaddress rather than leak a stale one.
+        let zero = self.c64(0);
+        let off =
+            crate::cpu::env_off(std::mem::offset_of!(crate::cpu::CpuArmState, exception_vaddress));
+        self.st_env64(zero, off);
         self.gen_exception_insn(0, EXCP_BKPT, syn_aa64_bkpt(a.imm as u32));
         true
     }

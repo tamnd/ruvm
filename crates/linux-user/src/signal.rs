@@ -69,12 +69,14 @@ pub(crate) const SEGV_ACCERR: i32 = 2;
 pub(crate) const FPE_INTDIV: i32 = 1;
 pub(crate) const TRAP_BRKPT: i32 = 1;
 pub(crate) const ILL_ILLOPN: i32 = 2;
+pub(crate) const ILL_ILLOPC: i32 = 1;
+pub(crate) const BUS_ADRALN: i32 = 1;
+pub(crate) const SEGV_MTEAERR: i32 = 8;
+pub(crate) const SEGV_MTESERR: i32 = 9;
 
 /// `SS_ONSTACK` and `SS_DISABLE`.
 const SS_ONSTACK: i32 = 1;
 const SS_DISABLE: i32 = 2;
-/// `TARGET_MINSIGSTKSZ`.
-const MINSIGSTKSZ: u64 = 2048;
 
 /// `QEMU_ERESTARTSYS`: the system call is restarted once the signal is delivered.
 pub(crate) const ERESTARTSYS: i64 = -512;
@@ -640,7 +642,7 @@ fn handle_pending_signal(
             let blocked = if t.in_sigsuspend { t.sigsuspend_mask } else { t.signal_mask };
             t.signal_mask = blocked | set;
             t.in_sigsuspend = false;
-            crate::x86_64::setup_rt_frame(space, t, cpu, sig, &sa, info, old);
+            (crate::guest::guest().setup_rt_frame)(space, t, cpu, sig, &sa, info, old);
             if sa.flags & SA_RESETHAND != 0 {
                 sigact()[sig as usize - 1].handler = SIG_DFL;
             }
@@ -735,7 +737,7 @@ pub(crate) fn restore_altstack(t: &mut Task, uss: &[u8], sp: u64) -> i64 {
             0
         }
         SS_ONSTACK | 0 => {
-            if size < MINSIGSTKSZ {
+            if size < crate::guest::guest().minsigstksz {
                 return -i64::from(libc::ENOMEM);
             }
             ss_sp

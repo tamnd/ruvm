@@ -383,6 +383,8 @@ pub(crate) enum Kind {
     },
     /// Reads as zero, writes ignored (`ARM_CP_CONST` with value 0).
     Zero,
+    /// Reads as the value (`ARM_CP_CONST`).
+    Const(u64),
     /// An operation with no effect here (`ARM_CP_NOP`).
     Nop,
     /// Read and written by [`read`] and [`write`] through helpers.
@@ -1089,6 +1091,48 @@ pub(crate) fn resolve(k: u32, el: u32, e2h: bool, feat: &ArmFeatures) -> Option<
     Some(k)
 }
 
+/// The registers a user mode CPU defines differently, `CONFIG_USER_ONLY`: the ID registers
+/// read at EL0 as Linux emulates them (`modify_arm_cp_regs()` with the fields the kernel
+/// exports), and of the generic timer only CNTFRQ_EL0 and CNTVCT_EL0. `None` means the usual
+/// [`lookup`]; `Some(None)` means the register does not exist.
+pub(crate) fn lookup_user(key_: u32, model: &ArmCpuModel) -> Option<Option<Reg>> {
+    const CNTFRQ_EL0: u32 = key(3, 3, 14, 0, 0);
+    let (op0, op1, crn, crm, op2) =
+        (key_ >> 14, (key_ >> 11) & 7, (key_ >> 7) & 0xf, (key_ >> 3) & 0xf, key_ & 7);
+    let reg = |name, value| {
+        Some(Some(Reg {
+            name,
+            key: key_,
+            access: PL0_R,
+            trap: Trap::None,
+            kind: Kind::Const(value),
+            feat: always,
+        }))
+    };
+    match (op0, op1, crn) {
+        (3, 0, 0) => match (crm, op2) {
+            (0, 0) => reg("MIDR_EL1", model.midr),
+            (0, 5) => reg("MPIDR_EL1", 0x8000_0000),
+            (0, 6) => reg("REVIDR_EL1", 0),
+            (4..=7, _) => reg("ID_AA64*", super::user::user_id_reg(model, crm, op2)),
+            _ => None,
+        },
+        (3, 3, 14) => match key_ {
+            CNTFRQ_EL0 => reg("CNTFRQ_EL0", model.cntfrq),
+            CNTVCT_EL0 => Some(Some(Reg {
+                name: "CNTVCT_EL0",
+                key: key_,
+                access: PL0_R,
+                trap: Trap::None,
+                kind: Kind::Special,
+                feat: always,
+            })),
+            _ => Some(None),
+        },
+        _ => None,
+    }
+}
+
 /// The register with encoding `key` on a CPU with `feat`, as `get_arm_cp_reginfo()` finds
 /// it. The ID register space that is not listed reads as zero at EL1.
 pub(crate) fn lookup(key_: u32, feat: &ArmFeatures) -> Option<Reg> {
@@ -1396,6 +1440,7 @@ pub(crate) fn read(cpu: &mut Cpu<'_>, key_: u32) -> u64 {
         OSLSR_EL1 => st.oslsr_el1,
         ZCR_EL1 | ZCR_EL2 | ZCR_EL3 => st.zcr_el[el_of(key_)],
         CNTPCT_EL0 => gtimer::phys_count(arm, &st),
+        CNTVCT_EL0 if f.user_only => super::user::user_cntvct(model.cntfrq),
         CNTVCT_EL0 => gtimer::virt_count(arm, &st),
         _ => panic!("no read for system register key 0x{key_:x}"),
     }
