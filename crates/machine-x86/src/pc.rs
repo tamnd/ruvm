@@ -8,7 +8,7 @@
 //! 0xf0) or one of the helpers pc.c uses to fill in the CMOS and the fw_cfg tables.
 
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ruvm_hw_core::Clock;
@@ -406,11 +406,16 @@ impl MmioOps for Port92 {
 }
 
 /// The I/O side of `PCSpkState` at port 0x61: the channel 2 gate, the speaker data bit, the
-/// channel 2 output and the refresh toggle BIOSes use for delays. There is no audio.
+/// channel 2 output and the refresh toggle BIOSes use for delays. The sound is the audio
+/// device's, which [`PcSpeaker::set_audio`] hooks up.
 pub struct PcSpeaker {
     pit: Arc<I8254>,
     state: Mutex<(u8, u8)>,
+    audio: OnceLock<SpeakerAudio>,
 }
+
+/// What a write to port 0x61 tells the speaker's voice: the channel 2 gate and the data bit.
+pub type SpeakerAudio = Box<dyn Fn(bool, bool) + Send + Sync>;
 
 impl fmt::Debug for PcSpeaker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -430,7 +435,18 @@ pub struct PcSpkVmState {
 impl PcSpeaker {
     /// `pcspk_realizefn()` with the `pit` link set.
     pub fn new(pit: Arc<I8254>) -> Arc<PcSpeaker> {
-        Arc::new(PcSpeaker { pit, state: Mutex::new((0, 0)) })
+        Arc::new(PcSpeaker { pit, state: Mutex::new((0, 0)), audio: OnceLock::new() })
+    }
+
+    /// The PIT whose channel 2 the speaker plays.
+    pub fn pit(&self) -> &Arc<I8254> {
+        &self.pit
+    }
+
+    /// Gives the speaker its voice, which hears every write to the port. Only the first
+    /// call counts.
+    pub fn set_audio(&self, audio: SpeakerAudio) {
+        let _ = self.audio.set(audio);
     }
 
     /// The migration state.
@@ -464,8 +480,12 @@ impl MmioOps for PcSpeaker {
     /// `pcspk_io_write()`.
     fn write(&self, _cx: &AccessCtx, _offset: u64, _size: AccessSize, value: u64) -> MemResult<()> {
         let gate = (value & 1) as i32;
-        self.state.lock().unwrap_or_else(PoisonError::into_inner).0 = ((value >> 1) & 1) as u8;
+        let data_on = ((value >> 1) & 1) as u8;
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).0 = data_on;
         self.pit.set_gate(2, gate);
+        if let Some(audio) = self.audio.get() {
+            audio(gate != 0, data_on != 0);
+        }
         Ok(())
     }
 

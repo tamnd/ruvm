@@ -18,6 +18,7 @@ ruvm-audio.workspace = true
 ruvm-base.workspace = true
 ruvm-hw-core.workspace = true
 ruvm-hw-pci.workspace = true
+ruvm-hw-timer.workspace = true
 ruvm-mem.workspace = true
 ruvm-qapi.workspace = true
 
