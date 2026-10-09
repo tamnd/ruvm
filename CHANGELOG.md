@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.5.3
+
+This patch finishes threads and /proc for M7 and brings in two more sound cards and two more displays for M6.
+
+For M7: `qemu-x86_64` now runs threaded programs (#207). `clone` with `CLONE_VM` gives each guest thread its own vCPU and host thread, with `set_tid_address`, the futex wake on thread exit and `exit` against `exit_group` as in QEMU, and mmap and brk flush the other threads' TLBs. `/proc/self/maps`, `smaps`, `stat`, `auxv` and `cmdline` are written the way QEMU writes them (#209), and shared anonymous memory stays shared across fork (#211). A pthread test, coreutils `sort --parallel` with up to 8 threads and the /proc test all match QEMU 11.1's `qemu-x86_64`. Guest code is still about 3 times slower than QEMU here because user mode goes through the softmmu TLB, and a direct guest memory path is planned.
+
+For M6: the PC speaker plays through `-machine pcspk-audiodev=` (#208), and the Sound Blaster 16 is in with `-device sb16` and `-audio model=sb16`, together with the two i8257 DMA controllers (#212). `-display dbus` is in behind the `ui-dbus` cargo feature over zbus (#210), and `-display cocoa` behind `ui-cocoa` over the objc2 crates (#213). The Cocoa display has only been cross checked for aarch64-apple-darwin from Linux and has not run on a Mac yet.
+
 ## 0.5.2
 
 This patch is mostly M6, with the first sound cards and two local display windows, plus signal delivery for M7.
