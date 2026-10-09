@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.5.2
+
+This patch is mostly M6, with the first sound cards and two local display windows, plus signal delivery for M7.
+
+For M6: AC97 is in with `-device AC97` and `-audio model=ac97` (#201), and so is Intel HD Audio as `intel-hda` and `ich9-intel-hda` with the `hda-duplex`, `hda-output` and `hda-micro` codecs and `-audio model=hda` (#204). A small guest that drives the HDA controller and plays a fixed PCM gives the same serial output and a byte for byte identical wav file under ruvm and QEMU 11.1, across 19 setups covering every codec, five stream formats, resampling, ich9 and MSI. 8 bit streams are left out of that check because QEMU's own output changes from run to run there. The audio backends now run on the machine's virtual clock and stop with the VM. `-display sdl` is in behind the `ui-sdl` cargo feature (#202), and `-display gtk` on GTK 4 behind `ui-gtk` (#205). Under Xvfb the window shows the same pixels as a QMP screendump, the captions and window sizes follow QEMU's, and keys, pointer moves, clicks, the wheel and the hotkeys reach the guest as the same bytes QEMU gives it. GTK 4 can't grab or warp the pointer, and there is no GL, VTE console or clipboard yet.
+
+For M7: `qemu-x86_64` now delivers signals the way QEMU's linux-user does (#203), with the kernel's rt_sigframe and the FXSAVE or XSAVE image, rt_sigreturn, sigaltstack, signalfd, the rt_sig* calls, and QEMU's safe_syscall so a signal that arrives right before a blocking call is never slept through. CPU faults turn into SIGSEGV, SIGBUS, SIGFPE, SIGILL and SIGTRAP with QEMU's si_code and address. Threads and the /proc emulation are next.
+
 ## 0.5.1
 
 This patch starts M7 with a working `qemu-x86_64`, and moves M6 along with virtio-gpu, a VNC server, the input layer and the audio core.
