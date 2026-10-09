@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.5.0
+
+This release closes M5, migration interop. Live migration between ruvm and QEMU 11.1 now works in both directions on q35 and microvm at machine versions 10.2, 11.0 and 11.1, with a memory dirtying guest and an I/O guest, and the guest's checksummed state checks out after every hop. That is all 16 runs of the matrix.
+
+For M5: the last failures in that matrix were not in virtio-net as they first looked. ruvm's TCG TSC counted host nanoseconds where QEMU counts host TSC ticks, so a guest that calibrated its TSC on QEMU ran at about a third of its speed once it came back to ruvm. The TSC now counts host ticks, stops while the guest is stopped and carries its value across migration as QEMU's does (#192). Loading RAM on the destination is much faster, since pages are read, written and checked for zero a word at a time and guest RAM uses transparent huge pages as on QEMU (#193). The pause for an idle 1 GiB guest from QEMU to ruvm went from 929 ms to 73 ms on the same host, against 4 ms for QEMU to QEMU, and `docs/migration-performance.md` records downtime and total time for every direction (#191). QEMU's `tests/functional/test_migration.py` passes 3 of 3 against ruvm, and the broader `migration-test --full` qtest passes 40 of 64 (#190). The rest of that one needs postcopy blocktime, COLO, zstd, x-ignore-shared and guest suspend, which are not in yet. #190 also fixes a hang in migration cancel, adds switchover-ack, and makes `fd:` and `/dev/fdset/N` channels work with `getfd` and `add-fd`. `-accel kvm,dirty-ring-size=` now harvests the dirty ring the way QEMU does (#189). That code has only run in unit tests because none of our hosts has `/dev/kvm`, and running it on a real KVM host is tracked in #194.
+
+For M6: the first display slice is in, with the ui console, QMP `screendump` in ppm and png, the standard VGA, `bochs-display` and `ramfb` on q35 and arm virt (#188). 51 screendumps taken under QEMU and ruvm with the same guests are identical pixel for pixel.
+
 ## 0.4.6
 
 This patch is all M6 and finishes the Arm boards. arm virt gets ACPI and the SMMUv3, and there is a new sbsa-ref board.
