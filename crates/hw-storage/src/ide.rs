@@ -72,6 +72,9 @@ pub struct DriveConfig {
     pub version: Option<String>,
     /// Whether the volatile write cache starts enabled. QEMU's default is on.
     pub write_cache: bool,
+    /// The `cyls`, `heads` and `secs` of a hard disk, when they were set. Without them the
+    /// geometry is guessed from the size, as `blkconf_geometry()` does when all three are 0.
+    pub geometry: Option<(u32, u32, u32)>,
 }
 
 impl DriveConfig {
@@ -83,6 +86,7 @@ impl DriveConfig {
             model: None,
             version: None,
             write_cache: true,
+            geometry: None,
         }
     }
 
@@ -249,8 +253,11 @@ impl IdeDrive {
         default_serial: String,
     ) -> Self {
         let nb_sectors = blk.as_ref().map_or(0, |b| b.len() / SECTOR_SIZE);
-        // guess_chs_for_size(). The MBR based guess is not ported.
-        let cylinders = (nb_sectors / (16 * 63)).clamp(2, 16383) as u32;
+        // blkconf_geometry(), and guess_chs_for_size() when no geometry was given. The MBR
+        // based guess is not ported.
+        let (cylinders, heads, sectors) = config
+            .geometry
+            .unwrap_or_else(|| ((nb_sectors / (16 * 63)).clamp(2, 16383) as u32, 16, 63));
         let model = match config.kind {
             DriveKind::Hd => "QEMU HARDDISK",
             DriveKind::Cd => "QEMU DVD-ROM",
@@ -260,10 +267,10 @@ impl IdeDrive {
             blk,
             nb_sectors,
             cylinders,
-            heads: 16,
-            sectors: 63,
-            drive_heads: 16,
-            drive_sectors: 63,
+            heads,
+            sectors,
+            drive_heads: heads,
+            drive_sectors: sectors,
             serial: config.serial.clone().unwrap_or(default_serial),
             model: config.model.clone().unwrap_or_else(|| model.to_string()),
             version: config.version.clone().unwrap_or_else(|| "2.5+".to_string()),

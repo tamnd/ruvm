@@ -49,6 +49,8 @@ pub mod write_tracking;
 pub mod xbzrle;
 
 pub use channel::{Channel, FdResolver, MigrationAddr, parse_input, parse_uri};
+#[cfg(unix)]
+pub use channel::{FdsetOpener, set_fdset_opener};
 pub use global_state::GlobalState;
 pub use ram::{NoHooks, RamHooks, RamSection, RamStats};
 pub use savevm::{

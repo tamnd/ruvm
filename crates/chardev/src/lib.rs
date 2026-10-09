@@ -8,13 +8,13 @@
 //! own, until it detaches. A chardev takes one frontend at a time, except for a mux, which takes
 //! up to four.
 //!
-//! The backends are `null`, `socket` on Unix and TCP sockets, `file`, `pipe`, `stdio`, `pty`
-//! on Unix, `ringbuf` (also called `memory`) and `mux`. For a backend that is not a socket the
-//! frontend gets one connection for as long as the backend is open. What a frontend writes goes
-//! through [`Attachment::write_all`] or the connection's writer. [`opts`] turns `-chardev` and
-//! the old compat strings into backends.
+//! The backends are `null`, `socket` on Unix and TCP sockets and on a socket passed in by
+//! number, `file`, `pipe`, `stdio`, `pty` on Unix, `ringbuf` (also called `memory`) and `mux`.
+//! For a backend that is not a socket the frontend gets one connection for as long as the
+//! backend is open. What a frontend writes goes through [`Attachment::write_all`] or the
+//! connection's writer. [`opts`] turns `-chardev` and the old compat strings into backends.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::fmt;
 use std::io;
@@ -31,6 +31,8 @@ use ruvm_qapi::types::{
 };
 
 pub mod conn;
+#[cfg(unix)]
+mod fd;
 mod file;
 mod local;
 pub mod mux;

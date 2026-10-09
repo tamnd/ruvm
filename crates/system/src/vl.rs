@@ -14,7 +14,8 @@
 //! - Without `-accel` or `-machine accel=`, a build with both KVM and TCG tries `kvm:tcg`, so
 //!   KVM is used where it works and TCG otherwise (after QEMU's "falling back to tcg"). QEMU
 //!   picks `tcg:kvm` unless its program name ends in `kvm`.
-//! - The x86 boards and virt do not run under qtest yet.
+//! - virt does not run under qtest yet. The x86 boards take `-qtest` on kvm or tcg, but do
+//!   not run on the qtest accelerator.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,7 +43,9 @@ use ruvm_qapi::types::{
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit};
 use ruvm_qapi::{QDict, QValue, json};
-use ruvm_qom::{Registry, type_print_class_properties, user_creatable_print_types};
+use ruvm_qom::{
+    Registry, TYPE_OBJECT, TypeInfo, type_print_class_properties, user_creatable_print_types,
+};
 
 use crate::arm;
 use crate::options::{Opt, arch_available, help_text, lookup_opt};
@@ -70,6 +73,16 @@ fn accels(target: &str) -> &'static [&'static str] {
         (true, _) => &["kvm", "tcg", "qtest"],
         (false, true) => &["tcg", "qtest"],
         (false, false) => &["qtest"],
+    }
+}
+
+/// The accelerator classes this build has for `target`, under the abstract `accel`, as the
+/// accel type_init() functions register them. `qtest_has_accel()` looks for them with
+/// `qom-list-types`.
+fn register_accel_types(registry: &Registry, target: &str) {
+    registry.register(TypeInfo::new("accel").parent(TYPE_OBJECT).abstract_());
+    for a in accels(target) {
+        registry.register(TypeInfo::new(format!("{a}-accel")).parent("accel"));
     }
 }
 
@@ -331,6 +344,7 @@ fn run(p: &Personality<'_>, args: &[String]) -> Flow<u8> {
     ruvm_hw_core::register_types(&registry);
     qtest::register_types(&registry);
     ruvm_chardev::qom::register_types(&registry);
+    register_accel_types(&registry, p.target);
     chardevs.set_registry(&registry);
     chardevs.hold();
     let mut cfg = Config::new();
@@ -975,7 +989,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         machine_initialized: AtomicBool::new(false),
         qtest: cfg.qtest.is_some(),
     });
-    qmp.register(|cmds| qmp_cmds::register(&vm, cmds));
+    qmp.register(|cmds| qmp_cmds::register(&vm, p.target, cmds));
     if cfg.incoming.is_some() {
         runstate.set(RunState::Inmigrate);
     }
@@ -1083,13 +1097,14 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         (None, None) => unreachable!("a QOM machine was created"),
     };
     let accel = configure_accelerators(p.target, kind, &mut cfg)?;
-    if (kind.is_some() || virt) && (matches!(accel, Accel::Qtest) || cfg.qtest.is_some()) {
+    let on_qtest = matches!(accel, Accel::Qtest);
+    if (kind.is_some() && on_qtest) || (virt && (on_qtest || cfg.qtest.is_some())) {
         return Err(fail_msg(
             "this machine type is only supported with -accel kvm or tcg by ruvm yet",
         ));
     }
     let clock = VirtualClock::manual(ruvm_base::ClockType::Virtual);
-    if cfg.qtest.is_some() {
+    if on_qtest {
         // monitor_qapi_event_init() throttles events on the virtual clock under qtest.
         let c = clock.clone();
         qmp.set_event_clock(move || c.get_ns());
@@ -1179,6 +1194,14 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
                     ));
                 }
                 keep = start_x86(&vm, &cfg, accel, kind, opts, &drives, &serial_hds, keep)?;
+                // qtest_server_init() on a board a real accelerator runs.
+                if let (Some(chrdev), Some(board)) = (&cfg.qtest, &keep.board) {
+                    let (memory, io) = board.address_spaces();
+                    let log = cfg.qtest_log.as_deref();
+                    let a = qtest::server_init_board(&chardevs, chrdev, log, p.target, memory, io)
+                        .map_err(|e| fail(&e))?;
+                    keep._qtest = Some(a);
+                }
             }
             _ => keep._accel = Some(accel),
         }

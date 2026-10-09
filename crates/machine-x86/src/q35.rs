@@ -86,7 +86,7 @@ use crate::pc::{
     ACPI_BUILD_PCI_IRQS, FW_CFG_ACPI_TABLES, FW_CFG_HPET, FW_CFG_IRQ0_OVERRIDE, GIB, GsiHook,
     GsiHookSlot, GsiState, HdGeometry, ISA_BIOS_MAX, IoportF0, MIB, PC_FW_DATA, PC_ROM_MIN_VGA,
     PC_ROM_SIZE, PCSPK_IO_BASE, PORT92_IO_BASE, PcSpeaker, Port92, REG_EQUIPMENT_BYTE,
-    UnassignedIo, WeakDma, boot_order_nibbles, cmos_init_disks, cmos_set_memory, err,
+    UnassignedIo, WeakDma, boot_order_nibbles, cmos_init_disks, cmos_set_memory, err, hd_geometry,
     hd_geometry_guess, pci_hole64_start, rtc_ref_date, rtc_set_cpus_count, set_boot_dev,
 };
 use crate::pflash::{FlashDrive, Pflash, PflashBacking, pc_system_flash_map};
@@ -599,6 +599,7 @@ fn acpi_build_update(src: &AcpiSource, cache: &Mutex<AcpiCache>, which: AcpiBlob
 struct PluggedDrive {
     kind: DriveKind,
     sectors: u64,
+    geometry: Option<(u32, u32, u32)>,
 }
 
 /// A q35 board.
@@ -1274,11 +1275,11 @@ impl Q35 {
         if index >= ICH9_AHCI_PORTS {
             return Err(format!("machine type does not support if=ide,bus={index},unit=0"));
         }
-        let kind = config.kind;
+        let (kind, geometry) = (config.kind, config.geometry);
         let sectors = blk.as_ref().map_or(0, |b| b.len() / 512);
         ahci.attach_drive(index, config, blk).map_err(err)?;
         self.drives.lock().unwrap_or_else(PoisonError::into_inner)[index] =
-            Some(PluggedDrive { kind, sectors });
+            Some(PluggedDrive { kind, sectors, geometry });
         Ok(())
     }
 
@@ -1400,7 +1401,10 @@ impl Q35 {
         // idebus[0] and idebus[1] are AHCI ports 0 and 1, each with one unit.
         let drives = *self.drives.lock().unwrap_or_else(PoisonError::into_inner);
         let geometry = |port: usize| -> Option<HdGeometry> {
-            drives[port].filter(|d| d.kind == DriveKind::Hd).map(|d| hd_geometry_guess(d.sectors))
+            drives[port].filter(|d| d.kind == DriveKind::Hd).map(|d| match d.geometry {
+                Some((c, h, s)) => hd_geometry(c, h, s),
+                None => hd_geometry_guess(d.sectors),
+            })
         };
         let hd = [geometry(0), None, geometry(1), None];
         cmos_init_disks(s, &hd);

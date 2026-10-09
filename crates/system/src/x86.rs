@@ -45,21 +45,22 @@ use ruvm_machine_x86::debugcon::{
     DEBUGCON_DEFAULT_IOBASE, DEBUGCON_DEFAULT_READBACK, DebugconConfig, IsaDebugcon,
     TYPE_ISA_DEBUGCON,
 };
+use ruvm_machine_x86::microvm::MICROVM_MAX_CPUS;
 use ruvm_machine_x86::migration::x86_savevm;
 use ruvm_machine_x86::pflash::raw_block_length;
-use ruvm_machine_x86::q35::{CpuIdent, PflashDrive};
+use ruvm_machine_x86::q35::{CpuIdent, PflashDrive, Q35_MAX_CPUS};
 use ruvm_machine_x86::run_event::{EventHandler, GuestEvent, ShutdownReason};
 use ruvm_machine_x86::tcg_run::{TCG_SMM_AVAILABLE, TcgCpuModel, TcgMachine, TcgRunConfig};
 use ruvm_machine_x86::{
     BoardKind, BoardSpec, FileBackend, FirmwareSearch, KernelFiles, MicrovmProps, PflashBacking,
     Q35Props, X86Board, build_board,
 };
-use ruvm_mem::RamBlock;
+use ruvm_mem::{AddressSpace, RamBlock};
 use ruvm_migration::Migration;
 use ruvm_qapi::events::{event_guest_panicked, event_reset};
 use ruvm_qapi::opts::{QemuOptsList, is_help_option};
 use ruvm_qapi::types::{
-    GuestPanicAction, GuestPanickedArg, MemorySizeConfiguration, ResetArg, RunState,
+    GuestPanicAction, GuestPanickedArg, MachineInfo, MemorySizeConfiguration, ResetArg, RunState,
     SMPConfiguration, ShutdownCause,
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, StringInputVisitor, Visit, Visitor, VisitorExt};
@@ -71,6 +72,33 @@ use crate::vl::Vm;
 /// Whether `target` is one the x86 boards exist for.
 pub(crate) fn is_x86(target: &str) -> bool {
     matches!(target, "x86_64" | "i386")
+}
+
+/// The `qmp_query_machines()` entries of the x86 boards, with the values QEMU gives them.
+/// The boards carry no compat properties of their own, so the list asked for with
+/// `compat-props` is empty.
+pub(crate) fn machine_infos(target: &str, compat_props: bool) -> Vec<MachineInfo> {
+    // TARGET_DEFAULT_CPU_TYPE
+    let cpu_type = if target == "x86_64" { "qemu64-x86_64-cpu" } else { "qemu32-i386-cpu" };
+    X86_BOARDS
+        .iter()
+        .map(|&(name, alias, _)| {
+            let microvm = name == "microvm";
+            MachineInfo {
+                name: name.into(),
+                alias: alias.map(Into::into),
+                is_default: None,
+                cpu_max: (if microvm { MICROVM_MAX_CPUS } else { Q35_MAX_CPUS }).into(),
+                hotpluggable_cpus: !microvm,
+                numa_mem_supported: false,
+                deprecated: false,
+                default_cpu_type: Some(cpu_type.into()),
+                default_ram_id: Some(if microvm { "microvm.ram" } else { "pc.ram" }.into()),
+                acpi: true,
+                compat_props: compat_props.then(Vec::new),
+            }
+        })
+        .collect()
 }
 
 /// The `-machine help` lines of the x86 boards, as (sort key, line) pairs. An alias gets its
@@ -808,6 +836,33 @@ pub(crate) struct ScsiPlug {
     pub loc: Option<Location>,
 }
 
+/// `TYPE_IDE_HD`.
+const TYPE_IDE_HD: &str = "ide-hd";
+
+/// The IDE buses of q35, one for each port of its AHCI controller.
+const Q35_IDE_BUSES: u32 = 6;
+
+/// An `ide-hd` to plug on a port of the q35 AHCI controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IdeHdPlug {
+    /// The AHCI port, whose IDE bus is `ide.N`.
+    pub port: u32,
+    /// Index into the drives.
+    pub drive: usize,
+    /// `cyls`, `heads` and `secs`, when they were set.
+    pub geometry: Option<(u32, u32, u32)>,
+    pub serial: Option<String>,
+}
+
+/// An `ide-hd` with its bus found and its properties set, not yet realized.
+struct IdeHdDevice {
+    bus: u32,
+    unit: Option<u32>,
+    drive: Option<usize>,
+    chs: (u32, u32, u32),
+    serial: Option<String>,
+}
+
 /// The ISA devices `-device` knows, with their properties.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IsaModel {
@@ -834,6 +889,8 @@ pub(crate) struct Plan {
     pub ide: Vec<(u32, usize)>,
     /// The empty CD-ROM drive q35 gets by default at IDE index 2.
     pub default_cdrom: Option<u32>,
+    /// The `ide-hd` devices, which come after the board's own drives.
+    pub ide_hd: Vec<IdeHdPlug>,
     /// The virtio devices, `-device` first and then the ones `-drive if=virtio` adds.
     pub virtio: Vec<Plug>,
     /// The ISA devices of `-device`, in order.
@@ -848,6 +905,7 @@ enum Planned {
     Virtio(Plug),
     Isa(IsaPlug),
     ScsiDisk(ScsiPlug),
+    IdeHd(IdeHdDevice),
     Console,
     Display(crate::display::DisplayPlug),
 }
@@ -922,9 +980,16 @@ pub(crate) fn plan(
                 used.insert(i);
             }
         }
-        // default_drive(default_cdrom, ..., IF_IDE, 2, CDROM_OPTS)
+        // default_drive(default_cdrom, ..., IF_IDE, 2, CDROM_OPTS), which default_driver_check()
+        // turns off for a disk or CD-ROM device on the command line.
         let taken = drives.iter().any(|d| d.iface == DriveIf::Ide && d.bus == 2 && d.unit == 0);
-        if has_defaults && !taken {
+        let disk_device = devices.iter().any(|(arg, _)| {
+            matches!(
+                device_driver(arg).as_deref(),
+                Some("ide-cd" | "ide-hd" | "scsi-cd" | "scsi-hd")
+            )
+        });
+        if has_defaults && !taken && !disk_device {
             p.default_cdrom = Some(2);
         }
     }
@@ -965,6 +1030,11 @@ pub(crate) fn plan(
                 };
                 ctrl.disks.push(disk);
             }
+            Planned::IdeHd(dev) => {
+                let plug =
+                    realize_ide_hd(&p, drives, dev).map_err(|e| vec![Located::new(loc, e)])?;
+                p.ide_hd.push(plug);
+            }
         }
     }
 
@@ -992,6 +1062,13 @@ pub(crate) fn plan(
     Ok(p)
 }
 
+/// The `driver` of a `-device` argument, or `None` if it does not parse; `plan_device()`
+/// reports that.
+fn device_driver(arg: &str) -> Option<String> {
+    let mut list = QemuOptsList::new("device", &[]).with_implied_opt_name("driver");
+    list.parse(arg, true).ok()?.get("driver").map(str::to_string)
+}
+
 fn plan_device(
     kind: Option<BoardKind>,
     drives: &[Drive],
@@ -1012,6 +1089,9 @@ fn plan_device(
     }
     if driver == TYPE_SCSI_HD {
         return plan_scsi_hd(drives, used, opts, loc).map(Planned::ScsiDisk);
+    }
+    if driver == TYPE_IDE_HD {
+        return plan_ide_hd(kind, drives, used, opts, loc).map(Planned::IdeHd);
     }
     if driver == TYPE_VIRTCONSOLE {
         if let Some((k, _)) = opts.iter().find(|(k, _)| !matches!(*k, "driver" | "id" | "bus")) {
@@ -1101,16 +1181,7 @@ fn plan_device(
             return Err(Located::new(loc, "drive property not set"));
         };
         if !used.insert(i) {
-            let d = &drives[i];
-            let msg = if d.iface == DriveIf::None || d.iface == DriveIf::Virtio {
-                format!("Drive '{}' is already in use by another device", d.id)
-            } else {
-                format!(
-                    "Drive '{}' is already in use because it has been automatically connected to another device (did you need 'if=none' in the drive options?)",
-                    d.id
-                )
-            };
-            return Err(Located::new(loc, msg));
+            return Err(Located::new(loc, drive_in_use(&drives[i])));
         }
         if drives[i].file.is_none() {
             return Err(Located::new(loc, "Device needs media, but drive is empty"));
@@ -1197,6 +1268,119 @@ fn plan_scsi_hd(
         return Err(Located::new(loc, "Device needs media, but drive is empty"));
     }
     Ok(disk)
+}
+
+/// The error of `blk_attach_dev()` for a drive that already has a device.
+fn drive_in_use(d: &Drive) -> String {
+    if d.iface == DriveIf::None || d.iface == DriveIf::Virtio {
+        format!("Drive '{}' is already in use by another device", d.id)
+    } else {
+        format!(
+            "Drive '{}' is already in use because it has been automatically connected to another device (did you need 'if=none' in the drive options?)",
+            d.id
+        )
+    }
+}
+
+/// An `ide-hd` up to its realize: `qdev_device_add()` finds the bus and then sets the `drive`,
+/// `unit`, `cyls`, `heads`, `secs`, `serial` and `id` properties in order. With no bus named,
+/// `qbus_find_recursive()` takes the first IDE bus among the controller's child buses, which are
+/// listed newest first, and an IDE bus never counts as full: that is `ide.5` on q35 every time.
+fn plan_ide_hd(
+    kind: Option<BoardKind>,
+    drives: &[Drive],
+    used: &mut HashSet<usize>,
+    opts: &ruvm_qapi::opts::QemuOpts,
+    loc: &Option<Location>,
+) -> std::result::Result<IdeHdDevice, Located> {
+    let q35 = kind == Some(BoardKind::Q35);
+    let bus = match opts.get("bus") {
+        None if q35 => Q35_IDE_BUSES - 1,
+        None => {
+            return Err(Located::new(
+                loc,
+                format!("No 'IDE' bus found for device '{TYPE_IDE_HD}'"),
+            ));
+        }
+        Some(b) => match (0..Q35_IDE_BUSES).find(|n| format!("ide.{n}") == b) {
+            Some(n) if q35 => n,
+            _ if q35 && b == "pcie.0" => {
+                return Err(Located::new(
+                    loc,
+                    format!("Device '{TYPE_IDE_HD}' can't go on PCIE bus"),
+                ));
+            }
+            _ => return Err(Located::new(loc, format!("Bus '{b}' not found"))),
+        },
+    };
+    let mut dev = IdeHdDevice { bus, unit: None, drive: None, chs: (0, 0, 0), serial: None };
+    let num = |k: &str, v: &str| prop_u32(k, v).map_err(|e| Located(loc.clone(), e));
+    for (k, v) in opts.iter() {
+        match k {
+            "driver" | "bus" | "id" => {}
+            "drive" => {
+                let Some(i) = drives.iter().position(|d| d.id == v) else {
+                    return Err(Located::new(
+                        loc,
+                        format!("Property '{TYPE_IDE_HD}.drive' can't find value '{v}'"),
+                    ));
+                };
+                if !used.insert(i) {
+                    return Err(Located::new(loc, drive_in_use(&drives[i])));
+                }
+                dev.drive = Some(i);
+            }
+            "unit" => dev.unit = Some(num(k, v)?),
+            "cyls" => dev.chs.0 = num(k, v)?,
+            "heads" => dev.chs.1 = num(k, v)?,
+            "secs" => dev.chs.2 = num(k, v)?,
+            "serial" => dev.serial = Some(v.to_string()),
+            _ => {
+                return Err(Located::new(loc, format!("Property '{TYPE_IDE_HD}.{k}' not found")));
+            }
+        }
+    }
+    Ok(dev)
+}
+
+/// `ide_qdev_realize()` and `ide_dev_initfn()` for an `ide-hd` on q35, where each IDE bus has
+/// one unit. The board's own drives are already on their buses.
+fn realize_ide_hd(
+    p: &Plan,
+    drives: &[Drive],
+    dev: IdeHdDevice,
+) -> std::result::Result<IdeHdPlug, String> {
+    let taken = p.ide.iter().any(|&(port, _)| port == dev.bus)
+        || p.default_cdrom == Some(dev.bus)
+        || p.ide_hd.iter().any(|d| d.port == dev.bus);
+    let unit = dev.unit.unwrap_or(u32::from(taken));
+    if unit >= 1 {
+        return Err(format!("Can't create IDE unit {unit}, bus supports only 1 units"));
+    }
+    if taken {
+        return Err(format!("IDE unit {unit} is in use"));
+    }
+    let Some(drive) = dev.drive else {
+        return Err("No drive specified".to_string());
+    };
+    // blkconf_geometry() with the limits of ide_dev_initfn().
+    let (cyls, heads, secs) = dev.chs;
+    let geometry = (dev.chs != (0, 0, 0)).then_some(dev.chs);
+    if geometry.is_some() {
+        if !(1..=65535).contains(&cyls) {
+            return Err("cyls must be between 1 and 65535".to_string());
+        }
+        if !(1..=16).contains(&heads) {
+            return Err("heads must be between 1 and 16".to_string());
+        }
+        if !(1..=255).contains(&secs) {
+            return Err("secs must be between 1 and 255".to_string());
+        }
+    }
+    if drives[drive].file.is_none() {
+        return Err("Device needs media, but drive is empty".to_string());
+    }
+    Ok(IdeHdPlug { port: dev.bus, drive, geometry, serial: dev.serial })
 }
 
 /// A `uint32` qdev property from its command line string, with QEMU's errors.
@@ -1325,9 +1509,16 @@ enum RunningMachine {
 pub(crate) struct Running {
     machine: RunningMachine,
     _attachments: Vec<Attachment>,
+    /// `address_space_memory` and `address_space_io`.
+    spaces: (Arc<AddressSpace>, Arc<AddressSpace>),
 }
 
 impl Running {
+    /// The system memory and I/O address spaces of the board.
+    pub(crate) fn address_spaces(&self) -> (Arc<AddressSpace>, Arc<AddressSpace>) {
+        self.spaces.clone()
+    }
+
     /// Stops the vCPU and timer threads.
     pub(crate) fn quit(&self) {
         match &self.machine {
@@ -1592,6 +1783,17 @@ fn build(
     if let Some(port) = p.default_cdrom {
         attach_ide(&board, port, DriveConfig::cdrom(), None).map_err(|e| one(Located::bare(e)))?;
     }
+    for plug in &p.ide_hd {
+        let d = &drives[plug.drive];
+        let blk = open_drive(d).map_err(|e| one(Located::new(&d.loc, e)))?;
+        let config = DriveConfig {
+            serial: plug.serial.clone(),
+            geometry: plug.geometry,
+            ..DriveConfig::hd()
+        };
+        attach_ide(&board, plug.port, config, Some(Arc::new(blk)))
+            .map_err(|e| one(Located::new(&d.loc, e)))?;
+    }
     let net = Arc::new(Network::new(&cmd.netdevs, &clock).map_err(one)?);
     let env = ClassEnv { drives, net: &net, ram_size: board.ram_size() };
     // pc_vga_init() comes before the -device functions, which take slots in order.
@@ -1782,6 +1984,7 @@ pub(crate) fn start_board_tcg(
     };
     let machine_type = opts.machine_type;
     let built = build(vm, accel, kind, opts, cmd, drives, serial_hds)?;
+    let spaces = (built.board.memory_as().clone(), built.board.io_as().clone());
     let cfg = TcgRunConfig { no_reboot: cmd.no_reboot, tcg, backend: None };
     let (machine, warnings) =
         TcgMachine::new(built.board, &cpu, built.clocks, &cfg, event_handler(vm)).map_err(one)?;
@@ -1792,7 +1995,8 @@ pub(crate) fn start_board_tcg(
     let machine = Arc::new(machine);
     set_cpu_hook(vm, &machine, net, TcgMachine::start, TcgMachine::pause);
     init_migration(vm, &machine, machine_type, cmd.uuid).map_err(one)?;
-    Ok(Running { machine: RunningMachine::Tcg(machine), _attachments: built.attachments })
+    let machine = RunningMachine::Tcg(machine);
+    Ok(Running { machine, _attachments: built.attachments, spaces })
 }
 
 /// `migration_object_init()` and the `register_savevm_live()` and `vmstate_register()` calls of
@@ -1822,8 +2026,44 @@ fn init_migration(
     )
     .with_snapshot_hooks(hooks);
     let m = Migration::new(Arc::new(Mutex::new(q.savevm)), Some(q.ram_stats), Arc::new(host));
+    #[cfg(unix)]
+    monitor_fds(&m, &vm.qmp);
     let _ = vm.migration.set(m);
     Ok(())
+}
+
+/// Where `fd:` channels and `/dev/fdset/N` files of a migration come from: the descriptors
+/// `getfd` gave the monitor whose command is running, and the fd sets of `add-fd`.
+#[cfg(unix)]
+fn monitor_fds(m: &Migration, qmp: &Arc<ruvm_monitor::Qmp>) {
+    use std::os::fd::AsRawFd;
+
+    let w = Arc::downgrade(qmp);
+    m.set_fd_resolver(Arc::new(move |name: &str| {
+        // monitor_fd_param(), where monitor_cur() is the monitor the dispatcher serves.
+        let mon = w
+            .upgrade()
+            .and_then(|qmp| qmp.monitors().into_iter().find(|mon| qmp.is_servicing(mon)));
+        match mon {
+            Some(mon) if !name.starts_with(|c: char| c.is_ascii_digit()) => {
+                mon.named_fds().take(name)
+            }
+            // A number is a descriptor the process inherited, which ruvm does not take over.
+            _ => Err(Error::generic(format!("Invalid file descriptor number '{name}'"))),
+        }
+    }));
+    let w = Arc::downgrade(qmp);
+    ruvm_migration::set_fdset_opener(Arc::new(move |id, flags| {
+        let Some(qmp) = w.upgrade() else {
+            return Err(Error::generic(format!("Failed to find fdset /dev/fdset/{id}")));
+        };
+        let mut sets = qmp.fdsets();
+        let fd = sets.dup_fd_add(id, flags)?;
+        // Nothing tells the monitor when the migration closes the duplicate, so the set does
+        // not count it as in use, and removing the members ends the set at once.
+        sets.dup_fd_remove(fd.as_raw_fd());
+        Ok(fd)
+    }));
 }
 
 /// The KVM side, Linux on x86_64 only.
@@ -1906,13 +2146,15 @@ mod kvm {
             cpu: cpu.ident(),
         };
         let built = build(vm, board_accel, kind, opts, cmd, drives, serial_hds)?;
+        let spaces = (built.board.memory_as().clone(), built.board.io_as().clone());
         let cfg = KvmRunConfig { no_reboot: cmd.no_reboot };
         let machine =
             KvmMachine::new(accel, built.board, &cpu, built.clocks, &cfg, event_handler(vm))
                 .map_err(one)?;
         let machine = Arc::new(machine);
         set_cpu_hook(vm, &machine, built.net, KvmMachine::start, KvmMachine::pause);
-        Ok(Running { machine: RunningMachine::Kvm(machine), _attachments: built.attachments })
+        let machine = RunningMachine::Kvm(machine);
+        Ok(Running { machine, _attachments: built.attachments, spaces })
     }
 }
 
@@ -2140,6 +2382,65 @@ mod tests {
 
     fn devices(args: &[&str]) -> Vec<(String, Option<Location>)> {
         args.iter().map(|a| (a.to_string(), None)).collect()
+    }
+
+    #[test]
+    fn ide_hd_goes_on_an_ahci_port() {
+        let q = Some(BoardKind::Q35);
+        let two = ["if=none,id=d0,file=a.img,format=raw", "if=none,id=d1,file=b.img,format=raw"];
+        let d = drives(q, &two).unwrap();
+        let args = ["ide-hd,drive=d0,secs=1,cyls=1,heads=1", "ide-hd,drive=d1,bus=ide.2,serial=s"];
+        let p = plan(q, &d, &devices(&args), true).unwrap();
+        assert_eq!(
+            p.ide_hd,
+            vec![
+                IdeHdPlug { port: 5, drive: 0, geometry: Some((1, 1, 1)), serial: None },
+                IdeHdPlug { port: 2, drive: 1, geometry: None, serial: Some("s".into()) },
+            ]
+        );
+        // A disk device turns the default CD-ROM drive off.
+        assert_eq!(p.default_cdrom, None);
+        let p = plan(q, &d, &devices(&["virtio-scsi", "driver=scsi-hd,drive=d0"]), true);
+        assert_eq!(p.unwrap().default_cdrom, None);
+        assert_eq!(plan(q, &d, &devices(&["virtio-rng"]), true).unwrap().default_cdrom, Some(2));
+
+        let err = |kind, args: &[&str]| {
+            let d =
+                drives(kind, &["if=none,id=d0,file=a.img,format=raw", "if=none,id=e", "file=c"])
+                    .unwrap();
+            plan(kind, &d, &devices(args), true).unwrap_err()[0].1.message().to_string()
+        };
+        // ide.0 has the if=ide drive.
+        assert_eq!(
+            err(q, &["ide-hd,drive=d0,bus=ide.0"]),
+            "Can't create IDE unit 1, bus supports only 1 units"
+        );
+        assert_eq!(err(q, &["ide-hd,drive=d0,bus=ide.0,unit=0"]), "IDE unit 0 is in use");
+        assert_eq!(
+            err(q, &["ide-hd,drive=d0", "ide-hd,drive=ide0-hd0"]),
+            "Drive 'ide0-hd0' is already in use because it has been automatically connected to another device (did you need 'if=none' in the drive options?)"
+        );
+        assert_eq!(err(q, &["ide-hd,bus=ide.1"]), "No drive specified");
+        assert_eq!(err(q, &["ide-hd,drive=e"]), "Device needs media, but drive is empty");
+        assert_eq!(err(q, &["ide-hd,drive=d0,secs=1"]), "cyls must be between 1 and 65535");
+        assert_eq!(
+            err(q, &["ide-hd,drive=d0,cyls=1,heads=17,secs=1"]),
+            "heads must be between 1 and 16"
+        );
+        assert_eq!(err(q, &["ide-hd,drive=d0,bus=ide.6"]), "Bus 'ide.6' not found");
+        assert_eq!(err(q, &["ide-hd,drive=d0,bus=pcie.0"]), "Device 'ide-hd' can't go on PCIE bus");
+        assert_eq!(err(q, &["ide-hd,drive=d0,foo=1"]), "Property 'ide-hd.foo' not found");
+        assert_eq!(
+            err(q, &["ide-hd,drive=d0", "ide-hd,drive=d0,bus=ide.1"]),
+            "Drive 'd0' is already in use by another device"
+        );
+        assert_eq!(
+            err(q, &["ide-hd,drive=d0", "ide-hd,drive=e"]),
+            "Can't create IDE unit 1, bus supports only 1 units"
+        );
+        let m = Some(BoardKind::Microvm);
+        assert_eq!(err(m, &["ide-hd,drive=d0"]), "No 'IDE' bus found for device 'ide-hd'");
+        assert_eq!(err(m, &["ide-hd,drive=d0,bus=ide.0"]), "Bus 'ide.0' not found");
     }
 
     #[test]

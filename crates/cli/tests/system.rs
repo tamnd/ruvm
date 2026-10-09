@@ -421,6 +421,13 @@ mod sockets {
             qmp.cmd(r#"{"execute": "x-exit-preconfig"}"#),
             r#"{"error": {"class": "GenericError", "desc": "The command is permitted only before machine initialization"}}"#
         );
+        // qtest_resolve_machine_alias() finds the q35 the tests ask for in query-machines.
+        let machines = qmp.cmd(r#"{"execute": "query-machines"}"#);
+        let q35 = r#"{"hotpluggable-cpus": true, "name": "pc-q35-11.1", "numa-mem-supported": false, "default-cpu-type": "qemu64-x86_64-cpu", "acpi": true, "cpu-max": 4096, "deprecated": false, "default-ram-id": "pc.ram", "alias": "q35"}"#;
+        assert!(machines.contains(q35), "{machines}");
+        for name in ["none", "microvm", "pc-q35-11.0", "pc-q35-10.2"] {
+            assert!(machines.contains(&format!(r#""name": "{name}""#)), "{machines}");
+        }
 
         qtest.write_all(b"readb 0x1000\ninl 0x60\nclock_step 100\nclock_step\n").unwrap();
         // Machine none has no timers, so there is no deadline to step to.
