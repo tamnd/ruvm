@@ -42,7 +42,7 @@ const CONDITIONS: &[(&str, Rule)] = &[
     ("CONFIG_EBPF", Rule::Off),
     ("CONFIG_FDT", Rule::On),
     ("CONFIG_FUSE", Rule::Off),
-    ("CONFIG_GTK", Rule::Off),
+    ("CONFIG_GTK", Rule::Feature("ui-gtk")),
     ("CONFIG_IGVM", Rule::Off),
     ("CONFIG_LIBPMEM", Rule::Off),
     ("CONFIG_LINUX", Rule::Os(&["linux"])),

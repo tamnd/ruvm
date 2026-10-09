@@ -26,6 +26,8 @@ ruvm-qapi-gen.workspace = true
 [features]
 # The types and commands of -display sdl.
 ui-sdl = []
+# The types and commands of -display gtk.
+ui-gtk = []
 
 [lints]
 workspace = true

@@ -2025,6 +2025,12 @@ pub(crate) fn start_board_tcg(
     }
     let machine = Arc::new(machine);
     set_cpu_hook(vm, &machine, net, TcgMachine::start, TcgMachine::pause);
+    let m = Arc::downgrade(&machine);
+    crate::display::set_reset_request(Arc::new(move || {
+        if let Some(m) = m.upgrade() {
+            m.request_reset();
+        }
+    }));
     init_migration(vm, &machine, machine_type, cmd.uuid).map_err(one)?;
     let machine = RunningMachine::Tcg(machine);
     Ok(Running { machine, _attachments: built.attachments, spaces })
@@ -2184,6 +2190,12 @@ mod kvm {
                 .map_err(one)?;
         let machine = Arc::new(machine);
         set_cpu_hook(vm, &machine, built.net, KvmMachine::start, KvmMachine::pause);
+        let m = Arc::downgrade(&machine);
+        crate::display::set_reset_request(Arc::new(move || {
+            if let Some(m) = m.upgrade() {
+                m.request_reset();
+            }
+        }));
         let machine = RunningMachine::Kvm(machine);
         Ok(Running { machine, _attachments: built.attachments, spaces })
     }

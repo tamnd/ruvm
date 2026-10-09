@@ -22,8 +22,8 @@
 //!
 //! The local displays are here too: `-display`, `-nographic` and `-full-screen` as `dpy` of
 //! QEMU's system/vl.c, the default display, `query-display-options` and opening the display.
-//! The only local display is SDL, with the `ui-sdl` feature. Without it the default is `none`,
-//! where QEMU would also open VNC on localhost:0.
+//! The local displays are GTK, with the `ui-gtk` feature, and SDL, with `ui-sdl`. Without either
+//! the default is `none`, where QEMU would also open VNC on localhost:0.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -138,6 +138,9 @@ fn dpy() -> MutexGuard<'static, Option<DisplayOptions>> {
 /// `qemu_display_help()`.
 pub(crate) fn display_help() -> String {
     let mut types = String::from("none\n");
+    if cfg!(feature = "ui-gtk") {
+        types.push_str("gtk\n");
+    }
     if cfg!(feature = "ui-sdl") {
         types.push_str("sdl\n");
     }
@@ -175,7 +178,7 @@ pub(crate) fn init_displays(vm: &Vm) -> std::result::Result<(), u8> {
         }
         d.clone()
     };
-    if opts.window_close.is_some() && !is_sdl(&opts) {
+    if opts.window_close.is_some() && !is_gtk(&opts) && !is_sdl(&opts) {
         error_report("window-close is only valid for GTK and SDL, ignoring option");
     }
     if opts.gl.is_some_and(|gl| gl != DisplayGLMode::Off) {
@@ -186,14 +189,23 @@ pub(crate) fn init_displays(vm: &Vm) -> std::result::Result<(), u8> {
 }
 
 /// `qemu_display_find_default()`: the first of GTK, SDL and Cocoa that is built in.
-#[cfg(feature = "ui-sdl")]
 fn default_display() -> DisplayOptionsU {
-    DisplayOptionsU::Sdl(Default::default())
+    #[cfg(feature = "ui-gtk")]
+    return DisplayOptionsU::Gtk(Default::default());
+    #[cfg(all(feature = "ui-sdl", not(feature = "ui-gtk")))]
+    return DisplayOptionsU::Sdl(Default::default());
+    #[cfg(not(any(feature = "ui-gtk", feature = "ui-sdl")))]
+    DisplayOptionsU::Default
 }
 
-#[cfg(not(feature = "ui-sdl"))]
-fn default_display() -> DisplayOptionsU {
-    DisplayOptionsU::Default
+#[cfg(feature = "ui-gtk")]
+fn is_gtk(opts: &DisplayOptions) -> bool {
+    matches!(opts.u, DisplayOptionsU::Gtk(_))
+}
+
+#[cfg(not(feature = "ui-gtk"))]
+fn is_gtk(_opts: &DisplayOptions) -> bool {
+    false
 }
 
 #[cfg(feature = "ui-sdl")]
@@ -206,24 +218,92 @@ fn is_sdl(_opts: &DisplayOptions) -> bool {
     false
 }
 
-#[cfg(feature = "ui-sdl")]
+#[cfg_attr(not(any(feature = "ui-gtk", feature = "ui-sdl")), allow(unused_variables))]
 fn open_display(vm: &Vm, opts: &DisplayOptions) -> std::result::Result<(), u8> {
-    if !is_sdl(opts) {
-        return Ok(());
+    #[cfg(feature = "ui-gtk")]
+    if is_gtk(opts) {
+        let hooks = Arc::new(GtkHooks(Arc::downgrade(&vm.runstate)));
+        return ruvm_ui::gtk::init(
+            DisplayState::global(),
+            InputState::global(),
+            opts,
+            vm.name.as_deref(),
+            hooks,
+        );
     }
-    let hooks = Arc::new(SdlHooks(Arc::downgrade(&vm.runstate)));
-    ruvm_ui::sdl::init(
-        DisplayState::global(),
-        InputState::global(),
-        opts,
-        vm.name.as_deref(),
-        hooks,
-    )
+    #[cfg(feature = "ui-sdl")]
+    if is_sdl(opts) {
+        let hooks = Arc::new(SdlHooks(Arc::downgrade(&vm.runstate)));
+        return ruvm_ui::sdl::init(
+            DisplayState::global(),
+            InputState::global(),
+            opts,
+            vm.name.as_deref(),
+            hooks,
+        );
+    }
+    Ok(())
 }
 
-#[cfg(not(feature = "ui-sdl"))]
-fn open_display(_vm: &Vm, _opts: &DisplayOptions) -> std::result::Result<(), u8> {
-    Ok(())
+/// A system reset request, `qemu_system_reset_request()`.
+type ResetRequest = Arc<dyn Fn() + Send + Sync>;
+
+/// The reset the `Machine` menu of the GTK window asks for, which the machine sets.
+static RESET: Mutex<Option<ResetRequest>> = Mutex::new(None);
+
+/// Sets what the GTK window's `Reset` item does.
+pub(crate) fn set_reset_request(f: ResetRequest) {
+    *RESET.lock().unwrap_or_else(PoisonError::into_inner) = Some(f);
+}
+
+#[cfg_attr(not(feature = "ui-gtk"), allow(dead_code))]
+fn reset_request() -> Option<ResetRequest> {
+    RESET.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// What the GTK window needs from the machine.
+#[cfg(feature = "ui-gtk")]
+struct GtkHooks(Weak<crate::runstate::Runstate>);
+
+#[cfg(feature = "ui-gtk")]
+impl ruvm_ui::gtk::Hooks for GtkHooks {
+    fn is_running(&self) -> bool {
+        self.0.upgrade().is_some_and(|r| r.is_running())
+    }
+
+    fn stop(&self) {
+        if let Some(r) = self.0.upgrade() {
+            let _ = r.qmp_stop();
+        }
+    }
+
+    fn cont(&self) {
+        if let Some(r) = self.0.upgrade() {
+            let _ = r.qmp_cont();
+        }
+    }
+
+    fn can_reset(&self) -> bool {
+        reset_request().is_some()
+    }
+
+    fn reset(&self) {
+        if let Some(f) = reset_request() {
+            f();
+        }
+    }
+
+    fn can_powerdown(&self) -> bool {
+        false
+    }
+
+    fn powerdown(&self) {}
+
+    fn quit(&self) {
+        if let Some(r) = self.0.upgrade() {
+            r.shutdown_request(ruvm_qapi::types::ShutdownCause::HostQmpQuit);
+        }
+    }
 }
 
 /// What the SDL window needs from the machine.
