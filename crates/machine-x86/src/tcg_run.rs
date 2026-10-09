@@ -55,7 +55,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ruvm_accel::VcpuControl;
 use ruvm_accel::tcg::{TcgOptions, TcgVcpus};
@@ -75,6 +75,7 @@ use ruvm_jit::{
 use ruvm_jit_core::Type;
 use ruvm_jit_core::types::INSN_START_WORDS;
 use ruvm_mem::{MemTxAttrs, MemTxResult, MemoryListener};
+use ruvm_sys::hostticks::Ticks;
 use ruvm_target_x86::cpuid::topo::X86CpuTopoInfo;
 use ruvm_target_x86::cpuid::{Accel, X86Cpu};
 use ruvm_target_x86::tcg::{
@@ -587,8 +588,8 @@ pub struct TcgMachine {
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// `QEMU_CLOCK_VIRTUAL`, stopped while the vCPUs are.
     vclock: Arc<Clock>,
-    /// Where `cpu_get_ticks()` counts from.
-    tsc_base: Instant,
+    /// `cpu_get_ticks()`, the count every vCPU's TSC is, stopped while the vCPUs are.
+    ticks: Arc<Ticks>,
     /// The APIC of each vCPU, in vCPU order.
     apics: Vec<Arc<Apic>>,
 }
@@ -643,8 +644,8 @@ impl TcgMachine {
             .ok_or_else(|| "no virtual clock".to_string())?;
         let max_apic_id = apic_ids.iter().copied().max().map_or(1, |m| m + 1);
         let bus = ApicBus::new(max_apic_id, pic, board.ioapics().clone());
-        // cpu_get_ticks() is one count for the whole machine.
-        let tsc_base = Instant::now();
+        // cpu_get_ticks() is one count for the whole machine, stopped until vm_start().
+        let ticks = Arc::new(Ticks::new());
         let mut vcpus: Vec<Vcpu> = Vec::new();
         let mut apics = Vec::new();
         let mut bsp_shared = None;
@@ -653,7 +654,8 @@ impl TcgMachine {
             let model = cpu.instance(apic_id)?;
             let state = model.new_state(is_bsp);
             let x2apic = model.has_feature("x2apic");
-            let x86 = Arc::new(X86::new(model).with_io(Arc::clone(&io)).with_tsc_base(tsc_base));
+            let x86 =
+                Arc::new(X86::new(model).with_io(Arc::clone(&io)).with_ticks(Arc::clone(&ticks)));
             let ops = Arc::new(PcCpu { x86: Arc::clone(&x86), apic: OnceLock::new() });
             let mut v = jit.create_vcpu(ops.clone(), Arc::clone(&mem), env::ENV_SIZE);
             env::load_state(&mut v.env, &state);
@@ -744,7 +746,7 @@ impl TcgMachine {
             vcpus,
             threads: Mutex::new(vec![control, timers]),
             vclock,
-            tsc_base,
+            ticks,
             apics: machine_apics,
         };
         Ok((machine, warnings))
@@ -766,10 +768,10 @@ impl TcgMachine {
         &self.vclock
     }
 
-    /// The instant `cpu_get_ticks()` counts from in nanoseconds: what every vCPU's TSC adds
-    /// its `tsc_offset` to.
-    pub fn tsc_base(&self) -> Instant {
-        self.tsc_base
+    /// `cpu_get_ticks()`: every vCPU's TSC is this count plus its `tsc_offset`. Like the
+    /// virtual clock, it only counts between [`start`](Self::start) and [`pause`](Self::pause).
+    pub fn ticks(&self) -> &Arc<Ticks> {
+        &self.ticks
     }
 
     /// The APIC of each vCPU, in vCPU order.
@@ -790,6 +792,7 @@ impl TcgMachine {
     /// `resume_all_vcpus()`.
     pub fn start(&self) {
         // vm_prepare_start(): cpu_enable_ticks().
+        self.ticks.enable();
         self.vclock.start();
         let mut c = self.shared.lock();
         c.running = true;
@@ -804,6 +807,7 @@ impl TcgMachine {
         self.shared.lock().running = false;
         self.vcpus.pause_all();
         // do_vm_stop(): cpu_disable_ticks().
+        self.ticks.disable();
         self.vclock.stop();
     }
 

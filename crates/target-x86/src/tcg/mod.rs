@@ -58,7 +58,9 @@
 //! - The accessed and dirty bits of page table entries are set with a plain read and write of
 //!   physical memory, not with a compare and swap, so another vCPU changing the same entry at
 //!   the same moment can lose an update.
-//! - The TSC counts host nanoseconds since [`X86`] was made, plus `IA32_TSC` writes.
+//! - The TSC counts host ticks since [`X86`] was made, or while the machine runs when it shares
+//!   the machine's count, plus `IA32_TSC` writes. As in QEMU's TCG, that is the host TSC on an
+//!   x86 host, so the guest TSC runs at the host TSC rate.
 //! - Unknown MSRs read as zero and ignore writes instead of raising #GP. Only the MSRs this
 //!   front end uses (EFER, STAR, LSTAR, CSTAR, FMASK, FS and GS base, KERNEL_GS_BASE, the
 //!   SYSENTER MSRs, TSC, TSC_AUX, PAT, APIC_BASE, MISC_ENABLE, PKRS) are kept.
@@ -111,7 +113,6 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
 
 use ruvm_jit::cputlb::tlb_flush;
 use ruvm_jit::translate::TbBuild;
@@ -121,6 +122,7 @@ use ruvm_jit::{
 };
 use ruvm_jit_interp::HelperRegistry;
 use ruvm_mem::AddressSpace;
+use ruvm_sys::hostticks::Ticks;
 
 use crate::cpuid::X86Cpu;
 use crate::state::{
@@ -244,7 +246,8 @@ pub struct X86 {
     /// The decoder's view of the model's features.
     feat: translate::Feat,
     io: Option<Arc<AddressSpace>>,
-    tsc_base: Instant,
+    /// `cpu_get_ticks()`, the count the TSC is, see [`ruvm_sys::hostticks`].
+    ticks: Arc<Ticks>,
     irqs: Mutex<VecDeque<u8>>,
     triple_faults: AtomicU64,
     platform: OnceLock<Arc<dyn X86Platform>>,
@@ -270,7 +273,7 @@ impl X86 {
             feat: translate::Feat::of(&model),
             model,
             io: None,
-            tsc_base: Instant::now(),
+            ticks: Arc::new(Ticks::running()),
             irqs: Mutex::new(VecDeque::new()),
             triple_faults: AtomicU64::new(0),
             platform: OnceLock::new(),
@@ -292,10 +295,10 @@ impl X86 {
         self
     }
 
-    /// Count the TSC from `base` instead of from when this [`X86`] was made, so that the
-    /// vCPUs of one machine share a time base, as `cpu_get_ticks()` does in QEMU.
-    pub fn with_tsc_base(mut self, base: Instant) -> X86 {
-        self.tsc_base = base;
+    /// Count the TSC with `ticks` instead of from when this [`X86`] was made, so that the vCPUs
+    /// of one machine share one `cpu_get_ticks()`, which stops while the machine does.
+    pub fn with_ticks(mut self, ticks: Arc<Ticks>) -> X86 {
+        self.ticks = ticks;
         self
     }
 
@@ -341,9 +344,10 @@ impl X86 {
         self.triple_faults.load(Ordering::Relaxed)
     }
 
-    /// The TSC before `tsc_offset` is added, `cpu_get_tsc()`.
+    /// The TSC before `tsc_offset` is added, `cpu_get_tsc()`. It counts host ticks, as
+    /// `cpu_get_ticks()` does under TCG, so it runs at the host TSC rate on an x86 host.
     pub(crate) fn host_tsc(&self) -> u64 {
-        self.tsc_base.elapsed().as_nanos() as u64
+        self.ticks.get()
     }
 
     pub(crate) fn io(&self) -> Option<&Arc<AddressSpace>> {

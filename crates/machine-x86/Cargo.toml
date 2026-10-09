@@ -31,6 +31,7 @@ ruvm-jit.workspace = true
 ruvm-jit-core.workspace = true
 ruvm-mem.workspace = true
 ruvm-migration.workspace = true
+ruvm-sys.workspace = true
 ruvm-target-x86.workspace = true
 ruvm-virtio-queue.workspace = true
 ruvm-vmstate.workspace = true
