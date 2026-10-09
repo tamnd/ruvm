@@ -1119,7 +1119,7 @@ fn plan_device(
     if let Some(plug) = crate::display::plan_device(driver, opts, loc, pci, sysbus) {
         return plug.map(Planned::Display);
     }
-    if let Some(plug) = crate::audio::plan_device(driver, opts, loc, pci) {
+    if let Some(plug) = crate::audio::plan_device(driver, opts, loc, pci, sysbus) {
         return plug.map(Planned::Audio);
     }
     let alias = DEVICE_ALIASES.iter().find(|(a, _)| *a == driver).map(|(_, t)| *t);
@@ -1815,6 +1815,7 @@ fn build(
     }
     let net = Arc::new(Network::new(&cmd.netdevs, &clock).map_err(one)?);
     ruvm_audio::registry::attach_clock(&clock);
+    crate::audio::realize_isa_dma(&board, &clock).map_err(|e| one(Located(None, e)))?;
     crate::audio::realize_pcspk(&board, opts.pcspk_audiodev.as_deref())
         .map_err(|e| one(Located(None, e)))?;
     let env = ClassEnv { drives, net: &net, ram_size: board.ram_size() };
