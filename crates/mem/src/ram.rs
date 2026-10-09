@@ -84,6 +84,12 @@ impl RamBlock {
         Self::new(name, size, page_bits)
     }
 
+    /// A block over host memory made elsewhere, such as the address space of a user mode
+    /// guest from [`HostMemory::reserve`]. Nothing logs its dirty pages.
+    pub fn from_memory(name: &str, mem: HostMemory, page_bits: u32) -> Self {
+        Self::with_memory(name, mem, page_bits)
+    }
+
     fn with_memory(name: &str, mem: HostMemory, page_bits: u32) -> Self {
         RamBlock { name: name.to_string(), mem, page_bits, dirty: Default::default() }
     }

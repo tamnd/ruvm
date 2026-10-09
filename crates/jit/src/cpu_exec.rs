@@ -69,6 +69,14 @@ fn cpu_handle_exception(cpu: &mut Cpu<'_>) -> Option<i32> {
         return Some(ret);
     }
     let ops = cpu.ops();
+    if cpu.jit().config.user_only {
+        // User mode hands every exception to the cpu loop of the emulator, which turns it into
+        // a syscall or a signal.
+        ops.fake_user_interrupt(cpu);
+        let ret = cpu.core.exception_index;
+        cpu.core.exception_index = -1;
+        return Some(ret);
+    }
     ops.do_interrupt(cpu);
     cpu.core.exception_index = -1;
     if cpu.core.singlestep_enabled {

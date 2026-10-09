@@ -513,6 +513,7 @@ dependencies = [
  "ruvm-base",
  "ruvm-img",
  "ruvm-io",
+ "ruvm-linux-user",
  "ruvm-machine-arm",
  "ruvm-nbd",
  "ruvm-qapi",
@@ -824,6 +825,14 @@ dependencies = [
 [[package]]
 name = "ruvm-linux-user"
 version = "0.5.0"
+dependencies = [
+ "libc",
+ "ruvm-jit",
+ "ruvm-jit-core",
+ "ruvm-mem",
+ "ruvm-target-x86",
+ "ruvm-user-common",
+]
 
 [[package]]
 name = "ruvm-machine-arm"
@@ -1218,6 +1227,10 @@ dependencies = [
 [[package]]
 name = "ruvm-user-common"
 version = "0.5.0"
+dependencies = [
+ "ruvm-mem",
+ "ruvm-sys",
+]
 
 [[package]]
 name = "ruvm-vfio-user"

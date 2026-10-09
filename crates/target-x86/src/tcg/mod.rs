@@ -108,6 +108,7 @@ mod helpers;
 mod mmu;
 mod seg;
 mod translate;
+pub mod user;
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -171,6 +172,9 @@ pub const EXCP10_COPR: i32 = 16;
 pub const EXCP11_ALGN: i32 = 17;
 /// Machine check.
 pub const EXCP12_MCHK: i32 = 18;
+/// `EXCP_SYSCALL`: the guest ran SYSCALL under user mode emulation, which returns to the
+/// emulator's cpu loop instead of entering a guest kernel.
+pub const EXCP_SYSCALL: i32 = 0x100;
 
 /// `CPU_INTERRUPT_POLL`: the local APIC asks its vCPU to look at it again.
 pub const CPU_INTERRUPT_POLL: u32 = 0x0010;
@@ -253,6 +257,8 @@ pub struct X86 {
     platform: OnceLock<Arc<dyn X86Platform>>,
     /// `CPUID_APIC` in `features[FEAT_1_EDX]`, cleared while the APIC is disabled.
     apic_feature: AtomicBool,
+    /// Built for user mode emulation, `CONFIG_USER_ONLY`.
+    user: bool,
 }
 
 impl fmt::Debug for X86 {
@@ -278,6 +284,7 @@ impl X86 {
             triple_faults: AtomicU64::new(0),
             platform: OnceLock::new(),
             apic_feature: AtomicBool::new(true),
+            user: false,
         }
     }
 
@@ -293,6 +300,18 @@ impl X86 {
     pub fn with_io(mut self, io: Arc<AddressSpace>) -> X86 {
         self.io = Some(io);
         self
+    }
+
+    /// Run as the CPU of a user mode emulator: SYSCALL leaves the vCPU with [`EXCP_SYSCALL`]
+    /// instead of entering a guest kernel, as QEMU's `CONFIG_USER_ONLY` helpers do.
+    pub fn with_user_mode(mut self) -> X86 {
+        self.user = true;
+        self
+    }
+
+    /// Whether this CPU runs under user mode emulation.
+    pub fn is_user_mode(&self) -> bool {
+        self.user
     }
 
     /// Count the TSC with `ticks` instead of from when this [`X86`] was made, so that the vCPUs
@@ -600,6 +619,10 @@ impl CpuOps for X86 {
 
     fn do_interrupt(&self, cpu: &mut Cpu<'_>) {
         seg::x86_cpu_do_interrupt(cpu, self);
+    }
+
+    fn fake_user_interrupt(&self, cpu: &mut Cpu<'_>) {
+        user::do_interrupt_user(cpu);
     }
 
     fn has_work(&self, cpu: &Cpu<'_>) -> bool {

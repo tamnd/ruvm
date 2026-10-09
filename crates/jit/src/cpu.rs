@@ -155,6 +155,13 @@ pub trait CpuOps: Send + Sync + fmt::Debug {
     /// `do_interrupt`: deliver `exception_index`.
     fn do_interrupt(&self, cpu: &mut Cpu<'_>);
 
+    /// `TCGCPUOps::fake_user_interrupt`: the part of delivering `exception_index` that user
+    /// mode still does in the CPU before the exception goes back to the caller of
+    /// `cpu_exec()`, such as stepping over a software interrupt. The default does nothing.
+    fn fake_user_interrupt(&self, cpu: &mut Cpu<'_>) {
+        let _ = cpu;
+    }
+
     /// `SysemuCPUOps::has_work`. The default looks for `CPU_INTERRUPT_HARD`.
     fn has_work(&self, cpu: &Cpu<'_>) -> bool {
         cpu.core.shared.interrupt_request() & interrupt::HARD != 0

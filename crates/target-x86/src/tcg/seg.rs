@@ -73,7 +73,7 @@ pub(crate) fn st(cpu: &mut Cpu<'_>, addr: u64, v: u64, mop: MemOp, idx: usize, r
     cpu_st_mmu(cpu, addr, v, MemOpIdx::new(mop, idx as u32), ra)
 }
 
-fn ldl_kernel(cpu: &mut Cpu<'_>, addr: u64, ra: Ra) -> R<u32> {
+pub(crate) fn ldl_kernel(cpu: &mut Cpu<'_>, addr: u64, ra: Ra) -> R<u32> {
     let idx = mmu_index_kernel(cpu.env);
     ld(cpu, addr, MemOp::LEUL, idx, ra).map(|v| v as u32)
 }
@@ -1160,6 +1160,10 @@ const FLAT_DATA: u32 =
 
 /// `helper_syscall()`.
 pub(crate) fn helper_syscall(cpu: &mut Cpu<'_>, next_eip_addend: u64, ra: Ra) -> R<()> {
+    let ops = cpu.ops();
+    if x86_of(&ops).is_user_mode() {
+        return Err(super::user::helper_syscall_user(cpu, next_eip_addend));
+    }
     if ld64(cpu.env, EFER) & MSR_EFER_SCE == 0 {
         return excp_err(cpu, EXCP06_ILLOP, 0, ra);
     }

@@ -11,7 +11,7 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 25
+unsafe-budget = 28
 
 [dependencies]
 
