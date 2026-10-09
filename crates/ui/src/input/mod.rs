@@ -32,7 +32,7 @@ use crate::console::{DisplayState, QemuConsole};
 
 pub use keymap::{
     key_number_to_linux, key_number_to_qcode, key_value_to_linux, linux_to_qcode,
-    linux_to_scancode, qcode_to_linux, usb_to_linux,
+    linux_to_scancode, osx_to_linux, qcode_to_linux, usb_to_linux,
 };
 
 /// `INPUT_EVENT_MASK_KEY` and the other event masks, `1 << kind`.

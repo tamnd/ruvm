@@ -11,7 +11,7 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 12
 
 [dependencies]
 flate2.workspace = true
@@ -26,6 +26,14 @@ zbus = { workspace = true, optional = true }
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = { workspace = true, optional = true }
+objc2 = { workspace = true, optional = true }
+objc2-app-kit = { workspace = true, optional = true }
+objc2-core-foundation = { workspace = true, optional = true }
+objc2-core-graphics = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true }
+
 [features]
 # -display sdl, over the system's SDL2 library.
 ui-sdl = ["dep:sdl2", "ruvm-qapi/ui-sdl"]
@@ -33,6 +41,16 @@ ui-sdl = ["dep:sdl2", "ruvm-qapi/ui-sdl"]
 ui-gtk = ["dep:gtk4", "ruvm-qapi/ui-gtk"]
 # -display dbus, over the zbus crate.
 ui-dbus = ["dep:zbus", "ruvm-qapi/ui-dbus"]
+# -display cocoa, over the system's AppKit.
+ui-cocoa = [
+    "dep:dispatch2",
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:objc2-core-foundation",
+    "dep:objc2-core-graphics",
+    "dep:objc2-foundation",
+    "ruvm-qapi/ui-cocoa",
+]
 
 [lints]
 workspace = true

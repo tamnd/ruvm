@@ -59,6 +59,8 @@ ui-sdl = ["ruvm-qapi/ui-sdl", "ruvm-ui/ui-sdl"]
 ui-gtk = ["ruvm-qapi/ui-gtk", "ruvm-ui/ui-gtk"]
 # -display dbus, over the zbus crate.
 ui-dbus = ["ruvm-audio/ui-dbus", "ruvm-qapi/ui-dbus", "ruvm-ui/ui-dbus"]
+# -display cocoa on macOS, over the system's AppKit.
+ui-cocoa = ["ruvm-qapi/ui-cocoa", "ruvm-ui/ui-cocoa"]
 
 [lints]
 workspace = true

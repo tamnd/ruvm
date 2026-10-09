@@ -144,6 +144,12 @@ rustix = { version = "1.1.5", default-features = false, features = ["std", "net"
 sdl2 = { version = "0.38.0", default-features = false }
 gtk4 = { version = "0.10.3", default-features = false }
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api", "p2p"] }
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
+objc2 = { version = "0.6.5", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "NSAlert", "NSApplication", "NSButton", "NSCell", "NSColor", "NSColorSpace", "NSControl", "NSCursor", "NSEvent", "NSFont", "NSGraphics", "NSGraphicsContext", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSText", "NSTextField", "NSTrackingArea", "NSView", "NSWindow", "NSWorkspace"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes", "CFData", "CFMachPort", "CFRunLoop"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "libc", "CGColorSpace", "CGContext", "CGDataProvider", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGEvent", "CGEventTypes", "CGImage", "CGRemoteOperation"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSDictionary", "NSGeometry", "NSNotification", "NSObject", "NSString", "NSThread", "NSURL", "NSValue"] }
 serde_json = "1.0.145"
 serpent = "0.5.1"
 sha1 = "0.10.6"

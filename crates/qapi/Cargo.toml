@@ -30,6 +30,8 @@ ui-sdl = []
 ui-gtk = []
 # The types and commands of -display dbus.
 ui-dbus = []
+# The types and commands of -display cocoa, which are there only on macOS.
+ui-cocoa = []
 
 [lints]
 workspace = true
