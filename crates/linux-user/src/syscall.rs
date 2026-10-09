@@ -5,8 +5,8 @@
 //! Most calls go to the host as they are, once their pointer arguments have been checked against
 //! the guest's mappings and turned into host addresses; [`spec`] says which argument is what.
 //! The rest are emulated here: memory management (`mmap.c`), the break, `clone()`, `execve()`,
-//! the signal bookkeeping and the handful of calls whose results name the emulator rather than
-//! the program.
+//! the signal calls (in [`crate::signal`]) and the handful of calls whose results name the
+//! emulator rather than the program.
 
 use std::sync::Arc;
 
@@ -14,7 +14,8 @@ use ruvm_jit::Cpu;
 use ruvm_jit::cputlb::tlb_flush;
 use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page, page_align};
 
-use crate::host::{self, sys};
+use crate::host::sys;
+use crate::signal::{self, Task, guest_sys, guest_syscall};
 use crate::x86_64;
 
 const EFAULT: i64 = libc::EFAULT as i64;
@@ -26,8 +27,6 @@ const ENOTTY: i64 = libc::ENOTTY as i64;
 const PATH_MAX: usize = 4096;
 /// `IOV_MAX`.
 const IOV_MAX: u64 = 1024;
-/// `_NSIG`.
-const NSIG: usize = 64;
 
 /// System calls the libc crate may not name on every version.
 mod nr {
@@ -133,8 +132,6 @@ fn spec(n: i64) -> Option<&'static [A]> {
         | libc::SYS_setregid
         | libc::SYS_getpriority
         | libc::SYS_eventfd2
-        | libc::SYS_kill
-        | libc::SYS_tkill
         | libc::SYS_munlock
         | libc::SYS_mlock
         | libc::SYS_timerfd_create
@@ -145,7 +142,6 @@ fn spec(n: i64) -> Option<&'static [A]> {
         | libc::SYS_setresuid
         | libc::SYS_setresgid
         | libc::SYS_fadvise64
-        | libc::SYS_tgkill
         | libc::SYS_socket => &[V, V, V],
         libc::SYS_nanosleep => &[R(16), W(16)],
         libc::SYS_getitimer => &[V, W(24)],
@@ -160,8 +156,6 @@ fn spec(n: i64) -> Option<&'static [A]> {
         libc::SYS_recvfrom => &[V, WL(2), V, V, WP(5), M(4)],
         libc::SYS_setsockopt => &[V, V, V, RL(4), V],
         libc::SYS_getsockopt => &[V, V, V, WP(4), M(4)],
-        libc::SYS_wait4 => &[V, W(4), V, W(144)],
-        libc::SYS_waitid => &[V, V, W(128), V, W(144)],
         libc::SYS_truncate => &[S, V],
         libc::SYS_getdents | libc::SYS_getdents64 => &[V, WL(2), V],
         libc::SYS_getcwd => &[WL(1), V],
@@ -218,7 +212,6 @@ fn spec(n: i64) -> Option<&'static [A]> {
         libc::SYS_pipe2 => &[W(8), V],
         libc::SYS_epoll_ctl => &[V, V, V, R(12)],
         libc::SYS_epoll_wait => &[V, WN(2, 12), V, V],
-        libc::SYS_epoll_pwait => &[V, WN(2, 12), V, V, RL(5), V],
         libc::SYS_timerfd_settime => &[V, V, R(32), W(32)],
         libc::SYS_timerfd_gettime => &[V, W(32)],
         libc::SYS_inotify_add_watch => &[V, S, V],
@@ -254,16 +247,7 @@ pub(crate) struct Proc {
     uname_release: Option<String>,
     /// `-L`.
     ld_prefix: String,
-    /// The guest's `struct sigaction`s: handler, flags, restorer, mask.
-    sigact: [[u64; 4]; NSIG + 1],
-    /// The guest's signal mask.
-    sigmask: u64,
-    /// The guest's `stack_t`: sp, flags, size.
-    altstack: [u64; 3],
 }
-
-/// `SS_DISABLE`.
-const SS_DISABLE: u64 = 2;
 
 impl Proc {
     pub(crate) fn new(
@@ -274,17 +258,12 @@ impl Proc {
         ld_prefix: String,
     ) -> Self {
         let brk = page_align(brk).unwrap_or(brk);
-        Proc {
-            space,
-            brk,
-            initial_brk: brk,
-            exec_path,
-            uname_release,
-            ld_prefix,
-            sigact: [[0; 4]; NSIG + 1],
-            sigmask: 0,
-            altstack: [0, SS_DISABLE, 0],
-        }
+        Proc { space, brk, initial_brk: brk, exec_path, uname_release, ld_prefix }
+    }
+
+    /// The guest's address space.
+    pub(crate) fn space(&self) -> &Arc<GuestSpace> {
+        &self.space
     }
 
     /// The host address of `len` bytes at `addr` with the page bits `need`; NULL stays NULL.
@@ -384,7 +363,7 @@ impl Proc {
                 written.push((v, len));
             }
         }
-        let r = host::syscall(n, a);
+        let r = guest_syscall(n, a);
         drop(keep);
         if r >= 0 {
             for (g, l) in written {
@@ -500,7 +479,7 @@ fn do_iov(p: &Proc, n: i64, a: [u64; 6], write_mem: bool) -> i64 {
     };
     let mut h = a;
     h[1] = v.as_ptr() as u64;
-    let r = host::syscall(n, h);
+    let r = guest_syscall(n, h);
     if r > 0 && write_mem {
         let mut left = r as u64;
         for i in 0..a[2] {
@@ -549,11 +528,11 @@ fn do_execve(p: &Proc, dirfd: Option<u64>, a: [u64; 6]) -> i64 {
         let argv = str_array(p, argv, &mut keep)?;
         let envp = str_array(p, envp, &mut keep)?;
         let r = match dirfd {
-            Some(fd) => sys(
+            Some(fd) => guest_sys(
                 libc::SYS_execveat,
                 &[fd, name.as_ptr() as u64, argv.as_ptr() as u64, envp.as_ptr() as u64, a[4]],
             ),
-            None => sys(
+            None => guest_sys(
                 libc::SYS_execve,
                 &[name.as_ptr() as u64, argv.as_ptr() as u64, envp.as_ptr() as u64],
             ),
@@ -603,12 +582,10 @@ fn do_readlink(p: &Proc, n: i64, a: [u64; 6], at: bool) -> i64 {
 /// `do_fork()` without `CLONE_VM`: a host fork.
 fn do_fork(
     p: &Proc,
+    t: &Task,
     cpu: &mut Cpu<'_>,
     flags: u64,
-    newsp: u64,
-    ptid: u64,
-    ctid: u64,
-    tls: u64,
+    [newsp, ptid, ctid, tls]: [u64; 4],
 ) -> i64 {
     const CSIGNAL: u64 = 0xff;
     const CLONE_VM: u64 = 0x100;
@@ -636,6 +613,10 @@ fn do_fork(
         | CLONE_IO;
     if flags & !ok != 0 {
         return -EINVAL;
+    }
+    // Signals stay blocked across the fork; the cpu loop lets them in again.
+    if signal::block_signals(t) {
+        return signal::ERESTARTSYS;
     }
     let r = sys(libc::SYS_clone, &[flags & CSIGNAL, 0, 0, 0, 0]);
     if r < 0 {
@@ -702,139 +683,6 @@ fn do_prctl(p: &Proc, a: [u64; 6]) -> i64 {
     p.generic(libc::SYS_prctl, a, s)
 }
 
-/// `rt_sigaction()`, bookkeeping: handlers are never run. Ignoring and the default are
-/// applied to the host so that they still do what they say.
-fn do_sigaction(p: &mut Proc, a: [u64; 6]) -> i64 {
-    let sig = a[0] as usize;
-    if a[3] != 8 || sig == 0 || sig > NSIG {
-        return -EINVAL;
-    }
-    let new = if a[1] != 0 {
-        if sig == libc::SIGKILL as usize || sig == libc::SIGSTOP as usize {
-            return -EINVAL;
-        }
-        let mut b = [0u8; 32];
-        if !p.space.read(a[1], &mut b) {
-            return -EFAULT;
-        }
-        let mut n = [0u64; 4];
-        for (i, v) in n.iter_mut().enumerate() {
-            *v = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
-        }
-        Some(n)
-    } else {
-        None
-    };
-    if a[2] != 0 {
-        let mut b = [0u8; 32];
-        for (i, v) in p.sigact[sig].iter().enumerate() {
-            b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-        }
-        if !p.space.write(a[2], &b) {
-            return -EFAULT;
-        }
-    }
-    if let Some(n) = new {
-        p.sigact[sig] = n;
-        let s = sig as i32;
-        let fault = [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGTRAP];
-        if !fault.contains(&s) {
-            match n[0] {
-                0 | 1 => {
-                    host::set_disposition(s, n[0]);
-                }
-                // A handler that will not run: at least do not die of a broken pipe.
-                _ if s == libc::SIGPIPE => {
-                    host::set_disposition(s, 1);
-                }
-                _ => {}
-            }
-        }
-    }
-    0
-}
-
-fn do_sigprocmask(p: &mut Proc, a: [u64; 6]) -> i64 {
-    if a[3] != 8 {
-        return -EINVAL;
-    }
-    let old = p.sigmask;
-    if a[1] != 0 {
-        let Ok(set) = p.get_u64(a[1]) else { return -EFAULT };
-        let set = set & !((1 << (libc::SIGKILL - 1)) | (1 << (libc::SIGSTOP - 1)));
-        p.sigmask = match a[0] {
-            0 => old | set,
-            1 => old & !set,
-            2 => set,
-            _ => return -EINVAL,
-        };
-    }
-    if a[2] != 0 && p.put(a[2], &old.to_le_bytes()).is_err() {
-        return -EFAULT;
-    }
-    0
-}
-
-fn do_sigaltstack(p: &mut Proc, a: [u64; 6]) -> i64 {
-    const SS_ONSTACK: u64 = 1;
-    const SS_AUTODISARM: u64 = 1 << 31;
-    const MINSIGSTKSZ: u64 = 2048;
-    let old = p.altstack;
-    if a[0] != 0 {
-        let mut b = [0u8; 24];
-        if !p.space.read(a[0], &mut b) {
-            return -EFAULT;
-        }
-        let sp = u64::from_le_bytes(b[0..8].try_into().unwrap());
-        let flags = u64::from(u32::from_le_bytes(b[8..12].try_into().unwrap()));
-        let size = u64::from_le_bytes(b[16..24].try_into().unwrap());
-        let mode = flags & !SS_AUTODISARM;
-        if mode != 0 && mode != SS_DISABLE && mode != SS_ONSTACK {
-            return -EINVAL;
-        }
-        p.altstack = if mode == SS_DISABLE {
-            [0, SS_DISABLE, 0]
-        } else {
-            if size < MINSIGSTKSZ {
-                return -i64::from(libc::ENOMEM);
-            }
-            [sp, flags, size]
-        };
-    }
-    if a[1] != 0 {
-        let mut b = [0u8; 24];
-        b[0..8].copy_from_slice(&old[0].to_le_bytes());
-        b[8..12].copy_from_slice(&(old[1] as u32).to_le_bytes());
-        b[16..24].copy_from_slice(&old[2].to_le_bytes());
-        if !p.space.write(a[1], &b) {
-            return -EFAULT;
-        }
-    }
-    0
-}
-
-/// Signals whose default action dumps core.
-fn core_signal(sig: u64) -> bool {
-    [3, 4, 5, 6, 7, 8, 11, 24, 25, 31].contains(&sig)
-}
-
-/// `kill()`, `tkill()` and `tgkill()` of the program itself with a signal it neither handles
-/// nor blocks: QEMU reports it like a fault.
-fn self_fatal(p: &Proc, n: i64, a: [u64; 6]) -> Option<i32> {
-    let (target, sig) = match n {
-        libc::SYS_kill => (a[0], a[1]),
-        libc::SYS_tkill => (a[0], a[1]),
-        _ => (a[1], a[2]),
-    };
-    let me =
-        if n == libc::SYS_kill { sys(libc::SYS_getpid, &[]) } else { sys(libc::SYS_gettid, &[]) };
-    if target as i64 != me || sig == 0 || sig > NSIG as u64 || !core_signal(sig) {
-        return None;
-    }
-    let blocked = p.sigmask & (1 << (sig - 1)) != 0;
-    (p.sigact[sig as usize][0] == 0 && !blocked).then_some(sig as i32)
-}
-
 /// `uname()`, with `-r`.
 fn do_uname(p: &Proc, a: [u64; 6]) -> i64 {
     let r = p.generic(libc::SYS_uname, a, &[W(390)]);
@@ -868,26 +716,37 @@ fn do_futex(p: &Proc, a: [u64; 6]) -> i64 {
     p.generic(libc::SYS_futex, a, s)
 }
 
-/// `pselect6()`: the last argument is `{ const sigset_t *, size_t }`.
-fn do_pselect6(p: &Proc, a: [u64; 6]) -> i64 {
-    let mut h = a;
-    let mut ss = [0u64; 2];
+/// `pselect6()`: the last argument is `{ const sigset_t *, size_t }`, the mask to wait with.
+fn do_pselect6(p: &Proc, t: &mut Task, a: [u64; 6]) -> i64 {
+    let (mut set, mut size) = (0, 0);
     if a[5] != 0 {
-        let (Ok(set), Ok(size)) = (p.get_u64(a[5]), p.get_u64(a[5] + 8)) else { return -EFAULT };
-        ss = match p.buf(set, size, page::READ) {
-            Ok(hp) => [hp, size],
-            Err(e) => return e,
-        };
-        h[5] = ss.as_ptr() as u64;
+        let (Ok(s), Ok(z)) = (p.get_u64(a[5]), p.get_u64(a[5] + 8)) else { return -EFAULT };
+        (set, size) = (s, z);
     }
-    let r = p.generic(libc::SYS_pselect6, h, &[V, F(0), F(0), F(0), M(16), V]);
-    let _ = ss;
-    r
+    let space = Arc::clone(&p.space);
+    signal::with_sigmask(&space, t, set, size, |m| {
+        let ss = [m, 8u64];
+        let mut h = a;
+        if a[5] != 0 {
+            h[5] = ss.as_ptr() as u64;
+        }
+        p.generic(libc::SYS_pselect6, h, &[V, F(0), F(0), F(0), M(16), V])
+    })
 }
 
 /// `do_syscall()`.
-pub(crate) fn do_syscall(p: &mut Proc, cpu: &mut Cpu<'_>, n: u64, a: [u64; 6]) -> i64 {
+pub(crate) fn do_syscall(
+    p: &mut Proc,
+    t: &mut Task,
+    cpu: &mut Cpu<'_>,
+    n: u64,
+    a: [u64; 6],
+) -> i64 {
     let n = n as i64;
+    let sp = x86_64::reg(cpu, x86_64::RSP);
+    if let Some(r) = signal::do_signal_syscall(&p.space, t, sp, n, a) {
+        return r;
+    }
     match n {
         libc::SYS_brk => do_brk(p, cpu, a[0]),
         libc::SYS_mmap => do_mmap(p, cpu, a),
@@ -957,9 +816,16 @@ pub(crate) fn do_syscall(p: &mut Proc, cpu: &mut Cpu<'_>, n: u64, a: [u64; 6]) -
         libc::SYS_arch_prctl => x86_64::arch_prctl(&p.space, cpu, a[0], a[1]),
         libc::SYS_set_tid_address => sys(libc::SYS_gettid, &[]),
         libc::SYS_set_robust_list | libc::SYS_get_robust_list | nr::RSEQ | nr::CLONE3 => -ENOSYS,
-        libc::SYS_clone => do_fork(p, cpu, a[0], a[1], a[2], a[3], a[4]),
-        libc::SYS_fork => do_fork(p, cpu, libc::SIGCHLD as u64, 0, 0, 0, 0),
-        libc::SYS_vfork => do_fork(p, cpu, 0x4100 | libc::SIGCHLD as u64, 0, 0, 0, 0),
+        libc::SYS_clone => do_fork(p, t, cpu, a[0], [a[1], a[2], a[3], a[4]]),
+        libc::SYS_fork => do_fork(p, t, cpu, libc::SIGCHLD as u64, [0; 4]),
+        libc::SYS_vfork => do_fork(p, t, cpu, 0x4100 | libc::SIGCHLD as u64, [0; 4]),
+        libc::SYS_rt_sigreturn => {
+            if signal::block_signals(t) {
+                return signal::ERESTARTSYS;
+            }
+            let space = Arc::clone(&p.space);
+            x86_64::do_rt_sigreturn(&space, t, cpu)
+        }
         libc::SYS_execve => do_execve(p, None, a),
         libc::SYS_execveat => do_execve(p, Some(a[0]), a),
         libc::SYS_readv | libc::SYS_preadv | nr::PREADV2 => do_iov(p, n, a, true),
@@ -967,22 +833,6 @@ pub(crate) fn do_syscall(p: &mut Proc, cpu: &mut Cpu<'_>, n: u64, a: [u64; 6]) -
         libc::SYS_ioctl => do_ioctl(p, a),
         libc::SYS_fcntl => do_fcntl(p, a),
         libc::SYS_prctl => do_prctl(p, a),
-        libc::SYS_rt_sigaction => do_sigaction(p, a),
-        libc::SYS_rt_sigprocmask => do_sigprocmask(p, a),
-        libc::SYS_rt_sigpending => {
-            if a[1] != 8 {
-                return -EINVAL;
-            }
-            if p.put(a[0], &0u64.to_le_bytes()).is_err() { -EFAULT } else { 0 }
-        }
-        libc::SYS_sigaltstack => do_sigaltstack(p, a),
-        libc::SYS_kill | libc::SYS_tkill | libc::SYS_tgkill => {
-            if let Some(sig) = self_fatal(p, n, a) {
-                eprintln!("qemu: uncaught target signal {sig} ({}) - core dumped", strsignal(sig));
-                host::die_with_signal(sig);
-            }
-            p.generic(n, a, &[V, V, V])
-        }
         libc::SYS_open => do_open(p, n, a, false),
         libc::SYS_openat => do_open(p, n, a, true),
         libc::SYS_readlink => do_readlink(p, n, a, false),
@@ -1002,28 +852,44 @@ pub(crate) fn do_syscall(p: &mut Proc, cpu: &mut Cpu<'_>, n: u64, a: [u64; 6]) -
             p.generic(n, h, &[V, V, R(16), W(16)])
         }
         libc::SYS_futex => do_futex(p, a),
-        libc::SYS_pselect6 => do_pselect6(p, a),
-        libc::SYS_ppoll => p.generic(n, a, &[MN(1, 8), V, M(16), RL(4), V]),
+        libc::SYS_pselect6 => do_pselect6(p, t, a),
+        libc::SYS_ppoll => {
+            let space = Arc::clone(&p.space);
+            signal::with_sigmask(&space, t, a[3], a[4], |m| {
+                let h = [a[0], a[1], a[2], m, 8, 0];
+                p.generic(n, h, &[MN(1, 8), V, M(16), V, V])
+            })
+        }
+        libc::SYS_epoll_pwait => {
+            let space = Arc::clone(&p.space);
+            signal::with_sigmask(&space, t, a[4], a[5], |m| {
+                let h = [a[0], a[1], a[2], a[3], m, 8];
+                p.generic(n, h, &[V, WN(2, 12), V, V, V, V])
+            })
+        }
+        libc::SYS_wait4 => {
+            let r = p.generic(n, a, &[V, W(4), V, W(144)]);
+            if r > 0 && a[1] != 0 {
+                if let Ok(st) = p.get_u32(a[1]) {
+                    let st = signal::host_to_target_waitstatus(st as i32);
+                    let _ = p.put(a[1], &st.to_le_bytes());
+                }
+            }
+            r
+        }
+        libc::SYS_waitid => {
+            let r = p.generic(n, a, &[V, V, W(128), V, W(144)]);
+            if r == 0 && a[2] != 0 {
+                let mut b = [0u8; 128];
+                if p.space.read(a[2], &mut b) {
+                    let _ = p.put(a[2], &signal::host_to_target_siginfo(&b));
+                }
+            }
+            r
+        }
         _ => match spec(n) {
             Some(s) => p.generic(n, a, s),
             None => -ENOSYS,
         },
-    }
-}
-
-/// `strsignal()`.
-pub(crate) fn strsignal(sig: i32) -> &'static str {
-    match sig {
-        libc::SIGQUIT => "Quit",
-        libc::SIGILL => "Illegal instruction",
-        libc::SIGTRAP => "Trace/breakpoint trap",
-        libc::SIGABRT => "Aborted",
-        libc::SIGBUS => "Bus error",
-        libc::SIGFPE => "Floating point exception",
-        libc::SIGSEGV => "Segmentation fault",
-        libc::SIGXCPU => "CPU time limit exceeded",
-        libc::SIGXFSZ => "File size limit exceeded",
-        libc::SIGSYS => "Bad system call",
-        _ => "Unknown signal",
     }
 }
