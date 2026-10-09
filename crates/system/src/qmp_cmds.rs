@@ -99,6 +99,7 @@ fn register_migration(vm: &Arc<Vm>, cmds: &mut Commands) {
 /// Registers every command in this module with `vm`'s dispatcher. `target` is the one of the
 /// personality, which decides the machines `query-machines` lists.
 pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
+    crate::audio::register(cmds);
     crate::display::register(cmds);
     let v = vm.clone();
     register_query_status(cmds, move |_: &MonitorQmp| Ok(v.runstate.status()));

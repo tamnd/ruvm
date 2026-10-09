@@ -16,6 +16,7 @@ unsafe-budget = 0
 [dependencies]
 ruvm-accel.workspace = true
 ruvm-accel-qtest.workspace = true
+ruvm-audio.workspace = true
 ruvm-base.workspace = true
 ruvm-block.workspace = true
 ruvm-chardev.workspace = true

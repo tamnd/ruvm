@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod arm;
+mod audio;
 mod display;
 mod migration;
 mod net;
