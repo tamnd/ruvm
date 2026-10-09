@@ -9,12 +9,14 @@
 //! line can name the accelerator anywhere. The accelerator itself exists only on x86-64 Linux for
 //! now.
 //!
-//! The `dirty-ring-size` property turns the dirty ring on with QEMU's checks and messages, but
-//! nothing reaps it yet.
+//! Dirty logging follows the memory system's dirty clients: a slot with any gets
+//! `KVM_MEM_LOG_DIRTY_PAGES`, and a sync copies what KVM logged into the RAM blocks, from
+//! `KVM_GET_DIRTY_LOG` or, with the `dirty-ring-size` property, from the per vCPU dirty rings,
+//! which a reaper thread, a full ring and every global sync harvest as in QEMU.
 //!
 //! Everything else in `spec/06-accelerators.md` comes later: register sync levels, CPUID and MSR
-//! setup (which belong to ruvm-target-x86), GSI routing, irqfd, ioeventfd, dirty logging and the
-//! other architectures.
+//! setup (which belong to ruvm-target-x86), GSI routing, irqfd, ioeventfd and the other
+//! architectures.
 
 use std::fmt;
 use std::io;

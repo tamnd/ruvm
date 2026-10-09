@@ -6,6 +6,10 @@
 //! stores 1 into `kvm_run.immediate_exit`, so a signal that lands just before `KVM_RUN` still
 //! makes the kernel return at once, and one that lands inside `KVM_RUN` interrupts it with
 //! `EINTR`. That is the `KVM_CAP_IMMEDIATE_EXIT` scheme; ruvm has no signal mask fallback.
+//!
+//! With a dirty ring the run loop also tells the ring when the vCPU is inside `KVM_RUN`, so
+//! a global dirty sync can kick it out and wait, and it reaps the rings when the kernel stops
+//! the vCPU with `KVM_EXIT_DIRTY_RING_FULL`.
 
 use std::cell::Cell;
 use std::io;
@@ -15,12 +19,14 @@ use std::sync::{Arc, Once};
 use std::thread::JoinHandle;
 
 use kvm_bindings::{
-    KVM_SYSTEM_EVENT_CRASH, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, kvm_run,
+    KVM_EXIT_DIRTY_RING_FULL, KVM_SYSTEM_EVENT_CRASH, KVM_SYSTEM_EVENT_RESET,
+    KVM_SYSTEM_EVENT_SHUTDOWN, kvm_run,
 };
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use ruvm_mem::{AddressSpace, MemTxAttrs};
 use vmm_sys_util::signal::{Killable, register_signal_handler};
 
+use super::dirty::{DirtyRings, VcpuRing};
 use super::os_error;
 use crate::{KvmError, vcpu_thread_name};
 
@@ -106,11 +112,17 @@ pub struct KvmVcpu {
     fd: VcpuFd,
     index: u32,
     exit_request: Arc<AtomicBool>,
+    /// The VM's dirty rings and this vCPU's own, when the ring is on.
+    dirty: Option<(Arc<DirtyRings>, Arc<VcpuRing>)>,
 }
 
 impl KvmVcpu {
-    pub(crate) fn new(fd: VcpuFd, index: u32) -> Self {
-        KvmVcpu { fd, index, exit_request: Arc::new(AtomicBool::new(false)) }
+    pub(crate) fn new(
+        fd: VcpuFd,
+        index: u32,
+        dirty: Option<(Arc<DirtyRings>, Arc<VcpuRing>)>,
+    ) -> Self {
+        KvmVcpu { fd, index, exit_request: Arc::new(AtomicBool::new(false)), dirty }
     }
 
     /// The vCPU index, `cpu_index`.
@@ -138,6 +150,9 @@ impl KvmVcpu {
     pub fn run(&mut self, io: &AddressSpace, mem: &AddressSpace) -> Result<VcpuStop, KvmError> {
         install_ipi_handler();
         let _binding = ImmediateExitBinding::bind(self.fd.get_kvm_run());
+        if let Some((_, ring)) = &self.dirty {
+            ring.set_kick(|| VcpuKick::current(Arc::clone(&self.exit_request)));
+        }
         let attrs = MemTxAttrs::UNSPECIFIED;
         loop {
             if self.exit_request.swap(false, Ordering::AcqRel) {
@@ -145,7 +160,14 @@ impl KvmVcpu {
                 // EINTR without running guest code.
                 self.fd.set_kvm_immediate_exit(1);
             }
-            let step = match self.fd.run() {
+            if let Some((_, ring)) = &self.dirty {
+                ring.enter_run();
+            }
+            let exit = self.fd.run();
+            if let Some((_, ring)) = &self.dirty {
+                ring.leave_run();
+            }
+            let step = match exit {
                 Ok(VcpuExit::IoIn(..) | VcpuExit::IoOut(..)) => Step::Io,
                 Ok(VcpuExit::MmioRead(addr, data)) => {
                     let _ = mem.read(addr, attrs, data);
@@ -168,6 +190,14 @@ impl KvmVcpu {
                 Ok(VcpuExit::InternalError) => Step::Stop(VcpuStop::InternalError),
                 Ok(VcpuExit::FailEntry(reason, cpu)) => {
                     Step::Stop(VcpuStop::FailEntry { reason, cpu })
+                }
+                // The kernel stops a vCPU whose ring is full until the entries are collected and
+                // reset. ruvm has no dirty limit, so every ring is reaped, as QEMU does then.
+                Ok(VcpuExit::Unsupported(KVM_EXIT_DIRTY_RING_FULL)) if self.dirty.is_some() => {
+                    if let Some((rings, _)) = &self.dirty {
+                        rings.reap(None);
+                    }
+                    Step::Continue
                 }
                 Ok(other) => Step::Stop(VcpuStop::Unhandled(format!("{other:?}"))),
                 Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
@@ -231,6 +261,13 @@ impl VcpuKick {
     /// `thread`.
     pub fn new<T>(thread: &JoinHandle<T>, exit_request: Arc<AtomicBool>) -> Self {
         VcpuKick { thread: thread.as_pthread_t(), exit_request }
+    }
+
+    /// A kicker for the calling thread, which runs the vCPU with `exit_request`.
+    pub(crate) fn current(exit_request: Arc<AtomicBool>) -> Self {
+        // SAFETY: pthread_self() has no preconditions and cannot fail.
+        let thread = unsafe { libc::pthread_self() };
+        VcpuKick { thread, exit_request }
     }
 
     /// Asks the vCPU to come back from [`KvmVcpu::run`] with [`VcpuStop::Kicked`].

@@ -430,6 +430,7 @@ dependencies = [
  "libc",
  "ruvm-base",
  "ruvm-mem",
+ "ruvm-sys",
  "vmm-sys-util",
 ]
 
