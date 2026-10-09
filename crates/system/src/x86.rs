@@ -898,6 +898,9 @@ pub(crate) struct Plan {
     /// The display devices of `-device`, each with the number of virtio plugs before it, so
     /// they take PCI slots in command line order.
     pub display: Vec<(usize, crate::display::DisplayPlug)>,
+    /// The sound cards of `-device`, each with the number of virtio and display plugs
+    /// before it.
+    pub audio: Vec<(usize, usize, crate::audio::AudioPlug)>,
 }
 
 /// One `-device`, planned.
@@ -908,6 +911,7 @@ enum Planned {
     IdeHd(IdeHdDevice),
     Console,
     Display(crate::display::DisplayPlug),
+    Audio(crate::audio::AudioPlug),
 }
 
 /// The drives of the q35 system flashes: `-machine pflashN=` names a drive by id, and
@@ -1005,6 +1009,7 @@ pub(crate) fn plan(
             Planned::Virtio(plug) => p.virtio.push(plug),
             Planned::Isa(plug) => p.isa.push(plug),
             Planned::Display(plug) => p.display.push((p.virtio.len(), plug)),
+            Planned::Audio(plug) => p.audio.push((p.virtio.len(), p.display.len(), plug)),
             Planned::Console => {
                 if !p.virtio.iter().any(|v| v.model == VirtioModel::Serial) {
                     return Err(vec![Located::new(
@@ -1102,6 +1107,9 @@ fn plan_device(
     let (pci, sysbus) = (kind == Some(BoardKind::Q35), kind.is_some());
     if let Some(plug) = crate::display::plan_device(driver, opts, loc, pci, sysbus) {
         return plug.map(Planned::Display);
+    }
+    if let Some(plug) = crate::audio::plan_device(driver, opts, loc, pci) {
+        return plug.map(Planned::Audio);
     }
     let alias = DEVICE_ALIASES.iter().find(|(a, _)| *a == driver).map(|(_, t)| *t);
     let name = alias.unwrap_or(driver);
@@ -1795,16 +1803,35 @@ fn build(
             .map_err(|e| one(Located::new(&d.loc, e)))?;
     }
     let net = Arc::new(Network::new(&cmd.netdevs, &clock).map_err(one)?);
+    ruvm_audio::registry::attach_clock(&clock);
     let env = ClassEnv { drives, net: &net, ram_size: board.ram_size() };
     // pc_vga_init() comes before the -device functions, which take slots in order.
     let firmware = cmd.firmware();
     crate::display::realize_x86_vga(&mut board, cmd.vga, &firmware).map_err(one)?;
     crate::display::connect_x86_input(&board, &clock, &firmware);
+    // audio_model_init() runs first in qemu_create_cli_devices().
+    if let Some(plug) = crate::audio::selected_model() {
+        crate::audio::realize_x86(&board, &plug).map_err(one)?;
+    }
     let mut display = p.display.iter().peekable();
-    for (i, plug) in p.virtio.into_iter().enumerate() {
-        while let Some((_, d)) = display.next_if(|(at, _)| *at == i) {
-            crate::display::realize_x86(&mut board, d, &firmware).map_err(one)?;
+    let mut audio = p.audio.iter().peekable();
+    let mut displays = 0;
+    // The display and sound cards that come before virtio plug `at`, or all that are left.
+    let mut plug_cards = |board: &mut X86Board, at: Option<usize>| {
+        let here = |vi: &usize| at.is_none_or(|i| *vi == i);
+        loop {
+            if let Some((_, _, a)) = audio.next_if(|(vi, dn, _)| here(vi) && *dn == displays) {
+                crate::audio::realize_x86(board, a).map_err(one)?;
+            } else if let Some((_, d)) = display.next_if(|(vi, _)| here(vi)) {
+                crate::display::realize_x86(board, d, &firmware).map_err(one)?;
+                displays += 1;
+            } else {
+                return Ok::<(), Vec<Located>>(());
+            }
         }
+    };
+    for (i, plug) in p.virtio.into_iter().enumerate() {
+        plug_cards(&mut board, Some(i))?;
         let (class, nic) = virtio_class(&plug, &env).map_err(one)?;
         let handle = board.attach_virtio(class).map_err(|e| {
             let msg = if e.starts_with("No 'virtio-bus' bus found for device") {
@@ -1829,9 +1856,7 @@ fn build(
             nic.connect(handle);
         }
     }
-    for (_, d) in display {
-        crate::display::realize_x86(&mut board, d, &firmware).map_err(one)?;
-    }
+    plug_cards(&mut board, None)?;
     let mut attachments = Vec::new();
     for plug in &p.isa {
         realize_isa(vm, &board, plug, &mut attachments).map_err(one)?;
@@ -1950,9 +1975,11 @@ fn set_cpu_hook<M: Send + Sync + 'static>(
         if let Some(m) = weak.upgrade() {
             if run {
                 net.vm_state_change(true);
+                ruvm_audio::registry::vm_state_change(true);
                 start(&m);
             } else {
                 pause(&m);
+                ruvm_audio::registry::vm_state_change(false);
                 net.vm_state_change(false);
             }
         }

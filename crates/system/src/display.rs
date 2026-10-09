@@ -313,7 +313,7 @@ fn prop_size(name: &str, value: &str) -> Result<u64> {
 }
 
 /// The `addr` property, `SLOT[.FN]` in hex.
-fn parse_devfn(v: &str) -> Option<u8> {
+pub(crate) fn parse_devfn(v: &str) -> Option<u8> {
     let (slot, func) = v.split_once('.').unwrap_or((v, "0"));
     let hex = |s: &str| {
         let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
