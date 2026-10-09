@@ -26,7 +26,10 @@ use ruvm_target_x86::state::{
     SegmentCache,
 };
 use ruvm_target_x86::tcg::env::{self, EIP, HF_OSFXSR_MASK, REGS, SEG_BASE, SEG_SIZE, SEGS};
-use ruvm_target_x86::tcg::user::record_sigsegv;
+use ruvm_target_x86::tcg::user::{
+    cpu_x86_fxrstor, cpu_x86_fxsave, cpu_x86_load_seg, cpu_x86_xrstor, cpu_x86_xsave,
+    record_sigsegv, xsave_area_size,
+};
 use ruvm_target_x86::tcg::{
     EXCP_SYSCALL, EXCP00_DIVZ, EXCP0B_NOSEG, EXCP0C_STACK, EXCP0D_GPF, EXCP0E_PAGE, EXCP01_DB,
     EXCP03_INT3, EXCP04_INTO, EXCP05_BOUND, EXCP06_ILLOP, X86, helper_registry, jit_config,
@@ -36,6 +39,7 @@ use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page};
 use crate::elf::{self, Arch, Creds, Exec};
 use crate::host;
 use crate::opts::{self, Exit};
+use crate::signal::{self, Sigaction, Task, get32, get64, put32, put64};
 use crate::syscall::{self, Proc};
 
 /// `TASK_UNMAPPED_BASE` for x86_64, `TASK_SIZE / 3` page aligned.
@@ -149,7 +153,11 @@ impl CpuOps for UserCpu {
         if probe {
             return Ok(false);
         }
-        Err(record_sigsegv(cpu, addr, access_type, flags == 0, ra))
+        // QEMU touches the host address, and the host reports a non-canonical one with a #GP,
+        // whose siginfo has no address.
+        let canonical = (addr as i64) << 16 >> 16 == addr as i64;
+        let fault = if canonical { addr } else { 0 };
+        Err(record_sigsegv(cpu, fault, access_type, flags == 0, ra))
     }
 
     fn do_unaligned_access(
@@ -392,17 +400,211 @@ fn initial_state(
     Ok(s)
 }
 
-/// `dump_core_and_abort()` for a signal the program did not handle: QEMU's message, then the
-/// same signal for the emulator, without a host core dump.
-fn dump_core_and_abort(sig: i32) -> ! {
-    eprintln!("qemu: uncaught target signal {sig} ({}) - core dumped", syscall::strsignal(sig));
-    host::die_with_signal(sig)
+/// The size of `struct rt_sigframe`: the return address, the `ucontext` and the `siginfo`.
+const FRAME_SIZE: u64 = 440;
+/// Where the `ucontext`, its `stack_t`, `sigcontext` and signal mask, and the `siginfo` are.
+const UC: usize = 8;
+const UC_STACK: usize = 24;
+const UC_SIGMASK: usize = 304;
+const INFO: usize = 312;
+/// The `sigcontext` slots of the general registers, in `REGS` order.
+const SC_REGS: [usize; 16] =
+    [152, 160, 144, 136, 168, 128, 120, 112, 48, 56, 64, 72, 80, 88, 96, 104];
+const SC_RIP: usize = 176;
+const SC_EFLAGS: usize = 184;
+const SC_CS: usize = 192;
+const SC_SS: usize = 198;
+const SC_ERR: usize = 200;
+const SC_TRAPNO: usize = 208;
+const SC_OLDMASK: usize = 216;
+const SC_CR2: usize = 224;
+const SC_FPSTATE: usize = 232;
+/// `sw_reserved` in the FXSAVE image, `struct _fpx_sw_bytes`.
+const FP_SW: u64 = 464;
+const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
+/// The legacy area and the XSAVE header.
+const XSAVE_MIN: u64 = 512 + 64;
+/// `TF_MASK`.
+const TF_MASK: u64 = 1 << 8;
+/// The flags `sigreturn()` takes from the frame: CF, PF, AF, ZF, SF, TF, DF, OF and AC.
+const FIX_EFLAGS: u64 = 0x40DD5;
+
+/// `get_fpstate_kind()`: whether frames carry XSAVE state rather than FXSAVE state.
+fn uses_xsave(cpu: &Cpu<'_>) -> bool {
+    env::ld64(cpu.env, env::cr(4)) & CR4_OSXSAVE_MASK != 0
+}
+
+/// `get_fpstate_size()`.
+fn fpstate_size(cpu: &Cpu<'_>, xsave: bool) -> u64 {
+    if xsave { xsave_area_size(cpu, env::ld64(cpu.env, env::XCR0)) as u64 + 4 } else { 512 }
+}
+
+/// `setup_rt_frame()`: the frame for the handler of `sig` on the guest stack, and the
+/// registers that enter it. `old` is the guest mask to return to.
+pub(crate) fn setup_rt_frame(
+    space: &GuestSpace,
+    t: &mut Task,
+    cpu: &mut Cpu<'_>,
+    sig: i32,
+    sa: &Sigaction,
+    info: &signal::Info,
+    old: u64,
+) {
+    let xsave = uses_xsave(cpu);
+    // get_sigframe(): below the red zone, or on the alternate stack.
+    let rsp = reg(cpu, R_ESP);
+    let mut sp = signal::target_sigsp(t, rsp.wrapping_sub(128), sa);
+    let math = fpstate_size(cpu, xsave);
+    sp = sp.wrapping_sub(math) & !63;
+    let fpstate = sp;
+    let fpend = sp.wrapping_add(math);
+    sp = sp.wrapping_sub(FRAME_SIZE).wrapping_add(8) & !15;
+    let frame = sp.wrapping_sub(8);
+
+    let mut f = [0u8; FRAME_SIZE as usize];
+    if fpend < frame
+        || !space.check(frame, fpend - frame, page::WRITE)
+        || !space.read_raw(frame, &mut f)
+    {
+        signal::force_sigsegv(t, sig);
+        return;
+    }
+    if sa.flags & signal::SA_SIGINFO != 0 {
+        f[INFO..].copy_from_slice(info);
+    }
+    put64(&mut f, UC, u64::from(xsave));
+    put64(&mut f, UC + 8, 0);
+    f[UC_STACK..UC_STACK + 24].copy_from_slice(&signal::save_altstack(t, rsp));
+
+    // setup_sigcontext().
+    for (n, at) in SC_REGS.iter().enumerate() {
+        put64(&mut f, *at, reg(cpu, n));
+    }
+    put64(&mut f, SC_TRAPNO, cpu.core.exception_index as i64 as u64);
+    put64(&mut f, SC_ERR, env::ld32(cpu.env, env::ERROR_CODE) as i32 as i64 as u64);
+    put64(&mut f, SC_RIP, env::ld64(cpu.env, EIP));
+    put64(&mut f, SC_EFLAGS, env::ld64(cpu.env, env::EFLAGS));
+    let sel = |cpu: &Cpu<'_>, s: usize| env::ld32(cpu.env, SEGS + s * SEG_SIZE) as u16;
+    f[SC_CS..SC_CS + 2].copy_from_slice(&sel(cpu, R_CS).to_le_bytes());
+    f[SC_CS + 2..SC_SS].fill(0);
+    f[SC_SS..SC_SS + 2].copy_from_slice(&sel(cpu, R_SS).to_le_bytes());
+    let fp_ok = if xsave {
+        // xsave_sigcontext(): XSAVE adds to the header, so it starts out zero.
+        let xcr0 = env::ld64(cpu.env, env::XCR0);
+        let xstate_size = fpend - fpstate - 4;
+        space.write_raw(fpstate + 512, &[0u8; 64]) && cpu_x86_xsave(cpu, fpstate, xcr0).is_ok() && {
+            let mut sw = [0u8; 24];
+            put32(&mut sw, 0, FP_XSTATE_MAGIC1);
+            put32(&mut sw, 4, (fpend - fpstate) as u32);
+            put64(&mut sw, 8, xcr0);
+            put32(&mut sw, 16, xstate_size as u32);
+            space.write_raw(fpstate + FP_SW, &sw)
+                && space.write_raw(fpstate + xstate_size, &FP_XSTATE_MAGIC2.to_le_bytes())
+        }
+    } else {
+        cpu_x86_fxsave(cpu, fpstate).is_ok() && space.write_raw(fpstate + FP_SW, &[0u8; 4])
+    };
+    if !fp_ok {
+        cpu.core.exception_index = -1;
+        signal::force_sigsegv(t, sig);
+        return;
+    }
+    put64(&mut f, SC_FPSTATE, fpstate);
+    put64(&mut f, SC_OLDMASK, old);
+    put64(&mut f, SC_CR2, env::ld64(cpu.env, env::cr(2)));
+    put64(&mut f, UC_SIGMASK, old);
+
+    // SA_RESTORER is required on x86_64.
+    if sa.flags & signal::SA_RESTORER == 0 {
+        signal::force_sigsegv(t, sig);
+        return;
+    }
+    put64(&mut f, 0, sa.restorer);
+    space.write_raw(frame, &f);
+
+    set_reg(cpu, R_ESP, frame);
+    env::st64(cpu.env, EIP, sa.handler);
+    set_reg(cpu, R_EAX, 0);
+    set_reg(cpu, R_EDI, sig as u64);
+    set_reg(cpu, R_ESI, frame + INFO as u64);
+    set_reg(cpu, R_EDX, frame + UC as u64);
+    for (seg, s) in [(R_DS, USER_DS), (R_ES, USER_DS), (R_CS, USER_CS), (R_SS, USER_DS)] {
+        if cpu_x86_load_seg(cpu, seg, s).is_err() {
+            break;
+        }
+    }
+    let fl = env::ld64(cpu.env, env::EFLAGS);
+    env::st64(cpu.env, env::EFLAGS, fl & !TF_MASK);
+}
+
+/// `xrstor_sigcontext()` of the state at `fp`, false when the frame is bad.
+fn restore_fpstate(space: &GuestSpace, cpu: &mut Cpu<'_>, fp: u64) -> bool {
+    let xsave = uses_xsave(cpu);
+    let math = fpstate_size(cpu, xsave);
+    let mut img = vec![0u8; 512];
+    if !space.check(fp, math, page::READ) || !space.read(fp, &mut img) {
+        return false;
+    }
+    if xsave {
+        let xcr0 = env::ld64(cpu.env, env::XCR0);
+        let sw = &img[FP_SW as usize..];
+        let (magic1, ext, xs) = (get32(sw, 0), u64::from(get32(sw, 4)), u64::from(get32(sw, 16)));
+        let max = xsave_area_size(cpu, xcr0) as u64;
+        if magic1 == FP_XSTATE_MAGIC1 && (XSAVE_MIN..=max).contains(&xs) && xs <= ext {
+            let xfeatures = get64(sw, 8) & xcr0;
+            if xs < xsave_area_size(cpu, xfeatures) as u64 || !space.check(fp, xs + 4, page::READ) {
+                return false;
+            }
+            let mut m2 = [0u8; 4];
+            if space.read(fp + xs, &mut m2) && u32::from_le_bytes(m2) == FP_XSTATE_MAGIC2 {
+                return matches!(cpu_x86_xrstor(cpu, fp, xfeatures), Ok(true));
+            }
+        }
+    }
+    cpu_x86_fxrstor(cpu, fp).is_ok()
+}
+
+/// `do_rt_sigreturn()`.
+pub(crate) fn do_rt_sigreturn(space: &GuestSpace, t: &mut Task, cpu: &mut Cpu<'_>) -> i64 {
+    let frame = reg(cpu, R_ESP).wrapping_sub(8);
+    let mut f = [0u8; FRAME_SIZE as usize];
+    if !space.read(frame, &mut f) {
+        signal::force_sig(t, signal::SIGSEGV);
+        return signal::ESIGRETURN;
+    }
+    signal::set_sigmask(t, signal::t2h_set(get64(&f, UC_SIGMASK)));
+
+    // restore_sigcontext().
+    for (n, at) in SC_REGS.iter().enumerate() {
+        set_reg(cpu, n, get64(&f, *at));
+    }
+    env::st64(cpu.env, EIP, get64(&f, SC_RIP));
+    // A selector that does not load leaves a #GP for the next instruction.
+    let cs = u32::from(u16::from_le_bytes([f[SC_CS], f[SC_CS + 1]])) | 3;
+    let ss = u32::from(u16::from_le_bytes([f[SC_SS], f[SC_SS + 1]])) | 3;
+    if cpu_x86_load_seg(cpu, R_CS, cs).is_ok() {
+        let _ = cpu_x86_load_seg(cpu, R_SS, ss);
+    }
+    let fl = env::ld64(cpu.env, env::EFLAGS);
+    let tmp = get64(&f, SC_EFLAGS);
+    env::st64(cpu.env, env::EFLAGS, (fl & !FIX_EFLAGS) | (tmp & FIX_EFLAGS));
+    let fp = get64(&f, SC_FPSTATE);
+    let ok = fp == 0 || restore_fpstate(space, cpu, fp);
+    if !ok {
+        signal::force_sig(t, signal::SIGSEGV);
+        return signal::ESIGRETURN;
+    }
+    let sp = reg(cpu, R_ESP);
+    let _ = signal::restore_altstack(t, &f[UC_STACK..UC_STACK + 24], sp);
+    signal::ESIGRETURN
 }
 
 /// `cpu_loop()`.
-fn cpu_loop(p: &mut Proc, cpu: &mut Cpu<'_>) -> ! {
+fn cpu_loop(p: &mut Proc, t: &mut Task, cpu: &mut Cpu<'_>) -> ! {
     loop {
         let trapnr = tcg_cpu_exec(cpu);
+        cpu.process_queued_cpu_work();
         match trapnr {
             0x80 | EXCP_SYSCALL => {
                 let a = if trapnr == EXCP_SYSCALL {
@@ -419,16 +621,38 @@ fn cpu_loop(p: &mut Proc, cpu: &mut Cpu<'_>) -> ! {
                     reg(cpu, a[5]),
                     reg(cpu, a[6]),
                 ];
-                let ret = syscall::do_syscall(p, cpu, nr, args);
-                set_reg(cpu, R_EAX, ret as u64);
+                let ret = syscall::do_syscall(p, t, cpu, nr, args);
+                if ret == signal::ERESTARTSYS {
+                    let eip = env::ld64(cpu.env, EIP);
+                    env::st64(cpu.env, EIP, eip.wrapping_sub(2));
+                } else if ret != signal::ESIGRETURN {
+                    set_reg(cpu, R_EAX, ret as u64);
+                }
             }
-            EXCP0B_NOSEG | EXCP0C_STACK => dump_core_and_abort(libc::SIGBUS),
-            EXCP0D_GPF | EXCP0E_PAGE | EXCP04_INTO | EXCP05_BOUND => {
-                dump_core_and_abort(libc::SIGSEGV)
+            EXCP0B_NOSEG | EXCP0C_STACK => signal::force_sig(t, signal::SIGBUS),
+            EXCP0D_GPF | EXCP04_INTO | EXCP05_BOUND => signal::force_sig(t, signal::SIGSEGV),
+            EXCP0E_PAGE => {
+                let code = if env::ld32(cpu.env, env::ERROR_CODE) & 1 != 0 {
+                    signal::SEGV_ACCERR
+                } else {
+                    signal::SEGV_MAPERR
+                };
+                let addr = env::ld64(cpu.env, env::cr(2));
+                signal::force_sig_fault(t, signal::SIGSEGV, code, addr);
             }
-            EXCP00_DIVZ => dump_core_and_abort(libc::SIGFPE),
-            EXCP01_DB | EXCP03_INT3 | excp::DEBUG => dump_core_and_abort(libc::SIGTRAP),
-            EXCP06_ILLOP => dump_core_and_abort(libc::SIGILL),
+            EXCP00_DIVZ => {
+                let eip = env::ld64(cpu.env, EIP);
+                signal::force_sig_fault(t, signal::SIGFPE, signal::FPE_INTDIV, eip);
+            }
+            EXCP01_DB | excp::DEBUG => {
+                let eip = env::ld64(cpu.env, EIP);
+                signal::force_sig_fault(t, signal::SIGTRAP, signal::TRAP_BRKPT, eip);
+            }
+            EXCP03_INT3 => signal::force_sig(t, signal::SIGTRAP),
+            EXCP06_ILLOP => {
+                let eip = env::ld64(cpu.env, EIP);
+                signal::force_sig_fault(t, signal::SIGILL, signal::ILL_ILLOPN, eip);
+            }
             excp::INTERRUPT => {}
             excp::ATOMIC => cpu_exec_step_atomic(cpu),
             _ => {
@@ -439,6 +663,8 @@ fn cpu_loop(p: &mut Proc, cpu: &mut Cpu<'_>) -> ! {
                 std::process::abort();
             }
         }
+        let space = Arc::clone(p.space());
+        signal::process_pending_signals(&space, t, cpu);
     }
 }
 
@@ -472,6 +698,8 @@ fn is_exec(file: &File) -> bool {
 
 /// `main()` of `qemu-x86_64`.
 pub(crate) fn main(argv0: &str, args: &[String]) -> ExitCode {
+    // Signals stay blocked until the guest runs, here and in any thread started meanwhile.
+    let host_mask = host::set_mask(!0);
     let prog = argv0.rsplit('/').next().unwrap_or(argv0);
     let env: Vec<(String, String)> = std::env::vars_os()
         .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
@@ -631,5 +859,8 @@ pub(crate) fn main(argv0: &str, args: &[String]) -> ExitCode {
         o.ld_prefix.clone(),
     );
     let mut cpu = v.cpu();
-    cpu_loop(&mut proc, &mut cpu)
+    signal::signal_init(prog);
+    let mut task = Task::new(host_mask, cpu.shared());
+    host::set_mask(task.run_mask());
+    cpu_loop(&mut proc, &mut task, &mut cpu)
 }

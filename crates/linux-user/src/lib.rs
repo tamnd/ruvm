@@ -22,10 +22,11 @@
 //! differences from QEMU are:
 //!
 //! - There is no vDSO; the C library falls back to system calls.
-//! - Signals are bookkeeping only. `rt_sigaction()` remembers handlers but never runs them;
-//!   `SIG_IGN` and `SIG_DFL` are applied to the host so that ignoring `SIGPIPE` and the like
-//!   still works. A fault the program takes ends it with QEMU's "uncaught target signal"
-//!   message and the signal itself.
+//! - Signals are delivered as QEMU delivers them: host signals are queued and run on the
+//!   guest's handlers with the kernel's `rt_sigframe`, faults the guest takes become its
+//!   `SIGSEGV`, `SIGBUS`, `SIGFPE`, `SIGILL` and `SIGTRAP`, and blocking system calls restart
+//!   or fail with `EINTR` as they should. Reads from a `signalfd` are not translated, and a
+//!   file mapping touched past its end does not raise `SIGBUS`.
 //! - `clone()` with `CLONE_VM` (threads) fails with `EINVAL`; `fork()`, `vfork()` and
 //!   `posix_spawn()` work, as forks.
 //! - Guest memory goes through the softmmu TLB rather than straight to host addresses.
@@ -40,6 +41,8 @@ pub mod opts;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod host;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod signal;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod syscall;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

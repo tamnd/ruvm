@@ -36,7 +36,7 @@
 //!   so it always writes every requested component.
 
 use ruvm_jit::cputlb::{probe_access, tlb_flush};
-use ruvm_jit::{Cpu, MmuAccessType};
+use ruvm_jit::{Cpu, MmuAccessType, Ra};
 use ruvm_jit_core::MemOp;
 use ruvm_jit_interp::{HelperEnv, Unwind};
 use ruvm_softfloat::{
@@ -2139,27 +2139,36 @@ fn fyl2x(e: &mut [u8], s: &mut FloatStatus) {
 /// A probed range of guest memory (`X86Access`).
 struct Access {
     idx: usize,
+    ra: Ra,
 }
 
 impl Access {
     /// `access_prepare()`: probe `size` bytes at `ptr` (at most two pages) for `at` with the
     /// current MMU index, raising any fault now.
     fn prepare(cpu: &mut Cpu<'_>, ptr: u64, size: usize, at: MmuAccessType) -> R<Self> {
+        Self::prepare_ra(cpu, ptr, size, at, TB)
+    }
+
+    /// [`Access::prepare`] for a caller that is not a helper, with `ra` for its faults.
+    fn prepare_ra(cpu: &mut Cpu<'_>, ptr: u64, size: usize, at: MmuAccessType, ra: Ra) -> R<Self> {
         let idx = mmu_index_pl(cpu.env, hflags(cpu) & HF_CPL_MASK);
-        let size1 = size.min(0x1000 - (ptr & 0xfff) as usize);
-        probe_access(cpu, ptr, size1, at, idx, TB)?;
-        if size > size1 {
-            probe_access(cpu, ptr.wrapping_add(size1 as u64), size - size1, at, idx, TB)?;
+        let mut done = 0;
+        // The user mode signal frame can be bigger than two pages.
+        while done < size {
+            let p = ptr.wrapping_add(done as u64);
+            let n = (size - done).min(0x1000 - (p & 0xfff) as usize);
+            probe_access(cpu, p, n, at, idx, ra)?;
+            done += n;
         }
-        Ok(Access { idx })
+        Ok(Access { idx, ra })
     }
 
     fn ld(&self, cpu: &mut Cpu<'_>, addr: u64, mop: MemOp) -> R<u64> {
-        sh::ld(cpu, addr, mop, self.idx, TB)
+        sh::ld(cpu, addr, mop, self.idx, self.ra)
     }
 
     fn st(&self, cpu: &mut Cpu<'_>, addr: u64, v: u64, mop: MemOp) -> R<()> {
-        sh::st(cpu, addr, v, mop, self.idx, TB)
+        sh::st(cpu, addr, v, mop, self.idx, self.ra)
     }
 
     /// `do_fldt()`.
@@ -2266,6 +2275,31 @@ fn xrstor_fpu(cpu: &mut Cpu<'_>, ac: &Access, ptr: u64) -> R<()> {
     Ok(())
 }
 
+/// `do_fxsave()`.
+fn fxsave(cpu: &mut Cpu<'_>, ac: &Access, ptr: u64) -> R<()> {
+    xsave_fpu(cpu, ac, ptr)?;
+    if ld64(cpu.env, cr(4)) & CR4_OSFXSR_MASK != 0 {
+        xsave_mxcsr(cpu, ac, ptr)?;
+        if !ffxsr_skips_sse(cpu) {
+            xsave_xmm(cpu, ac, ptr.wrapping_add(XO_XMM), 0)?;
+        }
+    }
+    Ok(())
+}
+
+/// `do_fxrstor()`.
+fn fxrstor(cpu: &mut Cpu<'_>, ac: &Access, ptr: u64) -> R<()> {
+    xrstor_fpu(cpu, ac, ptr)?;
+    if ld64(cpu.env, cr(4)) & CR4_OSFXSR_MASK != 0 {
+        let mxcsr = ac.ld(cpu, ptr.wrapping_add(XO_MXCSR), MemOp::LEUL)?;
+        st32(cpu.env, MXCSR, mxcsr as u32);
+        if !ffxsr_skips_sse(cpu) {
+            xrstor_xmm(cpu, ac, ptr.wrapping_add(XO_XMM), 0)?;
+        }
+    }
+    Ok(())
+}
+
 fn h_fxsave(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     let ptr = a[1];
     run(h, |cpu| {
@@ -2273,14 +2307,7 @@ fn h_fxsave(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
             return Err(sh::raise_exception_ra(cpu, EXCP0D_GPF, TB));
         }
         let ac = Access::prepare(cpu, ptr, LEGACY_SIZE, MmuAccessType::DataStore)?;
-        xsave_fpu(cpu, &ac, ptr)?;
-        if ld64(cpu.env, cr(4)) & CR4_OSFXSR_MASK != 0 {
-            xsave_mxcsr(cpu, &ac, ptr)?;
-            if !ffxsr_skips_sse(cpu) {
-                xsave_xmm(cpu, &ac, ptr.wrapping_add(XO_XMM), 0)?;
-            }
-        }
-        Ok(0)
+        fxsave(cpu, &ac, ptr).map(|()| 0)
     })
 }
 
@@ -2291,15 +2318,7 @@ fn h_fxrstor(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
             return Err(sh::raise_exception_ra(cpu, EXCP0D_GPF, TB));
         }
         let ac = Access::prepare(cpu, ptr, LEGACY_SIZE, MmuAccessType::DataLoad)?;
-        xrstor_fpu(cpu, &ac, ptr)?;
-        if ld64(cpu.env, cr(4)) & CR4_OSFXSR_MASK != 0 {
-            let mxcsr = ac.ld(cpu, ptr.wrapping_add(XO_MXCSR), MemOp::LEUL)?;
-            st32(cpu.env, MXCSR, mxcsr as u32);
-            if !ffxsr_skips_sse(cpu) {
-                xrstor_xmm(cpu, &ac, ptr.wrapping_add(XO_XMM), 0)?;
-            }
-        }
-        Ok(0)
+        fxrstor(cpu, &ac, ptr).map(|()| 0)
     })
 }
 
@@ -2332,17 +2351,29 @@ fn xsave(cpu: &mut Cpu<'_>, ptr: u64, rfbm: u64, inuse: u64, opt: u64) -> R<()> 
     let opt = opt & rfbm;
     let size = area_size(cpu, opt);
     let ac = Access::prepare(cpu, ptr, size, MmuAccessType::DataStore)?;
+    xsave_access(cpu, &ac, ptr, rfbm, inuse, opt)
+}
+
+/// `do_xsave_access()`.
+fn xsave_access(
+    cpu: &mut Cpu<'_>,
+    ac: &Access,
+    ptr: u64,
+    rfbm: u64,
+    inuse: u64,
+    opt: u64,
+) -> R<()> {
     if opt & XSTATE_FP != 0 {
-        xsave_fpu(cpu, &ac, ptr)?;
+        xsave_fpu(cpu, ac, ptr)?;
     }
     if rfbm & XSTATE_SSE != 0 {
-        xsave_mxcsr(cpu, &ac, ptr)?;
+        xsave_mxcsr(cpu, ac, ptr)?;
     }
     if opt & XSTATE_SSE != 0 {
-        xsave_xmm(cpu, &ac, ptr.wrapping_add(XO_XMM), 0)?;
+        xsave_xmm(cpu, ac, ptr.wrapping_add(XO_XMM), 0)?;
     }
     if opt & XSTATE_YMM != 0 {
-        xsave_xmm(cpu, &ac, ptr.wrapping_add(XO_AVX), 1)?;
+        xsave_xmm(cpu, ac, ptr.wrapping_add(XO_AVX), 1)?;
     }
     if opt & XSTATE_PKRU != 0 {
         let pkru = ld32(cpu.env, PKRU);
@@ -2358,6 +2389,60 @@ fn h_xsave(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| xsave(cpu, ptr, rfbm, xinuse(), rfbm).map(|()| 0))
 }
 
+/// `valid_xrstor_header()`: the XSTATE_BV of a standard form header, if it is one.
+fn xrstor_header(cpu: &mut Cpu<'_>, ac: &Access, ptr: u64) -> R<Option<u64>> {
+    let xstate_bv = ac.ld(cpu, ptr.wrapping_add(XO_XSTATE_BV), MemOp::LEUQ)?;
+    let xcomp_bv = ac.ld(cpu, ptr.wrapping_add(XO_XCOMP_BV), MemOp::LEUQ)?;
+    let reserve0 = ac.ld(cpu, ptr.wrapping_add(XO_RESERVE0), MemOp::LEUQ)?;
+    let xcr0 = ld64(cpu.env, XCR0);
+    let ok = xcomp_bv == 0 && reserve0 == 0 && xstate_bv & !xcr0 == 0;
+    Ok(ok.then_some(xstate_bv))
+}
+
+/// `do_xrstor()`.
+fn xrstor(cpu: &mut Cpu<'_>, ac: &Access, ptr: u64, rfbm: u64, xstate_bv: u64) -> R<()> {
+    if rfbm & XSTATE_FP != 0 {
+        if xstate_bv & XSTATE_FP != 0 {
+            xrstor_fpu(cpu, ac, ptr)?;
+        } else {
+            fninit(cpu.env);
+            for i in 0..8 {
+                stx(cpu.env, fpreg(i), ZERO);
+            }
+        }
+    }
+    if rfbm & XSTATE_SSE != 0 {
+        // The standard form of XRSTOR loads MXCSR whether or not XSTATE_BV has SSE.
+        let mxcsr = ac.ld(cpu, ptr.wrapping_add(XO_MXCSR), MemOp::LEUL)?;
+        st32(cpu.env, MXCSR, mxcsr as u32);
+        if xstate_bv & XSTATE_SSE != 0 {
+            xrstor_xmm(cpu, ac, ptr.wrapping_add(XO_XMM), 0)?;
+        } else {
+            clear_xmm(cpu, 0);
+        }
+    }
+    if rfbm & XSTATE_YMM != 0 {
+        if xstate_bv & XSTATE_YMM != 0 {
+            xrstor_xmm(cpu, ac, ptr.wrapping_add(XO_AVX), 1)?;
+        } else {
+            clear_xmm(cpu, 1);
+        }
+    }
+    if rfbm & XSTATE_PKRU != 0 {
+        let old = ld32(cpu.env, PKRU);
+        let new = if xstate_bv & XSTATE_PKRU != 0 {
+            ac.ld(cpu, ptr.wrapping_add(XO_PKRU), MemOp::LEUQ)? as u32
+        } else {
+            0
+        };
+        st32(cpu.env, PKRU, new);
+        if new != old {
+            tlb_flush(cpu);
+        }
+    }
+    Ok(())
+}
+
 fn h_xrstor(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     let (ptr, rfbm) = (a[1], a[2]);
     run(h, |cpu| {
@@ -2365,58 +2450,50 @@ fn h_xrstor(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
         // Begin with just the minimum size to validate the header.
         let size = LEGACY_HEADER_SIZE;
         let mut ac = Access::prepare(cpu, ptr, size, MmuAccessType::DataLoad)?;
-        let xstate_bv = ac.ld(cpu, ptr.wrapping_add(XO_XSTATE_BV), MemOp::LEUQ)?;
-        let xcomp_bv = ac.ld(cpu, ptr.wrapping_add(XO_XCOMP_BV), MemOp::LEUQ)?;
-        let reserve0 = ac.ld(cpu, ptr.wrapping_add(XO_RESERVE0), MemOp::LEUQ)?;
-        let xcr0 = ld64(cpu.env, XCR0);
-        if xcomp_bv != 0 || reserve0 != 0 || xstate_bv & !xcr0 != 0 {
+        let Some(xstate_bv) = xrstor_header(cpu, &ac, ptr)? else {
             return Err(sh::raise_exception_ra(cpu, EXCP0D_GPF, TB));
-        }
-        let rfbm = rfbm & xcr0;
+        };
+        let rfbm = rfbm & ld64(cpu.env, XCR0);
         let size_ext = area_size(cpu, rfbm & xstate_bv);
         if size < size_ext {
             ac = Access::prepare(cpu, ptr, size_ext, MmuAccessType::DataLoad)?;
         }
-
-        if rfbm & XSTATE_FP != 0 {
-            if xstate_bv & XSTATE_FP != 0 {
-                xrstor_fpu(cpu, &ac, ptr)?;
-            } else {
-                fninit(cpu.env);
-                for i in 0..8 {
-                    stx(cpu.env, fpreg(i), ZERO);
-                }
-            }
-        }
-        if rfbm & XSTATE_SSE != 0 {
-            // The standard form of XRSTOR loads MXCSR whether or not XSTATE_BV has SSE.
-            let mxcsr = ac.ld(cpu, ptr.wrapping_add(XO_MXCSR), MemOp::LEUL)?;
-            st32(cpu.env, MXCSR, mxcsr as u32);
-            if xstate_bv & XSTATE_SSE != 0 {
-                xrstor_xmm(cpu, &ac, ptr.wrapping_add(XO_XMM), 0)?;
-            } else {
-                clear_xmm(cpu, 0);
-            }
-        }
-        if rfbm & XSTATE_YMM != 0 {
-            if xstate_bv & XSTATE_YMM != 0 {
-                xrstor_xmm(cpu, &ac, ptr.wrapping_add(XO_AVX), 1)?;
-            } else {
-                clear_xmm(cpu, 1);
-            }
-        }
-        if rfbm & XSTATE_PKRU != 0 {
-            let old = ld32(cpu.env, PKRU);
-            let new = if xstate_bv & XSTATE_PKRU != 0 {
-                ac.ld(cpu, ptr.wrapping_add(XO_PKRU), MemOp::LEUQ)? as u32
-            } else {
-                0
-            };
-            st32(cpu.env, PKRU, new);
-            if new != old {
-                tlb_flush(cpu);
-            }
-        }
-        Ok(0)
+        xrstor(cpu, &ac, ptr, rfbm, xstate_bv).map(|()| 0)
     })
+}
+
+// The user mode signal frame, `cpu_x86_fxsave()` and friends: the same state to and from guest
+// memory at `ptr`, outside of any helper. A fault is the frame's, not an instruction's.
+
+/// `cpu_x86_fxsave()`.
+pub(crate) fn user_fxsave(cpu: &mut Cpu<'_>, ptr: u64) -> R<()> {
+    let ac = Access::prepare_ra(cpu, ptr, LEGACY_SIZE, MmuAccessType::DataStore, Ra::None)?;
+    fxsave(cpu, &ac, ptr)
+}
+
+/// `cpu_x86_fxrstor()`.
+pub(crate) fn user_fxrstor(cpu: &mut Cpu<'_>, ptr: u64) -> R<()> {
+    let ac = Access::prepare_ra(cpu, ptr, LEGACY_SIZE, MmuAccessType::DataLoad, Ra::None)?;
+    fxrstor(cpu, &ac, ptr)
+}
+
+/// `cpu_x86_xsave()`, of the components in `rfbm`, which XCR0 has.
+pub(crate) fn user_xsave(cpu: &mut Cpu<'_>, ptr: u64, rfbm: u64) -> R<()> {
+    let size = area_size(cpu, rfbm);
+    let ac = Access::prepare_ra(cpu, ptr, size, MmuAccessType::DataStore, Ra::None)?;
+    xsave_access(cpu, &ac, ptr, rfbm, xinuse(), rfbm)
+}
+
+/// `cpu_x86_xrstor()`: false when the header is not a valid standard form one.
+pub(crate) fn user_xrstor(cpu: &mut Cpu<'_>, ptr: u64, rfbm: u64) -> R<bool> {
+    let size = area_size(cpu, rfbm);
+    let ac = Access::prepare_ra(cpu, ptr, size, MmuAccessType::DataLoad, Ra::None)?;
+    let Some(xstate_bv) = xrstor_header(cpu, &ac, ptr)? else { return Ok(false) };
+    xrstor(cpu, &ac, ptr, rfbm, xstate_bv)?;
+    Ok(true)
+}
+
+/// `xsave_area_size(mask, false)` for the vCPU's model.
+pub(crate) fn user_xsave_area_size(cpu: &Cpu<'_>, mask: u64) -> usize {
+    area_size(cpu, mask)
 }

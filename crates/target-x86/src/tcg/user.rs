@@ -81,3 +81,37 @@ pub fn record_sigsegv(
     st64(cpu.env, EXCEPTION_NEXT_EIP, u64::MAX);
     cpu.cpu_loop_exit_restore(ra)
 }
+
+/// `cpu_x86_fxsave()`: the FXSAVE image of the vCPU's x87 and SSE state to guest memory at
+/// `ptr`, for a signal frame.
+pub fn cpu_x86_fxsave(cpu: &mut Cpu<'_>, ptr: u64) -> Result<(), CpuLoopExit> {
+    super::helpers::fpu::user_fxsave(cpu, ptr)
+}
+
+/// `cpu_x86_fxrstor()`: the reverse of [`cpu_x86_fxsave`].
+pub fn cpu_x86_fxrstor(cpu: &mut Cpu<'_>, ptr: u64) -> Result<(), CpuLoopExit> {
+    super::helpers::fpu::user_fxrstor(cpu, ptr)
+}
+
+/// `cpu_x86_xsave()`: the standard form XSAVE image of the components in `rfbm`, which must
+/// all be in XCR0, to guest memory at `ptr`.
+pub fn cpu_x86_xsave(cpu: &mut Cpu<'_>, ptr: u64, rfbm: u64) -> Result<(), CpuLoopExit> {
+    super::helpers::fpu::user_xsave(cpu, ptr, rfbm)
+}
+
+/// `cpu_x86_xrstor()`: the reverse of [`cpu_x86_xsave`], false when the image's header is not
+/// valid.
+pub fn cpu_x86_xrstor(cpu: &mut Cpu<'_>, ptr: u64, rfbm: u64) -> Result<bool, CpuLoopExit> {
+    super::helpers::fpu::user_xrstor(cpu, ptr, rfbm)
+}
+
+/// `xsave_area_size(mask, false)` for the vCPU's CPU model.
+pub fn xsave_area_size(cpu: &Cpu<'_>, mask: u64) -> usize {
+    super::helpers::fpu::user_xsave_area_size(cpu, mask)
+}
+
+/// `cpu_x86_load_seg()` in protected mode: load segment register `seg` with `selector` from
+/// the descriptor tables, as the kernel does when it enters a signal handler.
+pub fn cpu_x86_load_seg(cpu: &mut Cpu<'_>, seg: usize, selector: u32) -> Result<(), CpuLoopExit> {
+    super::seg::helper_load_seg(cpu, seg, selector, Ra::None)
+}
