@@ -7,12 +7,14 @@ use std::fmt;
 use std::fs::File;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use ruvm_jit::cpu_exec::{cpu_exec_step_atomic, tcg_cpu_exec};
 use ruvm_jit::cputlb::tlb_set_page;
 use ruvm_jit::translate::TbBuild;
 use ruvm_jit::{
-    Cpu, CpuLoopExit, CpuOps, Jit, MmuAccessType, Ra, Tb, TbCpuState, Watchpoint, excp,
+    Cpu, CpuLoopExit, CpuOps, ENV_TARGET_OFFSET, Jit, MmuAccessType, Ra, Tb, TbCpuState,
+    Watchpoint, cf, excp,
 };
 use ruvm_jit_core::Type;
 use ruvm_jit_core::types::INSN_START_WORDS;
@@ -40,7 +42,10 @@ use crate::elf::{self, Arch, Creds, Exec};
 use crate::host;
 use crate::opts::{self, Exit};
 use crate::signal::{self, Sigaction, Task, get32, get64, put32, put64};
-use crate::syscall::{self, Proc};
+use crate::syscall::{
+    self, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_LOCK, CLONE_PARENT_SETTID, CLONE_SETTLS,
+    Proc, THREAD_EXIT, THREADS, lock,
+};
 
 /// `TASK_UNMAPPED_BASE` for x86_64, `TASK_SIZE / 3` page aligned.
 const TASK_UNMAPPED_BASE: u64 = 0x2aaa_aaaa_b000;
@@ -600,8 +605,83 @@ pub(crate) fn do_rt_sigreturn(space: &GuestSpace, t: &mut Task, cpu: &mut Cpu<'_
     signal::ESIGRETURN
 }
 
-/// `cpu_loop()`.
-fn cpu_loop(p: &mut Proc, t: &mut Task, cpu: &mut Cpu<'_>) -> ! {
+/// The host stack of a guest thread, which only the emulator runs on.
+const THREAD_STACK: usize = 8 << 20;
+
+/// The `CLONE_VM` half of `do_fork()`: a copy of the vCPU, run by a new host thread. `flags`
+/// were checked already.
+pub(crate) fn new_thread(
+    p: &Arc<Proc>,
+    t: &Task,
+    cpu: &mut Cpu<'_>,
+    flags: u64,
+    [newsp, ptid, ctid, tls]: [u64; 4],
+) -> i64 {
+    // Grab a mutex so that thread setup appears atomic.
+    let clone = lock(&CLONE_LOCK);
+    let jit = cpu.jit();
+    // begin_parallel_context(): code for one vCPU does not do for several.
+    if cpu.core.tcg_cflags & cf::PARALLEL == 0 {
+        jit.tb_flush_exclusive_or_serial();
+        cpu.core.tcg_cflags |= cf::PARALLEL;
+    }
+    // cpu_copy() and cpu_clone_regs_child().
+    let mut v = jit.create_vcpu(cpu.ops(), Arc::clone(cpu.core.address_space()), env::ENV_SIZE);
+    v.core.tcg_cflags = cpu.core.tcg_cflags;
+    v.env[ENV_TARGET_OFFSET..].copy_from_slice(&cpu.env[ENV_TARGET_OFFSET..]);
+    {
+        let mut c = v.cpu();
+        if newsp != 0 {
+            set_reg(&mut c, R_ESP, newsp);
+        }
+        set_reg(&mut c, R_EAX, 0);
+        if flags & CLONE_SETTLS != 0 {
+            set_tls(&mut c, tls);
+        }
+    }
+    let mask = t.signal_mask;
+    let p = Arc::clone(p);
+    let (tx, rx) = std::sync::mpsc::channel();
+    // It is not safe to deliver signals until the child has finished initializing.
+    let old = host::set_mask(!0);
+    let spawned = std::thread::Builder::new().stack_size(THREAD_STACK).spawn(move || {
+        let mut v = v;
+        let mut cpu = v.cpu();
+        let tid = host::sys(libc::SYS_gettid, &[]) as u32;
+        let mut task = Task::new(mask, cpu.shared());
+        if flags & CLONE_CHILD_CLEARTID != 0 {
+            task.child_tidptr = ctid;
+        }
+        if flags & CLONE_CHILD_SETTID != 0 {
+            let _ = p.put(ctid, &tid.to_le_bytes());
+        }
+        if flags & CLONE_PARENT_SETTID != 0 {
+            let _ = p.put(ptid, &tid.to_le_bytes());
+        }
+        host::set_mask(task.run_mask());
+        let _ = tx.send(tid);
+        // Wait until the parent has finished.
+        drop(lock(&CLONE_LOCK));
+        cpu_loop(&p, &mut task, &mut cpu);
+        task.exit_thread();
+    });
+    host::set_mask(old);
+    let r = match spawned {
+        Ok(_) => match rx.recv() {
+            Ok(tid) => {
+                THREADS.fetch_add(1, Ordering::AcqRel);
+                i64::from(tid)
+            }
+            Err(_) => -i64::from(libc::EAGAIN),
+        },
+        Err(e) => -i64::from(e.raw_os_error().unwrap_or(libc::EAGAIN)),
+    };
+    drop(clone);
+    r
+}
+
+/// `cpu_loop()`, until the thread calls `exit` with others left.
+fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
     loop {
         let trapnr = tcg_cpu_exec(cpu);
         cpu.process_queued_cpu_work();
@@ -622,6 +702,9 @@ fn cpu_loop(p: &mut Proc, t: &mut Task, cpu: &mut Cpu<'_>) -> ! {
                     reg(cpu, a[6]),
                 ];
                 let ret = syscall::do_syscall(p, t, cpu, nr, args);
+                if ret == THREAD_EXIT {
+                    return;
+                }
                 if ret == signal::ERESTARTSYS {
                     let eip = env::ld64(cpu.env, EIP);
                     env::st64(cpu.env, EIP, eip.wrapping_sub(2));
@@ -811,7 +894,9 @@ pub(crate) fn main(argv0: &str, args: &[String]) -> ExitCode {
 
     let mut config = jit_config();
     config.user_only = true;
-    config.mttcg = false;
+    // Every guest thread has a vCPU and a host thread; the first runs serial code until there
+    // is a second.
+    config.mttcg = true;
     if let Some(mb) = o.tb_size {
         if mb != 0 {
             config.code_gen_buffer_size = usize::try_from(mb << 20).unwrap_or(usize::MAX);
@@ -850,17 +935,24 @@ pub(crate) fn main(argv0: &str, args: &[String]) -> ExitCode {
     let x86 = Arc::new(X86::new(model).with_user_mode());
     let ops = Arc::new(UserCpu { x86, space: Arc::clone(&space) });
     let mut v = jit.create_vcpu(ops, as_, env::ENV_SIZE);
+    v.core.tcg_cflags &= !cf::PARALLEL;
     env::load_state(&mut v.env, &state);
-    let mut proc = Proc::new(
+    let proc = Arc::new(Proc::new(
         Arc::clone(&space),
         info.brk,
         real_exec_path,
         o.uname_release.clone(),
         o.ld_prefix.clone(),
-    );
+    ));
     let mut cpu = v.cpu();
     signal::signal_init(prog);
     let mut task = Task::new(host_mask, cpu.shared());
     host::set_mask(task.run_mask());
-    cpu_loop(&mut proc, &mut task, &mut cpu)
+    cpu_loop(&proc, &mut task, &mut cpu);
+    // The main thread called exit with others left: it ends, and the process with the last.
+    task.exit_thread();
+    drop(v);
+    loop {
+        host::sys(libc::SYS_exit, &[0]);
+    }
 }
