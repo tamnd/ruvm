@@ -18,7 +18,7 @@
 //! against the size of the reservation first, so the kernel only ever sees memory inside it.
 //!
 //! What this first version runs: x86_64 programs on an x86_64 Linux host, static or dynamic,
-//! with the system calls of single threaded programs (files, memory, processes, time). The
+//! threaded or not, with the system calls of files, memory, processes, time and signals. The
 //! differences from QEMU are:
 //!
 //! - There is no vDSO; the C library falls back to system calls.
@@ -27,8 +27,9 @@
 //!   `SIGSEGV`, `SIGBUS`, `SIGFPE`, `SIGILL` and `SIGTRAP`, and blocking system calls restart
 //!   or fail with `EINTR` as they should. Reads from a `signalfd` are not translated, and a
 //!   file mapping touched past its end does not raise `SIGBUS`.
-//! - `clone()` with `CLONE_VM` (threads) fails with `EINVAL`; `fork()`, `vfork()` and
-//!   `posix_spawn()` work, as forks.
+//! - Threads are `clone()` with QEMU's flags, each a vCPU on its own host thread, with
+//!   `set_tid_address()`, `CLONE_CHILD_CLEARTID` and `exit` of one thread as QEMU has them.
+//!   Robust futex lists are `ENOSYS` there and here. `vfork()` and `posix_spawn()` are forks.
 //! - Guest memory goes through the softmmu TLB rather than straight to host addresses.
 //! - The vsyscall page is not emulated, `-g`, `-strace`, `-t`, `-trace` and `-plugin` are not
 //!   supported yet, and `/proc/self` is the host's except for `/proc/self/exe`.

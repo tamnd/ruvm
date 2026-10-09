@@ -8,13 +8,14 @@
 //! the signal calls (in [`crate::signal`]) and the handful of calls whose results name the
 //! emulator rather than the program.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use ruvm_jit::Cpu;
 use ruvm_jit::cputlb::tlb_flush;
+use ruvm_jit::{Cpu, CpuShared};
 use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page, page_align};
 
-use crate::host::sys;
+use crate::host::{self, sys};
 use crate::signal::{self, Task, guest_sys, guest_syscall};
 use crate::x86_64;
 
@@ -237,8 +238,8 @@ fn spec(n: i64) -> Option<&'static [A]> {
 /// The per-process state of the emulated kernel.
 pub(crate) struct Proc {
     space: Arc<GuestSpace>,
-    /// `target_brk`.
-    brk: u64,
+    /// `target_brk`, behind what is also `mmap_lock`: held while the mappings change.
+    mm: Mutex<u64>,
     /// `initial_target_brk`.
     initial_brk: u64,
     /// The program, what `/proc/self/exe` is.
@@ -258,7 +259,12 @@ impl Proc {
         ld_prefix: String,
     ) -> Self {
         let brk = page_align(brk).unwrap_or(brk);
-        Proc { space, brk, initial_brk: brk, exec_path, uname_release, ld_prefix }
+        Proc { space, mm: Mutex::new(brk), initial_brk: brk, exec_path, uname_release, ld_prefix }
+    }
+
+    /// `mmap_lock()`, with the break.
+    fn mm(&self) -> MutexGuard<'_, u64> {
+        self.mm.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The guest's address space.
@@ -287,7 +293,7 @@ impl Proc {
         if self.space.read(addr, &mut b) { Ok(u64::from_le_bytes(b)) } else { Err(-EFAULT) }
     }
 
-    fn put(&self, addr: u64, b: &[u8]) -> Result<(), i64> {
+    pub(crate) fn put(&self, addr: u64, b: &[u8]) -> Result<(), i64> {
         if self.space.write(addr, b) { Ok(()) } else { Err(-EFAULT) }
     }
 
@@ -375,29 +381,30 @@ impl Proc {
 }
 
 /// `do_brk()`.
-fn do_brk(p: &mut Proc, cpu: &mut Cpu<'_>, brk: u64) -> i64 {
+fn do_brk(p: &Proc, cpu: &mut Cpu<'_>, brk: u64) -> i64 {
+    let mut cur = p.mm();
     if brk < p.initial_brk {
-        return p.brk as i64;
+        return *cur as i64;
     }
-    let Some(new_brk) = page_align(brk) else { return p.brk as i64 };
-    let old_brk = page_align(p.brk).unwrap_or(p.brk);
+    let Some(new_brk) = page_align(brk) else { return *cur as i64 };
+    let old_brk = page_align(*cur).unwrap_or(*cur);
     if new_brk == old_brk {
-        p.brk = brk;
+        *cur = brk;
         return brk as i64;
     }
     if new_brk < old_brk {
         let _ = p.space.munmap(new_brk, old_brk - new_brk);
-        tlb_flush(cpu);
-        p.brk = brk;
+        flush_tlbs(cpu);
+        *cur = brk;
         return brk as i64;
     }
     let kind = MapKind { noreplace: true, anon: true, ..MapKind::default() };
     let r = p.space.mmap(old_brk, new_brk - old_brk, page::READ | page::WRITE, kind, None, 0);
-    tlb_flush(cpu);
+    flush_tlbs(cpu);
     if r == Ok(old_brk) {
-        p.brk = brk;
+        *cur = brk;
     }
-    p.brk as i64
+    *cur as i64
 }
 
 fn errno(r: Result<u64, i32>) -> i64 {
@@ -435,8 +442,9 @@ fn do_mmap(p: &Proc, cpu: &mut Cpu<'_>, a: [u64; 6]) -> i64 {
         anon: flags & MAP_ANONYMOUS != 0,
     };
     let fd = if kind.anon { None } else { Some(fd) };
+    let _mm = p.mm();
     let r = p.space.mmap(start, len, prot, kind, fd, off);
-    tlb_flush(cpu);
+    flush_tlbs(cpu);
     errno(r)
 }
 
@@ -579,46 +587,130 @@ fn do_readlink(p: &Proc, n: i64, a: [u64; 6], at: bool) -> i64 {
     p.generic(n, a, if at { &[V, P, WL(3), V] } else { &[P, WL(2), V] })
 }
 
-/// `do_fork()` without `CLONE_VM`: a host fork.
+/// `clone_lock`: held while a thread starts, while one exits and across a fork.
+pub(crate) static CLONE_LOCK: Mutex<()> = Mutex::new(());
+
+/// The number of guest threads, changed under [`CLONE_LOCK`].
+pub(crate) static THREADS: AtomicUsize = AtomicUsize::new(1);
+
+/// What `exit` returns when it ends the calling thread only: its cpu loop returns.
+pub(crate) const THREAD_EXIT: i64 = i64::MIN;
+
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `tlb_flush()` of this vCPU, and of every other one before it next runs guest code: the
+/// mappings changed under them.
+fn flush_tlbs(cpu: &mut Cpu<'_>) {
+    tlb_flush(cpu);
+    if THREADS.load(Ordering::Acquire) > 1 {
+        let me = cpu.shared();
+        for c in cpu.jit().cpu_list() {
+            if !Arc::ptr_eq(&c, &me) {
+                CpuShared::async_run_on_cpu(&c, tlb_flush);
+            }
+        }
+    }
+}
+
+/// `exit`: the end of the calling thread, or of the process when it is the last one.
+fn do_exit(p: &Proc, t: &Task, code: u64) -> i64 {
+    if signal::block_signals(t) {
+        return signal::ERESTARTSYS;
+    }
+    let _g = lock(&CLONE_LOCK);
+    if THREADS.load(Ordering::Acquire) > 1 {
+        THREADS.fetch_sub(1, Ordering::AcqRel);
+        if t.child_tidptr != 0 && p.put(t.child_tidptr, &0u32.to_le_bytes()).is_ok() {
+            const FUTEX_WAKE: u64 = 1;
+            let addr = p.space.g2h(t.child_tidptr) as u64;
+            sys(libc::SYS_futex, &[addr, FUTEX_WAKE, i32::MAX as u64, 0, 0, 0]);
+        }
+        return THREAD_EXIT;
+    }
+    sys(libc::SYS_exit_group, &[code]);
+    std::process::exit(code as i32)
+}
+
+const CSIGNAL: u64 = 0xff;
+const CLONE_VM: u64 = 0x100;
+const CLONE_FS: u64 = 0x200;
+const CLONE_FILES: u64 = 0x400;
+const CLONE_SIGHAND: u64 = 0x800;
+const CLONE_PIDFD: u64 = 0x1000;
+const CLONE_VFORK: u64 = 0x4000;
+const CLONE_PARENT: u64 = 0x8000;
+const CLONE_THREAD: u64 = 0x1_0000;
+const CLONE_SYSVSEM: u64 = 0x4_0000;
+pub(crate) const CLONE_SETTLS: u64 = 0x8_0000;
+pub(crate) const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+pub(crate) const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+const CLONE_DETACHED: u64 = 0x40_0000;
+pub(crate) const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+const CLONE_IO: u64 = 0x8000_0000;
+/// `CLONE_THREAD_FLAGS`, all of which a thread needs.
+const THREAD_FLAGS: u64 =
+    CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
+/// `CLONE_IGNORED_FLAGS`.
+const IGNORED_FLAGS: u64 = CLONE_DETACHED | CLONE_IO;
+
+/// `do_fork()`: a thread on a new vCPU with `CLONE_VM`, a host fork otherwise.
 fn do_fork(
-    p: &Proc,
-    t: &Task,
+    p: &Arc<Proc>,
+    t: &mut Task,
     cpu: &mut Cpu<'_>,
     flags: u64,
     [newsp, ptid, ctid, tls]: [u64; 4],
 ) -> i64 {
-    const CSIGNAL: u64 = 0xff;
-    const CLONE_VM: u64 = 0x100;
-    const CLONE_VFORK: u64 = 0x4000;
-    const CLONE_SETTLS: u64 = 0x8_0000;
-    const CLONE_PARENT_SETTID: u64 = 0x10_0000;
-    const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
-    const CLONE_DETACHED: u64 = 0x40_0000;
-    const CLONE_CHILD_SETTID: u64 = 0x100_0000;
-    const CLONE_IO: u64 = 0x8000_0000;
     let mut flags = flags & 0xffff_ffff;
     if flags & CLONE_VFORK != 0 {
         flags &= !(CLONE_VFORK | CLONE_VM);
     }
     if flags & CLONE_VM != 0 {
-        // Threads come with signal delivery.
-        return -EINVAL;
+        let ok = CSIGNAL
+            | THREAD_FLAGS
+            | CLONE_SETTLS
+            | CLONE_PARENT_SETTID
+            | CLONE_CHILD_CLEARTID
+            | CLONE_CHILD_SETTID
+            | CLONE_PARENT
+            | IGNORED_FLAGS;
+        if flags & THREAD_FLAGS != THREAD_FLAGS || flags & !ok != 0 {
+            return -EINVAL;
+        }
+        return x86_64::new_thread(p, t, cpu, flags, [newsp, ptid, ctid, tls]);
     }
     let ok = CSIGNAL
         | CLONE_SETTLS
         | CLONE_PARENT_SETTID
+        | CLONE_PIDFD
         | CLONE_CHILD_CLEARTID
         | CLONE_CHILD_SETTID
-        | CLONE_DETACHED
-        | CLONE_IO;
-    if flags & !ok != 0 {
+        | IGNORED_FLAGS;
+    if flags & !ok != 0 || flags & CSIGNAL != libc::SIGCHLD as u64 {
+        return -EINVAL;
+    }
+    if flags & CLONE_PIDFD != 0 && flags & CLONE_PARENT_SETTID != 0 {
         return -EINVAL;
     }
     // Signals stay blocked across the fork; the cpu loop lets them in again.
     if signal::block_signals(t) {
         return signal::ERESTARTSYS;
     }
-    let r = sys(libc::SYS_clone, &[flags & CSIGNAL, 0, 0, 0, 0]);
+    // fork_start(): no other vCPU in generated code, no mapping or thread half made.
+    let jit = cpu.jit();
+    let clone = lock(&CLONE_LOCK);
+    let mm = p.mm();
+    jit.start_exclusive();
+    let r = host::fork();
+    jit.end_exclusive();
+    if r == 0 {
+        // The other threads did not come along.
+        THREADS.store(1, Ordering::Release);
+    }
+    drop(mm);
+    drop(clone);
     if r < 0 {
         return r;
     }
@@ -626,18 +718,24 @@ fn do_fork(
         if newsp != 0 {
             x86_64::set_reg(cpu, x86_64::RSP, newsp);
         }
+        if flags & CLONE_CHILD_SETTID != 0 {
+            let tid = sys(libc::SYS_gettid, &[]) as u32;
+            let _ = p.put(ctid, &tid.to_le_bytes());
+        }
         if flags & CLONE_SETTLS != 0 {
             x86_64::set_tls(cpu, tls);
         }
-        let tid = sys(libc::SYS_gettid, &[]) as u32;
-        if flags & CLONE_CHILD_SETTID != 0 {
-            let _ = p.put(ctid, &tid.to_le_bytes());
+        if flags & CLONE_CHILD_CLEARTID != 0 {
+            t.child_tidptr = ctid;
         }
+    } else {
         if flags & CLONE_PARENT_SETTID != 0 {
-            let _ = p.put(ptid, &tid.to_le_bytes());
+            let _ = p.put(ptid, &(r as u32).to_le_bytes());
         }
-    } else if flags & CLONE_PARENT_SETTID != 0 {
-        let _ = p.put(ptid, &(r as u32).to_le_bytes());
+        if flags & CLONE_PIDFD != 0 {
+            let fd = sys(libc::SYS_pidfd_open, &[r as u64, 0]).max(0);
+            let _ = p.put(ptid, &(fd as u32).to_le_bytes());
+        }
     }
     r
 }
@@ -736,7 +834,7 @@ fn do_pselect6(p: &Proc, t: &mut Task, a: [u64; 6]) -> i64 {
 
 /// `do_syscall()`.
 pub(crate) fn do_syscall(
-    p: &mut Proc,
+    p: &Arc<Proc>,
     t: &mut Task,
     cpu: &mut Cpu<'_>,
     n: u64,
@@ -751,14 +849,16 @@ pub(crate) fn do_syscall(
         libc::SYS_brk => do_brk(p, cpu, a[0]),
         libc::SYS_mmap => do_mmap(p, cpu, a),
         libc::SYS_munmap => {
+            let _mm = p.mm();
             let r = p.space.munmap(a[0], a[1]);
-            tlb_flush(cpu);
+            flush_tlbs(cpu);
             errno(r.map(|()| 0))
         }
         libc::SYS_mprotect => {
             let Some(prot) = prot_flags(a[2]) else { return -EINVAL };
+            let _mm = p.mm();
             let r = p.space.mprotect(a[0], a[1], prot);
-            tlb_flush(cpu);
+            flush_tlbs(cpu);
             errno(r.map(|()| 0))
         }
         libc::SYS_mremap => {
@@ -767,6 +867,7 @@ pub(crate) fn do_syscall(
             if a[3] & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0 {
                 return -EINVAL;
             }
+            let _mm = p.mm();
             let r = p.space.mremap(
                 a[0],
                 a[1],
@@ -775,7 +876,7 @@ pub(crate) fn do_syscall(
                 a[3] & MREMAP_FIXED != 0,
                 a[4],
             );
-            tlb_flush(cpu);
+            flush_tlbs(cpu);
             errno(r)
         }
         libc::SYS_madvise => {
@@ -785,6 +886,7 @@ pub(crate) fn do_syscall(
             }
             if a[2] == MADV_DONTNEED && a[1] != 0 {
                 let Some(len) = page_align(a[1]) else { return -EINVAL };
+                let _mm = p.mm();
                 if !p.space.range_valid(a[0], len) {
                     return -i64::from(libc::ENOMEM);
                 }
@@ -809,12 +911,16 @@ pub(crate) fn do_syscall(
             }
             sys(libc::SYS_msync, &[p.space.g2h(a[0]) as u64, len, a[2]])
         }
-        libc::SYS_exit | libc::SYS_exit_group => {
+        libc::SYS_exit => do_exit(p, t, a[0]),
+        libc::SYS_exit_group => {
             sys(libc::SYS_exit_group, &[a[0]]);
             std::process::exit(a[0] as i32)
         }
         libc::SYS_arch_prctl => x86_64::arch_prctl(&p.space, cpu, a[0], a[1]),
-        libc::SYS_set_tid_address => sys(libc::SYS_gettid, &[]),
+        libc::SYS_set_tid_address => {
+            t.child_tidptr = a[0];
+            sys(libc::SYS_gettid, &[])
+        }
         libc::SYS_set_robust_list | libc::SYS_get_robust_list | nr::RSEQ | nr::CLONE3 => -ENOSYS,
         libc::SYS_clone => do_fork(p, t, cpu, a[0], [a[1], a[2], a[3], a[4]]),
         libc::SYS_fork => do_fork(p, t, cpu, libc::SIGCHLD as u64, [0; 4]),

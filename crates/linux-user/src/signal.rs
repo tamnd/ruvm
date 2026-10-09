@@ -265,8 +265,9 @@ pub(crate) struct ThreadSignals {
     pub(crate) pending: AtomicU32,
     /// `sigtab`, by target signal.
     sigtab: [Slot; NSIG as usize],
-    /// The vCPU to kick out of translated code.
-    cpu: OnceLock<Arc<CpuShared>>,
+    /// The vCPU to kick out of translated code. Only its own thread sets it, with every host
+    /// signal blocked, so the handler's `try_lock` always gets it.
+    cpu: Mutex<Option<Arc<CpuShared>>>,
 }
 
 impl ThreadSignals {
@@ -274,16 +275,21 @@ impl ThreadSignals {
         ThreadSignals {
             pending: AtomicU32::new(0),
             sigtab: [const { Slot::new() }; NSIG as usize],
-            cpu: OnceLock::new(),
+            cpu: Mutex::new(None),
         }
     }
 
     fn cpu_exit(&self) {
-        if let Some(c) = self.cpu.get() {
-            c.cpu_exit();
+        if let Ok(c) = self.cpu.try_lock() {
+            if let Some(c) = c.as_ref() {
+                c.cpu_exit();
+            }
         }
     }
 }
+
+/// The signal state of threads that have exited, for the next ones.
+static FREE: Mutex<Vec<&'static ThreadSignals>> = Mutex::new(Vec::new());
 
 thread_local! {
     /// `thread_cpu`, as far as signals are concerned.
@@ -339,14 +345,18 @@ pub(crate) struct Task {
     altstack: (u64, u64),
     /// `sync_signal`: a signal the vCPU raised itself.
     sync: Option<Info>,
+    /// `child_tidptr`: cleared and woken when the thread exits.
+    pub(crate) child_tidptr: u64,
 }
 
 impl Task {
     /// The signal state of the calling thread, with `mask` as its signal mask, and the vCPU
     /// that a signal kicks out of translated code.
     pub(crate) fn new(mask: u64, cpu: Arc<CpuShared>) -> Self {
-        let ts: &'static ThreadSignals = Box::leak(Box::new(ThreadSignals::new()));
-        let _ = ts.cpu.set(cpu);
+        let reuse = FREE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop();
+        let ts: &'static ThreadSignals =
+            reuse.unwrap_or_else(|| Box::leak(Box::new(ThreadSignals::new())));
+        *ts.cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cpu);
         CURRENT.set(Some(ts));
         Task {
             ts,
@@ -355,7 +365,22 @@ impl Task {
             sigsuspend_mask: 0,
             altstack: (0, 0),
             sync: None,
+            child_tidptr: 0,
         }
+    }
+
+    /// The end of a thread: with every host signal blocked, its signal state goes back for the
+    /// next thread.
+    pub(crate) fn exit_thread(self) {
+        host::set_mask(!0);
+        CURRENT.set(None);
+        let ts = self.ts;
+        *ts.cpu.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        ts.pending.store(0, Ordering::SeqCst);
+        for k in &ts.sigtab {
+            k.pending.store(false, Ordering::Relaxed);
+        }
+        FREE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ts);
     }
 
     /// The host mask while guest code runs: the guest's, with the signals of the emulator's

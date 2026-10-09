@@ -111,6 +111,20 @@ pub(crate) fn safe_syscall(pending: &AtomicU32, nr: i64, a: [u64; 6]) -> i64 {
     unsafe { ruvm_lu_safe_syscall_base(pending, nr, a[0], a[1], a[2], a[3], a[4], a[5]) }
 }
 
+/// `fork()` of the C library, which also makes its allocator usable in the child when other
+/// threads were inside it. The child's pid in the parent, 0 in the child, or `-errno`.
+pub(crate) fn fork() -> i64 {
+    // SAFETY: fork() has no arguments and touches no Rust memory itself. The child goes on
+    // with a copy of this thread only; the callers hold the emulator's locks that another
+    // thread could otherwise have left taken, and no other vCPU runs generated code.
+    let r = unsafe { libc::fork() };
+    if r < 0 {
+        -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    } else {
+        i64::from(r)
+    }
+}
+
 /// `syscall(nr, a0, ..., a5)`, returning the raw result: a value, or `-errno`.
 pub(crate) fn syscall(nr: i64, a: [u64; 6]) -> i64 {
     safe_syscall(&NEVER, nr, a)
