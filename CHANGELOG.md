@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.5.1
+
+This patch starts M7 with a working `qemu-x86_64`, and moves M6 along with virtio-gpu, a VNC server, the input layer and the audio core.
+
+For M7: `qemu-x86_64` now runs static and dynamic x86_64 Linux programs on an x86_64 Linux host, with the ELF loader, the guest address space and mmap engine from QEMU's mmap.c, the cpu loop and the common syscalls (#197). On 46 programs, including static and dynamic hello, about 30 busybox applets with `sh` doing fork, exec and pipes, coreutils, dash and the segfault, abort and ud2 crash paths, stdout, stderr and the exit status match QEMU 11.1's `qemu-x86_64`. Signal handlers are recorded but not run yet, threads are refused, there is no vDSO, and `-g`, `-strace` and the other guest debug options are refused with a message.
+
+For M6: there is virtio-gpu 2D as `virtio-gpu-pci` and `virtio-gpu-device`, and a VNC server with `-vnc`, `-display vnc=`, RFB 3.3 to 3.8, VNC auth and the raw, hextile, zlib and tight encodings (#196). On x86, 30 of 30 virtio-gpu screendumps and 112 of 112 VNC frames are byte for byte the same as QEMU's. The input layer from ui/input.c is in, with `send-key`, `input-send-event`, `query-mice` and `-k`, and the PS/2 keyboard and mouse and the VNC server are wired into it (#199). All 38 input checks against QEMU, over QMP and two VNC clients, match on the serial bytes the guest saw and every byte the clients got. The audio core from QEMU's audio/ is in with the mixing engine and resampler, `-audiodev` and `-audio`, `query-audiodevs` and the none and wav backends (#198). There are no sound cards yet, those come next.
+
 ## 0.5.0
 
 This release closes M5, migration interop. Live migration between ruvm and QEMU 11.1 now works in both directions on q35 and microvm at machine versions 10.2, 11.0 and 11.1, with a memory dirtying guest and an I/O guest, and the guest's checksummed state checks out after every hop. That is all 16 runs of the matrix.
