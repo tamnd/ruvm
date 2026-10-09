@@ -836,7 +836,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "ruvm-accel"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-jit",
  "ruvm-jit-core",
@@ -847,11 +847,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-accel-hvf"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-accel-kvm"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -864,19 +864,19 @@ dependencies = [
 
 [[package]]
 name = "ruvm-accel-mshv"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-accel-nitro"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-accel-nvmm"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-accel-qtest"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-qapi",
@@ -884,15 +884,15 @@ dependencies = [
 
 [[package]]
 name = "ruvm-accel-whpx"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-accel-xen"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-aio"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "mio",
  "ruvm-base",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-audio"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
@@ -909,11 +909,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-base"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-block"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "io-uring",
@@ -926,11 +926,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-bsd-user"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-chardev"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "rustix",
  "ruvm-base",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "ruvm-base",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-crypto"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "aes",
  "cast5",
@@ -982,27 +982,27 @@ dependencies = [
 
 [[package]]
 name = "ruvm-decode"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-firmware"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-ga"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-gdbstub"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-helpers"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-hostmem"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-mem",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-acpi"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-audio"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-audio",
  "ruvm-base",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-char"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-chardev",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-hostmem",
@@ -1054,11 +1054,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-cxl"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-hw-display"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-i2c"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-pci",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-input"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-intc"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-iommu"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-hw-core",
  "ruvm-mem",
@@ -1108,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-misc"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
@@ -1118,11 +1118,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-net"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-hw-pci"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
@@ -1131,11 +1131,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-ssi"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-hw-storage"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
@@ -1145,7 +1145,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-timer"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
@@ -1154,19 +1154,19 @@ dependencies = [
 
 [[package]]
 name = "ruvm-hw-tpm"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-hw-usb"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-hw-vfio"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-hw-virtio"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "rustix",
  "ruvm-base",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-img"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "ruvm-base",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-io"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "ruvm-base",
@@ -1203,7 +1203,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-jit"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-jit-aarch64",
  "ruvm-jit-core",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-jit-aarch64"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "ruvm-jit-core",
@@ -1225,11 +1225,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-jit-core"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-jit-interp"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-jit-core",
  "ruvm-sys",
@@ -1237,15 +1237,15 @@ dependencies = [
 
 [[package]]
 name = "ruvm-jit-loongarch64"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-jit-ppc64"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-jit-riscv64"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "ruvm-jit-core",
@@ -1254,11 +1254,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-jit-s390x"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-jit-x86_64"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "ruvm-jit-core",
@@ -1267,7 +1267,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-linux-user"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "ruvm-jit",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-machine-arm"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "ruvm-accel",
@@ -1303,23 +1303,23 @@ dependencies = [
 
 [[package]]
 name = "ruvm-machine-loongarch"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-machine-mips"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-machine-other"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-machine-ppc"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-machine-riscv"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "ruvm-accel",
@@ -1342,11 +1342,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-machine-s390x"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-machine-x86"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "kvm-bindings",
@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-mem"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "arc-swap",
  "proptest",
@@ -1388,11 +1388,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-mem-vmm"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-migration"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "rustix",
@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-monitor"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "rustix",
  "ruvm-base",
@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-nbd"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "rustix",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-net"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "rustix",
@@ -1442,7 +1442,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-plugin"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "ruvm-base",
@@ -1455,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-qapi"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-qapi-gen",
@@ -1463,11 +1463,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-qapi-gen"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-qom"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
  "ruvm-qapi",
@@ -1475,19 +1475,19 @@ dependencies = [
 
 [[package]]
 name = "ruvm-qom-macros"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-replay"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-softfloat"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-storage-daemon"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "rustix",
@@ -1506,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-sys"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "rustix",
@@ -1514,7 +1514,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-system"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-accel",
  "ruvm-accel-kvm",
@@ -1551,11 +1551,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-target-alpha"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-arm"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "ruvm-decode",
@@ -1568,43 +1568,43 @@ dependencies = [
 
 [[package]]
 name = "ruvm-target-avr"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-hexagon"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-hppa"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-loongarch"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-m68k"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-microblaze"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-mips"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-openrisc"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-ppc"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-riscv"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-decode",
  "ruvm-jit",
@@ -1616,27 +1616,27 @@ dependencies = [
 
 [[package]]
 name = "ruvm-target-rx"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-s390x"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-sh4"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-sparc"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-tricore"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-target-x86"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -1652,15 +1652,15 @@ dependencies = [
 
 [[package]]
 name = "ruvm-target-xtensa"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-trace"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-ui"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "gtk4",
@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "ruvm-user-common"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-mem",
  "ruvm-sys",
@@ -1682,11 +1682,11 @@ dependencies = [
 
 [[package]]
 name = "ruvm-vfio-user"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-vhost"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "rustix",
@@ -1695,22 +1695,22 @@ dependencies = [
 
 [[package]]
 name = "ruvm-vhost-backends"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-virtio-queue"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "ruvm-vmstate"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ruvm-base",
 ]
 
 [[package]]
 name = "ruvm-vmstate-macros"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "sdl2"
@@ -2054,7 +2054,7 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "xtask"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "serde_json",
  "sha2",
