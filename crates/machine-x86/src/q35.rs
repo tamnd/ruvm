@@ -672,9 +672,14 @@ pub struct Q35 {
     a20: Arc<A20Line>,
     acpi_cache: Arc<Mutex<AcpiCache>>,
     acpi_src: Arc<AcpiSource>,
+    /// What devices outside the board reset with it.
+    reset_hooks: Mutex<Vec<ResetHook>>,
 
     done: bool,
 }
+
+/// A device's part of a system reset, for devices the board does not own.
+pub type ResetHook = Box<dyn Fn() + Send + Sync>;
 
 impl fmt::Debug for Q35 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1254,6 +1259,7 @@ impl Q35 {
             a20,
             acpi_cache: Arc::new(Mutex::new(AcpiCache::default())),
             acpi_src,
+            reset_hooks: Mutex::new(Vec::new()),
             done: false,
         })
     }
@@ -1465,6 +1471,9 @@ impl Q35 {
         }
         if let Some(p) = &self.port92 {
             p.reset();
+        }
+        for hook in self.reset_hooks.lock().unwrap_or_else(PoisonError::into_inner).iter() {
+            hook();
         }
         // The CPU reset turns the A20 mask off again.
         self.a20.set(true);
@@ -1770,6 +1779,11 @@ impl Q35 {
     /// The speaker port, with the PIT.
     pub fn pcspk(&self) -> Option<&Arc<PcSpeaker>> {
         self.pcspk.as_ref()
+    }
+
+    /// Has `hook` run on every system reset, after the board's own devices.
+    pub fn add_reset_hook(&self, hook: ResetHook) {
+        self.reset_hooks.lock().unwrap_or_else(PoisonError::into_inner).push(hook);
     }
 
     /// The HPET, with `hpet=on`.

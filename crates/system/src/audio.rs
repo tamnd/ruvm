@@ -11,10 +11,11 @@ use ruvm_audio::{AudioBackend, model, registry};
 use ruvm_base::report::{Location, error_report, push_location, report_error};
 use ruvm_base::{Error, Result};
 use ruvm_hw_audio::{
-    Ac97, HdaCodecKind, IntelHda, PcSpkAudio, TYPE_AC97, TYPE_HDA_DUPLEX, TYPE_HDA_MICRO,
-    TYPE_HDA_OUTPUT, TYPE_ICH9_INTEL_HDA, TYPE_INTEL_HDA,
+    Ac97, HdaCodecKind, IntelHda, IsaDma, PcSpkAudio, Sb16, Sb16Config, TYPE_AC97, TYPE_HDA_DUPLEX,
+    TYPE_HDA_MICRO, TYPE_HDA_OUTPUT, TYPE_ICH9_INTEL_HDA, TYPE_INTEL_HDA, TYPE_SB16,
 };
 use ruvm_hw_core::fw_cfg::DmaMemory;
+use ruvm_hw_core::timer::Clock;
 use ruvm_machine_x86::X86Board;
 use ruvm_mem::AddressSpace;
 use ruvm_monitor::{Commands, MonitorQmp};
@@ -147,15 +148,19 @@ pub(crate) struct AudioPlug {
     pub old_msi_addr: bool,
     /// The codec `-audio model=hda` puts on its controller.
     pub codec: Option<Box<AudioPlug>>,
+    /// The properties of an `sb16`.
+    pub sb16: Sb16Config,
     /// Whether the machine has the root bus `pcie.0`.
     pci: bool,
+    /// Whether the machine has the ISA bus `isa.0`.
+    isa: bool,
     /// A property error, its message and hint. QEMU only gets to the properties once the
     /// bus is found.
     err: Option<(String, Option<String>)>,
 }
 
 impl AudioPlug {
-    fn new(typename: &'static str, loc: Option<Location>, pci: bool) -> AudioPlug {
+    fn new(typename: &'static str, loc: Option<Location>, pci: bool, isa: bool) -> AudioPlug {
         AudioPlug {
             typename,
             id: None,
@@ -169,7 +174,9 @@ impl AudioPlug {
             msi: None,
             old_msi_addr: false,
             codec: None,
+            sb16: Sb16Config::default(),
             pci,
+            isa,
             err: None,
         }
     }
@@ -183,6 +190,7 @@ const AUDIO_TYPES: &[&str] = &[
     TYPE_HDA_OUTPUT,
     TYPE_HDA_DUPLEX,
     TYPE_HDA_MICRO,
+    TYPE_SB16,
 ];
 
 fn is_hda_controller(typename: &str) -> bool {
@@ -190,16 +198,18 @@ fn is_hda_controller(typename: &str) -> bool {
 }
 
 /// `qdev_device_add()` up to realize for a sound card or codec: the properties. `None` when
-/// `driver` is not one. `pci` says whether the machine has the root bus `pcie.0`. The bus
-/// is checked by [`add_plug`], which knows the HDA buses planned so far.
+/// `driver` is not one. `pci` says whether the machine has the root bus `pcie.0` and `isa`
+/// whether it has an ISA bus. The bus is checked by [`add_plug`], which knows the HDA buses
+/// planned so far.
 pub(crate) fn plan_device(
     driver: &str,
     opts: &QemuOpts,
     loc: &Option<Location>,
     pci: bool,
+    isa: bool,
 ) -> Option<std::result::Result<AudioPlug, Located>> {
     let &typename = AUDIO_TYPES.iter().find(|t| **t == driver)?;
-    let mut plug = AudioPlug::new(typename, loc.clone(), pci);
+    let mut plug = AudioPlug::new(typename, loc.clone(), pci, isa);
     plug.id = opts.id().map(str::to_string);
     plug.bus = opts.get("bus").map(str::to_string);
     if let Err(Located(_, e)) = plan(&mut plug, opts) {
@@ -238,10 +248,11 @@ fn plan(plug: &mut AudioPlug, opts: &QemuOpts) -> std::result::Result<(), Locate
     let at = |e: Error| Located(loc.clone(), e);
     let codec = HdaCodecKind::from_type(typename).is_some();
     let ctrl = is_hda_controller(typename);
+    let sb16 = typename == TYPE_SB16;
     for (k, v) in opts.iter() {
         match k {
             "driver" | "bus" => {}
-            "addr" if !codec => {
+            "addr" if !codec && !sb16 => {
                 plug.devfn = Some(crate::display::parse_devfn(v).ok_or_else(|| {
                     Located::new(
                         &loc,
@@ -273,6 +284,11 @@ fn plan(plug: &mut AudioPlug, opts: &QemuOpts) -> std::result::Result<(), Locate
                 };
             }
             "old_msi_addr" if ctrl => plug.old_msi_addr = prop_bool(k, v).map_err(at)?,
+            "version" if sb16 => plug.sb16.ver = prop_u32(k, v).map_err(at)?,
+            "iobase" if sb16 => plug.sb16.port = prop_u32(k, v).map_err(at)?,
+            "irq" if sb16 => plug.sb16.irq = prop_u32(k, v).map_err(at)?,
+            "dma" if sb16 => plug.sb16.dma = prop_u32(k, v).map_err(at)?,
+            "dma16" if sb16 => plug.sb16.hdma = prop_u32(k, v).map_err(at)?,
             _ => return Err(Located::new(&loc, format!("Property '{typename}.{k}' not found"))),
         }
     }
@@ -306,6 +322,7 @@ pub(crate) fn add_plug(
     buses.extend(audio.iter().filter_map(|(_, _, a)| a.hda_bus.clone()));
     let t = plug.typename;
     let codec = HdaCodecKind::from_type(t).is_some();
+    let isa_dev = t == TYPE_SB16;
     let fail = |msg: String| Err(Located::new(&plug.loc, msg));
     match plug.bus.as_deref() {
         Some(b) if buses.iter().any(|h| h == b) => {
@@ -314,8 +331,13 @@ pub(crate) fn add_plug(
             }
         }
         Some("pcie.0") if plug.pci => {
-            if codec {
+            if codec || isa_dev {
                 return fail(format!("Device '{t}' can't go on PCIE bus"));
+            }
+        }
+        Some("isa.0") if plug.isa => {
+            if !isa_dev {
+                return fail(format!("Device '{t}' can't go on ISA bus"));
             }
         }
         Some("main-system-bus") => return fail(format!("Device '{t}' can't go on System bus")),
@@ -325,9 +347,12 @@ pub(crate) fn add_plug(
             Some(b) => plug.bus = Some(b.clone()),
             None => return fail(format!("No 'HDA' bus found for device '{t}'")),
         },
+        None if isa_dev && !plug.isa => {
+            return fail(format!("No 'ISA' bus found for device '{t}'"));
+        }
         None => {}
     }
-    if !codec && !plug.pci {
+    if !codec && !isa_dev && !plug.pci {
         return fail(format!("No 'PCI' bus found for device '{t}'"));
     }
     if let Some((msg, hint)) = plug.err.take() {
@@ -363,10 +388,10 @@ pub(crate) fn add_plug(
 pub(crate) fn selected_model() -> Option<AudioPlug> {
     let (m, audiodev) = model::selected()?;
     let typename = AUDIO_TYPES.iter().copied().find(|t| *t == m.typename)?;
-    let mut plug = AudioPlug::new(typename, None, true);
+    let mut plug = AudioPlug::new(typename, None, true, true);
     if is_hda_controller(typename) {
         plug.hda_bus = Some(MODEL_HDA_BUS.to_string());
-        let mut codec = AudioPlug::new(TYPE_HDA_DUPLEX, None, true);
+        let mut codec = AudioPlug::new(TYPE_HDA_DUPLEX, None, true, true);
         codec.bus = Some(MODEL_HDA_BUS.to_string());
         codec.audiodev = Some(audiodev);
         plug.codec = Some(Box::new(codec));
@@ -404,6 +429,51 @@ impl DmaMemory for WeakDma {
     }
 }
 
+/// The two i8257s of a q35 board, which an `sb16` takes its channels from.
+static ISA_DMA: Mutex<Option<IsaDma>> = Mutex::new(None);
+
+/// `i8257_dma_init()` from `pc_basic_device_init()`: the DMA controllers every q35 board has,
+/// with their ports, reset with the board. microvm has none.
+pub(crate) fn realize_isa_dma(board: &X86Board, clock: &Arc<Clock>) -> Result<()> {
+    let X86Board::Q35(m, _) = board else {
+        *ISA_DMA.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        return Ok(());
+    };
+    let dma = IsaDma::new(Arc::new(WeakDma(Arc::downgrade(board.memory_as()))), clock);
+    let mem = board.memory_system();
+    let io = board.io_as().root();
+    for (name, port, size, ops) in dma.io_regions() {
+        let r =
+            mem.new_io(name, u128::from(size), ops).map_err(|e| Error::generic(e.to_string()))?;
+        mem.add_subregion(io, u64::from(port), r).map_err(|e| Error::generic(e.to_string()))?;
+    }
+    let d = dma.clone();
+    m.add_reset_hook(Box::new(move || d.reset()));
+    *ISA_DMA.lock().unwrap_or_else(PoisonError::into_inner) = Some(dma);
+    Ok(())
+}
+
+/// `sb16_realizefn()` on an x86 board: the card on the ISA bus, with the ISA interrupts of
+/// the board's GSIs.
+fn realize_sb16(board: &X86Board, plug: &AudioPlug) -> Result<()> {
+    let be = backend(plug)?;
+    let clock = registry::clock().ok_or_else(|| Error::generic("no virtual clock yet"))?;
+    let irqs = match board {
+        X86Board::Q35(m, _) => m.gsi(),
+        X86Board::Microvm(m) => m.gsi(),
+    };
+    let dma = ISA_DMA.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let sb16 = Sb16::realize(be, plug.sb16, dma.as_ref(), irqs, &clock).map_err(Error::generic)?;
+    let mem = board.memory_system();
+    let io = board.io_as().root();
+    for (port, size, ops) in sb16.io_regions() {
+        let r =
+            mem.new_io("sb16", u128::from(size), ops).map_err(|e| Error::generic(e.to_string()))?;
+        mem.add_subregion(io, u64::from(port), r).map_err(|e| Error::generic(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Realizes a planned sound card or codec on an x86 board.
 pub(crate) fn realize_x86(board: &X86Board, plug: &AudioPlug) -> std::result::Result<(), Located> {
     let at = |e: Error| Located(plug.loc.clone(), e);
@@ -417,6 +487,9 @@ pub(crate) fn realize_x86(board: &X86Board, plug: &AudioPlug) -> std::result::Re
         };
         ctrl.add_codec(kind, plug.cad, plug.mixer, || backend(plug)).map_err(at)?;
         return Ok(());
+    }
+    if plug.typename == TYPE_SB16 {
+        return realize_sb16(board, plug).map_err(at);
     }
     let X86Board::Q35(m, _) = board else {
         return Err(Located::new(
