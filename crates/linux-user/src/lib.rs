@@ -32,7 +32,8 @@
 //!   Robust futex lists are `ENOSYS` there and here. `vfork()` and `posix_spawn()` are forks.
 //! - Guest memory goes through the softmmu TLB rather than straight to host addresses.
 //! - The vsyscall page is not emulated, `-g`, `-strace`, `-t`, `-trace` and `-plugin` are not
-//!   supported yet, and `/proc/self` is the host's except for `/proc/self/exe`.
+//!   supported yet. `/proc/self` is the host's except for `exe`, `maps`, `smaps`, `stat`,
+//!   `auxv` and `cmdline`, which describe the guest as QEMU's do.
 //! - The guest space is a 64 TiB reservation, as QEMU lays it out with `-R`, so addresses
 //!   differ from QEMU's default layout.
 
@@ -42,6 +43,8 @@ pub mod opts;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod host;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod procfs;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod signal;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

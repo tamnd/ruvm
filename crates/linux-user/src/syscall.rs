@@ -16,6 +16,7 @@ use ruvm_jit::{Cpu, CpuShared};
 use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page, page_align};
 
 use crate::host::{self, sys};
+use crate::procfs::{self, Image};
 use crate::signal::{self, Task, guest_sys, guest_syscall};
 use crate::x86_64;
 
@@ -248,23 +249,38 @@ pub(crate) struct Proc {
     uname_release: Option<String>,
     /// `-L`.
     ld_prefix: String,
+    /// What `/proc/self` says about the program.
+    image: Image,
 }
 
 impl Proc {
     pub(crate) fn new(
         space: Arc<GuestSpace>,
-        brk: u64,
         exec_path: String,
         uname_release: Option<String>,
         ld_prefix: String,
+        image: Image,
     ) -> Self {
-        let brk = page_align(brk).unwrap_or(brk);
-        Proc { space, mm: Mutex::new(brk), initial_brk: brk, exec_path, uname_release, ld_prefix }
+        let brk = page_align(image.brk).unwrap_or(image.brk);
+        Proc {
+            space,
+            mm: Mutex::new(brk),
+            initial_brk: brk,
+            exec_path,
+            uname_release,
+            ld_prefix,
+            image,
+        }
     }
 
     /// `mmap_lock()`, with the break.
-    fn mm(&self) -> MutexGuard<'_, u64> {
+    pub(crate) fn mm(&self) -> MutexGuard<'_, u64> {
         self.mm.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What `/proc/self` says about the program.
+    pub(crate) fn image(&self) -> &Image {
+        &self.image
     }
 
     /// The guest's address space.
@@ -302,13 +318,6 @@ impl Proc {
         let mut s = self.space.read_cstr(addr, PATH_MAX).ok_or(-EFAULT)?;
         s.push(0);
         Ok(s)
-    }
-
-    /// `is_proc_myself(name, "exe")`.
-    fn is_self_exe(name: &[u8]) -> bool {
-        let Some(rest) = name.strip_prefix(b"/proc/") else { return false };
-        let Some(rest) = rest.strip_suffix(b"/exe") else { return false };
-        rest == b"self" || rest == sys(libc::SYS_getpid, &[]).to_string().as_bytes()
     }
 
     /// Runs a call of [`spec`].
@@ -529,7 +538,7 @@ fn do_execve(p: &Proc, dirfd: Option<u64>, a: [u64; 6]) -> i64 {
     let r = (|| {
         let mut keep = Vec::new();
         let mut name = p.cstr(path)?;
-        if Proc::is_self_exe(&name[..name.len() - 1]) {
+        if procfs::is_proc_myself(&name[..name.len() - 1], "exe") {
             name = p.exec_path.clone().into_bytes();
             name.push(0);
         }
@@ -552,12 +561,13 @@ fn do_execve(p: &Proc, dirfd: Option<u64>, a: [u64; 6]) -> i64 {
     }
 }
 
-/// `open()` and `openat()`: `/proc/self/exe` is the program, not the emulator.
-fn do_open(p: &Proc, n: i64, a: [u64; 6], at: bool) -> i64 {
+/// `open()` and `openat()`: `/proc/self/exe` is the program, not the emulator, and the files
+/// of [`procfs`] describe the guest.
+fn do_open(p: &Proc, t: &Task, n: i64, a: [u64; 6], at: bool) -> i64 {
     let path = if at { a[1] } else { a[0] };
     if path != 0 {
         if let Some(name) = p.space.read_cstr(path, PATH_MAX) {
-            if Proc::is_self_exe(&name) {
+            if procfs::is_proc_myself(&name, "exe") {
                 let mut e = p.exec_path.clone().into_bytes();
                 e.push(0);
                 let (fl, mode) = if at { (a[2], a[3]) } else { (a[1], a[2]) };
@@ -565,6 +575,9 @@ fn do_open(p: &Proc, n: i64, a: [u64; 6], at: bool) -> i64 {
                     libc::SYS_openat,
                     &[libc::AT_FDCWD as u64, e.as_ptr() as u64, fl, mode],
                 );
+            }
+            if let Some(fd) = procfs::fake_open(p, t, &name) {
+                return fd;
             }
         }
     }
@@ -576,7 +589,7 @@ fn do_open(p: &Proc, n: i64, a: [u64; 6], at: bool) -> i64 {
 fn do_readlink(p: &Proc, n: i64, a: [u64; 6], at: bool) -> i64 {
     let (path, buf, len) = if at { (a[1], a[2], a[3]) } else { (a[0], a[1], a[2]) };
     let Some(name) = p.space.read_cstr(path, PATH_MAX) else { return -EFAULT };
-    if Proc::is_self_exe(&name) {
+    if procfs::is_proc_myself(&name, "exe") {
         let e = p.exec_path.as_bytes();
         let l = e.len().min(len as usize);
         if !p.space.write(buf, &e[..l]) {
@@ -939,8 +952,8 @@ pub(crate) fn do_syscall(
         libc::SYS_ioctl => do_ioctl(p, a),
         libc::SYS_fcntl => do_fcntl(p, a),
         libc::SYS_prctl => do_prctl(p, a),
-        libc::SYS_open => do_open(p, n, a, false),
-        libc::SYS_openat => do_open(p, n, a, true),
+        libc::SYS_open => do_open(p, t, n, a, false),
+        libc::SYS_openat => do_open(p, t, n, a, true),
         libc::SYS_readlink => do_readlink(p, n, a, false),
         libc::SYS_readlinkat => do_readlink(p, n, a, true),
         libc::SYS_uname => do_uname(p, a),
