@@ -526,6 +526,7 @@ fn parse_options(
                 cfg.x86.default_monitor = false;
             }
             Opt::Display => parse_display(arg)?,
+            Opt::Vnc => crate::vnc::parse(arg).map_err(Exit)?,
             Opt::Audio => parse_audio(arg)?,
             Opt::Qtest => cfg.qtest = Some(arg.to_string()),
             Opt::QtestLog => cfg.qtest_log = Some(arg.to_string()),
@@ -708,6 +709,12 @@ fn parse_display(arg: &str) -> Flow<()> {
             "Available display backend types:\nnone\n\nSome display backends support suboptions, which can be set with\n   -display backend,option=value,option=value...\nFor a short list of the suboptions for each display, see the top-level -help output; more detail is in the documentation.\n"
         );
         return Err(Exit(0));
+    }
+    if let Some(rest) = arg.strip_prefix("vnc") {
+        return match rest.strip_prefix('=') {
+            Some(opts) => crate::vnc::parse(opts).map_err(Exit),
+            None => Err(fail_msg("VNC requires a display argument vnc=<display>")),
+        };
     }
     let dict = keyval_parse(arg, Some("type"), None).map_err(|e| fail(&e))?;
     let mut v = QObjectInputVisitor::new_keyval(QValue::Dict(dict));
@@ -1213,6 +1220,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     } else {
         vm.exit_preconfig().map_err(|e| fail(&e))?;
     }
+    crate::vnc::init(&vm).map_err(Exit)?;
     // The main loop starts here, and with it the frontends.
     chardevs.release();
     Ok((vm, keep))

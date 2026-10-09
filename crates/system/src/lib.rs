@@ -16,4 +16,5 @@ mod riscv;
 pub mod runstate;
 mod snapshot;
 pub mod vl;
+mod vnc;
 mod x86;

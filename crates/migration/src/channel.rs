@@ -125,6 +125,8 @@ fn inet_parse(s: &str) -> Result<InetSocketAddress> {
 }
 
 /// `migrate_uri_parse()`.
+// On Windows the unix socket address has only a path, so the default fill is empty there.
+#[allow(clippy::needless_update)]
 pub fn parse_uri(uri: &str) -> Result<MigrationAddr> {
     let u = if let Some(cmd) = uri.strip_prefix("exec:") {
         let args = if cfg!(windows) {

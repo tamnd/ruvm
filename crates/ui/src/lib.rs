@@ -4,8 +4,8 @@
 //!
 //! So far this holds the console core of QEMU's `ui/`: pixman style pixel formats and images
 //! ([`pixman`]), display surfaces ([`surface`]), consoles with their device and listener hooks
-//! ([`console`]), the VGA font ([`vgafont`]) and the QMP `screendump` command ([`screendump`]).
-//! The remote and local front ends come later. The plan for this crate is in
+//! ([`console`]), the VGA font ([`vgafont`]), the QMP `screendump` command ([`screendump`]) and
+//! the VNC server ([`vnc`]). The other front ends come later. The plan for this crate is in
 //! `spec/24-workspace-layout.md`.
 
 pub mod console;
@@ -13,3 +13,4 @@ pub mod pixman;
 pub mod screendump;
 pub mod surface;
 pub mod vgafont;
+pub mod vnc;

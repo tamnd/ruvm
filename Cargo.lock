@@ -621,8 +621,10 @@ dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
  "ruvm-hw-pci",
+ "ruvm-hw-virtio",
  "ruvm-mem",
  "ruvm-ui",
+ "ruvm-virtio-queue",
 ]
 
 [[package]]
@@ -1207,7 +1209,10 @@ name = "ruvm-ui"
 version = "0.5.0"
 dependencies = [
  "flate2",
+ "rustix",
  "ruvm-base",
+ "ruvm-crypto",
+ "ruvm-qapi",
 ]
 
 [[package]]

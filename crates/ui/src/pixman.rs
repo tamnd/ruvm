@@ -502,7 +502,7 @@ impl Image {
         let Some((x, y, w, h)) = clip_rect(self, x, y, w, h) else {
             return;
         };
-        let v = pack(self.format, color.argb());
+        let v = pack_solid(self.format, color.argb());
         let bpp = self.format.bpp();
         for row in y..y + h {
             let drow = &mut self.data[row * self.stride..];
@@ -536,10 +536,17 @@ impl Image {
                     let d = unpack(self.format, read_pixel(drow, dx + col, bpp));
                     blend_over(fg, m, d)
                 };
-                write_pixel(drow, dx + col, bpp, pack(self.format, out));
+                write_pixel(drow, dx + col, bpp, pack_solid(self.format, out));
             }
         }
     }
+}
+
+/// Packs a solid colour the way pixman's fills and its `over_n_8_8888` path store it: they
+/// treat x8r8g8b8 as a8r8g8b8, so the unused byte gets the alpha. Only a client that reads that
+/// byte, such as a 32 bpp VNC client, can tell.
+fn pack_solid(format: PixelFormat, p: Argb) -> u32 {
+    pack(if format == X8R8G8B8 { A8R8G8B8 } else { format }, p)
 }
 
 /// `src IN mask OVER dst` for one pixel, with pixman's rounding division by 255.
@@ -744,6 +751,11 @@ mod tests {
         mask.data_mut()[1] = 0xff;
         img.over_mask(Color::GRAY, &mask, 1, 0);
         assert_eq!(img.pixel(1, 0), 0);
-        assert_eq!(img.pixel(2, 0), 0x00aa_aaaa);
+        assert_eq!(img.pixel(2, 0), 0xffaa_aaaa);
+        img.fill(Color::BLACK, 3, 0, 1, 1);
+        assert_eq!(img.pixel(3, 0), 0xff00_0000);
+        let mut img = Image::new(R5G6B5, 1, 1, 0);
+        img.fill(Color::GRAY, 0, 0, 1, 1);
+        assert_eq!(img.pixel(0, 0), 0xad55);
     }
 }

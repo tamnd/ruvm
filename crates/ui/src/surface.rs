@@ -164,9 +164,12 @@ mod tests {
         let mut lit = 0;
         for y in 0..480 {
             for x in 0..640 {
+                // Like pixman, the cells get the colours' alpha in the unused byte.
                 let p = s.image().pixel(x, y);
-                if p != 0 {
-                    assert_eq!(p, 0x00aa_aaaa);
+                let cell = (x0..x0 + 44 * 8).contains(&x) && (y0..y0 + 16).contains(&y);
+                assert_eq!(p >> 24, if cell { 0xff } else { 0 });
+                if p & 0xff_ffff != 0 {
+                    assert_eq!(p, 0xffaa_aaaa);
                     assert!((x0..x0 + 44 * 8).contains(&x) && (y0..y0 + 16).contains(&y));
                     lit += 1;
                 }
