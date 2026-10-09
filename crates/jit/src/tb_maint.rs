@@ -471,8 +471,18 @@ impl Jit {
     pub fn tb_invalidate_phys_range(&self, start: u64, last: u64) {
         let mut pages = lock(&self.pages);
         let index_last = self.page_index(last);
-        let mut index = self.page_index(start);
-        while index <= index_last {
+        let index_first = self.page_index(start);
+        // A user mode guest can unmap terabytes at once; walk the pages that hold code instead
+        // of the range when there are fewer of them.
+        let indexes: Vec<u64> = if index_last - index_first >= pages.len() as u64 {
+            let mut v: Vec<u64> =
+                pages.keys().copied().filter(|i| (index_first..=index_last).contains(i)).collect();
+            v.sort_unstable();
+            v
+        } else {
+            (index_first..=index_last).collect()
+        };
+        for index in indexes {
             if pages.contains_key(&index) {
                 let page_start = index << self.config.page_bits;
                 let page_last = (page_start | !self.page_mask()).min(last);
@@ -487,7 +497,6 @@ impl Jit {
                 debug_assert!(r.is_ok());
                 let _ = r;
             }
-            index += 1;
         }
     }
 

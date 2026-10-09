@@ -51,6 +51,9 @@ pub struct JitConfig {
     pub optimize: bool,
     /// `TARGET_LONG_BITS`.
     pub target_long_bits: u32,
+    /// `CONFIG_USER_ONLY`: the guest is one process run by user mode emulation, so exceptions
+    /// go back to the caller of `cpu_exec()` instead of being delivered into the guest.
+    pub user_only: bool,
 }
 
 impl Default for JitConfig {
@@ -64,6 +67,7 @@ impl Default for JitConfig {
             nochain: false,
             optimize: true,
             target_long_bits: 64,
+            user_only: false,
         }
     }
 }

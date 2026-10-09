@@ -68,6 +68,11 @@ fn run(personality: &Personality, argv0: &str, args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     }
+    if let Personality::User(target) = personality {
+        if let Some(code) = ruvm_linux_user::run(target, argv0, args) {
+            return code;
+        }
+    }
     eprintln!(
         "{}: ruvm {} cannot run this program yet, see https://github.com/tamnd/ruvm#status",
         personality.name(),

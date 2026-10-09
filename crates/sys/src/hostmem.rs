@@ -79,9 +79,26 @@ impl HostMemory {
         Self::map(len, Some(file.into()))
     }
 
+    /// Maps `len` bytes of address space for the whole of a user mode guest, `reserved_va`.
+    /// Unlike guest RAM it gets no huge pages, since the guest maps and unmaps it a page at a
+    /// time with [`map_fixed`](Self::map_fixed).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn reserve(len: usize) -> std::io::Result<Self> {
+        Self::map_with(len, None, false)
+    }
+
     /// `mmap()` of `len` bytes: anonymous and private without `fd`, shared with it.
     #[cfg(unix)]
     fn map(len: usize, fd: Option<std::os::fd::OwnedFd>) -> std::io::Result<Self> {
+        Self::map_with(len, fd, true)
+    }
+
+    #[cfg(unix)]
+    fn map_with(
+        len: usize,
+        fd: Option<std::os::fd::OwnedFd>,
+        hugepage: bool,
+    ) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd;
 
         if len == 0 {
@@ -107,13 +124,19 @@ impl HostMemory {
         // ram_block_add() asks for transparent huge pages on every RAM block. A huge page
         // takes one fault where small ones take 512, and a page nobody wrote reads from the
         // huge zero page. A missing page in a range registered with userfaultfd still goes
-        // to the handler first, so postcopy sees the same faults.
+        // to the handler first, so postcopy sees the same faults. A user mode reservation
+        // instead stays out of core dumps: walking its terabytes takes the kernel hours.
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        // SAFETY: advice on the mapping just made, which nothing else uses yet; it only
-        // changes how the kernel backs the pages, never their contents.
-        unsafe {
-            libc::madvise(p, len, libc::MADV_HUGEPAGE);
+        {
+            let advice = if hugepage { libc::MADV_HUGEPAGE } else { libc::MADV_DONTDUMP };
+            // SAFETY: advice on the mapping just made, which nothing else uses yet; it only
+            // changes how the kernel backs or dumps the pages, never their contents.
+            unsafe {
+                libc::madvise(p, len, advice);
+            }
         }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _ = hugepage;
         let ptr = std::ptr::NonNull::new(p.cast::<AtomicU8>()).expect("mmap never returns null");
         Ok(HostMemory { ptr, len, fd })
     }
@@ -173,10 +196,7 @@ impl HostMemory {
     /// them unmapped for userfaultfd to report, or `MADV_REMOVE` for shared memory, which
     /// punches the hole in the file; elsewhere the bytes are zeroed.
     pub fn discard(&self, offset: usize, len: usize) -> std::io::Result<()> {
-        let end = offset.checked_add(len);
-        if end.is_none_or(|e| e > self.len) || offset % 4096 != 0 || len % 4096 != 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
-        }
+        self.check_range(offset, len)?;
         if len == 0 {
             return Ok(());
         }
@@ -202,6 +222,123 @@ impl HostMemory {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    fn check_range(&self, offset: usize, len: usize) -> std::io::Result<()> {
+        let end = offset.checked_add(len);
+        if end.is_none_or(|e| e > self.len) || offset % 4096 != 0 || len % 4096 != 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+        Ok(())
+    }
+
+    /// Replaces `len` bytes at `offset`, page aligned, with a new mapping: zero pages without
+    /// `fd`, or else the bytes of `fd` from `file_off`, copy on write unless `shared`. This is
+    /// how a user mode guest's `mmap()` and `munmap()` land in the memory from
+    /// [`reserve`](Self::reserve).
+    ///
+    /// The new pages are always readable and writable, so the `AtomicU8` view stays valid;
+    /// the guest's own protection is the emulator's to enforce. Pages past the end of the file
+    /// are zero pages instead of the file pages that would raise SIGBUS. A file shrunk later
+    /// still raises it, as a mapped file does for any process.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn map_fixed(
+        &self,
+        offset: usize,
+        len: usize,
+        fd: Option<std::os::fd::RawFd>,
+        file_off: u64,
+        shared: bool,
+    ) -> std::io::Result<()> {
+        self.check_range(offset, len)?;
+        if self.fd.is_some() || file_off % 4096 != 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+        let (file_len, raw) = match fd {
+            Some(raw) => {
+                // SAFETY: fstat() writes at most one `struct stat`, and the buffer is read only
+                // when it succeeded. The descriptor is a plain number here; a closed or wrong one
+                // makes fstat() fail with EBADF, which is the answer a user mode guest gets.
+                let st = unsafe {
+                    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                    if libc::fstat(raw, st.as_mut_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    st.assume_init()
+                };
+                let size = st.st_size.max(0) as u64;
+                let pages = size.saturating_sub(file_off).div_ceil(4096) * 4096;
+                (usize::try_from(pages).unwrap_or(usize::MAX).min(len), raw)
+            }
+            None => (0, -1),
+        };
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        let private = libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE;
+        let mut parts = Vec::with_capacity(2);
+        if file_len > 0 {
+            let flags = if shared { libc::MAP_SHARED | libc::MAP_FIXED } else { private };
+            parts.push((offset, file_len, flags, raw));
+        }
+        if file_len < len {
+            parts.push((offset + file_len, len - file_len, private | libc::MAP_ANONYMOUS, -1));
+        }
+        for (off, l, flags, raw) in parts {
+            let file_off = if raw < 0 { 0 } else { file_off as libc::off_t };
+            // SAFETY: the range is inside the mapping this value owns (checked above), so
+            // MAP_FIXED replaces only our own pages. The new pages are readable and writable
+            // like the ones they replace, and the file part ends before the end of the file,
+            // so every access through the `AtomicU8` view stays valid; readers only see the
+            // contents change, which atomics allow.
+            let p = unsafe {
+                libc::mmap(
+                    self.ptr.as_ptr().cast::<u8>().add(off).cast(),
+                    l,
+                    prot,
+                    flags,
+                    raw,
+                    file_off,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves the pages of `len` bytes at `from` to `to`, both page aligned and not
+    /// overlapping, without copying them, the way `mremap()` moves a user mode guest's
+    /// mapping. `from` keeps a mapping of zero pages (`MREMAP_DONTUNMAP`), so the
+    /// `AtomicU8` view never has a hole. Fails on kernels before 5.13 or for memory the kernel
+    /// cannot move that way; the caller then copies.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn move_pages(&self, from: usize, to: usize, len: usize) -> std::io::Result<()> {
+        self.check_range(from, len)?;
+        self.check_range(to, len)?;
+        if self.fd.is_some() || from.max(to) - from.min(to) < len {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let base = self.ptr.as_ptr().cast::<u8>();
+        let flags = libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED | libc::MREMAP_DONTUNMAP;
+        // SAFETY: both ranges are inside the mapping this value owns and do not overlap.
+        // MREMAP_FIXED only replaces our own pages at `to`, and MREMAP_DONTUNMAP leaves `from`
+        // mapped, so every byte of the `AtomicU8` view stays valid memory.
+        let p = unsafe {
+            libc::mremap(
+                base.add(from).cast(),
+                len,
+                len,
+                flags,
+                base.add(to).cast::<libc::c_void>(),
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -260,6 +397,42 @@ mod tests {
         m.discard(4096, 4096).unwrap();
         assert_eq!(again.as_slice()[4096 + 5].load(Ordering::Relaxed), 0);
         assert!(!HostMemory::new(4096).unwrap().is_shared());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn fixed_mappings_replace_pages() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let m = HostMemory::reserve(16 * 4096).unwrap();
+        m.as_slice()[4096].store(5, Ordering::Relaxed);
+        m.map_fixed(4096, 4096, None, 0, false).unwrap();
+        assert_eq!(m.as_slice()[4096].load(Ordering::Relaxed), 0);
+
+        let path = std::env::temp_dir().join(format!("ruvm-hostmem-{}", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&[7u8; 5000]).unwrap();
+        drop(f);
+        let f = std::fs::File::open(&path).unwrap();
+        // Three pages over a file of two: the third reads as zero instead of raising SIGBUS.
+        m.map_fixed(8 * 4096, 3 * 4096, Some(f.as_raw_fd()), 0, false).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let s = m.as_slice();
+        assert_eq!(s[8 * 4096 + 4999].load(Ordering::Relaxed), 7);
+        assert_eq!(s[8 * 4096 + 5000].load(Ordering::Relaxed), 0);
+        assert_eq!(s[10 * 4096 + 1].load(Ordering::Relaxed), 0);
+        // Private, so writes stay here.
+        s[8 * 4096].store(1, Ordering::Relaxed);
+        assert!(m.map_fixed(4095, 4096, None, 0, false).is_err());
+        assert!(m.map_fixed(15 * 4096, 2 * 4096, None, 0, false).is_err());
+
+        s[2 * 4096 + 3].store(9, Ordering::Relaxed);
+        if m.move_pages(2 * 4096, 12 * 4096, 4096).is_ok() {
+            assert_eq!(s[12 * 4096 + 3].load(Ordering::Relaxed), 9);
+            assert_eq!(s[2 * 4096 + 3].load(Ordering::Relaxed), 0);
+        }
+        assert!(m.move_pages(0, 4096, 2 * 4096).is_err());
     }
 
     #[test]
