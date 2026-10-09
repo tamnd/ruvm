@@ -14,8 +14,11 @@ use kvm_ioctls::{Kvm, VmFd};
 
 use crate::{KVM_API_VERSION, KVM_IDENTITY_BASE, KernelIrqchip, KvmError, KvmOptions};
 
+mod dirty;
 mod slots;
 mod vcpu;
+
+use dirty::DirtyRings;
 
 pub use slots::SlotListener;
 pub use vcpu::{KvmVcpu, VcpuKick, VcpuStop, spawn_vcpu_thread};
@@ -57,10 +60,8 @@ pub struct KvmAccel {
     irqchip: KernelIrqchip,
     readonly_mem: bool,
     nr_slots: usize,
-    /// `kvm_dirty_ring_size`: 0 when the dirty bitmap is in use.
-    dirty_ring_size: u32,
-    /// `kvm_dirty_ring_with_bitmap`.
-    dirty_ring_with_bitmap: bool,
+    /// The dirty rings, which also know the ring size: 0 when the dirty bitmap is in use.
+    rings: Arc<DirtyRings>,
     warnings: Vec<String>,
 }
 
@@ -115,16 +116,10 @@ impl KvmAccel {
             create_irqchip(&kvm, &vm, irqchip)?;
         }
 
-        Ok(KvmAccel {
-            kvm,
-            vm: Arc::new(vm),
-            irqchip,
-            readonly_mem,
-            nr_slots,
-            dirty_ring_size,
-            dirty_ring_with_bitmap,
-            warnings,
-        })
+        let vm = Arc::new(vm);
+        let rings = DirtyRings::new(Arc::clone(&vm), dirty_ring_size, dirty_ring_with_bitmap)
+            .map_err(|e| KvmError::Ioctl("starting the kvm-reaper thread", e))?;
+        Ok(KvmAccel { kvm, vm, irqchip, readonly_mem, nr_slots, rings, warnings })
     }
 
     /// What `kvm_init()` warned about, for the caller to report.
@@ -134,12 +129,12 @@ impl KvmAccel {
 
     /// `kvm_dirty_ring_size()`: the entries of each vCPU's dirty ring, 0 without one.
     pub fn dirty_ring_size(&self) -> u32 {
-        self.dirty_ring_size
+        self.rings.size()
     }
 
     /// Whether the dirty ring comes with a backup bitmap, `kvm_dirty_ring_with_bitmap`.
     pub fn dirty_ring_with_bitmap(&self) -> bool {
-        self.dirty_ring_with_bitmap
+        self.rings.with_bitmap()
     }
 
     /// The VM file descriptor, for the device and CPU code that issues its own ioctls.
@@ -163,18 +158,26 @@ impl KvmAccel {
     }
 
     /// A memory listener for this VM. Register it on the memory address space and it keeps the
-    /// KVM slots in step with the guest physical map.
+    /// KVM slots in step with the guest physical map, logs dirty pages in the ranges that have
+    /// dirty clients and copies them into the RAM blocks when the memory system syncs.
     pub fn slot_listener(&self) -> Arc<SlotListener> {
-        Arc::new(SlotListener::new(Arc::clone(&self.vm), self.readonly_mem, self.nr_slots))
+        Arc::new(SlotListener::new(
+            Arc::clone(&self.vm),
+            self.readonly_mem,
+            self.nr_slots,
+            Arc::clone(&self.rings),
+        ))
     }
 
-    /// Creates vCPU `index`, `kvm_create_vcpu()`.
+    /// Creates vCPU `index`, `kvm_create_vcpu()`, and maps its dirty ring when the ring is on.
     pub fn create_vcpu(&self, index: u32) -> Result<KvmVcpu, KvmError> {
         let fd = self
             .vm
             .create_vcpu(u64::from(index))
             .map_err(|e| KvmError::Ioctl("KVM_CREATE_VCPU", os_error(e)))?;
-        Ok(KvmVcpu::new(fd, index))
+        let ring =
+            self.rings.add_vcpu(&fd).map_err(|e| KvmError::Ioctl("mmap of the dirty ring", e))?;
+        Ok(KvmVcpu::new(fd, index, ring.map(|r| (Arc::clone(&self.rings), r))))
     }
 }
 
