@@ -530,9 +530,12 @@ impl GuestSpace {
             };
             let moved = old_size.min(new_size);
             self.move_range(old, to, moved);
-            // The old range ends up unmapped and the new one holds its pages.
+            // The old range ends up unmapped and the new one holds its pages. It may start or
+            // end inside a mapping merged with its neighbours, so split those first.
             let parts: Vec<(u64, u64, u32)> = {
-                let inner = self.lock();
+                let mut inner = self.lock();
+                inner.split_at(old);
+                inner.split_at(old + moved);
                 inner
                     .ranges
                     .range(old..old + moved)
@@ -637,6 +640,7 @@ mod tests {
     }
 
     const ANON: MapKind = MapKind { fixed: false, noreplace: false, shared: false, anon: true };
+    const FIXED_ANON: MapKind = MapKind { fixed: true, ..ANON };
 
     #[test]
     fn layout_follows_reserved_va() {
@@ -741,6 +745,23 @@ mod tests {
         // Shrinking in place.
         assert_eq!(s.mremap(b, 4 * PAGE_SIZE, PAGE_SIZE, false, false, 0), Ok(b));
         assert_eq!(s.page_flags(b + PAGE_SIZE), 0);
+    }
+
+    #[test]
+    fn mremap_moves_part_of_a_merged_mapping() {
+        let s = space();
+        let rw = page::READ | page::WRITE;
+        let a = s.mmap(0, 2 * PAGE_SIZE, rw, ANON, None, 0).unwrap();
+        let c = s.mmap(a + 2 * PAGE_SIZE, 2 * PAGE_SIZE, rw, FIXED_ANON, None, 0).unwrap();
+        assert!(s.write(c + 10, b"data"));
+        let b = s.mremap(c, 2 * PAGE_SIZE, 3 * PAGE_SIZE, true, false, 0).unwrap();
+        assert_ne!(b, c);
+        let mut buf = [0u8; 4];
+        assert!(s.read(b + 10, &mut buf));
+        assert_eq!(&buf, b"data");
+        assert!(s.check(b, 3 * PAGE_SIZE, page::WRITE));
+        assert!(s.check(a, 2 * PAGE_SIZE, page::WRITE));
+        assert_eq!(s.page_flags(c), 0);
     }
 
     #[test]

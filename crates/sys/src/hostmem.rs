@@ -342,7 +342,12 @@ impl HostMemory {
             )
         };
         if p == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            // The kernel unmaps the destination before it checks the source, so a move that
+            // fails, say for a source that spans two mappings, leaves a hole at `to`. Put the
+            // zero pages back before the caller copies into them.
+            self.map_fixed(to, len, None, 0, false)?;
+            return Err(err);
         }
         Ok(())
     }
@@ -439,6 +444,15 @@ mod tests {
             assert_eq!(s[2 * 4096 + 3].load(Ordering::Relaxed), 0);
         }
         assert!(m.move_pages(0, 4096, 2 * 4096).is_err());
+        // Pages 9 and 10 are the file mapping's last page and its zero page, two host
+        // mappings that the kernel will not move as one. The destination must stay mapped.
+        s[13 * 4096 + 5].store(3, Ordering::Relaxed);
+        if m.move_pages(9 * 4096, 13 * 4096, 2 * 4096).is_err() {
+            assert_eq!(s[13 * 4096 + 5].load(Ordering::Relaxed), 0);
+            assert_eq!(s[14 * 4096 + 4095].load(Ordering::Relaxed), 0);
+        } else {
+            assert_eq!(s[13 * 4096 + 5000 - 4096 - 1].load(Ordering::Relaxed), 7);
+        }
     }
 
     #[test]
