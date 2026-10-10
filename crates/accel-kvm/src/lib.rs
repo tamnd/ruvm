@@ -6,26 +6,33 @@
 //! error text, the in-kernel and split irqchip, a memory listener that keeps KVM's memory slots in
 //! step with the guest physical map, and a vCPU run loop that sends port and MMIO exits into the
 //! I/O and memory address spaces. The option types and errors build on every host so the command
-//! line can name the accelerator anywhere. The accelerator itself exists only on x86-64 Linux for
-//! now.
+//! line can name the accelerator anywhere. The accelerator itself exists on x86-64 and AArch64
+//! Linux.
 //!
 //! Dirty logging follows the memory system's dirty clients: a slot with any gets
 //! `KVM_MEM_LOG_DIRTY_PAGES`, and a sync copies what KVM logged into the RAM blocks, from
 //! `KVM_GET_DIRTY_LOG` or, with the `dirty-ring-size` property, from the per vCPU dirty rings,
 //! which a reaper thread, a full ring and every global sync harvest as in QEMU.
 //!
-//! Everything else in `spec/06-accelerators.md` comes later: register sync levels, CPUID and MSR
-//! setup (which belong to ruvm-target-x86), GSI routing, irqfd, ioeventfd and the other
-//! architectures.
+//! On AArch64 the VM opens with QEMU's Arm irqchip rules and the in-kernel vGIC is in [`arm`]: the
+//! GICv2, GICv3 and ITS setup, save and restore sequences, which build and test on every host,
+//! and on AArch64 Linux the device file descriptors that run them. Arm vCPU setup and the wiring
+//! into the arm virt machine come later.
+//!
+//! Everything else in `spec/06-accelerators.md` comes later too: register sync levels, CPUID and
+//! MSR setup (which belong to ruvm-target-x86), irqfd, ioeventfd and the other architectures.
 
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod arm;
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod linux;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use linux::{KvmAccel, KvmVcpu, SlotListener, VcpuKick, VcpuStop, spawn_vcpu_thread};
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub use linux::{KvmGicV2, KvmGicV3, KvmIts, vgic_probe};
 
 /// `KVM_API_VERSION`. Anything else is refused, like QEMU does.
 pub const KVM_API_VERSION: i32 = 12;
@@ -130,6 +137,10 @@ pub enum KvmError {
     DirtyRing(io::Error),
     /// `KVM_CAP_DIRTY_LOG_RING_WITH_BITMAP` could not be enabled.
     DirtyRingBitmap(io::Error),
+    /// Split irqchip was asked for on Arm, which has no such thing.
+    ArmSplitIrqchip,
+    /// The host pages are not 4 KiB. The slot and dirty ring code assumes they are.
+    HostPageSize(u64),
 }
 
 /// `strerror()` text, without the `(os error N)` that Rust appends.
@@ -167,6 +178,12 @@ impl fmt::Display for KvmError {
             ),
             Self::DirtyRingBitmap(e) => {
                 write!(f, "Enabling of KVM dirty ring's backup bitmap failed: {}. ", strerror(e))
+            }
+            Self::ArmSplitIrqchip => {
+                f.write_str("-machine kernel_irqchip=split is not supported on ARM.")
+            }
+            Self::HostPageSize(size) => {
+                write!(f, "kvm: host page size {size} is not supported, ruvm needs 4096 for now")
             }
         }
     }
