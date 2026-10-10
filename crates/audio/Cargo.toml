@@ -17,6 +17,7 @@ unsafe-budget = 0
 alsa = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 libpulse-binding = { workspace = true, optional = true }
+pipewire = { workspace = true, optional = true }
 ruvm-base.workspace = true
 ruvm-hw-core.workspace = true
 ruvm-qapi.workspace = true
@@ -28,6 +29,8 @@ ui-dbus = ["ruvm-qapi/ui-dbus"]
 audio-alsa = ["dep:alsa", "dep:libc", "ruvm-qapi/audio-alsa"]
 # The pa audiodev type, over the system's PulseAudio client library.
 audio-pa = ["dep:libpulse-binding", "ruvm-qapi/audio-pa"]
+# The pipewire audiodev type, over the system's PipeWire library.
+audio-pipewire = ["dep:pipewire", "dep:libc", "ruvm-qapi/audio-pipewire"]
 
 [lints]
 workspace = true
