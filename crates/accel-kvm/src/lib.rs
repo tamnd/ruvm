@@ -193,6 +193,22 @@ impl fmt::Display for KvmError {
 
 impl std::error::Error for KvmError {}
 
+impl KvmError {
+    /// The lines QEMU prints when `kvm_init()` fails: the reason, then `failed to initialize
+    /// kvm` with the error number's text.
+    pub fn init_error_lines(&self) -> [String; 2] {
+        let errno = match self {
+            Self::Open(e) | Self::SplitIrqchip(e) | Self::CreateIrqchip(e) | Self::Ioctl(_, e) => {
+                strerror(e)
+            }
+            // kvm_dirty_ring_init() gives -EIO whatever the ioctl said.
+            Self::DirtyRing(_) | Self::DirtyRingBitmap(_) => "Input/output error".to_string(),
+            _ => "Invalid argument".to_string(),
+        };
+        [self.to_string(), format!("failed to initialize kvm: {errno}")]
+    }
+}
+
 /// The vCPU thread name, `CPU n/KVM`, which libvirt and `query-cpus-fast` users look for.
 pub fn vcpu_thread_name(index: u32) -> String {
     format!("CPU {index}/KVM")
@@ -201,6 +217,16 @@ pub fn vcpu_thread_name(index: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_failures_print_two_lines() {
+        let lines = KvmError::Open(io::Error::from_raw_os_error(2)).init_error_lines();
+        assert_eq!(lines[1], "failed to initialize kvm: No such file or directory");
+        let lines = KvmError::DirtyRing(io::Error::from_raw_os_error(22)).init_error_lines();
+        assert_eq!(lines[1], "failed to initialize kvm: Input/output error");
+        let lines = KvmError::ArmSplitIrqchip.init_error_lines();
+        assert_eq!(lines[1], "failed to initialize kvm: Invalid argument");
+    }
 
     #[test]
     fn messages_match_qemu() {

@@ -83,16 +83,7 @@ pub use crate::run_event::{EventHandler, GuestEvent, ShutdownReason};
 /// The lines QEMU prints when `kvm_init()` fails: the reason, then `failed to initialize kvm`
 /// with the error number's text.
 pub fn init_error_lines(e: &KvmError) -> [String; 2] {
-    let errno = match e {
-        KvmError::Open(e)
-        | KvmError::SplitIrqchip(e)
-        | KvmError::CreateIrqchip(e)
-        | KvmError::Ioctl(_, e) => strerror(e),
-        // kvm_dirty_ring_init() gives -EIO whatever the ioctl said.
-        KvmError::DirtyRing(_) | KvmError::DirtyRingBitmap(_) => "Input/output error".to_string(),
-        _ => "Invalid argument".to_string(),
-    };
-    [e.to_string(), format!("failed to initialize kvm: {errno}")]
+    e.init_error_lines()
 }
 
 /// Opens KVM for a board whose class has `default_kernel_irqchip_split` set to

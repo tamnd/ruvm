@@ -47,7 +47,7 @@ ruvm-ui.workspace = true
 [target.'cfg(unix)'.dependencies]
 ruvm-sys.workspace = true
 
-[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 ruvm-accel-kvm.workspace = true
 
 [build-dependencies]
