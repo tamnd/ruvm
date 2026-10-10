@@ -16,10 +16,11 @@ use ruvm_migration::default_parameters;
 use ruvm_monitor::{Commands, MonitorQmp};
 use ruvm_qapi::commands::*;
 use ruvm_qapi::types::{
-    Accelerator, AcceleratorInfo, CurrentMachineParams, DumpGuestMemoryCapability, DumpQueryResult,
-    DumpStatus, HumanReadableText, KvmInfo, MemoryInfo, MigrationCapability,
-    MigrationCapabilityStatus, QemuTargetInfo, ReplayInfo, ReplayMode, SysEmuTarget, UuidInfo,
-    YankInstance, YankInstanceBlockNode, YankInstanceChardev, YankInstanceU,
+    Accelerator, AcceleratorInfo, CurrentMachineParams, DirtyRateInfo, DirtyRateMeasureMode,
+    DirtyRateStatus, DumpGuestMemoryCapability, DumpQueryResult, DumpStatus, HumanReadableText,
+    KvmInfo, MemoryInfo, MigrationCapability, MigrationCapabilityStatus, QemuTargetInfo,
+    ReplayInfo, ReplayMode, SysEmuTarget, TimeUnit, UuidInfo, XDbgBlockGraph, YankInstance,
+    YankInstanceBlockNode, YankInstanceChardev, YankInstanceU,
 };
 
 use crate::vl::{Vm, accels};
@@ -74,6 +75,35 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
             return Err(Error::generic("JIT information is only available with accel=tcg"));
         }
         Err(Error::generic("x-query-jit is not supported by ruvm yet"))
+    });
+    // qtest keeps no statistics. TCG and KVM print theirs in QEMU, which ruvm does not yet.
+    let v = vm.clone();
+    register_x_accel_stats(cmds, move |_: &MonitorQmp| {
+        if current_accel(&v)? != Accelerator::Qtest {
+            return Err(Error::generic(
+                "x-accel-stats is not supported with this accelerator by ruvm yet",
+            ));
+        }
+        Ok(text(""))
+    });
+    let v = vm.clone();
+    register_query_command_line_options(cmds, move |_: &MonitorQmp, arg| {
+        crate::config_qmp::query_command_line_options(&v.registry, arg.option.as_deref())
+    });
+    // ruvm registers no statistics providers.
+    register_query_stats_schemas(cmds, |_: &MonitorQmp, _| Ok(Vec::new()));
+    // qmp_query_dirty_rate() before a measurement. ruvm has no calc-dirty-rate to start one.
+    register_query_dirty_rate(cmds, |_: &MonitorQmp, arg| {
+        Ok(DirtyRateInfo {
+            dirty_rate: None,
+            status: DirtyRateStatus::Unstarted,
+            start_time: 0,
+            calc_time: 0,
+            calc_time_unit: arg.calc_time_unit.unwrap_or(TimeUnit::Second),
+            sample_pages: 0,
+            mode: DirtyRateMeasureMode::PageSampling,
+            vcpu_dirty_rate: None,
+        })
     });
     // ruvm has no record and replay and no -icount.
     register_query_replay(cmds, |_: &MonitorQmp| {
@@ -154,6 +184,9 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
     register_query_s390x_cpu_polarization(cmds, |_: &MonitorQmp| {
         Err(Error::generic("CPU polarization is not supported on this target"))
     });
+    register_xen_event_list(cmds, |_: &MonitorQmp| {
+        Err(Error::generic("Xen event channel emulation not enabled"))
+    });
 
     register_machine(vm, target, cmds);
 }
@@ -230,6 +263,53 @@ fn register_machine(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
     register_x_query_roms(cmds, move |_: &MonitorQmp| {
         none_machine(&v, "x-query-roms")?;
         Ok(text(""))
+    });
+    // Machine none has no drives and no NICs. Its block nodes are the ones blockdev-add made.
+    let v = vm.clone();
+    register_query_block(cmds, move |_: &MonitorQmp, _| {
+        none_machine(&v, "query-block")?;
+        Ok(Vec::new())
+    });
+    let v = vm.clone();
+    register_query_blockstats(cmds, move |_: &MonitorQmp, arg| {
+        none_machine(&v, "query-blockstats")?;
+        if arg.query_nodes == Some(true) && !v.block.nodes().is_empty() {
+            return Err(Error::generic(
+                "query-blockstats of block nodes is not supported by ruvm yet",
+            ));
+        }
+        Ok(Vec::new())
+    });
+    let v = vm.clone();
+    register_query_named_block_nodes(cmds, move |_: &MonitorQmp, arg| {
+        none_machine(&v, "query-named-block-nodes")?;
+        v.block.query_named_block_nodes(arg.flat)
+    });
+    let v = vm.clone();
+    register_x_debug_query_block_graph(cmds, move |_: &MonitorQmp| {
+        none_machine(&v, "x-debug-query-block-graph")?;
+        if !v.block.nodes().is_empty() {
+            return Err(Error::generic(
+                "x-debug-query-block-graph with block nodes is not supported by ruvm yet",
+            ));
+        }
+        Ok(XDbgBlockGraph { nodes: Vec::new(), edges: Vec::new() })
+    });
+    let v = vm.clone();
+    register_query_rx_filter(cmds, move |_: &MonitorQmp, arg| {
+        none_machine(&v, "query-rx-filter")?;
+        if arg.name.is_some() {
+            return Err(Error::generic(
+                "query-rx-filter of a net client is not supported by ruvm yet",
+            ));
+        }
+        Ok(Vec::new())
+    });
+    // find_ovmf_log() looks only on the x86 and Arm virt boards.
+    let v = vm.clone();
+    register_query_firmware_log(cmds, move |_: &MonitorQmp, _| {
+        none_machine(&v, "query-firmware-log")?;
+        Err(Error::generic("firmware log buffer not found"))
     });
     // ruvm has no -numa.
     register_x_query_numa(cmds, |_: &MonitorQmp| Ok(text("0 nodes\n")));

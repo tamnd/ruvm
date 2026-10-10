@@ -424,7 +424,7 @@ fn open_with_input(
     input: Arc<InputState>,
     hooks: Arc<TestHooks>,
 ) -> Result<Arc<VncDisplay>> {
-    let mut list = opts::opts_list();
+    let mut list = opts_list();
     let o = list.parse_noisily(arg, true).expect("options parse");
     opts::open(o, id, Some("test"), DisplayState::new(), input, hooks)
 }

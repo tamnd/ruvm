@@ -455,6 +455,32 @@ mod sockets {
         assert!(accels.contains(r#""enabled": "qtest""#), "{accels}");
         let params = qmp.cmd(r#"{"execute": "query-migrate-parameters"}"#);
         assert!(params.contains(r#""cpr-exec-command": []"#), "{params}");
+        for (c, want) in [
+            ("x-accel-stats", r#"{"return": {"human-readable-text": ""}}"#),
+            ("query-block", r#"{"return": []}"#),
+            ("query-named-block-nodes", r#"{"return": []}"#),
+            ("x-debug-query-block-graph", r#"{"return": {"edges": [], "nodes": []}}"#),
+            ("query-rx-filter", r#"{"return": []}"#),
+            ("query-stats-schemas", r#"{"return": []}"#),
+            (
+                "query-firmware-log",
+                r#"{"error": {"class": "GenericError", "desc": "firmware log buffer not found"}}"#,
+            ),
+            (
+                "xen-event-list",
+                r#"{"error": {"class": "GenericError", "desc": "Xen event channel emulation not enabled"}}"#,
+            ),
+        ] {
+            assert_eq!(qmp.cmd(&format!(r#"{{"execute": "{c}"}}"#)), want, "{c}");
+        }
+        let rate = qmp.cmd(r#"{"execute": "query-dirty-rate"}"#);
+        assert!(rate.contains(r#""status": "unstarted""#), "{rate}");
+        let opts = qmp.cmd(r#"{"execute": "query-command-line-options"}"#);
+        assert!(opts.starts_with(r#"{"return": [{"parameters": [{"name": "type""#), "{opts}");
+        assert!(opts.contains(r#""option": "drive""#), "{opts}");
+        let bad =
+            qmp.cmd(r#"{"execute": "query-command-line-options", "arguments": {"option": "foo"}}"#);
+        assert!(bad.contains("invalid option name: foo"), "{bad}");
 
         qtest.write_all(b"readb 0x1000\ninl 0x60\nclock_step 100\nclock_step\n").unwrap();
         // Machine none has no timers, so there is no deadline to step to.

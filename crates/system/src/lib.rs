@@ -7,6 +7,7 @@
 
 mod arm;
 mod audio;
+mod config_qmp;
 mod display;
 mod info;
 mod migration;

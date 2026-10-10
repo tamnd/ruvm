@@ -69,7 +69,7 @@ use crate::surface::DisplaySurface;
 use client::{Client, ShareMode, Update};
 use net::{AddrInfo, Listener};
 
-pub use opts::{configured, init, parse};
+pub use opts::{configured, init, opts_list, parse};
 
 pub(crate) const ENCODING_RAW: i32 = 0;
 pub(crate) const ENCODING_HEXTILE: i32 = 5;
