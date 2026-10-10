@@ -141,7 +141,8 @@ fn pcm_out_plays_the_buffers_into_a_wav_file() {
     out(&io_as, NABM + 0x16, 2, 0x1c);
     assert_eq!(level.load(Ordering::SeqCst), 0);
 
-    registry::cleanup();
+    // The card still holds the backend, so registry::cleanup() would leave it open.
+    registry::be_by_name("snd0").unwrap().shutdown();
     let data = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     assert_eq!(&data[22..24], &2u16.to_le_bytes());

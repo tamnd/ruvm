@@ -8,7 +8,7 @@
 //! consume audio at the speed of the virtual clock.
 
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ruvm_hw_core::timer::{Clock, muldiv64};
 use ruvm_qapi::types::{AudioFormat, Audiodev, AudiodevPerDirectionOptions};
@@ -17,6 +17,29 @@ use crate::mixeng::{SampleFmt, format_bits};
 
 /// Whether the host stores samples big endian.
 pub const HOST_BIG_ENDIAN: bool = cfg!(target_endian = "big");
+
+/// `-name guest=`, which drivers that name themselves to a sound server use.
+static APPLICATION_NAME: Mutex<Option<String>> = Mutex::new(None);
+
+/// Sets the name the sound server drivers give the server, the guest name of `-name`.
+pub fn set_application_name(name: Option<&str>) {
+    *APPLICATION_NAME.lock().unwrap_or_else(|e| e.into_inner()) = name.map(str::to_string);
+}
+
+/// `audio_application_name()`: the guest name, or `qemu` without one.
+pub fn application_name() -> String {
+    let name = APPLICATION_NAME.lock().unwrap_or_else(|e| e.into_inner());
+    name.clone().unwrap_or_else(|| "qemu".to_string())
+}
+
+/// `error_printf()`: text on stderr with no program name in front.
+#[cfg(any(feature = "audio-alsa", feature = "audio-pa"))]
+pub(crate) fn error_printf(s: &str) {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(s.as_bytes());
+    let _ = err.flush();
+}
 
 /// The format of a stream as a device asks for it, QEMU's `struct audsettings`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -489,6 +512,11 @@ pub trait Driver: Send + Sync + fmt::Debug {
     /// Whether the driver applies capture volume itself.
     fn volume_in(&self) -> bool {
         false
+    }
+    /// Sets the driver up for `dev`, the driver's part of `audio_be_realize()`. Most drivers
+    /// have nothing to do.
+    fn realize(&mut self, _dev: &Audiodev) -> ruvm_base::Result<()> {
+        Ok(())
     }
     /// Opens a playback stream. The driver reports its own errors.
     fn init_out(&self, ctx: &InitCtx<'_>, as_: &AudSettings) -> Option<HwInit<Box<dyn PcmOut>>>;
