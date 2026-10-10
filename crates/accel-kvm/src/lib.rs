@@ -16,8 +16,10 @@
 //!
 //! On AArch64 the VM opens with QEMU's Arm irqchip rules and the in-kernel vGIC is in [`arm`]: the
 //! GICv2, GICv3 and ITS setup, save and restore sequences, which build and test on every host,
-//! and on AArch64 Linux the device file descriptors that run them. Arm vCPU setup and the wiring
-//! into the arm virt machine come later.
+//! and on AArch64 Linux the device file descriptors that run them. The Arm vCPU setup and
+//! register sync from target/arm/kvm.c are in `arm::vcpu`, written the same way: the sequences
+//! build and test on every host, and on AArch64 Linux `KvmVcpu` runs them. The wiring into the
+//! arm virt machine comes later.
 //!
 //! Everything else in `spec/06-accelerators.md` comes later too: register sync levels, CPUID and
 //! MSR setup (which belong to ruvm-target-x86), irqfd, ioeventfd and the other architectures.

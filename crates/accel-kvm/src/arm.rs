@@ -14,6 +14,10 @@
 //! migration and nothing of the TCG model, which lives in ruvm-hw-intc. That crate sits above
 //! this one in the layering, so the state is described here and a machine that runs a vGIC
 //! keeps it next to the device.
+//!
+//! The vCPU setup and register sync from target/arm/kvm.c are in [`vcpu`].
+
+pub mod vcpu;
 
 use std::fmt;
 use std::io;

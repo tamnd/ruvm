@@ -10,8 +10,14 @@
 //! With a dirty ring the run loop also tells the ring when the vCPU is inside `KVM_RUN`, so
 //! a global dirty sync can kick it out and wait, and it reaps the rings when the kernel stops
 //! the vCPU with `KVM_EXIT_DIRTY_RING_FULL`.
+//!
+//! On Arm with the GIC in userspace, KVM still runs the timers and the PMU and reports their
+//! outputs in `kvm_run.s.regs.device_irq_level` on every exit. A machine that wants them sets a
+//! hook, which the run loop calls with what changed, `kvm_arch_post_run()`.
 
 use std::cell::Cell;
+#[cfg(target_arch = "aarch64")]
+use std::fmt;
 use std::io;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -28,6 +34,8 @@ use vmm_sys_util::signal::{Killable, register_signal_handler};
 
 use super::dirty::{DirtyRings, VcpuRing};
 use super::os_error;
+#[cfg(target_arch = "aarch64")]
+use crate::arm::{DeviceIrqChanges, device_irq_changes};
 use crate::{KvmError, vcpu_thread_name};
 
 /// `SIG_IPI`, which is SIGUSR1 in QEMU's include/qemu/osdep.h.
@@ -114,6 +122,30 @@ pub struct KvmVcpu {
     exit_request: Arc<AtomicBool>,
     /// The VM's dirty rings and this vCPU's own, when the ring is on.
     dirty: Option<(Arc<DirtyRings>, Arc<VcpuRing>)>,
+    #[cfg(target_arch = "aarch64")]
+    device_irq: DeviceIrqHook,
+}
+
+/// The last `device_irq_level` seen and what to tell about a change, `device_irq_level` in
+/// `ARMCPU`.
+#[cfg(target_arch = "aarch64")]
+#[derive(Default)]
+struct DeviceIrqHook {
+    level: u64,
+    hook: Option<DeviceIrqFn>,
+}
+
+#[cfg(target_arch = "aarch64")]
+type DeviceIrqFn = Box<dyn FnMut(&DeviceIrqChanges) + Send>;
+
+#[cfg(target_arch = "aarch64")]
+impl fmt::Debug for DeviceIrqHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceIrqHook")
+            .field("level", &self.level)
+            .field("hook", &self.hook.is_some())
+            .finish()
+    }
 }
 
 impl KvmVcpu {
@@ -122,7 +154,47 @@ impl KvmVcpu {
         index: u32,
         dirty: Option<(Arc<DirtyRings>, Arc<VcpuRing>)>,
     ) -> Self {
-        KvmVcpu { fd, index, exit_request: Arc::new(AtomicBool::new(false)), dirty }
+        KvmVcpu {
+            fd,
+            index,
+            exit_request: Arc::new(AtomicBool::new(false)),
+            dirty,
+            #[cfg(target_arch = "aarch64")]
+            device_irq: DeviceIrqHook::default(),
+        }
+    }
+
+    /// Sets the hook for the timer and PMU outputs, for a machine whose GIC is in userspace.
+    /// After every exit from `KVM_RUN` in which `device_irq_level` changed, the hook gets the
+    /// outputs that changed and their new levels. With an in-kernel vGIC the kernel wires those
+    /// outputs itself and the level never changes.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_device_irq_hook(&mut self, hook: impl FnMut(&DeviceIrqChanges) + Send + 'static) {
+        self.device_irq.hook = Some(Box::new(hook));
+    }
+
+    /// `kvm_arch_post_run()` on Arm. QEMU runs it before it handles the exit; here an MMIO exit
+    /// is already handled, because the exit borrows the `kvm_run` page until then.
+    #[cfg(target_arch = "aarch64")]
+    fn post_run(&mut self) {
+        if self.device_irq.hook.is_none() {
+            return;
+        }
+        let run = self.fd.get_kvm_run();
+        // SAFETY: on arm64 `s` is a union of `kvm_sync_regs` and padding, and every bit pattern
+        // is a valid u64. The kernel fills `device_irq_level` on every exit to userspace when
+        // the irqchip is not in the kernel, and nothing else writes it while KVM_RUN is not
+        // running, which needs `&mut self`.
+        let level = unsafe { run.s.regs.device_irq_level };
+        let old = self.device_irq.level;
+        if level == old {
+            return;
+        }
+        self.device_irq.level = level;
+        let changes = device_irq_changes(old, level);
+        if let Some(hook) = &mut self.device_irq.hook {
+            hook(&changes);
+        }
     }
 
     /// The vCPU index, `cpu_index`.
@@ -209,6 +281,8 @@ impl KvmVcpu {
                 }
             };
             self.fd.set_kvm_immediate_exit(0);
+            #[cfg(target_arch = "aarch64")]
+            self.post_run();
             match step {
                 Step::Continue => {}
                 Step::Io => self.handle_io(io, attrs),
