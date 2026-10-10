@@ -672,6 +672,12 @@ fn peer_address(fd: &OwnedFd) -> Option<SocketAddress> {
 
 /// The path of a Unix socket address, empty for an unnamed one.
 pub(crate) fn unix_path(u: &SocketAddrUnix) -> String {
+    #[cfg(target_os = "linux")]
+    if let Some(name) = u.abstract_name() {
+        // g_strndup() stops at the padding of a name that is not tight.
+        let name = name.split(|c| *c == 0).next().unwrap_or(name);
+        return String::from_utf8_lossy(name).into_owned();
+    }
     match u.path() {
         Some(p) => p.to_string_lossy().into_owned(),
         None => u
@@ -846,14 +852,47 @@ pub(crate) fn inet_connect(addr: &InetSocketAddress) -> Result<OwnedFd> {
     Err(Error::from_io(format!("Failed to connect to '{}:{}'", addr.host, addr.port), last))
 }
 
+/// `saddr_is_abstract()`: abstract names are Linux only, elsewhere the path is a file.
+pub(crate) fn is_abstract(saddr: &UnixSocketAddress) -> bool {
+    cfg!(target_os = "linux") && saddr.abstract_ == Some(true)
+}
+
+/// The address `unix_listen_saddr()` and `unix_connect_saddr()` bind or connect to. An
+/// abstract name that is not `tight` fills the whole of `sun_path`, padded with zero bytes,
+/// like QEMU's `addrlen = sizeof(un)`.
+fn unix_saddr(saddr: &UnixSocketAddress) -> Result<SocketAddrUnix> {
+    #[cfg(target_os = "linux")]
+    if is_abstract(saddr) {
+        let path = &saddr.path;
+        let max =
+            size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path) - 1;
+        let too_long = || {
+            Error::generic(format!("UNIX socket path '{path}' is too long"))
+                .hint(format!("Path must be less than {max} bytes\n"))
+        };
+        if path.len() > max {
+            return Err(too_long());
+        }
+        let mut name = path.as_bytes().to_vec();
+        if saddr.tight == Some(false) {
+            name.resize(max, 0);
+        }
+        return SocketAddrUnix::new_abstract_name(&name).map_err(|_| too_long());
+    }
+    unix_addr(&saddr.path)
+}
+
 /// `unix_listen_saddr()`.
-pub(crate) fn unix_listen(path: &str) -> Result<OwnedFd> {
+pub(crate) fn unix_listen(saddr: &UnixSocketAddress) -> Result<OwnedFd> {
+    let path = &saddr.path;
     let fd = new_socket(AddressFamily::UNIX, SocketType::STREAM)
         .map_err(|e| Error::from_io("Failed to create Unix socket", e))?;
-    let sa = unix_addr(path)?;
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != io::ErrorKind::NotFound {
-            return Err(Error::from_io(format!("Failed to unlink socket {path}"), e));
+    let sa = unix_saddr(saddr)?;
+    if !is_abstract(saddr) {
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(Error::from_io(format!("Failed to unlink socket {path}"), e));
+            }
         }
     }
     rustix::net::bind(&fd, &sa)
@@ -864,10 +903,11 @@ pub(crate) fn unix_listen(path: &str) -> Result<OwnedFd> {
 }
 
 /// `unix_connect_saddr()`.
-pub(crate) fn unix_connect(path: &str) -> Result<OwnedFd> {
+pub(crate) fn unix_connect(saddr: &UnixSocketAddress) -> Result<OwnedFd> {
+    let path = &saddr.path;
     let fd = new_socket(AddressFamily::UNIX, SocketType::STREAM)
         .map_err(|e| Error::from_io("Failed to create socket", e))?;
-    let sa = unix_addr(path)?;
+    let sa = unix_saddr(saddr)?;
     loop {
         match rustix::net::connect(&fd, &sa) {
             Ok(()) => return Ok(fd),

@@ -242,6 +242,50 @@ fn stream_unix() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A Linux abstract name: nothing appears in the file system, and the connect event reports
+/// the name with `abstract` and `tight` as QEMU 11.1 does, for a tight name and a padded one.
+#[cfg(target_os = "linux")]
+#[test]
+fn stream_unix_abstract() {
+    use std::sync::Mutex;
+
+    use ruvm_net::NetEvent;
+    use ruvm_qapi::types::SocketAddressU;
+
+    for tight in [true, false] {
+        let name = format!("ruvm-net-test-{}-{tight}", std::process::id());
+        let addr = format!("addr.type=unix,addr.path={name},addr.abstract=on,addr.tight={tight}");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut net = Net::new();
+        let ev = Arc::clone(&events);
+        net.set_event_sink(Some(Arc::new(move |e| ev.lock().unwrap().push(e))));
+        netdev(&mut net, &format!("stream,id=st0,server=true,{addr}")).unwrap();
+        assert!(!std::path::Path::new(&name).exists());
+        let mut net1 = Net::new();
+        netdev(&mut net1, &format!("stream,id=st0,server=false,{addr}")).unwrap();
+        let want = format!("st0: index=0,type=stream,unix:{name}");
+        wait_state(&net1, "st0", &want);
+        wait_state(&net, "st0", &want);
+        let a = attach_nic(&mut net, "st0");
+        let b = attach_nic(&mut net1, "st0");
+        exchange(&a, &b);
+        let got = events.lock().unwrap().clone();
+        let [NetEvent::StreamConnected { netdev_id, addr }] = &got[..] else {
+            panic!("{got:?}");
+        };
+        assert_eq!(netdev_id, "st0");
+        let SocketAddressU::Unix(u) = &addr.u else { panic!("{addr:?}") };
+        assert_eq!(
+            (u.path.as_str(), u.abstract_, u.tight),
+            (name.as_str(), Some(true), Some(tight))
+        );
+        net.cleanup();
+        net.del_nic(&a.0);
+        net1.cleanup();
+        net1.del_nic(&b.0);
+    }
+}
+
 #[test]
 fn stream_unix_reconnect() {
     let dir = tmpdir("sr");

@@ -17,8 +17,8 @@ use crate::client::NetClient;
 use crate::net::Net;
 use crate::poll::unblock;
 use crate::sock::{
-    Connector, Flavour, Framing, SockConfig, inet_connect, inet_listen, new_sock, socket_get_fd,
-    unix_connect, unix_listen,
+    Connector, Flavour, Framing, SockConfig, inet_connect, inet_listen, is_abstract, new_sock,
+    socket_get_fd, unix_connect, unix_listen,
 };
 
 const MODEL: &str = "stream";
@@ -27,7 +27,7 @@ const MODEL: &str = "stream";
 fn listen(net: &mut Net, addr: &SocketAddress) -> Result<std::os::fd::OwnedFd> {
     match &addr.u {
         SocketAddressU::Inet(inet) => inet_listen(inet),
-        SocketAddressU::Unix(unix) => unix_listen(&unix.path),
+        SocketAddressU::Unix(unix) => unix_listen(unix),
         SocketAddressU::Fd(fd) => {
             let sock = socket_get_fd(net, &fd.str)?;
             rustix::net::listen(&sock, 1)
@@ -54,7 +54,9 @@ fn server_init(
             cfg.info = "listening".to_string();
             cfg.events = net.event_sink.clone();
             cfg.listen_fd = Some(fd);
-            if let SocketAddressU::Unix(u) = &addr.u {
+            if let SocketAddressU::Unix(u) = &addr.u
+                && !is_abstract(u)
+            {
                 cfg.unlink = Some(u.path.clone().into());
             }
         }
@@ -78,8 +80,8 @@ fn client_init(
             Box::new(move || inet_connect(&inet))
         }
         SocketAddressU::Unix(unix) => {
-            let path = unix.path.clone();
-            Box::new(move || unix_connect(&path))
+            let unix = unix.clone();
+            Box::new(move || unix_connect(&unix))
         }
         SocketAddressU::Fd(fd) => {
             // The descriptor has to be looked up now, while the monitor is at hand. It can
