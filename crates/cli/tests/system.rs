@@ -481,6 +481,30 @@ mod sockets {
         let bad =
             qmp.cmd(r#"{"execute": "query-command-line-options", "arguments": {"option": "foo"}}"#);
         assert!(bad.contains("invalid option name: foo"), "{bad}");
+        for (line, want) in [
+            ("help info uuid", r#"{"return": "info uuid  -- show the current VM UUID\r\n"}"#),
+            ("frob", r#"{"return": "unknown command: 'frob'\r\n"}"#),
+            (
+                "info qtree",
+                r#"{"return": "ruvm's human monitor does not have 'info qtree' yet\r\n"}"#,
+            ),
+        ] {
+            let c = format!(
+                r#"{{"execute": "human-monitor-command", "arguments": {{"command-line": "{line}"}}}}"#
+            );
+            assert_eq!(qmp.cmd(&c), want, "{line}");
+        }
+        let c =
+            r#"{"execute": "human-monitor-command", "arguments": {"command-line": "help info"}}"#;
+        let info = qmp.cmd(c);
+        assert!(
+            info.starts_with(r#"{"return": "info kvm  -- show KVM information\r\ninfo name "#),
+            "{info}"
+        );
+        let c =
+            r#"{"execute": "human-monitor-command", "arguments": {"command-line": "info status"}}"#;
+        let status = qmp.cmd(c);
+        assert!(status.starts_with(r#"{"return": "VM status: "#), "{status}");
 
         qtest.write_all(b"readb 0x1000\ninl 0x60\nclock_step 100\nclock_step\n").unwrap();
         // Machine none has no timers, so there is no deadline to step to.

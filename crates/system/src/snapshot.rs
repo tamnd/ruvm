@@ -2,13 +2,11 @@
 
 //! Snapshots of the whole VM: `save_snapshot()`, `load_snapshot()` and `delete_snapshot()` of
 //! migration/savevm.c, the `snapshot-save`, `snapshot-load` and `snapshot-delete` jobs and the
-//! job commands, and the `savevm`, `loadvm`, `delvm` and `info snapshots` HMP commands that
-//! `human-monitor-command` runs.
+//! job commands. The `savevm`, `loadvm`, `delvm` and `info snapshots` HMP commands are in
+//! [`crate::hmp`].
 //!
 //! Differences from QEMU:
 //!
-//! - The human monitor has only the four snapshot commands. Any other command fails with a
-//!   QMP error instead of running.
 //! - `-loadvm` is not supported yet.
 //! - There are no migration blockers, so `save_snapshot()` skips `migration_is_blocked()`, and
 //!   no record/replay, so a snapshot has no icount.
@@ -51,7 +49,7 @@ fn load_snapshot_resume(vm: &Vm, state: RunState) {
 /// `save_snapshot()`: takes the snapshot `name`, or one named after the time, with the VM
 /// state on `vmstate` or the first node that can hold it. `devices` are the nodes to snapshot,
 /// `None` for all writable disks.
-fn save_snapshot(
+pub(crate) fn save_snapshot(
     vm: &Vm,
     name: Option<&str>,
     overwrite: bool,
@@ -121,14 +119,19 @@ fn load_snapshot(
 }
 
 /// `delete_snapshot()`.
-fn delete_snapshot(vm: &Vm, name: &str, devices: Option<&[String]>) -> Result<()> {
+pub(crate) fn delete_snapshot(vm: &Vm, name: &str, devices: Option<&[String]>) -> Result<()> {
     vm.block.all_can_snapshot(devices)?;
     vm.block.all_delete_snapshot(name, devices)
 }
 
 /// `hmp_loadvm()` and `snapshot_load_job_bh()`: stops the guest, loads the snapshot and, if
 /// that worked, puts the guest back in the state it was in.
-fn loadvm(vm: &Vm, name: &str, vmstate: Option<&str>, devices: Option<&[String]>) -> Result<()> {
+pub(crate) fn loadvm(
+    vm: &Vm,
+    name: &str,
+    vmstate: Option<&str>,
+    devices: Option<&[String]>,
+) -> Result<()> {
     let saved_state = vm.runstate.get();
     vm.runstate.vm_stop(RunState::RestoreVm);
     load_snapshot(vm, name, vmstate, devices)?;
@@ -136,139 +139,9 @@ fn loadvm(vm: &Vm, name: &str, vmstate: Option<&str>, devices: Option<&[String]>
     Ok(())
 }
 
-/// `get_str()`: a word, or a string in double quotes with `\n`, `\r`, `\\`, `\'` and `\"`
-/// escapes. Gives the string and the rest of the line, or `None` with nothing to read.
-fn get_str(p: &str) -> Option<(String, &str)> {
-    let p = p.trim_start_matches(is_space);
-    if p.is_empty() {
-        return None;
-    }
-    let mut out = String::new();
-    if let Some(rest) = p.strip_prefix('"') {
-        let mut it = rest.char_indices();
-        while let Some((i, c)) = it.next() {
-            match c {
-                '"' => return Some((out, &rest[i + 1..])),
-                '\\' => match it.next().map(|e| e.1) {
-                    Some('n') => out.push('\n'),
-                    Some('r') => out.push('\r'),
-                    Some(c @ ('\\' | '\'' | '"')) => out.push(c),
-                    // QEMU prints "unsupported escape code" to its stdout here.
-                    _ => return None,
-                },
-                c => out.push(c),
-            }
-        }
-        // QEMU prints "unterminated string" to its stdout here.
-        return None;
-    }
-    let end = p.find(is_space).unwrap_or(p.len());
-    out.push_str(&p[..end]);
-    Some((out, &p[end..]))
-}
-
-fn is_space(c: char) -> bool {
-    // qemu_isspace()
-    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
-}
-
-/// An HMP command of this module and its one string argument, `name:s` or `name:s?`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Hmp {
-    Savevm,
-    Loadvm,
-    Delvm,
-    InfoSnapshots,
-}
-
-/// `handle_hmp_command()` for the commands of this module: what the monitor prints.
-fn hmp(vm: &Vm, cmdline: &str) -> Result<String> {
-    let start = cmdline;
-    // get_command_name()
-    let name_of = |p: &str| -> Option<(usize, usize)> {
-        let s = p.len() - p.trim_start_matches(is_space).len();
-        if s == p.len() {
-            return None;
-        }
-        let len = p[s..].find(|c: char| c == '/' || is_space(c)).unwrap_or(p.len() - s);
-        Some((s, s + len))
-    };
-    let Some((s, e)) = name_of(start) else { return Ok(String::new()) };
-    let cmd = match &start[s..e] {
-        "savevm" => Hmp::Savevm,
-        "loadvm" => Hmp::Loadvm,
-        "delvm" => Hmp::Delvm,
-        "info" => {
-            let rest = start[e..].trim_start_matches(is_space);
-            let Some((s2, e2)) = name_of(rest) else {
-                bail!("ruvm's human monitor has no 'info' listing yet");
-            };
-            let off = start.len() - rest.len();
-            if &rest[s2..e2] != "snapshots" {
-                bail!("ruvm's human monitor does not have 'info {}' yet", &rest[s2..e2]);
-            }
-            return parse_args(vm, start, off + e2, Hmp::InfoSnapshots);
-        }
-        other => bail!("ruvm's human monitor does not have '{other}' yet"),
-    };
-    parse_args(vm, start, e, cmd)
-}
-
-/// `monitor_parse_arguments()` and the command itself. `args` is where the arguments of
-/// `cmdline` start.
-fn parse_args(vm: &Vm, cmdline: &str, args: usize, cmd: Hmp) -> Result<String> {
-    let name = match cmd {
-        Hmp::Savevm => "savevm",
-        Hmp::Loadvm => "loadvm",
-        Hmp::Delvm => "delvm",
-        Hmp::InfoSnapshots => "snapshots",
-    };
-    // monitor_parse_command() skips the space after the name.
-    let after = &cmdline[args..];
-    let args = cmdline.len() - after.trim_start_matches(is_space).len();
-    let try_help = || {
-        let shown = cmdline[..args].trim_end_matches(is_space);
-        format!("Try \"help {shown}\" for more information\n")
-    };
-    let mut p = &cmdline[args..];
-    let mut arg = None;
-    if cmd != Hmp::InfoSnapshots {
-        let optional = cmd == Hmp::Savevm;
-        if !(optional && p.trim_start_matches(is_space).is_empty()) {
-            match get_str(p) {
-                Some((s, rest)) => {
-                    arg = Some(s);
-                    p = rest;
-                }
-                None => return Ok(format!("{name}: string expected\n{}", try_help())),
-            }
-        }
-    }
-    if !p.trim_start_matches(is_space).is_empty() {
-        return Ok(format!("{name}: extraneous characters at the end of line\n{}", try_help()));
-    }
-    let res = match cmd {
-        Hmp::Savevm => save_snapshot(vm, arg.as_deref(), true, None, None),
-        Hmp::Loadvm => loadvm(vm, arg.as_deref().unwrap_or_default(), None, None),
-        Hmp::Delvm => delete_snapshot(vm, arg.as_deref().unwrap_or_default(), None),
-        Hmp::InfoSnapshots => return Ok(vm.block.info_snapshots()),
-    };
-    // hmp_handle_error()
-    Ok(match res {
-        Ok(()) => String::new(),
-        Err(e) => format!("Error: {}\n", e.message()),
-    })
-}
-
-/// Registers `human-monitor-command`, the `snapshot-*` jobs and the job commands, and sends
-/// `JOB_STATUS_CHANGE` for the jobs.
+/// Registers the `snapshot-*` jobs and the job commands, and sends `JOB_STATUS_CHANGE` for the
+/// jobs.
 pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
-    let v = vm.clone();
-    // monitor_puts() puts a carriage return before every newline.
-    register_human_monitor_command(cmds, move |_: &MonitorQmp, arg| {
-        hmp(&v, &arg.command_line).map(|out| out.replace('\n', "\r\n"))
-    });
-
     let v = vm.clone();
     register_snapshot_save(cmds, move |_: &MonitorQmp, arg| {
         let (w, id) = (v.clone(), arg.job_id.clone());
@@ -323,18 +196,4 @@ pub(crate) fn register(vm: &Arc<Vm>, cmds: &mut Commands) {
             }
         }
     })));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strings() {
-        assert_eq!(get_str("  ab cd"), Some(("ab".into(), " cd")));
-        assert_eq!(get_str(r#" "a \"b\"\n" x"#), Some(("a \"b\"\n".into(), " x")));
-        assert_eq!(get_str("   "), None);
-        assert_eq!(get_str(r#""open"#), None);
-        assert_eq!(get_str(r#""\q""#), None);
-    }
 }

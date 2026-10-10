@@ -9,6 +9,7 @@ mod arm;
 mod audio;
 mod config_qmp;
 mod display;
+mod hmp;
 mod info;
 mod migration;
 mod net;
