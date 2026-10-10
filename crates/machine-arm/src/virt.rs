@@ -87,6 +87,7 @@
 pub(crate) mod boot;
 pub(crate) mod cpus;
 mod dt;
+pub mod kvm;
 pub mod memmap;
 
 use std::fmt;
@@ -414,6 +415,22 @@ pub struct VirtConfig {
     pub oem_table_id: String,
     /// The `-smp` topology. `None` is one socket with a core for each possible CPU.
     pub topology: Option<CpuTopology>,
+    /// Where the SPIs go instead of the board's GIC, for a GIC that KVM keeps in the kernel.
+    pub spi_sink: Option<SpiSink>,
+}
+
+/// Takes SPI `n` and its new level, for [`VirtConfig::spi_sink`].
+pub type SpiSink = Arc<dyn Fn(u32, bool) + Send + Sync>;
+
+/// The line of SPI `n`: the sink's when there is one, the GIC's otherwise.
+fn spi_line(gic: &VirtGic, sink: Option<&SpiSink>, n: u32) -> IrqLine {
+    match sink {
+        Some(sink) => {
+            let sink = Arc::clone(sink);
+            IrqLine::from_fn(move |level| sink(n, level != 0))
+        }
+        None => gic.spi(n),
+    }
 }
 
 impl fmt::Debug for VirtConfig {
@@ -483,6 +500,7 @@ impl VirtConfig {
             oem_id: APPNAME6.to_string(),
             oem_table_id: APPNAME8.to_string(),
             topology: None,
+            spi_sink: None,
         }
     }
 }
@@ -1090,14 +1108,18 @@ impl VirtMachine {
             mem.add_subregion(system, VIRT_GIC_ITS, main).map_err(err)?;
             (Some(its), Some(dt::add_its_node(&mut fdt)?))
         } else if v2m_on {
-            let gic = gic.clone();
-            let v2m = GicV2m::new(VIRT_GIC_V2M_IRQ, NUM_GICV2M_SPIS, move |n| gic.spi(n))?;
+            let (gic, sink) = (gic.clone(), cfg.spi_sink.clone());
+            let v2m = GicV2m::new(VIRT_GIC_V2M_IRQ, NUM_GICV2M_SPIS, move |n| {
+                spi_line(&gic, sink.as_ref(), n)
+            })?;
             let r = mem.new_io("gicv2m", GICV2M_SIZE.into(), Arc::new(v2m)).map_err(err)?;
             mem.add_subregion(system, VIRT_GIC_V2M, r).map_err(err)?;
             (None, Some(dt::add_v2m_node(&mut fdt)?))
         } else {
             (None, None)
         };
+        // The device interrupts, which go to KVM instead when it keeps the GIC.
+        let spi = |n: u32| spi_line(&gic, cfg.spi_sink.as_ref(), n);
         if model.features.pmu != 0 {
             dt::add_pmu_node(&mut fdt, ppi_cpus)?;
         }
@@ -1165,7 +1187,7 @@ impl VirtMachine {
             let uart = Pl011::new(chr);
             let r = mem.new_io("pl011", PL011_MMIO_SIZE.into(), uart.clone()).map_err(err)?;
             mem.add_subregion(system, base, r).map_err(err)?;
-            uart.irq(0).connect(gic.spi(irq));
+            uart.irq(0).connect(spi(irq));
             dt::create_uart(fdt, clock_phandle, which)?;
             Ok(uart)
         };
@@ -1195,7 +1217,7 @@ impl VirtMachine {
         let rtc = Pl031::new(rtc_clock, rtc_date);
         let r = mem.new_io("pl031", PL031_MMIO_SIZE.into(), rtc.clone()).map_err(err)?;
         mem.add_subregion(system, VIRT_RTC, r).map_err(err)?;
-        rtc.irq().connect(gic.spi(VIRT_RTC_IRQ));
+        rtc.irq().connect(spi(VIRT_RTC_IRQ));
         dt::create_rtc(&mut fdt, clock_phandle)?;
 
         // create_pcie(), with the msi-map to the ITS.
@@ -1206,13 +1228,13 @@ impl VirtMachine {
             pio: MemMapEntry { base: VIRT_PCIE_PIO, size: VIRT_PCIE_PIO_SIZE },
             irq: VIRT_PCIE_IRQ,
         };
-        let gpex = create_pcie(&mem, system, &layout, &|n| gic.spi(n), &memory_as)?;
+        let gpex = create_pcie(&mem, system, &layout, &spi, &memory_as)?;
         dt::create_pcie(&mut fdt, &memmap, gic_phandle, msi_phandle, VIRT_PCIE_IRQ)?;
         // create_smmu(), with the stage property set to nested as on every virt version that
         // has the SMMU. It reads its tables from system memory, and the functions on the root
         // bus get their address spaces from it as they are plugged.
         let smmu = if cfg.iommu == VirtIommu::SmmuV3 {
-            let irqs = std::array::from_fn(|i| gic.spi(VIRT_SMMU_IRQ + i as u32));
+            let irqs = std::array::from_fn(|i| spi(VIRT_SMMU_IRQ + i as u32));
             let smmu = SmmuV3::new(SmmuStage::Nested, &memory_as, irqs);
             let r = mem.new_io("smmuv3", SMMU_SIZE.into(), smmu.mmio_ops()).map_err(err)?;
             mem.add_subregion(system, VIRT_SMMU, r).map_err(err)?;
@@ -1233,7 +1255,7 @@ impl VirtMachine {
             .map_err(err)?;
             let r = mem.new_io("acpi-ged", ACPI_GED_EVT_SEL_LEN.into(), ged.evt_ops());
             mem.add_subregion(system, VIRT_ACPI_GED, r.map_err(err)?).map_err(err)?;
-            ged.irq().connect(gic.spi(VIRT_ACPI_GED_IRQ));
+            ged.irq().connect(spi(VIRT_ACPI_GED_IRQ));
             Some(ged)
         } else {
             None
@@ -1243,7 +1265,7 @@ impl VirtMachine {
             let pl061 = Pl061::new(Pl061Props { pullups: 0, pulldowns: 0xff })?;
             let r = mem.new_io("pl061", PL061_MMIO_SIZE.into(), pl061.clone()).map_err(err)?;
             mem.add_subregion(system, base, r).map_err(err)?;
-            pl061.irq().connect(gic.spi(irq));
+            pl061.irq().connect(spi(irq));
             dt::create_gpio(fdt, clock_phandle, base, irq, secure)?;
             Ok(pl061)
         };
@@ -1282,7 +1304,7 @@ impl VirtMachine {
         for i in 0..VIRTIO_TRANSPORTS {
             let t = VirtioMmio::new(None, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT).map_err(err)?;
             let slot = Arc::new(VirtioSlot {
-                gsi: gic.spi(VIRT_MMIO_IRQ + i as u32),
+                gsi: spi(VIRT_MMIO_IRQ + i as u32),
                 transport: RwLock::new(Arc::new(t)),
                 plugged: RwLock::new(false),
             });

@@ -1302,7 +1302,32 @@ impl GicV2State {
     fn num_cpu(&self) -> u32 {
         self.cpus.len() as u32
     }
+
+    /// `arm_gic_common_reset_hold()` for a GIC without the security or virtualization
+    /// extensions, which is what KVM has: everything zero except the SGIs, which are enabled
+    /// and edge triggered, the aliased binary point, and the targets of a single CPU GIC, which
+    /// all name that CPU.
+    pub fn reset(&mut self) {
+        let single = self.cpus.len() == 1;
+        self.ctlr = 0;
+        for v in [&mut self.group, &mut self.enabled, &mut self.pending, &mut self.active] {
+            v.fill(0);
+        }
+        self.edge_trigger.fill(false);
+        self.priority.fill(0);
+        self.targets.fill(u8::from(single));
+        for i in 0..GIC_NR_SGIS.min(self.num_irq) as usize {
+            self.enabled[i] = ALL_CPU_MASK;
+            self.edge_trigger[i] = true;
+        }
+        for c in &mut self.cpus {
+            *c = GicV2Cpu { abpr: GIC_MIN_ABPR, ..GicV2Cpu::default() };
+        }
+    }
 }
+
+/// `GIC_MIN_ABPR`, the reset value of `GICC_ABPR`.
+const GIC_MIN_ABPR: u32 = 1;
 
 /// The CPU mask of interrupt `irq` as seen from `cpu`.
 fn cpu_mask(irq: u32, cpu: u32) -> u8 {
@@ -2072,5 +2097,28 @@ mod tests {
             "KVM_SET_DEVICE_ATTR failed: Group 1 attr 0x0000000000000014: Invalid argument"
         );
         assert_eq!(e.errno(), Some(22));
+    }
+
+    #[test]
+    fn gicv2_reset_matches_arm_gic_common() {
+        let mut s = GicV2State::new(64, 2);
+        s.ctlr = 1;
+        s.enabled[40] = 0xff;
+        s.pending[3] = 1;
+        s.cpus[1].priority_mask = 0xf0;
+        s.reset();
+        assert_eq!(s.ctlr, 0);
+        assert!(s.enabled[..16].iter().all(|&e| e == 0xff));
+        assert!(s.enabled[16..].iter().all(|&e| e == 0));
+        assert!(s.edge_trigger[..16].iter().all(|&e| e));
+        assert!(!s.edge_trigger[16..].iter().any(|&e| e));
+        assert_eq!(s.pending[3], 0);
+        assert!(s.targets.iter().all(|&t| t == 0));
+        assert_eq!(s.cpus[1], GicV2Cpu { abpr: 1, ..GicV2Cpu::default() });
+
+        // A single CPU GIC sends everything to its CPU.
+        let mut one = GicV2State::new(64, 1);
+        one.reset();
+        assert!(one.targets.iter().all(|&t| t == 1));
     }
 }
