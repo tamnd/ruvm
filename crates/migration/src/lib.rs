@@ -35,6 +35,9 @@
 //! and the dirty ring.
 
 #![forbid(unsafe_code)]
+// Off Linux the unix socket address has only its path, so filling the rest from Default is
+// needless there while it is needed on Linux.
+#![cfg_attr(not(target_os = "linux"), allow(clippy::needless_update))]
 
 pub mod channel;
 pub mod cpr;
