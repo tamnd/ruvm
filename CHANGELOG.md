@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.5.4
+
+This patch adds the aarch64 guest to user mode for M7, and for M6 brings in the virtio input devices, the first host audio backends, the HVF and WHPX accelerators and the start of the qtest work.
+
+For M7: `qemu-aarch64` runs static and dynamic aarch64 Linux programs on an x86_64 host (#216), with the rt_sigframe and its FPSIMD, ESR and SVE records, AT_HWCAP and AT_HWCAP2 from the ID registers, and the generic syscall table mapped onto the host's. Counting online CPUs no longer needs unsafe (#218).
+
+For M6: virtio-keyboard, virtio-mouse, virtio-tablet and virtio-multitouch are in on q35, arm virt and microvm (#217). In an Alpine guest on q35 the PCI ids, the capability bitmaps and every input event the guest read match QEMU 11.1. The `alsa` audiodev is in behind `audio-alsa` (#215) and the `pa` audiodev behind `audio-pa` (#220), both with QEMU's buffer defaults and error messages. The Hypervisor.framework accelerator for Apple silicon (#221) and the Windows Hypervisor Platform accelerator (#223) are ported. Neither has run on real hardware yet, because we have no macOS or Windows build host, so they are only cross checked and unit tested for now. QEMU's qmp-cmd-test now gets through every query on machine none for aarch64 and riscv64, with query-command-line-options, query-memdev, query-kvm, query-target and the other queries it runs answered the way QEMU does (#222, #224). A stale note in virtio-gpu is gone (#219).
+
 ## 0.5.3
 
 This patch finishes threads and /proc for M7 and brings in two more sound cards and two more displays for M6.
