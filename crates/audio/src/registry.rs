@@ -18,6 +18,8 @@ use ruvm_qapi::types::{
 
 #[cfg(feature = "audio-alsa")]
 use crate::alsa::AlsaDriver;
+#[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
+use crate::coreaudio::CoreaudioDriver;
 use crate::engine::AudioBackend;
 use crate::none::NoneDriver;
 #[cfg(feature = "audio-pa")]
@@ -33,6 +35,8 @@ use crate::wav::WavDriver;
 const PRIO_LIST: &[AudiodevDriver] = &[
     #[cfg(feature = "audio-pa")]
     AudiodevDriver::Pa,
+    #[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
+    AudiodevDriver::Coreaudio,
     AudiodevDriver::None,
 ];
 
@@ -72,6 +76,8 @@ fn driver_for(driver: AudiodevDriver) -> Option<Box<dyn Driver>> {
         AudiodevDriver::Pa => Some(Box::new(PaDriver::default())),
         #[cfg(feature = "audio-pipewire")]
         AudiodevDriver::Pipewire => Some(Box::new(PwDriver::default())),
+        #[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
+        AudiodevDriver::Coreaudio => Some(Box::new(CoreaudioDriver)),
     }
 }
 
@@ -129,6 +135,8 @@ per_direction!(ruvm_qapi::types::AudiodevAlsaPerDirectionOptions);
 per_direction!(ruvm_qapi::types::AudiodevPaPerDirectionOptions);
 #[cfg(feature = "audio-pipewire")]
 per_direction!(ruvm_qapi::types::AudiodevPipewirePerDirectionOptions);
+#[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
+per_direction!(ruvm_qapi::types::AudiodevCoreaudioPerDirectionOptions);
 
 /// The base `in` and `out` options of an audiodev, whatever its driver.
 fn pdos(
@@ -151,6 +159,8 @@ fn pdos(
         AudiodevU::Pa(o) => base(&o.in_, &o.out),
         #[cfg(feature = "audio-pipewire")]
         AudiodevU::Pipewire(o) => base(&o.in_, &o.out),
+        #[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
+        AudiodevU::Coreaudio(o) => base(&o.in_, &o.out),
     }
 }
 
@@ -197,6 +207,8 @@ pub fn validate_opts(dev: &mut Audiodev) -> Result<()> {
         AudiodevU::Pa(o) => validate(&mut o.in_, &mut o.out)?,
         #[cfg(feature = "audio-pipewire")]
         AudiodevU::Pipewire(o) => validate(&mut o.in_, &mut o.out)?,
+        #[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
+        AudiodevU::Coreaudio(o) => validate(&mut o.in_, &mut o.out)?,
     }
     dev.timer_period.get_or_insert(10000);
     Ok(())

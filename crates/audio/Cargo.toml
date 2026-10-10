@@ -11,7 +11,7 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 7
 
 [dependencies]
 alsa = { workspace = true, optional = true }
@@ -22,6 +22,10 @@ ruvm-base.workspace = true
 ruvm-hw-core.workspace = true
 ruvm-qapi.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-audio = { workspace = true, optional = true }
+objc2-core-audio-types = { workspace = true, optional = true }
+
 [features]
 # The dbus audiodev type, which comes with -display dbus.
 ui-dbus = ["ruvm-qapi/ui-dbus"]
@@ -31,6 +35,12 @@ audio-alsa = ["dep:alsa", "dep:libc", "ruvm-qapi/audio-alsa"]
 audio-pa = ["dep:libpulse-binding", "ruvm-qapi/audio-pa"]
 # The pipewire audiodev type, over the system's PipeWire library.
 audio-pipewire = ["dep:pipewire", "dep:libc", "ruvm-qapi/audio-pipewire"]
+# The coreaudio audiodev type, over CoreAudio on macOS.
+audio-coreaudio = [
+    "dep:objc2-core-audio",
+    "dep:objc2-core-audio-types",
+    "ruvm-qapi/audio-coreaudio",
+]
 
 [lints]
 workspace = true

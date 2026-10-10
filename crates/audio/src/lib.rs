@@ -8,12 +8,16 @@
 //! themselves. The `none` driver plays nothing and records silence, and the `wav` driver writes
 //! what the guest plays to a file, which is how the sound cards are checked against QEMU. The
 //! host drivers sit behind cargo features: `audio-alsa` adds `alsa`, `audio-pa` adds `pa` and
-//! `audio-pipewire` adds `pipewire`.
+//! `audio-pipewire` adds `pipewire`. On macOS `audio-coreaudio` adds `coreaudio`, which is the one
+//! driver with unsafe code of its own, its calls into CoreAudio.
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(all(feature = "audio-coreaudio", target_os = "macos")), forbid(unsafe_code))]
+#![cfg_attr(all(feature = "audio-coreaudio", target_os = "macos"), deny(unsafe_code))]
 
 #[cfg(feature = "audio-alsa")]
 pub mod alsa;
+#[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
+pub mod coreaudio;
 pub mod engine;
 pub mod mixeng;
 pub mod model;
