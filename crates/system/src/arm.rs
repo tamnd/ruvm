@@ -763,6 +763,10 @@ fn kvm_cpu_model(arg: Option<&str>, host_pmu: bool) -> Result<ArmCpuModel> {
     let mut model = ArmCpuModel::max();
     model.name = "host";
     model.dtb_compatible = "arm,arm-v8";
+    // The VM has the default 40-bit IPA space, so the memory map is laid out for 40 bits, as
+    // virt_kvm_type() does when KVM has no KVM_CAP_ARM_VM_IPA_SIZE. The guest reads its own
+    // ID registers from KVM.
+    model.id_aa64mmfr0 = (model.id_aa64mmfr0 & !0xf) | 2;
     Ok(if pmu { model } else { model.without_pmu() })
 }
 
@@ -1546,6 +1550,7 @@ mod tests {
         let m = kvm_cpu_model(Some("host"), true).unwrap();
         assert_eq!((m.name, m.dtb_compatible), ("host", "arm,arm-v8"));
         assert_ne!(m.features.pmu, 0);
+        assert_eq!(m.pamax(), 40);
         assert_eq!(kvm_cpu_model(Some("max"), true).unwrap().name, "host");
         assert_eq!(kvm_cpu_model(Some("host"), false).unwrap().features.pmu, 0);
         assert_eq!(kvm_cpu_model(Some("host,pmu=off"), true).unwrap().features.pmu, 0);
