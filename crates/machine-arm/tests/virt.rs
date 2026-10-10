@@ -14,9 +14,9 @@ use ruvm_hw_virtio::{VirtioPci, VirtioPciProps};
 use ruvm_jit::cpu_exec::cpu_exec;
 use ruvm_jit::{Vcpu, excp};
 use ruvm_machine_arm::virt::{
-    VIRT_FW_CFG, VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GPIO, VIRT_MEM, VIRT_MMIO,
-    VIRT_PCIE_MMIO, VIRT_PCIE_PIO, VIRT_RTC, VIRT_SECURE_GPIO, VIRT_SMMU, VIRT_UART, VirtConfig,
-    VirtIommu, VirtMachine, VirtMsi, VirtRequest,
+    VIRT_FW_CFG, VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GIC_V2M, VIRT_GPIO, VIRT_MEM,
+    VIRT_MMIO, VIRT_PCIE_MMIO, VIRT_PCIE_PIO, VIRT_RTC, VIRT_SECURE_GPIO, VIRT_SMMU, VIRT_UART,
+    VirtConfig, VirtGicVersion, VirtIommu, VirtMachine, VirtMsi, VirtRequest,
 };
 use ruvm_mem::{Endian, MemTxAttrs};
 use ruvm_target_arm::cpu::ArmCpuModel;
@@ -265,6 +265,21 @@ fn dtb_a57_its_matches_qemu() {
 }
 
 #[test]
+fn dtb_a57_gicv2_matches_qemu() {
+    // gic-version=2 with msi=auto: the cortex-a15-gic node, the GICv2m frame and its msi-map,
+    // and the CPU mask in the flags of the timer PPIs.
+    let mut cfg = VirtConfig::new(model("cortex-a57"));
+    cfg.smp = 2;
+    cfg.gic_version = VirtGicVersion::V2;
+    compare(cfg, "virt-a57-smp2-gicv2.dtb.gz");
+    let mut cfg = VirtConfig::new(model("cortex-a57"));
+    cfg.smp = 8;
+    cfg.gic_version = VirtGicVersion::V2;
+    cfg.msi = VirtMsi::Off;
+    compare(cfg, "virt-a57-smp8-gicv2-msi-off.dtb.gz");
+}
+
+#[test]
 fn dtb_a57_smp130_matches_qemu() {
     // 123 redistributors fill the low region, so the other 7 go to the high one.
     let mut cfg = VirtConfig::new(model("cortex-a57"));
@@ -439,8 +454,17 @@ fn config_errors() {
          (635)"
     );
     let mut cfg = a57();
-    cfg.msi = VirtMsi::Gicv2m;
-    assert_eq!(VirtMachine::new(cfg).unwrap_err(), "msi=gicv2m is not supported by ruvm yet");
+    cfg.gic_version = VirtGicVersion::V2;
+    cfg.msi = VirtMsi::Its;
+    assert_eq!(VirtMachine::new(cfg).unwrap_err(), "GICv2 + ITS is an invalid configuration.");
+    // A GICv2 has 8 CPU interfaces, and more redistributor space does not help.
+    let mut cfg = a57();
+    cfg.gic_version = VirtGicVersion::V2;
+    cfg.max_cpus = Some(9);
+    assert_eq!(
+        VirtMachine::new(cfg).unwrap_err(),
+        "Number of SMP CPUs requested (9) exceeds max CPUs supported by machine 'mach-virt' (8)"
+    );
     let mut cfg = a57();
     let bits = cfg.cpu.pamax();
     cfg.ram_size = 1 << bits;
@@ -806,6 +830,39 @@ fn msi_through_the_its() {
     assert!(!nodes.iter().any(|n| n.path.contains("/its@")));
     let pcie = nodes.iter().find(|n| n.path == "/pcie@10000000").unwrap();
     assert!(!pcie.props.iter().any(|(n, _)| n == "msi-map"));
+}
+
+#[test]
+fn msi_through_the_gicv2m() {
+    let rng =
+        || Box::new(VirtioRng::new(Box::new(RandomFile::default()), VirtioRngConf::default()));
+    let mut cfg = a57();
+    cfg.smp = 2;
+    cfg.gic_version = VirtGicVersion::V2;
+    let mut m = VirtMachine::new(cfg).unwrap();
+    let dev = m.attach_virtio_pci(rng(), Some(2 << 3), &VirtioPciProps::default()).unwrap();
+    m.machine_done().unwrap();
+    // GICD_TYPER: 288 interrupts and two CPU interfaces.
+    assert_eq!(r32(&m, VIRT_GIC_DIST + 4), (1 << 5) | 8);
+    // MSI_TYPER: SPIs from 80, 64 of them.
+    assert_eq!(r32(&m, VIRT_GIC_V2M + 8), (80 << 16) | 64);
+    // There is no ITS and no redistributor.
+    let mut b = [0; 4];
+    assert!(!m.memory_as().read(VIRT_GIC_ITS + 8, U, &mut b).is_ok());
+    assert!(!m.memory_as().read(VIRT_GIC_REDIST, U, &mut b).is_ok());
+
+    // The device writes interrupt ID 81 to MSI_SETSPI_NS once it is a bus master, which makes
+    // SPI 49 pending once it is edge triggered, as Linux sets the SPIs of the frame, and
+    // targets CPU 0.
+    w(&m, VIRT_GIC_DIST + 0xc14, 4, 2 << 2);
+    w(&m, VIRT_GIC_DIST + 0x851, 1, 1);
+    let msg = MsiMessage { address: VIRT_GIC_V2M + 0x40, data: 81 };
+    dev.pci_dev().msi_send_message(msg);
+    assert_eq!(r32(&m, VIRT_GIC_DIST + 0x208) & (1 << 17), 0);
+    let ecam = m.memmap().ecam.base;
+    w(&m, ecam + (2 << 15) + 4, 2, 0x6);
+    dev.pci_dev().msi_send_message(msg);
+    assert_ne!(r32(&m, VIRT_GIC_DIST + 0x208) & (1 << 17), 0);
 }
 
 fn movz(rd: u32, imm: u32, hw: u32) -> u32 {

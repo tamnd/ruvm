@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The `virt` board, hw/arm/virt.c, with a GICv3 and AArch64 CPUs.
+//! The `virt` board, hw/arm/virt.c, with a GICv3 or a GICv2 and AArch64 CPUs.
 //!
 //! # What is there
 //!
@@ -19,7 +19,9 @@
 //! sends its MSIs through an address space of its own that the SMMU translates. A
 //! second `-serial` adds the second PL011 at 0x09040000 (SPI 8). `virtualization=on` keeps EL2
 //! and `secure=on` keeps EL3 and adds the secure UART at 0x09040000 and the secure RAM at
-//! 0x0e000000. PSCI goes through HVC, or SMC with `virtualization=on`, and is left to the
+//! 0x0e000000. `gic-version=2` puts a GICv2 in place of the GICv3, its distributor at
+//! 0x08000000 and its CPU interface at 0x08010000, for at most 8 CPUs, with the GICv2m MSI
+//! frame at 0x08020000 (SPIs 48 to 111) unless `msi=off`. PSCI goes through HVC, or SMC with `virtualization=on`, and is left to the
 //! firmware when `secure=on` has a firmware or the boot EL is at or above the conduit's EL, as
 //! hw/arm/virt.c and hw/arm/boot.c decide. The device tree is built with the same libfdt calls
 //! in the same order as QEMU, so it matches `-M virt,dumpdtb=` byte for byte. `-kernel` takes
@@ -51,8 +53,9 @@
 //!
 //! These leave a seam for M6:
 //!
-//! - The GICv2m (`msi=gicv2m`), which only makes sense with the GICv2 that is not modelled
-//!   either.
+//! - The virtualization and security extensions of the GICv2, so `gic-version=2` with
+//!   `virtualization=on` or `secure=on` fails. Without `gic-version`, QEMU picks a GICv2 for
+//!   TCG when there are at most 8 CPUs; ruvm keeps its GICv3.
 //! - CXL, so the empty `cxl_host_reg` container QEMU maps above the redistributors is not
 //!   there either.
 //! - SMBIOS (`virt_build_smbios()`), so firmware finds no SMBIOS tables in fw_cfg.
@@ -93,7 +96,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use ruvm_base::ClockType;
 use ruvm_firmware::acpi::BuildTables;
 use ruvm_firmware::acpi::arm_virt::{
-    self, ArmVirtAcpi, IortSmmu, PsciConduit as AcpiPsci, VirtIrqs, VirtMemmap as AcpiMemmap,
+    self, ArmVirtAcpi, GicV2Bases, GicV2mFrame, IortSmmu, PsciConduit as AcpiPsci, VirtIrqs,
+    VirtMemmap as AcpiMemmap,
 };
 use ruvm_firmware::acpi::gpex::Window;
 use ruvm_firmware::acpi::q35::{PciDevice as AcpiPciDevice, PciDeviceAml};
@@ -110,6 +114,8 @@ use ruvm_hw_core::fw_cfg::{
 };
 use ruvm_hw_core::timer::TimeSource;
 use ruvm_hw_core::{Clock, IrqLine};
+use ruvm_hw_intc::gicv2::{GIC_NCPU, GICV2_CPU_SIZE, GICV2_DIST_SIZE, GicV2, GicV2Props};
+use ruvm_hw_intc::gicv2m::{GICV2M_SIZE, GicV2m};
 use ruvm_hw_intc::gicv3::{
     GICV3_DIST_SIZE, GICV3_REDIST_SIZE, GicV3, GicV3Its, GicV3Props, ITS_CONTROL_SIZE, ITS_SIZE,
     ITS_TRANS_SIZE,
@@ -155,6 +161,18 @@ pub const VIRT_GIC_REDIST_SIZE: u64 = 0x00f6_0000;
 pub const VIRT_GICV3_MAX_CPUS: usize = (VIRT_GIC_REDIST_SIZE / GICV3_REDIST_SIZE) as usize;
 /// `VIRT_GIC_ITS`.
 pub const VIRT_GIC_ITS: u64 = 0x0808_0000;
+/// `VIRT_GIC_CPU`, the GICv2 CPU interface.
+pub const VIRT_GIC_CPU: u64 = 0x0801_0000;
+/// `VIRT_GIC_HYP`, the GICv2 virtual interface control, which ruvm does not model yet.
+pub const VIRT_GIC_HYP: u64 = 0x0803_0000;
+/// `VIRT_GIC_VCPU`, the GICv2 virtual CPU interface, which ruvm does not model yet.
+pub const VIRT_GIC_VCPU: u64 = 0x0804_0000;
+/// `VIRT_GIC_V2M`, the GICv2m MSI frame.
+pub const VIRT_GIC_V2M: u64 = 0x0802_0000;
+/// The first SPI of the GICv2m frame, `irqmap[VIRT_GIC_V2M]`.
+pub const VIRT_GIC_V2M_IRQ: u32 = 48;
+/// `NUM_GICV2M_SPIS`.
+pub const NUM_GICV2M_SPIS: u32 = 64;
 /// `VIRT_UART0`.
 pub const VIRT_UART: u64 = 0x0900_0000;
 /// The size of the UART window.
@@ -235,15 +253,64 @@ pub const VIRT_RAM_ID: &str = "mach-virt.ram";
 /// The `msi` machine property, which `its` sets too: the MSI controller of the board.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VirtMsi {
-    /// `msi=auto`, the default, which is the ITS with a GICv3.
+    /// `msi=auto`, the default: the ITS with a GICv3 and the GICv2m with a GICv2.
     #[default]
     Auto,
     /// `msi=its` or `its=on`.
     Its,
-    /// `msi=gicv2m`, which is not modelled.
+    /// `msi=gicv2m`.
     Gicv2m,
-    /// `msi=off`, or `its=off` with a GICv3.
+    /// `msi=off`.
     Off,
+    /// `its=off`, `VIRT_MSI_LEGACY_OPT_ITS_OFF`: the GICv2m with a GICv2, and no MSI
+    /// controller with a GICv3.
+    ItsOff,
+}
+
+/// The `gic-version` machine property, once `finalize_gic_version()` has made it a number.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VirtGicVersion {
+    /// `gic-version=2`.
+    V2,
+    /// `gic-version=3`. QEMU picks a GICv2 when the property is not given and there are at
+    /// most 8 CPUs; ruvm keeps the GICv3 it has always had.
+    #[default]
+    V3,
+}
+
+/// The GIC of a virt board.
+#[derive(Clone, Debug)]
+pub enum VirtGic {
+    /// A GICv2, with `gic-version=2`.
+    V2(Arc<GicV2>),
+    /// A GICv3.
+    V3(Arc<GicV3>),
+}
+
+impl VirtGic {
+    /// SPI `n`, interrupt `n + 32`.
+    pub fn spi(&self, n: u32) -> IrqLine {
+        match self {
+            VirtGic::V2(g) => g.spi(n),
+            VirtGic::V3(g) => g.spi(n),
+        }
+    }
+
+    /// The PPI with interrupt ID `n` of `cpu`.
+    pub fn ppi(&self, cpu: usize, n: u32) -> IrqLine {
+        match self {
+            VirtGic::V2(g) => g.ppi(cpu, n),
+            VirtGic::V3(g) => g.ppi(cpu, n),
+        }
+    }
+
+    /// The device reset.
+    pub fn reset(&self) {
+        match self {
+            VirtGic::V2(g) => g.reset(),
+            VirtGic::V3(g) => g.reset(),
+        }
+    }
 }
 
 /// The `iommu` machine property: the IOMMU in front of the PCIe root bus.
@@ -311,6 +378,8 @@ pub struct VirtConfig {
     pub highmem: Highmem,
     /// The `msi` property.
     pub msi: VirtMsi,
+    /// The `gic-version` property.
+    pub gic_version: VirtGicVersion,
     /// The `iommu` property.
     pub iommu: VirtIommu,
     /// `default-bus-bypass-iommu`: the root bus is not behind the IOMMU.
@@ -397,6 +466,7 @@ impl VirtConfig {
             mte: false,
             highmem: Highmem::default(),
             msi: VirtMsi::Auto,
+            gic_version: VirtGicVersion::V3,
             iommu: VirtIommu::None,
             default_bus_bypass_iommu: false,
             firmware: None,
@@ -555,7 +625,7 @@ pub(crate) fn create_pcie(
     mem: &Arc<MemorySystem>,
     system: RegionId,
     layout: &PcieLayout,
-    gic: &Arc<GicV3>,
+    spi: &dyn Fn(u32) -> IrqLine,
     memory_as: &Arc<AddressSpace>,
 ) -> Result<GpexHost, String> {
     let w = |e: MemMapEntry| GpexWindow { base: e.base, size: e.size };
@@ -589,7 +659,7 @@ pub(crate) fn create_pcie(
     for i in 0..PCI_NUM_PINS {
         let irq = layout.irq + i as u32;
         if let Some(pin) = gpex.irq(i) {
-            pin.connect(gic.spi(irq));
+            pin.connect(spi(irq));
         }
         gpex.set_irq_num(i, irq as i32).map_err(err)?;
     }
@@ -720,6 +790,23 @@ pub(crate) fn wire_cpu(gic: &Arc<GicV3>, arm: &Arc<Arm>, i: usize, shared: &Arc<
     gic.maintenance_irq(i).connect(gic.ppi(i, 16 + dt::ARCH_GIC_MAINT_IRQ));
 }
 
+/// Connect the IRQ and FIQ outputs of a GICv2 for CPU `i` to the vCPU `shared`. Without the
+/// virtualization extensions the GICv2 has no virtual outputs and no maintenance interrupt.
+fn wire_cpu_v2(gic: &Arc<GicV2>, arm: &Arc<Arm>, i: usize, shared: &Arc<CpuShared>) {
+    type SetLine = fn(&Arm, &CpuShared, bool);
+    let lines: [(&ruvm_hw_core::IrqPin, SetLine); 2] =
+        [(gic.cpu_irq(i), Arm::set_irq), (gic.cpu_fiq(i), Arm::set_fiq)];
+    for (pin, set) in lines {
+        let arm = Arc::downgrade(arm);
+        let cpu = Arc::downgrade(shared);
+        pin.connect(IrqLine::from_fn(move |level| {
+            if let (Some(a), Some(c)) = (arm.upgrade(), cpu.upgrade()) {
+                set(&a, &c, level != 0);
+            }
+        }));
+    }
+}
+
 /// `virt_cpu_mp_affinity()` for a GICv3: 16 CPUs per Aff1 cluster.
 pub fn virt_cpu_mp_affinity(idx: usize) -> u64 {
     let idx = idx as u64;
@@ -738,8 +825,9 @@ pub struct VirtMachine {
     memory_as: Arc<AddressSpace>,
     arm: Arc<Arm>,
     hub: Arc<CpuHub>,
-    gic: Arc<GicV3>,
+    gic: VirtGic,
     its: Option<Arc<GicV3Its>>,
+    v2m: bool,
     uart: Arc<Pl011>,
     uart1: Option<Arc<Pl011>>,
     flash: [Arc<Pflash>; 2],
@@ -822,12 +910,20 @@ impl VirtMachine {
         let ram_size = cfg.ram_size;
 
         let memmap = memmap::virt_set_memmap(VIRT_MEM, ram_size, model.pamax(), &cfg.highmem)?;
-        // finalize_msi_controller(): auto is the ITS with a GICv3.
-        let its_on = match cfg.msi {
-            VirtMsi::Auto | VirtMsi::Its => true,
-            VirtMsi::Off => false,
-            VirtMsi::Gicv2m => return Err("msi=gicv2m is not supported by ruvm yet".to_string()),
+        // finalize_msi_controller(): auto is the ITS with a GICv3 and the GICv2m with a GICv2.
+        let v2 = cfg.gic_version == VirtGicVersion::V2;
+        let msi = match cfg.msi {
+            VirtMsi::ItsOff if v2 => VirtMsi::Gicv2m,
+            VirtMsi::ItsOff => VirtMsi::Off,
+            VirtMsi::Auto if v2 => VirtMsi::Gicv2m,
+            VirtMsi::Auto => VirtMsi::Its,
+            m => m,
         };
+        if msi == VirtMsi::Its && v2 {
+            return Err("GICv2 + ITS is an invalid configuration.".to_string());
+        }
+        let its_on = msi == VirtMsi::Its;
+        let v2m_on = msi == VirtMsi::Gicv2m;
 
         let mem = Arc::new(MemorySystem::new());
         let system = mem.new_container("system", 1 << 64).map_err(err)?;
@@ -872,14 +968,14 @@ impl VirtMachine {
         // memory map.
         let redist2_capacity =
             memmap.high_redist2.map_or(0, |r| (r.size / GICV3_REDIST_SIZE) as usize);
-        let virt_max_cpus = VIRT_GICV3_MAX_CPUS + redist2_capacity;
+        let virt_max_cpus = if v2 { GIC_NCPU } else { VIRT_GICV3_MAX_CPUS + redist2_capacity };
         let max_cpus = cfg.max_cpus.unwrap_or(smp);
         if max_cpus > virt_max_cpus {
             let mut msg = format!(
                 "Number of SMP CPUs requested ({max_cpus}) exceeds max CPUs supported by \
                  machine 'mach-virt' ({virt_max_cpus})"
             );
-            if memmap.high_redist2.is_none() {
+            if !v2 && memmap.high_redist2.is_none() {
                 msg.push_str("\nTry 'highmem-redists=on' for more CPUs");
             }
             return Err(msg);
@@ -912,7 +1008,9 @@ impl VirtMachine {
         let mpidrs: Vec<u64> = (0..smp).map(virt_cpu_mp_affinity).collect();
         // ns_el2_virt_timer_present().
         let ns_el2_virt_timer_irq = model.features.el2 && model.features.vh;
-        dt::add_timer_nodes(&mut fdt, ns_el2_virt_timer_irq)?;
+        // With a GICv2 the PPI flags carry the mask of the CPUs.
+        let ppi_cpus = if v2 { Some(smp) } else { None };
+        dt::add_timer_nodes(&mut fdt, ns_el2_virt_timer_irq, ppi_cpus)?;
         let psci = vms_conduit != PsciConduit::Disabled;
         dt::add_cpu_nodes(&mut fdt, &model, &mpidrs, psci, &topology)?;
 
@@ -921,46 +1019,66 @@ impl VirtMachine {
 
         dt::virt_flash_fdt(&mut fdt, cfg.secure)?;
 
-        // create_gic(), with the second redistributor region when the CPUs do not fit in the
-        // first.
-        let redist0_count = smp.min(VIRT_GICV3_MAX_CPUS);
-        let redist2 = memmap.high_redist2.filter(|_| smp > VIRT_GICV3_MAX_CPUS);
-        let mut redist_region_count = vec![redist0_count as u32];
-        if redist2.is_some() {
-            redist_region_count.push((smp - redist0_count).min(redist2_capacity) as u32);
-        }
-        let gic = GicV3::with_sysmem(
-            GicV3Props {
+        // create_gic(): a GICv2 or a GICv3.
+        let (gic, redist2) = if v2 {
+            let gic = GicV2::new(GicV2Props {
                 num_cpu: smp,
                 num_irq: VIRT_GIC_NUM_IRQ,
-                revision: 3,
+                revision: 2,
                 security_extn: cfg.secure,
-                redist_region_count,
-                mp_affinity: mpidrs.clone(),
-                pribits: model.gic_pribits,
-                // The TCG ITS is on for every current machine version, so the GIC has LPIs
-                // even when msi=off leaves the ITS out.
-                has_lpi: true,
-            },
-            Some(&memory_as),
-        )?;
-        let r = mem.new_io("gicv3_dist", GICV3_DIST_SIZE.into(), gic.dist_ops()).map_err(err)?;
-        mem.add_subregion(system, VIRT_GIC_DIST, r).map_err(err)?;
-        let redist_bases = [Some(VIRT_GIC_REDIST), redist2.map(|r| r.base)];
-        for (i, base) in redist_bases.into_iter().enumerate() {
-            let Some(base) = base else { continue };
-            let name = format!("gicv3_redist_region[{i}]");
-            let r = mem
-                .new_io(&name, gic.redist_region_size(i).into(), gic.redist_ops(i))
-                .map_err(err)?;
-            mem.add_subregion(system, base, r).map_err(err)?;
-        }
-        let gic_phandle = dt::add_gic_node(&mut fdt, redist2, cfg.virtualization)?;
+                virt_extn: cfg.virtualization,
+                n_prio_bits: model.gic_pribits,
+            })?;
+            gic.set_current_cpu_fn(Some(Arc::new(ruvm_jit::cpu_exec::current_cpu_index)));
+            let r = mem.new_io("gic_dist", GICV2_DIST_SIZE.into(), gic.dist_ops()).map_err(err)?;
+            mem.add_subregion(system, VIRT_GIC_DIST, r).map_err(err)?;
+            let r = mem.new_io("gic_cpu", GICV2_CPU_SIZE.into(), gic.cpu_ops()).map_err(err)?;
+            mem.add_subregion(system, VIRT_GIC_CPU, r).map_err(err)?;
+            (VirtGic::V2(gic), None)
+        } else {
+            // create_gic(), with the second redistributor region when the CPUs do not fit in the
+            // first.
+            let redist0_count = smp.min(VIRT_GICV3_MAX_CPUS);
+            let redist2 = memmap.high_redist2.filter(|_| smp > VIRT_GICV3_MAX_CPUS);
+            let mut redist_region_count = vec![redist0_count as u32];
+            if redist2.is_some() {
+                redist_region_count.push((smp - redist0_count).min(redist2_capacity) as u32);
+            }
+            let gic = GicV3::with_sysmem(
+                GicV3Props {
+                    num_cpu: smp,
+                    num_irq: VIRT_GIC_NUM_IRQ,
+                    revision: 3,
+                    security_extn: cfg.secure,
+                    redist_region_count,
+                    mp_affinity: mpidrs.clone(),
+                    pribits: model.gic_pribits,
+                    // The TCG ITS is on for every current machine version, so the GIC has LPIs
+                    // even when msi=off leaves the ITS out.
+                    has_lpi: true,
+                },
+                Some(&memory_as),
+            )?;
+            let r =
+                mem.new_io("gicv3_dist", GICV3_DIST_SIZE.into(), gic.dist_ops()).map_err(err)?;
+            mem.add_subregion(system, VIRT_GIC_DIST, r).map_err(err)?;
+            let redist_bases = [Some(VIRT_GIC_REDIST), redist2.map(|r| r.base)];
+            for (i, base) in redist_bases.into_iter().enumerate() {
+                let Some(base) = base else { continue };
+                let name = format!("gicv3_redist_region[{i}]");
+                let r = mem
+                    .new_io(&name, gic.redist_region_size(i).into(), gic.redist_ops(i))
+                    .map_err(err)?;
+                mem.add_subregion(system, base, r).map_err(err)?;
+            }
+            (VirtGic::V3(gic), redist2)
+        };
+        let gic_phandle = dt::add_gic_node(&mut fdt, v2, redist2, cfg.virtualization)?;
 
         // create_msi_controller(): the ITS, its control frame and then its translation frame
         // in one container.
-        let (its, msi_phandle) = if its_on {
-            let its = GicV3Its::new(&gic)?;
+        let (its, msi_phandle) = if let (true, VirtGic::V3(g)) = (its_on, &gic) {
+            let its = GicV3Its::new(g)?;
             let main = mem.new_container("gicv3_its", ITS_SIZE.into()).map_err(err)?;
             let r =
                 mem.new_io("control", ITS_CONTROL_SIZE.into(), its.control_ops()).map_err(err)?;
@@ -971,11 +1089,17 @@ impl VirtMachine {
             mem.add_subregion(main, ITS_CONTROL_SIZE, r).map_err(err)?;
             mem.add_subregion(system, VIRT_GIC_ITS, main).map_err(err)?;
             (Some(its), Some(dt::add_its_node(&mut fdt)?))
+        } else if v2m_on {
+            let gic = gic.clone();
+            let v2m = GicV2m::new(VIRT_GIC_V2M_IRQ, NUM_GICV2M_SPIS, move |n| gic.spi(n))?;
+            let r = mem.new_io("gicv2m", GICV2M_SIZE.into(), Arc::new(v2m)).map_err(err)?;
+            mem.add_subregion(system, VIRT_GIC_V2M, r).map_err(err)?;
+            (None, Some(dt::add_v2m_node(&mut fdt)?))
         } else {
             (None, None)
         };
         if model.features.pmu != 0 {
-            dt::add_pmu_node(&mut fdt)?;
+            dt::add_pmu_node(&mut fdt, ppi_cpus)?;
         }
 
         // arm_load_kernel(), which decides the PSCI conduit the CPUs are created with.
@@ -1004,13 +1128,13 @@ impl VirtMachine {
         let clock = cfg.clock.unwrap_or_else(|| {
             Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()))
         });
-        let hub = Arc::new(CpuHub::new(&gic, mpidrs.clone(), clock.clone()));
+        let hub = Arc::new(CpuHub::new(|cpu, n| gic.ppi(cpu, n), mpidrs.clone(), clock.clone()));
         let heap = Arc::new(Mutex::new((0, 0)));
         let cmdline = cfg.append.clone().unwrap_or_default();
-        let mut arm = Arm::new(model.clone())
-            .with_psci(conduit)
-            .with_board(hub.clone())
-            .with_gicv3(Arc::new(GicCpuIf(gic.clone())));
+        let mut arm = Arm::new(model.clone()).with_psci(conduit).with_board(hub.clone());
+        if let VirtGic::V3(g) = &gic {
+            arm = arm.with_gicv3(Arc::new(GicCpuIf(g.clone())));
+        }
         if cfg.mte {
             // The tags of the RAM, one byte per two 16-byte granules, as the
             // "mach-virt.tag" RAM is at VIRT_MEM / 32 of the tag address space.
@@ -1082,7 +1206,7 @@ impl VirtMachine {
             pio: MemMapEntry { base: VIRT_PCIE_PIO, size: VIRT_PCIE_PIO_SIZE },
             irq: VIRT_PCIE_IRQ,
         };
-        let gpex = create_pcie(&mem, system, &layout, &gic, &memory_as)?;
+        let gpex = create_pcie(&mem, system, &layout, &|n| gic.spi(n), &memory_as)?;
         dt::create_pcie(&mut fdt, &memmap, gic_phandle, msi_phandle, VIRT_PCIE_IRQ)?;
         // create_smmu(), with the stage property set to nested as on every virt version that
         // has the SMMU. It reads its tables from system memory, and the functions on the root
@@ -1194,8 +1318,9 @@ impl VirtMachine {
         let pbus = mem.new_container("platform bus", VIRT_PLATFORM_BUS_SIZE.into()).map_err(err)?;
         mem.add_subregion(system, VIRT_PLATFORM_BUS, pbus).map_err(err)?;
 
-        if info.is_linux {
-            gic.arm_linux_init(false);
+        // A GICv2 without the security extensions has nothing to set up for Linux.
+        if let (true, VirtGic::V3(g)) = (info.is_linux, &gic) {
+            g.arm_linux_init(false);
         }
 
         let uart1_ns = !cfg.secure && uart1.is_some();
@@ -1212,6 +1337,7 @@ impl VirtMachine {
             hub,
             gic,
             its,
+            v2m: v2m_on,
             uart,
             uart1,
             flash: [flash0, flash1],
@@ -1351,6 +1477,16 @@ impl VirtMachine {
                 gic_redist: w(VIRT_GIC_REDIST, VIRT_GIC_REDIST_SIZE),
                 gic_redist2: self.redist2.map(e),
                 gic_its: self.its.as_ref().map(|_| VIRT_GIC_ITS),
+                gic_v2: matches!(self.gic, VirtGic::V2(_)).then_some(GicV2Bases {
+                    cpu: VIRT_GIC_CPU,
+                    vcpu: VIRT_GIC_VCPU,
+                    hyp: VIRT_GIC_HYP,
+                }),
+                gic_v2m: self.v2m.then_some(GicV2mFrame {
+                    base: VIRT_GIC_V2M,
+                    spi_base: (VIRT_GIC_V2M_IRQ + ARM_SPI_BASE) as u16,
+                    spi_count: NUM_GICV2M_SPIS as u16,
+                }),
                 acpi_ged: VIRT_ACPI_GED,
                 gpio: w(VIRT_GPIO, VIRT_GPIO_SIZE),
                 mem: VIRT_MEM,
@@ -1546,7 +1682,10 @@ impl VirtMachine {
             if shared.cpu_index != i {
                 return Err(format!("vCPU {i} got index {}", shared.cpu_index));
             }
-            wire_cpu(&self.gic, &self.arm, i, &shared);
+            match &self.gic {
+                VirtGic::V2(g) => wire_cpu_v2(g, &self.arm, i, &shared),
+                VirtGic::V3(g) => wire_cpu(g, &self.arm, i, &shared),
+            }
             self.hub.register(i, &shared);
             self.reset_cpu(&mut v.cpu());
             vcpus.push(v);
@@ -1622,7 +1761,7 @@ impl VirtMachine {
     }
 
     /// The GIC.
-    pub fn gic(&self) -> &Arc<GicV3> {
+    pub fn gic(&self) -> &VirtGic {
         &self.gic
     }
 

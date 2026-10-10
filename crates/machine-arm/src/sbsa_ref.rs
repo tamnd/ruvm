@@ -536,7 +536,7 @@ impl SbsaRefMachine {
         let clock = cfg.clock.unwrap_or_else(|| {
             Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()))
         });
-        let hub = Arc::new(CpuHub::new(&gic, mpidrs.clone(), clock.clone()));
+        let hub = Arc::new(CpuHub::new(|cpu, n| gic.ppi(cpu, n), mpidrs.clone(), clock.clone()));
         let arm = Arc::new(
             Arm::new(model.clone())
                 .with_psci(PsciConduit::Disabled)
@@ -637,7 +637,7 @@ impl SbsaRefMachine {
             pio: MemMapEntry { base: SBSA_PCIE_PIO, size: SBSA_PCIE_PIO_SIZE },
             irq: SBSA_PCIE_IRQ,
         };
-        let gpex = create_pcie(&mem, system, &layout, &gic, &memory_as)?;
+        let gpex = create_pcie(&mem, system, &layout, &|n| gic.spi(n), &memory_as)?;
         let irqs = std::array::from_fn(|i| gic.spi(SBSA_SMMU_IRQ + i as u32));
         let smmu = SmmuV3::new(SmmuStage::Nested, &memory_as, irqs);
         let r = mem.new_io("smmuv3", SMMU_SIZE.into(), smmu.mmio_ops()).map_err(err)?;

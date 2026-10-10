@@ -62,6 +62,17 @@ dump_its virt-a57-smmuv3 -cpu cortex-a57,pmu=off -M iommu=smmuv3
 dump_its virt-a57-smmuv3-bypass -cpu cortex-a57,pmu=off \
     -M iommu=smmuv3,default-bus-bypass-iommu=on
 
+# gic-version=2: the cortex-a15-gic node, the GICv2m frame under it with msi=auto and the CPU
+# mask in the PPI flags.
+dump_v2() {
+    local name=$1
+    shift
+    "$QEMU" -nodefaults -display none -M "virt,gic-version=2,dtb-randomness=off,dumpdtb=$TMP/$name.dtb" "$@"
+    gzip -9n -c "$TMP/$name.dtb" > "$name.dtb.gz"
+}
+dump_v2 virt-a57-smp2-gicv2 -cpu cortex-a57,pmu=off -smp 2
+dump_v2 virt-a57-smp8-gicv2-msi-off -cpu cortex-a57,pmu=off -smp 8 -M msi=off
+
 # A user -dtb: QEMU drops its memory nodes and /psci and adds its own.
 dtc -q -I dts -O dtb -o "$TMP/user.dtb" user.dts
 cp "$TMP/user.dtb" user.dtb

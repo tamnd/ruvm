@@ -9,8 +9,8 @@
 mod common;
 
 use ruvm_firmware::acpi::arm_virt::{
-    self, ArmVirtAcpi, IortSmmu, NumaNode, PossibleCpu, PsciConduit, VIRTUAL_PMU_IRQ, VirtIrqs,
-    VirtMemmap,
+    self, ArmVirtAcpi, GicV2Bases, GicV2mFrame, IortSmmu, NumaNode, PossibleCpu, PsciConduit,
+    VIRTUAL_PMU_IRQ, VirtIrqs, VirtMemmap,
 };
 use ruvm_firmware::acpi::gpex::Window;
 use ruvm_firmware::acpi::linker::Command;
@@ -46,6 +46,8 @@ fn base() -> ArmVirtAcpi {
             gic_redist: w(0x080a_0000, 0x00f6_0000),
             gic_redist2: None,
             gic_its: Some(0x0808_0000),
+            gic_v2: None,
+            gic_v2m: None,
             acpi_ged: 0x0908_0000,
             gpio: w(0x0903_0000, 0x1000),
             mem: 0x4000_0000,
@@ -284,6 +286,30 @@ fn madt_and_iort_with_its() {
     let map = &rc[36..];
     let r = |o: usize| u32::from_le_bytes(map[o..o + 4].try_into().unwrap());
     assert_eq!([r(0), r(4), r(8), r(12), r(16)], [0, 0xffff, 0, 48, 0]);
+}
+
+/// The `gic-version=2` MADT: a version 2 distributor, the CPU interface bases in each GICC,
+/// no GICR or ITS, and the GICv2m frame.
+#[test]
+fn madt_gicv2_with_v2m() {
+    let mut m = base();
+    m.mpidrs = vec![0, 1];
+    m.possible_cpus = arm_virt::possible_cpus(1, 1, 2, 1);
+    m.memmap.gic_its = None;
+    m.memmap.gic_v2 = Some(GicV2Bases { cpu: 0x0801_0000, vcpu: 0x0804_0000, hyp: 0x0803_0000 });
+    m.memmap.gic_v2m = Some(GicV2mFrame { base: 0x0802_0000, spi_base: 80, spi_count: 64 });
+    let tables = load(&arm_virt::build(&m));
+    let apic = common::table(&tables, "APIC");
+    assert_eq!(apic.len(), 44 + 24 + 2 * 80 + 24);
+    assert_eq!(apic[44 + 20], 2, "GIC version");
+    let gicc1 = &apic[44 + 24 + 80..44 + 24 + 160];
+    let q = |o: usize| u64::from_le_bytes(gicc1[o..o + 8].try_into().unwrap());
+    assert_eq!([q(32), q(40), q(48)], [0x0801_0000, 0x0804_0000, 0x0803_0000]);
+    assert_eq!(q(60), 0, "no GICR base");
+    let frame = &apic[apic.len() - 24..];
+    assert_eq!(frame[..8], [0xD, 24, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(u64::from_le_bytes(frame[8..16].try_into().unwrap()), 0x0802_0000);
+    assert_eq!(frame[16..], [1, 0, 0, 0, 64, 0, 80, 0]);
 }
 
 /// The `smmuv3-legacy` test: `iommu=smmuv3` with a GICv2, so no ITS, and three host bridges,

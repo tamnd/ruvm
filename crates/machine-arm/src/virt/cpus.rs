@@ -70,9 +70,13 @@ impl fmt::Debug for CpuHub {
 }
 
 impl CpuHub {
-    pub(crate) fn new(gic: &Arc<GicV3>, mpidrs: Vec<u64>, clock: Arc<Clock>) -> CpuHub {
-        let ppis = (0..mpidrs.len()).map(|cpu| TIMER_PPIS.map(|ppi| gic.ppi(cpu, ppi))).collect();
-        let pmu_ppis = (0..mpidrs.len()).map(|cpu| gic.ppi(cpu, PMU_PPI)).collect();
+    pub(crate) fn new(
+        ppi: impl Fn(usize, u32) -> IrqLine,
+        mpidrs: Vec<u64>,
+        clock: Arc<Clock>,
+    ) -> CpuHub {
+        let ppis = (0..mpidrs.len()).map(|cpu| TIMER_PPIS.map(|n| ppi(cpu, n))).collect();
+        let pmu_ppis = (0..mpidrs.len()).map(|cpu| ppi(cpu, PMU_PPI)).collect();
         let slots = (0..mpidrs.len())
             .map(|_| CpuSlot { shared: Weak::new(), timers: Default::default(), pmu_timer: None })
             .collect();
