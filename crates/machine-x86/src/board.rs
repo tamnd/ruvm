@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read;
 use std::sync::Arc;
 
 use ruvm_firmware::smbios::{SmbiosOptions, SmbiosTopology};
@@ -470,17 +471,19 @@ fn strerror(e: &std::io::Error) -> String {
     }
 }
 
-/// Reads the `-kernel` and `-initrd` files. The errors are those of `x86_load_linux()`.
+/// Reads the `-kernel` and `-initrd` files. The errors are those of `x86_load_linux()`, which
+/// opens the kernel with `fopen()` and maps the initrd with `g_mapped_file_new()`.
 pub fn load_kernel(files: &KernelFiles) -> Result<KernelConfig, String> {
-    let data = std::fs::read(&files.kernel)
-        .map_err(|e| format!("qemu: could not load kernel '{}': {}", files.kernel, strerror(&e)))?;
+    let k = &files.kernel;
+    let mut file = std::fs::File::open(k)
+        .map_err(|e| format!("qemu: could not open kernel file '{k}': {}", strerror(&e)))?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .map_err(|e| format!("qemu: could not load kernel '{k}': {}", strerror(&e)))?;
     let initrd = match &files.initrd {
-        Some(f) => Some(std::fs::read(f).map_err(|e| {
-            format!(
-                "qemu: error reading initrd {f}: Failed to open file \u{201c}{f}\u{201d}: {}",
-                strerror(&e)
-            )
-        })?),
+        Some(f) => {
+            Some(read_initrd(f).map_err(|e| format!("qemu: error reading initrd {f}: {e}"))?)
+        }
         None => None,
     };
     Ok(KernelConfig {
@@ -490,6 +493,22 @@ pub fn load_kernel(files: &KernelFiles) -> Result<KernelConfig, String> {
         initrd,
         ..KernelConfig::default()
     })
+}
+
+/// Reads the `-initrd` file, failing with the messages of `g_mapped_file_new()`.
+fn read_initrd(f: &str) -> Result<Vec<u8>, String> {
+    let mut file = std::fs::File::open(f).map_err(|e| {
+        format!("Failed to open file \u{201c}{f}\u{201d}: open() failed: {}", strerror(&e))
+    })?;
+    let mut data = Vec::new();
+    match file.read_to_end(&mut data) {
+        Ok(_) => Ok(data),
+        // GLib maps the file, and mmap() of a directory fails with ENODEV.
+        Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => {
+            Err(format!("Failed to map {f}' {f}': mmap() failed: No such device"))
+        }
+        Err(e) => Err(format!("Failed to map {f}' {f}': mmap() failed: {}", strerror(&e))),
+    }
 }
 
 /// Builds the board `spec` describes, with its firmware, option ROMs and kernel loaded. The
