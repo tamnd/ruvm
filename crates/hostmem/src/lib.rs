@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::region::RegionObjects;
 use ruvm_base::{Error, Result};
 use ruvm_mem::RegionId;
-use ruvm_qapi::types::HostMemPolicy;
+use ruvm_qapi::types::{HostMemPolicy, Memdev};
 use ruvm_qapi::visit::VisitorExt;
 use ruvm_qom::{
     BoolGetter, BoolSetter, EnumGetter, EnumSetter, LinkFlags, LinkSlot, Object, Property,
@@ -63,6 +63,36 @@ fn backend(obj: &Object) -> Arc<Backend> {
 /// `host_memory_backend_mr_inited()`.
 fn mr_inited(b: &Backend) -> bool {
     lock(&b.region).is_some()
+}
+
+/// `qmp_query_memdev()`: the memory backends under `/objects`. QEMU prepends each to the
+/// list, so the newest comes first.
+pub fn query_memdev(registry: &Registry) -> Vec<Memdev> {
+    let mut out = Vec::new();
+    registry.objects_root().child_foreach(|obj| {
+        let Some(b) = obj.dynamic_cast(TYPE_MEMORY_BACKEND).and_then(|o| o.state::<Backend>())
+        else {
+            return 0;
+        };
+        out.push(Memdev {
+            id: obj.canonical_path_component(),
+            size: b.size.load(Ordering::Acquire),
+            merge: b.merge.load(Ordering::Acquire),
+            dump: b.dump.load(Ordering::Acquire),
+            prealloc: b.prealloc.load(Ordering::Acquire),
+            share: b.share.load(Ordering::Acquire),
+            // The property only exists on Linux, as in QEMU.
+            reserve: cfg!(target_os = "linux").then(|| b.reserve.load(Ordering::Acquire)),
+            host_nodes: Vec::new(),
+            policy: HostMemPolicy::ALL
+                .get(b.policy.load(Ordering::Acquire))
+                .copied()
+                .unwrap_or_default(),
+        });
+        0
+    });
+    out.reverse();
+    out
 }
 
 /// The RAM region of a completed backend, `host_memory_backend_get_memory()`.

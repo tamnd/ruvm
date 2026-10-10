@@ -891,6 +891,8 @@ impl Migration {
         if !s.has_block_bitmap_mapping {
             p.block_bitmap_mapping = None;
         }
+        // migrate_mark_all_params_present() leaves the unset command an empty list.
+        p.cpr_exec_command.get_or_insert_with(Vec::new);
         p
     }
 

@@ -428,6 +428,33 @@ mod sockets {
         for name in ["none", "microvm", "pc-q35-11.0", "pc-q35-10.2"] {
             assert!(machines.contains(&format!(r#""name": "{name}""#)), "{machines}");
         }
+        // The queries qmp-cmd-test runs on machine none, with QEMU's answers.
+        for (c, want) in [
+            ("query-target", r#"{"return": {"arch": "x86_64"}}"#),
+            ("query-uuid", r#"{"return": {"UUID": "00000000-0000-0000-0000-000000000000"}}"#),
+            (
+                "query-yank",
+                r#"{"return": [{"type": "chardev", "id": "char0"}, {"type": "chardev", "id": "qtest"}]}"#,
+            ),
+            ("query-memory-size-summary", r#"{"return": {"base-memory": 0, "plugged-memory": 0}}"#),
+            ("query-current-machine", r#"{"return": {"wakeup-suspend-support": false}}"#),
+            ("query-replay", r#"{"return": {"icount": 0, "mode": "none"}}"#),
+            ("query-memdev", r#"{"return": []}"#),
+            (
+                "query-hotpluggable-cpus",
+                r#"{"error": {"class": "GenericError", "desc": "machine does not support hot-plugging CPUs"}}"#,
+            ),
+            (
+                "query-balloon",
+                r#"{"error": {"class": "DeviceNotActive", "desc": "No balloon device has been activated"}}"#,
+            ),
+        ] {
+            assert_eq!(qmp.cmd(&format!(r#"{{"execute": "{c}"}}"#)), want, "{c}");
+        }
+        let accels = qmp.cmd(r#"{"execute": "query-accelerators"}"#);
+        assert!(accels.contains(r#""enabled": "qtest""#), "{accels}");
+        let params = qmp.cmd(r#"{"execute": "query-migrate-parameters"}"#);
+        assert!(params.contains(r#""cpr-exec-command": []"#), "{params}");
 
         qtest.write_all(b"readb 0x1000\ninl 0x60\nclock_step 100\nclock_step\n").unwrap();
         // Machine none has no timers, so there is no deadline to step to.

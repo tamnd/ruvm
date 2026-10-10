@@ -272,6 +272,14 @@ pub(crate) fn set_qemu_uuid(uuid: Option<[u8; 16]>) {
     *QEMU_UUID.lock().unwrap_or_else(PoisonError::into_inner) = uuid;
 }
 
+/// `qemu_uuid` as `qemu_uuid_unparse()` writes it, all zeros when none was given.
+pub(crate) fn qemu_uuid_string() -> String {
+    let u = QEMU_UUID.lock().unwrap_or_else(PoisonError::into_inner).unwrap_or_default();
+    let hex =
+        |r: std::ops::Range<usize>| u[r].iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!("{}-{}-{}-{}-{}", hex(0..4), hex(4..6), hex(6..8), hex(8..10), hex(10..16))
+}
+
 /// What the main thread runs instead of the machine's main loop, which then moves to another
 /// thread: `qemu_main` of QEMU, which Cocoa sets.
 static UI_MAIN: Mutex<Option<fn() -> !>> = Mutex::new(None);

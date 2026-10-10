@@ -72,16 +72,8 @@ fn register_migration(vm: &Arc<Vm>, cmds: &mut Commands) {
         migration(&v)?.set_capabilities(&arg.capabilities)
     });
     let v = vm.clone();
-    register_query_migrate_capabilities(cmds, move |_: &MonitorQmp| {
-        Ok(migration(&v)?.query_capabilities())
-    });
-    let v = vm.clone();
     register_migrate_set_parameters(cmds, move |_: &MonitorQmp, params| {
         migration(&v)?.set_parameters(&params)
-    });
-    let v = vm.clone();
-    register_query_migrate_parameters(cmds, move |_: &MonitorQmp| {
-        Ok(migration(&v)?.query_parameters())
     });
     let v = vm.clone();
     register_migrate_cancel(cmds, move |_: &MonitorQmp| match v.migration.get() {
@@ -101,6 +93,7 @@ fn register_migration(vm: &Arc<Vm>, cmds: &mut Commands) {
 pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
     crate::audio::register(cmds);
     crate::display::register(cmds);
+    crate::info::register(vm, target, cmds);
     let v = vm.clone();
     register_query_status(cmds, move |_: &MonitorQmp| Ok(v.runstate.status()));
     let v = vm.clone();
