@@ -36,6 +36,7 @@ enum Cmd {
     InfoSnapshots,
     InfoStatus,
     InfoName,
+    InfoNetwork,
     InfoUuid,
 }
 
@@ -97,6 +98,7 @@ const HMP_CMDS: &[HmpCommand] = &[
 const INFO_CMDS: &[HmpCommand] = &[
     command("kvm", Args::None, "", "show KVM information", Cmd::InfoKvm),
     command("name", Args::None, "", "show the current VM name", Cmd::InfoName),
+    command("network", Args::None, "", "show the network state", Cmd::InfoNetwork),
     command(
         "snapshots",
         Args::None,
@@ -509,6 +511,9 @@ fn hmp(vm: &Vm, kvm_present: bool, cmdline: &str) -> String {
             return out;
         }
         Cmd::InfoName => return vm.name.as_ref().map(|n| format!("{n}\n")).unwrap_or_default(),
+        Cmd::InfoNetwork => {
+            return vm.network.get().map(|n| n.info_network()).unwrap_or_default();
+        }
         Cmd::InfoUuid => return format!("{}\n", crate::display::qemu_uuid_string()),
     };
     // hmp_handle_error()

@@ -116,6 +116,11 @@ impl Network {
         lock(&self.net).check_clients();
     }
 
+    /// `hmp_info_network()`.
+    pub(crate) fn info_network(&self) -> String {
+        lock(&self.net).info_network()
+    }
+
     /// `net_vm_change_state_handler()`: a stopped VM sends and takes nothing.
     pub(crate) fn vm_state_change(&self, running: bool) {
         lock(&self.net).vm_state_change(running);

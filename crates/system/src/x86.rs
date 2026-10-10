@@ -1814,6 +1814,7 @@ fn build(
             .map_err(|e| one(Located::new(&d.loc, e)))?;
     }
     let net = Arc::new(Network::new(&cmd.netdevs, &clock).map_err(one)?);
+    let _ = vm.network.set(Arc::clone(&net));
     ruvm_audio::registry::attach_clock(&clock);
     crate::audio::realize_isa_dma(&board, &clock).map_err(|e| one(Located(None, e)))?;
     crate::audio::realize_pcspk(&board, opts.pcspk_audiodev.as_deref())
