@@ -126,10 +126,10 @@ Device crates. Each holds a family and depends on `ruvm-hw-core`, `ruvm-mem`, `r
 | ruvm-hw-char | 16550, pl011, board UARTs, parallel port, virtio independent console glue. |
 | ruvm-hw-display | VGA family, cirrus, bochs-display, ramfb, QXL, board framebuffers, EDID generation. |
 | ruvm-hw-audio | HDA codec and controller, AC97, SB16, ES1370, Gravis, board audio. |
-| ruvm-hw-input | PS/2, i8042, virtio independent HID glue, board keypads and touch controllers. |
+| ruvm-hw-input | PS/2, i8042, the virtio keyboard, mouse, tablet and multitouch, virtio independent HID glue, board keypads and touch controllers. |
 | ruvm-hw-net | e1000, e1000e, igb, rtl8139, pcnet, ne2000, vmxnet3, board NICs. |
 | ruvm-hw-storage | IDE and AHCI, LSI53C895A, megasas, mptsas, NVMe including ZNS and SR-IOV, SD and eMMC, UFS, floppy, SCSI core and SCSI disk and cd. |
-| ruvm-hw-virtio | Every virtio device and transport except virtio-gpu (in ruvm-hw-display) and virtio-snd (in ruvm-hw-audio), built on ruvm-virtio-queue and ruvm-vhost. |
+| ruvm-hw-virtio | Every virtio device and transport except virtio-gpu (in ruvm-hw-display), virtio-snd (in ruvm-hw-audio) and the virtio input devices (in ruvm-hw-input), built on ruvm-virtio-queue and ruvm-vhost. |
 | ruvm-vhost-backends | vhost-user backends ruvm ships as separate processes (blk, scsi, gpu, input, a net bridge for tests, vsock, rng, snd, rtc), reusing the in-process device models. gpio, i2c, spi, scmi and CAN backends are left to rust-vmm's vhost-device project (document 13). |
 | ruvm-hw-vfio | VFIO PCI, platform, AP and CCW, legacy container and iommufd backends, the quirk tables, vfio-user client. |
 | ruvm-hw-iommu | intel-iommu, amd-iommu, smmuv3, virtio-iommu, riscv-iommu. |
