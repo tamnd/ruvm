@@ -127,7 +127,7 @@ aes = "0.8.4"
 alsa = "0.12.1"
 arc-swap = "1.9.2"
 cast5 = "0.11.1"
-cipher = "0.4.4"
+cipher = "0.5.2"
 des = "0.8.1"
 digest = "0.10.7"
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
