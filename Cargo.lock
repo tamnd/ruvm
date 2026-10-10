@@ -1374,6 +1374,10 @@ dependencies = [
 [[package]]
 name = "ruvm-accel-whpx"
 version = "0.5.3"
+dependencies = [
+ "ruvm-mem",
+ "windows-sys",
+]
 
 [[package]]
 name = "ruvm-accel-xen"
