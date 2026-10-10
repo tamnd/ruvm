@@ -105,10 +105,12 @@ fn tap_device_as_root() {
     nc.set_vnet_hdr_len(ruvm_net::VNET_HDR_MRG_RXBUF_LEN);
     assert_eq!(nc.vnet_hdr_len(), ruvm_net::VNET_HDR_MRG_RXBUF_LEN);
     let (nic, _rec) = attach_nic(&mut net, "t0");
-    // The device is down, so the frame goes nowhere, but the write has to work.
+    // The device is down, so the frame goes nowhere. Some kernels take the write and drop it,
+    // others refuse it with EIO, and QEMU passes either result up as it is.
     let mut f = vec![0u8; ruvm_net::VNET_HDR_MRG_RXBUF_LEN];
     f.extend_from_slice(&frame(1, 64));
-    assert!(nic.queue().send_packet(&f) >= 0);
+    let r = nic.queue().send_packet(&f);
+    assert!(r >= 0 || r == -5, "{r}");
     net.cleanup();
     net.del_nic(&nic);
 
