@@ -34,6 +34,8 @@ ui-dbus = []
 audio-alsa = []
 # The types of -audiodev pa.
 audio-pa = []
+# The types of -audiodev pipewire.
+audio-pipewire = []
 # The types and commands of -display cocoa, which are there only on macOS.
 ui-cocoa = []
 

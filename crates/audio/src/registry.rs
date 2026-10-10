@@ -23,6 +23,8 @@ use crate::none::NoneDriver;
 #[cfg(feature = "audio-pa")]
 use crate::pa::PaDriver;
 use crate::pcm::{Driver, Pdo};
+#[cfg(feature = "audio-pipewire")]
+use crate::pipewire::PwDriver;
 use crate::wav::WavDriver;
 
 /// `audio_prio_list`: the drivers a default audiodev is tried with, in order. QEMU builds it
@@ -68,6 +70,8 @@ fn driver_for(driver: AudiodevDriver) -> Option<Box<dyn Driver>> {
         AudiodevDriver::Alsa => Some(Box::new(AlsaDriver)),
         #[cfg(feature = "audio-pa")]
         AudiodevDriver::Pa => Some(Box::new(PaDriver::default())),
+        #[cfg(feature = "audio-pipewire")]
+        AudiodevDriver::Pipewire => Some(Box::new(PwDriver::default())),
     }
 }
 
@@ -123,6 +127,8 @@ macro_rules! per_direction {
 per_direction!(ruvm_qapi::types::AudiodevAlsaPerDirectionOptions);
 #[cfg(feature = "audio-pa")]
 per_direction!(ruvm_qapi::types::AudiodevPaPerDirectionOptions);
+#[cfg(feature = "audio-pipewire")]
+per_direction!(ruvm_qapi::types::AudiodevPipewirePerDirectionOptions);
 
 /// The base `in` and `out` options of an audiodev, whatever its driver.
 fn pdos(
@@ -143,6 +149,8 @@ fn pdos(
         AudiodevU::Alsa(o) => base(&o.in_, &o.out),
         #[cfg(feature = "audio-pa")]
         AudiodevU::Pa(o) => base(&o.in_, &o.out),
+        #[cfg(feature = "audio-pipewire")]
+        AudiodevU::Pipewire(o) => base(&o.in_, &o.out),
     }
 }
 
@@ -187,6 +195,8 @@ pub fn validate_opts(dev: &mut Audiodev) -> Result<()> {
         AudiodevU::Alsa(o) => validate(&mut o.in_, &mut o.out)?,
         #[cfg(feature = "audio-pa")]
         AudiodevU::Pa(o) => validate(&mut o.in_, &mut o.out)?,
+        #[cfg(feature = "audio-pipewire")]
+        AudiodevU::Pipewire(o) => validate(&mut o.in_, &mut o.out)?,
     }
     dev.timer_period.get_or_insert(10000);
     Ok(())

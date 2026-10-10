@@ -7,7 +7,8 @@
 //! and resampler ([`mixeng`]), the layer host drivers plug into ([`pcm`]) and the drivers
 //! themselves. The `none` driver plays nothing and records silence, and the `wav` driver writes
 //! what the guest plays to a file, which is how the sound cards are checked against QEMU. The
-//! host drivers sit behind cargo features: `audio-alsa` adds `alsa` and `audio-pa` adds `pa`.
+//! host drivers sit behind cargo features: `audio-alsa` adds `alsa`, `audio-pa` adds `pa` and
+//! `audio-pipewire` adds `pipewire`.
 
 #![forbid(unsafe_code)]
 
@@ -20,6 +21,8 @@ pub mod none;
 #[cfg(feature = "audio-pa")]
 pub mod pa;
 pub mod pcm;
+#[cfg(feature = "audio-pipewire")]
+pub mod pipewire;
 pub mod registry;
 pub mod wav;
 
