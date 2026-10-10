@@ -11,9 +11,11 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 44
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
+ruvm-mem.workspace = true
+windows-sys.workspace = true
 
 [lints]
 workspace = true
