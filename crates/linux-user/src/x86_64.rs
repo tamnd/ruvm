@@ -674,6 +674,7 @@ pub(crate) static GUEST: Guest = Guest {
     minsigstksz: 2048,
     env_size: env::ENV_SIZE,
     generic_abi: false,
+    sa_restorer: true,
     open_flags: &[],
     cpuinfo: None,
     sp: |cpu| reg(cpu, R_ESP),

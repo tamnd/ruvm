@@ -965,6 +965,7 @@ pub(crate) static GUEST: Guest = Guest {
     minsigstksz: 2048,
     env_size: ENV_SIZE,
     generic_abi: true,
+    sa_restorer: true,
     // O_DIRECTORY, O_NOFOLLOW, O_DIRECT and O_LARGEFILE.
     open_flags: &[
         (0o40000, 0o200000),
