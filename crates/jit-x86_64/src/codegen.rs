@@ -43,11 +43,13 @@
 //! - Helper calls, guest memory accesses and `divs2`/`divu2` go through the service routine,
 //!   with every argument in memory, instead of the host calling convention. Only the TLB miss
 //!   path of a `qemu_ld` or `qemu_st` does: with [`GenOptions::tlb_page_bits`] the lookup is
-//!   inlined as in QEMU, except for byte swapped accesses and 128-bit accesses that must be
-//!   atomic as a whole, which always take the slow path (QEMU inlines those too). A 128-bit
-//!   access is inlined as two 64-bit host accesses when its halves need only be atomic each
-//!   (`MO_ATOM_IFALIGN_PAIR`, such as an aarch64 `ldp` or `stp` of two X registers) or not at
-//!   all.
+//!   inlined as in QEMU, except for byte swapped accesses, which always take the slow path
+//!   (QEMU inlines those too). A 128-bit access is inlined as two 64-bit host accesses when its
+//!   halves need only be atomic each (`MO_ATOM_IFALIGN_PAIR`, such as an aarch64 `ldp` or
+//!   `stp` of two X registers) or not at all. One that must be atomic as a whole when aligned
+//!   (`MO_ATOM_IFALIGN`, such as an x86 `movdqu` on a CPU with AVX) is inlined as one
+//!   `vmovdqa` or `vmovdqu` through `VT0` when the host makes those atomic, as QEMU does, and
+//!   takes the slow path otherwise.
 //! - `insn_start` emits no code. Each service request carries the index of the `insn_start`
 //!   of its instruction, fixed when the block is compiled, and each exit stores it in the run
 //!   context, instead of QEMU's table of host code offsets next to the code; the runtime
@@ -622,6 +624,13 @@ fn vexl(ty: Type) -> u32 {
     if ty == Type::V256 { P_VEXL } else { 0 }
 }
 
+/// Whether a 128-bit `qemu_ld` or `qemu_st` must be atomic as more than two halves, so that
+/// two 64-bit host accesses cannot make it.
+fn atomic16(oi: MemOpIdx) -> bool {
+    let atom = oi.memop().0 & MemOp::ATOM_MASK.0;
+    atom != MemOp::ATOM_IFALIGN_PAIR.0 && atom != MemOp::ATOM_NONE.0
+}
+
 fn is_vec_reg(r: Reg) -> bool {
     r >= 16
 }
@@ -976,8 +985,8 @@ impl Gen<'_> {
     /// it falls through with the entry's addend in `TMP1`, so the access is at `(addr, TMP1)`
     /// for the returned address register; on a miss it jumps to the returned label. `None`
     /// when the access always takes the slow path: no TLB to read, a byte swapped access, a
-    /// 128-bit access that two 64-bit host accesses cannot make, or an alignment the compare
-    /// cannot check.
+    /// 128-bit access that neither two 64-bit host accesses nor one atomic vector access can
+    /// make, or an alignment the compare cannot check.
     fn tlb_fast_path(
         &mut self,
         f: &Func,
@@ -991,11 +1000,12 @@ impl Gen<'_> {
         let (s_bits, a_bits) = (m.size(), m.alignment_bits());
         // Alignment bits must stay below the comparator's flag bits, or a misaligned address
         // could match a flagged comparator.
-        // Two 64-bit host accesses make a 128-bit one whose halves need only be atomic each.
+        // Two 64-bit host accesses make a 128-bit one whose halves need only be atomic each,
+        // and one vector access one that must be atomic as a whole when aligned.
         let atom = m.0 & MemOp::ATOM_MASK.0;
-        let pair_ok = atom == MemOp::ATOM_IFALIGN_PAIR.0 || atom == MemOp::ATOM_NONE.0;
+        let vec_ok = atom == MemOp::ATOM_IFALIGN.0 && self.feat.avx && self.feat.atomic_vmovdqa;
         if s_bits > 4
-            || (s_bits == 4 && !pair_ok)
+            || (s_bits == 4 && atomic16(oi) && !vec_ok)
             || m.is_bswap()
             || a_bits > TLB_FLAGS_SHIFT
             || mmu_idx >= TLB_MAX_MMU_MODES
@@ -1028,6 +1038,34 @@ impl Gen<'_> {
         self.a.jump(Some(cc::NE), miss, false);
         self.a.load(TMP1, Mem::Base(TMP1, (TLB_ADDEND_WORD * 8) as i32), 8, false, P_REXW);
         Some((addr, miss))
+    }
+
+    /// The vector half of an atomic 128-bit access at `(addr, TMP1)` through `VT0`, QEMU's
+    /// `MO_128` case of `tcg_out_qemu_ld_direct` and `tcg_out_qemu_st_direct`: `vmovdqa` when
+    /// the op requires 16-byte alignment, `vmovdqu` when the host makes it atomic too, and
+    /// otherwise a test of the address that picks `vmovdqa` when it is aligned. The addend is
+    /// page aligned, so the guest address tells.
+    fn vec_access16(&mut self, oi: MemOpIdx, addr: Reg, store: bool) {
+        let host = Mem::Index(addr, TMP1, 0);
+        let (aligned, unaligned) = if store {
+            (op::MOVDQA_WX_VX, op::MOVDQU_WX_VX)
+        } else {
+            (op::MOVDQA_VX_WX, op::MOVDQU_VX_WX)
+        };
+        if oi.memop().alignment_bits() >= 4 {
+            self.a.vex_modrm_mem(aligned, VT0, 0, host);
+        } else if self.feat.atomic_vmovdqu {
+            self.a.vex_modrm_mem(unaligned, VT0, 0, host);
+        } else {
+            let (other, done) = (self.a.new_label(), self.a.new_label());
+            self.a.testi(0, addr, 15);
+            self.a.jump(Some(cc::NE), other, true);
+            self.a.vex_modrm_mem(aligned, VT0, 0, host);
+            self.a.jump(None, done, true);
+            self.a.bind(other);
+            self.a.vex_modrm_mem(unaligned, VT0, 0, host);
+            self.a.bind(done);
+        }
     }
 
     /// Set the flags for `c` from `a` and `b`, `tcg_out_cmp`, and return the x86 condition
@@ -1590,6 +1628,26 @@ impl Gen<'_> {
             Opcode::QemuLd2 => {
                 let oi = MemOpIdx(op.args[3] as u32);
                 match self.tlb_fast_path(f, r(2), oi, false) {
+                    Some((addr, label)) if atomic16(oi) => {
+                        self.vec_access16(oi, addr, false);
+                        // `tcg_out_vec_to_pair`: `vmovq` and `vpextrq $1`.
+                        self.a.vex_modrm(op::MOVD_EY_VY | P_REXW, VT0, 0, r(0));
+                        self.a.vex_modrm(op::PEXTRD | P_REXW, VT0, 0, r(1));
+                        self.a.b8(1);
+                        let back = self.a.new_label();
+                        self.a.bind(back);
+                        self.ldst.push(LdstSlow {
+                            label,
+                            back,
+                            oi,
+                            ty,
+                            addr: r(2),
+                            val: None,
+                            out: r(0),
+                            hi: Some((r(1) as u64, false)),
+                            insn: self.insn,
+                        });
+                    }
                     Some((addr, label)) => {
                         // Load the half whose register is the address last.
                         let halves = if r(0) == addr { [(1, 8), (0, 0)] } else { [(0, 0), (1, 8)] };
@@ -1672,6 +1730,38 @@ impl Gen<'_> {
                 let oi = MemOpIdx(op.args[3] as u32);
                 let val = [(args[0], const_args[0]), (args[1], const_args[1])];
                 match self.tlb_fast_path(f, r(2), oi, true) {
+                    Some((addr, label)) if atomic16(oi) => {
+                        // `tcg_out_pair_to_vec`: `vmovq` and `vpinsrq $1`, with a constant
+                        // half put in `TMP0` first.
+                        for (k, (v, is_const)) in val.into_iter().enumerate() {
+                            let s = if is_const {
+                                self.a.movi(true, TMP0, v, false);
+                                TMP0
+                            } else {
+                                v as Reg
+                            };
+                            if k == 0 {
+                                self.a.vex_modrm(op::MOVD_VY_EY | P_REXW, VT0, 0, s);
+                            } else {
+                                self.a.vex_modrm(op::PINSRD | P_REXW, VT0, VT0, s);
+                                self.a.b8(1);
+                            }
+                        }
+                        self.vec_access16(oi, addr, true);
+                        let back = self.a.new_label();
+                        self.a.bind(back);
+                        self.ldst.push(LdstSlow {
+                            label,
+                            back,
+                            oi,
+                            ty,
+                            addr: r(2),
+                            val: Some(val[0]),
+                            out: 0,
+                            hi: Some(val[1]),
+                            insn: self.insn,
+                        });
+                    }
                     Some((addr, label)) => {
                         for (k, (v, is_const)) in val.into_iter().enumerate() {
                             let host = Mem::Index(addr, TMP1, 8 * k as i32);

@@ -4,7 +4,8 @@
 //! accesses that hit go straight to host memory, and misses, flagged comparators, misaligned
 //! and page crossing accesses, and accesses after the TLB is resized in the middle of a block go
 //! to the guest memory, with the same results. 128-bit accesses whose halves need only be atomic
-//! each are two host accesses on a hit.
+//! each are two host accesses on a hit, and those that must be atomic as a whole one vector
+//! access when the host makes those atomic.
 //!
 //! Generated code only runs on an x86-64 host; elsewhere these tests only compile and link.
 
@@ -19,7 +20,7 @@ use ruvm_jit_interp::fast_tlb::TLB_INVALID_ENTRY;
 use ruvm_jit_interp::{
     Exit, FastTlb, FaultKind, GuestMemory, HelperEnv, HelperRegistry, MemFault, TlbTables, Unwind,
 };
-use ruvm_jit_x86_64::{CodeRegion, CompileOptions, CompiledTb, GenCodeError};
+use ruvm_jit_x86_64::{CodeRegion, CompileOptions, CompiledTb, GenCodeError, HostFeatures};
 
 const NATIVE: bool = cfg!(all(any(unix, windows), target_arch = "x86_64"));
 const ENV_SIZE: usize = 0x200;
@@ -35,10 +36,23 @@ const MODES: usize = 2;
 /// The comparator flag the softmmu uses for `TLB_NOTDIRTY`.
 const NOTDIRTY: u64 = 1 << 7;
 
+/// Host bytes for [`TlbMem`], page aligned as guest RAM is, so that an aligned guest address
+/// is an aligned host address.
+#[repr(C, align(4096))]
+struct Pages([AtomicU8; PAGES * PAGE as usize]);
+
+impl std::ops::Deref for Pages {
+    type Target = [AtomicU8];
+
+    fn deref(&self) -> &[AtomicU8] {
+        &self.0
+    }
+}
+
 /// Guest memory of [`PAGES`] pages at [`GUEST`], backed by host bytes the TLB entries point
 /// into, counting the accesses that reach it (the slow path).
 struct TlbMem {
-    host: Box<[AtomicU8]>,
+    host: Box<Pages>,
     fast: Arc<FastTlb>,
     reads: usize,
     writes: usize,
@@ -50,7 +64,7 @@ struct TlbMem {
 
 impl TlbMem {
     fn new(fast: Arc<FastTlb>) -> TlbMem {
-        let host = (0..PAGES * PAGE as usize).map(|i| AtomicU8::new(i as u8)).collect();
+        let host = Box::new(Pages(std::array::from_fn(|i| AtomicU8::new(i as u8))));
         TlbMem { host, fast, reads: 0, writes: 0, insn: 0, seen: Vec::new() }
     }
 
@@ -127,8 +141,18 @@ fn opts() -> CompileOptions<'static> {
 }
 
 fn compile(f: &Func) -> CompiledTb {
-    let r = CodeRegion::new(1 << 16).expect("code region");
+    compile_for(f, HostFeatures::detect())
+}
+
+fn compile_for(f: &Func, feat: HostFeatures) -> CompiledTb {
+    let r = CodeRegion::with_features(1 << 16, feat).expect("code region");
     r.compile_with(f, &opts()).expect("compile")
+}
+
+/// Whether the host inlines a 128-bit access that must be atomic as a whole.
+fn atomic16_inline(feat: HostFeatures) -> bool {
+    let feat = feat.normalized();
+    feat.avx && feat.atomic_vmovdqa
 }
 
 fn rd64(env: &[u8], off: usize) -> u64 {
@@ -478,15 +502,88 @@ fn pairs_of_halves_use_the_fast_path() {
         assert_eq!((rd64(&env, 0x110), rd64(&env, 0x118)), cross);
         let whole = (mem.peek(GUEST + 0x60, 8), mem.peek(GUEST + 0x68, 8));
         assert_eq!((rd64(&env, 0x120), rd64(&env, 0x128)), whole);
-        // Mapped, only the page crossing pair and, with `parallel`, the access that must be
-        // atomic as a whole are slow.
+        // Mapped, only the page crossing pair and, with `parallel` on a host without atomic
+        // vector accesses, the access that must be atomic as a whole are slow.
         let want = if !mapped {
             (3, 2)
-        } else if parallel {
+        } else if parallel && !atomic16_inline(HostFeatures::detect()) {
             (2, 0)
         } else {
             (1, 0)
         };
         assert_eq!((mem.reads, mem.writes), want, "mapped {mapped}");
+    }
+}
+
+/// 128-bit accesses that must be atomic as a whole (`MO_ATOM_IFALIGN` in a parallel block, as
+/// an x86 `movdqu` with AVX): an aligned and a misaligned load, a store that requires 16-byte
+/// alignment, a misaligned constant store, and a page crossing load.
+fn whole_block() -> Func {
+    let mut f = Func::new(FuncConfig { parallel: true, ..FuncConfig::default() });
+    let env = f.env();
+    let base = f.global_mem_new_i64(env, 0x180, "base");
+    let r: Vec<TempI64> =
+        (0..6).map(|i| f.global_mem_new_i64(env, 0x100 + 8 * i, format!("r{i}"))).collect();
+    let mop = MemOp::MO_128.or(MemOp::ATOM_IFALIGN);
+    let load = |f: &mut Func, off: i64, lo: TempI64, hi: TempI64| {
+        let a = f.temp_new_i64();
+        f.gen_addi_i64(a, base, off);
+        let t = f.temp_new_i128();
+        f.gen_qemu_ld_i128(t, a, 0, mop);
+        f.gen_extr_i128_i64(lo, hi, t);
+    };
+    load(&mut f, 0x30, r[0], r[1]);
+    load(&mut f, 0x73, r[2], r[3]);
+    let t = f.temp_new_i128();
+    f.gen_concat_i64_i128(t, r[1], r[2]);
+    let a = f.temp_new_i64();
+    f.gen_addi_i64(a, base, PAGE as i64 + 0x80);
+    f.gen_qemu_st_i128(t, a, 0, mop.or(MemOp::ALIGN));
+    let (c0, c1) = (f.constant_i64(0x1234_5678_9abc), f.constant_i64(-3));
+    let t = f.temp_new_i128();
+    f.gen_concat_i64_i128(t, c0, c1);
+    let a = f.temp_new_i64();
+    f.gen_addi_i64(a, base, PAGE as i64 + 0x99);
+    f.gen_qemu_st_i128(t, a, 0, mop);
+    load(&mut f, 2 * PAGE as i64 - 4, r[4], r[5]);
+    f.gen_exit_tb(0, 0);
+    f
+}
+
+#[test]
+fn whole_accesses_use_a_vector_on_hosts_that_make_it_atomic() {
+    if !NATIVE {
+        return;
+    }
+    let host = HostFeatures::detect();
+    let tiers = [
+        host,
+        HostFeatures { atomic_vmovdqu: false, ..host },
+        HostFeatures { atomic_vmovdqa: false, ..host },
+        HostFeatures { avx: false, avx2: false, ..host },
+    ];
+    for feat in tiers {
+        let tb = compile_for(&whole_block(), feat);
+        let t = TlbTables::new(PAGE_BITS, MODES, ENTRIES);
+        let mut mem = TlbMem::new(Arc::clone(t.fast()));
+        for p in 0..PAGES {
+            map(&t, &mem, 0, p, true);
+        }
+        let mut env = vec![0u8; ENV_SIZE];
+        env[0x180..0x188].copy_from_slice(&GUEST.to_le_bytes());
+        let x = tb.run(&mut env, &mut mem, &HelperRegistry::new());
+        assert_eq!(x, Ok(Exit::ExitTb(0)), "{feat:?}");
+        let pair = |a: u64| (mem.peek(a, 8), mem.peek(a + 8, 8));
+        let (lo, hi) = pair(GUEST + 0x30);
+        assert_eq!((rd64(&env, 0x100), rd64(&env, 0x108)), (lo, hi), "{feat:?}");
+        let (mlo, mhi) = pair(GUEST + 0x73);
+        assert_eq!((rd64(&env, 0x110), rd64(&env, 0x118)), (mlo, mhi), "{feat:?}");
+        assert_eq!(pair(GUEST + PAGE + 0x80), (hi, mlo), "{feat:?}");
+        assert_eq!(pair(GUEST + PAGE + 0x99), (0x1234_5678_9abc, u64::MAX - 2), "{feat:?}");
+        let cross = pair(GUEST + 2 * PAGE - 4);
+        assert_eq!((rd64(&env, 0x120), rd64(&env, 0x128)), cross, "{feat:?}");
+        // Only the page crossing load is slow when the host makes vector accesses atomic.
+        let want = if atomic16_inline(feat) { (1, 0) } else { (3, 2) };
+        assert_eq!((mem.reads, mem.writes), want, "{feat:?}");
     }
 }

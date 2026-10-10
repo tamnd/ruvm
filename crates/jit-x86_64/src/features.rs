@@ -24,6 +24,12 @@ pub struct HostFeatures {
     pub lzcnt: bool,
     /// POPCNT, `have_popcnt`.
     pub popcnt: bool,
+    /// A 16-byte aligned `vmovdqa` load or store is atomic, `CPUINFO_ATOMIC_VMOVDQA`: AVX on
+    /// an Intel or AMD processor, as both vendors document.
+    pub atomic_vmovdqa: bool,
+    /// So is a `vmovdqu` whose address happens to be 16-byte aligned,
+    /// `CPUINFO_ATOMIC_VMOVDQU`: AVX on an AMD processor.
+    pub atomic_vmovdqu: bool,
 }
 
 impl HostFeatures {
@@ -38,6 +44,8 @@ impl HostFeatures {
         bmi2: false,
         lzcnt: false,
         popcnt: false,
+        atomic_vmovdqa: false,
+        atomic_vmovdqu: false,
     };
 
     /// Every extension the backend knows about.
@@ -51,12 +59,18 @@ impl HostFeatures {
         bmi2: true,
         lzcnt: true,
         popcnt: true,
+        atomic_vmovdqa: true,
+        atomic_vmovdqu: true,
     };
 
     /// The extensions of the CPU this runs on; [`HostFeatures::BASELINE`] on other hosts.
     pub fn detect() -> HostFeatures {
         #[cfg(target_arch = "x86_64")]
         {
+            // The vendor, as `cpuinfo_init` reads it: "ntel" ends GenuineIntel and "cAMD"
+            // ends AuthenticAMD.
+            let vendor = std::arch::x86_64::__cpuid(0).ecx;
+            let (intel, amd) = (vendor == 0x6c65_746e, vendor == 0x444d_4163);
             HostFeatures {
                 ssse3: std::arch::is_x86_feature_detected!("ssse3"),
                 sse41: std::arch::is_x86_feature_detected!("sse4.1"),
@@ -68,6 +82,8 @@ impl HostFeatures {
                 lzcnt: std::arch::is_x86_feature_detected!("lzcnt")
                     && std::arch::is_x86_feature_detected!("bmi1"),
                 popcnt: std::arch::is_x86_feature_detected!("popcnt"),
+                atomic_vmovdqa: intel || amd,
+                atomic_vmovdqu: amd,
             }
             .normalized()
         }
@@ -78,13 +94,16 @@ impl HostFeatures {
     }
 
     /// The same set with every extension whose prerequisites are missing turned off: AVX2
-    /// needs AVX, AVX needs SSE4.2, SSE4.2 needs SSE4.1 and SSE4.1 needs SSSE3.
+    /// needs AVX, AVX needs SSE4.2, SSE4.2 needs SSE4.1 and SSE4.1 needs SSSE3. The atomic
+    /// vector accesses need AVX, and an atomic `vmovdqu` an atomic `vmovdqa`.
     pub fn normalized(self) -> HostFeatures {
         let mut f = self;
         f.sse41 &= f.ssse3;
         f.sse42 &= f.sse41;
         f.avx &= f.sse42;
         f.avx2 &= f.avx;
+        f.atomic_vmovdqa &= f.avx;
+        f.atomic_vmovdqu &= f.atomic_vmovdqa;
         f
     }
 
@@ -100,6 +119,8 @@ impl HostFeatures {
             bmi2: self.bmi2 && other.bmi2,
             lzcnt: self.lzcnt && other.lzcnt,
             popcnt: self.popcnt && other.popcnt,
+            atomic_vmovdqa: self.atomic_vmovdqa && other.atomic_vmovdqa,
+            atomic_vmovdqu: self.atomic_vmovdqu && other.atomic_vmovdqu,
         }
         .normalized()
     }
