@@ -14,6 +14,8 @@ use kvm_ioctls::{Kvm, VmFd};
 
 use crate::{KVM_API_VERSION, KernelIrqchip, KvmError, KvmOptions};
 
+#[cfg(target_arch = "aarch64")]
+mod arm_vcpu;
 mod dirty;
 mod slots;
 mod vcpu;
