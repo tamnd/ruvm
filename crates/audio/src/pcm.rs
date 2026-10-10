@@ -33,7 +33,11 @@ pub fn application_name() -> String {
 }
 
 /// `error_printf()`: text on stderr with no program name in front.
-#[cfg(any(feature = "audio-alsa", feature = "audio-pa"))]
+#[cfg(any(
+    feature = "audio-alsa",
+    feature = "audio-pa",
+    all(feature = "audio-coreaudio", target_os = "macos")
+))]
 pub(crate) fn error_printf(s: &str) {
     use std::io::Write;
     let mut err = std::io::stderr().lock();

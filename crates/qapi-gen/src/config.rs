@@ -28,7 +28,7 @@ pub enum Rule {
 const CONDITIONS: &[(&str, Rule)] = &[
     ("CONFIG_AF_XDP", Rule::Off),
     ("CONFIG_AUDIO_ALSA", Rule::Feature("audio-alsa")),
-    ("CONFIG_AUDIO_COREAUDIO", Rule::Off),
+    ("CONFIG_AUDIO_COREAUDIO", Rule::FeatureOs("audio-coreaudio", &["macos"])),
     ("CONFIG_AUDIO_DSOUND", Rule::Off),
     ("CONFIG_AUDIO_JACK", Rule::Off),
     ("CONFIG_AUDIO_OSS", Rule::Off),

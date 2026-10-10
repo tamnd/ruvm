@@ -45,6 +45,8 @@ audio-alsa = ["ruvm-system/audio-alsa"]
 audio-pa = ["ruvm-system/audio-pa"]
 # -audiodev pipewire, over the system's PipeWire library.
 audio-pipewire = ["ruvm-system/audio-pipewire"]
+# -audiodev coreaudio, over CoreAudio on macOS.
+audio-coreaudio = ["ruvm-system/audio-coreaudio"]
 # -display cocoa on macOS, over the system's AppKit.
 ui-cocoa = ["ruvm-system/ui-cocoa"]
 
