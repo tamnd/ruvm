@@ -2050,6 +2050,7 @@ version = "0.5.5"
 dependencies = [
  "flate2",
  "ruvm-accel",
+ "ruvm-accel-kvm",
  "ruvm-base",
  "ruvm-firmware",
  "ruvm-hw-acpi",
