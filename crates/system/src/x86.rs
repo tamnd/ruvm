@@ -1468,14 +1468,14 @@ pub(crate) fn probe_warning(file: &str) -> String {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) use kvm::{kvm_init, start_board};
+pub(crate) use kvm::start_board;
 
 /// The accelerator `configure_accelerators()` picked.
 #[derive(Debug)]
 pub(crate) enum Accel {
     Qtest,
     Tcg(TcgOptions),
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     Kvm(Box<ruvm_accel_kvm::KvmAccel>),
 }
 
@@ -1485,7 +1485,10 @@ pub(crate) enum AccelInitError {
     /// A bad property, which QEMU treats as fatal.
     Fatal(Error),
     /// `init_machine()` failed; the lines to print before trying the next accelerator.
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(
+        not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(dead_code)
+    )]
     Failed([String; 2]),
 }
 
@@ -1505,7 +1508,10 @@ pub(crate) fn tcg_init(
 }
 
 /// The `dirty-ring-size` property of the kvm accelerator, `kvm_set_dirty_ring_size()`.
-#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))),
+    allow(dead_code)
+)]
 pub(crate) fn parse_dirty_ring_size(value: &str) -> Result<u32> {
     let mut n = 0;
     StringInputVisitor::new(value).type_uint32(Some("dirty-ring-size"), &mut n)?;
@@ -1513,6 +1519,47 @@ pub(crate) fn parse_dirty_ring_size(value: &str) -> Result<u32> {
         return Err(Error::generic("dirty-ring-size must be a power of two."));
     }
     Ok(n)
+}
+
+/// `do_configure_accelerator()` for kvm: the `-accel kvm` properties, with
+/// `-machine kernel-irqchip=` as the default for the property of that name.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) fn kvm_init(
+    props: &[(String, String)],
+    irqchip_sugar: Option<&str>,
+    default_split: bool,
+) -> std::result::Result<ruvm_accel_kvm::KvmAccel, AccelInitError> {
+    use ruvm_accel_kvm::{KernelIrqchip, KvmError, KvmOptions};
+
+    let mut opts = KvmOptions::default();
+    let parse =
+        |v: &str| KernelIrqchip::parse(v).map_err(|e| AccelInitError::Fatal(Error::generic(e)));
+    if let Some(v) = irqchip_sugar {
+        opts.kernel_irqchip = Some(parse(v)?);
+    }
+    for (k, v) in props {
+        match k.as_str() {
+            "kernel-irqchip" => opts.kernel_irqchip = Some(parse(v)?),
+            "device" => opts.device = Some(v.into()),
+            "dirty-ring-size" => {
+                opts.dirty_ring_size = parse_dirty_ring_size(v).map_err(AccelInitError::Fatal)?;
+            }
+            _ => {
+                return Err(AccelInitError::Fatal(Error::generic(format!(
+                    "Property 'kvm-accel.{k}' not found"
+                ))));
+            }
+        }
+    }
+    let accel = ruvm_accel_kvm::KvmAccel::new(&opts, default_split).map_err(|e| match e {
+        // kvm_arch_irqchip_create() on Arm exits right there.
+        KvmError::ArmSplitIrqchip => AccelInitError::Fatal(Error::generic(e.to_string())),
+        e => AccelInitError::Failed(e.init_error_lines()),
+    })?;
+    for w in accel.warnings() {
+        warn_report(w);
+    }
+    Ok(accel)
 }
 
 /// The machine the vCPUs run, on either accelerator.
@@ -2120,55 +2167,17 @@ fn monitor_fds(m: &Migration, qmp: &Arc<ruvm_monitor::Qmp>) {
 mod kvm {
     use std::sync::Arc;
 
-    use ruvm_accel_kvm::{KernelIrqchip, KvmAccel, KvmOptions};
-    use ruvm_base::Error;
+    use ruvm_accel_kvm::KvmAccel;
     use ruvm_base::report::warn_report;
     use ruvm_chardev::Chardev;
     use ruvm_machine_x86::BoardKind;
-    use ruvm_machine_x86::kvm_run::{
-        CpuModel, KvmMachine, KvmRunConfig, open_accel, pit_in_kernel,
-    };
+    use ruvm_machine_x86::kvm_run::{CpuModel, KvmMachine, KvmRunConfig, pit_in_kernel};
 
     use super::{
-        AccelInitError, BoardAccel, BoardOptions, Cmdline, Drive, Located, Running, RunningMachine,
-        build, event_handler, set_cpu_hook,
+        BoardAccel, BoardOptions, Cmdline, Drive, Located, Running, RunningMachine, build,
+        event_handler, set_cpu_hook,
     };
     use crate::vl::Vm;
-
-    /// `do_configure_accelerator()` for kvm: the `-accel kvm` properties, with
-    /// `-machine kernel-irqchip=` as the default for the property of that name.
-    pub(crate) fn kvm_init(
-        props: &[(String, String)],
-        irqchip_sugar: Option<&str>,
-        default_split: bool,
-    ) -> Result<KvmAccel, AccelInitError> {
-        let mut opts = KvmOptions::default();
-        let parse =
-            |v: &str| KernelIrqchip::parse(v).map_err(|e| AccelInitError::Fatal(Error::generic(e)));
-        if let Some(v) = irqchip_sugar {
-            opts.kernel_irqchip = Some(parse(v)?);
-        }
-        for (k, v) in props {
-            match k.as_str() {
-                "kernel-irqchip" => opts.kernel_irqchip = Some(parse(v)?),
-                "device" => opts.device = Some(v.into()),
-                "dirty-ring-size" => {
-                    opts.dirty_ring_size =
-                        super::parse_dirty_ring_size(v).map_err(AccelInitError::Fatal)?;
-                }
-                _ => {
-                    return Err(AccelInitError::Fatal(Error::generic(format!(
-                        "Property 'kvm-accel.{k}' not found"
-                    ))));
-                }
-            }
-        }
-        let accel = open_accel(&opts, default_split).map_err(AccelInitError::Failed)?;
-        for w in accel.warnings() {
-            warn_report(w);
-        }
-        Ok(accel)
-    }
 
     /// `qemu_init_board()`, `qemu_create_cli_devices()` and `qemu_machine_creation_done()`
     /// for an x86 board on KVM: builds the board, plugs the devices and puts it all on the

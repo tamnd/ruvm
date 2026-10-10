@@ -85,8 +85,12 @@ use crate::vl::Vm;
 use crate::x86::{Drive, Located};
 
 mod devices;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod kvm;
 
 pub(crate) use devices::parse_drives;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub(crate) use kvm::start_board_kvm;
 
 /// Whether `target` is one the Arm boards exist for.
 pub(crate) fn is_arm(target: &str) -> bool {
@@ -715,6 +719,53 @@ pub(crate) fn parse_cpu(board: ArmBoard, arg: Option<&str>) -> Result<ArmCpuMode
     Ok(model)
 }
 
+/// The CPU model for `-cpu` with KVM. Only `host` and `max`, which is `host` under KVM, are
+/// taken, since ruvm inits every vCPU with the target KVM prefers. `host_pmu` says whether
+/// KVM can give the guest a PMU, which `host` has unless `pmu=off`.
+#[cfg_attr(not(all(target_os = "linux", target_arch = "aarch64")), allow(dead_code))]
+fn kvm_cpu_model(arg: Option<&str>, host_pmu: bool) -> Result<ArmCpuModel> {
+    // QEMU's default for virt is a cortex-a15, which KVM refuses.
+    let Some(arg) = arg else {
+        return Err(Error::generic("-accel kvm needs -cpu host or -cpu max in ruvm for now"));
+    };
+    let mut parts = arg.split(',');
+    let name = parts.next().unwrap_or_default();
+    if name != "host" && name != "max" {
+        return Err(Error::generic(format!(
+            "CPU model '{name}' with KVM is not supported by ruvm yet"
+        ))
+        .hint("Use -cpu host.\n"));
+    }
+    let mut pmu = host_pmu;
+    for feat in parts.filter(|f| !f.is_empty()) {
+        let (prop, value) = match feat.split_once('=') {
+            Some((p, v)) => (p, v),
+            None => match feat.strip_prefix('-') {
+                Some(p) => (p, "off"),
+                None => (feat.strip_prefix('+').unwrap_or(feat), "on"),
+            },
+        };
+        match prop {
+            "pmu" => {
+                pmu = prop_bool(prop, value)?;
+                if pmu && !host_pmu {
+                    return Err(Error::generic("'pmu' feature not supported by KVM on this host"));
+                }
+            }
+            _ => {
+                return Err(Error::generic(format!(
+                    "CPU property {prop}={value} with KVM is not supported by ruvm yet"
+                )));
+            }
+        }
+    }
+    // aarch64_host_initfn(): the host's ID registers, a generic v8 node in the device tree.
+    let mut model = ArmCpuModel::max();
+    model.name = "host";
+    model.dtb_compatible = "arm,arm-v8";
+    Ok(if pmu { model } else { model.without_pmu() })
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -888,6 +939,8 @@ impl Frontend for SemiConsoleFrontend {
 enum Machine {
     Virt(Arc<VirtTcgMachine>),
     SbsaRef(Arc<SbsaRefTcgMachine>),
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    Kvm(Arc<ruvm_machine_arm::virt::kvm::KvmVirtMachine>),
 }
 
 /// The board running on its vCPUs, and the chardevs its devices are attached to.
@@ -912,6 +965,8 @@ impl Running {
         match &self.machine {
             Machine::Virt(m) => m.quit(),
             Machine::SbsaRef(m) => m.quit(),
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            Machine::Kvm(m) => m.quit(),
         }
     }
 }
@@ -1003,6 +1058,48 @@ pub(crate) fn start_board_tcg(
         return start_sbsa_ref_tcg(vm, tcg, opts, args, serial_hds);
     }
     let one = |e: Error| vec![Located(None, e)];
+    let cpu = || parse_cpu(ArmBoard::Virt, args.cpu).map_err(one);
+    let built = build_virt(vm, opts, args, serial_hds, cpu, |_| Ok(()))?;
+    let BuiltVirt { mut board, console, attachments, clocks, dumpdtb: dtb_path } = built;
+    board.machine_done().map_err(|e| one(Error::generic(e)))?;
+    if let Some(path) = &dtb_path {
+        dumpdtb(path, board.fdt().as_bytes())?;
+    }
+
+    let cfg = VirtRunConfig { no_reboot: args.no_reboot, tcg, backend: None };
+    let (machine, warnings) = VirtTcgMachine::new(board, clocks, &cfg, event_handler(vm))
+        .map_err(|e| one(Error::generic(e)))?;
+    for w in &warnings {
+        warn_report(w);
+    }
+    let machine = Arc::new(machine);
+    set_cpu_hook(vm, &machine);
+    Ok(Running { machine: Machine::Virt(machine), console, _attachments: attachments })
+}
+
+/// The virt board built from the command line, before `qemu_machine_creation_done()`.
+struct BuiltVirt {
+    board: VirtMachine,
+    console: Option<Arc<SemiConsole>>,
+    attachments: Vec<Attachment>,
+    /// The clocks the board's timers run on.
+    clocks: Vec<Arc<Clock>>,
+    /// `dumpdtb`.
+    dumpdtb: Option<String>,
+}
+
+/// `qemu_init_board()` for virt with the CPU model `cpu` gives: builds the board, plugs the devices and connects
+/// the UARTs to `serial_hds` and semihosting to its chardev. `prepare` sees the config last,
+/// for what the accelerator needs.
+fn build_virt(
+    vm: &Arc<Vm>,
+    opts: BoardOptions,
+    args: &ArmArgs<'_>,
+    serial_hds: &[Option<Arc<Chardev>>],
+    cpu: impl FnOnce() -> std::result::Result<ArmCpuModel, Vec<Located>>,
+    prepare: impl FnOnce(&mut VirtConfig) -> std::result::Result<(), Vec<Located>>,
+) -> std::result::Result<BuiltVirt, Vec<Located>> {
+    let one = |e: Error| vec![Located(None, e)];
     let semi = args.semihosting;
     let console_chr = semihosting_chardev(&vm.chardevs, semi).map_err(|e| vec![e])?;
     if semi.enabled && semi.target == SemihostingTarget::Gdb {
@@ -1010,7 +1107,7 @@ pub(crate) fn start_board_tcg(
             "semihosting-config target=gdb is not supported by ruvm yet",
         )));
     }
-    let cpu = parse_cpu(ArmBoard::Virt, args.cpu).map_err(one)?;
+    let cpu = cpu()?;
     let plan = devices::plan(ArmBoard::Virt, args.drives, args.devices)?;
     let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
     let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
@@ -1067,7 +1164,8 @@ pub(crate) fn start_board_tcg(
     cfg.semihosting_userspace = semi.userspace;
     cfg.clock = Some(Arc::clone(&clock));
     cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
-    let mut board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
+    prepare(&mut cfg)?;
+    let board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
     devices::plug(devices::Target::Virt(&board), &plan.virtio, &plan.display, args.drives)
         .map_err(|e| vec![e])?;
 
@@ -1092,21 +1190,8 @@ pub(crate) fn start_board_tcg(
         attachments.push(chr.attach(fe).map_err(|e| vec![Located(None, e)])?);
     }
 
-    board.machine_done().map_err(|e| one(Error::generic(e)))?;
-    if let Some(path) = &opts.dumpdtb {
-        dumpdtb(path, board.fdt().as_bytes())?;
-    }
-
-    let cfg = VirtRunConfig { no_reboot: args.no_reboot, tcg, backend: None };
-    let (machine, warnings) =
-        VirtTcgMachine::new(board, vec![clock, rtc_clock], &cfg, event_handler(vm))
-            .map_err(|e| one(Error::generic(e)))?;
-    for w in &warnings {
-        warn_report(w);
-    }
-    let machine = Arc::new(machine);
-    set_cpu_hook(vm, &machine);
-    Ok(Running { machine: Machine::Virt(machine), console, _attachments: attachments })
+    let clocks = vec![clock, rtc_clock];
+    Ok(BuiltVirt { board, console, attachments, clocks, dumpdtb: opts.dumpdtb })
 }
 
 /// [`start_board_tcg`] for sbsa-ref: the UART on `serial_hds[0]` and the secure UARTs on
@@ -1454,5 +1539,31 @@ mod tests {
         );
         assert!(machine_help_lines().iter().any(|(k, l)| k == "sbsa-ref"
             && l == "sbsa-ref             QEMU 'SBSA Reference' ARM Virtual Machine\n"));
+    }
+
+    #[test]
+    fn kvm_takes_only_the_host_cpu() {
+        let m = kvm_cpu_model(Some("host"), true).unwrap();
+        assert_eq!((m.name, m.dtb_compatible), ("host", "arm,arm-v8"));
+        assert_ne!(m.features.pmu, 0);
+        assert_eq!(kvm_cpu_model(Some("max"), true).unwrap().name, "host");
+        assert_eq!(kvm_cpu_model(Some("host"), false).unwrap().features.pmu, 0);
+        assert_eq!(kvm_cpu_model(Some("host,pmu=off"), true).unwrap().features.pmu, 0);
+        let msg = |arg: Option<&str>, pmu: bool| {
+            kvm_cpu_model(arg, pmu).unwrap_err().message().to_string()
+        };
+        assert_eq!(
+            msg(Some("host,pmu=on"), false),
+            "'pmu' feature not supported by KVM on this host"
+        );
+        assert_eq!(msg(None, true), "-accel kvm needs -cpu host or -cpu max in ruvm for now");
+        assert_eq!(
+            msg(Some("cortex-a57"), true),
+            "CPU model 'cortex-a57' with KVM is not supported by ruvm yet"
+        );
+        assert_eq!(
+            msg(Some("host,sve=off"), true),
+            "CPU property sve=off with KVM is not supported by ruvm yet"
+        );
     }
 }

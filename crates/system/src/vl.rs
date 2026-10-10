@@ -59,9 +59,11 @@ use crate::riscv;
 use crate::runstate::{Killed, Runstate};
 use crate::x86::{self, Accel, AccelInitError, Located};
 
-/// Whether KVM is built in for `target`: the host is Linux on x86_64 and so is the target.
+/// Whether KVM is built in for `target`: the host is Linux on x86_64 or AArch64 and the
+/// target is the same architecture.
 fn have_kvm(target: &str) -> bool {
-    cfg!(all(target_os = "linux", target_arch = "x86_64")) && x86::is_x86(target)
+    (cfg!(all(target_os = "linux", target_arch = "x86_64")) && x86::is_x86(target))
+        || (cfg!(all(target_os = "linux", target_arch = "aarch64")) && arm::is_arm(target))
 }
 
 /// Whether TCG is built in for `target`: the x86 targets, aarch64 and riscv64, whose front
@@ -875,6 +877,8 @@ fn configure_accelerators(target: &str, kind: Option<BoardKind>, cfg: &mut Confi
     if cfg.accel.is_empty() {
         let accelerators = match cfg.accelerators.clone() {
             Some(a) => a,
+            // ruvm keeps TCG as the Arm default until KVM there has run on real hardware.
+            None if arm::is_arm(target) => "tcg".to_string(),
             None if have_kvm(target) && have_tcg(target) => "kvm:tcg".to_string(),
             None if have_kvm(target) => "kvm".to_string(),
             None if have_tcg(target) => "tcg".to_string(),
@@ -951,7 +955,7 @@ fn init_accel(
     kernel_irqchip: Option<&str>,
     default_split: bool,
 ) -> std::result::Result<Accel, AccelInitError> {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     if acc == "kvm" {
         return x86::kvm_init(props, kernel_irqchip, default_split)
             .map(|a| Accel::Kvm(Box::new(a)));
@@ -1118,7 +1122,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     let _ = vm.accel.set(match &accel {
         Accel::Qtest => Accelerator::Qtest,
         Accel::Tcg(_) => Accelerator::Tcg,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
         Accel::Kvm(_) => Accelerator::Kvm,
     });
     let on_qtest = matches!(accel, Accel::Qtest);
@@ -1207,7 +1211,6 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         if cfg.preconfig {
             return Err(fail_msg("-preconfig is not supported with this machine by ruvm yet"));
         }
-        let Accel::Tcg(tcg) = accel else { unreachable!("checked above") };
         let args = arm::ArmArgs {
             cpu: cfg.x86.cpu.as_deref(),
             no_reboot: cfg.x86.no_reboot,
@@ -1215,13 +1218,18 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             devices: &cfg.x86.devices,
             drives: &drives,
         };
-        let running =
-            arm::start_board_tcg(&vm, tcg, opts, &args, &serial_hds).map_err(|errors| {
-                for e in &errors {
-                    e.report();
-                }
-                Exit(1)
-            })?;
+        let running = match accel {
+            Accel::Tcg(tcg) => arm::start_board_tcg(&vm, tcg, opts, &args, &serial_hds),
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            Accel::Kvm(accel) => arm::start_board_kvm(&vm, *accel, opts, &args, &serial_hds),
+            _ => unreachable!("checked above"),
+        };
+        let running = running.map_err(|errors| {
+            for e in &errors {
+                e.report();
+            }
+            Exit(1)
+        })?;
         keep.arm_board = Some(running);
     } else {
         match (kind, board_opts) {
@@ -1292,7 +1300,7 @@ fn start_x86(
         Accel::Tcg(tcg) => x86::start_board_tcg(vm, tcg, kind, opts, &cfg.x86, drives, serial_hds),
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         Accel::Kvm(accel) => x86::start_board(vm, *accel, kind, opts, &cfg.x86, drives, serial_hds),
-        Accel::Qtest => unreachable!("checked by the caller"),
+        _ => unreachable!("checked by the caller"),
     };
     let running = running.map_err(|errors| {
         for e in &errors {
