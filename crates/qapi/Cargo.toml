@@ -38,6 +38,8 @@ audio-pa = []
 audio-pipewire = []
 # The types of -audiodev coreaudio, on macOS.
 audio-coreaudio = []
+# The types of -audiodev dsound, on Windows.
+audio-dsound = []
 # The types and commands of -display cocoa, which are there only on macOS.
 ui-cocoa = []
 

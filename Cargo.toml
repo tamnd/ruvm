@@ -165,6 +165,7 @@ syn = { version = "2.0.110", default-features = false, features = ["full", "visi
 toml = "1.1.6"
 twofish = "0.7.1"
 vmm-sys-util = "0.15"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_Audio_DirectSound", "Win32_Media_Multimedia", "Win32_System_Com", "Win32_UI_WindowsAndMessaging"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Hypervisor", "Win32_System_LibraryLoader"] }
 
 # The lint set from spec/24-workspace-layout.md. Unsafe code is where an emulator gets a guest

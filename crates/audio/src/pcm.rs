@@ -36,7 +36,8 @@ pub fn application_name() -> String {
 #[cfg(any(
     feature = "audio-alsa",
     feature = "audio-pa",
-    all(feature = "audio-coreaudio", target_os = "macos")
+    all(feature = "audio-coreaudio", target_os = "macos"),
+    all(feature = "audio-dsound", windows)
 ))]
 pub(crate) fn error_printf(s: &str) {
     use std::io::Write;

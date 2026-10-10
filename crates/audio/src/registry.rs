@@ -20,6 +20,8 @@ use ruvm_qapi::types::{
 use crate::alsa::AlsaDriver;
 #[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
 use crate::coreaudio::CoreaudioDriver;
+#[cfg(all(feature = "audio-dsound", windows))]
+use crate::dsound::DsoundDriver;
 use crate::engine::AudioBackend;
 use crate::none::NoneDriver;
 #[cfg(feature = "audio-pa")]
@@ -37,6 +39,8 @@ const PRIO_LIST: &[AudiodevDriver] = &[
     AudiodevDriver::Pa,
     #[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
     AudiodevDriver::Coreaudio,
+    #[cfg(all(feature = "audio-dsound", windows))]
+    AudiodevDriver::Dsound,
     AudiodevDriver::None,
 ];
 
@@ -78,6 +82,8 @@ fn driver_for(driver: AudiodevDriver) -> Option<Box<dyn Driver>> {
         AudiodevDriver::Pipewire => Some(Box::new(PwDriver::default())),
         #[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
         AudiodevDriver::Coreaudio => Some(Box::new(CoreaudioDriver)),
+        #[cfg(all(feature = "audio-dsound", windows))]
+        AudiodevDriver::Dsound => Some(Box::new(DsoundDriver::default())),
     }
 }
 
@@ -161,6 +167,8 @@ fn pdos(
         AudiodevU::Pipewire(o) => base(&o.in_, &o.out),
         #[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
         AudiodevU::Coreaudio(o) => base(&o.in_, &o.out),
+        #[cfg(all(feature = "audio-dsound", windows))]
+        AudiodevU::Dsound(o) => base(&o.in_, &o.out),
     }
 }
 
@@ -209,6 +217,13 @@ pub fn validate_opts(dev: &mut Audiodev) -> Result<()> {
         AudiodevU::Pipewire(o) => validate(&mut o.in_, &mut o.out)?,
         #[cfg(all(feature = "audio-coreaudio", target_os = "macos"))]
         AudiodevU::Coreaudio(o) => validate(&mut o.in_, &mut o.out)?,
+        #[cfg(all(feature = "audio-dsound", windows))]
+        AudiodevU::Dsound(o) => {
+            validate(&mut o.in_, &mut o.out)?;
+            // QEMU sets this one in audio_dsound_realize(), which runs for every -audiodev
+            // before the monitor can ask.
+            o.latency.get_or_insert(10000);
+        }
     }
     dev.timer_period.get_or_insert(10000);
     Ok(())
