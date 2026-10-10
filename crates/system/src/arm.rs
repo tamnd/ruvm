@@ -194,7 +194,8 @@ impl Default for Semihosting {
     }
 }
 
-fn semihosting_config_opts() -> QemuOptsList {
+/// `qemu_semihosting_config_opts`.
+pub(crate) fn semihosting_config_opts() -> QemuOptsList {
     QemuOptsList::new(
         "semihosting-config",
         &[

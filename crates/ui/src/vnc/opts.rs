@@ -48,7 +48,7 @@ const VNC_OPT_DESCS: &[QemuOptDesc] = &[
 ];
 
 /// `qemu_vnc_opts`.
-pub(crate) fn opts_list() -> QemuOptsList {
+pub fn opts_list() -> QemuOptsList {
     QemuOptsList::new("vnc", VNC_OPT_DESCS).with_implied_opt_name("vnc")
 }
 

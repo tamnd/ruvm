@@ -172,7 +172,7 @@ fn fail_msg(msg: &str) -> Exit {
 }
 
 /// `qemu_mon_opts`.
-fn mon_opts() -> QemuOptsList {
+pub(crate) fn mon_opts() -> QemuOptsList {
     QemuOptsList::new(
         "mon",
         &[
@@ -185,7 +185,7 @@ fn mon_opts() -> QemuOptsList {
 }
 
 /// `qemu_mem_opts`.
-fn memory_opts() -> QemuOptsList {
+pub(crate) fn memory_opts() -> QemuOptsList {
     QemuOptsList::new(
         "memory",
         &[
@@ -199,7 +199,7 @@ fn memory_opts() -> QemuOptsList {
 }
 
 /// `qemu_name_opts`.
-fn name_opts() -> QemuOptsList {
+pub(crate) fn name_opts() -> QemuOptsList {
     QemuOptsList::new(
         "name",
         &[
@@ -207,9 +207,8 @@ fn name_opts() -> QemuOptsList {
                 .help("Sets the name of the guest.\nThis name will be displayed in the SDL window caption.\nThe name will also be used for the VNC server"),
             QemuOptDesc::new("process", QemuOptType::String)
                 .help("Sets the name of the QEMU process, as shown in top etc"),
-            QemuOptDesc::new("debug-threads", QemuOptType::Bool).help(
-                "When enabled, name the individual threads; defaults off.\nNOTE: The thread names are for debugging and not a\nstable API.",
-            ),
+            QemuOptDesc::new("debug-threads", QemuOptType::Bool)
+                .help("Enable thread names(deprecated, always enabled where supported)"),
         ],
     )
     .with_implied_opt_name("guest")
@@ -218,7 +217,7 @@ fn name_opts() -> QemuOptsList {
 
 /// `qemu_run_with_opts`.
 #[cfg(unix)]
-fn run_with_opts() -> QemuOptsList {
+pub(crate) fn run_with_opts() -> QemuOptsList {
     let mut desc = Vec::new();
     if cfg!(target_os = "linux") {
         desc.push(QemuOptDesc::new("async-teardown", QemuOptType::Bool));
