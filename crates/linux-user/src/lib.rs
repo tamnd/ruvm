@@ -58,6 +58,8 @@ mod host;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod procfs;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod riscv64;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod signal;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod start;
@@ -94,6 +96,7 @@ pub fn run(target: &str, argv0: &str, args: &[String]) -> Option<ExitCode> {
     match target {
         "x86_64" => return Some(start::main(argv0, args, &mut x86_64::Target::default())),
         "aarch64" => return Some(start::main(argv0, args, &mut aarch64::Target::default())),
+        "riscv64" => return Some(start::main(argv0, args, &mut riscv64::Target::default())),
         _ => {}
     }
     let _ = (target, argv0, args);

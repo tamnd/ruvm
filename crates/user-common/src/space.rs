@@ -238,9 +238,13 @@ impl GuestSpace {
         let block = Arc::new(RamBlock::from_memory("guest", mem, 12));
         let reserved_va = size - 1;
         let third = page_align(reserved_va / 3).unwrap_or(0);
-        let unmapped_base =
-            if task_unmapped_base < reserved_va { task_unmapped_base } else { third };
-        let et_dyn_base = if elf_et_dyn_base < reserved_va { elf_et_dyn_base } else { third * 2 };
+        // QEMU falls back for each base on its own, but when only ELF_ET_DYN_BASE is out of
+        // range (x86_64 and riscv64 in the default reservation) its replacement lands right on
+        // TASK_UNMAPPED_BASE: the stack then follows the executable and leaves brk no room.
+        // Falling back together keeps the two apart, in the kernel's order.
+        let fits = task_unmapped_base < reserved_va && elf_et_dyn_base < reserved_va;
+        let (unmapped_base, et_dyn_base) =
+            if fits { (task_unmapped_base, elf_et_dyn_base) } else { (third, third * 2) };
         Ok(GuestSpace {
             block,
             size,
@@ -642,8 +646,13 @@ mod tests {
         assert_eq!(s.et_dyn_base(), s.unmapped_base() * 2);
         let big = GuestSpace::new(1 << 46, TUB, TUB * 2).unwrap();
         if big.size() == 1 << 46 {
-            assert_eq!(big.unmapped_base(), TUB);
+            assert_eq!(big.unmapped_base(), 0x1555_5555_6000);
             assert_eq!(big.et_dyn_base(), 0x2aaa_aaaa_c000);
+        }
+        drop(big);
+        let fits = GuestSpace::new(1 << 46, TUB / 2, TUB).unwrap();
+        if fits.size() == 1 << 46 {
+            assert_eq!((fits.unmapped_base(), fits.et_dyn_base()), (TUB / 2, TUB));
         }
     }
 

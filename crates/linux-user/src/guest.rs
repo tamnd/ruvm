@@ -22,6 +22,8 @@ pub(crate) struct Guest {
     /// Whether the target has the system call numbers and structures of `asm-generic`
     /// (`struct stat`, `struct epoll_event`), which the host's differ from.
     pub(crate) generic_abi: bool,
+    /// Whether `struct sigaction` has `sa_restorer`, `TARGET_ARCH_HAS_SA_RESTORER`.
+    pub(crate) sa_restorer: bool,
     /// The `O_` flags whose target value differs from the host's, as `(target, host)`.
     pub(crate) open_flags: &'static [(u64, u64)],
     /// `/proc/cpuinfo`, when the target has its own, `open_cpuinfo()`.

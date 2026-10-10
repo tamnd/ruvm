@@ -693,7 +693,7 @@ pub(crate) fn process_pending_signals(space: &GuestSpace, t: &mut Task, cpu: &mu
 }
 
 /// `on_sig_stack()`.
-fn on_sig_stack(t: &Task, sp: u64) -> bool {
+pub(crate) fn on_sig_stack(t: &Task, sp: u64) -> bool {
     sp.wrapping_sub(t.altstack.0) < t.altstack.1
 }
 
@@ -776,11 +776,14 @@ fn do_sigaction(space: &GuestSpace, t: &Task, a: [u64; 6]) -> i64 {
     if a[3] != 8 {
         return -EINVAL;
     }
+    // handler, flags, restorer when the target has it, and mask.
+    let restorer = crate::guest::guest().sa_restorer;
+    let size = if restorer { 32 } else { 24 };
     let mut act = [0u8; 32];
-    if a[1] != 0 && !space.read(a[1], &mut act) {
+    if a[1] != 0 && !space.read(a[1], &mut act[..size]) {
         return -EFAULT;
     }
-    if a[2] != 0 && !space.check(a[2], 32, ruvm_user_common::page::WRITE) {
+    if a[2] != 0 && !space.check(a[2], size as u64, ruvm_user_common::page::WRITE) {
         return -EFAULT;
     }
     if !(1..=NSIG).contains(&sig) {
@@ -798,9 +801,11 @@ fn do_sigaction(space: &GuestSpace, t: &Task, a: [u64; 6]) -> i64 {
         let mut b = [0u8; 32];
         put64(&mut b, 0, k.handler);
         put64(&mut b, 8, k.flags);
-        put64(&mut b, 16, k.restorer);
-        put64(&mut b, 24, k.mask);
-        if !space.write(a[2], &b) {
+        if restorer {
+            put64(&mut b, 16, k.restorer);
+        }
+        put64(&mut b, size - 8, k.mask);
+        if !space.write(a[2], &b[..size]) {
             return -EFAULT;
         }
     }
@@ -810,8 +815,8 @@ fn do_sigaction(space: &GuestSpace, t: &Task, a: [u64; 6]) -> i64 {
     *k = Sigaction {
         handler: get64(&act, 0),
         flags: get64(&act, 8),
-        restorer: get64(&act, 16),
-        mask: get64(&act, 24),
+        restorer: if restorer { get64(&act, 16) } else { 0 },
+        mask: get64(&act, size - 8),
     };
     let host_sig = t2h(sig);
     if host_sig > NSIG {
