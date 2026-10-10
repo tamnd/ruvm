@@ -8,7 +8,7 @@ The tests come from the QEMU 11.1.0 source tree. QEMU itself was built from that
 
 Each qtest binary was run on its own, once with `QTEST_QEMU_BINARY` pointing at the QEMU build and once pointing at ruvm. libqtest takes the target from the binary name, so ruvm was reached through symlinks named `qemu-system-aarch64` and `qemu-system-riscv64`. The test list, environment and timeouts are the ones meson writes into `tests.json` for the `qtest-aarch64` and `qtest-riscv64` suites, and the counts below are read from the TAP output of each test.
 
-The ruvm binary was a release build of main at #224 plus the human monitor change that follows it. The riscv64 linux-user guest landed in #228 after these runs, so the linux-user numbers below are from before it and will be measured again.
+The ruvm binary was a release build of main at #224 plus the human monitor change that follows it, except for netdev-socket and the riscv64 linux-user tests, which were run again with a release build that has #239.
 
 A count is the number of TAP cases that passed. A test that registers no cases passes trivially with 0, and that is shown as 0 rather than as a pass, because it means the test found nothing in ruvm to run against.
 
@@ -47,8 +47,8 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | machine-none-test | 1 | 1 | |
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 0 | `-readconfig` is not supported |
-| netdev-socket | 10 | 0 | times out polling HMP `info network`, which ruvm lacks |
-| Total | 447 | 37 | |
+| netdev-socket | 10 | 10 | |
+| Total | 447 | 47 | |
 
 ## qtest-riscv64
 
@@ -67,8 +67,8 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | machine-none-test | 1 | 1 | |
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 0 | `-readconfig` is not supported |
-| netdev-socket | 10 | 0 | times out polling HMP `info network`, which ruvm lacks |
-| Total | 241 | 37 | |
+| netdev-socket | 10 | 10 | |
+| Total | 241 | 47 | |
 
 ## qmp-cmd-test and VNC
 
@@ -79,15 +79,15 @@ The QEMU build used for the tests has no VNC, so `qmp-cmd-test` is compiled to e
 | Suite | Reference | Reference passes | ruvm passes | Notes |
 |---|---|---|---|---|
 | riscv64-softmmu | QEMU 11.1 | 3 of 5 | 3 of 5 | the other two need TCG plugins, which neither build has |
-| riscv64-linux-user | qemu-riscv64 8.2.2 | 31 of 34 | 0 of 34 | ruvm measured before #228 |
+| riscv64-linux-user | qemu-riscv64 8.2.2 | 31 of 34 | 26 of 34 | ruvm measured with #239 |
 
-The QEMU 11.1 build here is softmmu only, so the linux-user reference is the distribution's qemu-riscv64 8.2.2. It fails `tb-link`, `test-mmap` and `linux-sigrtminmax`. The 12 gdbstub tests were skipped for both, because the host has no gdb with riscv64 support. ruvm before #228 printed "cannot run this program yet" for 33 of the 34 programs, since it had no riscv64 linux-user guest then.
+The QEMU 11.1 build here is softmmu only, so the linux-user reference is the distribution's qemu-riscv64 8.2.2. It fails `tb-link`, `test-mmap` and `linux-sigrtminmax`. The 12 gdbstub tests were skipped for both, because the host has no gdb with riscv64 support. ruvm passes `tb-link`, which 8.2.2 fails, and fails eight: `test-mmap` and `linux-sigrtminmax` like 8.2.2 (the second because ruvm does not take `-t`), `semihosting` (the semihosting call stops with SIGTRAP, and ruvm's linux-user does not take `-semihosting`), `signals` (`timer_create` returns ENOSYS), `linux-test` (`shmget` returns ENOSYS), `linux-madvise` (a file mapping reads back the wrong byte after `madvise`), and `linux-shmat-maps` and `linux-shmat-null` (no System V shared memory).
 
 ## What is left
 
 The largest gap by far is that `query-machines` lists only `none` on the aarch64 and riscv64 targets, although ruvm runs the `virt` machine on both. Most qtests choose their machines from that list, so bios-tables-test, cdrom-test on aarch64, qos-test, riscv-csr-test, arm-cpu-features, numa-test and migration-test register nothing or skip, and qom-test and test-hmp cover one machine instead of many. Listing `virt` is the next change, and it will show which of those tests then fail on `virt` itself.
 
-`-cdrom` and `-readconfig` are command line options ruvm does not take yet. netdev-socket starts its stream and dgram backends and then polls the human monitor's `info network` until the link shows up, and ruvm's human monitor has no `info network`, so the test runs into its timeout.
+`-cdrom` and `-readconfig` are command line options ruvm does not take yet. netdev-socket passes since HMP `info network` came in #234 and the stream netdev events in #239.
 
 The Xilinx, Raspberry Pi, Aspeed, Nuvoton and Kendryte K230 boards are not in ruvm. Those tests fail because the machine type is unknown. Each board is its own piece of work and none of them is planned for M6.
 
