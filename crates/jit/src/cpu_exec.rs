@@ -18,6 +18,7 @@
 //! - A block that was translated after a `tb_flush` done by `tb_gen_code()` itself is not
 //!   chained to the block that ran before, which no longer exists.
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -345,10 +346,38 @@ fn cpu_exec_loop(cpu: &mut Cpu<'_>) -> Result<i32, CpuLoopExit> {
     }
 }
 
+thread_local! {
+    /// QEMU's `current_cpu`, as the index of the vCPU this thread runs guest code for.
+    static CURRENT_CPU: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// The `cpu_index` of the vCPU whose guest code this thread is running, QEMU's
+/// `current_cpu->cpu_index`. Devices that bank registers per CPU, like the GICv2, use it to
+/// tell which CPU made an access. `None` outside [`cpu_exec`] and `cpu_exec_step_atomic()`.
+pub fn current_cpu_index() -> Option<usize> {
+    CURRENT_CPU.with(Cell::get)
+}
+
+/// Sets [`current_cpu_index`] for as long as it lives, then puts back the previous value.
+struct CurrentCpu(Option<usize>);
+
+impl CurrentCpu {
+    fn enter(cpu: &Cpu<'_>) -> CurrentCpu {
+        CurrentCpu(CURRENT_CPU.with(|c| c.replace(Some(cpu.shared().cpu_index))))
+    }
+}
+
+impl Drop for CurrentCpu {
+    fn drop(&mut self) {
+        CURRENT_CPU.with(|c| c.set(self.0));
+    }
+}
+
 /// `cpu_exec()`: run guest code until something makes the CPU stop. Returns an `EXCP_*` code:
 /// [`excp::HALTED`], [`excp::INTERRUPT`], [`excp::HLT`], [`excp::DEBUG`], [`excp::YIELD`],
 /// [`excp::ATOMIC`] or a target code at or above [`excp::INTERRUPT`].
 pub fn cpu_exec(cpu: &mut Cpu<'_>) -> i32 {
+    let _current = CurrentCpu::enter(cpu);
     if cpu_handle_halt(cpu) {
         return excp::HALTED;
     }
@@ -371,6 +400,7 @@ pub fn cpu_exec(cpu: &mut Cpu<'_>) -> i32 {
 /// `cpu_exec_step_atomic()`: run one instruction with every other vCPU stopped and without
 /// `CF_PARALLEL`, after a block left with [`excp::ATOMIC`].
 pub fn cpu_exec_step_atomic(cpu: &mut Cpu<'_>) {
+    let _current = CurrentCpu::enter(cpu);
     let jit = cpu.jit();
     let shared = cpu.shared();
     jit.start_exclusive();

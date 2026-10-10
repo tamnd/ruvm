@@ -30,10 +30,9 @@
 //!   models virt accepts fail with "... is not supported by ruvm yet", and so do the CPU
 //!   properties other than `sve-max-vq` and `pmu`.
 //! - The machine properties are taken only where their value describes the board that exists:
-//!   `gic-version=3`, `its`, `secure`, `virtualization`, `mte`, `ras=off`, `acpi`, `spcr`,
-//!   `x-oem-id`, `x-oem-table-id`, `iommu`, `default-bus-bypass-iommu`, `msi` other than
-//!   `gicv2m`, 32 virtio-mmio
-//!   transports and the `highmem*` properties. Other values fail with "... is not supported by ruvm yet". The
+//!   `gic-version=2` or `3`, `its`, `secure`, `virtualization`, `mte`, `ras=off`, `acpi`,
+//!   `spcr`, `x-oem-id`, `x-oem-table-id`, `iommu`, `default-bus-bypass-iommu`, `msi`, 32
+//!   virtio-mmio transports and the `highmem*` properties. Other values fail with "... is not supported by ruvm yet". The
 //!   board behaves as with `dtb-randomness=off` whatever that property says.
 //! - `-semihosting-config target=gdb` fails, since there is no gdbstub; `auto` and `native`
 //!   both mean native.
@@ -68,7 +67,9 @@ use ruvm_machine_arm::tcg_run::{
     VirtRunConfig, VirtTcgMachine,
 };
 use ruvm_machine_arm::virt::memmap::check_highmem_mmio_size;
-use ruvm_machine_arm::virt::{CpuTopology, Highmem, VirtConfig, VirtIommu, VirtMachine, VirtMsi};
+use ruvm_machine_arm::virt::{
+    CpuTopology, Highmem, VirtConfig, VirtGicVersion, VirtIommu, VirtMachine, VirtMsi,
+};
 use ruvm_qapi::events::event_reset;
 use ruvm_qapi::opts::{QemuOptDesc, QemuOptType, QemuOptsList};
 use ruvm_qapi::types::{
@@ -268,6 +269,9 @@ pub(crate) struct BoardOptions {
     pub highmem: Highmem,
     /// `msi`, or `its`, whichever came last.
     pub msi: VirtMsi,
+    /// `gic-version`. Without it ruvm uses a GICv3, where QEMU picks a GICv2 for TCG with at
+    /// most 8 CPUs.
+    pub gic_version: VirtGicVersion,
     /// `iommu`.
     pub iommu: VirtIommu,
     /// `default-bus-bypass-iommu`.
@@ -350,8 +354,7 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
         // The board always behaves as with dtb-randomness=off.
         "dtb-randomness" | "dtb-kaslr-seed" => prop_bool(name, value).map(drop),
         "gic-version" => match value {
-            "3" => Ok(()),
-            "2" | "4" | "5" | "host" | "max" => Err(not_supported(name, value)),
+            "4" | "5" | "host" | "max" => Err(not_supported(name, value)),
             _ => Err(Error::generic("Invalid gic-version value".to_string())
                 .hint("Valid values are 2, 3, 4, 5, host, and max.\n")),
         },
@@ -516,12 +519,19 @@ pub(crate) fn take_board_options(board: ArmBoard, machine: &QDict) -> Result<Boa
             "highmem-redists" => {
                 o.highmem.redists = prop_bool(name, &prop_string(name, value)?)?;
             }
-            // virt_set_msi() and virt_set_its(). its=off means no MSI controller with a GICv3.
+            // virt_set_gic_version().
+            "gic-version" => match prop_string(name, value)?.as_str() {
+                "2" => o.gic_version = VirtGicVersion::V2,
+                "3" => o.gic_version = VirtGicVersion::V3,
+                v => check_virt_prop(name, v)?,
+            },
+            // virt_set_msi() and virt_set_its(). its=off is the GICv2m with a GICv2 and no MSI
+            // controller with a GICv3.
             "msi" => {
                 o.msi = match prop_string(name, value)?.as_str() {
                     "auto" => VirtMsi::Auto,
                     "its" => VirtMsi::Its,
-                    "gicv2m" => return Err(not_supported(name, "gicv2m")),
+                    "gicv2m" => VirtMsi::Gicv2m,
                     "off" => VirtMsi::Off,
                     _ => {
                         return Err(Error::generic("Invalid msi value")
@@ -531,7 +541,7 @@ pub(crate) fn take_board_options(board: ArmBoard, machine: &QDict) -> Result<Boa
             }
             "its" => {
                 let on = prop_bool(name, &prop_string(name, value)?)?;
-                o.msi = if on { VirtMsi::Its } else { VirtMsi::Off };
+                o.msi = if on { VirtMsi::Its } else { VirtMsi::ItsOff };
             }
             // virt_set_iommu().
             "iommu" => {
@@ -1029,6 +1039,7 @@ pub(crate) fn start_board_tcg(
     cfg.mte = opts.mte;
     cfg.highmem = opts.highmem;
     cfg.msi = opts.msi;
+    cfg.gic_version = opts.gic_version;
     cfg.iommu = opts.iommu;
     cfg.default_bus_bypass_iommu = opts.default_bus_bypass_iommu;
     // machvirt_init() checks maxcpus against the redistributor space.
@@ -1283,7 +1294,18 @@ mod tests {
         let o = take_board_options(ArmBoard::Virt, &m).unwrap();
         assert_eq!(o.kernel.as_deref(), Some("k"));
         assert_eq!(o.dtb.as_deref(), Some("d.dtb"));
-        assert_eq!(o.msi, VirtMsi::Off);
+        assert_eq!(o.msi, VirtMsi::ItsOff);
+        assert_eq!(o.gic_version, VirtGicVersion::V3);
+        let mut m = QDict::new();
+        m.put("gic-version", "2");
+        let o = take_board_options(ArmBoard::Virt, &m).unwrap();
+        assert_eq!(o.gic_version, VirtGicVersion::V2);
+        let mut m = QDict::new();
+        m.put("gic-version", "max");
+        assert_eq!(
+            take_board_options(ArmBoard::Virt, &m).unwrap_err().message(),
+            "gic-version=max is not supported by ruvm yet"
+        );
         // msi and its set the same thing, and the last one wins.
         let msi = |props: &[(&str, &str)]| {
             let mut m = QDict::new();
@@ -1300,10 +1322,7 @@ mod tests {
         let e = msi(&[("msi", "foo")]).unwrap_err();
         assert_eq!(e.message(), "Invalid msi value");
         assert_eq!(e.hint_text(), Some("Valid values are auto, gicv2m, its, off\n"));
-        assert_eq!(
-            msi(&[("msi", "gicv2m")]).unwrap_err().message(),
-            "msi=gicv2m is not supported by ruvm yet"
-        );
+        assert_eq!(msi(&[("msi", "gicv2m")]).unwrap(), VirtMsi::Gicv2m);
         // virt_set_iommu().
         let iommu = |v: &str| {
             let mut m = QDict::new();

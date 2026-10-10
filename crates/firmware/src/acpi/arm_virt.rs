@@ -96,9 +96,31 @@ pub struct VirtMemmap {
     pub gic_redist2: Option<Window>,
     /// The ITS, `msi_controller == VIRT_MSI_CTRL_ITS`.
     pub gic_its: Option<u64>,
+    /// The CPU interfaces of a GICv2. With them the MADT has a version 2 distributor and no
+    /// redistributors or ITS.
+    pub gic_v2: Option<GicV2Bases>,
+    /// The GICv2m frame, `msi_controller == VIRT_MSI_CTRL_GICV2M`.
+    pub gic_v2m: Option<GicV2mFrame>,
     pub acpi_ged: u64,
     pub gpio: Window,
     pub mem: u64,
+}
+
+/// The GICv2 CPU interface regions, `VIRT_GIC_CPU`, `VIRT_GIC_VCPU` and `VIRT_GIC_HYP`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GicV2Bases {
+    pub cpu: u64,
+    pub vcpu: u64,
+    pub hyp: u64,
+}
+
+/// A GICv2m MSI frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GicV2mFrame {
+    pub base: u64,
+    /// The first SPI of the frame, as a GSI.
+    pub spi_base: u16,
+    pub spi_count: u16,
 }
 
 /// The interrupts of the devices, as GSIs (SPI number plus 32).
@@ -342,7 +364,7 @@ fn build_madt(tbl: &mut Vec<u8>, linker: &mut BiosLinker, s: &ArmVirtAcpi) {
     append_int_noprefix(tbl, 0, 4); // GIC ID
     append_int_noprefix(tbl, memmap.gic_dist, 8); // Physical Base Address
     append_int_noprefix(tbl, 0, 4); // System Vector Base
-    tbl.push(3); // GIC version
+    tbl.push(if memmap.gic_v2.is_some() { 2 } else { 3 }); // GIC version
     append_int_noprefix(tbl, 0, 3); // Reserved
 
     let vgic_interrupt = if s.virtualization { ARCH_GIC_MAINT_IRQ } else { 0 };
@@ -357,9 +379,10 @@ fn build_madt(tbl: &mut Vec<u8>, linker: &mut BiosLinker, s: &ArmVirtAcpi) {
         append_int_noprefix(tbl, 0, 4); // Parking Protocol Version
         append_int_noprefix(tbl, s.pmu_irq.into(), 4); // Performance Interrupt GSIV
         append_int_noprefix(tbl, 0, 8); // Parked Address
-        append_int_noprefix(tbl, 0, 8); // Physical Base Address
-        append_int_noprefix(tbl, 0, 8); // GICV
-        append_int_noprefix(tbl, 0, 8); // GICH
+        let v2 = memmap.gic_v2.unwrap_or_default();
+        append_int_noprefix(tbl, v2.cpu, 8); // Physical Base Address
+        append_int_noprefix(tbl, v2.vcpu, 8); // GICV
+        append_int_noprefix(tbl, v2.hyp, 8); // GICH
         append_int_noprefix(tbl, vgic_interrupt.into(), 4); // VGIC Maintenance interrupt
         append_int_noprefix(tbl, 0, 8); // GICR Base Address
         append_int_noprefix(tbl, mpidr, 8); // MPIDR
@@ -367,19 +390,32 @@ fn build_madt(tbl: &mut Vec<u8>, linker: &mut BiosLinker, s: &ArmVirtAcpi) {
         append_int_noprefix(tbl, 0, 3); // Reserved
     }
 
-    append_gicr(tbl, memmap.gic_redist);
-    if let Some(redist2) = memmap.gic_redist2 {
-        append_gicr(tbl, redist2);
+    if memmap.gic_v2.is_none() {
+        append_gicr(tbl, memmap.gic_redist);
+        if let Some(redist2) = memmap.gic_redist2 {
+            append_gicr(tbl, redist2);
+        }
+        if let Some(its) = memmap.gic_its {
+            // ACPI spec, Revision 6.0 Errata A (original 6.0 definition has invalid Length)
+            // 5.2.12.18 GIC ITS Structure
+            tbl.push(0xF); // Type
+            tbl.push(20); // Length
+            append_int_noprefix(tbl, 0, 2); // Reserved
+            append_int_noprefix(tbl, 0, 4); // GIC ITS ID
+            append_int_noprefix(tbl, its, 8); // Physical Base Address
+            append_int_noprefix(tbl, 0, 4); // Reserved
+        }
     }
-    if let Some(its) = memmap.gic_its {
-        // ACPI spec, Revision 6.0 Errata A (original 6.0 definition has invalid Length)
-        // 5.2.12.18 GIC ITS Structure
-        tbl.push(0xF); // Type
-        tbl.push(20); // Length
+    if let Some(v2m) = memmap.gic_v2m {
+        // 5.2.12.16 GIC MSI Frame Structure
+        tbl.push(0xD); // Type
+        tbl.push(24); // Length
         append_int_noprefix(tbl, 0, 2); // Reserved
-        append_int_noprefix(tbl, 0, 4); // GIC ITS ID
-        append_int_noprefix(tbl, its, 8); // Physical Base Address
-        append_int_noprefix(tbl, 0, 4); // Reserved
+        append_int_noprefix(tbl, 0, 4); // GIC MSI Frame ID
+        append_int_noprefix(tbl, v2m.base, 8); // Physical Base Address
+        append_int_noprefix(tbl, 1, 4); // Flags
+        append_int_noprefix(tbl, v2m.spi_count.into(), 2); // SPI Count
+        append_int_noprefix(tbl, v2m.spi_base.into(), 2); // SPI Base
     }
     table.end(Some(linker), tbl);
 }

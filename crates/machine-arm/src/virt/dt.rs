@@ -9,13 +9,15 @@ use ruvm_target_arm::cpu::ArmCpuModel;
 
 use super::{
     CpuTopology, MemMapEntry, VIRT_FLASH, VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE,
-    VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GIC_REDIST_SIZE, VIRT_GPIO_SIZE, VIRT_MMIO,
-    VIRT_MMIO_IRQ, VIRT_MMIO_SIZE, VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO,
-    VIRT_PCIE_PIO_SIZE, VIRT_PLATFORM_BUS, VIRT_PLATFORM_BUS_SIZE, VIRT_RTC, VIRT_RTC_IRQ,
-    VIRT_RTC_SIZE, VIRT_SECURE_MEM, VIRT_SECURE_MEM_SIZE, VIRT_SMMU, VIRT_SMMU_IRQ, VIRT_UART,
-    VIRT_UART_IRQ, VIRT_UART_SIZE, VIRT_UART1, VIRT_UART1_IRQ, VIRTIO_TRANSPORTS, VirtMemmap,
+    VIRT_GIC_CPU, VIRT_GIC_DIST, VIRT_GIC_HYP, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GIC_REDIST_SIZE,
+    VIRT_GIC_V2M, VIRT_GIC_VCPU, VIRT_GPIO_SIZE, VIRT_MMIO, VIRT_MMIO_IRQ, VIRT_MMIO_SIZE,
+    VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE, VIRT_PLATFORM_BUS,
+    VIRT_PLATFORM_BUS_SIZE, VIRT_RTC, VIRT_RTC_IRQ, VIRT_RTC_SIZE, VIRT_SECURE_MEM,
+    VIRT_SECURE_MEM_SIZE, VIRT_SMMU, VIRT_SMMU_IRQ, VIRT_UART, VIRT_UART_IRQ, VIRT_UART_SIZE,
+    VIRT_UART1, VIRT_UART1_IRQ, VIRTIO_TRANSPORTS, VirtMemmap,
 };
 use crate::fdt::{Fdt, sized_cells};
+use ruvm_hw_intc::gicv2m::GICV2M_SIZE;
 use ruvm_hw_intc::gicv3::{GICV3_DIST_SIZE, ITS_SIZE};
 use ruvm_hw_iommu::SMMU_SIZE;
 
@@ -88,10 +90,23 @@ pub(crate) fn create_fdt(fdt: &mut Fdt, secure: bool) -> Result<u32, String> {
     Ok(clock)
 }
 
-/// `fdt_add_timer_nodes()` for a GICv3. `ns_el2_virt_timer_irq` adds the EL2 virtual timer,
-/// which a CPU with EL2 and FEAT_VHE has.
-pub(crate) fn add_timer_nodes(fdt: &mut Fdt, ns_el2_virt_timer_irq: bool) -> Result<(), String> {
-    let irqflags = GIC_FDT_IRQ_FLAGS_LEVEL_HI;
+/// The flags cell of a PPI. With a GICv2, `gicv2_cpus` is the number of CPUs, whose mask goes
+/// in bits 8 to 15.
+fn ppi_flags(gicv2_cpus: Option<usize>) -> u32 {
+    match gicv2_cpus {
+        Some(n) => GIC_FDT_IRQ_FLAGS_LEVEL_HI | ((((1u32 << n) - 1) & 0xff) << 8),
+        None => GIC_FDT_IRQ_FLAGS_LEVEL_HI,
+    }
+}
+
+/// `fdt_add_timer_nodes()`. `ns_el2_virt_timer_irq` adds the EL2 virtual timer, which a CPU
+/// with EL2 and FEAT_VHE has, and `gicv2_cpus` is the CPU count with a GICv2.
+pub(crate) fn add_timer_nodes(
+    fdt: &mut Fdt,
+    ns_el2_virt_timer_irq: bool,
+    gicv2_cpus: Option<usize>,
+) -> Result<(), String> {
+    let irqflags = ppi_flags(gicv2_cpus);
     fdt.add_subnode("/timer")?;
     fdt.setprop("/timer", "compatible", b"arm,armv8-timer\0arm,armv7-timer\0")?;
     fdt.setprop("/timer", "always-on", &[])?;
@@ -270,11 +285,12 @@ pub(crate) fn virt_flash_fdt(fdt: &mut Fdt, secure: bool) -> Result<(), String> 
     }
 }
 
-/// `fdt_add_gic_node()` for a GICv3. `redist2` is the high memory redistributor region when
-/// the GIC uses it, and `virt` is `virtualization=on`, which describes the maintenance
-/// interrupt. Returns the GIC phandle.
+/// `fdt_add_gic_node()`. `v2` picks a GICv2, `redist2` is the high memory redistributor
+/// region when a GICv3 uses it, and `virt` is `virtualization=on`, which describes the
+/// maintenance interrupt. Returns the GIC phandle.
 pub(crate) fn add_gic_node(
     fdt: &mut Fdt,
+    v2: bool,
     redist2: Option<MemMapEntry>,
     virt: bool,
 ) -> Result<u32, String> {
@@ -288,6 +304,25 @@ pub(crate) fn add_gic_node(
     fdt.setprop_cell(&nodename, "#address-cells", 0x2)?;
     fdt.setprop_cell(&nodename, "#size-cells", 0x2)?;
     fdt.setprop(&nodename, "ranges", &[])?;
+    if v2 {
+        // "cortex-a15-gic" means a GICv2.
+        fdt.setprop_string(&nodename, "compatible", "arm,cortex-a15-gic")?;
+        let mut reg =
+            vec![(2, VIRT_GIC_DIST), (2, GICV3_DIST_SIZE), (2, VIRT_GIC_CPU), (2, 0x1_0000)];
+        if virt {
+            reg.extend([(2, VIRT_GIC_HYP), (2, 0x1_0000), (2, VIRT_GIC_VCPU), (2, 0x1_0000)]);
+        }
+        setprop_sized_cells(fdt, &nodename, "reg", &reg)?;
+        if virt {
+            fdt.setprop_cells(
+                &nodename,
+                "interrupts",
+                &[GIC_FDT_IRQ_TYPE_PPI, ARCH_GIC_MAINT_IRQ, GIC_FDT_IRQ_FLAGS_LEVEL_HI],
+            )?;
+        }
+        fdt.setprop_cell(&nodename, "phandle", gic)?;
+        return Ok(gic);
+    }
     fdt.setprop_string(&nodename, "compatible", "arm,gic-v3")?;
     fdt.setprop_cell(&nodename, "#redistributor-regions", 1 + u32::from(redist2.is_some()))?;
     let mut reg = vec![
@@ -324,14 +359,28 @@ pub(crate) fn add_its_node(fdt: &mut Fdt) -> Result<u32, String> {
     Ok(msi)
 }
 
+/// `fdt_add_v2m_gic_node()`: the GICv2m frame under the GIC node. Returns the MSI controller
+/// phandle.
+pub(crate) fn add_v2m_node(fdt: &mut Fdt) -> Result<u32, String> {
+    let msi = fdt.alloc_phandle();
+    let nodename = format!("/intc/v2m@{VIRT_GIC_V2M:x}");
+    fdt.add_subnode(&nodename)?;
+    fdt.setprop_string(&nodename, "compatible", "arm,gic-v2m-frame")?;
+    fdt.setprop(&nodename, "msi-controller", &[])?;
+    setprop_sized_cells(fdt, &nodename, "reg", &[(2, VIRT_GIC_V2M), (2, GICV2M_SIZE)])?;
+    fdt.setprop_cell(&nodename, "phandle", msi)?;
+    Ok(msi)
+}
+
 /// `fdt_add_pmu_nodes()` for a CPU with a PMU: its interrupt is PPI `VIRTUAL_PMU_IRQ`.
-pub(crate) fn add_pmu_node(fdt: &mut Fdt) -> Result<(), String> {
+/// `gicv2_cpus` is the CPU count with a GICv2.
+pub(crate) fn add_pmu_node(fdt: &mut Fdt, gicv2_cpus: Option<usize>) -> Result<(), String> {
     fdt.add_subnode("/pmu")?;
     fdt.setprop_string("/pmu", "compatible", "arm,armv8-pmuv3")?;
     fdt.setprop_cells(
         "/pmu",
         "interrupts",
-        &[GIC_FDT_IRQ_TYPE_PPI, super::cpus::PMU_PPI - 16, GIC_FDT_IRQ_FLAGS_LEVEL_HI],
+        &[GIC_FDT_IRQ_TYPE_PPI, super::cpus::PMU_PPI - 16, ppi_flags(gicv2_cpus)],
     )
 }
 
