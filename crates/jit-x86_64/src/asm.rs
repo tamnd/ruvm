@@ -124,6 +124,7 @@ pub(crate) mod op {
     pub(crate) const MOVD_VY_EY: u32 = 0x6e | P_EXT | P_DATA16;
     pub(crate) const MOVD_EY_VY: u32 = 0x7e | P_EXT | P_DATA16;
     pub(crate) const MOVDQA_VX_WX: u32 = 0x6f | P_EXT | P_DATA16;
+    pub(crate) const MOVDQA_WX_VX: u32 = 0x7f | P_EXT | P_DATA16;
     pub(crate) const MOVDQU_VX_WX: u32 = 0x6f | P_EXT | P_SIMDF3;
     pub(crate) const MOVDQU_WX_VX: u32 = 0x7f | P_EXT | P_SIMDF3;
     pub(crate) const MOVQ_VQ_WQ: u32 = 0x7e | P_EXT | P_SIMDF3;
@@ -154,6 +155,8 @@ pub(crate) mod op {
     pub(crate) const PCMPGTW: u32 = 0x65 | P_EXT | P_DATA16;
     pub(crate) const PCMPGTD: u32 = 0x66 | P_EXT | P_DATA16;
     pub(crate) const PCMPGTQ: u32 = 0x37 | P_EXT38 | P_DATA16;
+    pub(crate) const PEXTRD: u32 = 0x16 | P_EXT3A | P_DATA16;
+    pub(crate) const PINSRD: u32 = 0x22 | P_EXT3A | P_DATA16;
     pub(crate) const PMAXSB: u32 = 0x3c | P_EXT38 | P_DATA16;
     pub(crate) const PMAXSW: u32 = 0xee | P_EXT | P_DATA16;
     pub(crate) const PMAXSD: u32 = 0x3d | P_EXT38 | P_DATA16;
