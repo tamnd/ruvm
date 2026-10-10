@@ -126,7 +126,7 @@ ruvm-vmstate-macros = { version = "=0.5.5", path = "crates/vmstate-macros" }
 aes = "0.8.4"
 alsa = "0.12.1"
 arc-swap = "1.9.2"
-cast5 = "0.11.1"
+cast5 = "0.12.0"
 cipher = "0.4.4"
 des = "0.8.1"
 digest = "0.10.7"
