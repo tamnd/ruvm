@@ -23,6 +23,10 @@ allow = [
   # libloading, which clang-sys loads libclang with while bindgen writes the PipeWire bindings at
   # build time. ISC is a short permissive license in the MIT mould, and it never reaches the binary.
   "ISC",
+  # target-lexicon, which cfg-expr uses inside system-deps when the GTK and PipeWire features look
+  # up their system libraries at build time. It is Apache-2.0 with the LLVM exception, which only
+  # loosens Apache-2.0, and it never reaches the binary either.
+  "Apache-2.0 WITH LLVM-exception",
 ]
 confidence-threshold = 0.93
 
