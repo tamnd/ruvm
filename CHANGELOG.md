@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.5.5
+
+This patch brings the riscv64 guest to user mode for M7, and for M6 adds Arm KVM, the emulated GICv2, the macOS, Windows and PipeWire audio backends and a large step in the qtest work.
+
+For M7: `qemu-riscv64` runs riscv64 Linux programs on an x86_64 host (#228). On QEMU's tests/tcg riscv64 linux-user programs it passes 26 of 34, against 31 of 34 for qemu-riscv64 8.2.2. The 128-bit atomic loads and stores are now inlined as one vector access in the x86_64 backend (#238).
+
+For M6: KVM builds on AArch64 Linux with the in-kernel vGIC (#226), plus Arm vCPU setup, ONE_REG sync, the virtual timer and cpreg migration (#232). The emulated GICv2 and the GICv2m MSI frame are in (#236), and arm virt takes `gic-version=2` (#241). The `pipewire` (#229), `coreaudio` (#233) and `dsound` (#235) audiodevs are in behind their features. Like HVF and WHPX, the Arm KVM, coreaudio and dsound pieces are cross checked only until we have the hardware to run them on, which #227 tracks. On the qtest side, human-monitor-command gives QEMU's text replies (#231), `-netdev` works on machine none with HMP `info network` (#234), the stream netdev sends the connect and disconnect events (#239) and takes Linux abstract socket names (#242). docs/qtest-status.md now records the aarch64 and riscv64 qtest and tests/tcg results against QEMU (#230, #240). On aarch64 and riscv64, ruvm now passes 47 of the qtest programs, against 447 and 241 for QEMU, and the main gap left is `virt` under the qtest accelerator. Clippy is clean on macOS and Windows again and cargo deny accepts target-lexicon (#237).
+
 ## 0.5.4
 
 This patch adds the aarch64 guest to user mode for M7, and for M6 brings in the virtio input devices, the first host audio backends, the HVF and WHPX accelerators and the start of the qtest work.
