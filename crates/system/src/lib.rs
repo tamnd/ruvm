@@ -8,6 +8,7 @@
 mod arm;
 mod audio;
 mod display;
+mod info;
 mod migration;
 mod net;
 pub mod options;

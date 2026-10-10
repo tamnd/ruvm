@@ -228,6 +228,15 @@ impl BlockGraph {
             .collect()
     }
 
+    /// The nodes with a yank instance, which an NBD client registers as it opens, oldest first.
+    pub fn yank_nodes(&self) -> Vec<String> {
+        self.named_nodes()
+            .into_iter()
+            .filter(|n| n.driver_name == "nbd")
+            .map(|n| n.name.clone())
+            .collect()
+    }
+
     /// `graph_bdrv_states`: every live named node, in the order they were added.
     pub(crate) fn named_nodes(&self) -> Vec<Arc<Node>> {
         let nodes = self.nodes.lock().unwrap();

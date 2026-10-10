@@ -714,6 +714,16 @@ impl Chardevs {
         Ok(())
     }
 
+    /// The chardevs with a yank instance, which a socket chardev registers as it opens, oldest
+    /// first.
+    pub fn yank_instances(&self) -> Vec<String> {
+        lock(&self.list)
+            .iter()
+            .filter(|c| matches!(c.backend, Backend::Socket(_)))
+            .map(|c| c.label.clone())
+            .collect()
+    }
+
     /// `qmp_query_chardev()`. QEMU prepends each chardev to the list, so the newest comes
     /// first.
     pub fn query(&self) -> Vec<ChardevInfo> {

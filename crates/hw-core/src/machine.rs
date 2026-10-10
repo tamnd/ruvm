@@ -399,6 +399,11 @@ pub struct Machine {
 }
 
 impl Machine {
+    /// `ram_size`.
+    pub fn ram_size(&self) -> u64 {
+        lock(&state(&self.object).mem).ram_size
+    }
+
     /// Sets `ram_size` straight, as `qemu_resolve_machine_memdev()` does with the size of the
     /// backend.
     pub fn set_ram_size(&self, size: u64) {

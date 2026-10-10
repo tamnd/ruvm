@@ -39,7 +39,8 @@ use ruvm_monitor::object::{TYPE_MONITOR_HMP, TYPE_MONITOR_QMP, monitor_compat_id
 use ruvm_qapi::keyval::{keyval_merge, keyval_parse, keyval_parse_into};
 use ruvm_qapi::opts::{OptsHandle, QemuOptDesc, QemuOptType, QemuOptsList, is_help_option};
 use ruvm_qapi::types::{
-    DisplayOptions, MonitorMode, MonitorOptions, ObjectOptions, RunState, ShutdownCause,
+    Accelerator, DisplayOptions, MonitorMode, MonitorOptions, ObjectOptions, RunState,
+    ShutdownCause,
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit};
 use ruvm_qapi::{QDict, QValue, json};
@@ -68,7 +69,7 @@ fn have_tcg(target: &str) -> bool {
 
 /// The accelerators this build has for `target`. qtest is left out of `-accel help`, as in
 /// QEMU.
-fn accels(target: &str) -> &'static [&'static str] {
+pub(crate) fn accels(target: &str) -> &'static [&'static str] {
     match (have_kvm(target), have_tcg(target)) {
         (true, _) => &["kvm", "tcg", "qtest"],
         (false, true) => &["tcg", "qtest"],
@@ -107,6 +108,8 @@ pub struct Vm {
     incoming: Option<String>,
     /// The migration state, on a machine ruvm can migrate.
     pub(crate) migration: OnceLock<Migration>,
+    /// The accelerator `configure_accelerators()` picked.
+    pub(crate) accel: OnceLock<Accelerator>,
     machine_initialized: AtomicBool,
     /// `qtest_driver()`: a test drives the machine over `-qtest`.
     qtest: bool,
@@ -989,6 +992,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         autostart: Arc::new(AtomicBool::new(cfg.autostart)),
         incoming: cfg.incoming.clone(),
         migration: OnceLock::new(),
+        accel: OnceLock::new(),
         machine_initialized: AtomicBool::new(false),
         qtest: cfg.qtest.is_some(),
     });
@@ -1102,6 +1106,12 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         (None, None) => unreachable!("a QOM machine was created"),
     };
     let accel = configure_accelerators(p.target, kind, &mut cfg)?;
+    let _ = vm.accel.set(match &accel {
+        Accel::Qtest => Accelerator::Qtest,
+        Accel::Tcg(_) => Accelerator::Tcg,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        Accel::Kvm(_) => Accelerator::Kvm,
+    });
     let on_qtest = matches!(accel, Accel::Qtest);
     if (kind.is_some() && on_qtest) || (virt && (on_qtest || cfg.qtest.is_some())) {
         return Err(fail_msg(
