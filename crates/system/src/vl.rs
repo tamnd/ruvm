@@ -6,16 +6,19 @@
 //!
 //! ruvm behaves like a QEMU build with the `qtest` accelerator, the `none` machine and no
 //! displays, plus, for the x86 targets, the `microvm` and `q35` boards on `tcg` and, on Linux
-//! x86_64 hosts, `kvm`, and for aarch64 the `virt` board on `tcg`. Options for things that
-//! build would leave out fail with QEMU's own messages.
+//! x86_64 hosts, `kvm`, for aarch64 the `virt` board on `tcg`, and for riscv64 the `virt`
+//! board on `tcg` and `qtest`. Options for things that build would leave out fail with QEMU's
+//! own messages.
 //!
 //! Deliberate differences from QEMU:
 //!
 //! - Without `-accel` or `-machine accel=`, a build with both KVM and TCG tries `kvm:tcg`, so
 //!   KVM is used where it works and TCG otherwise (after QEMU's "falling back to tcg"). QEMU
 //!   picks `tcg:kvm` unless its program name ends in `kvm`.
-//! - virt does not run under qtest yet. The x86 boards take `-qtest` on kvm or tcg, but do
-//!   not run on the qtest accelerator.
+//! - The aarch64 virt board does not run under qtest yet. The x86 boards take `-qtest` on kvm
+//!   or tcg, but do not run on the qtest accelerator.
+//! - The `/machine` object of riscv64 virt has only the generic machine properties. The board
+//!   itself is built outside QOM from the `-machine` options.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -355,6 +358,9 @@ fn run(p: &Personality<'_>, args: &[String]) -> Flow<u8> {
     ruvm_hostmem::region::register_types(&registry);
     ruvm_hostmem::register_types(&registry, &regions);
     ruvm_hw_core::register_types(&registry);
+    if riscv::is_riscv(p.target) {
+        riscv::register_types(&registry);
+    }
     qtest::register_types(&registry);
     ruvm_chardev::qom::register_types(&registry);
     register_accel_types(&registry, p.target);
@@ -1052,6 +1058,15 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             (None, Some(vm.machine.get_or_init(|| machine)))
         }
     };
+    // qemu_create_machine() for a board built outside QOM: the `/machine` object with its
+    // containers, and the I/O address space a `-qtest` client sees. The board has its own
+    // system memory.
+    let board_machine = if rv_virt {
+        let typename = machine_type_name("virt");
+        Some(create_machine(&vm.registry, &typename, &vm.regions).map_err(|e| fail(&e))?)
+    } else {
+        None
+    };
     // cpr_state_load(): before any device, which may need the descriptors.
     if let Some(c) = &cfg.incoming_cpr {
         ruvm_migration::cpr::state_load(&c.addr).map_err(|e| fail(&e))?;
@@ -1126,7 +1141,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         Accel::Kvm(_) => Accelerator::Kvm,
     });
     let on_qtest = matches!(accel, Accel::Qtest);
-    if (kind.is_some() && on_qtest) || (virt && (on_qtest || cfg.qtest.is_some())) {
+    if (kind.is_some() && on_qtest) || (arm_board.is_some() && (on_qtest || cfg.qtest.is_some())) {
         return Err(fail_msg(
             "this machine type is only supported with -accel kvm or tcg by ruvm yet",
         ));
@@ -1146,7 +1161,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
                 chrdev,
                 cfg.qtest_log.as_deref(),
                 p.target,
-                clock,
+                Arc::clone(&clock),
                 machine,
             )
             .map_err(|e| fail(&e))?;
@@ -1190,7 +1205,12 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         if cfg.preconfig {
             return Err(fail_msg("-preconfig is not supported with this machine by ruvm yet"));
         }
-        let Accel::Tcg(tcg) = accel else { unreachable!("checked above") };
+        let accel = match accel {
+            Accel::Tcg(tcg) => riscv::BoardAccel::Tcg(tcg),
+            Accel::Qtest => riscv::BoardAccel::Qtest(Arc::clone(&clock)),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Accel::Kvm(_) => unreachable!("no KVM for this target"),
+        };
         let args = riscv::RiscvArgs {
             cpu: cfg.x86.cpu.as_deref(),
             no_reboot: cfg.x86.no_reboot,
@@ -1200,12 +1220,30 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             firmware: cfg.x86.firmware(),
         };
         let running =
-            riscv::start_board_tcg(&vm, tcg, opts, &args, &serial_hds).map_err(|errors| {
+            riscv::start_board(&vm, accel, opts, &args, &serial_hds).map_err(|errors| {
                 for e in &errors {
                     e.report();
                 }
                 Exit(1)
             })?;
+        // qtest_server_init()
+        if let (Some(chrdev), Some(m)) = (&cfg.qtest, &board_machine) {
+            let log = cfg.qtest_log.as_deref();
+            let io = Arc::clone(&m.address_space_io);
+            let clock = on_qtest.then(|| Arc::clone(&clock));
+            let a = qtest::server_init_board(
+                &chardevs,
+                chrdev,
+                log,
+                p.target,
+                running.memory(),
+                io,
+                clock,
+            )
+            .map_err(|e| fail(&e))?;
+            qtest::add_object(&m.object, log).map_err(|e| fail(&e))?;
+            keep._qtest = Some(a);
+        }
         keep.riscv_board = Some(running);
     } else if let Some(opts) = virt_opts {
         if cfg.preconfig {
@@ -1244,8 +1282,10 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
                 if let (Some(chrdev), Some(board)) = (&cfg.qtest, &keep.board) {
                     let (memory, io) = board.address_spaces();
                     let log = cfg.qtest_log.as_deref();
-                    let a = qtest::server_init_board(&chardevs, chrdev, log, p.target, memory, io)
-                        .map_err(|e| fail(&e))?;
+                    let a = qtest::server_init_board(
+                        &chardevs, chrdev, log, p.target, memory, io, None,
+                    )
+                    .map_err(|e| fail(&e))?;
                     keep._qtest = Some(a);
                 }
             }

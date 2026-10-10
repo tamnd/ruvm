@@ -14,7 +14,9 @@ pub mod machine;
 pub mod timer;
 
 pub use irq::{IrqLine, IrqPin};
-pub use machine::{Machine, MachineClassInfo, create_machine, machine_class_info};
+pub use machine::{
+    Machine, MachineClassInfo, create_machine, machine_class_info, register_machine_type,
+};
 pub use timer::{Clock, Timer};
 
 /// Registers the bus and machine types.

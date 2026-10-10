@@ -8,7 +8,7 @@ The tests come from the QEMU 11.1.0 source tree. QEMU itself was built from that
 
 Each qtest binary was run on its own, once with `QTEST_QEMU_BINARY` pointing at the QEMU build and once pointing at ruvm. libqtest takes the target from the binary name, so ruvm was reached through symlinks named `qemu-system-aarch64` and `qemu-system-riscv64`. The test list, environment and timeouts are the ones meson writes into `tests.json` for the `qtest-aarch64` and `qtest-riscv64` suites, and the counts below are read from the TAP output of each test.
 
-The ruvm binary was a release build of main at #224 plus the human monitor change that follows it, except for netdev-socket and the riscv64 linux-user tests, which were run again with a release build that has #239.
+The ruvm binary was a release build of main at #224 plus the human monitor change that follows it, except for netdev-socket and the riscv64 linux-user tests, which were run again with a release build that has #239. The qtest-riscv64 suite was run again with the change that runs riscv64 `virt` under the qtest accelerator.
 
 A count is the number of TAP cases that passed. A test that registers no cases passes trivially with 0, and that is shown as 0 rather than as a pass, because it means the test found nothing in ruvm to run against.
 
@@ -54,21 +54,21 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 
 | Test | QEMU | ruvm | Why ruvm is short |
 |---|---|---|---|
-| bios-tables-test | 3 | 0 | registers no cases: needs `virt` |
-| qom-test | 13 | 2 | one case per machine, and ruvm lists only `none` |
+| bios-tables-test | 3 | 0 | registers no cases, see below |
+| qom-test | 13 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | device-introspect-test | 6 | 6 | |
 | cdrom-test | 1 | 0 | `-cdrom` is not supported |
-| test-hmp | 13 | 2 | one case per machine |
+| test-hmp | 13 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | qmp-cmd-test | 59 | 17 | stops at `query-vnc`, see below |
-| qos-test | 113 (5 skipped) | 0 | registers no cases: needs `virt` |
-| riscv-csr-test | 1 | 0 | registers no cases: needs `virt` |
-| iommu-riscv-test | 4 | 0 (4 skipped) | skipped: "virt machine not available" |
+| qos-test | 113 (5 skipped) | 0 | registers no cases, see below |
+| riscv-csr-test | 1 | 0 | no `veyron-v1` CPU model |
+| iommu-riscv-test | 4 | 0 | `-net none` is not supported, and there is no `riscv-iommu-pci` or `iommu-testdev` |
 | k230-wdt-test | 7 | 0 | no `k230` board |
 | machine-none-test | 1 | 1 | |
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 0 | `-readconfig` is not supported |
 | netdev-socket | 10 | 10 | |
-| Total | 241 | 47 | |
+| Total | 241 | 49 | |
 
 ## qmp-cmd-test and VNC
 
@@ -85,7 +85,9 @@ The QEMU 11.1 build here is softmmu only, so the linux-user reference is the dis
 
 ## What is left
 
-The largest gap by far is that `query-machines` lists only `none` on the aarch64 and riscv64 targets, although ruvm runs the `virt` machine on both. Most qtests choose their machines from that list, so bios-tables-test, cdrom-test on aarch64, qos-test, riscv-csr-test, arm-cpu-features, numa-test and migration-test register nothing or skip, and qom-test and test-hmp cover one machine instead of many. Listing `virt` is the next change, and it will show which of those tests then fail on `virt` itself.
+On riscv64, `virt` now runs under the qtest accelerator with no harts and with its timers on the qtest clock, has a `/machine` object, and is listed in `query-machines` with the values QEMU 11.1 gives. qom-test and test-hmp pass on it. qos-test and bios-tables-test still register no cases, and riscv-csr-test and iommu-riscv-test now start and fail on the CPU model and the devices they ask for.
+
+On aarch64, `query-machines` still lists only `none`, although ruvm runs the `virt` machine on TCG. Most qtests choose their machines from that list, so bios-tables-test, cdrom-test, qos-test, arm-cpu-features, numa-test and migration-test register nothing or skip, and qom-test and test-hmp cover one machine instead of many. Running aarch64 `virt` under the qtest accelerator is the next change.
 
 `-cdrom` and `-readconfig` are command line options ruvm does not take yet. netdev-socket passes since HMP `info network` came in #234 and the stream netdev events in #239.
 

@@ -224,9 +224,10 @@ pub fn server_init(
     serve(chardevs, chrdev, log, machine)
 }
 
-/// `qtest_server_init()` for a board that a real accelerator runs, with its system memory and
-/// I/O address spaces. The test reads and writes guest memory and ports through the protocol,
-/// but the clock commands are not there, as in QEMU when `qtest_enabled()` is false.
+/// `qtest_server_init()` for a board, with its system memory and I/O address spaces. The test
+/// reads and writes guest memory and ports through the protocol. `clock` is the virtual clock
+/// of the qtest accelerator. On a real accelerator it is `None` and the clock commands are not
+/// there, as in QEMU when `qtest_enabled()` is false.
 pub fn server_init_board(
     chardevs: &Chardevs,
     chrdev: &str,
@@ -234,8 +235,9 @@ pub fn server_init_board(
     target: &str,
     memory: Arc<AddressSpace>,
     io: Arc<AddressSpace>,
+    clock: Option<Arc<VirtualClock>>,
 ) -> Result<Attachment> {
-    let machine = NoneMachine { big_endian: target_big_endian(target), clock: None, memory, io };
+    let machine = NoneMachine { big_endian: target_big_endian(target), clock, memory, io };
     serve(chardevs, chrdev, log, machine)
 }
 

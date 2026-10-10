@@ -346,13 +346,18 @@ pub(crate) fn register_types(registry: &Registry) {
         .class_init(machine_class_init);
     registry.register(machine);
     for info in MACHINES {
-        let ext = info.clone();
-        registry.register(
-            TypeInfo::new(machine_type_name(info.name))
-                .parent(TYPE_MACHINE)
-                .class_init(move |k| k.set_ext(ext.clone())),
-        );
+        register_machine_type(registry, info.clone());
     }
+}
+
+/// Registers the machine type `info` describes, `MACHINE_TYPE_NAME(name)` under
+/// `TYPE_MACHINE`. The boards built outside QOM use it for their `/machine` object.
+pub fn register_machine_type(registry: &Registry, info: MachineClassInfo) {
+    registry.register(
+        TypeInfo::new(machine_type_name(info.name))
+            .parent(TYPE_MACHINE)
+            .class_init(move |k| k.set_ext(info.clone())),
+    );
 }
 
 /// `unassigned_io_ops`: I/O ports nobody claimed read as all ones and ignore writes.
