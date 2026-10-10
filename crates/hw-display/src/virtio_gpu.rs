@@ -24,8 +24,6 @@
 //! - The cursor image is kept but not handed to the UI, which has no cursor define call yet. The
 //!   cursor position goes to the console with `qemu_console_set_mouse()` as in QEMU.
 //! - Commands run when the queue is kicked, not from a bottom half.
-//! - Without a config notifier (virtio-gpu-device on Arm virt) the config interrupt for a UI
-//!   size change is raised at the next queue kick instead of at once.
 //! - `blob=on` fails with "need rutabaga or udmabuf for blob resources", as on a host without
 //!   udmabuf. virgl, rutabaga, `hostmem`, `outputs` and the statistics are not ported.
 //! - The guest errors QEMU logs with `qemu_log_mask(LOG_GUEST_ERROR)` are not printed.
