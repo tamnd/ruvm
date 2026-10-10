@@ -217,11 +217,24 @@ pub(crate) fn random16() -> [u8; 16] {
     b
 }
 
-/// `sysconf(_SC_NPROCESSORS_ONLN)`, the processors `/proc/cpuinfo` lists.
+/// `sysconf(_SC_NPROCESSORS_ONLN)`, the processors `/proc/cpuinfo` lists. glibc counts the
+/// ranges in `/sys/devices/system/cpu/online`, so this does the same.
 pub(crate) fn online_cpus() -> u64 {
-    // SAFETY: sysconf has no preconditions.
-    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    u64::try_from(n).unwrap_or(1).max(1)
+    std::fs::read_to_string("/sys/devices/system/cpu/online").map_or(1, |s| count_cpus(&s))
+}
+
+/// The CPUs in a sysfs list such as `0-3,8,10-11`, at least one.
+fn count_cpus(list: &str) -> u64 {
+    let mut n = 0;
+    for r in list.trim().split(',') {
+        let mut it = r.splitn(2, '-').map(|v| v.parse::<u64>().ok());
+        n += match (it.next().flatten(), it.next()) {
+            (Some(_), None) => 1,
+            (Some(a), Some(Some(b))) if b >= a => b - a + 1,
+            _ => 0,
+        };
+    }
+    n.max(1)
 }
 
 /// The end of `dump_core_and_abort()`: no host core dump, then `sig` with its default action.
@@ -240,4 +253,17 @@ pub(crate) fn die_with_signal(sig: i32) -> ! {
     let pid = sys(libc::SYS_getpid, &[]);
     sys(libc::SYS_kill, &[pid as u64, sig as u64]);
     std::process::abort()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::count_cpus;
+
+    #[test]
+    fn sysfs_cpu_lists() {
+        assert_eq!(count_cpus("0\n"), 1);
+        assert_eq!(count_cpus("0-63\n"), 64);
+        assert_eq!(count_cpus("0-3,8,10-11\n"), 7);
+        assert_eq!(count_cpus(""), 1);
+    }
 }
