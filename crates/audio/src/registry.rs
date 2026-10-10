@@ -20,12 +20,19 @@ use ruvm_qapi::types::{
 use crate::alsa::AlsaDriver;
 use crate::engine::AudioBackend;
 use crate::none::NoneDriver;
+#[cfg(feature = "audio-pa")]
+use crate::pa::PaDriver;
 use crate::pcm::{Driver, Pdo};
 use crate::wav::WavDriver;
 
-/// `audio_prio_list`: the drivers a default audiodev is tried with, in order. `none` always
-/// works, so it comes last.
-const PRIO_LIST: &[AudiodevDriver] = &[AudiodevDriver::None];
+/// `audio_prio_list`: the drivers a default audiodev is tried with, in order. QEMU builds it
+/// from the drivers it has out of pa, coreaudio, dsound, sndio and oss. `none` always works, so
+/// it comes last.
+const PRIO_LIST: &[AudiodevDriver] = &[
+    #[cfg(feature = "audio-pa")]
+    AudiodevDriver::Pa,
+    AudiodevDriver::None,
+];
 
 struct Reg {
     audiodevs: Vec<Audiodev>,
@@ -59,6 +66,8 @@ fn driver_for(driver: AudiodevDriver) -> Option<Box<dyn Driver>> {
         AudiodevDriver::Dbus => None,
         #[cfg(feature = "audio-alsa")]
         AudiodevDriver::Alsa => Some(Box::new(AlsaDriver)),
+        #[cfg(feature = "audio-pa")]
+        AudiodevDriver::Pa => Some(Box::new(PaDriver::default())),
     }
 }
 
@@ -112,6 +121,8 @@ macro_rules! per_direction {
 
 #[cfg(feature = "audio-alsa")]
 per_direction!(ruvm_qapi::types::AudiodevAlsaPerDirectionOptions);
+#[cfg(feature = "audio-pa")]
+per_direction!(ruvm_qapi::types::AudiodevPaPerDirectionOptions);
 
 /// The base `in` and `out` options of an audiodev, whatever its driver.
 fn pdos(
@@ -130,6 +141,8 @@ fn pdos(
         AudiodevU::Dbus(o) => base(&o.in_, &o.out),
         #[cfg(feature = "audio-alsa")]
         AudiodevU::Alsa(o) => base(&o.in_, &o.out),
+        #[cfg(feature = "audio-pa")]
+        AudiodevU::Pa(o) => base(&o.in_, &o.out),
     }
 }
 
@@ -172,6 +185,8 @@ pub fn validate_opts(dev: &mut Audiodev) -> Result<()> {
         AudiodevU::Dbus(o) => validate(&mut o.in_, &mut o.out)?,
         #[cfg(feature = "audio-alsa")]
         AudiodevU::Alsa(o) => validate(&mut o.in_, &mut o.out)?,
+        #[cfg(feature = "audio-pa")]
+        AudiodevU::Pa(o) => validate(&mut o.in_, &mut o.out)?,
     }
     dev.timer_period.get_or_insert(10000);
     Ok(())
@@ -210,9 +225,10 @@ pub fn create_default_audiodevs() {
 /// `audio_be_new()`.
 fn be_new(dev: Audiodev, clock: Option<&Arc<Clock>>, running: bool) -> Result<Arc<AudioBackend>> {
     let drv = dev.u.tag();
-    let Some(driver) = driver_for(drv) else {
+    let Some(mut driver) = driver_for(drv) else {
         return Err(Error::generic(format!("Unknown audio driver `{}'", drv.as_str())));
     };
+    driver.realize(&dev)?;
     let (pin, pout) = pdos(&dev.u);
     let pdo_in = Pdo::from_qapi(&pin.unwrap_or_default());
     let pdo_out = Pdo::from_qapi(&pout.unwrap_or_default());
@@ -346,7 +362,9 @@ pub fn vm_state_change(running: bool) {
     }
 }
 
-/// `audio_cleanup()`: closes every backend, which finishes files such as the WAVE header.
+/// `audio_cleanup()`: drops the list of backends. QEMU unparents them, so only a backend no
+/// device holds any more is finalized and has its voices closed. One a device still uses stays
+/// open until the process exits, which leaves a WAVE header unfinished as on QEMU.
 pub fn cleanup() {
     let backends = {
         let mut r = reg();
@@ -354,7 +372,9 @@ pub fn cleanup() {
         std::mem::take(&mut r.backends)
     };
     for be in backends {
-        be.shutdown();
+        if Arc::strong_count(&be) == 1 {
+            be.shutdown();
+        }
     }
 }
 

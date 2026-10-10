@@ -62,6 +62,8 @@ ui-gtk = ["ruvm-qapi/ui-gtk", "ruvm-ui/ui-gtk"]
 ui-dbus = ["ruvm-audio/ui-dbus", "ruvm-qapi/ui-dbus", "ruvm-ui/ui-dbus"]
 # -audiodev alsa, over the system's ALSA library.
 audio-alsa = ["ruvm-audio/audio-alsa", "ruvm-qapi/audio-alsa"]
+# -audiodev pa, over the system's PulseAudio client library.
+audio-pa = ["ruvm-audio/audio-pa", "ruvm-qapi/audio-pa"]
 # -display cocoa on macOS, over the system's AppKit.
 ui-cocoa = ["ruvm-qapi/ui-cocoa", "ruvm-ui/ui-cocoa"]
 

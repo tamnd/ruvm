@@ -104,8 +104,10 @@ pub(crate) fn parse_audio(arg: &str) -> std::result::Result<(), u8> {
 }
 
 /// The audio half of `qemu_create_early_backends()`: a backend for every `-audiodev`, then the
-/// default audiodevs unless the command line set up audio itself or gave `-nodefaults`.
-pub(crate) fn create_early_backends(has_defaults: bool) -> Result<()> {
+/// default audiodevs unless the command line set up audio itself or gave `-nodefaults`. `name`
+/// is the guest name of `-name`, which the sound server drivers report.
+pub(crate) fn create_early_backends(has_defaults: bool, name: Option<&str>) -> Result<()> {
+    ruvm_audio::set_application_name(name);
     registry::init_audiodevs()?;
     if has_defaults && DEFAULT_AUDIO.load(Ordering::Relaxed) {
         registry::create_default_audiodevs();

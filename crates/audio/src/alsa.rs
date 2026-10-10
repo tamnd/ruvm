@@ -5,8 +5,6 @@
 //! poll descriptors of the PCM when `try-poll` is on; that mode is not here, so the timer runs
 //! every voice whatever `try-poll` says.
 
-use std::io::Write;
-
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 use ruvm_base::error::strerror;
@@ -14,8 +12,8 @@ use ruvm_base::report::{error_report, warn_report};
 use ruvm_qapi::types::{AudioFormat, AudiodevAlsaPerDirectionOptions, AudiodevU};
 
 use crate::pcm::{
-    AudSettings, Driver, HwCore, HwInit, InitCtx, PcmIn, PcmInfo, PcmOut, generic_buffer_get_free,
-    generic_run_buffer_in, generic_run_buffer_out,
+    AudSettings, Driver, HwCore, HwInit, InitCtx, PcmIn, PcmInfo, PcmOut, error_printf,
+    generic_buffer_get_free, generic_run_buffer_in, generic_run_buffer_out,
 };
 
 /// The `alsa` driver.
@@ -34,13 +32,6 @@ fn snd_strerror(errno: i32) -> String {
         500_001 => "Lisp encountered an error during acall".to_string(),
         e => strerror(&std::io::Error::from_raw_os_error(e)),
     }
-}
-
-/// `error_printf()`: text on stderr with no program name in front.
-fn error_printf(s: &str) {
-    let mut err = std::io::stderr().lock();
-    let _ = err.write_all(s.as_bytes());
-    let _ = err.flush();
 }
 
 /// `alsa_logerr()`.

@@ -32,6 +32,8 @@ ui-gtk = []
 ui-dbus = []
 # The types of -audiodev alsa.
 audio-alsa = []
+# The types of -audiodev pa.
+audio-pa = []
 # The types and commands of -display cocoa, which are there only on macOS.
 ui-cocoa = []
 

@@ -72,7 +72,8 @@ fn channel_2_plays_a_square_wave_into_a_wav_file() {
     spk.io_write(true, false);
     run(&clock, 300, 400);
 
-    registry::cleanup();
+    // The card still holds the backend, so registry::cleanup() would leave it open.
+    registry::be_by_name("snd0").unwrap().shutdown();
     let data = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     assert_eq!(&data[22..24], &1u16.to_le_bytes());

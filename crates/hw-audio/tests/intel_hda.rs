@@ -230,7 +230,8 @@ fn stream_4_plays_the_buffers_into_a_wav_file() {
     assert_eq!(level.load(Ordering::SeqCst), 0);
     wr(m, SD4, 4, 1 << 20);
 
-    registry::cleanup();
+    // The card still holds the backend, so registry::cleanup() would leave it open.
+    registry::be_by_name("snd0").unwrap().shutdown();
     let data = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     assert_eq!(&data[22..24], &2u16.to_le_bytes());

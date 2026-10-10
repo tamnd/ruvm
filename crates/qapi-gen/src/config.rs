@@ -32,7 +32,7 @@ const CONDITIONS: &[(&str, Rule)] = &[
     ("CONFIG_AUDIO_DSOUND", Rule::Off),
     ("CONFIG_AUDIO_JACK", Rule::Off),
     ("CONFIG_AUDIO_OSS", Rule::Off),
-    ("CONFIG_AUDIO_PA", Rule::Off),
+    ("CONFIG_AUDIO_PA", Rule::Feature("audio-pa")),
     ("CONFIG_AUDIO_PIPEWIRE", Rule::Off),
     ("CONFIG_AUDIO_SDL", Rule::Off),
     ("CONFIG_AUDIO_SNDIO", Rule::Off),

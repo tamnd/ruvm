@@ -1069,7 +1069,8 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     } else {
         parse_drives(kind, &cfg.x86.drives)?
     };
-    crate::audio::create_early_backends(cfg.x86.has_defaults).map_err(|e| fail(&e))?;
+    crate::audio::create_early_backends(cfg.x86.has_defaults, vm.name.as_deref())
+        .map_err(|e| fail(&e))?;
 
     // qemu_apply_legacy_machine_options() and qemu_apply_machine_options()
     let memdev = apply_legacy_machine_options(&mut cfg)?;
