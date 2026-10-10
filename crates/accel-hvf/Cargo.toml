@@ -11,9 +11,10 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+unsafe-budget = 51
 
 [dependencies]
+ruvm-mem.workspace = true
 
 [lints]
 workspace = true

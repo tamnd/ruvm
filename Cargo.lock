@@ -1334,6 +1334,9 @@ dependencies = [
 [[package]]
 name = "ruvm-accel-hvf"
 version = "0.5.3"
+dependencies = [
+ "ruvm-mem",
+]
 
 [[package]]
 name = "ruvm-accel-kvm"
