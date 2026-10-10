@@ -105,6 +105,8 @@ pub const PCI_CLASS_NETWORK_ETHERNET: u16 = 0x0200;
 pub const PCI_BASE_CLASS_NETWORK: u16 = 0x02;
 /// `PCI_CLASS_DISPLAY_OTHER`.
 pub const PCI_CLASS_DISPLAY_OTHER: u16 = 0x0380;
+/// `PCI_CLASS_MULTIMEDIA_AUDIO`.
+pub const PCI_CLASS_MULTIMEDIA_AUDIO: u16 = 0x0401;
 /// `PCI_CLASS_COMMUNICATION_OTHER`.
 pub const PCI_CLASS_COMMUNICATION_OTHER: u16 = 0x0780;
 
@@ -256,6 +258,8 @@ fn device_table(id: u16) -> (Option<u16>, u16, Option<&'static str>) {
         16 => (None, PCI_CLASS_DISPLAY_OTHER, Some("virtio-gpu")),
         19 => (None, PCI_CLASS_COMMUNICATION_OTHER, Some("vhost-vsock")),
         20 => (None, PCI_CLASS_OTHERS, Some("virtio-crypto")),
+        // virtio-sound-pci sets its class in its class_init too.
+        25 => (None, PCI_CLASS_MULTIMEDIA_AUDIO, Some("virtio-sound")),
         26 => (None, PCI_CLASS_STORAGE_OTHER, Some("vhost-user-fs")),
         _ => (None, PCI_CLASS_OTHERS, None),
     }

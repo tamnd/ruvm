@@ -2,7 +2,7 @@
 
 //! The audio parts of system/vl.c: `-audiodev`, `-audio`, creating the backends before the
 //! machine, and `query-audiodevs`. It also plans and realizes the sound cards of `-device`
-//! and `-audio model=`.
+//! and `-audio model=`, virtio-sound-pci among them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -13,10 +13,14 @@ use ruvm_base::{Error, Result};
 use ruvm_hw_audio::{
     Ac97, HdaCodecKind, IntelHda, IsaDma, PcSpkAudio, Sb16, Sb16Config, TYPE_AC97, TYPE_HDA_DUPLEX,
     TYPE_HDA_MICRO, TYPE_HDA_OUTPUT, TYPE_ICH9_INTEL_HDA, TYPE_INTEL_HDA, TYPE_SB16,
+    TYPE_VIRTIO_SND_PCI, VirtioSnd, VirtioSndConf,
 };
 use ruvm_hw_core::fw_cfg::DmaMemory;
 use ruvm_hw_core::timer::Clock;
-use ruvm_machine_x86::X86Board;
+use ruvm_hw_virtio::{
+    AddressSpaceMemory, SharedGuestMemory, VirtIODevice, VirtioBackend, VirtioPci, VirtioPciProps,
+};
+use ruvm_machine_x86::{Q35, X86Board};
 use ruvm_mem::AddressSpace;
 use ruvm_monitor::{Commands, MonitorQmp};
 use ruvm_qapi::commands::register_query_audiodevs;
@@ -152,6 +156,10 @@ pub(crate) struct AudioPlug {
     pub codec: Option<Box<AudioPlug>>,
     /// The properties of an `sb16`.
     pub sb16: Sb16Config,
+    /// The properties of a `virtio-sound-pci`.
+    pub snd: VirtioSndConf,
+    /// A `virtio-sound-pci`'s `vectors` property.
+    pub vectors: u32,
     /// Whether the machine has the root bus `pcie.0`.
     pci: bool,
     /// Whether the machine has the ISA bus `isa.0`.
@@ -177,6 +185,8 @@ impl AudioPlug {
             old_msi_addr: false,
             codec: None,
             sb16: Sb16Config::default(),
+            snd: VirtioSndConf::default(),
+            vectors: 2,
             pci,
             isa,
             err: None,
@@ -193,6 +203,7 @@ const AUDIO_TYPES: &[&str] = &[
     TYPE_HDA_DUPLEX,
     TYPE_HDA_MICRO,
     TYPE_SB16,
+    TYPE_VIRTIO_SND_PCI,
 ];
 
 fn is_hda_controller(typename: &str) -> bool {
@@ -210,6 +221,8 @@ pub(crate) fn plan_device(
     pci: bool,
     isa: bool,
 ) -> Option<std::result::Result<AudioPlug, Located>> {
+    // The alias of virtio_pci_types_register().
+    let driver = if driver == "virtio-sound" { TYPE_VIRTIO_SND_PCI } else { driver };
     let &typename = AUDIO_TYPES.iter().find(|t| **t == driver)?;
     let mut plug = AudioPlug::new(typename, loc.clone(), pci, isa);
     plug.id = opts.id().map(str::to_string);
@@ -251,6 +264,7 @@ fn plan(plug: &mut AudioPlug, opts: &QemuOpts) -> std::result::Result<(), Locate
     let codec = HdaCodecKind::from_type(typename).is_some();
     let ctrl = is_hda_controller(typename);
     let sb16 = typename == TYPE_SB16;
+    let snd = typename == TYPE_VIRTIO_SND_PCI;
     for (k, v) in opts.iter() {
         match k {
             "driver" | "bus" => {}
@@ -291,8 +305,29 @@ fn plan(plug: &mut AudioPlug, opts: &QemuOpts) -> std::result::Result<(), Locate
             "irq" if sb16 => plug.sb16.irq = prop_u32(k, v).map_err(at)?,
             "dma" if sb16 => plug.sb16.dma = prop_u32(k, v).map_err(at)?,
             "dma16" if sb16 => plug.sb16.hdma = prop_u32(k, v).map_err(at)?,
+            "jacks" if snd => plug.snd.jacks = prop_u32(k, v).map_err(at)?,
+            "streams" if snd => plug.snd.streams = prop_u32(k, v).map_err(at)?,
+            "chmaps" if snd => plug.snd.chmaps = prop_u32(k, v).map_err(at)?,
+            "vectors" if snd => plug.vectors = prop_u32(k, v).map_err(at)?,
+            // virtio_pci_force_virtio_1() overrides disable-modern, and ioeventfd is a host
+            // detail.
+            "disable-modern" | "ioeventfd" if snd => {
+                prop_bool(k, v).map_err(at)?;
+            }
+            // An OnOffAuto, which virtio_pci_force_virtio_1() overrides too.
+            "disable-legacy" if snd => {
+                if !matches!(v, "on" | "off" | "auto") {
+                    let msg = format!("Parameter '{k}' does not accept value '{v}'");
+                    return Err(Located::new(&loc, msg));
+                }
+            }
             _ => return Err(Located::new(&loc, format!("Property '{typename}.{k}' not found"))),
         }
+    }
+    // The start of virtio_snd_realize(). QEMU realizes each device before it sets the
+    // properties of the next, so these come before a later device's property errors.
+    if snd {
+        plug.snd.check().map_err(at)?;
     }
     Ok(())
 }
@@ -499,6 +534,9 @@ pub(crate) fn realize_x86(board: &X86Board, plug: &AudioPlug) -> std::result::Re
             format!("No 'PCI' bus found for device '{}'", plug.typename),
         ));
     };
+    if plug.typename == TYPE_VIRTIO_SND_PCI {
+        return realize_virtio_snd(m, plug).map_err(at);
+    }
     let dma: Arc<dyn DmaMemory> = Arc::new(WeakDma(Arc::downgrade(board.memory_as())));
     if plug.typename == TYPE_AC97 {
         let be = backend(plug).map_err(at)?;
@@ -521,6 +559,31 @@ pub(crate) fn realize_x86(board: &X86Board, plug: &AudioPlug) -> std::result::Re
     if let Some(codec) = &plug.codec {
         realize_x86(board, codec)?;
     }
+    Ok(())
+}
+
+/// virtio-sound-pci on a q35 board: the device model on the PCI transport, the voice
+/// callbacks reaching both through a weak handle. Like QEMU, it does not migrate.
+fn realize_virtio_snd(m: &Q35, plug: &AudioPlug) -> Result<()> {
+    let be = backend(plug)?;
+    let mem: SharedGuestMemory = Arc::new(AddressSpaceMemory::new(Arc::clone(m.memory_as())));
+    let backend = VirtioBackend::new(Box::new(VirtioSnd::new(be, plug.snd)), mem)?;
+    let props = VirtioPciProps {
+        disable_legacy: Some(true),
+        disable_modern: false,
+        vectors: Some(plug.vectors),
+        id: plug.id.clone(),
+        ..VirtioPciProps::default()
+    };
+    let dev = VirtioPci::new(m.pci_bus(), plug.devfn, backend, &props)?;
+    let weak = dev.downgrade();
+    dev.with_device::<VirtioSnd, _>(|_, snd| {
+        snd.connect(Box::new(move |f: &mut dyn FnMut(&mut VirtIODevice, &mut VirtioSnd)| {
+            if let Some(dev) = weak.upgrade() {
+                dev.with_device::<VirtioSnd, _>(|vdev, snd| f(vdev, snd));
+            }
+        }));
+    });
     Ok(())
 }
 

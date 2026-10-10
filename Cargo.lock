@@ -1791,8 +1791,10 @@ dependencies = [
  "ruvm-hw-core",
  "ruvm-hw-pci",
  "ruvm-hw-timer",
+ "ruvm-hw-virtio",
  "ruvm-mem",
  "ruvm-qapi",
+ "ruvm-virtio-queue",
 ]
 
 [[package]]
