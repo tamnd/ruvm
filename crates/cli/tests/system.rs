@@ -360,9 +360,11 @@ mod sockets {
             l
         }
 
-        /// Sends a command and returns its reply, keeping the events that came first.
+        /// Sends a command and returns its reply, keeping the events that came first. The
+        /// newline goes out in the same write: the parser runs `quit` as soon as the object
+        /// closes, and the machine may be gone before a second write.
         fn cmd(&mut self, c: &str) -> String {
-            writeln!(self.writer, "{c}").unwrap();
+            self.writer.write_all(format!("{c}\n").as_bytes()).unwrap();
             loop {
                 let l = self.line();
                 if l.contains("\"event\"") {
@@ -606,6 +608,58 @@ mod sockets {
                 "{p} hub port b has no peer\n{p} hub port a has no peer\n{p} netdev st0 has no peer\n{p} netdev a has no peer\n{p} netdev b has no peer\n"
             )
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stream netdev listening on a Unix socket sends `NETDEV_STREAM_CONNECTED` with its own
+    /// address when a client comes, and `NETDEV_STREAM_DISCONNECTED` when the client goes, as
+    /// net/stream.c does in QEMU 11.1.
+    #[test]
+    fn stream_netdev_events() {
+        let dir = std::env::temp_dir().join(format!("ruvm-stream-ev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ms, st) = (dir.join("qmp.sock"), dir.join("st.sock"));
+        let _ = std::fs::remove_file(&ms);
+        let _ = std::fs::remove_file(&st);
+        let stream = format!("stream,id=st0,server=on,addr.type=unix,addr.path={}", st.display());
+        let child = Command::new(ruvm())
+            .arg("qemu-system-riscv64")
+            .args(["-machine", "none", "-display", "none", "-nodefaults"])
+            .args(["-netdev", &stream])
+            .args(["-qmp", &format!("unix:{},server=on,wait=off", ms.display())])
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _child = Machine(child);
+        let m = loop {
+            match UnixStream::connect(&ms) {
+                Ok(m) => break m,
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        let mut qmp =
+            Qmp { reader: BufReader::new(m.try_clone().unwrap()), writer: m, events: Vec::new() };
+        qmp.line();
+        assert_eq!(qmp.cmd(r#"{"execute": "qmp_capabilities"}"#), r#"{"return": {}}"#);
+        let event = |qmp: &mut Qmp| {
+            let l = qmp.line();
+            let at = l.find(r#""event": "#).unwrap();
+            l.trim_end()[at..].to_string()
+        };
+        let peer = UnixStream::connect(&st).unwrap();
+        assert_eq!(
+            event(&mut qmp),
+            format!(
+                r#""event": "NETDEV_STREAM_CONNECTED", "data": {{"netdev-id": "st0", "addr": {{"path": "{}", "type": "unix"}}}}}}"#,
+                st.display()
+            )
+        );
+        drop(peer);
+        assert_eq!(
+            event(&mut qmp),
+            r#""event": "NETDEV_STREAM_DISCONNECTED", "data": {"netdev-id": "st0"}}"#
+        );
+        assert_eq!(qmp.cmd(r#"{"execute": "quit"}"#), r#"{"return": {}}"#);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -19,7 +19,7 @@ use ruvm_base::error::ErrorClass;
 use ruvm_base::{Error, Result, warn_report};
 use ruvm_qapi::cutils::id_wellformed;
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
-use ruvm_qapi::types::{NetClientDriver, Netdev, NetdevHubPortOptions, NetdevU};
+use ruvm_qapi::types::{NetClientDriver, Netdev, NetdevHubPortOptions, NetdevU, SocketAddress};
 use ruvm_qapi::visit::QObjectInputVisitor;
 use ruvm_qapi::visit::Visit;
 
@@ -80,6 +80,18 @@ fn into_raw(fd: OwnedFd) -> RawFd {
 
 /// Looks up a descriptor the monitor was given under a name, `monitor_get_fd()`.
 pub type FdResolver = Box<dyn FnMut(&str) -> Result<OwnedFd> + Send>;
+
+/// A QAPI event a netdev sends.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NetEvent {
+    /// `NETDEV_STREAM_CONNECTED`: a stream netdev took or made a connection to `addr`.
+    StreamConnected { netdev_id: String, addr: SocketAddress },
+    /// `NETDEV_STREAM_DISCONNECTED`: the connection of a stream netdev ended.
+    StreamDisconnected { netdev_id: String },
+}
+
+/// Where the netdevs send their events. It is called on the backend's I/O thread.
+pub type EventSink = Arc<dyn Fn(NetEvent) + Send + Sync>;
 
 /// `NICInfo`: one NIC asked for with `-net nic` or `-nic`, for the machine to create.
 #[derive(Clone, Debug, Default)]
@@ -191,6 +203,7 @@ pub struct Net {
     modern: Vec<Netdev>,
     vm_running: Arc<AtomicBool>,
     fd_resolver: Option<FdResolver>,
+    pub(crate) event_sink: Option<EventSink>,
     #[cfg(unix)]
     pub(crate) chardev_resolver: Option<crate::vhost_user::ChardevResolver>,
     qtest: bool,
@@ -241,6 +254,7 @@ impl Net {
             modern: Vec::new(),
             vm_running: Arc::new(AtomicBool::new(true)),
             fd_resolver: None,
+            event_sink: None,
             #[cfg(unix)]
             chardev_resolver: None,
             qtest: false,
@@ -251,6 +265,11 @@ impl Net {
     /// not start with a digit.
     pub fn set_fd_resolver(&mut self, resolver: Option<FdResolver>) {
         self.fd_resolver = resolver;
+    }
+
+    /// Installs where the netdevs made after this send their events.
+    pub fn set_event_sink(&mut self, sink: Option<EventSink>) {
+        self.event_sink = sink;
     }
 
     /// Leaves out the "not connected to host network" hub warning, as QEMU does under qtest.

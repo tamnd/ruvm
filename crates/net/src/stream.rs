@@ -52,6 +52,7 @@ fn server_init(
     }) {
         Ok(fd) => {
             cfg.info = "listening".to_string();
+            cfg.events = net.event_sink.clone();
             cfg.listen_fd = Some(fd);
             if let SocketAddressU::Unix(u) = &addr.u {
                 cfg.unlink = Some(u.path.clone().into());
@@ -100,6 +101,7 @@ fn client_init(
     cfg.info = "connecting".to_string();
     cfg.connector = Some(connector);
     cfg.reconnect_ms = reconnect_ms;
+    cfg.events = net.event_sink.clone();
     new_sock(net, NetClientDriver::Stream, peer, MODEL, name, cfg)?;
     Ok(())
 }
