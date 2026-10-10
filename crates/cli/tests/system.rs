@@ -561,6 +561,54 @@ mod sockets {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `-netdev` on machine none, which has no NICs: the backends are made all the same, and
+    /// `info network` shows them as QEMU 11.1 does.
+    #[test]
+    fn info_network_on_machine_none() {
+        let dir = std::env::temp_dir().join(format!("ruvm-netdev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ms, st) = (dir.join("qmp.sock"), dir.join("st.sock"));
+        let _ = std::fs::remove_file(&ms);
+        let _ = std::fs::remove_file(&st);
+        let stream = format!("stream,id=st0,server=on,addr.type=unix,addr.path={}", st.display());
+        let child = Command::new(ruvm())
+            .arg("qemu-system-riscv64")
+            .args(["-machine", "none", "-display", "none", "-nodefaults"])
+            .args(["-netdev", "hubport,id=a,hubid=0", "-netdev", "hubport,id=b,hubid=0"])
+            .args(["-netdev", &stream])
+            .args(["-qmp", &format!("unix:{},server=on,wait=off", ms.display())])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = Machine(child);
+        let m = loop {
+            match UnixStream::connect(&ms) {
+                Ok(m) => break m,
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        let mut qmp =
+            Qmp { reader: BufReader::new(m.try_clone().unwrap()), writer: m, events: Vec::new() };
+        qmp.line();
+        assert_eq!(qmp.cmd(r#"{"execute": "qmp_capabilities"}"#), r#"{"return": {}}"#);
+        let c = r#"{"execute": "human-monitor-command", "arguments": {"command-line": "info network"}}"#;
+        assert_eq!(
+            qmp.cmd(c),
+            r#"{"return": "hub 0\r\n \\ b\r\n \\ a\r\nst0: index=0,type=stream,listening\r\n"}"#
+        );
+        assert_eq!(qmp.cmd(r#"{"execute": "quit"}"#), r#"{"return": {}}"#);
+        let mut err = String::new();
+        child.0.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+        let p = "qemu-system-riscv64: warning:";
+        assert_eq!(
+            err,
+            format!(
+                "{p} hub port b has no peer\n{p} hub port a has no peer\n{p} netdev st0 has no peer\n{p} netdev a has no peer\n{p} netdev b has no peer\n"
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The reply goes out over QMP exactly as built. crates/qapi/tests/introspect.rs checks the
     /// built reply against QEMU's after the normalization list.
     #[test]

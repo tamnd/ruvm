@@ -20,17 +20,19 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use ruvm_base::report::{
     Location, current_location, error_report, push_location, report_error, warn_report,
 };
-use ruvm_base::{Error, Result};
+use ruvm_base::{ClockType, Error, Result};
 use ruvm_block::BlockGraph;
 use ruvm_chardev::opts::{chardev_opts, parse_compat};
 use ruvm_chardev::{Chardev, Chardevs};
 use ruvm_hostmem::region::RegionObjects;
 use ruvm_hw_core::machine::{MACHINES, machine_type_name};
-use ruvm_hw_core::{Machine, create_machine};
+use ruvm_hw_core::timer::TimeSource;
+use ruvm_hw_core::{Clock, Machine, create_machine};
 use ruvm_machine_x86::{BoardKind, canonical_machine_name};
 use ruvm_mem::MemorySystem;
 use ruvm_migration::Migration;
@@ -49,12 +51,13 @@ use ruvm_qom::{
 };
 
 use crate::arm;
+use crate::net::Network;
 use crate::options::{Opt, arch_available, help_text, lookup_opt};
 use crate::qmp_cmds::{self, object_options_dict};
 use crate::qtest::{self, VirtualClock};
 use crate::riscv;
 use crate::runstate::{Killed, Runstate};
-use crate::x86::{self, Accel, AccelInitError};
+use crate::x86::{self, Accel, AccelInitError, Located};
 
 /// Whether KVM is built in for `target`: the host is Linux on x86_64 and so is the target.
 fn have_kvm(target: &str) -> bool {
@@ -110,6 +113,8 @@ pub struct Vm {
     pub(crate) migration: OnceLock<Migration>,
     /// The accelerator `configure_accelerators()` picked.
     pub(crate) accel: OnceLock<Accelerator>,
+    /// The netdevs `net_init_clients()` made, on a machine that has them.
+    pub(crate) network: OnceLock<Arc<Network>>,
     machine_initialized: AtomicBool,
     /// `qtest_driver()`: a test drives the machine over `-qtest`.
     qtest: bool,
@@ -130,6 +135,10 @@ impl Vm {
                 report_error(&e);
                 ruvm_chardev::stdio::term_exit();
                 std::process::exit(1);
+            }
+            // qemu_machine_creation_done()
+            if let Some(net) = self.network.get() {
+                net.check_clients();
             }
         }
         self.qmp.set_machine_ready(true);
@@ -992,6 +1001,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         incoming: cfg.incoming.clone(),
         migration: OnceLock::new(),
         accel: OnceLock::new(),
+        network: OnceLock::new(),
         machine_initialized: AtomicBool::new(false),
         qtest: cfg.qtest.is_some(),
     });
@@ -1117,7 +1127,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             "this machine type is only supported with -accel kvm or tcg by ruvm yet",
         ));
     }
-    let clock = VirtualClock::manual(ruvm_base::ClockType::Virtual);
+    let clock = VirtualClock::manual(ClockType::Virtual);
     if on_qtest {
         // monitor_qapi_event_init() throttles events on the virtual clock under qtest.
         let c = clock.clone();
@@ -1141,6 +1151,18 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         }
         _ => None,
     };
+    // net_init_clients(). The boards make their netdevs with their NICs.
+    if machine.is_some() {
+        let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
+        let net = Network::new(&cfg.x86.netdevs, &clock).map_err(|Located(loc, e)| {
+            let _loc = loc.map(push_location);
+            fail(&e)
+        })?;
+        let net = Arc::new(net);
+        let n = Arc::clone(&net);
+        vm.runstate.set_cpu_hook(Some(Arc::new(move |run| n.vm_state_change(run))));
+        let _ = vm.network.set(net);
+    }
     create_objects(&vm, &mut cfg, |ty| !object_create_early(ty))?;
     let handles: Vec<OptsHandle> = cfg.mon.iter().map(|o| o.handle()).collect();
     for h in handles {
