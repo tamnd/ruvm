@@ -563,6 +563,60 @@ mod sockets {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The riscv64 virt board on the qtest accelerator: no vCPUs run, the memory map answers
+    /// qtest reads and writes, and QMP sees `/machine` and the query-machines entry QEMU 11.1
+    /// gives.
+    #[test]
+    fn riscv_virt_under_qtest() {
+        let dir = std::env::temp_dir().join(format!("ruvm-rvqtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (qs, ms) = (dir.join("qtest.sock"), dir.join("qmp.sock"));
+        let _ = std::fs::remove_file(&qs);
+        let _ = std::fs::remove_file(&ms);
+        let lq = UnixListener::bind(&qs).unwrap();
+        let lm = UnixListener::bind(&ms).unwrap();
+        let child = Command::new(ruvm())
+            .arg("qemu-system-riscv64")
+            .args(["-qtest", &format!("unix:{}", qs.display()), "-qtest-log", "/dev/null"])
+            .args(["-chardev", &format!("socket,path={},id=char0", ms.display())])
+            .args(["-object", "monitor-qmp,id=qmp0,chardev=char0"])
+            .args(["-display", "none", "-audio", "none", "-machine", "virt", "-accel", "qtest"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = Machine(child);
+        let (mut qtest, _) = lq.accept().unwrap();
+        let (m, _) = lm.accept().unwrap();
+        m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut qmp =
+            Qmp { reader: BufReader::new(m.try_clone().unwrap()), writer: m, events: Vec::new() };
+        qmp.line();
+        assert_eq!(qmp.cmd(r#"{"execute": "qmp_capabilities"}"#), r#"{"return": {}}"#);
+        let machines = qmp.cmd(r#"{"execute": "query-machines"}"#);
+        let virt = r#"{"hotpluggable-cpus": false, "name": "virt", "numa-mem-supported": true, "default-cpu-type": "rv64-riscv-cpu", "acpi": true, "cpu-max": 512, "deprecated": false, "default-ram-id": "riscv_virt_board.ram"}"#;
+        assert!(machines.contains(virt), "{machines}");
+        let c = r#"{"execute": "qom-get", "arguments": {"path": "/machine", "property": "type"}}"#;
+        assert_eq!(qmp.cmd(c), r#"{"return": "virt-machine"}"#);
+        let list = qmp.cmd(r#"{"execute": "qom-list", "arguments": {"path": "/machine"}}"#);
+        assert!(list.contains(r#"{"name": "type", "type": "string"}"#), "{list}");
+
+        qtest
+            .write_all(b"writel 0x80000000 0x12345678\nreadl 0x80000000\nclock_step 100\n")
+            .unwrap();
+        let want = "OK\nOK 0x0000000012345678\nOK 100\n";
+        let mut got = vec![0; want.len()];
+        qtest.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        qtest.read_exact(&mut got).unwrap();
+        assert_eq!(String::from_utf8(got).unwrap(), want);
+
+        assert_eq!(qmp.cmd(r#"{"execute": "quit"}"#), r#"{"return": {}}"#);
+        assert!(child.0.wait().unwrap().success());
+        let mut err = String::new();
+        child.0.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+        assert_eq!(err, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `-netdev` on machine none, which has no NICs: the backends are made all the same, and
     /// `info network` shows them as QEMU 11.1 does.
     #[test]

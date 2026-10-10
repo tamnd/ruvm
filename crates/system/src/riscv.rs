@@ -3,6 +3,8 @@
 //! The RISC-V `virt` board from the command line: what `-machine virt`, `-m`, `-smp`, `-cpu`,
 //! `-kernel`, `-initrd`, `-append`, `-dtb`, `-bios`, `-serial`, `-drive`, `-device`,
 //! `-semihosting` and `-semihosting-config` turn into, and the board running on TCG.
+//! Under the qtest accelerator the board is built the same way, but no harts run and the
+//! timers follow the qtest clock, as for QEMU's `-accel qtest`.
 //!
 //! `-serial` (or `-nographic`) connects `serial_hd(0)` to the 16550 UART. `-bios` names the
 //! M-mode firmware: `default` (or no `-bios`) is OpenSBI's `fw_dynamic` build, looked up in
@@ -46,8 +48,8 @@ use ruvm_base::report::{Location, warn_report};
 use ruvm_base::{ClockType, Error, Result};
 use ruvm_chardev::{Attachment, Chardev, Chardevs, Connection, Frontend};
 use ruvm_hw_char::serial::{Serial, SerialBackend};
-use ruvm_hw_core::Clock;
 use ruvm_hw_core::timer::TimeSource;
+use ruvm_hw_core::{Clock, MachineClassInfo, register_machine_type};
 use ruvm_machine_riscv::tcg_run::{
     ShutdownReason, VirtEvent, VirtEventHandler, VirtRunConfig, VirtTcgMachine,
 };
@@ -55,12 +57,14 @@ use ruvm_machine_riscv::virt::{
     GenericLoader, VIRT_CPUS_MAX, VirtAia, VirtConfig, VirtMachine, riscv_find_firmware,
 };
 use ruvm_machine_x86::FirmwareSearch;
+use ruvm_mem::AddressSpace;
 use ruvm_qapi::events::event_reset;
 use ruvm_qapi::types::{
-    MemorySizeConfiguration, ResetArg, RunState, SMPConfiguration, ShutdownCause,
+    MachineInfo, MemorySizeConfiguration, ResetArg, RunState, SMPConfiguration, ShutdownCause,
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
+use ruvm_qom::Registry;
 use ruvm_target_riscv::cfg::{
     CPU_MODELS, CpuBuilder, OTHER_CPU_MODELS, PropError, RiscvCfg, model_missing,
 };
@@ -609,10 +613,17 @@ impl Frontend for SemiConsoleFrontend {
     }
 }
 
-/// The virt board running on its vCPUs, and the chardevs its devices are attached to.
+/// The board, on its vCPUs under TCG or without them under the qtest accelerator.
+#[derive(Debug)]
+enum Board {
+    Tcg(Arc<VirtTcgMachine>),
+    Qtest(Box<VirtMachine>),
+}
+
+/// The virt board, and the chardevs its devices are attached to.
 #[derive(Debug)]
 pub(crate) struct Running {
-    machine: Arc<VirtTcgMachine>,
+    board: Board,
     console: Option<Arc<SemiConsole>>,
     _attachments: Vec<Attachment>,
 }
@@ -628,7 +639,17 @@ impl Running {
     /// Stops the vCPU and timer threads.
     pub(crate) fn quit(&self) {
         self.wake_console();
-        self.machine.quit();
+        if let Board::Tcg(m) = &self.board {
+            m.quit();
+        }
+    }
+
+    /// The system memory, which a `-qtest` client reads and writes.
+    pub(crate) fn memory(&self) -> Arc<AddressSpace> {
+        match &self.board {
+            Board::Qtest(b) => Arc::clone(b.memory_as()),
+            Board::Tcg(m) => Arc::clone(lock(m.board()).memory_as()),
+        }
     }
 }
 
@@ -701,13 +722,57 @@ fn semihosting_chardev(
     }
 }
 
+/// The accelerator virt runs on: TCG, or qtest with the virtual clock the test drives.
+pub(crate) enum BoardAccel {
+    Tcg(TcgOptions),
+    Qtest(Arc<Clock>),
+}
+
+/// The type of the `/machine` object, `TYPE_RISCV_VIRT_MACHINE`, with the values
+/// `virt_machine_class_init()` gives the machine class.
+pub(crate) fn register_types(registry: &Registry) {
+    register_machine_type(
+        registry,
+        MachineClassInfo {
+            name: "virt",
+            desc: VIRT_DESC,
+            max_cpus: VIRT_CPUS_MAX as u32,
+            default_cpus: 1,
+            default_ram_size: 128 << 20,
+            default_ram_id: Some(VIRT_RAM_ID),
+        },
+    );
+}
+
+/// `default_ram_id` of virt.
+const VIRT_RAM_ID: &str = "riscv_virt_board.ram";
+
+/// What `query-machines` says about virt, as QEMU 11.1 does.
+pub(crate) fn machine_info(compat_props: bool) -> MachineInfo {
+    MachineInfo {
+        name: "virt".into(),
+        alias: None,
+        is_default: None,
+        cpu_max: VIRT_CPUS_MAX as i64,
+        hotpluggable_cpus: false,
+        numa_mem_supported: true,
+        deprecated: false,
+        default_cpu_type: Some("rv64-riscv-cpu".into()),
+        default_ram_id: Some(VIRT_RAM_ID.into()),
+        acpi: true,
+        compat_props: compat_props.then(Vec::new),
+    }
+}
+
 /// `qemu_init_board()`, `qemu_create_cli_devices()` and `qemu_machine_creation_done()` for
-/// virt on TCG: builds the board, connects the UART to `serial_hds[0]` and semihosting to
-/// its chardev, realizes the `-device loader`s and puts it all on the vCPU threads, stopped
-/// until `vm_start()`. A `dumpdtb` ends the process here, as in QEMU.
-pub(crate) fn start_board_tcg(
+/// virt: builds the board, connects the UART to `serial_hds[0]` and semihosting to its
+/// chardev and realizes the `-device loader`s. On TCG it all goes on the vCPU threads,
+/// stopped until `vm_start()`. Under the qtest accelerator there are no vCPUs, the devices
+/// run on the test's virtual clock and a missing firmware file is not an error. A `dumpdtb`
+/// ends the process here, as in QEMU.
+pub(crate) fn start_board(
     vm: &Arc<Vm>,
-    tcg: TcgOptions,
+    accel: BoardAccel,
     opts: BoardOptions,
     args: &RiscvArgs<'_>,
     serial_hds: &[Option<Arc<Chardev>>],
@@ -729,9 +794,13 @@ pub(crate) fn start_board_tcg(
     let cpu = cpu.map_err(one)?;
     let plan = devices::plan(args.drives, args.devices)?;
     let find = |name: &str| args.firmware.find(name).map(|p| p.to_string_lossy().into_owned());
-    let firmware =
-        riscv_find_firmware(opts.firmware.as_deref(), find).map_err(|e| one(Error::generic(e)))?;
-    let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
+    let qtest = matches!(accel, BoardAccel::Qtest(_));
+    let firmware = riscv_find_firmware(opts.firmware.as_deref(), qtest, find)
+        .map_err(|e| one(Error::generic(e)))?;
+    let clock = match &accel {
+        BoardAccel::Qtest(clock) => Arc::clone(clock),
+        BoardAccel::Tcg(_) => Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now())),
+    };
     let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
 
     let console = semi.enabled.then(|| {
@@ -791,6 +860,16 @@ pub(crate) fn start_board_tcg(
         std::process::exit(0);
     }
 
+    let tcg = match accel {
+        BoardAccel::Tcg(tcg) => tcg,
+        BoardAccel::Qtest(_) => {
+            return Ok(Running {
+                board: Board::Qtest(Box::new(board)),
+                console,
+                _attachments: attachments,
+            });
+        }
+    };
     let cfg = VirtRunConfig { no_reboot: args.no_reboot, tcg, backend: None };
     let (machine, warnings) =
         VirtTcgMachine::new(board, vec![clock, rtc_clock], &cfg, event_handler(vm))
@@ -800,7 +879,7 @@ pub(crate) fn start_board_tcg(
     }
     let machine = Arc::new(machine);
     set_cpu_hook(vm, &machine);
-    Ok(Running { machine, console, _attachments: attachments })
+    Ok(Running { board: Board::Tcg(machine), console, _attachments: attachments })
 }
 
 #[cfg(test)]

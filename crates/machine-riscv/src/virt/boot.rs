@@ -613,9 +613,11 @@ pub(crate) fn riscv_setup_firmware_boot(
 
 /// `riscv_find_firmware()`: the file `-bios` names, through `find` (`qemu_find_file()` with
 /// `QEMU_FILE_TYPE_BIOS`). `None` or `default` is the OpenSBI build QEMU ships and `none`
-/// is no firmware.
+/// is no firmware. Under the qtest accelerator a missing file means no firmware, as in
+/// `riscv_find_bios()`.
 pub fn riscv_find_firmware(
     bios: Option<&str>,
+    qtest_enabled: bool,
     find: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<String>, String> {
     let name = match bios {
@@ -625,6 +627,7 @@ pub fn riscv_find_firmware(
     };
     match find(name) {
         Some(p) => Ok(Some(p)),
+        None if qtest_enabled => Ok(None),
         None => Err(format!("Unable to find the RISC-V BIOS \"{name}\"")),
     }
 }
@@ -1052,14 +1055,15 @@ mod tests {
     fn find_firmware() {
         let find = |n: &str| (n == RISCV64_BIOS_BIN).then(|| format!("/fw/{n}"));
         assert_eq!(
-            riscv_find_firmware(None, find).unwrap().unwrap(),
+            riscv_find_firmware(None, false, find).unwrap().unwrap(),
             format!("/fw/{RISCV64_BIOS_BIN}")
         );
-        assert_eq!(riscv_find_firmware(Some("none"), find), Ok(None));
+        assert_eq!(riscv_find_firmware(Some("none"), false, find), Ok(None));
         assert_eq!(
-            riscv_find_firmware(Some("x.bin"), find).unwrap_err(),
+            riscv_find_firmware(Some("x.bin"), false, find).unwrap_err(),
             "Unable to find the RISC-V BIOS \"x.bin\""
         );
+        assert_eq!(riscv_find_firmware(Some("x.bin"), true, find), Ok(None));
     }
 
     /// A little ELF64 with one PT_LOAD of `code` at `paddr`.

@@ -119,8 +119,8 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
     register_x_exit_preconfig(cmds, move |_: &MonitorQmp| v.exit_preconfig());
     // Machine "none" has no CPUs.
     register_query_cpus_fast(cmds, |_: &MonitorQmp| Ok(Vec::new()));
-    // `qmp_query_machines()`: `none` with the values QEMU gives it, and the x86 boards on an x86
-    // target.
+    // `qmp_query_machines()`: `none` with the values QEMU gives it, the x86 boards on an x86
+    // target and virt on riscv64.
     let target = target.to_string();
     register_query_machines(cmds, move |_: &MonitorQmp, arg| {
         let mut out = vec![MachineInfo {
@@ -138,6 +138,9 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
         }];
         if crate::x86::is_x86(&target) {
             out.extend(crate::x86::machine_infos(&target, arg.compat_props.unwrap_or(false)));
+        }
+        if crate::riscv::is_riscv(&target) {
+            out.push(crate::riscv::machine_info(arg.compat_props.unwrap_or(false)));
         }
         Ok(out)
     });
