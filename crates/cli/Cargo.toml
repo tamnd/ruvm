@@ -47,6 +47,8 @@ audio-pa = ["ruvm-system/audio-pa"]
 audio-pipewire = ["ruvm-system/audio-pipewire"]
 # -audiodev coreaudio, over CoreAudio on macOS.
 audio-coreaudio = ["ruvm-system/audio-coreaudio"]
+# -audiodev dsound, over DirectSound on Windows.
+audio-dsound = ["ruvm-system/audio-dsound"]
 # -display cocoa on macOS, over the system's AppKit.
 ui-cocoa = ["ruvm-system/ui-cocoa"]
 

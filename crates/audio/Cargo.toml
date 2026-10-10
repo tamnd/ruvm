@@ -11,7 +11,7 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 7
+unsafe-budget = 34
 
 [dependencies]
 alsa = { workspace = true, optional = true }
@@ -25,6 +25,9 @@ ruvm-qapi.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-audio = { workspace = true, optional = true }
 objc2-core-audio-types = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, optional = true }
 
 [features]
 # The dbus audiodev type, which comes with -display dbus.
@@ -41,6 +44,8 @@ audio-coreaudio = [
     "dep:objc2-core-audio-types",
     "ruvm-qapi/audio-coreaudio",
 ]
+# The dsound audiodev type, over DirectSound on Windows.
+audio-dsound = ["dep:windows", "ruvm-qapi/audio-dsound"]
 
 [lints]
 workspace = true
