@@ -1761,6 +1761,17 @@ fn attach_ide(
     }
 }
 
+/// Reports a failure to build the board. The firmware and kernel loaders print their
+/// errors with a bare `fprintf(stderr)` before `exit(1)`, so the ones that start with
+/// "qemu: " go out as they are, without the program name in front.
+fn board_error(e: String) -> Vec<Located> {
+    if e.starts_with("qemu: ") {
+        eprintln!("{e}");
+        return Vec::new();
+    }
+    vec![Located::bare(e)]
+}
+
 /// What the accelerator tells the board about itself.
 struct BoardAccel {
     kvm: bool,
@@ -1821,7 +1832,7 @@ fn build(
         memdev: opts.memdev.map(|m| m.0),
         aux_ram_share: opts.aux_ram_share,
     };
-    let (mut board, warnings) = build_board(spec).map_err(|e| one(Located::bare(e)))?;
+    let (mut board, warnings) = build_board(spec).map_err(board_error)?;
     for w in warnings.iter().chain(board.warnings()) {
         warn_report(w);
     }
@@ -2229,6 +2240,14 @@ mod tests {
 
     fn machine(arg: &str) -> QDict {
         keyval_parse(arg, Some("type"), None).unwrap()
+    }
+
+    #[test]
+    fn loader_errors_skip_error_report() {
+        assert!(board_error("qemu: could not load PC BIOS 'nope.bin'".into()).is_empty());
+        let e = board_error("Property 'x' not found".into());
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].1.to_string(), "Property 'x' not found");
     }
 
     #[test]

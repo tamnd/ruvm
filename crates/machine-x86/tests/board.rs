@@ -147,8 +147,36 @@ fn kernel_errors_are_qemus() {
     let files = KernelFiles { kernel: "/nonexistent/bzImage".into(), ..KernelFiles::default() };
     assert_eq!(
         load_kernel(&files).unwrap_err(),
-        "qemu: could not load kernel '/nonexistent/bzImage': No such file or directory"
+        "qemu: could not open kernel file '/nonexistent/bzImage': No such file or directory"
     );
+    let dir = TempDir::new("kernel-errors");
+    let kernel = dir.file("bzImage", b"kernel").to_str().unwrap().to_string();
+    let files = KernelFiles {
+        kernel,
+        initrd: Some("/nonexistent/initrd".into()),
+        ..KernelFiles::default()
+    };
+    assert_eq!(
+        load_kernel(&files).unwrap_err(),
+        "qemu: error reading initrd /nonexistent/initrd: Failed to open file \u{201c}/nonexistent/initrd\u{201d}: open() failed: No such file or directory"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let d = dir.path().to_str().unwrap().to_string();
+        let files = KernelFiles { kernel: d.clone(), ..KernelFiles::default() };
+        assert_eq!(
+            load_kernel(&files).unwrap_err(),
+            format!("qemu: could not load kernel '{d}': Is a directory")
+        );
+        let files =
+            KernelFiles { kernel: format!("{d}/bzImage"), initrd: Some(d.clone()), ..files };
+        assert_eq!(
+            load_kernel(&files).unwrap_err(),
+            format!(
+                "qemu: error reading initrd {d}: Failed to map {d}' {d}': mmap() failed: No such device"
+            )
+        );
+    }
 }
 
 fn spec(kind: BoardKind, firmware: FirmwareSearch) -> BoardSpec {
