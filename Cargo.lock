@@ -1535,6 +1535,7 @@ version = "0.5.3"
 dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
+ "ruvm-hw-virtio",
  "ruvm-mem",
  "ruvm-qapi",
  "ruvm-ui",
@@ -1981,6 +1982,7 @@ dependencies = [
  "ruvm-hw-char",
  "ruvm-hw-core",
  "ruvm-hw-display",
+ "ruvm-hw-input",
  "ruvm-hw-misc",
  "ruvm-hw-pci",
  "ruvm-hw-storage",

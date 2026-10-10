@@ -1,6 +1,6 @@
 [package]
 name = "ruvm-hw-input"
-description = "PS/2, i8042 and board input devices."
+description = "PS/2, i8042, virtio and board input devices."
 license = "GPL-2.0-or-later"
 version.workspace = true
 edition.workspace = true
@@ -16,6 +16,7 @@ unsafe-budget = 0
 [dependencies]
 ruvm-base.workspace = true
 ruvm-hw-core.workspace = true
+ruvm-hw-virtio.workspace = true
 ruvm-mem.workspace = true
 ruvm-qapi.workspace = true
 ruvm-ui.workspace = true

@@ -3,7 +3,9 @@
 //! The display side of the command line and the monitor: `-vga` (`select_vgahw()` of QEMU's
 //! system/vl.c), `pc_vga_init()` of hw/i386/pc.c, `-device VGA`, `bochs-display`, `ramfb`,
 //! `virtio-gpu-pci` and `virtio-gpu-device` on q35, microvm and Arm virt, and the QMP
-//! `screendump` command of ui/ui-qmp-cmds.c.
+//! `screendump` command of ui/ui-qmp-cmds.c. The virtio keyboard, mouse, tablet and multitouch
+//! devices go through here too, in their `-pci` and `-device` forms, because they take the
+//! same buses and are realized in the same order as the display devices.
 //!
 //! Where this differs from QEMU:
 //! - q35 gets a VGA card only with `-vga std` or `-device VGA`. QEMU plugs the std VGA by
@@ -15,7 +17,9 @@
 //! - `virtio-gpu-device` on q35 fails with QEMU's "No 'virtio-bus' bus found" error when it is
 //!   realized, after the properties are checked, instead of before. On x86 it takes no `bus`.
 //! - virtio-gpu takes the properties listed in [`plan`]. `hostmem`, `outputs` and the generic
-//!   virtio and PCI ones such as `ats` or `rombar` are not there.
+//!   virtio and PCI ones such as `ats` or `rombar` are not there. The same goes for the virtio
+//!   input devices, which take `serial`, `display` and `head`.
+//! - The virtio input devices are not there on RISC-V virt yet.
 //!
 //! It also connects the input layer of ui/input.c: the i8042 of q35, the clock `send-key` paces
 //! its keys on, and the `query-mice`, `send-key` and `input-send-event` commands.
@@ -41,11 +45,13 @@ use ruvm_hw_display::edid::EdidInfo;
 use ruvm_hw_display::ramfb::Ramfb;
 use ruvm_hw_display::vga_pci::{VGA_ROMFILE, VgaPci, VgaPciProps};
 use ruvm_hw_display::virtio_gpu::{TYPE_VIRTIO_GPU, TYPE_VIRTIO_GPU_PCI, VirtioGpu, VirtioGpuConf};
+use ruvm_hw_input::virtio_input::{VirtioInput, VirtioInputConf, VirtioInputKind};
 use ruvm_hw_pci::regs::PCI_ROM_SLOT;
 use ruvm_hw_pci::{PciBus, PciDevice};
 use ruvm_hw_virtio::mmio::VIRTIO_MMIO_FORCE_LEGACY_DEFAULT;
 use ruvm_hw_virtio::{
-    AddressSpaceMemory, SharedGuestMemory, VirtioBackend, VirtioMmio, VirtioPci, VirtioPciProps,
+    AddressSpaceMemory, SharedGuestMemory, VirtioBackend, VirtioDeviceClass, VirtioMmio, VirtioPci,
+    VirtioPciProps,
 };
 use ruvm_machine_arm::virt::VirtMachine;
 use ruvm_machine_x86::{FirmwareSearch, VirtioHandle, X86Board};
@@ -455,7 +461,7 @@ impl ruvm_ui::cocoa::Hooks for CocoaHooks {
     }
 }
 
-/// The display types `-device` knows.
+/// The display types `-device` knows, and the virtio input devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DisplayModel {
     /// "VGA", the std VGA PCI card.
@@ -468,6 +474,11 @@ pub(crate) enum DisplayModel {
     VirtioGpuPci,
     /// "virtio-gpu-device", on a virtio-mmio transport.
     VirtioGpuDevice,
+    /// "virtio-keyboard-pci" and the other virtio input functions. "virtio-keyboard",
+    /// "virtio-mouse" and "virtio-tablet" are aliases on x86 and Arm.
+    VirtioInputPci(VirtioInputKind),
+    /// "virtio-keyboard-device" and the others on a virtio-mmio transport.
+    VirtioInputDevice(VirtioInputKind),
 }
 
 /// The `-device` names of the display types, with the aliases of `qdev_alias_table[]`.
@@ -478,12 +489,25 @@ const DISPLAY_TYPES: &[(&str, DisplayModel)] = &[
     ("virtio-gpu-pci", DisplayModel::VirtioGpuPci),
     ("virtio-gpu", DisplayModel::VirtioGpuPci),
     ("virtio-gpu-device", DisplayModel::VirtioGpuDevice),
+    ("virtio-keyboard-pci", DisplayModel::VirtioInputPci(VirtioInputKind::Keyboard)),
+    ("virtio-keyboard", DisplayModel::VirtioInputPci(VirtioInputKind::Keyboard)),
+    ("virtio-keyboard-device", DisplayModel::VirtioInputDevice(VirtioInputKind::Keyboard)),
+    ("virtio-mouse-pci", DisplayModel::VirtioInputPci(VirtioInputKind::Mouse)),
+    ("virtio-mouse", DisplayModel::VirtioInputPci(VirtioInputKind::Mouse)),
+    ("virtio-mouse-device", DisplayModel::VirtioInputDevice(VirtioInputKind::Mouse)),
+    ("virtio-tablet-pci", DisplayModel::VirtioInputPci(VirtioInputKind::Tablet)),
+    ("virtio-tablet", DisplayModel::VirtioInputPci(VirtioInputKind::Tablet)),
+    ("virtio-tablet-device", DisplayModel::VirtioInputDevice(VirtioInputKind::Tablet)),
+    ("virtio-multitouch-pci", DisplayModel::VirtioInputPci(VirtioInputKind::MultiTouch)),
+    ("virtio-multitouch-device", DisplayModel::VirtioInputDevice(VirtioInputKind::MultiTouch)),
 ];
 
 /// The `vectors` virtio-gpu-pci starts with.
 const VIRTIO_GPU_PCI_VECTORS: u32 = 3;
+/// The `vectors` of `virtio_input_pci_properties`.
+const VIRTIO_INPUT_PCI_VECTORS: u32 = 2;
 
-/// A display device to plug, with its properties.
+/// A display or virtio input device to plug, with its properties.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DisplayPlug {
     pub model: DisplayModel,
@@ -511,10 +535,14 @@ pub(crate) struct DisplayPlug {
     max_outputs: u32,
     max_hostmem: u64,
     blob: bool,
-    /// virtio-gpu-pci `vectors`.
+    /// virtio-gpu-pci and virtio input `vectors`.
     vectors: u32,
-    /// virtio-gpu-device `bus=virtio-mmio-bus.<n>`.
+    /// virtio-gpu-device and virtio input `bus=virtio-mmio-bus.<n>`.
     mmio_bus: Option<usize>,
+    /// virtio input `serial`, `display` and `head`.
+    serial: Option<String>,
+    input_display: Option<String>,
+    head: u32,
     pub loc: Option<Location>,
 }
 
@@ -524,7 +552,29 @@ impl DisplayModel {
     }
 
     fn is_pci(self) -> bool {
-        !matches!(self, DisplayModel::Ramfb | DisplayModel::VirtioGpuDevice)
+        !matches!(
+            self,
+            DisplayModel::Ramfb
+                | DisplayModel::VirtioGpuDevice
+                | DisplayModel::VirtioInputDevice(_)
+        )
+    }
+
+    fn input_kind(self) -> Option<VirtioInputKind> {
+        match self {
+            DisplayModel::VirtioInputPci(k) | DisplayModel::VirtioInputDevice(k) => Some(k),
+            _ => None,
+        }
+    }
+
+    /// A virtio PCI function.
+    fn is_virtio_pci(self) -> bool {
+        matches!(self, DisplayModel::VirtioGpuPci | DisplayModel::VirtioInputPci(_))
+    }
+
+    /// A virtio device on a virtio-mmio transport.
+    fn is_virtio_mmio(self) -> bool {
+        matches!(self, DisplayModel::VirtioGpuDevice | DisplayModel::VirtioInputDevice(_))
     }
 }
 
@@ -533,9 +583,7 @@ impl DisplayPlug {
         let romfile = match model {
             DisplayModel::Vga => Some(VGA_ROMFILE.to_string()),
             DisplayModel::BochsDisplay => Some(BOCHS_DISPLAY_ROMFILE.to_string()),
-            DisplayModel::Ramfb | DisplayModel::VirtioGpuPci | DisplayModel::VirtioGpuDevice => {
-                None
-            }
+            _ => None,
         };
         let gpu = VirtioGpuConf::default();
         let (xres, yres) = if model.is_virtio_gpu() { (gpu.xres, gpu.yres) } else { (0, 0) };
@@ -559,8 +607,15 @@ impl DisplayPlug {
             max_outputs: gpu.max_outputs,
             max_hostmem: gpu.max_hostmem,
             blob: gpu.blob,
-            vectors: VIRTIO_GPU_PCI_VECTORS,
+            vectors: if model.input_kind().is_some() {
+                VIRTIO_INPUT_PCI_VECTORS
+            } else {
+                VIRTIO_GPU_PCI_VECTORS
+            },
             mmio_bus: None,
+            serial: None,
+            input_display: None,
+            head: 0,
             loc,
         }
     }
@@ -572,6 +627,8 @@ impl DisplayPlug {
             DisplayModel::Ramfb => "ramfb",
             DisplayModel::VirtioGpuPci => TYPE_VIRTIO_GPU_PCI,
             DisplayModel::VirtioGpuDevice => TYPE_VIRTIO_GPU,
+            DisplayModel::VirtioInputPci(k) => k.pci_typename(),
+            DisplayModel::VirtioInputDevice(k) => k.typename(),
         }
     }
 
@@ -594,14 +651,45 @@ impl DisplayPlug {
         VirtioGpu::new(conf, DisplayState::global(), dev)
     }
 
+    /// The virtio device model, virtio-gpu or one of the input devices.
+    fn virtio_class(&self) -> Box<dyn VirtioDeviceClass> {
+        let Some(kind) = self.model.input_kind() else {
+            return Box::new(self.virtio_gpu());
+        };
+        let conf = VirtioInputConf {
+            serial: self.serial.clone(),
+            display: self.input_display.clone(),
+            head: self.head,
+        };
+        Box::new(VirtioInput::new(kind, conf, InputState::global(), DisplayState::global()))
+    }
+
     /// The virtio PCI properties: `virtio_pci_force_virtio_1()` turns legacy off and modern on.
+    /// The input functions take their class from the type.
     fn virtio_pci_props(&self) -> VirtioPciProps {
         VirtioPciProps {
             disable_legacy: Some(true),
             disable_modern: false,
             vectors: Some(self.vectors),
+            class_code: self.model.input_kind().map_or(0, VirtioInputKind::pci_class),
             id: self.id.clone(),
             ..VirtioPciProps::default()
+        }
+    }
+
+    /// Lets the device reach the guest from outside a queue kick, through the PCI function.
+    fn connect_pci(&self, dev: &VirtioPci) {
+        match self.model.input_kind() {
+            Some(_) => connect_input_pci(dev),
+            None => connect_gpu_pci(dev),
+        }
+    }
+
+    /// [`DisplayPlug::connect_pci`] for a virtio-mmio transport.
+    fn connect_mmio(&self, t: &Arc<VirtioMmio>) {
+        match self.model.input_kind() {
+            Some(_) => connect_input_mmio(t),
+            None => connect_gpu_mmio(t),
         }
     }
 
@@ -658,9 +746,10 @@ pub(crate) fn parse_devfn(v: &str) -> Option<u8> {
 }
 
 /// `qdev_device_add()` up to realize for a display type: the bus, then the properties.
-/// `None` when `driver` is not a display type. `pci` says whether the machine has the root
-/// bus `pcie.0`, `sysbus` whether it takes a `ramfb`. Whether there is a virtio-mmio
-/// transport for `virtio-gpu-device` is found out when it is realized.
+/// `None` when `driver` is not a display type or a virtio input device. `pci` says whether the
+/// machine has the root bus `pcie.0`, `sysbus` whether it takes a `ramfb`. Whether there is a
+/// virtio-mmio transport for `virtio-gpu-device` or an input `-device` is found out when it is
+/// realized.
 pub(crate) fn plan_device(
     driver: &str,
     opts: &QemuOpts,
@@ -668,6 +757,17 @@ pub(crate) fn plan_device(
     pci: bool,
     sysbus: bool,
 ) -> Option<std::result::Result<DisplayPlug, Located>> {
+    // The abstract bases of the virtio input devices.
+    if matches!(
+        driver,
+        "virtio-input-device"
+            | "virtio-input-hid-device"
+            | "virtio-input-pci"
+            | "virtio-input-hid-pci"
+    ) {
+        let msg = "Parameter 'driver' expects a non-abstract device type".to_string();
+        return Some(Err(Located::new(loc, msg)));
+    }
     let &(_, model) = DISPLAY_TYPES.iter().find(|(t, _)| *t == driver)?;
     let typename = DisplayPlug::new(model, None).typename();
     Some(plan(typename, model, opts, loc, pci, sysbus))
@@ -694,7 +794,7 @@ fn plan(
             _ => return Err(Located::new(loc, format!("Bus '{b}' not found"))),
         };
         let fits = match model {
-            DisplayModel::VirtioGpuDevice => bus_type == "virtio-mmio-bus",
+            _ if model.is_virtio_mmio() => bus_type == "virtio-mmio-bus",
             _ => (bus_type == "PCIE") == is_pci,
         };
         if !fits {
@@ -705,7 +805,7 @@ fn plan(
     if is_pci && !pci {
         return Err(Located::new(loc, format!("No 'PCI' bus found for device '{typename}'")));
     }
-    if model == DisplayModel::VirtioGpuDevice && !sysbus {
+    if model.is_virtio_mmio() && !sysbus {
         let msg = format!("No 'virtio-bus' bus found for device '{typename}'");
         return Err(Located::new(loc, msg));
     }
@@ -717,7 +817,9 @@ fn plan(
     let bochs = model == DisplayModel::BochsDisplay;
     // The EDID and framebuffer properties VGA and bochs-display share.
     let vga_like = vga || bochs;
-    let gpu_pci = model == DisplayModel::VirtioGpuPci;
+    let ramfb = model == DisplayModel::Ramfb;
+    let input = model.input_kind().is_some();
+    let virtio_pci = model.is_virtio_pci();
     for (k, v) in opts.iter() {
         match k {
             "driver" | "bus" => {}
@@ -747,23 +849,30 @@ fn plan(
             "max_outputs" if gpu => plug.max_outputs = prop_u32(k, v).map_err(at)?,
             "max_hostmem" if gpu => plug.max_hostmem = prop_size(k, v).map_err(at)?,
             "blob" if gpu => plug.blob = prop_bool(k, v).map_err(at)?,
-            "vectors" if gpu_pci => plug.vectors = prop_u32(k, v).map_err(at)?,
-            // virtio_pci_force_virtio_1() overrides these two, and ioeventfd is a host detail.
-            "ioeventfd" | "disable-modern" if gpu_pci => {
+            "serial" if input => plug.serial = Some(v.to_string()),
+            "display" if input => plug.input_display = Some(v.to_string()),
+            "head" if input => plug.head = prop_u32(k, v).map_err(at)?,
+            "vectors" if virtio_pci => plug.vectors = prop_u32(k, v).map_err(at)?,
+            // virtio_pci_force_virtio_1() overrides disable-modern. ioeventfd is a host detail,
+            // and only virtio-gpu-pci has it.
+            "disable-modern" if virtio_pci => {
+                prop_bool(k, v).map_err(at)?;
+            }
+            "ioeventfd" if gpu && virtio_pci => {
                 prop_bool(k, v).map_err(at)?;
             }
             // An OnOffAuto.
-            "disable-legacy" if gpu_pci => {
+            "disable-legacy" if virtio_pci => {
                 if !matches!(v, "on" | "off" | "auto") {
                     let msg = format!("Parameter '{k}' does not accept value '{v}'");
                     return Err(Located::new(loc, msg));
                 }
             }
-            "use-legacy-x86-rom" if !is_pci => {
+            "use-legacy-x86-rom" if ramfb => {
                 plug.legacy_rom = Some(prop_bool(k, v).map_err(at)?);
             }
             // Only what migrates depends on it.
-            "x-migrate" if !is_pci => {
+            "x-migrate" if ramfb => {
                 prop_bool(k, v).map_err(at)?;
             }
             _ => return Err(Located::new(loc, format!("Property '{typename}.{k}' not found"))),
@@ -856,9 +965,7 @@ fn realize_pci(
             let dev = BochsDisplay::realize(bus, plug.devfn, true, &props, &ds).map_err(at)?;
             (Arc::clone(dev.pci_device()), "bochs-display")
         }
-        DisplayModel::Ramfb | DisplayModel::VirtioGpuPci | DisplayModel::VirtioGpuDevice => {
-            unreachable!("{} is not realized here", plug.typename())
-        }
+        _ => unreachable!("{} is not realized here", plug.typename()),
     };
     // qemu_console_fill_device_address() for the consoles the function took. The display
     // functions sit on a root bus, so there is no bridge in front.
@@ -896,38 +1003,64 @@ fn connect_gpu_mmio(t: &Arc<VirtioMmio>) {
     });
 }
 
-/// Realizes virtio-gpu-pci on q35 or virtio-gpu-device on microvm.
-fn realize_x86_virtio_gpu(
+/// Sends the input batches the device finished through the PCI function, which the input
+/// handler must not keep alive.
+fn connect_input_pci(dev: &VirtioPci) {
+    let weak = dev.downgrade();
+    dev.with_device::<VirtioInput, _>(|_, input| {
+        input.set_kick(Some(Box::new(move || {
+            if let Some(dev) = weak.upgrade() {
+                dev.with_device::<VirtioInput, _>(|vdev, input| input.flush(vdev));
+            }
+        })));
+    });
+}
+
+/// [`connect_input_pci`] for a virtio-mmio transport.
+fn connect_input_mmio(t: &Arc<VirtioMmio>) {
+    let weak = Arc::downgrade(t);
+    t.with_device::<VirtioInput, _>(|_, input| {
+        input.set_kick(Some(Box::new(move || {
+            if let Some(t) = weak.upgrade() {
+                t.with_device::<VirtioInput, _>(|vdev, input| input.flush(vdev));
+            }
+        })));
+    });
+}
+
+/// Realizes virtio-gpu-pci or a virtio input function on q35, or virtio-gpu-device or an input
+/// `-device` on microvm.
+fn realize_x86_virtio(
     board: &mut X86Board,
     plug: &DisplayPlug,
     firmware: &FirmwareSearch,
 ) -> std::result::Result<(), Located> {
     let at = |e: Error| Located(plug.loc.clone(), e);
     let typename = plug.typename();
-    let handle = match (plug.model, &mut *board) {
-        (DisplayModel::VirtioGpuPci, X86Board::Q35(m, devs)) => {
+    let handle = match &mut *board {
+        X86Board::Q35(m, devs) if plug.model.is_virtio_pci() => {
             let mem: SharedGuestMemory =
                 Arc::new(AddressSpaceMemory::new(Arc::clone(m.memory_as())));
-            let backend = VirtioBackend::new(Box::new(plug.virtio_gpu()), mem).map_err(at)?;
+            let backend = VirtioBackend::new(plug.virtio_class(), mem).map_err(at)?;
             let props = plug.virtio_pci_props();
             let dev = VirtioPci::new(m.pci_bus(), plug.devfn, backend, &props).map_err(at)?;
-            connect_gpu_pci(&dev);
+            plug.connect_pci(&dev);
             devs.push(dev.clone());
             VirtioHandle::Pci(dev)
         }
-        (DisplayModel::VirtioGpuDevice, X86Board::Microvm(_)) => {
+        X86Board::Microvm(_) if plug.model.is_virtio_mmio() => {
             if let Some(n) = plug.mmio_bus {
                 return Err(plug.at(format!("Bus 'virtio-mmio-bus.{n}' not found")));
             }
             let handle = board
-                .attach_virtio(Box::new(plug.virtio_gpu()))
+                .attach_virtio(plug.virtio_class())
                 .map_err(|e| plug.at(format!("{e} '{typename}'")))?;
             if let VirtioHandle::Mmio(t) = &handle {
-                connect_gpu_mmio(t);
+                plug.connect_mmio(t);
             }
             handle
         }
-        (DisplayModel::VirtioGpuDevice, _) => {
+        _ if plug.model.is_virtio_mmio() => {
             return Err(plug.at(format!("No 'virtio-bus' bus found for device '{typename}'")));
         }
         _ => return Err(plug.at(format!("No 'PCI' bus found for device '{typename}'"))),
@@ -988,8 +1121,8 @@ pub(crate) fn realize_x86(
         let legacy = plug.legacy_rom.unwrap_or(true).then_some(firmware);
         return realize_ramfb(plug, &fw_cfg, board.memory_as(), legacy);
     }
-    if plug.model.is_virtio_gpu() {
-        return realize_x86_virtio_gpu(board, plug, firmware);
+    if plug.model.is_virtio_pci() || plug.model.is_virtio_mmio() {
+        return realize_x86_virtio(board, plug, firmware);
     }
     let X86Board::Q35(m, _) = board else {
         return Err(plug.at(format!("No 'PCI' bus found for device '{}'", plug.typename())));
@@ -1019,32 +1152,33 @@ pub(crate) fn realize_virt(
     if plug.model == DisplayModel::Ramfb {
         return realize_ramfb(plug, board.fw_cfg().state(), board.memory_as(), None);
     }
-    let typename = plug.typename();
-    match plug.model {
-        DisplayModel::VirtioGpuPci => {
-            let class = Box::new(plug.virtio_gpu());
-            let dev = board
-                .attach_virtio_pci(class, plug.devfn, &plug.virtio_pci_props())
-                .map_err(|e| plug.at(e))?;
-            connect_gpu_pci(&dev);
-            Ok(())
-        }
-        // The board gives no handle on its virtio-mmio transports, so a UI size change
-        // raises the config interrupt at the next queue kick.
-        DisplayModel::VirtioGpuDevice => {
-            let class = Box::new(plug.virtio_gpu());
-            match plug.mmio_bus {
-                Some(n) => board
-                    .attach_virtio_at(n, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT)
-                    .map_err(|e| plug.at(e)),
-                None => board
-                    .attach_virtio(class)
-                    .map(drop)
-                    .map_err(|e| plug.at(format!("{e} '{typename}'"))),
-            }
-        }
-        _ => realize_pci(board.gpex().bus(), plug, false).map(drop),
+    if plug.model.input_kind().is_some() {
+        // The clock send-key paces its keys on, which connect_x86_input() sets on x86.
+        InputState::global().set_clock(board.clock());
     }
+    let typename = plug.typename();
+    if plug.model.is_virtio_pci() {
+        let dev = board
+            .attach_virtio_pci(plug.virtio_class(), plug.devfn, &plug.virtio_pci_props())
+            .map_err(|e| plug.at(e))?;
+        plug.connect_pci(&dev);
+        return Ok(());
+    }
+    if plug.model.is_virtio_mmio() {
+        let class = plug.virtio_class();
+        let index = match plug.mmio_bus {
+            Some(n) => board
+                .attach_virtio_at(n, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT)
+                .map(|()| n)
+                .map_err(|e| plug.at(e))?,
+            None => board.attach_virtio(class).map_err(|e| plug.at(format!("{e} '{typename}'")))?,
+        };
+        if let Some(t) = board.virtio_transport(index) {
+            plug.connect_mmio(&t);
+        }
+        return Ok(());
+    }
+    realize_pci(board.gpex().bus(), plug, false).map(drop)
 }
 
 /// The QMP `screendump` command.
@@ -1200,5 +1334,63 @@ mod tests {
             err("virtio-gpu-device,bus=virtio-mmio-bus.0", false, false),
             "Bus 'virtio-mmio-bus.0' not found"
         );
+        assert_eq!(
+            err("virtio-gpu-device,x-migrate=on", true, true),
+            "Property 'virtio-gpu-device.x-migrate' not found"
+        );
+    }
+
+    #[test]
+    fn virtio_input_properties() {
+        let p = plan_one("virtio-tablet,id=t,addr=4,serial=abc,display=vga0,head=1", true, true)
+            .unwrap();
+        assert_eq!(p.model, DisplayModel::VirtioInputPci(VirtioInputKind::Tablet));
+        assert_eq!(p.typename(), "virtio-tablet-pci");
+        assert_eq!((p.id.as_deref(), p.devfn, p.vectors), (Some("t"), Some(0x20), 2));
+        assert_eq!(
+            (p.serial.as_deref(), p.input_display.as_deref(), p.head),
+            (Some("abc"), Some("vga0"), 1)
+        );
+        let props = p.virtio_pci_props();
+        assert_eq!((props.disable_legacy, props.class_code), (Some(true), 0x0980));
+        let p = plan_one("virtio-keyboard-pci,vectors=0", true, true).unwrap();
+        assert_eq!((p.vectors, p.virtio_pci_props().class_code), (0, 0x0900));
+        let p = plan_one("virtio-mouse", true, true).unwrap();
+        assert_eq!(p.virtio_pci_props().class_code, 0x0902);
+        let p = plan_one("virtio-multitouch-device,bus=virtio-mmio-bus.2", true, true).unwrap();
+        assert_eq!(p.model, DisplayModel::VirtioInputDevice(VirtioInputKind::MultiTouch));
+        assert_eq!((p.typename(), p.mmio_bus), ("virtio-multitouch-device", Some(2)));
+
+        let err = |arg, pci, sysbus| plan_one(arg, pci, sysbus).unwrap_err();
+        assert_eq!(
+            err("virtio-keyboard-device,vectors=3", true, true),
+            "Property 'virtio-keyboard-device.vectors' not found"
+        );
+        assert_eq!(
+            err("virtio-mouse-pci,xres=3", true, true),
+            "Property 'virtio-mouse-pci.xres' not found"
+        );
+        assert_eq!(
+            err("virtio-input-hid-pci", true, true),
+            "Parameter 'driver' expects a non-abstract device type"
+        );
+        assert_eq!(
+            err("virtio-keyboard-pci,ioeventfd=off", true, true),
+            "Property 'virtio-keyboard-pci.ioeventfd' not found"
+        );
+        assert_eq!(
+            err("virtio-tablet-device,bus=pcie.0", true, true),
+            "Device 'virtio-tablet-device' can't go on PCIE bus"
+        );
+        assert_eq!(
+            err("virtio-keyboard-device", false, false),
+            "No 'virtio-bus' bus found for device 'virtio-keyboard-device'"
+        );
+        assert_eq!(
+            err("virtio-keyboard", false, true),
+            "No 'PCI' bus found for device 'virtio-keyboard-pci'"
+        );
+        // There is no alias for the multitouch device.
+        assert!(!DISPLAY_TYPES.iter().any(|(t, _)| *t == "virtio-multitouch"));
     }
 }
