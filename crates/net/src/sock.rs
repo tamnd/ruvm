@@ -19,10 +19,12 @@ use std::time::{Duration, Instant};
 use rustix::io::{Errno, FdFlags};
 use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketAddrAny, SocketAddrUnix, SocketType};
 use ruvm_base::{Error, Result};
-use ruvm_qapi::types::{InetSocketAddress, NetClientDriver};
+use ruvm_qapi::types::{
+    InetSocketAddress, NetClientDriver, SocketAddress, SocketAddressU, UnixSocketAddress,
+};
 
 use crate::client::{NET_BUFSIZE, NetClient, NetClientOps, lock};
-use crate::net::Net;
+use crate::net::{EventSink, Net, NetEvent};
 use crate::poll::{Interest, IoHandler, IoThread, unblock};
 use crate::util::SocketReadState;
 
@@ -76,6 +78,8 @@ pub(crate) struct SockConfig {
     /// A Unix socket path to remove at cleanup.
     pub(crate) unlink: Option<PathBuf>,
     pub(crate) hooks: Option<Arc<dyn SockHooks>>,
+    /// Where a stream netdev sends `NETDEV_STREAM_CONNECTED` and `NETDEV_STREAM_DISCONNECTED`.
+    pub(crate) events: Option<EventSink>,
 }
 
 impl SockConfig {
@@ -92,6 +96,7 @@ impl SockConfig {
             info: String::new(),
             unlink: None,
             hooks: None,
+            events: None,
         }
     }
 }
@@ -116,6 +121,7 @@ pub(crate) struct Sock {
     reconnect_at: Mutex<Option<Instant>>,
     unlink: Mutex<Option<PathBuf>>,
     hooks: Option<Arc<dyn SockHooks>>,
+    events: Option<EventSink>,
     io: OnceLock<IoThread>,
 }
 
@@ -150,6 +156,7 @@ pub(crate) fn new_sock(
         info,
         unlink,
         hooks,
+        events,
     } = cfg;
     let has_fd = fd.is_some();
     let has_listen = listen_fd.is_some();
@@ -175,6 +182,7 @@ pub(crate) fn new_sock(
             reconnect_at: Mutex::new(connect_now.then(Instant::now)),
             unlink: Mutex::new(unlink),
             hooks,
+            events,
             io: OnceLock::new(),
         });
         state = Some(s.clone());
@@ -312,6 +320,7 @@ impl Sock {
         if listening {
             self.accepting.store(true, Ordering::SeqCst);
         }
+        self.send_event(|netdev_id| NetEvent::StreamDisconnected { netdev_id });
         if self.flavour == Flavour::Stream {
             self.arm_reconnect();
         }
@@ -324,6 +333,13 @@ impl Sock {
                     self.install(fd);
                 }
             }
+        }
+    }
+
+    /// Sends an event of a stream netdev, named after the client.
+    fn send_event(&self, event: impl FnOnce(String) -> NetEvent) {
+        if let (Some(sink), Some(nc)) = (&self.events, self.nc.upgrade()) {
+            sink(event(nc.name().to_string()));
         }
     }
 
@@ -373,6 +389,7 @@ impl Sock {
             return;
         }
         self.accepting.store(false, Ordering::SeqCst);
+        let mut addr = None;
         let info = match self.flavour {
             Flavour::Socket => match from.map(SocketAddrV4::try_from) {
                 Some(Ok(a)) => format!("socket: connection from {}:{}", a.ip(), a.port()),
@@ -380,18 +397,21 @@ impl Sock {
             },
             Flavour::Stream => {
                 let local = rustix::net::getsockname(&fd).ok();
-                let addr = if local.as_ref().map(SocketAddrAny::address_family)
+                addr = if local.as_ref().map(SocketAddrAny::address_family)
                     == Some(AddressFamily::UNIX)
                 {
                     local
                 } else {
                     rustix::net::getpeername(&fd).ok().flatten()
                 };
-                addr.map(|a| socket_uri(&a)).unwrap_or_default()
+                addr.as_ref().map(socket_uri).unwrap_or_default()
             }
         };
         self.install(fd);
         self.set_info(&info);
+        if let Some(addr) = addr.as_ref().and_then(socket_address) {
+            self.send_event(|netdev_id| NetEvent::StreamConnected { netdev_id, addr });
+        }
     }
 
     /// A stream client connecting, from `net_stream_client_connected()`.
@@ -407,8 +427,12 @@ impl Sock {
             Ok(fd) => {
                 let _ = rustix::net::sockopt::set_tcp_nodelay(&fd, true);
                 let info = peer_uri(&fd);
+                let addr = peer_address(&fd);
                 self.install(fd);
                 self.set_info(&info);
+                if let Some(addr) = addr {
+                    self.send_event(|netdev_id| NetEvent::StreamConnected { netdev_id, addr });
+                }
             }
             Err(e) => {
                 self.set_info(&format!("error: {}", e.message()));
@@ -602,6 +626,47 @@ fn peer_uri(fd: &OwnedFd) -> String {
             Ok(a) => socket_uri(&a),
             Err(_) => String::new(),
         },
+    }
+}
+
+/// `socket_sockaddr_to_address()` for an address the kernel handed back.
+fn socket_address(addr: &SocketAddrAny) -> Option<SocketAddress> {
+    if let Ok(a) = SocketAddr::try_from(addr.clone()) {
+        let v4 = a.is_ipv4();
+        return Some(SocketAddress {
+            u: SocketAddressU::Inet(InetSocketAddress {
+                host: a.ip().to_string(),
+                port: a.port().to_string(),
+                ipv4: v4.then_some(true),
+                ipv6: (!v4).then_some(true),
+                ..Default::default()
+            }),
+        });
+    }
+    let u = SocketAddrUnix::try_from(addr.clone()).ok()?;
+    // The kernel gives back only the bytes of an abstract name, so the length is tight unless
+    // the name fills the whole of sun_path.
+    #[cfg(target_os = "linux")]
+    let (abstract_, tight) = match u.abstract_name() {
+        Some(name) => {
+            let max =
+                size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+            (Some(true), Some(name.len() + 1 < max))
+        }
+        None => (None, None),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (abstract_, tight) = (None, None);
+    let unix = UnixSocketAddress { path: unix_path(&u), abstract_, tight };
+    Some(SocketAddress { u: SocketAddressU::Unix(unix) })
+}
+
+/// `qio_channel_socket_get_remote_address()`. An unnamed Unix peer, as from `socketpair()`,
+/// comes back as a Unix address with an empty path.
+fn peer_address(fd: &OwnedFd) -> Option<SocketAddress> {
+    match rustix::net::getpeername(fd) {
+        Ok(Some(a)) => socket_address(&a),
+        _ => Some(SocketAddress { u: SocketAddressU::Unix(UnixSocketAddress::default()) }),
     }
 }
 

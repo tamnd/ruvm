@@ -18,8 +18,10 @@ use ruvm_base::report::Location;
 use ruvm_hw_core::{Clock, Timer};
 use ruvm_hw_virtio::{NetPeer, RxOutcome, VirtioNet, VirtioNetHdr};
 use ruvm_machine_x86::VirtioHandle;
-use ruvm_net::{MacAddr, Net, NetClient, NetClientOps, NicConf};
-use ruvm_qapi::types::NetClientDriver;
+use ruvm_monitor::Qmp;
+use ruvm_net::{EventSink, MacAddr, Net, NetClient, NetClientOps, NetEvent, NicConf};
+use ruvm_qapi::events::{event_netdev_stream_connected, event_netdev_stream_disconnected};
+use ruvm_qapi::types::{NetClientDriver, NetdevStreamConnectedArg, NetdevStreamDisconnectedArg};
 
 use crate::x86::Located;
 
@@ -44,12 +46,15 @@ impl fmt::Debug for Network {
 
 impl Network {
     /// Parses the `-netdev` options and makes the backends, `net_init_clients()`. The VM
-    /// counts as stopped until [`Network::vm_state_change`] says otherwise.
+    /// counts as stopped until [`Network::vm_state_change`] says otherwise. The backends send
+    /// their QAPI events to `events`.
     pub(crate) fn new(
         netdevs: &[(String, Option<Location>)],
         clock: &Arc<Clock>,
+        events: Option<EventSink>,
     ) -> Result<Network, Located> {
         let mut net = Net::new();
+        net.set_event_sink(events);
         for (arg, loc) in netdevs {
             net.parse_netdev(arg).map_err(|e| Located(loc.clone(), e))?;
         }
@@ -125,6 +130,25 @@ impl Network {
     pub(crate) fn vm_state_change(&self, running: bool) {
         lock(&self.net).vm_state_change(running);
     }
+}
+
+/// Sends the events of the netdevs out on QMP.
+pub(crate) fn qmp_events(qmp: &Arc<Qmp>) -> EventSink {
+    let qmp = Arc::clone(qmp);
+    Arc::new(move |e| {
+        let policy = qmp.policy();
+        let ev = match e {
+            NetEvent::StreamConnected { netdev_id, addr } => {
+                event_netdev_stream_connected(&policy, NetdevStreamConnectedArg { netdev_id, addr })
+            }
+            NetEvent::StreamDisconnected { netdev_id } => {
+                event_netdev_stream_disconnected(&policy, NetdevStreamDisconnectedArg { netdev_id })
+            }
+        };
+        if let Some(ev) = ev {
+            qmp.emit_event(ev);
+        }
+    })
 }
 
 /// A NIC made by [`Network::new_nic`], waiting for its device.
@@ -236,7 +260,8 @@ mod tests {
     fn nics_join_their_netdevs() {
         let clock = Clock::manual(ruvm_base::ClockType::Virtual);
         let net =
-            Network::new(&args(&["hubport,id=a,hubid=0", "hubport,id=b,hubid=0"]), &clock).unwrap();
+            Network::new(&args(&["hubport,id=a,hubid=0", "hubport,id=b,hubid=0"]), &clock, None)
+                .unwrap();
         let mut mac = [0; 6];
         let (_, port) = net.new_nic("virtio-net-pci", None, Some("a"), &mut mac).unwrap();
         assert_eq!(mac, [0x52, 0x54, 0, 0x12, 0x34, 0x56]);
@@ -257,6 +282,6 @@ mod tests {
         port.0.run();
         assert_eq!(lock(&port.0.queue).len(), 1);
 
-        assert!(Network::new(&args(&["bogus,id=x"]), &clock).is_err());
+        assert!(Network::new(&args(&["bogus,id=x"]), &clock, None).is_err());
     }
 }

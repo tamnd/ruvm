@@ -66,7 +66,7 @@ use ruvm_qapi::types::{
 use ruvm_qapi::visit::{QObjectInputVisitor, StringInputVisitor, Visit, Visitor, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
 
-use crate::net::{Network, NicPort};
+use crate::net::{Network, NicPort, qmp_events};
 use crate::vl::Vm;
 
 /// Whether `target` is one the x86 boards exist for.
@@ -1813,7 +1813,7 @@ fn build(
         attach_ide(&board, plug.port, config, Some(Arc::new(blk)))
             .map_err(|e| one(Located::new(&d.loc, e)))?;
     }
-    let net = Arc::new(Network::new(&cmd.netdevs, &clock).map_err(one)?);
+    let net = Arc::new(Network::new(&cmd.netdevs, &clock, Some(qmp_events(&vm.qmp))).map_err(one)?);
     let _ = vm.network.set(Arc::clone(&net));
     ruvm_audio::registry::attach_clock(&clock);
     crate::audio::realize_isa_dma(&board, &clock).map_err(|e| one(Located(None, e)))?;

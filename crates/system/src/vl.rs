@@ -51,7 +51,7 @@ use ruvm_qom::{
 };
 
 use crate::arm;
-use crate::net::Network;
+use crate::net::{Network, qmp_events};
 use crate::options::{Opt, arch_available, help_text, lookup_opt};
 use crate::qmp_cmds::{self, object_options_dict};
 use crate::qtest::{self, VirtualClock};
@@ -1154,10 +1154,12 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     // net_init_clients(). The boards make their netdevs with their NICs.
     if machine.is_some() {
         let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
-        let net = Network::new(&cfg.x86.netdevs, &clock).map_err(|Located(loc, e)| {
-            let _loc = loc.map(push_location);
-            fail(&e)
-        })?;
+        let net = Network::new(&cfg.x86.netdevs, &clock, Some(qmp_events(&vm.qmp))).map_err(
+            |Located(loc, e)| {
+                let _loc = loc.map(push_location);
+                fail(&e)
+            },
+        )?;
         let net = Arc::new(net);
         let n = Arc::clone(&net);
         vm.runstate.set_cpu_hook(Some(Arc::new(move |run| n.vm_state_change(run))));

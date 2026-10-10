@@ -53,8 +53,8 @@ pub use client::{
 };
 pub use hub::{Hub, hub_id_for_client};
 pub use net::{
-    AVAILABLE_NETDEVS, DEV_NVECTORS_UNSPECIFIED, FdResolver, MAX_NICS, Net, Nic, NicConf, NicInfo,
-    netdev_is_modern, parse_modern, show_netdevs,
+    AVAILABLE_NETDEVS, DEV_NVECTORS_UNSPECIFIED, EventSink, FdResolver, MAX_NICS, Net, NetEvent,
+    Nic, NicConf, NicInfo, netdev_is_modern, parse_modern, show_netdevs,
 };
 pub use opts_visitor::OptsVisitor;
 pub use passt::{PasstOptions, passt_args};
