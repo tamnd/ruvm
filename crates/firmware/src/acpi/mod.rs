@@ -15,6 +15,7 @@ pub mod pcihp;
 pub mod q35;
 pub mod riscv_virt;
 pub mod table;
+pub mod viot;
 pub mod x86;
 
 use linker::BiosLinker;

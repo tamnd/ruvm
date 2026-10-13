@@ -66,6 +66,7 @@ fn base() -> Q35Acpi {
             plain(0xfa),
             plain(0xfb),
         ],
+        viot: None,
     }
 }
 

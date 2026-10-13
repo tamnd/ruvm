@@ -16,6 +16,7 @@ use super::devices::{self, IsaDevice};
 use super::linker::BiosLinker;
 use super::pci::{self, CrsRange, CrsRangeSet};
 use super::table::{self, AcpiTable, FadtData, Gas, McfgInfo, RsdpData, TABLE_FILE, fadt_flags};
+use super::viot::{self, ViotInfo};
 use super::x86::{self, HPET_BASE, MadtConfig};
 use super::{cpuhp, pcihp};
 
@@ -103,6 +104,8 @@ pub struct Q35Acpi {
     pub pci_hole64: Option<CrsRange>,
     /// The devices on the root bus in devfn order.
     pub pci_devices: Vec<PciDevice>,
+    /// The VIOT contents when there is a virtio-iommu-pci.
+    pub viot: Option<ViotInfo>,
 }
 
 impl Q35Acpi {
@@ -669,6 +672,10 @@ pub fn build(q: &Q35Acpi) -> BuildTables {
     if let Some(mcfg) = &q.mcfg {
         table::add_table(&mut table_offsets, data);
         table::build_mcfg(data, linker, mcfg, &q.oem_id, &q.oem_table_id);
+    }
+    if let Some(viot) = &q.viot {
+        table::add_table(&mut table_offsets, data);
+        viot::build_viot(data, linker, viot, &q.oem_id, &q.oem_table_id);
     }
     table::add_table(&mut table_offsets, data);
     x86::build_waet(data, linker, &q.oem_id, &q.oem_table_id);

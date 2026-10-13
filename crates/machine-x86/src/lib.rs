@@ -21,6 +21,7 @@ pub mod kvm_run;
 pub mod microvm;
 pub mod migration;
 pub mod pc;
+pub mod pci_dma;
 pub mod pflash;
 pub mod q35;
 pub mod run_event;

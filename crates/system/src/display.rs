@@ -715,7 +715,7 @@ impl DisplayPlug {
 
 /// A qdev property from its command line string, read the way the keyval input visitor reads
 /// it, so the errors are QEMU's.
-fn prop<T: Default>(
+pub(crate) fn prop<T: Default>(
     name: &str,
     value: &str,
     visit: impl FnOnce(&mut QObjectInputVisitor, &str, &mut T) -> Result<()>,

@@ -39,7 +39,7 @@ pub mod props;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::SystemTime;
 
 use ruvm_base::ClockType;
@@ -49,6 +49,7 @@ use ruvm_firmware::acpi::q35::{
     self as acpi_q35, PciDevice as AcpiPciDevice, PciDeviceAml, Q35Acpi,
 };
 use ruvm_firmware::acpi::table::{LOADER_FILE, McfgInfo, RSDP_FILE, TABLE_FILE, TPMLOG_FILE};
+use ruvm_firmware::acpi::viot::ViotInfo;
 use ruvm_firmware::acpi::x86::{MadtConfig, PossibleCpu};
 use ruvm_firmware::e820::{E820_FILE, E820_RAM, E820_RESERVED, E820Table};
 use ruvm_firmware::smbios::{
@@ -71,7 +72,10 @@ use ruvm_hw_intc::ioapic::{
     IO_APIC_DEFAULT_ADDRESS, IOAPIC_NUM_PINS, IOAPIC_VER_DEF, IoApic, IoApicMsiHandler, IoApics,
 };
 use ruvm_hw_pci::q35::{Q35Config, Q35PciHost};
-use ruvm_hw_pci::regs::{PCI_CLASS_DEVICE, PCI_HEADER_TYPE, PCI_HEADER_TYPE_BRIDGE};
+use ruvm_hw_pci::regs::{
+    PCI_CLASS_DEVICE, PCI_HEADER_TYPE, PCI_HEADER_TYPE_BRIDGE, PCI_SECONDARY_BUS,
+    PCI_SUBORDINATE_BUS,
+};
 use ruvm_hw_pci::{PCIE_BASE_ADDR_UNMAPPED, PciBus};
 use ruvm_hw_storage::{BlockBackend, DriveConfig, DriveKind, ICH9_AHCI_PORTS, Ich9Ahci};
 use ruvm_hw_timer::hpet::{HPET_BASE, HPET_LEN, Hpet, HpetFwConfig, HpetProperties};
@@ -89,6 +93,7 @@ use crate::pc::{
     UnassignedIo, WeakDma, boot_order_nibbles, cmos_init_disks, cmos_set_memory, err, hd_geometry,
     hd_geometry_guess, pci_hole64_start, rtc_ref_date, rtc_set_cpus_count, set_boot_dev,
 };
+use crate::pci_dma::PciDma;
 use crate::pflash::{FlashDrive, Pflash, PflashBacking, pc_system_flash_map};
 
 pub use props::{Q35Props, SmbiosEntryPointType};
@@ -414,19 +419,6 @@ struct RomBlob {
     size: u64,
 }
 
-/// AHCI DMA through a weak reference to system memory.
-struct WeakAhciDma(Weak<AddressSpace>);
-
-impl ruvm_hw_storage::DmaMemory for WeakAhciDma {
-    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> bool {
-        self.0.upgrade().is_some_and(|a| a.read(addr, MemTxAttrs::UNSPECIFIED, buf).is_ok())
-    }
-
-    fn dma_write(&self, addr: u64, buf: &[u8]) -> bool {
-        self.0.upgrade().is_some_and(|a| a.write(addr, MemTxAttrs::UNSPECIFIED, buf).is_ok())
-    }
-}
-
 /// `a20_line` from `pc_superio_init()`: both the i8042 and port 0x92 drive the CPU's A20 mask
 /// and the last write wins.
 struct A20Line {
@@ -456,6 +448,8 @@ struct AcpiSource {
     hpet: bool,
     /// The indexes of the ISA serial ports that exist, COM1 being 0.
     serials: Vec<usize>,
+    /// The requester ID of the virtio-iommu-pci function, which gets a VIOT.
+    virtio_iommu: OnceLock<u16>,
 }
 
 impl AcpiSource {
@@ -552,8 +546,25 @@ impl AcpiSource {
             pci_hole64: (hole64_end > hole64_start)
                 .then(|| CrsRange { base: hole64_start, limit: hole64_end - 1 }),
             pci_devices: self.pci_devices(self.host.bus()),
+            viot: self
+                .virtio_iommu
+                .get()
+                .map(|&bdf| ViotInfo { bdf, ranges: vec![pci_bus_range(self.host.bus())] }),
         }
     }
+}
+
+/// `pci_bus_range()`: the bus numbers behind `bus`, from its bridges as the firmware set them.
+fn pci_bus_range(bus: &PciBus) -> (u8, u8) {
+    let num = bus.bus_num();
+    bus.devices().iter().fold((num, num), |(min, max), d| {
+        d.with_config(|c| {
+            if c.config[PCI_HEADER_TYPE] & 0x7f != PCI_HEADER_TYPE_BRIDGE {
+                return (min, max);
+            }
+            (min.min(c.config[PCI_SECONDARY_BUS]), max.max(c.config[PCI_SUBORDINATE_BUS]))
+        })
+    })
 }
 
 /// `AcpiBuildState`: whether the tables were rebuilt since the last reset, and the blobs.
@@ -672,6 +683,8 @@ pub struct Q35 {
     a20: Arc<A20Line>,
     acpi_cache: Arc<Mutex<AcpiCache>>,
     acpi_src: Arc<AcpiSource>,
+    /// The DMA address spaces of the PCI functions.
+    pci_dma: Arc<PciDma>,
     /// What devices outside the board reset with it.
     reset_hooks: Mutex<Vec<ResetHook>>,
 
@@ -1172,10 +1185,11 @@ impl Q35 {
             (None, None)
         };
 
+        let pci_dma = PciDma::new(&mem, &memory_as);
         // The ICH9 AHCI controller, which takes the MSI path set above.
         let ahci = if props.sata {
-            let dma: Arc<dyn ruvm_hw_storage::DmaMemory> =
-                Arc::new(WeakAhciDma(Arc::downgrade(&memory_as)));
+            let bdf = Arc::new(OnceLock::from(u16::from(ICH9_SATA1_DEVFN)));
+            let dma: Arc<dyn ruvm_hw_storage::DmaMemory> = Arc::new(pci_dma.bus_master(bdf));
             Some(
                 Ich9Ahci::new_multifunction(host.bus(), dma, Some(ICH9_SATA1_DEVFN))
                     .map_err(err)?,
@@ -1197,6 +1211,7 @@ impl Q35 {
             i8042: i8042.is_some(),
             hpet: hpet.is_some(),
             serials: (0..MAX_ISA_SERIAL_PORTS).filter(|&i| serials[i].is_some()).collect(),
+            virtio_iommu: OnceLock::new(),
         });
 
         Ok(Q35 {
@@ -1259,6 +1274,7 @@ impl Q35 {
             a20,
             acpi_cache: Arc::new(Mutex::new(AcpiCache::default())),
             acpi_src,
+            pci_dma,
             reset_hooks: Mutex::new(Vec::new()),
             done: false,
         })
@@ -1429,6 +1445,7 @@ impl Q35 {
         // anything.
         boot_order_nibbles(&self.boot_devices)?;
         self.done = true;
+        self.pci_dma.machine_done();
         let fwc = Arc::clone(self.fw_cfg.state());
         fwc.machine_reset(self.bootorder(), Vec::new()).map_err(err)?;
         self.lpc.machine_ready();
@@ -1779,6 +1796,16 @@ impl Q35 {
     /// The speaker port, with the PIT.
     pub fn pcspk(&self) -> Option<&Arc<PcSpeaker>> {
         self.pcspk.as_ref()
+    }
+
+    /// The DMA address spaces of the PCI functions, which a vIOMMU takes over.
+    pub fn pci_dma(&self) -> &Arc<PciDma> {
+        &self.pci_dma
+    }
+
+    /// Gives the ACPI tables a VIOT for the virtio-iommu-pci function with requester ID `bdf`.
+    pub fn set_virtio_iommu(&self, bdf: u16) {
+        let _ = self.acpi_src.virtio_iommu.set(bdf);
     }
 
     /// Has `hook` run on every system reset, after the board's own devices.
