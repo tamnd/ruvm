@@ -31,6 +31,11 @@
 //! `msi-parent`. The domains and PCI functions send their messages as 32 bit stores into
 //! system memory.
 //!
+//! `aclint=on` gives the device tree the ACLINT nodes in place of the SiFive CLINT one and
+//! adds the ACLINT SSWI at 0x2f00000, which drives each hart's SSIP. With `aia=aplic-imsic`
+//! as well, the CLINT window holds only the MTIMER, at 0x2000000, and the IMSICs carry the
+//! software interrupts.
+//!
 //! Each hart's MSIP, MTIP, M external and S external lines go to `Riscv::set_irq` as
 //! interrupts 3, 7, 11 and 9, and the outputs of its S level IMSIC's guest files to the
 //! guest external interrupt lines 64 and up. The CPU reaches the IMSIC registers through
@@ -74,8 +79,7 @@
 //!
 //! # Not modelled
 //!
-//! - The ACLINT SSWI (`aclint=on`) and the RISC-V IOMMU (`iommu-sys=on`); those properties
-//!   are taken only with their default values.
+//! - The RISC-V IOMMU (`iommu-sys=on`); that property is taken only with its default value.
 //! - SMBIOS (`virt_build_smbios()`).
 //! - NUMA and more than one socket: every hart is in socket 0.
 //! - uImage kernels, Intel HEX files for `-device loader`, u-boot ramdisks.
@@ -146,7 +150,8 @@ use ruvm_mem::{
 };
 use ruvm_target_riscv::cfg::{VM_SV39, VM_SV48, VM_SV57};
 use ruvm_target_riscv::cpu::{
-    CpuRiscvState, IRQ_LOCAL_MAX, IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, RiscvCfg,
+    CpuRiscvState, IRQ_LOCAL_MAX, IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT,
+    RiscvCfg,
 };
 use ruvm_target_riscv::tcg::{Riscv, SemihostingHost, create_vcpu};
 use ruvm_virtio_queue::{GuestMemory, MemoryError};
@@ -337,6 +342,9 @@ pub struct VirtConfig {
     pub acpi: bool,
     /// The machine's `spcr` property: whether the ACPI tables include an SPCR.
     pub spcr: bool,
+    /// `aclint`: the ACLINT MSWI, MTIMER and SSWI instead of the SiFive CLINT, or the
+    /// MTIMER alone with [`VirtAia::AplicImsic`].
+    pub aclint: bool,
 }
 
 /// `RISCVVirtAIAType`, the `aia` property.
@@ -382,6 +390,7 @@ impl fmt::Debug for VirtConfig {
             .field("aia_guests", &self.aia_guests)
             .field("acpi", &self.acpi)
             .field("spcr", &self.spcr)
+            .field("aclint", &self.aclint)
             .finish_non_exhaustive()
     }
 }
@@ -411,6 +420,7 @@ impl Default for VirtConfig {
             aia_guests: 0,
             acpi: true,
             spcr: true,
+            aclint: false,
         }
     }
 }
@@ -583,8 +593,10 @@ pub struct VirtMachine {
     memory_as: Arc<AddressSpace>,
     riscv: Arc<Riscv>,
     hub: Arc<CpuHub>,
-    swi: Arc<RiscvAclintSwi>,
+    swi: Option<Arc<RiscvAclintSwi>>,
     mtimer: Arc<RiscvAclintMtimer>,
+    sswi: Option<Arc<RiscvAclintSwi>>,
+    aclint: bool,
     irqchip: Irqchip,
     aia: VirtAia,
     aia_guests: u32,
@@ -715,14 +727,21 @@ impl VirtMachine {
             Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()))
         });
 
-        // The SiFive CLINT: the ACLINT MSWI, then the MTIMER after it.
-        let swi = RiscvAclintSwi::new(AclintSwiConfig {
-            hartid_base: 0,
-            num_harts: harts,
-            sswi: false,
-            absent_harts: Vec::new(),
-        });
-        map_io(&mem, system, TYPE_RISCV_ACLINT_SWI, VIRT_CLINT, swi.mmio_size(), swi.clone())?;
+        // The SiFive CLINT, or with aclint=on the ACLINT: the MSWI, then the MTIMER after it,
+        // and the SSWI. With aclint=on and the IMSICs there is only the MTIMER, at the start.
+        let mtimer_only = cfg.aclint && cfg.aia == VirtAia::AplicImsic;
+        let new_swi = |sswi| {
+            RiscvAclintSwi::new(AclintSwiConfig {
+                hartid_base: 0,
+                num_harts: harts,
+                sswi,
+                absent_harts: Vec::new(),
+            })
+        };
+        let swi = (!mtimer_only).then(|| new_swi(false));
+        if let Some(swi) = &swi {
+            map_io(&mem, system, TYPE_RISCV_ACLINT_SWI, VIRT_CLINT, swi.mmio_size(), swi.clone())?;
+        }
         let mtimer = RiscvAclintMtimer::new(
             clock.clone(),
             AclintMtimerConfig {
@@ -735,9 +754,15 @@ impl VirtMachine {
                 absent_harts: Vec::new(),
             },
         );
-        let mtimer_base = VIRT_CLINT + u64::from(RISCV_ACLINT_SWI_SIZE);
+        let mtimer_base =
+            if mtimer_only { VIRT_CLINT } else { VIRT_CLINT + u64::from(RISCV_ACLINT_SWI_SIZE) };
         let size = mtimer.mmio_size();
         map_io(&mem, system, TYPE_RISCV_ACLINT_MTIMER, mtimer_base, size, mtimer.clone())?;
+        let sswi = (cfg.aclint && !mtimer_only).then(|| new_swi(true));
+        if let Some(sswi) = &sswi {
+            let size = sswi.mmio_size();
+            map_io(&mem, system, TYPE_RISCV_ACLINT_SWI, VIRT_ACLINT_SSWI, size, sswi.clone())?;
+        }
 
         // The per-socket interrupt controller.
         let aia = cfg.aia;
@@ -931,6 +956,8 @@ impl VirtMachine {
             hub,
             swi,
             mtimer,
+            sswi,
+            aclint: cfg.aclint,
             irqchip,
             aia,
             aia_guests,
@@ -1042,6 +1069,7 @@ impl VirtMachine {
                 cpu: riscv.cfg(),
                 aia: self.aia,
                 aia_guests: self.aia_guests,
+                aclint: self.aclint,
             };
             dt::finalize_fdt(&mut self.fdt, args)?;
         }
@@ -1226,7 +1254,9 @@ impl VirtMachine {
     /// that order. Each vCPU is reset separately with [`VirtMachine::reset_cpu`] on its own
     /// thread.
     pub fn system_reset(&mut self) -> Result<(), String> {
-        self.swi.reset();
+        for swi in self.swi.iter().chain(&self.sswi) {
+            swi.reset();
+        }
         self.mtimer.reset();
         self.irqchip.reset();
         self.uart.reset();
@@ -1277,11 +1307,17 @@ impl VirtMachine {
         Ok(vcpus)
     }
 
-    /// Connect the MSIP, MTIP, the two external interrupt lines and the guest external
-    /// interrupt lines of hart `i` to the vCPU `shared`.
+    /// Connect the MSIP, MTIP, SSIP (with the SSWI), the two external interrupt lines and
+    /// the guest external interrupt lines of hart `i` to the vCPU `shared`.
     fn wire(&self, i: usize, shared: &Arc<CpuShared>) {
-        let mut lines: Vec<(&IrqPin, u32)> =
-            vec![(self.swi.soft_irq(i), IRQ_M_SOFT), (self.mtimer.timer_irq(i), IRQ_M_TIMER)];
+        let mut lines: Vec<(&IrqPin, u32)> = Vec::new();
+        if let Some(swi) = &self.swi {
+            lines.push((swi.soft_irq(i), IRQ_M_SOFT));
+        }
+        lines.push((self.mtimer.timer_irq(i), IRQ_M_TIMER));
+        if let Some(sswi) = &self.sswi {
+            lines.push((sswi.soft_irq(i), IRQ_S_SOFT));
+        }
         match &self.irqchip {
             Irqchip::Plic(plic) => {
                 lines.push((plic.m_external_irq(i), IRQ_M_EXT));
@@ -1369,9 +1405,14 @@ impl VirtMachine {
         &self.memory_as
     }
 
-    /// The ACLINT MSWI of the CLINT.
-    pub fn swi(&self) -> &Arc<RiscvAclintSwi> {
-        &self.swi
+    /// The ACLINT MSWI, absent with `aclint=on` and `aia=aplic-imsic`.
+    pub fn swi(&self) -> Option<&Arc<RiscvAclintSwi>> {
+        self.swi.as_ref()
+    }
+
+    /// The ACLINT SSWI, there with `aclint=on` unless `aia=aplic-imsic`.
+    pub fn sswi(&self) -> Option<&Arc<RiscvAclintSwi>> {
+        self.sswi.as_ref()
     }
 
     /// The ACLINT MTIMER of the CLINT.
@@ -1542,6 +1583,23 @@ mod tests {
         assert_eq!(m.boot_info().start_addr, VIRT_DRAM);
         assert_eq!(m.boot_info().firmware_end, VIRT_DRAM + 0x100);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn aclint_devices() {
+        let m = board(VirtConfig { aclint: true, ..VirtConfig::default() });
+        assert!(m.swi().is_some() && m.sswi().is_some());
+        assert_eq!(read(&m, VIRT_ACLINT_SSWI, 4), [0; 4]);
+        assert!(m.fdt().getprop("/soc/sswi@2f00000", "reg").is_ok());
+
+        // With the IMSICs the MTIMER starts the CLINT window, so mtimecmp of hart 0 is there.
+        let cfg = VirtConfig { aclint: true, aia: VirtAia::AplicImsic, ..VirtConfig::default() };
+        let m = board(cfg);
+        assert!(m.swi().is_none() && m.sswi().is_none());
+        let cmp = 0x1234_5678u64.to_le_bytes();
+        assert!(m.memory_as().write(VIRT_CLINT, MemTxAttrs::UNSPECIFIED, &cmp).is_ok());
+        assert_eq!(read(&m, VIRT_CLINT, 8), cmp);
+        assert!(m.fdt().getprop("/soc/mtimer@2000000", "reg").is_ok());
     }
 
     #[test]
