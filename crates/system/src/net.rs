@@ -12,17 +12,24 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use ruvm_base::Error;
 use ruvm_base::report::Location;
+use ruvm_base::{ClockType, Error};
+use ruvm_hw_core::timer::TimeSource;
 use ruvm_hw_core::{Clock, Timer};
 use ruvm_hw_virtio::{NetPeer, RxOutcome, VirtioNet, VirtioNetHdr};
 use ruvm_machine_x86::VirtioHandle;
 use ruvm_monitor::Qmp;
-use ruvm_net::{EventSink, MacAddr, Net, NetClient, NetClientOps, NetEvent, NicConf};
+use ruvm_net::{
+    AnnounceTimers, EventSink, MacAddr, Net, NetClient, NetClientOps, NetEvent, NicConf,
+};
 use ruvm_qapi::events::{event_netdev_stream_connected, event_netdev_stream_disconnected};
-use ruvm_qapi::types::{NetClientDriver, NetdevStreamConnectedArg, NetdevStreamDisconnectedArg};
+use ruvm_qapi::types::{
+    AnnounceParameters, NetClientDriver, NetdevStreamConnectedArg, NetdevStreamDisconnectedArg,
+};
 
 use crate::vl::Vm;
 use crate::x86::Located;
@@ -46,6 +53,7 @@ pub(crate) enum NetOption {
 pub(crate) struct Network {
     net: Mutex<Net>,
     clock: Arc<Clock>,
+    announce: Arc<AnnounceTimers>,
 }
 
 impl fmt::Debug for Network {
@@ -89,7 +97,11 @@ impl Network {
             ));
         }
         net.vm_state_change(false);
-        Ok(Network { net: Mutex::new(net), clock: Arc::clone(clock) })
+        Ok(Network {
+            net: Mutex::new(net),
+            clock: Arc::clone(clock),
+            announce: AnnounceTimers::new(),
+        })
     }
 
     /// The NIC of a virtio-net of type `typename`, joined to netdev `netdev` if given, as
@@ -159,6 +171,44 @@ impl Network {
     pub(crate) fn vm_state_change(&self, running: bool) {
         lock(&self.net).vm_state_change(running);
     }
+
+    /// `qmp_announce_self()`: sends RARP frames from the NICs on the timer `params` names.
+    pub(crate) fn announce_self(self: &Arc<Self>, params: AnnounceParameters) {
+        let weak = Arc::downgrade(self);
+        self.announce.announce_self(params, move || {
+            weak.upgrade().map(|n| lock(&n.net).nics().to_vec()).unwrap_or_default()
+        });
+    }
+}
+
+/// A realtime clock whose timers run on a thread of their own.
+fn timer_thread_clock() -> Arc<Clock> {
+    let clock = Clock::new(ClockType::Realtime, TimeSource::Monotonic(Instant::now()));
+    let wake = Arc::new((Mutex::new(false), Condvar::new()));
+    let w = Arc::clone(&wake);
+    clock.set_notify(move || {
+        *lock(&w.0) = true;
+        w.1.notify_one();
+    });
+    let weak = Arc::downgrade(&clock);
+    let _ = thread::Builder::new().name("nic-timers".into()).spawn(move || {
+        // Wake up now and then without a timer, to see whether the clock is gone.
+        const IDLE: Duration = Duration::from_millis(100);
+        loop {
+            let Some(clock) = weak.upgrade() else { return };
+            clock.run_timers();
+            let wait = clock.next_deadline().map_or(IDLE, |d| {
+                Duration::from_nanos(d.saturating_sub(clock.get_ns()).max(0) as u64).min(IDLE)
+            });
+            drop(clock);
+            let mut woken = lock(&wake.0);
+            if !*woken {
+                woken = wake.1.wait_timeout(woken, wait).unwrap_or_else(PoisonError::into_inner).0;
+            }
+            *woken = false;
+        }
+    });
+    clock
 }
 
 /// `net_init_clients()` for a board whose NICs take their frames on `clock`. The network is
@@ -169,7 +219,10 @@ pub(crate) fn init_clients(
     board_nics: bool,
     clock: &Arc<Clock>,
 ) -> Result<Arc<Network>, Located> {
-    let net = Network::new(args, board_nics, clock, Some(qmp_events(&vm.qmp)))?;
+    // Under qtest the board clock only moves when the test steps it, but QEMU hands the frames
+    // to the NICs from its main loop whether it does or not.
+    let clock = if clock.is_manual() { timer_thread_clock() } else { Arc::clone(clock) };
+    let net = Network::new(args, board_nics, &clock, Some(qmp_events(&vm.qmp)))?;
     let net = Arc::new(net);
     let _ = vm.network.set(Arc::clone(&net));
     Ok(net)
@@ -272,6 +325,13 @@ impl NetClientOps for NicOps {
         }
         room
     }
+
+    /// `virtio_net_announce()`.
+    fn announce(&self, _nc: &NetClient) {
+        if let Some(nic) = self.0.handle.get() {
+            nic.with_device(|vdev, n: &mut VirtioNet| n.announce(vdev));
+        }
+    }
 }
 
 /// The device's side: the frames the guest sends go to the netdev.
@@ -301,7 +361,7 @@ mod tests {
 
     #[test]
     fn nics_join_their_netdevs() {
-        let clock = Clock::manual(ruvm_base::ClockType::Virtual);
+        let clock = Clock::manual(ClockType::Virtual);
         let netdevs = args(&["hubport,id=a,hubid=0", "hubport,id=b,hubid=0"]);
         let net = Network::new(&netdevs, true, &clock, None).unwrap();
         let mut mac = [0; 6];
@@ -328,8 +388,19 @@ mod tests {
     }
 
     #[test]
+    fn timer_thread_runs_timers() {
+        let clock = timer_thread_clock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = clock.new_timer(move || {
+            let _ = tx.send(());
+        });
+        t.modify(clock.get_ns() + 1_000_000);
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
     fn nic_none_makes_nothing() {
-        let clock = Clock::manual(ruvm_base::ClockType::Virtual);
+        let clock = Clock::manual(ClockType::Virtual);
         let a = |opt, s: &str| (opt, s.to_string(), None);
         let none = [a(NetOption::Nic, "none"), a(NetOption::Net, "none")];
         let net = Network::new(&none, true, &clock, None).unwrap();

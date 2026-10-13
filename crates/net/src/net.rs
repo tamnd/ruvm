@@ -303,6 +303,11 @@ impl Net {
         &self.clients
     }
 
+    /// The NICs, as `qemu_foreach_nic()` visits them.
+    pub fn nics(&self) -> &[Arc<Nic>] {
+        &self.nics
+    }
+
     /// The hubs, newest first.
     pub fn hubs(&self) -> &[Arc<Hub>] {
         &self.hubs

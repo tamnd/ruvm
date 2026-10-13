@@ -8,7 +8,7 @@ The tests come from the QEMU 11.1.0 source tree. QEMU itself was built from that
 
 Each qtest binary was run on its own, once with `QTEST_QEMU_BINARY` pointing at the QEMU build and once pointing at ruvm. libqtest takes the target from the binary name, so ruvm was reached through symlinks named `qemu-system-aarch64` and `qemu-system-riscv64`. The test list, environment and timeouts are the ones meson writes into `tests.json` for the `qtest-aarch64` and `qtest-riscv64` suites, and the counts below are read from the TAP output of each test.
 
-The ruvm binary was a release build of main at #224 plus the human monitor change that follows it, except for netdev-socket and the riscv64 linux-user tests, which were run again with a release build that has #239. The qtest-riscv64 suite was run again with the change that runs riscv64 `virt` under the qtest accelerator, and the qtest-aarch64 suite with the change that does the same for aarch64 `virt`. Both suites were run again with the change that adds `system_reset` and the QOM device types, and again with the virtio-blk device types.
+The ruvm binary was a release build of main at #224 plus the human monitor change that follows it, except for netdev-socket and the riscv64 linux-user tests, which were run again with a release build that has #239. The qtest-riscv64 suite was run again with the change that runs riscv64 `virt` under the qtest accelerator, and the qtest-aarch64 suite with the change that does the same for aarch64 `virt`. Both suites were run again with the change that adds `system_reset` and the QOM device types, and again with the virtio-blk device types. qom-test, device-introspect-test and qos-test were run again with the virtio-net device types.
 
 A count is the number of TAP cases that passed. A test that registers no cases passes trivially with 0, and that is shown as 0 rather than as a pass, because it means the test found nothing in ruvm to run against.
 
@@ -30,7 +30,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | boot-serial-test | 1 | 0 | `-no-shutdown` is not supported |
 | test-hmp | 90 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | qmp-cmd-test | 59 | 17 | stops at `query-vnc`, see below |
-| qos-test | 90 (5 skipped) | 11 (2 skipped) | runs the virtio-rng, virtio-blk and virtio-balloon cases only, see below |
+| qos-test | 90 (5 skipped) | 16 (3 skipped) | runs the virtio-rng, virtio-blk, virtio-balloon and virtio-net cases only, see below |
 | xlnx-canfd-test | 3 | 0 | no `xlnx-zcu102` board |
 | xlnx-versal-trng-test | 5 | 0 | no `xlnx-versal-virt` board |
 | bcm2835-dma-test | 1 | 0 | no Raspberry Pi boards |
@@ -48,7 +48,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 0 | `-readconfig` is not supported |
 | netdev-socket | 10 | 10 | |
-| Total | 447 | 60 | |
+| Total | 447 | 65 | |
 
 ## qtest-riscv64
 
@@ -60,7 +60,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | cdrom-test | 1 | 0 | `-cdrom` is not supported |
 | test-hmp | 13 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | qmp-cmd-test | 59 | 17 | stops at `query-vnc`, see below |
-| qos-test | 113 (5 skipped) | 17 (2 skipped) | runs the virtio-rng, virtio-blk and virtio-balloon cases only, see below |
+| qos-test | 113 (5 skipped) | 27 (3 skipped) | runs the virtio-rng, virtio-blk, virtio-balloon and virtio-net cases only, see below |
 | riscv-csr-test | 1 | 0 | no `veyron-v1` CPU model |
 | iommu-riscv-test | 4 | 0 | no `riscv-iommu-pci` or `iommu-testdev` |
 | k230-wdt-test | 7 | 0 | no `k230` board |
@@ -68,7 +68,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 0 | `-readconfig` is not supported |
 | netdev-socket | 10 | 10 | |
-| Total | 241 | 66 | |
+| Total | 241 | 76 | |
 
 ## qmp-cmd-test and VNC
 
@@ -89,9 +89,9 @@ On riscv64, `virt` now runs under the qtest accelerator with no harts and with i
 
 On aarch64, `virt` now runs under the qtest accelerator the same way, and is listed in `query-machines` as `virt-11.1` with the alias `virt` and the values QEMU 11.1 gives. qom-test and test-hmp pass on it. sbsa-ref is not listed yet, because it does not run under qtest. The tests that started to run on `virt` now fail on options ruvm does not take: `-machine memory-backend=` (migration-test), `-no-shutdown` (boot-serial-test), `gic-version=max` (arm-cpu-features) and `-numa` (numa-test).
 
-On both targets `system_reset` now resets `virt` under the qtest accelerator and sends the RESET event QEMU sends, which qos-test needs between cases that share a command line. qos-test, bios-tables-test, cdrom-test and iommu-smmuv3-test decide what to run from `qom-list-types` with `implements=device`. ruvm now lists the device types with the parents QEMU gives them, but only for the devices whose qos-test cases pass, because a qos-test case that fails stops the whole test. So far that is virtio-rng, virtio-blk and virtio-balloon, on PCI and on virtio-mmio. Their hotplug cases are skipped on both sides, because the generic PCI host does not take hotplug. The virtio-blk cases needed `-drive` to take `auto-read-only` and `file=null-co://` with `file.read-zeroes`, and the QMP `block_resize` command to resize a drive and raise the configuration interrupt of its device. virtio-balloon only needed the boards to plug it, with the same backend as on x86, which leaves the RAM the guest gives back alone.
+On both targets `system_reset` now resets `virt` under the qtest accelerator and sends the RESET event QEMU sends, which qos-test needs between cases that share a command line. qos-test, bios-tables-test, cdrom-test and iommu-smmuv3-test decide what to run from `qom-list-types` with `implements=device`. ruvm now lists the device types with the parents QEMU gives them, but only for the devices whose qos-test cases pass, because a qos-test case that fails stops the whole test. So far that is virtio-rng, virtio-blk, virtio-balloon and virtio-net, on PCI and on virtio-mmio. Their hotplug cases are skipped on both sides, because the generic PCI host does not take hotplug. The virtio-blk cases needed `-drive` to take `auto-read-only` and `file=null-co://` with `file.read-zeroes`, and the QMP `block_resize` command to resize a drive and raise the configuration interrupt of its device. virtio-balloon only needed the boards to plug it, with the same backend as on x86, which leaves the RAM the guest gives back alone. virtio-net needed the boards to take `-netdev`, the QMP `announce-self` command, which sends the RARP frames from a thread of its own because ruvm has no realtime timer list yet, and the NIC timers to run on their own thread under qtest, since the qtest clock only moves when a test steps it and QEMU 11.1's virtio tests no longer do.
 
-With virtio-blk listed, bios-tables-test and cdrom-test now register their cases, and both stop at `-cdrom`, which ruvm does not take yet. The next devices are virtio-net, which these boards now plug with `-netdev` but whose cases still need the QMP `announce-self` command, virtio-scsi, and virtio-serial, which needs `virtconsole` and `virtserialport` on the serial bus. The rest of the qos-test devices (the Intel and other PCI network cards, the SCSI, NVMe and UFS controllers, the sound cards and the IOMMUs) are not built on these boards by ruvm.
+With virtio-blk listed, bios-tables-test and cdrom-test now register their cases, and both stop at `-cdrom`, which ruvm does not take yet. The next devices are virtio-scsi and virtio-serial, which needs `virtconsole` and `virtserialport` on the serial bus. The rest of the qos-test devices (the Intel and other PCI network cards, the SCSI, NVMe and UFS controllers, the sound cards and the IOMMUs) are not built on these boards by ruvm.
 
 `-cdrom` and `-readconfig` are command line options ruvm does not take yet. bios-tables-test also boots the guest from a qcow2 CD image with UEFI firmware. netdev-socket passes since HMP `info network` came in #234 and the stream netdev events in #239.
 

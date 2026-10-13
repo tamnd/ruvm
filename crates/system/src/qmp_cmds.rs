@@ -124,6 +124,13 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
         }
     });
     let v = vm.clone();
+    register_announce_self(cmds, move |_: &MonitorQmp, params| {
+        if let Some(net) = v.network.get() {
+            net.announce_self(params);
+        }
+        Ok(())
+    });
+    let v = vm.clone();
     register_system_reset(cmds, move |_: &MonitorQmp| v.runstate.qmp_system_reset());
     let v = vm.clone();
     register_query_name(cmds, move |_: &MonitorQmp| Ok(NameInfo { name: v.name.clone() }));
