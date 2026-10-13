@@ -46,9 +46,9 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | numa-test | 5 | 0 | `-numa` is not supported |
 | machine-none-test | 1 | 1 | |
 | qmp-test | 9 | 9 | |
-| readconfig-test | 1 | 0 | `-readconfig` is not supported |
+| readconfig-test | 1 | 1 | |
 | netdev-socket | 10 | 10 | |
-| Total | 447 | 66 | |
+| Total | 447 | 67 | |
 
 ## qtest-riscv64
 
@@ -66,9 +66,9 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | k230-wdt-test | 7 | 0 | no `k230` board |
 | machine-none-test | 1 | 1 | |
 | qmp-test | 9 | 9 | |
-| readconfig-test | 1 | 0 | `-readconfig` is not supported |
+| readconfig-test | 1 | 1 | |
 | netdev-socket | 10 | 10 | |
-| Total | 241 | 76 | |
+| Total | 241 | 77 | |
 
 ## qmp-cmd-test and VNC
 
@@ -93,7 +93,7 @@ On both targets `system_reset` now resets `virt` under the qtest accelerator and
 
 With virtio-blk listed, bios-tables-test and cdrom-test now register their cases, and both stop at `-cdrom`, which ruvm does not take yet. The next devices are virtio-scsi and virtio-serial, which needs `virtconsole` and `virtserialport` on the serial bus. The rest of the qos-test devices (the Intel and other PCI network cards, the SCSI, NVMe and UFS controllers, the sound cards and the IOMMUs) are not built on these boards by ruvm.
 
-`-cdrom` and `-readconfig` are command line options ruvm does not take yet. bios-tables-test also boots the guest from a qcow2 CD image with UEFI firmware. netdev-socket passes since HMP `info network` came in #234 and the stream netdev events in #239.
+`-cdrom` is a command line option ruvm does not take yet. readconfig-test passes since ruvm takes `-readconfig`, which reads the file the way QEMU's `sscanf()` loop does and handles each group as the command line option it stands for, and has the `rng-builtin` and `rng-random` objects. virtio-rng does not take their `rng` link yet. bios-tables-test also boots the guest from a qcow2 CD image with UEFI firmware. netdev-socket passes since HMP `info network` came in #234 and the stream netdev events in #239.
 
 The Xilinx, Raspberry Pi, Aspeed, Nuvoton and Kendryte K230 boards are not in ruvm. Those tests fail because the machine type is unknown. Each board is its own piece of work and none of them is planned for M6.
 

@@ -2297,6 +2297,7 @@ dependencies = [
 name = "ruvm-system"
 version = "0.5.7"
 dependencies = [
+ "libc",
  "ruvm-accel",
  "ruvm-accel-kvm",
  "ruvm-accel-qtest",

@@ -60,6 +60,7 @@ use crate::options::{Opt, arch_available, help_text, lookup_opt};
 use crate::qdev;
 use crate::qmp_cmds::{self, object_options_dict};
 use crate::qtest::{self, VirtualClock};
+use crate::readconfig;
 use crate::riscv;
 use crate::runstate::{Killed, MachineReset, Runstate};
 use crate::x86::{self, Accel, AccelInitError, Located};
@@ -388,6 +389,7 @@ fn run(p: &Personality<'_>, args: &[String]) -> Flow<u8> {
         qdev::register_types(&registry);
     }
     qtest::register_types(&registry);
+    crate::rng::register_types(&registry);
     ruvm_chardev::qom::register_types(&registry);
     register_accel_types(&registry, p.target);
     crate::audio::register_models(p.target);
@@ -444,13 +446,17 @@ fn parse_options(
     args: &[String],
     cfg: &mut Config,
 ) -> Flow<()> {
+    let mut args = args.to_vec();
+    // The options before this index that -readconfig put in from a file.
+    let mut config_end = 0;
     let mut optind = 0;
     while optind < args.len() {
+        let from_config = optind < config_end;
         if !args[optind].starts_with('-') {
             let _loc = push_location(Location::CmdLine { option: args[optind].clone(), arg: None });
             return Err(fail_msg("disk images are not supported by ruvm yet"));
         }
-        let found = lookup_opt(args, &mut optind).map_err(|e| {
+        let found = lookup_opt(&args, &mut optind).map_err(|e| {
             eprintln!("{}: {}", p.prgname, e.message());
             Exit(1)
         })?;
@@ -473,8 +479,11 @@ fn parse_options(
                 cfg.remember("chardev", h);
             }
             Opt::Mon => {
-                cfg.x86.default_monitor = false;
-                if !cfg.mon_deprecation_warned {
+                // A [mon] group is only recorded, as QEMU does not run the option's code for it.
+                if !from_config {
+                    cfg.x86.default_monitor = false;
+                }
+                if !from_config && !cfg.mon_deprecation_warned {
                     cfg.mon_deprecation_warned = true;
                     warn_report(
                         "'-mon' is deprecated, use '-object' with 'monitor-hmp' or 'monitor-qmp' types instead",
@@ -585,6 +594,16 @@ fn parse_options(
                     _ => NetOption::Netdev,
                 };
                 cfg.x86.netdevs.push((opt, arg.to_string(), current_location()));
+            }
+            Opt::Readconfig => {
+                let options = readconfig::read_config_file(arg).map_err(|e| {
+                    let _loc = e
+                        .line
+                        .map(|line| push_location(Location::File { name: arg.to_string(), line }));
+                    fail_msg(&e.msg)
+                })?;
+                config_end = optind + options.len();
+                args.splice(optind..optind, options);
             }
             Opt::NoReboot => cfg.x86.no_reboot = true,
             Opt::NoShutdown => cfg.no_shutdown = true,
