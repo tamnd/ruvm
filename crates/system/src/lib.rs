@@ -8,6 +8,7 @@
 mod arm;
 mod audio;
 mod config_qmp;
+mod cpus;
 mod display;
 mod drives;
 mod global;

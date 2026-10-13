@@ -19,7 +19,7 @@ unsafe-budget = 29
 libc.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-rustix.workspace = true
+rustix = { workspace = true, features = ["thread"] }
 
 [lints]
 workspace = true

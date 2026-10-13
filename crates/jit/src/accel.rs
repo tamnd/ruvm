@@ -18,6 +18,7 @@
 //!   vCPUs back when it ends.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -101,12 +102,14 @@ fn qemu_wait_io_event(cpu: &mut Cpu<'_>) {
 
 fn register_thread(cpu: &CpuShared) {
     *lock(&cpu.thread) = Some(std::thread::current().id());
+    cpu.thread_id.store(ruvm_sys::thread::thread_id(), Ordering::Release);
 }
 
-/// `mttcg_cpu_thread_fn()`.
-fn mttcg_cpu_thread_fn(mut vcpu: Vcpu) -> Vec<Vcpu> {
+/// `mttcg_cpu_thread_fn()`. Dropping `created` is `cpu_thread_signal_created()`.
+fn mttcg_cpu_thread_fn(mut vcpu: Vcpu, created: Sender<()>) -> Vec<Vcpu> {
     let shared = vcpu.shared().clone();
     register_thread(&shared);
+    drop(created);
     let mut cpu = vcpu.cpu();
     cpu.set_can_do_io(true);
 
@@ -213,12 +216,13 @@ fn rr_deal_with_unplugged_cpus(vcpus: &mut Vec<Vcpu>, gone: &mut Vec<Vcpu>) {
     }
 }
 
-/// `rr_cpu_thread_fn()`.
-fn rr_cpu_thread_fn(jit: Arc<Jit>, mut vcpus: Vec<Vcpu>) -> Vec<Vcpu> {
+/// `rr_cpu_thread_fn()`. Dropping `created` is `cpu_thread_signal_created()`.
+fn rr_cpu_thread_fn(jit: Arc<Jit>, mut vcpus: Vec<Vcpu>, created: Sender<()>) -> Vec<Vcpu> {
     for v in &mut vcpus {
         register_thread(v.shared());
         v.cpu().set_can_do_io(true);
     }
+    drop(created);
     let mut timer = None;
     let mut gone = Vec::new();
     rr_start_kick_timer(&jit, &mut timer, vcpus.len());
@@ -290,27 +294,35 @@ pub struct VcpuThreads {
 }
 
 /// Start the vCPU threads for `vcpus`, `tcg_start_vcpu_thread()`: one per vCPU with MTTCG,
-/// one for all of them in round robin mode.
+/// one for all of them in round robin mode. Returns once every vCPU has its thread, as
+/// `qemu_init_vcpu()` waits for `cpu->created`.
 pub fn start_vcpus(jit: &Arc<Jit>, vcpus: Vec<Vcpu>) -> VcpuThreads {
     let cpus = vcpus.iter().map(|v| v.shared().clone()).collect();
     let mut handles = Vec::new();
+    let (created, wait) = channel::<()>();
     if jit.config.mttcg {
         for v in vcpus {
             let name = format!("CPU {}/TCG", v.shared().cpu_index);
             let h = std::thread::Builder::new()
                 .name(name)
-                .spawn(move || mttcg_cpu_thread_fn(v))
+                .spawn({
+                    let created = created.clone();
+                    move || mttcg_cpu_thread_fn(v, created)
+                })
                 .expect("cannot create the vCPU thread");
             handles.push(h);
         }
     } else if !vcpus.is_empty() {
-        let jit = jit.clone();
+        let (jit, created) = (jit.clone(), created.clone());
         let h = std::thread::Builder::new()
             .name("ALL CPUs/TCG".to_string())
-            .spawn(move || rr_cpu_thread_fn(jit, vcpus))
+            .spawn(move || rr_cpu_thread_fn(jit, vcpus, created))
             .expect("cannot create the vCPU thread");
         handles.push(h);
     }
+    // Fails once every thread dropped its sender.
+    drop(created);
+    let _ = wait.recv();
     VcpuThreads { cpus, handles }
 }
 

@@ -2178,6 +2178,11 @@ impl VirtMachine {
         self.smp
     }
 
+    /// The `-smp` topology.
+    pub fn topology(&self) -> CpuTopology {
+        self.topology
+    }
+
     /// The RAM size.
     pub fn ram_size(&self) -> u64 {
         self.ram_size

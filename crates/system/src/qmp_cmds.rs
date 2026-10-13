@@ -136,8 +136,12 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
     register_query_name(cmds, move |_: &MonitorQmp| Ok(NameInfo { name: v.name.clone() }));
     let v = vm.clone();
     register_x_exit_preconfig(cmds, move |_: &MonitorQmp| v.exit_preconfig());
-    // Machine "none" has no CPUs.
-    register_query_cpus_fast(cmds, |_: &MonitorQmp| Ok(Vec::new()));
+    // Machine "none" has no CPUs, and the boards other than Arm and RISC-V virt and sbsa-ref
+    // do not list theirs yet.
+    let v = vm.clone();
+    register_query_cpus_fast(cmds, move |_: &MonitorQmp| {
+        Ok(v.cpus.get().map(crate::cpus::Cpus::query).unwrap_or_default())
+    });
     // `qmp_query_machines()`: `none` with the values QEMU gives it, the x86 boards on an x86
     // target and virt on aarch64 and riscv64.
     let target = target.to_string();

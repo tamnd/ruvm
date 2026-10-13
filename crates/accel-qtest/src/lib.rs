@@ -15,11 +15,14 @@
 //! Where qtest.c has a `g_assert()` on client input, a missing argument or a number that does
 //! not parse, QEMU aborts. The engine returns an error with the assertion text instead, and the
 //! caller is expected to abort.
+//!
+//! [`DummyVcpus`] are the vCPU threads of the accelerator, which run no guest code.
 
 #![forbid(unsafe_code)]
 
 mod backend;
 mod base64;
+mod dummy;
 
 use std::fs::File;
 use std::io::{self, LineWriter, Read, Write};
@@ -30,6 +33,7 @@ use ruvm_base::{Error, Result, error_report};
 use ruvm_qapi::cutils;
 
 pub use backend::QtestBackend;
+pub use dummy::DummyVcpus;
 
 /// `MAX_IRQ`: how many IRQ levels the engine remembers to filter repeated edges.
 pub const MAX_IRQ: usize = 256;
