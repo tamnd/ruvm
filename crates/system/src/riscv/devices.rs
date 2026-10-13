@@ -23,18 +23,19 @@ use ruvm_hw_virtio::mmio::VIRTIO_MMIO_FORCE_LEGACY_DEFAULT;
 use ruvm_hw_virtio::pci::virtio_pci_optimal_num_queues;
 use ruvm_hw_virtio::{
     RandomFile, VirtioBalloon, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass,
-    VirtioPciProps, VirtioRng, VirtioRngConf,
+    VirtioNet, VirtioNetConf, VirtioPciProps, VirtioRng, VirtioRngConf,
 };
 use ruvm_machine_arm::pflash::PflashBacking;
 use ruvm_machine_riscv::virt::{GenericLoader, VirtMachine};
-use ruvm_machine_x86::FileBackend;
+use ruvm_machine_x86::{FileBackend, VirtioHandle};
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
 
 use super::{parse_loader, prop_bool};
-use crate::drives::{Plugged, mmio_resize_cb, pci_resize_cb};
+use crate::drives::{Plugged, resize_cb};
+use crate::net::Network;
 use crate::x86::{
     Drive, DriveIf, KeepRam, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive,
-    probe_warning,
+    parse_mac, probe_warning,
 };
 
 /// The virtio device models virt can plug.
@@ -44,6 +45,7 @@ enum Model {
     Rng,
     Serial,
     Balloon,
+    Net,
 }
 
 /// The device types, with the bus they plug into.
@@ -56,6 +58,8 @@ const DEVICE_TYPES: &[(&str, Model, Transport)] = &[
     ("virtio-serial-pci", Model::Serial, Transport::Pci),
     ("virtio-balloon-device", Model::Balloon, Transport::Mmio),
     ("virtio-balloon-pci", Model::Balloon, Transport::Pci),
+    ("virtio-net-device", Model::Net, Transport::Mmio),
+    ("virtio-net-pci", Model::Net, Transport::Pci),
 ];
 
 /// `qdev_alias_table[]` for RISC-V, where the default virtio transport is PCI.
@@ -92,6 +96,10 @@ pub(crate) struct Plug {
     devfn: Option<u8>,
     /// `bus=virtio-mmio-bus.<n>` of a virtio-mmio device.
     mmio_bus: Option<usize>,
+    /// virtio-net `netdev`.
+    netdev: Option<String>,
+    /// virtio-net `mac`.
+    mac: Option<[u8; 6]>,
     props: VirtioPciProps,
     loc: Option<Location>,
 }
@@ -163,6 +171,8 @@ fn plan_virtio(
         serial: None,
         devfn: None,
         mmio_bus: None,
+        netdev: None,
+        mac: None,
         props: VirtioPciProps::default(),
         loc: loc.clone(),
     };
@@ -206,6 +216,10 @@ fn plan_virtio(
                 plug.drive = Some(i);
             }
             "serial" if model == Model::Blk => plug.serial = Some(v.to_string()),
+            "netdev" if model == Model::Net => plug.netdev = Some(v.to_string()),
+            "mac" if model == Model::Net => {
+                plug.mac = Some(parse_mac(v).ok_or_else(|| bad_value(k, v))?)
+            }
             _ => return Err(Located::new(loc, format!("Property '{typename}.{k}' not found"))),
         }
     }
@@ -317,16 +331,18 @@ fn open_drive(d: &Drive) -> Result<FileBackend, String> {
 }
 
 /// `qdev_device_add()` for the planned virtio devices: builds each one and plugs it into its
-/// bus. Gives the drives it put on virtio-blk devices.
+/// bus, a virtio-net joined to its netdev in `net`. Gives the drives it put on virtio-blk
+/// devices.
 pub(crate) fn plug(
     board: &VirtMachine,
     plugs: &[Plug],
     drives: &[Drive],
+    net: &Network,
 ) -> Result<Vec<Plugged>, Located> {
     let mut plugged = Vec::new();
     for plug in plugs {
         let at = |e: String| Located::new(&plug.loc, e);
-        let mut image = None;
+        let (mut image, mut nic) = (None, None);
         let class: Box<dyn VirtioDeviceClass> = match plug.model {
             Model::Blk => {
                 let drive = plug.drive.expect("planned with a drive");
@@ -354,25 +370,37 @@ pub(crate) fn plug(
             }
             Model::Serial => Box::new(VirtioConsole::new(None)),
             Model::Balloon => Box::new(VirtioBalloon::new(board.ram_size(), Box::new(KeepRam))),
+            Model::Net => {
+                let mut mac = plug.mac.unwrap_or_default();
+                let id = plug.props.id.as_deref();
+                let (peer, port) =
+                    net.new_nic(plug.typename, id, plug.netdev.as_deref(), &mut mac).map_err(at)?;
+                nic = Some(port);
+                let conf = VirtioNetConf { mac, ..VirtioNetConf::default() };
+                Box::new(VirtioNet::new(conf, Some(peer)))
+            }
         };
-        let resize_cb = match (plug.transport, plug.mmio_bus) {
+        let handle = match (plug.transport, plug.mmio_bus) {
             (Transport::Pci, _) => {
                 let dev = board.attach_virtio_pci(class, plug.devfn, &plug.props).map_err(at)?;
-                pci_resize_cb(&dev)
+                Some(VirtioHandle::Pci(dev))
             }
             (Transport::Mmio, Some(n)) => {
                 board.attach_virtio_at(n, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT).map_err(at)?;
-                mmio_resize_cb(board.virtio_transport(n))
+                board.virtio_transport(n).map(VirtioHandle::Mmio)
             }
             (Transport::Mmio, None) => {
                 let n = board
                     .attach_virtio(class)
                     .map_err(|e| at(format!("{e} '{}'", plug.typename)))?;
-                mmio_resize_cb(board.virtio_transport(n))
+                board.virtio_transport(n).map(VirtioHandle::Mmio)
             }
         };
         if let Some((drive, image)) = image {
-            plugged.push(Plugged { drive, image, resize_cb });
+            plugged.push(Plugged { drive, image, resize_cb: resize_cb(handle.as_ref()) });
+        }
+        if let (Some(nic), Some(handle)) = (nic, handle) {
+            nic.connect(handle);
         }
     }
     Ok(plugged)
@@ -380,7 +408,11 @@ pub(crate) fn plug(
 
 #[cfg(test)]
 mod tests {
+    use ruvm_base::ClockType;
+    use ruvm_hw_core::Clock;
+
     use super::*;
+    use crate::net::NetOption;
 
     fn dev(arg: &str) -> (String, Option<Location>) {
         (arg.to_string(), None)
@@ -436,11 +468,38 @@ mod tests {
         );
         assert_eq!(err(&["virtio-blk-pci"]), "drive property not set");
         assert_eq!(
-            err(&["virtio-net-device"]),
-            "-device virtio-net-device is not supported with this machine by ruvm yet"
+            err(&["virtio-scsi-device"]),
+            "-device virtio-scsi-device is not supported with this machine by ruvm yet"
         );
         assert_eq!(err(&["e1000"]), "'e1000' is not a valid device model name");
         assert_eq!(err(&["loader,foo=1"]), "Property 'loader.foo' not found");
+    }
+
+    fn no_net() -> Network {
+        Network::new(&[], false, &Clock::manual(ClockType::Virtual), None).unwrap()
+    }
+
+    #[test]
+    fn virtio_net() {
+        let plan_one = |a: &str| plan(&[], &[dev(a)]).map(|mut p| p.virtio.remove(0));
+        let p = plan_one("virtio-net-pci,netdev=n0,mac=52:54:00:12:34:57").unwrap();
+        assert_eq!(p.netdev.as_deref(), Some("n0"));
+        assert_eq!(p.mac, Some([0x52, 0x54, 0, 0x12, 0x34, 0x57]));
+        assert_eq!(plan_one("virtio-net-device").unwrap().transport, Transport::Mmio);
+        let e = plan_one("virtio-net-pci,mac=52:54:00").unwrap_err();
+        assert_eq!(e[0].1.message(), "Property 'virtio-net-pci.mac' doesn't take value '52:54:00'");
+
+        // The NIC takes its netdev, and a second one on the same netdev is refused.
+        let netdevs = [(NetOption::Netdev, "hubport,id=n0,hubid=0".to_string(), None)];
+        let net = Network::new(&netdevs, false, &Clock::manual(ClockType::Virtual), None).unwrap();
+        let p = plan(&[], &[dev("virtio-net-pci,netdev=n0")]).unwrap();
+        let board = VirtMachine::new(ruvm_machine_riscv::virt::VirtConfig::default()).unwrap();
+        plug(&board, &p.virtio, &[], &net).unwrap();
+        let e = plug(&board, &p.virtio, &[], &net).err().unwrap();
+        assert_eq!(
+            e.1.message(),
+            "Property 'virtio-net-pci.netdev' can't take value 'n0', it's in use"
+        );
     }
 
     #[test]
@@ -456,7 +515,7 @@ mod tests {
             ..ruvm_machine_riscv::virt::VirtConfig::default()
         };
         let board = VirtMachine::new(cfg).unwrap();
-        plug(&board, &p.virtio, &d).unwrap();
+        plug(&board, &p.virtio, &d, &no_net()).unwrap();
         let _ = std::fs::remove_file(&path);
         let vectors: Vec<u32> = board.pci_devices().iter().map(|f| f.nvectors()).collect();
         assert_eq!(vectors, [2, 3]);

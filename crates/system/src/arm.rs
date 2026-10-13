@@ -85,6 +85,7 @@ use ruvm_target_arm::cpu::{ARM_MAX_VQ, ArmCpuModel, PauthAlg};
 use ruvm_target_arm::tcg::SemihostingHost;
 
 use crate::drives::Drives;
+use crate::net::{NetOption, Network, init_clients};
 use crate::runstate::{MachineReset, Runstate};
 use crate::vl::Vm;
 use crate::x86::{Drive, Located};
@@ -1122,15 +1123,19 @@ fn event_handler(vm: &Arc<Vm>) -> VirtEventHandler {
     })
 }
 
-/// Lets the runstate start and stop the vCPUs.
-fn set_cpu_hook<B: TcgBoard>(vm: &Arc<Vm>, machine: &Arc<TcgMachine<B>>) {
+/// Lets the runstate start and stop the vCPUs. The netdevs are told first when the VM starts
+/// and last when it stops, as `vm_state_notify()` runs before `resume_all_vcpus()` and after
+/// `pause_all_vcpus()`.
+fn set_cpu_hook<B: TcgBoard>(vm: &Arc<Vm>, machine: &Arc<TcgMachine<B>>, net: Arc<Network>) {
     let weak = Arc::downgrade(machine);
     vm.runstate.set_cpu_hook(Some(Arc::new(move |run| {
         if let Some(m) = weak.upgrade() {
             if run {
+                net.vm_state_change(true);
                 m.start();
             } else {
                 m.pause();
+                net.vm_state_change(false);
             }
         }
     })));
@@ -1148,6 +1153,8 @@ pub(crate) struct ArmArgs<'a> {
     pub devices: &'a [(String, Option<Location>)],
     /// `-drive`, from [`parse_drives`].
     pub drives: &'a [Drive],
+    /// `-netdev`, `-nic` and `-net`.
+    pub netdevs: &'a [(NetOption, String, Option<Location>)],
 }
 
 /// `qemu_semihosting_chardev_init()`: the chardev of `-semihosting-config chardev=`.
@@ -1189,7 +1196,7 @@ pub(crate) fn start_board_tcg(
     let one = |e: Error| vec![Located(None, e)];
     let cpu = || parse_cpu(ArmBoard::Virt, args.cpu).map_err(one);
     let built = build_virt(vm, opts, args, serial_hds, cpu, |_| Ok(()))?;
-    let BuiltVirt { mut board, console, attachments, clocks, dumpdtb: dtb_path } = built;
+    let BuiltVirt { mut board, console, attachments, clocks, dumpdtb: dtb_path, net } = built;
     board.machine_done().map_err(|e| one(Error::generic(e)))?;
     if let Some(path) = &dtb_path {
         dumpdtb(path, board.fdt().as_bytes())?;
@@ -1202,7 +1209,7 @@ pub(crate) fn start_board_tcg(
         warn_report(w);
     }
     let machine = Arc::new(machine);
-    set_cpu_hook(vm, &machine);
+    set_cpu_hook(vm, &machine, net);
     Ok(Running { machine: Machine::Virt(machine), console, _attachments: attachments })
 }
 
@@ -1221,11 +1228,13 @@ pub(crate) fn start_board_qtest(
         cfg.clock = Some(clock);
         Ok(())
     })?;
-    let BuiltVirt { mut board, console, attachments, clocks: _, dumpdtb: dtb_path } = built;
+    let BuiltVirt { mut board, console, attachments, clocks: _, dumpdtb: dtb_path, net } = built;
     board.machine_done().map_err(|e| one(Error::generic(e)))?;
     if let Some(path) = &dtb_path {
         dumpdtb(path, board.fdt().as_bytes())?;
     }
+    // With no vCPUs only the netdevs follow the run state.
+    vm.runstate.set_cpu_hook(Some(Arc::new(move |run| net.vm_state_change(run))));
     Ok(Running {
         machine: Machine::Qtest(Arc::new(Mutex::new(board))),
         console,
@@ -1242,6 +1251,7 @@ struct BuiltVirt {
     clocks: Vec<Arc<Clock>>,
     /// `dumpdtb`.
     dumpdtb: Option<String>,
+    net: Arc<Network>,
 }
 
 /// `qemu_init_board()` for virt with the CPU model `cpu` gives: builds the board, plugs the devices and connects
@@ -1321,11 +1331,15 @@ fn build_virt(
     cfg.clock = Some(Arc::clone(&clock));
     cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
     prepare(&mut cfg)?;
+    let net_clock = cfg.clock.clone().expect("set above");
+    // pci_init_nic_devices() would make the -nic NICs.
+    let net = init_clients(vm, args.netdevs, true, &net_clock).map_err(|e| vec![e])?;
     let board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
-    let plugged =
-        devices::plug(devices::Target::Virt(&board), &plan.virtio, &plan.display, args.drives)
-            .map_err(|e| vec![e])?;
+    let target = devices::Target::Virt(&board);
+    let plugged = devices::plug(target, &plan.virtio, &plan.display, args.drives, &net)
+        .map_err(|e| vec![e])?;
     let _ = vm.drives.set(Drives::new(args.drives, plugged));
+    net.check_clients();
 
     let mut attachments = Vec::new();
     if let Some(Some(chr)) = serial_hds.first() {
@@ -1349,7 +1363,7 @@ fn build_virt(
     }
 
     let clocks = vec![clock, rtc_clock];
-    Ok(BuiltVirt { board, console, attachments, clocks, dumpdtb: opts.dumpdtb })
+    Ok(BuiltVirt { board, console, attachments, clocks, dumpdtb: opts.dumpdtb, net })
 }
 
 /// [`start_board_tcg`] for sbsa-ref: the UART on `serial_hds[0]` and the secure UARTs on
@@ -1391,12 +1405,14 @@ fn start_sbsa_ref_tcg(
     }
     cfg.clock = Some(Arc::clone(&clock));
     cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
+    let net = init_clients(vm, args.netdevs, true, &clock).map_err(|e| vec![e])?;
     let mut board = SbsaRefMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
     devices::plug_ahci(&board, &plan.ide, args.drives).map_err(|e| vec![e])?;
-    let plugged =
-        devices::plug(devices::Target::SbsaRef(&board), &plan.virtio, &plan.display, args.drives)
-            .map_err(|e| vec![e])?;
+    let target = devices::Target::SbsaRef(&board);
+    let plugged = devices::plug(target, &plan.virtio, &plan.display, args.drives, &net)
+        .map_err(|e| vec![e])?;
     let _ = vm.drives.set(Drives::new(args.drives, plugged));
+    net.check_clients();
 
     let mut attachments = Vec::new();
     let uarts = [board.uart(), board.secure_uarts()[0], board.secure_uarts()[1]].map(Arc::clone);
@@ -1423,7 +1439,7 @@ fn start_sbsa_ref_tcg(
         warn_report(w);
     }
     let machine = Arc::new(machine);
-    set_cpu_hook(vm, &machine);
+    set_cpu_hook(vm, &machine, net);
     Ok(Running { machine: Machine::SbsaRef(machine), console: None, _attachments: attachments })
 }
 

@@ -72,6 +72,7 @@ use ruvm_target_riscv::tcg::SemihostingHost;
 
 use crate::arm::{Semihosting, SemihostingTarget};
 use crate::drives::Drives;
+use crate::net::{NetOption, Network, init_clients};
 use crate::runstate::{MachineReset, Runstate};
 use crate::vl::Vm;
 use crate::x86::{Drive, Located};
@@ -692,15 +693,19 @@ fn event_handler(vm: &Arc<Vm>) -> VirtEventHandler {
     })
 }
 
-/// Lets the runstate start and stop the vCPUs.
-fn set_cpu_hook(vm: &Arc<Vm>, machine: &Arc<VirtTcgMachine>) {
+/// Lets the runstate start and stop the vCPUs. The netdevs are told first when the VM starts
+/// and last when it stops, as `vm_state_notify()` runs before `resume_all_vcpus()` and after
+/// `pause_all_vcpus()`.
+fn set_cpu_hook(vm: &Arc<Vm>, machine: &Arc<VirtTcgMachine>, net: Arc<Network>) {
     let weak = Arc::downgrade(machine);
     vm.runstate.set_cpu_hook(Some(Arc::new(move |run| {
         if let Some(m) = weak.upgrade() {
             if run {
+                net.vm_state_change(true);
                 m.start();
             } else {
                 m.pause();
+                net.vm_state_change(false);
             }
         }
     })));
@@ -720,6 +725,8 @@ pub(crate) struct RiscvArgs<'a> {
     pub drives: &'a [Drive],
     /// Where `qemu_find_file(QEMU_FILE_TYPE_BIOS, ...)` looks.
     pub firmware: FirmwareSearch,
+    /// `-netdev`, `-nic` and `-net`.
+    pub netdevs: &'a [(NetOption, String, Option<Location>)],
 }
 
 /// `qemu_semihosting_chardev_init()`: the chardev of `-semihosting-config chardev=`.
@@ -849,9 +856,12 @@ pub(crate) fn start_board(
     cfg.semihosting_userspace = semi.userspace;
     cfg.clock = Some(Arc::clone(&clock));
     cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
+    // virt makes no NICs for -nic, which net_check_clients() warns about.
+    let net = init_clients(vm, args.netdevs, false, &clock).map_err(|e| vec![e])?;
     let mut board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
-    let plugged = devices::plug(&board, &plan.virtio, args.drives).map_err(|e| vec![e])?;
+    let plugged = devices::plug(&board, &plan.virtio, args.drives, &net).map_err(|e| vec![e])?;
     let _ = vm.drives.set(Drives::new(args.drives, plugged));
+    net.check_clients();
 
     let mut attachments = Vec::new();
     if let Some(Some(chr)) = serial_hds.first() {
@@ -877,6 +887,8 @@ pub(crate) fn start_board(
     let tcg = match accel {
         BoardAccel::Tcg(tcg) => tcg,
         BoardAccel::Qtest(_) => {
+            // With no harts only the netdevs follow the run state.
+            vm.runstate.set_cpu_hook(Some(Arc::new(move |run| net.vm_state_change(run))));
             return Ok(Running {
                 board: Board::Qtest(Arc::new(Mutex::new(board))),
                 console,
@@ -892,7 +904,7 @@ pub(crate) fn start_board(
         warn_report(w);
     }
     let machine = Arc::new(machine);
-    set_cpu_hook(vm, &machine);
+    set_cpu_hook(vm, &machine, net);
     Ok(Running { board: Board::Tcg(machine), console, _attachments: attachments })
 }
 

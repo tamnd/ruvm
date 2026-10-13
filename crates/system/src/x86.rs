@@ -1346,7 +1346,7 @@ fn plan_device(
 }
 
 /// `mac`, six hex bytes joined by colons.
-fn parse_mac(v: &str) -> Option<[u8; 6]> {
+pub(crate) fn parse_mac(v: &str) -> Option<[u8; 6]> {
     let mut mac = [0u8; 6];
     let mut parts = v.split(':');
     for b in &mut mac {
