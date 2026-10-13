@@ -99,6 +99,10 @@ pub(crate) fn main(argv0: &str, args: &[String], target: &mut dyn Target) -> Exi
     if o.stack_size == opts::DEFAULT_STACK_SIZE {
         o.stack_size = stack_size;
     }
+    if let Err(e) = crate::strace::start(o.strace, o.log_file.as_deref()) {
+        eprintln!("{prog}: {e}");
+        return ExitCode::FAILURE;
+    }
     host::reset_sigpipe();
 
     let cpu_name = o.cpu.clone().unwrap_or_else(|| "max".to_string());

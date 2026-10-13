@@ -27,6 +27,10 @@ pub struct Options {
     pub one_insn_per_tb: bool,
     /// `-tb-size` in MiB.
     pub tb_size: Option<u64>,
+    /// `-strace`, or `strace` in `-d`.
+    pub strace: bool,
+    /// `-D`, where the log goes instead of `stderr`.
+    pub log_file: Option<String>,
     /// The guest's environment, in the order `envlist_to_environ()` gives it.
     pub env: Vec<String>,
     /// The program, `exec_path`.
@@ -213,6 +217,8 @@ fn unset_env(env: &mut Vec<String>, name: &str) {
 struct Parser<'a> {
     target: &'a str,
     o: Options,
+    /// Whether the last `-d` asked for `strace`.
+    d_strace: bool,
 }
 
 impl Parser<'_> {
@@ -277,9 +283,12 @@ impl Parser<'_> {
                 let (v, _) = strtoul(arg);
                 o.tb_size = Some(v);
             }
-            // Logging, the random seed and perf maps change nothing a program sees.
-            "d" | "dfilter" | "D" | "seed" | "perfmap" | "jitdump" | "B" => {}
-            "g" | "t" | "strace" | "trace" | "plugin" => {
+            "d" => self.d_strace = arg.split(',').any(|item| item == "strace" || item == "all"),
+            "D" => o.log_file = Some(arg.to_string()),
+            "strace" => o.strace = true,
+            // The other logs, the random seed and perf maps change nothing a program sees.
+            "dfilter" | "seed" | "perfmap" | "jitdump" | "B" => {}
+            "g" | "t" | "trace" | "plugin" => {
                 return Err(Exit::Error(format!(
                     "qemu: option '-{name}' is not supported by ruvm yet"
                 )));
@@ -304,10 +313,13 @@ pub fn parse(target: &str, env: Vec<(String, String)>, args: &[String]) -> Resul
             reserved_va: 0,
             one_insn_per_tb: false,
             tb_size: None,
+            strace: false,
+            log_file: None,
             env: env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
             exec_path: String::new(),
             args: Vec::new(),
         },
+        d_strace: false,
     };
     for arg in TABLE {
         if arg.env.is_empty() {
@@ -346,6 +358,7 @@ pub fn parse(target: &str, env: Vec<(String, String)>, args: &[String]) -> Resul
     if let Some(a0) = &p.o.argv0 {
         p.o.args[0] = a0.clone();
     }
+    p.o.strace |= p.d_strace;
     Ok(p.o)
 }
 
@@ -373,6 +386,20 @@ mod tests {
         let o = parse("x86_64", env, &s(&["-E", "C=3,A=4", "-U", "B", "-0", "zero", "p"])).unwrap();
         assert_eq!(o.env, s(&["A=4", "C=3"]));
         assert_eq!(o.args, s(&["zero"]));
+    }
+
+    #[test]
+    fn strace_and_log() {
+        let o = parse("x86_64", vec![], &s(&["-strace", "-D", "/tmp/l%d", "p"])).unwrap();
+        assert!(o.strace);
+        assert_eq!(o.log_file.as_deref(), Some("/tmp/l%d"));
+        let o = parse("x86_64", vec![], &s(&["-d", "in_asm,strace", "p"])).unwrap();
+        assert!(o.strace);
+        // The last -d wins.
+        let o = parse("x86_64", vec![], &s(&["-d", "all", "-d", "in_asm", "p"])).unwrap();
+        assert!(!o.strace);
+        let env = vec![("QEMU_STRACE".to_string(), String::new())];
+        assert!(parse("x86_64", env, &s(&["p"])).unwrap().strace);
     }
 
     #[test]

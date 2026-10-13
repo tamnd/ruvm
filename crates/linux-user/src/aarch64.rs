@@ -33,6 +33,7 @@ use crate::guest::Guest;
 use crate::host;
 use crate::signal::{self, Sigaction, Task, get32, get64, put32, put64};
 use crate::start;
+use crate::strace;
 use crate::syscall::{self, Proc, THREAD_EXIT};
 
 /// `TASK_UNMAPPED_BASE` for aarch64.
@@ -905,6 +906,15 @@ pub(crate) fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
                 for (i, a) in args.iter_mut().enumerate() {
                     *a = xreg(cpu, i);
                 }
+                let orig = args;
+                let traced = strace::on().then(|| {
+                    strace::syscall(
+                        p.space(),
+                        nr,
+                        generic::to_host(nr).and_then(strace::entry),
+                        &orig,
+                    )
+                });
                 let ret = match generic::to_host(nr) {
                     Some(n) => {
                         // CLONE_BACKWARDS: tls before the child's tid pointer.
@@ -915,6 +925,9 @@ pub(crate) fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
                     }
                     None => -ENOSYS,
                 };
+                if let Some(e) = traced {
+                    strace::syscall_ret(p.space(), e, ret, &orig);
+                }
                 if ret == THREAD_EXIT {
                     return;
                 }
