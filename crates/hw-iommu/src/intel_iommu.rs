@@ -842,7 +842,7 @@ impl State {
             );
         }
         self.set_frcd_and_update_ppf(next);
-        self.next_frcd_reg = (next + 1) % FRCD_REG_NR;
+        self.next_frcd_reg = if next + 1 == FRCD_REG_NR { 0 } else { next + 1 };
         if fsts & FSTS_PPF == 0 {
             self.generate_fault_event(fsts);
         }
@@ -1083,7 +1083,7 @@ impl State {
             Ok((pte, level, reads, writes)) => {
                 let xlat = pte & !0xfff & self.haw();
                 let size = 1u64 << level_shift(level);
-                if xlat <= INTERRUPT_ADDR_LAST && xlat + size - 1 >= INTERRUPT_ADDR_FIRST {
+                if xlat <= INTERRUPT_ADDR_LAST && xlat + size > INTERRUPT_ADDR_FIRST {
                     let fr = if self.conf.scalable_mode {
                         FR_SM_INTERRUPT_ADDR
                     } else {
@@ -1092,7 +1092,7 @@ impl State {
                     self.report_fault(fr, fpd, sid, addr, is_write, false, 0);
                     return Walked::Fault { mask: !level_page_mask(level) };
                 }
-                let flags = u8::from(reads) * ACCESS_R | u8::from(writes) * ACCESS_W;
+                let flags = (u8::from(reads) * ACCESS_R) | (u8::from(writes) * ACCESS_W);
                 let did = ((ce[1] >> 8) & 0xffff) as u16;
                 Walked::Page { pte, level, flags, did }
             }
