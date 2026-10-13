@@ -143,7 +143,7 @@ use ruvm_hw_intc::riscv_aclint::{
 use ruvm_hw_intc::riscv_aplic::aplic_size;
 use ruvm_hw_intc::riscv_imsic::imsic_hart_size;
 use ruvm_hw_intc::sifive_plic::{SiFivePlic, SiFivePlicConfig, TYPE_SIFIVE_PLIC};
-use ruvm_hw_iommu::{RiscvIommu, TYPE_RISCV_IOMMU_MEMORY_REGION};
+use ruvm_hw_iommu::RiscvIommu;
 use ruvm_hw_misc::sifive_test::{SiFiveTest, SiFiveTestRequest, TYPE_SIFIVE_TEST};
 use ruvm_hw_pci::regs::{PCI_CLASS_DEVICE, PCI_NUM_PINS};
 use ruvm_hw_pci::{GpexConfig, GpexHost, GpexWindow, MsiRemap, MsiTrigger};
@@ -1152,8 +1152,7 @@ impl VirtMachine {
                     .upgrade()
                     .and_then(|b| b.find_device((rid >> 8) as u8, rid as u8))
                     .is_some_and(|d| {
-                        d.config_read(PCI_CLASS_DEVICE as u32, 2) as u16
-                            == iommu::PCI_CLASS_SYSTEM_IOMMU
+                        d.config_read(PCI_CLASS_DEVICE as u32, 2) as u16 == PCI_CLASS_SYSTEM_IOMMU
                     });
                 match first.upgrade() {
                     Some(i) if !is_iommu => i.remap_msi(rid, addr, data),
@@ -1974,8 +1973,7 @@ mod tests {
 
     #[test]
     fn riscv_iommu_pci() {
-        let mut cfg = VirtConfig::default();
-        cfg.rng_seed = Some([7; 32]);
+        let cfg = VirtConfig { rng_seed: Some([7; 32]), ..VirtConfig::default() };
         let mut m = VirtMachine::new(cfg).unwrap();
         m.attach_riscv_iommu_pci(&RiscvIommuPciProps::default(), None).unwrap();
         m.machine_done().unwrap();
