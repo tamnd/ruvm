@@ -88,6 +88,7 @@ use ruvm_hw_timer::hpet::{HPET_BASE, HPET_LEN, Hpet, HpetFwConfig, HpetPropertie
 use ruvm_hw_timer::i8254::I8254;
 use ruvm_hw_timer::mc146818::{Mc146818Props, Mc146818Rtc};
 use ruvm_hw_tpm::TpmBackend;
+use ruvm_hw_tpm::crb::{TPM_CRB_ADDR_BASE, TPM_CRB_CMD_SIZE, TPM_CRB_DATA_BUFFER, TpmCrb};
 use ruvm_hw_tpm::ppi::{TPM_PPI_ADDR_BASE, TPM_PPI_ADDR_SIZE, TpmPpi};
 use ruvm_hw_tpm::tis::{TPM_TIS_ADDR_BASE, TPM_TIS_ADDR_SIZE, TpmTis};
 use ruvm_mem::{AddressSpace, MemTxAttrs, MemorySystem, MmioOps, RamBlock, RegionId, RegionType};
@@ -488,7 +489,9 @@ impl AcpiSource {
                     // creates the serial ports in index order and the i8042 after them, and
                     // the RTC came with the LPC bridge before all of them.
                     // A tpm-tis from -device is the newest of all.
-                    if let Some(&tpm) = self.tpm.get() {
+                    if let Some(&tpm) =
+                        self.tpm.get().filter(|t| t.interface == TpmInterface::TisIsa)
+                    {
                         isa.push(IsaDevice::TpmTis(tpm));
                     }
                     if self.i8042 {
@@ -1917,10 +1920,7 @@ impl Q35 {
     /// every reset and, as in QEMU, the process exits when that fails. The PPI memory clear
     /// on reset is not done yet.
     pub fn attach_tpm_tis(&self, be: Box<dyn TpmBackend>, irq: u32) -> Result<Arc<TpmTis>, String> {
-        let version = match be.version() {
-            ruvm_hw_tpm::TpmVersion::V1_2 => AcpiTpmVersion::V1_2,
-            ruvm_hw_tpm::TpmVersion::V2_0 => AcpiTpmVersion::V2_0,
-        };
+        let version = be.version();
         let tis = TpmTis::new(be, irq);
         tis.irq().connect(self.gsi[irq as usize].clone());
         let ops: Arc<dyn MmioOps> = tis.clone();
@@ -1936,9 +1936,53 @@ impl Q35 {
                 std::process::exit(1);
             }
         }));
-        let info = TpmInfo { version, interface: TpmInterface::TisIsa, ppi: true };
-        let _ = self.acpi_src.tpm.set(info);
+        self.set_tpm(version, TpmInterface::TisIsa);
         Ok(tis)
+    }
+
+    /// `tpm_crb_realize()`: maps the CRB registers and command buffer over `be` and the PPI
+    /// memory, and gives the ACPI tables the TPM. The CRB starts the TPM on every reset and,
+    /// as in QEMU, the process exits when that fails. The PPI memory clear on reset is not
+    /// done yet.
+    pub fn attach_tpm_crb(
+        &self,
+        be: Box<dyn TpmBackend>,
+        cap_chunk: bool,
+    ) -> Result<Arc<TpmCrb>, String> {
+        let version = be.version();
+        let crb = TpmCrb::new(be, cap_chunk);
+        let ops: Arc<dyn MmioOps> = crb.clone();
+        let r =
+            self.mem.new_io("tpm-crb-mmio", u128::from(TPM_CRB_DATA_BUFFER), ops).map_err(err)?;
+        self.mem.add_subregion(self.system, TPM_CRB_ADDR_BASE, r).map_err(err)?;
+        let r = self
+            .mem
+            .new_io("tpm-crb-cmd", TPM_CRB_CMD_SIZE as u128, crb.cmd_region())
+            .map_err(err)?;
+        self.mem
+            .add_subregion(self.system, TPM_CRB_ADDR_BASE + TPM_CRB_DATA_BUFFER, r)
+            .map_err(err)?;
+        let ppi: Arc<dyn MmioOps> = Arc::new(TpmPpi::default());
+        let r = self.mem.new_io("tpm-ppi", TPM_PPI_ADDR_SIZE as u128, ppi).map_err(err)?;
+        self.mem.add_subregion(self.system, TPM_PPI_ADDR_BASE, r).map_err(err)?;
+        let reset = Arc::clone(&crb);
+        self.add_reset_hook(Box::new(move || {
+            if let Err(e) = reset.reset() {
+                error_report(&e);
+                std::process::exit(1);
+            }
+        }));
+        self.set_tpm(version, TpmInterface::Crb);
+        Ok(crb)
+    }
+
+    /// Gives the ACPI tables the TPM, which has the PPI.
+    fn set_tpm(&self, version: ruvm_hw_tpm::TpmVersion, interface: TpmInterface) {
+        let version = match version {
+            ruvm_hw_tpm::TpmVersion::V1_2 => AcpiTpmVersion::V1_2,
+            ruvm_hw_tpm::TpmVersion::V2_0 => AcpiTpmVersion::V2_0,
+        };
+        let _ = self.acpi_src.tpm.set(TpmInfo { version, interface, ppi: true });
     }
 
     /// Has `hook` run on every system reset, after the board's own devices.

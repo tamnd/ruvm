@@ -939,6 +939,9 @@ pub(crate) enum IsaModel {
     DebugExit { iobase: u32, iosize: u32 },
     /// `tpm-tis`, with the id of its backend.
     TpmTis { tpmdev: Option<String>, irq: u32 },
+    /// `tpm-crb`, which has no bus but is realized in order with the ISA devices so that the
+    /// check for a second TPM goes as in QEMU.
+    TpmCrb { tpmdev: Option<String>, cap_chunk: bool },
 }
 
 /// `TYPE_ISA_DEBUG_EXIT`.
@@ -946,6 +949,9 @@ const TYPE_ISA_DEBUG_EXIT: &str = "isa-debug-exit";
 
 /// `TYPE_TPM_TIS_ISA`.
 const TYPE_TPM_TIS_ISA: &str = "tpm-tis";
+
+/// `TYPE_TPM_CRB`.
+const TYPE_TPM_CRB: &str = "tpm-crb";
 
 /// An ISA device to plug.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1317,6 +1323,9 @@ fn plan_device(
     if driver == TYPE_IDE_HD {
         return plan_ide_hd(kind, drives, used, opts, loc).map(Planned::IdeHd);
     }
+    if driver == TYPE_TPM_CRB {
+        return plan_tpm_crb(kind, opts, loc).map(Planned::Isa);
+    }
     if driver == TYPE_INTEL_IOMMU_DEVICE {
         return plan_intel_iommu(kind, opts, loc).map(Planned::IntelIommu);
     }
@@ -1662,6 +1671,45 @@ fn prop_u32(name: &str, value: &str) -> Result<u32> {
 
 /// `qdev_device_add()` for `isa-debugcon`, `isa-debug-exit` and `tpm-tis`: the bus first, then the
 /// properties. Whether the chardev exists is checked when the device is realized.
+/// `qdev_device_add()` for `tpm-crb`, a device without a bus.
+fn plan_tpm_crb(
+    kind: Option<BoardKind>,
+    opts: &ruvm_qapi::opts::QemuOpts,
+    loc: &Option<Location>,
+) -> std::result::Result<IsaPlug, Located> {
+    // The bus is looked up by name first, then its type is checked, and no bus takes it.
+    if let Some(b) = opts.get("bus") {
+        let bus_type = match b {
+            "pcie.0" if kind == Some(BoardKind::Q35) => "PCIE",
+            "isa.0" => "ISA",
+            "main-system-bus" => "System",
+            _ => return Err(Located::new(loc, format!("Bus '{b}' not found"))),
+        };
+        let msg = format!("Device '{TYPE_TPM_CRB}' can't go on {bus_type} bus");
+        return Err(Located::new(loc, msg));
+    }
+    let (mut tpmdev, mut cap_chunk) = (None, true);
+    let boolean = |k: &str, v: &str| {
+        crate::display::prop(k, v, |vi, n, out| vi.type_bool(Some(n), out))
+            .map_err(|e| Located(loc.clone(), e))
+    };
+    for (k, v) in opts.iter() {
+        match k {
+            "driver" => {}
+            "tpmdev" => tpmdev = Some(v.to_string()),
+            "cap-chunk" => cap_chunk = boolean(k, v)?,
+            // Only a migration blocker for old machine types.
+            "x-allow-chunk-migration" => {
+                boolean(k, v)?;
+            }
+            _ => {
+                return Err(Located::new(loc, format!("Property '{TYPE_TPM_CRB}.{k}' not found")));
+            }
+        }
+    }
+    Ok(IsaPlug { model: IsaModel::TpmCrb { tpmdev, cap_chunk }, loc: loc.clone() })
+}
+
 fn plan_isa_device(
     kind: Option<BoardKind>,
     typename: &str,
@@ -2286,20 +2334,16 @@ fn realize_isa(
         }
         IsaModel::TpmTis { tpmdev, irq } => {
             let located = |e: String| Located::new(&plug.loc, e);
-            let be = match tpmdev {
-                Some(id) => Some(crate::tpm::take("tpm-tis.tpmdev", id).map_err(located)?),
-                None => None,
-            };
-            if !crate::tpm::add_device() {
-                return Err(located("at most one TPM device is permitted".to_string()));
-            }
-            let Some(be) = be else {
-                return Err(located("'tpmdev' property is required".to_string()));
-            };
+            let be = crate::tpm::realize("tpm-tis.tpmdev", tpmdev.as_deref()).map_err(located)?;
             if *irq > 15 {
                 return Err(located(format!("IRQ {irq} is outside valid range of 0 to 15")));
             }
             board.attach_tpm_tis(be, *irq).map_err(located)?;
+        }
+        IsaModel::TpmCrb { tpmdev, cap_chunk } => {
+            let located = |e: String| Located::new(&plug.loc, e);
+            let be = crate::tpm::realize("tpm-crb.tpmdev", tpmdev.as_deref()).map_err(located)?;
+            board.attach_tpm_crb(be, *cap_chunk).map_err(located)?;
         }
     }
     Ok(())
