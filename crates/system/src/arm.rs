@@ -1340,9 +1340,11 @@ fn build_virt(
     let net = init_clients(vm, args.netdevs, true, &net_clock).map_err(|e| vec![e])?;
     let board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
     let target = devices::Target::Virt(&board);
-    let plugged = devices::plug(&vm.block, target, &plan.virtio, &plan.display, args.drives, &net)
-        .map_err(|e| vec![e])?;
-    let _ = vm.drives.set(Drives::new(args.drives, plugged));
+    let mut plugged =
+        devices::plug(&vm.block, target, &plan.virtio, &plan.display, args.drives, &net)
+            .map_err(|e| vec![e])?;
+    plugged.extend(crate::drives::flash_plugged(args.drives, "virt"));
+    let _ = vm.drives.set(Drives::new(&vm.block, args.drives, plugged));
     net.check_clients();
 
     let mut attachments = Vec::new();
@@ -1411,11 +1413,15 @@ fn start_sbsa_ref_tcg(
     cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
     let net = init_clients(vm, args.netdevs, true, &clock).map_err(|e| vec![e])?;
     let mut board = SbsaRefMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
-    devices::plug_ahci(&vm.block, &board, &plan.ide, args.drives).map_err(|e| vec![e])?;
+    let mut plugged =
+        devices::plug_ahci(&vm.block, &board, &plan.ide, args.drives).map_err(|e| vec![e])?;
     let target = devices::Target::SbsaRef(&board);
-    let plugged = devices::plug(&vm.block, target, &plan.virtio, &plan.display, args.drives, &net)
-        .map_err(|e| vec![e])?;
-    let _ = vm.drives.set(Drives::new(args.drives, plugged));
+    plugged.extend(
+        devices::plug(&vm.block, target, &plan.virtio, &plan.display, args.drives, &net)
+            .map_err(|e| vec![e])?,
+    );
+    plugged.extend(crate::drives::flash_plugged(args.drives, "sbsa"));
+    let _ = vm.drives.set(Drives::new(&vm.block, args.drives, plugged));
     net.check_clients();
 
     let mut attachments = Vec::new();

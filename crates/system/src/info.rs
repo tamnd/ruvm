@@ -264,12 +264,12 @@ fn register_machine(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
         none_machine(&v, "x-query-roms")?;
         Ok(text(""))
     });
-    // Machine none has no drives and no NICs. Its block nodes are the ones blockdev-add made.
     let v = vm.clone();
-    register_query_block(cmds, move |_: &MonitorQmp, _| {
-        none_machine(&v, "query-block")?;
-        Ok(Vec::new())
+    register_query_block(cmds, move |_: &MonitorQmp, _| match v.drives.get() {
+        Some(drives) => drives.query_block(&v.block),
+        None => Err(Error::generic("query-block is not supported with this machine by ruvm yet")),
     });
+    // Machine none has no NICs. Its block nodes are the ones blockdev-add made.
     let v = vm.clone();
     register_query_blockstats(cmds, move |_: &MonitorQmp, arg| {
         none_machine(&v, "query-blockstats")?;

@@ -863,9 +863,10 @@ pub(crate) fn start_board(
     // virt makes no NICs for -nic, which net_check_clients() warns about.
     let net = init_clients(vm, args.netdevs, false, &clock).map_err(|e| vec![e])?;
     let mut board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
-    let plugged =
+    let mut plugged =
         devices::plug(&vm.block, &board, &plan.virtio, args.drives, &net).map_err(|e| vec![e])?;
-    let _ = vm.drives.set(Drives::new(args.drives, plugged));
+    plugged.extend(crate::drives::flash_plugged(args.drives, "virt"));
+    let _ = vm.drives.set(Drives::new(&vm.block, args.drives, plugged));
     net.check_clients();
 
     let mut attachments = Vec::new();

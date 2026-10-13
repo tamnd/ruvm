@@ -18,6 +18,8 @@ use ruvm_block::{
 };
 use ruvm_hw_virtio::{VirtioMmio, VirtioPci};
 use ruvm_machine_x86::VirtioHandle;
+use ruvm_qapi::opts::QemuOptsList;
+use ruvm_qapi::types::{BlockDeviceIoStatus, BlockInfo};
 
 use crate::x86::{Drive, DriveIf, Located};
 
@@ -110,20 +112,69 @@ impl ruvm_hw_storage::BlockBackend for DriveImage {
 /// `BlockDevOps.resize_cb` of a device: tells the guest the size of its image changed.
 pub(crate) type ResizeCb = Arc<dyn Fn() + Send + Sync>;
 
+/// The device a drive is on, as `qmp_query_block()` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DriveDev {
+    /// `blk_get_attached_dev_id()`: the device id, or its QOM path if it has none.
+    pub(crate) qdev: String,
+    /// The device has `change_media_cb` and a tray, as `ide-cd` does.
+    pub(crate) removable: bool,
+    /// The device turned on I/O status reporting with `blk_iostatus_enable()`.
+    pub(crate) iostatus: bool,
+}
+
+impl DriveDev {
+    /// A device without a tray that reports its I/O status, such as `virtio-blk` or `ide-hd`.
+    pub(crate) fn disk(qdev: String) -> DriveDev {
+        DriveDev { qdev, removable: false, iostatus: true }
+    }
+}
+
 /// A drive a board put on a device, with what the device does when the image is resized.
 pub(crate) struct Plugged {
     /// The index of the drive in the `-drive` list.
     pub(crate) drive: usize,
-    pub(crate) resize_cb: ResizeCb,
+    pub(crate) dev: DriveDev,
+    /// `None` for a device ruvm cannot resize yet, such as a flash.
+    pub(crate) resize_cb: Option<ResizeCb>,
+}
+
+/// `pflash_cfi01_legacy_drive()`: the drives of the two flashes of a board, which are
+/// `/machine/<prefix>.flash0` and `flash1`.
+pub(crate) fn flash_plugged(drives: &[Drive], prefix: &str) -> Vec<Plugged> {
+    drives
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.iface == DriveIf::Pflash && d.bus == 0 && d.unit < 2)
+        .map(|(i, d)| {
+            let qdev = format!("/machine/{prefix}.flash{}", d.unit);
+            let dev = DriveDev { qdev, removable: false, iostatus: false };
+            Plugged { drive: i, dev, resize_cb: None }
+        })
+        .collect()
+}
+
+/// `qdev_set_id()` for the `-device` `arg`: `/machine/peripheral/<id>`, or the next of
+/// `/machine/peripheral-anon/device[<n>]` for a device without an id.
+pub(crate) fn peripheral_path(arg: &str, anon: &mut usize) -> String {
+    let mut list = QemuOptsList::new("device", &[]).with_implied_opt_name("driver");
+    let id = list.parse(arg, true).ok().and_then(|o| o.id().map(str::to_string));
+    match id {
+        Some(id) => format!("/machine/peripheral/{id}"),
+        None => {
+            *anon += 1;
+            format!("/machine/peripheral-anon/device[{}]", *anon - 1)
+        }
+    }
 }
 
 /// How a drive is used.
 enum Use {
     /// On no device.
     Free,
-    /// On a device that follows a change of size.
-    Device(ResizeCb),
-    /// On a device ruvm cannot resize yet, such as a flash.
+    /// On a device, which follows a change of size if it has a `resize_cb`.
+    Device(DriveDev, Option<ResizeCb>),
+    /// On a device the board did not describe.
     Other,
 }
 
@@ -140,22 +191,70 @@ impl std::fmt::Debug for Drives {
 }
 
 impl Drives {
-    /// The list for `drives`, of which the board put `plugged` on devices.
-    pub(crate) fn new(drives: &[Drive], plugged: Vec<Plugged>) -> Drives {
-        let mut list: Vec<(String, Use)> = drives
-            .iter()
-            .map(|d| {
-                let u = match d.iface {
-                    DriveIf::None => Use::Free,
-                    _ => Use::Other,
+    /// The drives of `graph` in the order they were made, of which the board put `plugged`
+    /// on devices. `drives` are the ones from the command line. The others are the defaults
+    /// `default_drive()` adds, which are on no device.
+    pub(crate) fn new(graph: &BlockGraph, drives: &[Drive], plugged: Vec<Plugged>) -> Drives {
+        let mut list: Vec<(String, Use)> = graph
+            .drives()
+            .into_iter()
+            .map(|info| {
+                let u = match drives.iter().find(|d| d.id == info.id) {
+                    Some(d) if d.iface != DriveIf::None => Use::Other,
+                    _ => Use::Free,
                 };
-                (d.id.clone(), u)
+                (info.id, u)
             })
             .collect();
         for p in plugged {
-            list[p.drive].1 = Use::Device(p.resize_cb);
+            let id = &drives[p.drive].id;
+            if let Some(entry) = list.iter_mut().find(|(d, _)| d == id) {
+                entry.1 = Use::Device(p.dev, p.resize_cb);
+            }
         }
         Drives(Some(list))
+    }
+
+    /// `qmp_query_block()` for the drives of `graph`.
+    pub(crate) fn query_block(&self, graph: &BlockGraph) -> Result<Vec<BlockInfo>> {
+        let Some(list) = &self.0 else {
+            return Err(Error::generic(
+                "query-block is not supported with this machine by ruvm yet",
+            ));
+        };
+        let mut out = Vec::new();
+        for (id, u) in list {
+            let Some(blk) = graph.backend(id) else { continue };
+            // bdrv_query_info(). A device has not locked its medium or opened its tray before
+            // the guest asks it to, and ruvm does not report that yet.
+            let mut info = BlockInfo {
+                device: id.clone(),
+                type_: "unknown".into(),
+                removable: true,
+                inserted: blk.query_inserted()?,
+                ..BlockInfo::default()
+            };
+            match u {
+                Use::Free => {}
+                Use::Device(dev, _) => {
+                    info.qdev = Some(dev.qdev.clone());
+                    info.removable = dev.removable;
+                    if dev.removable {
+                        info.tray_open = Some(false);
+                    }
+                    if dev.iostatus {
+                        info.io_status = Some(BlockDeviceIoStatus::Ok);
+                    }
+                }
+                Use::Other => {
+                    return Err(Error::generic(format!(
+                        "query-block of drive '{id}' is not supported with its device by ruvm yet"
+                    )));
+                }
+            }
+            out.push(info);
+        }
+        Ok(out)
     }
 
     /// `qmp_block_resize()` for a drive of `graph`. `node_exists` says whether
@@ -194,14 +293,14 @@ impl Drives {
         if size < 0 {
             return Err(Error::generic("Parameter 'size' expects a >0 size"));
         }
-        if matches!(u, Use::Other) {
+        if matches!(u, Use::Other | Use::Device(_, None)) {
             return Err(Error::generic(format!(
                 "block_resize of drive '{id}' is not supported with its device by ruvm yet"
             )));
         }
         // A backend of its own that may resize the node, as qmp_block_resize() makes.
         BlockBackend::new(graph, &node, BLK_PERM_RESIZE, BLK_PERM_ALL)?.truncate(size as u64)?;
-        if let Use::Device(resize_cb) = u {
+        if let Use::Device(_, Some(resize_cb)) = u {
             resize_cb();
         }
         Ok(())
@@ -282,7 +381,8 @@ mod tests {
         let cb: ResizeCb = Arc::new(move || {
             r.fetch_add(1, Ordering::Relaxed);
         });
-        let drives = Drives::new(&d, vec![Plugged { drive: 0, resize_cb: cb }]);
+        let dev = DriveDev::disk("/machine/peripheral-anon/device[0]/virtio-backend".into());
+        let drives = Drives::new(&graph, &d, vec![Plugged { drive: 0, dev, resize_cb: Some(cb) }]);
         let resize = |dev: Option<&str>, node: Option<&str>, size| {
             drives
                 .block_resize(&graph, dev, node, size, |n| n == "n0")
@@ -307,5 +407,56 @@ mod tests {
         let e = Drives::default().block_resize(&graph, Some("d0"), None, 1, |_| false).unwrap_err();
         assert_eq!(e.message(), "block_resize is not supported with this machine by ruvm yet");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn query_block_is_qemus() {
+        let graph = BlockGraph::new();
+        let d = drives(
+            &graph,
+            &[
+                "if=virtio,file=null-co://,format=raw,readonly=on",
+                "if=none,id=d1",
+                "if=ide,index=2,media=cdrom,file=null-co://,format=raw",
+                "if=pflash,unit=1,file=null-co://,format=raw",
+            ],
+        );
+        graph.drive_new("if=floppy,index=0", BlockInterfaceType::Floppy).unwrap();
+        let qdev = "/machine/unattached/device[14]".to_string();
+        let cd = DriveDev { qdev, removable: true, iostatus: true };
+        let mut plugged = vec![
+            Plugged { drive: 2, dev: cd, resize_cb: None },
+            Plugged { drive: 0, dev: DriveDev::disk("blk0".into()), resize_cb: None },
+        ];
+        plugged.extend(flash_plugged(&d, "virt"));
+        let list = Drives::new(&graph, &d, plugged).query_block(&graph).unwrap();
+        let ids: Vec<&str> = list.iter().map(|b| b.device.as_str()).collect();
+        assert_eq!(ids, ["virtio0", "d1", "ide1-cd0", "pflash1", "floppy0"]);
+        type Fields<'a> = (Option<&'a str>, bool, Option<bool>, Option<BlockDeviceIoStatus>, bool);
+        fn fields(b: &BlockInfo) -> Fields<'_> {
+            (b.qdev.as_deref(), b.removable, b.tray_open, b.io_status, b.inserted.is_some())
+        }
+        let ok = Some(BlockDeviceIoStatus::Ok);
+        assert_eq!(fields(&list[0]), (Some("blk0"), false, None, ok, true));
+        assert!(list[0].inserted.as_ref().unwrap().ro);
+        assert_eq!(fields(&list[1]), (None, true, None, None, false));
+        let cd = Some("/machine/unattached/device[14]");
+        assert_eq!(fields(&list[2]), (cd, true, Some(false), ok, true));
+        assert_eq!(fields(&list[3]), (Some("/machine/virt.flash1"), false, None, None, true));
+        assert_eq!(fields(&list[4]), (None, true, None, None, false));
+        assert_eq!(list[4].type_, "unknown");
+        let e = Drives::default().query_block(&graph).unwrap_err();
+        assert_eq!(e.message(), "query-block is not supported with this machine by ruvm yet");
+    }
+
+    #[test]
+    fn peripheral_paths() {
+        let mut anon = 0;
+        assert_eq!(peripheral_path("virtio-rng", &mut anon), "/machine/peripheral-anon/device[0]");
+        assert_eq!(peripheral_path("virtio-blk,id=b,drive=d", &mut anon), "/machine/peripheral/b");
+        assert_eq!(
+            peripheral_path("driver=virtio-blk", &mut anon),
+            "/machine/peripheral-anon/device[1]"
+        );
     }
 }

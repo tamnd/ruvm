@@ -1218,6 +1218,12 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             e.report();
             Exit(1)
         })?;
+        // default_drive() for the floppy of the virt boards and sbsa-ref, which have no
+        // controller for it, so it stays on no device. Machine none sets no_floppy.
+        let floppy = ruvm_block::BlockInterfaceType::Floppy;
+        if virt && cfg.x86.has_defaults && vm.block.drive_get_by_index(floppy, 0).is_none() {
+            vm.block.drive_new("if=floppy,index=0", floppy).map_err(|e| fail(&e))?;
+        }
     }
     crate::audio::create_early_backends(cfg.x86.has_defaults, vm.name.as_deref())
         .map_err(|e| fail(&e))?;
@@ -1489,7 +1495,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             }
             _ => {
                 // Machine none: its drives are on no device.
-                let _ = vm.drives.set(Drives::new(&drives, Vec::new()));
+                let _ = vm.drives.set(Drives::new(&vm.block, &drives, Vec::new()));
                 keep._accel = Some(accel);
             }
         }

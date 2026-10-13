@@ -213,6 +213,15 @@ impl crate::node::NodeMeta {
     }
 }
 
+impl BlockBackend {
+    /// The `inserted` member `bdrv_query_info()` gives a backend in `query-block`: the medium,
+    /// or `None` without one.
+    pub fn query_inserted(&self) -> Result<Option<BlockDeviceInfo>> {
+        // bdrv_skip_implicit_filters() has no implicit filters to skip yet.
+        self.root().map(|bs| bs.block_device_info(Some(self), false)).transpose()
+    }
+}
+
 impl BlockGraph {
     /// `qmp_query_named_block_nodes()`: every named node, the newest first, as
     /// `bdrv_named_nodes_list()` prepends.
