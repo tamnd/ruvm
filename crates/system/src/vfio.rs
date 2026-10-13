@@ -9,6 +9,7 @@ use ruvm_hw_iommu::intel_iommu::OnOffAuto;
 use ruvm_hw_vfio::{PciHostDeviceAddress, VfioPciConf};
 use ruvm_machine_x86::{FirmwareSearch, X86Board};
 use ruvm_qapi::opts::QemuOpts;
+use ruvm_qapi::visit::Visitor;
 
 use crate::x86::Located;
 
@@ -67,7 +68,7 @@ pub(crate) fn plan_device(
     opts: &QemuOpts,
     loc: &Option<Location>,
     pci: bool,
-) -> std::result::Result<VfioPlug, Located> {
+) -> Result<VfioPlug, Located> {
     match opts.get("bus") {
         Some("pcie.0") if pci => {}
         Some(b) => return Err(Located::new(loc, format!("Bus '{b}' not found"))),
@@ -150,7 +151,7 @@ pub(crate) fn realize_x86(
     board: &mut X86Board,
     plug: &VfioPlug,
     firmware: &FirmwareSearch,
-) -> std::result::Result<(), Located> {
+) -> Result<(), Located> {
     use ruvm_hw_pci::regs::PCI_ROM_SLOT;
 
     let X86Board::Q35(m, _) = board else {
@@ -184,6 +185,6 @@ pub(crate) fn realize_x86(
     _board: &mut X86Board,
     plug: &VfioPlug,
     _firmware: &FirmwareSearch,
-) -> std::result::Result<(), Located> {
+) -> Result<(), Located> {
     Err(Located::new(&plug.loc, format!("'{TYPE_VFIO_PCI}' is not a valid device model name")))
 }
