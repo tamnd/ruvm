@@ -7,11 +7,12 @@
 //! `IF_VIRTIO`, and every `if=virtio` drive adds a `-device virtio-blk,drive=<id>` after the
 //! others. The short virtio names are aliases of the PCI types, as in `qdev_alias_table[]`.
 //!
-//! `-device` takes `loader`, `virtio-blk`, `virtio-rng` and `virtio-serial`, each as a PCI
-//! function on the root bus `pcie.0` (`virtio-*-pci`) or on a virtio-mmio transport
-//! (`virtio-*-device`). The other virtio types fail with "... is not supported with this
-//! machine by ruvm yet". The PCI types take `addr`, `bus=pcie.0`, `disable-legacy`,
-//! `disable-modern` and `vectors`; the virtio-mmio ones take `bus=virtio-mmio-bus.<n>`.
+//! `-device` takes `loader`, `riscv-iommu-pci`, `virtio-blk`, `virtio-rng` and
+//! `virtio-serial`, the virtio ones as a PCI function on the root bus `pcie.0`
+//! (`virtio-*-pci`) or on a virtio-mmio transport (`virtio-*-device`). The other virtio
+//! types fail with "... is not supported with this machine by ruvm yet". The PCI types take
+//! `addr`, `bus=pcie.0`, `disable-legacy`, `disable-modern`, `iommu_platform` and `vectors`;
+//! the virtio-mmio ones take `bus=virtio-mmio-bus.<n>`.
 //! `-drive if=pflash` with unit 0 or 1 on bus 0 is the drive of the flash of that number, as
 //! `pflash_cfi01_legacy_drive()` takes it.
 
@@ -26,7 +27,9 @@ use ruvm_hw_virtio::{
     RandomFile, VirtioBalloon, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass,
     VirtioNet, VirtioNetConf, VirtioPciProps, VirtioRng, VirtioRngConf,
 };
-use ruvm_machine_riscv::virt::{GenericLoader, VirtMachine};
+use ruvm_machine_riscv::virt::{
+    GenericLoader, RiscvIommuPciProps, TYPE_RISCV_IOMMU_PCI, VirtMachine,
+};
 use ruvm_machine_x86::VirtioHandle;
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
 
@@ -43,6 +46,8 @@ enum Model {
     Serial,
     Balloon,
     Net,
+    /// `riscv-iommu-pci`, which is not a virtio device but plugs in the same order.
+    RiscvIommu,
 }
 
 /// The device types, with the bus they plug into.
@@ -98,6 +103,10 @@ pub(crate) struct Plug {
     /// virtio-net `mac`.
     mac: Option<[u8; 6]>,
     props: VirtioPciProps,
+    /// `iommu_platform` of a PCI function: its DMA goes through the IOMMU.
+    iommu_platform: bool,
+    /// The properties of a `riscv-iommu-pci`.
+    iommu: RiscvIommuPciProps,
     /// Where `qdev_set_id()` put the device in the QOM tree.
     path: String,
     loc: Option<Location>,
@@ -174,6 +183,8 @@ fn plan_virtio(
         netdev: None,
         mac: None,
         props: VirtioPciProps::default(),
+        iommu_platform: false,
+        iommu: RiscvIommuPciProps::default(),
         path: String::new(),
         loc: loc.clone(),
     };
@@ -206,6 +217,9 @@ fn plan_virtio(
             }
             "vectors" if pci => {
                 plug.props.vectors = Some(v.parse().map_err(|_| bad_value(k, v))?);
+            }
+            "iommu_platform" if pci => {
+                plug.iommu_platform = prop_bool(k, v).map_err(|_| bad_value(k, v))?;
             }
             "drive" if model == Model::Blk => {
                 let Some(i) = drives.iter().position(|d| d.id == v) else {
@@ -247,6 +261,73 @@ fn plan_virtio(
     Ok(plug)
 }
 
+/// A `riscv-iommu-pci` with its own properties and those of `riscv-iommu`. The `bus`
+/// property of `riscv-iommu` cannot be given here, since `qdev_device_add()` takes `bus` as
+/// the bus to plug into.
+fn plan_riscv_iommu(opts: &QemuOpts, loc: &Option<Location>) -> Result<Plug, Located> {
+    let at = |e: Error| Located(loc.clone(), e);
+    let boolean =
+        |k: &str, v: &str| crate::display::prop(k, v, |vi, n, out| vi.type_bool(Some(n), out));
+    let u16_prop =
+        |k: &str, v: &str| crate::display::prop(k, v, |vi, n, out| vi.type_uint16(Some(n), out));
+    let u8_prop =
+        |k: &str, v: &str| crate::display::prop(k, v, |vi, n, out| vi.type_uint8(Some(n), out));
+    let u32_prop =
+        |k: &str, v: &str| crate::display::prop(k, v, |vi, n, out| vi.type_uint32(Some(n), out));
+    let mut plug = Plug {
+        typename: TYPE_RISCV_IOMMU_PCI,
+        model: Model::RiscvIommu,
+        transport: Transport::Pci,
+        drive: None,
+        serial: None,
+        devfn: None,
+        mmio_bus: None,
+        netdev: None,
+        mac: None,
+        props: VirtioPciProps::default(),
+        iommu_platform: false,
+        iommu: RiscvIommuPciProps::default(),
+        path: String::new(),
+        loc: loc.clone(),
+    };
+    let p = &mut plug.iommu;
+    for (k, v) in opts.iter() {
+        match k {
+            "driver" => {}
+            "id" => p.id = Some(v.to_string()),
+            "bus" if v == PCIE_ROOT_BUS => {}
+            "bus" => return Err(Located::new(loc, format!("Bus '{v}' not found"))),
+            "addr" => {
+                plug.devfn = Some(parse_devfn(v).ok_or_else(|| {
+                    Located::new(
+                        loc,
+                        format!("Property '{TYPE_RISCV_IOMMU_PCI}.{k}' doesn't take value '{v}'"),
+                    )
+                })?);
+            }
+            "vendor-id" => p.vendor_id = u16_prop(k, v).map_err(at)?,
+            "device-id" => p.device_id = u16_prop(k, v).map_err(at)?,
+            "revision" => p.revision = u8_prop(k, v).map_err(at)?,
+            "version" => p.conf.version = u32_prop(k, v).map_err(at)?,
+            "pas-bits" => p.conf.pas_bits = u32_prop(k, v).map_err(at)?,
+            "ioatc-limit" => p.conf.ioatc_limit = u32_prop(k, v).map_err(at)?,
+            "intremap" => p.conf.intremap = boolean(k, v).map_err(at)?,
+            "ats" => p.conf.ats = boolean(k, v).map_err(at)?,
+            "off" => p.conf.off = boolean(k, v).map_err(at)?,
+            "s-stage" => p.conf.s_stage = boolean(k, v).map_err(at)?,
+            "g-stage" => p.conf.g_stage = boolean(k, v).map_err(at)?,
+            "hpm-counters" => p.conf.hpm_counters = u8_prop(k, v).map_err(at)?,
+            _ => {
+                return Err(Located::new(
+                    loc,
+                    format!("Property '{TYPE_RISCV_IOMMU_PCI}.{k}' not found"),
+                ));
+            }
+        }
+    }
+    Ok(plug)
+}
+
 /// What one `-device` plugs.
 enum Planned {
     Loader(GenericLoader),
@@ -270,6 +351,9 @@ fn plan_device(
     }
     if driver == "loader" {
         return parse_loader(opts, loc).map(Planned::Loader);
+    }
+    if driver == TYPE_RISCV_IOMMU_PCI {
+        return plan_riscv_iommu(opts, loc).map(Planned::Virtio);
     }
     plan_virtio(drives, used, driver, opts, loc).map(Planned::Virtio)
 }
@@ -389,6 +473,10 @@ pub(crate) fn plug(
             }
             Model::Serial => Box::new(VirtioConsole::new(None)),
             Model::Balloon => Box::new(VirtioBalloon::new(board.ram_size(), Box::new(KeepRam))),
+            Model::RiscvIommu => {
+                board.attach_riscv_iommu_pci(&plug.iommu, plug.devfn).map_err(at)?;
+                continue;
+            }
             Model::Net => {
                 let mut mac = plug.mac.unwrap_or_default();
                 let id = plug.props.id.as_deref();
@@ -401,7 +489,9 @@ pub(crate) fn plug(
         };
         let handle = match (plug.transport, plug.mmio_bus) {
             (Transport::Pci, _) => {
-                let dev = board.attach_virtio_pci(class, plug.devfn, &plug.props).map_err(at)?;
+                let dev = board
+                    .attach_virtio_pci_with(class, plug.devfn, &plug.props, plug.iommu_platform)
+                    .map_err(at)?;
                 Some(VirtioHandle::Pci(dev))
             }
             (Transport::Mmio, Some(n)) => {
@@ -493,6 +583,40 @@ mod tests {
         );
         assert_eq!(err(&["e1000"]), "'e1000' is not a valid device model name");
         assert_eq!(err(&["loader,foo=1"]), "Property 'loader.foo' not found");
+    }
+
+    #[test]
+    fn riscv_iommu_pci() {
+        let d = parse_drives(&[dev("file=a.img,if=none,id=d0")]).unwrap();
+        let p = plan(
+            &d,
+            &[
+                dev("riscv-iommu-pci,addr=1,pas-bits=48,s-stage=off,hpm-counters=4,id=io0"),
+                dev("virtio-blk-pci,drive=d0,iommu_platform=on"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(p.virtio[0].model, Model::RiscvIommu);
+        assert_eq!(p.virtio[0].devfn, Some(1 << 3));
+        assert_eq!(p.virtio[0].iommu.id.as_deref(), Some("io0"));
+        assert_eq!(p.virtio[0].iommu.device_id, 0x0014);
+        let conf = &p.virtio[0].iommu.conf;
+        assert_eq!((conf.pas_bits, conf.s_stage, conf.hpm_counters), (48, false, 4));
+        assert!(p.virtio[1].iommu_platform);
+
+        let err = |a: &str| plan(&[], &[dev(a)]).unwrap_err()[0].1.message().to_string();
+        assert_eq!(err("riscv-iommu-pci,foo=1"), "Property 'riscv-iommu-pci.foo' not found");
+        assert_eq!(err("riscv-iommu-pci,bus=pci.0"), "Bus 'pci.0' not found");
+        assert_eq!(
+            err("virtio-rng-device,iommu_platform=on"),
+            "Property 'virtio-rng-device.iommu_platform' not found"
+        );
+
+        let board = VirtMachine::new(ruvm_machine_riscv::virt::VirtConfig::default()).unwrap();
+        let p =
+            plan(&[], &[dev("riscv-iommu-pci"), dev("virtio-rng-pci,iommu_platform=on")]).unwrap();
+        plug(&BlockGraph::new(), &board, &p.virtio, &[], &no_net()).unwrap();
+        assert_eq!(board.riscv_iommus().len(), 1);
     }
 
     fn no_net() -> Network {
