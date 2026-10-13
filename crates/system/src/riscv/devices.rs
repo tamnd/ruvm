@@ -292,10 +292,10 @@ fn plan_riscv_iommu(opts: &QemuOpts, loc: &Option<Location>) -> Result<Plug, Loc
         loc: loc.clone(),
     };
     let p = &mut plug.iommu;
+    p.id = opts.id().map(str::to_string);
     for (k, v) in opts.iter() {
         match k {
             "driver" => {}
-            "id" => p.id = Some(v.to_string()),
             "bus" if v == PCIE_ROOT_BUS => {}
             "bus" => return Err(Located::new(loc, format!("Bus '{v}' not found"))),
             "addr" => {
