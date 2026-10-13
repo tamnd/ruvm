@@ -141,7 +141,7 @@ mod linux {
     /// on descriptor 3, and writes the pid of that to the `--pid` file.
     fn fake_passt(dir: &Path) -> PathBuf {
         let path = dir.join("passt");
-        std::fs::write(
+        write_executable(
             &path,
             "#!/bin/sh\n\
              printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\n\
@@ -152,17 +152,24 @@ mod linux {
              done\n\
              cat <&3 >&3 3>&- 2>/dev/null &\n\
              echo $! > \"$pidfile\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         path
     }
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
         path
+    }
+
+    /// Writes a program the tests then run. A child process writes it, not this one: while this
+    /// process has the file open for writing, a child that another test forks at that moment
+    /// holds it open too until it execs, and running the program then fails with ETXTBSY.
+    fn write_executable(path: &Path, text: &str) {
+        let tmp = path.with_extension("txt");
+        std::fs::write(&tmp, text).unwrap();
+        assert!(Command::new("cp").arg(&tmp).arg(path).status().unwrap().success());
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn pid_of(net: &Net, id: &str) -> Option<u32> {
