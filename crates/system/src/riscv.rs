@@ -44,6 +44,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use ruvm_accel::tcg::TcgOptions;
+use ruvm_accel_qtest::DummyVcpus;
 use ruvm_base::report::{Location, warn_report};
 use ruvm_base::{ClockType, Error, Result};
 use ruvm_chardev::{Attachment, Chardev, Chardevs, Connection, Frontend};
@@ -60,7 +61,8 @@ use ruvm_machine_x86::FirmwareSearch;
 use ruvm_mem::AddressSpace;
 use ruvm_qapi::events::event_reset;
 use ruvm_qapi::types::{
-    MachineInfo, MemorySizeConfiguration, ResetArg, RunState, SMPConfiguration, ShutdownCause,
+    CpuInfoFastU, MachineInfo, MemorySizeConfiguration, ResetArg, RunState, SMPConfiguration,
+    ShutdownCause,
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
@@ -71,6 +73,7 @@ use ruvm_target_riscv::cfg::{
 use ruvm_target_riscv::tcg::SemihostingHost;
 
 use crate::arm::{Semihosting, SemihostingTarget};
+use crate::cpus::{CpuSlot, Cpus, Threads, topology_props};
 use crate::drives::Drives;
 use crate::net::{NetOption, Network, init_clients};
 use crate::runstate::{MachineReset, Runstate};
@@ -107,6 +110,8 @@ pub(crate) struct BoardOptions {
     pub ram_size: Option<u64>,
     pub cpus: u32,
     pub max_cpus: u32,
+    /// `smp.threads`.
+    pub threads: u32,
     pub kernel: Option<String>,
     pub initrd: Option<String>,
     pub append: Option<String>,
@@ -230,8 +235,8 @@ fn check_virt_prop(o: &mut BoardOptions, name: &str, value: &str) -> Result<()> 
 }
 
 /// `machine_parse_smp_config()` for virt, which knows none of drawers, books, dies,
-/// clusters and modules. Gives (cpus, maxcpus).
-pub(crate) fn parse_smp(config: &SMPConfiguration) -> Result<(u32, u32)> {
+/// clusters and modules. Gives (cpus, maxcpus, threads).
+pub(crate) fn parse_smp(config: &SMPConfiguration) -> Result<(u32, u32, u32)> {
     let explicit = [
         config.cpus,
         config.drawers,
@@ -318,8 +323,8 @@ pub(crate) fn parse_smp(config: &SMPConfiguration) -> Result<(u32, u32)> {
     if sockets > 1 {
         return Err(Error::generic(format!("-smp sockets={sockets} is not supported by ruvm yet")));
     }
-    // Both are at most 512 now.
-    Ok((cpus as u32, maxcpus as u32))
+    // All are at most 512 now.
+    Ok((cpus as u32, maxcpus as u32, threads as u32))
 }
 
 /// `qemu_apply_machine_options()` for virt: takes the generic properties out of `machine`
@@ -334,7 +339,7 @@ pub(crate) fn take_board_options(machine: &QDict) -> Result<BoardOptions> {
         o.ram_size = mem.size.map(|s| s.next_multiple_of(8192));
     }
     let smp = visit_member::<SMPConfiguration>(machine, "smp")?.unwrap_or_default();
-    (o.cpus, o.max_cpus) = parse_smp(&smp)?;
+    (o.cpus, o.max_cpus, o.threads) = parse_smp(&smp)?;
     for (name, value) in machine.iter_inserted() {
         match name {
             "memory" | "smp" => {}
@@ -805,6 +810,7 @@ pub(crate) fn start_board(
         )));
     }
     let cpu = parse_cpu(args.cpu).map_err(one)?;
+    let slots = hart_slots(&opts, args.cpu);
     let mut cpu_warnings = Vec::new();
     let cpu = finalize_cpu(&cpu, opts.cpus as usize, &mut cpu_warnings);
     for w in &cpu_warnings {
@@ -897,6 +903,9 @@ pub(crate) fn start_board(
         BoardAccel::Qtest(_) => {
             // With no harts only the netdevs follow the run state.
             vm.runstate.set_cpu_hook(Some(Arc::new(move |run| net.vm_state_change(run))));
+            let threads =
+                DummyVcpus::start(slots.len()).map_err(|e| one(Error::generic(e.to_string())))?;
+            let _ = vm.cpus.set(Cpus::new(slots, CpuInfoFastU::Riscv64, Threads::Dummy(threads)));
             return Ok(Running {
                 board: Board::Qtest(Arc::new(Mutex::new(board))),
                 console,
@@ -912,8 +921,26 @@ pub(crate) fn start_board(
         warn_report(w);
     }
     let machine = Arc::new(machine);
+    let threads = Threads::Tcg(Arc::clone(machine.vcpus()));
+    let _ = vm.cpus.set(Cpus::new(slots, CpuInfoFastU::Riscv64, threads));
     set_cpu_hook(vm, &machine, net);
     Ok(Running { board: Board::Tcg(machine), console, _attachments: attachments })
+}
+
+/// The harts of virt as `query-cpus-fast` lists them, the children of the one hart array
+/// with the props `riscv_numa_possible_cpu_arch_ids()` gives.
+fn hart_slots(opts: &BoardOptions, cpu: Option<&str>) -> Vec<CpuSlot> {
+    let name = cpu.unwrap_or("rv64").split(',').next().unwrap_or_default();
+    let qom_type = format!("{name}-riscv-cpu");
+    let threads = opts.threads.max(1);
+    let cores = opts.max_cpus.max(1) / threads;
+    (0..opts.cpus)
+        .map(|n| CpuSlot {
+            qom_path: format!("/machine/soc0/harts[{n}]"),
+            qom_type: qom_type.clone(),
+            props: topology_props(n, 1, cores, threads),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -926,8 +953,10 @@ mod tests {
 
     #[test]
     fn smp_topologies() {
-        assert_eq!(parse_smp(&SMPConfiguration::default()).unwrap(), (1, 1));
-        assert_eq!(parse_smp(&smp(Some(4), None, None)).unwrap(), (4, 4));
+        assert_eq!(parse_smp(&SMPConfiguration::default()).unwrap(), (1, 1, 1));
+        assert_eq!(parse_smp(&smp(Some(4), None, None)).unwrap(), (4, 4, 1));
+        let threads = SMPConfiguration { cpus: Some(2), threads: Some(2), ..smp(None, None, None) };
+        assert_eq!(parse_smp(&threads).unwrap(), (2, 2, 2));
         let e = parse_smp(&smp(Some(3), None, Some(2))).unwrap_err();
         assert_eq!(
             e.message(),

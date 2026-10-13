@@ -22,7 +22,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::ThreadId;
 
@@ -297,6 +297,8 @@ pub struct CpuShared {
     work: Mutex<VecDeque<WorkItem>>,
     pub(crate) halt: Arc<(Mutex<()>, Condvar)>,
     pub(crate) thread: Mutex<Option<ThreadId>>,
+    /// `thread_id`: the host id of the thread the vCPU runs on, 0 until it started.
+    pub(crate) thread_id: AtomicI64,
     pub(crate) tlb: Mutex<CpuTlb>,
     /// The part of `tlb` generated code reads.
     pub(crate) fast_tlb: Arc<ruvm_jit_interp::FastTlb>,
@@ -338,6 +340,7 @@ impl CpuShared {
             work: Mutex::new(VecDeque::new()),
             halt,
             thread: Mutex::new(None),
+            thread_id: AtomicI64::new(0),
             fast_tlb: Arc::clone(tlb.fast()),
             tlb: Mutex::new(tlb),
             jc_pending: Mutex::new(JcPending::default()),
@@ -363,6 +366,12 @@ impl CpuShared {
     /// `cpu_reset_interrupt()`.
     pub fn reset_interrupt(&self, mask: u32) {
         self.interrupt_request.fetch_and(!mask, Ordering::AcqRel);
+    }
+
+    /// `thread_id`, what `query-cpus-fast` reports: the host id of the vCPU thread, from
+    /// `qemu_get_thread_id()`. All the vCPUs of the round robin thread give its id.
+    pub fn thread_id(&self) -> i64 {
+        self.thread_id.load(Ordering::Acquire)
     }
 
     /// `qemu_cpu_is_self()`.

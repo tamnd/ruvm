@@ -870,6 +870,26 @@ fn mttcg_step_atomic_under_contention() {
     }
 }
 
+/// Each vCPU has the host id of its thread once start_vcpus() returns, and in round robin
+/// mode they all have the id of the one thread, as `query-cpus-fast` shows in QEMU.
+#[test]
+fn vcpu_thread_ids() {
+    for mttcg in [true, false] {
+        let w = world(JitConfig { mttcg, ..JitConfig::default() });
+        atomic_counter_program(&w, 1);
+        let vcpus: Vec<Vcpu> = (0..3).map(|_| w.vcpu(0x1000)).collect();
+        let threads = start_vcpus(&w.jit, vcpus);
+        let ids: Vec<i64> = threads.cpus().iter().map(|c| c.thread_id()).collect();
+        assert!(ids.iter().all(|&id| id > 0), "{ids:?}");
+        if cfg!(target_os = "linux") {
+            let distinct = ids.iter().collect::<std::collections::HashSet<_>>().len();
+            assert_eq!(distinct, if mttcg { 3 } else { 1 }, "{ids:?}");
+        }
+        assert!(threads.wait_all_stopped(Duration::from_secs(60)));
+        drop(threads.stop_and_join());
+    }
+}
+
 /// Several vCPUs add `1 << 16` to the word at 0x5000 with an atomic fetch-and-add while
 /// another stores to its low half with plain 16-bit stores, as a spinlock's owner releases the
 /// lock byte while other vCPUs queue on the same word. The atomics must not undo a plain store

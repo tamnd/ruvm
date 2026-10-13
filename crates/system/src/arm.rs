@@ -56,6 +56,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use ruvm_accel::tcg::TcgOptions;
+use ruvm_accel_qtest::DummyVcpus;
 use ruvm_base::report::{Location, warn_report};
 use ruvm_base::{ClockType, Error, Result};
 use ruvm_chardev::{Attachment, Chardev, Chardevs, Connection, Frontend};
@@ -76,7 +77,8 @@ use ruvm_mem::AddressSpace;
 use ruvm_qapi::events::event_reset;
 use ruvm_qapi::opts::{QemuOptDesc, QemuOptType, QemuOptsList};
 use ruvm_qapi::types::{
-    MachineInfo, MemorySizeConfiguration, ResetArg, RunState, SMPConfiguration, ShutdownCause,
+    CpuInfoFastU, CpuInstanceProperties, MachineInfo, MemorySizeConfiguration, ResetArg, RunState,
+    SMPConfiguration, ShutdownCause,
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor};
 use ruvm_qapi::{QDict, QValue};
@@ -84,6 +86,7 @@ use ruvm_qom::Registry;
 use ruvm_target_arm::cpu::{ARM_MAX_VQ, ArmCpuModel, PauthAlg};
 use ruvm_target_arm::tcg::SemihostingHost;
 
+use crate::cpus::{CpuSlot, Cpus, Threads, topology_props};
 use crate::drives::Drives;
 use crate::net::{NetOption, Network, init_clients};
 use crate::runstate::{MachineReset, Runstate};
@@ -1204,6 +1207,7 @@ pub(crate) fn start_board_tcg(
         dumpdtb(path, board.fdt().as_bytes())?;
     }
 
+    let slots = virt_cpu_slots(&board);
     let cfg = VirtRunConfig { no_reboot: args.no_reboot, tcg, backend: None };
     let (machine, warnings) = VirtTcgMachine::new(board, clocks, &cfg, event_handler(vm))
         .map_err(|e| one(Error::generic(e)))?;
@@ -1211,6 +1215,8 @@ pub(crate) fn start_board_tcg(
         warn_report(w);
     }
     let machine = Arc::new(machine);
+    let threads = Threads::Tcg(Arc::clone(machine.vcpus()));
+    let _ = vm.cpus.set(Cpus::new(slots, CpuInfoFastU::Aarch64, threads));
     set_cpu_hook(vm, &machine, net);
     Ok(Running { machine: Machine::Virt(machine), console, _attachments: attachments })
 }
@@ -1237,11 +1243,28 @@ pub(crate) fn start_board_qtest(
     }
     // With no vCPUs only the netdevs follow the run state.
     vm.runstate.set_cpu_hook(Some(Arc::new(move |run| net.vm_state_change(run))));
+    let threads = DummyVcpus::start(board.smp()).map_err(|e| one(Error::generic(e.to_string())))?;
+    let slots = virt_cpu_slots(&board);
+    let _ = vm.cpus.set(Cpus::new(slots, CpuInfoFastU::Aarch64, Threads::Dummy(threads)));
     Ok(Running {
         machine: Machine::Qtest(Arc::new(Mutex::new(board))),
         console,
         _attachments: attachments,
     })
+}
+
+/// The CPUs of virt as `query-cpus-fast` lists them, with the props
+/// `virt_possible_cpu_arch_ids()` gives.
+fn virt_cpu_slots(board: &VirtMachine) -> Vec<CpuSlot> {
+    let topo = board.topology();
+    let qom_type = format!("{}-arm-cpu", board.cpu_model().name);
+    (0..board.smp() as u32)
+        .map(|n| CpuSlot {
+            qom_path: format!("/machine/unattached/device[{n}]"),
+            qom_type: qom_type.clone(),
+            props: topology_props(n, topo.clusters, topo.cores, topo.threads),
+        })
+        .collect()
 }
 
 /// The virt board built from the command line, before `qemu_machine_creation_done()`.
@@ -1445,6 +1468,15 @@ fn start_sbsa_ref_tcg(
         dumpdtb(path, board.fdt().as_bytes())?;
     }
 
+    // sbsa_ref_possible_cpu_arch_ids() gives each CPU only a thread-id, its index.
+    let qom_type = format!("{}-arm-cpu", board.cpu_model().name);
+    let slots: Vec<CpuSlot> = (0..board.smp() as i64)
+        .map(|n| CpuSlot {
+            qom_path: format!("/machine/unattached/device[{n}]"),
+            qom_type: qom_type.clone(),
+            props: CpuInstanceProperties { thread_id: Some(n), ..Default::default() },
+        })
+        .collect();
     let cfg = VirtRunConfig { no_reboot: args.no_reboot, tcg, backend: None };
     let (machine, warnings) =
         SbsaRefTcgMachine::new(board, vec![clock, rtc_clock], &cfg, event_handler(vm))
@@ -1453,6 +1485,8 @@ fn start_sbsa_ref_tcg(
         warn_report(w);
     }
     let machine = Arc::new(machine);
+    let threads = Threads::Tcg(Arc::clone(machine.vcpus()));
+    let _ = vm.cpus.set(Cpus::new(slots, CpuInfoFastU::Aarch64, threads));
     set_cpu_hook(vm, &machine, net);
     Ok(Running { machine: Machine::SbsaRef(machine), console: None, _attachments: attachments })
 }

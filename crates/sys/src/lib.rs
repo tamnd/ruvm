@@ -4,9 +4,9 @@
 //!
 //! So far this holds the termination signal handler in [`signal`], host memory for guest RAM
 //! in [`hostmem`], host atomic operations on it in [`hostatomic`], the host's cycle counter in
-//! [`hostticks`], the direct I/O flag in [`directio`] and, on Linux, the userfaultfd postcopy
-//! migration uses in `userfaultfd` and the KVM dirty ring in `kvm`. The plan for the rest is in
-//! `spec/24-workspace-layout.md`.
+//! [`hostticks`], the direct I/O flag in [`directio`], the host thread id of a vCPU in
+//! [`thread`] and, on Linux, the userfaultfd postcopy migration uses in `userfaultfd` and the
+//! KVM dirty ring in `kvm`. The plan for the rest is in `spec/24-workspace-layout.md`.
 
 pub mod directio;
 pub mod hostatomic;
@@ -16,6 +16,7 @@ pub mod hostticks;
 pub mod kvm;
 #[cfg(unix)]
 pub mod signal;
+pub mod thread;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod userfaultfd;
 

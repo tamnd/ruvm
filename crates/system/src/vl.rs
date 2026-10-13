@@ -125,6 +125,8 @@ pub struct Vm {
     pub(crate) network: OnceLock<Arc<Network>>,
     /// The `-drive` images by id, on a machine that keeps them.
     pub(crate) drives: OnceLock<Drives>,
+    /// The CPUs `query-cpus-fast` lists, on a board that has them listed.
+    pub(crate) cpus: OnceLock<crate::cpus::Cpus>,
     machine_initialized: AtomicBool,
     /// `qtest_driver()`: a test drives the machine over `-qtest`.
     qtest: bool,
@@ -1117,6 +1119,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         accel: OnceLock::new(),
         network: OnceLock::new(),
         drives: OnceLock::new(),
+        cpus: OnceLock::new(),
         machine_initialized: AtomicBool::new(false),
         qtest: cfg.qtest.is_some(),
     });
