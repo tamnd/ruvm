@@ -11,13 +11,18 @@
 //! What is there: legacy mode translation with second stage page tables, pass-through and
 //! device-IOTLB context entries, the fault recording register with its fault event interrupt,
 //! the context cache and the IOTLB with register based and queued invalidation, and the
-//! invalidation wait descriptor with its completion interrupt. Interrupt remapping takes the
-//! MSIs of the PCI devices and the IOAPIC through [`IntelIommu::remap_msi`], with the
-//! remapping table, its source ID checks and its faults.
+//! invalidation wait descriptor with its completion interrupt. Scalable mode reads the PASID
+//! directory and table for PASID 0 and walks second stage tables, or first stage tables with
+//! `fsts=on`, setting their accessed and dirty bits, and has the PASID based IOTLB
+//! invalidation. Interrupt remapping takes the MSIs of the PCI devices and the IOAPIC through
+//! [`IntelIommu::remap_msi`], with the remapping table, its source ID checks and its faults.
 //!
 //! # Differences from QEMU
 //!
-//! - Scalable mode is not there yet, and `scalable-mode=on` is an error after QEMU's own checks.
+//! - Only requests without a PASID are translated. QEMU also gives PASID capable devices an
+//!   address space per PASID, and with `svm=on` takes ATS translation requests and page
+//!   requests into its page request queue. ruvm has the page request registers but never
+//!   queues a request.
 //! - There are no IOMMU notifiers and no replay, so nothing like vhost or VFIO can sit behind
 //!   the IOMMU, and `caching-mode` only sets the capability bit.
 //! - DMA to the interrupt range, 0xfee00000 to 0xfeefffff, is not translated. QEMU puts its
@@ -79,6 +84,14 @@ const DMAR_IEADDR_REG: u64 = 0xa8;
 const DMAR_IEUADDR_REG: u64 = 0xac;
 const DMAR_IRTA_REG: u64 = 0xb8;
 const DMAR_IRTA_REG_HI: u64 = 0xbc;
+const DMAR_PQH_REG: u64 = 0xc0;
+const DMAR_PQT_REG: u64 = 0xc8;
+const DMAR_PQA_REG: u64 = 0xd0;
+const DMAR_PRS_REG: u64 = 0xdc;
+const DMAR_PECTL_REG: u64 = 0xe0;
+const DMAR_PEDATA_REG: u64 = 0xe4;
+const DMAR_PEADDR_REG: u64 = 0xe8;
+const DMAR_PEUADDR_REG: u64 = 0xec;
 const DMAR_IVA_REG: u64 = 0xf0;
 const DMAR_IVA_REG_HI: u64 = 0xf4;
 const DMAR_IOTLB_REG: u64 = 0xf8;
@@ -128,6 +141,10 @@ const IQT_QT_256_RSV_BIT: u64 = 0x10;
 const ICS_IWC: u32 = 1;
 const IECTL_IM: u32 = 1 << 31;
 const IECTL_IP: u32 = 1 << 30;
+const PR_STATUS_PPR: u32 = 1;
+const PR_STATUS_PRO: u32 = 1 << 1;
+const PR_PECTL_IP: u32 = 1 << 30;
+const PR_PECTL_IM: u32 = 1 << 31;
 const FSTS_PFO: u32 = 1;
 const FSTS_PPF: u32 = 1 << 1;
 const FSTS_IQE: u32 = 1 << 4;
@@ -194,6 +211,21 @@ const CONTEXT_TT_DEV_IOTLB: u64 = 1 << 2;
 const CONTEXT_TT_PASS_THROUGH: u64 = 2 << 2;
 const CONTEXT_ENTRY_RSVD_HI: u64 = 0xffff_ffff_ff00_0080;
 
+const PASID_DIR_P: u64 = 1;
+const PASID_DIR_FPD: u64 = 1 << 1;
+const PASID_ENTRY_P: u64 = 1;
+const PASID_ENTRY_FPD: u64 = 1 << 1;
+/// The PASID granular translation types, `VTD_SM_PASID_ENTRY_FST` and the rest.
+const PGTT_FST: u8 = 1;
+const PGTT_SST: u8 = 2;
+const PGTT_PT: u8 = 4;
+const FS_P: u64 = 1;
+const FS_RW: u64 = 1 << 1;
+const FS_US: u64 = 1 << 2;
+const FS_A: u64 = 1 << 5;
+const FS_D: u64 = 1 << 6;
+const FS_UPPER_IGNORED: u64 = 0xfff0_0000_0000_0000;
+
 const INV_DESC_CC: u8 = 0x1;
 const INV_DESC_IOTLB: u8 = 0x2;
 const INV_DESC_DEVICE: u8 = 0x3;
@@ -229,7 +261,20 @@ const FR_IR_ENTRY_P: u8 = 0x22;
 const FR_IR_ROOT_INVAL: u8 = 0x23;
 const FR_IR_IRTE_RSVD: u8 = 0x24;
 const FR_IR_SID_ERR: u8 = 0x26;
+const FR_PASID_DIR_ACCESS_ERR: u8 = 0x50;
+const FR_PASID_DIR_ENTRY_P: u8 = 0x51;
+const FR_PASID_TABLE_ACCESS_ERR: u8 = 0x58;
+const FR_PASID_ENTRY_P: u8 = 0x59;
+const FR_PASID_TABLE_ENTRY_INV: u8 = 0x5b;
+const FR_FS_PAGING_ENTRY_INV: u8 = 0x70;
+const FR_FS_PAGING_ENTRY_P: u8 = 0x71;
+const FR_FS_PAGING_ENTRY_RSVD: u8 = 0x72;
+const FR_PASID_ENTRY_FSPTPTR_INV: u8 = 0x73;
+const FR_FS_NON_CANONICAL: u8 = 0x80;
+const FR_FS_PAGING_ENTRY_US: u8 = 0x81;
+const FR_SM_WRITE: u8 = 0x85;
 const FR_SM_INTERRUPT_ADDR: u8 = 0x87;
+const FR_FS_BIT_UPDATE_FAILED: u8 = 0x91;
 
 /// `vtd_qualified_faults[]`: the faults that the FPD bit suppresses.
 fn qualified_fault(fault: u8) -> bool {
@@ -394,9 +439,6 @@ impl IntelIommuConf {
                 return Err("Need to set PASID support for svm".into());
             }
         }
-        if c.scalable_mode {
-            return Err("ruvm's intel-iommu has no scalable mode yet".into());
-        }
         c.intremap = if ir { OnOffAuto::On } else { OnOffAuto::Off };
         Ok(c)
     }
@@ -490,6 +532,8 @@ struct IotlbEntry {
     pte: u64,
     access_flags: u8,
     mask: u64,
+    /// The PGTT the entry came from, second stage for legacy mode.
+    pgtt: u8,
 }
 
 /// `IOMMU_RO` and `IOMMU_WO` as bits.
@@ -509,8 +553,8 @@ struct Xlate {
 enum Walked {
     /// Pass-through: the address untranslated, 4K at a time.
     PassThrough,
-    /// The leaf entry, its level, the access it allows and the domain.
-    Page { pte: u64, level: u32, flags: u8, did: u16 },
+    /// The leaf entry, its level, the access it allows, the domain and the PGTT.
+    Page { pte: u64, level: u32, flags: u8, did: u16, pgtt: u8 },
     /// A fault, recorded already, with the mask of the entry to give.
     Fault { mask: u64 },
 }
@@ -545,6 +589,8 @@ struct State {
     context_cache: HashMap<u16, (u32, ContextEntry)>,
     spte_rsvd: [u64; 5],
     spte_rsvd_large: [u64; 5],
+    fpte_rsvd: [u64; 5],
+    fpte_rsvd_large: [u64; 5],
     /// MSIs to send once the lock is dropped, as (address, data).
     msis: Vec<(u64, u32)>,
 }
@@ -598,6 +644,8 @@ impl State {
             context_cache: HashMap::new(),
             spte_rsvd: [0; 5],
             spte_rsvd_large: [0; 5],
+            fpte_rsvd: [0; 5],
+            fpte_rsvd_large: [0; 5],
             msis: Vec::new(),
         };
         s.init();
@@ -757,6 +805,9 @@ impl State {
             self.spte_rsvd_large[2] &= !SPTE_SNP;
             self.spte_rsvd_large[3] &= !SPTE_SNP;
         }
+        let fs = !(haw | FS_UPPER_IGNORED);
+        self.fpte_rsvd = [!0, fs, fs, fs, 0x80 | fs];
+        self.fpte_rsvd_large = [0, 0, 0x1f_e000 | fs, 0x3fff_e000 | fs, 0];
         if self.conf.svm {
             self.ecap |= ECAP_PRS | ECAP_PDS | ECAP_NWFS;
         }
@@ -791,6 +842,16 @@ impl State {
         self.define_quad(DMAR_FRCD_REG_0_0, 0, 0, 0);
         self.define_quad(DMAR_FRCD_REG_0_2, 0, 0, 0x8000_0000_0000_0000);
         self.define_quad(DMAR_IRTA_REG, 0, 0xffff_ffff_ffff_f80f, 0);
+        if self.ecap & ECAP_PRS != 0 {
+            self.define_quad(DMAR_PQH_REG, 0, 0x7ffe0, 0);
+            self.define_quad(DMAR_PQT_REG, 0, 0x7ffe0, 0);
+            self.define_quad(DMAR_PQA_REG, 0, 0xffff_ffff_ffff_f007, 0);
+            self.define_long(DMAR_PRS_REG, 0, 0, 0x3);
+            self.define_long(DMAR_PECTL_REG, 0, 0x8000_0000, 0);
+            self.define_long(DMAR_PEDATA_REG, 0, 0xffff, 0);
+            self.define_long(DMAR_PEADDR_REG, 0, 0xffff_fffc, 0);
+            self.define_long(DMAR_PEUADDR_REG, 0, 0xffff_ffff, 0);
+        }
     }
 
     /// `vtd_reset_caches()`: the context cache and the IOTLB.
@@ -1074,8 +1135,100 @@ impl State {
             if !ok {
                 return Err((FR_CONTEXT_ENTRY_INV, ce[0]));
             }
+        } else {
+            // vtd_ce_pasid_0_check(): a present scalable mode context entry needs a good
+            // PASID entry for requests without a PASID.
+            self.ce_get_pasid_entry(m, &ce, 0).map_err(|fr| (fr, ce[0]))?;
         }
         Ok(ce)
+    }
+
+    /// `vtd_pe_type_check()`. Nested translation is not supported, as in QEMU.
+    fn pe_type_check(&self, pe: &PasidEntry) -> bool {
+        match pe_pgtt(pe) {
+            PGTT_FST => self.ecap & ECAP_FSTS != 0,
+            PGTT_SST => self.ecap & ECAP_SSTS != 0,
+            PGTT_PT => self.ecap & ECAP_PT != 0,
+            _ => false,
+        }
+    }
+
+    /// `vtd_get_pe_in_pasid_leaf_table()`, without a present check.
+    fn pe_in_leaf_table(&self, m: &Dma<'_>, pasid: u32, table: u64) -> Result<PasidEntry, u8> {
+        let addr = table + u64::from(pasid & 0x3f) * 64;
+        let pe = m.read_quads::<8>(addr).ok_or(FR_PASID_TABLE_ACCESS_ERR)?;
+        if !self.pe_type_check(&pe) {
+            return Err(FR_PASID_TABLE_ENTRY_INV);
+        }
+        let ok = match pe_pgtt(&pe) {
+            PGTT_SST => self.ss_level_supported(pe_ss_level(&pe)),
+            PGTT_FST => pe_fs_level(&pe) == 4,
+            _ => true,
+        };
+        if !ok {
+            return Err(FR_PASID_TABLE_ENTRY_INV);
+        }
+        Ok(pe)
+    }
+
+    /// `vtd_ce_get_pasid_entry()`: the present PASID entry of `pasid`.
+    fn ce_get_pasid_entry(
+        &self,
+        m: &Dma<'_>,
+        ce: &ContextEntry,
+        pasid: u32,
+    ) -> Result<PasidEntry, u8> {
+        let pdire = pdire_get(m, ce, pasid)?;
+        if pdire & PASID_DIR_P == 0 {
+            return Err(FR_PASID_DIR_ENTRY_P);
+        }
+        let pe = self.pe_in_leaf_table(m, pasid, pdire & !0xfff)?;
+        if pe[0] & PASID_ENTRY_P == 0 {
+            return Err(FR_PASID_ENTRY_P);
+        }
+        Ok(pe)
+    }
+
+    /// `vtd_ce_get_pasid_fpd()`. The FPD bits count even where the present bits are clear.
+    fn ce_get_pasid_fpd(&self, m: &Dma<'_>, ce: &ContextEntry, pasid: u32) -> Result<bool, u8> {
+        let pdire = pdire_get(m, ce, pasid)?;
+        if pdire & PASID_DIR_FPD != 0 {
+            return Ok(true);
+        }
+        if pdire & PASID_DIR_P == 0 {
+            return Err(FR_PASID_DIR_ENTRY_P);
+        }
+        let pe = self.pe_in_leaf_table(m, pasid, pdire & !0xfff)?;
+        Ok(pe[0] & PASID_ENTRY_FPD != 0)
+    }
+
+    /// What `vtd_get_iova_level()`, `vtd_get_iova_agaw()`, `vtd_get_iova_pgtbl_base()` and
+    /// `vtd_get_domain_id()` give for PASID 0. Like QEMU they do not look at whether the PASID
+    /// entry could be read; a failed read here counts as an entry of zeroes.
+    fn stage(&self, m: &Dma<'_>, ce: &ContextEntry) -> Stage {
+        if !self.root_scalable {
+            return Stage {
+                level: ce_level(ce),
+                agaw: ce_agaw(ce),
+                base: ce[0] & !0xfff,
+                did: ((ce[1] >> 8) & 0xffff) as u16,
+            };
+        }
+        let pe = self.ce_get_pasid_entry(m, ce, 0).unwrap_or([0; 8]);
+        let (level, base) = if self.conf.fsts {
+            (pe_fs_level(&pe), pe[2] & !0xfff)
+        } else {
+            (pe_ss_level(&pe), pe[0] & !0xfff)
+        };
+        Stage { level, agaw: 30 + ((pe[0] >> 2) & 7) as u32 * 9, base, did: pe[1] as u16 }
+    }
+
+    /// `vtd_dev_pt_enabled()` for PASID 0.
+    fn dev_pt_enabled(&self, m: &Dma<'_>, ce: &ContextEntry) -> bool {
+        if self.root_scalable {
+            return self.ce_get_pasid_entry(m, ce, 0).is_ok_and(|pe| pe_pgtt(&pe) == PGTT_PT);
+        }
+        ce[0] & CONTEXT_ENTRY_TT == CONTEXT_TT_PASS_THROUGH
     }
 
     /// `vtd_is_ss_level_supported()`.
@@ -1099,19 +1252,19 @@ impl State {
     fn iova_to_sspte(
         &self,
         m: &Dma<'_>,
-        ce: &ContextEntry,
+        st: &Stage,
         iova: u64,
         is_write: bool,
     ) -> Result<(u64, u32, bool, bool), u8> {
         let aw = self.conf.aw_bits;
-        let top = ce_level(ce);
-        let limit = 1u64 << ce_agaw(ce).min(u32::from(aw));
+        let top = st.level;
+        let limit = 1u64 << st.agaw.min(u32::from(aw));
         if iova & !(limit - 1) != 0 {
             return Err(FR_ADDR_BEYOND_MGAW);
         }
         let check = if is_write { 2 } else { 1 };
         let (mut reads, mut writes) = (true, true);
-        let mut addr = ce[0] & !0xfff;
+        let mut addr = st.base;
         let mut level = top;
         loop {
             let offset = (iova >> level_shift(level)) & 0x1ff;
@@ -1129,6 +1282,74 @@ impl State {
             }
             if level == 1 || pte & PT_PAGE_SIZE_MASK != 0 {
                 return Ok((pte, level, reads, writes));
+            }
+            addr = pte & !0xfff & haw_mask(aw);
+            level -= 1;
+        }
+    }
+
+    /// `vtd_fspte_nonzero_rsvd()`.
+    fn fspte_nonzero_rsvd(&self, pte: u64, level: u32) -> bool {
+        let l = level as usize;
+        let mask = if (l == 2 || l == 3) && pte & PT_PAGE_SIZE_MASK != 0 {
+            self.fpte_rsvd_large[l]
+        } else {
+            self.fpte_rsvd.get(l).copied().unwrap_or(!0)
+        };
+        pte & mask != 0
+    }
+
+    /// `vtd_iova_to_fspte()`: the leaf entry with its level and the access the walk allows,
+    /// or the fault with the level the walk was at. The accessed bit is set on the way down,
+    /// and the dirty bit on the leaf of a write, each only when neither bit is set yet, which
+    /// is what `vtd_set_flag_in_pte()` does.
+    fn iova_to_fspte(
+        &self,
+        m: &Dma<'_>,
+        st: &Stage,
+        iova: u64,
+        is_write: bool,
+    ) -> Result<(u64, u32, bool, bool), (u8, u32)> {
+        let aw = self.conf.aw_bits;
+        let top = st.level;
+        let limit = 1u64 << st.agaw.min(u32::from(aw));
+        let upper_mask = !(limit - 1);
+        let upper = iova & upper_mask;
+        let canonical = if iova & (limit >> 1) != 0 { upper == upper_mask } else { upper == 0 };
+        if !canonical {
+            return Err((FR_FS_NON_CANONICAL, top));
+        }
+        let mut writes = true;
+        let mut addr = st.base;
+        let mut level = top;
+        loop {
+            let offset = (iova >> level_shift(level)) & 0x1ff;
+            let pte = m.pte(addr, offset);
+            if pte == u64::MAX {
+                let fr =
+                    if level == top { FR_PASID_ENTRY_FSPTPTR_INV } else { FR_FS_PAGING_ENTRY_INV };
+                return Err((fr, level));
+            }
+            if pte & FS_P == 0 {
+                return Err((FR_FS_PAGING_ENTRY_P, level));
+            }
+            if pte & FS_US == 0 {
+                return Err((FR_FS_PAGING_ENTRY_US, level));
+            }
+            writes &= pte & FS_RW != 0;
+            if is_write && pte & FS_RW == 0 {
+                return Err((FR_SM_WRITE, level));
+            }
+            if self.fspte_nonzero_rsvd(pte, level) {
+                return Err((FR_FS_PAGING_ENTRY_RSVD, level));
+            }
+            let last = level == 1 || pte & PT_PAGE_SIZE_MASK != 0;
+            let flag = if last && is_write { FS_A | FS_D } else { FS_A };
+            if pte & flag == 0 && !m.write(addr + offset * 8, &(pte | flag).to_le_bytes()) {
+                return Err((FR_FS_BIT_UPDATE_FAILED, level));
+            }
+            if last {
+                return Ok((pte, level, true, writes));
             }
             addr = pte & !0xfff & haw_mask(aw);
             level -= 1;
@@ -1154,6 +1375,7 @@ impl State {
         access_flags: u8,
         level: u32,
         pasid: u32,
+        pgtt: u8,
     ) {
         let gfn = (addr & level_page_mask(level)) >> 12;
         if self.iotlb.len() >= IOTLB_MAX_SIZE {
@@ -1162,7 +1384,7 @@ impl State {
         let mask = level_page_mask(level);
         self.iotlb.insert(
             IotlbKey { gfn, sid, level, pasid },
-            IotlbEntry { gfn, domain_id, pte, access_flags, mask },
+            IotlbEntry { gfn, domain_id, pte, access_flags, mask, pgtt },
         );
     }
 
@@ -1178,8 +1400,8 @@ impl State {
                 Walked::Fault { mask } => {
                     return Xlate { iova: 0, translated: 0, mask, perm: 0 };
                 }
-                Walked::Page { pte, level, flags, did } => {
-                    self.update_iotlb(sid, did, addr, pte, flags, level, 0);
+                Walked::Page { pte, level, flags, did, pgtt } => {
+                    self.update_iotlb(sid, did, addr, pte, flags, level, 0, pgtt);
                     (pte, flags, level_page_mask(level))
                 }
             },
@@ -1195,22 +1417,44 @@ impl State {
             s.report_fault(fr, fpd, sid, addr, is_write, false, 0);
             Walked::Fault { mask: !PAGE_MASK_4K }
         };
-        let ce = match self.context_cache.get(&sid) {
-            Some(&(generation, ce)) if generation == self.context_cache_gen => ce,
-            _ => match self.dev_to_context_entry(m, (sid >> 8) as u8, sid as u8) {
-                Ok(ce) => {
-                    self.context_cache.insert(sid, (self.context_cache_gen, ce));
-                    ce
+        let (ce, fpd) = match self.context_cache.get(&sid) {
+            Some(&(generation, ce)) if generation == self.context_cache_gen => {
+                let mut fpd = ce[0] & CONTEXT_ENTRY_FPD != 0;
+                if !fpd && self.root_scalable {
+                    match self.ce_get_pasid_fpd(m, &ce, 0) {
+                        Ok(f) => fpd = f,
+                        Err(fr) => return fault(self, fr, false),
+                    }
                 }
-                Err((fr, lo)) => return fault(self, fr, lo & CONTEXT_ENTRY_FPD != 0),
-            },
+                (ce, fpd)
+            }
+            _ => {
+                let (ce, mut fpd) = match self.dev_to_context_entry(m, (sid >> 8) as u8, sid as u8)
+                {
+                    Ok(ce) => (ce, ce[0] & CONTEXT_ENTRY_FPD != 0),
+                    Err((fr, lo)) => return fault(self, fr, lo & CONTEXT_ENTRY_FPD != 0),
+                };
+                if !fpd && self.root_scalable {
+                    match self.ce_get_pasid_fpd(m, &ce, 0) {
+                        Ok(f) => fpd = f,
+                        Err(fr) => return fault(self, fr, false),
+                    }
+                }
+                self.context_cache.insert(sid, (self.context_cache_gen, ce));
+                (ce, fpd)
+            }
         };
-        let fpd = ce[0] & CONTEXT_ENTRY_FPD != 0;
-        if ce[0] & CONTEXT_ENTRY_TT == CONTEXT_TT_PASS_THROUGH {
+        if self.dev_pt_enabled(m, &ce) {
             return Walked::PassThrough;
         }
-        match self.iova_to_sspte(m, &ce, addr, is_write) {
-            Ok((pte, level, reads, writes)) => {
+        let st = self.stage(m, &ce);
+        let walked = if self.conf.fsts && self.root_scalable {
+            self.iova_to_fspte(m, &st, addr, is_write).map(|w| (w, PGTT_FST))
+        } else {
+            self.iova_to_sspte(m, &st, addr, is_write).map(|w| (w, PGTT_SST)).map_err(|fr| (fr, 0))
+        };
+        match walked {
+            Ok(((pte, level, reads, writes), pgtt)) => {
                 let xlat = pte & !0xfff & self.haw();
                 let size = 1u64 << level_shift(level);
                 if xlat <= INTERRUPT_ADDR_LAST && xlat + size > INTERRUPT_ADDR_FIRST {
@@ -1223,10 +1467,15 @@ impl State {
                     return Walked::Fault { mask: !level_page_mask(level) };
                 }
                 let flags = (u8::from(reads) * ACCESS_R) | (u8::from(writes) * ACCESS_W);
-                let did = ((ce[1] >> 8) & 0xffff) as u16;
-                Walked::Page { pte, level, flags, did }
+                Walked::Page { pte, level, flags, did: st.did, pgtt }
             }
-            Err(fr) => fault(self, fr, fpd),
+            // The second stage walk leaves the level unset on a fault, the first stage
+            // walk leaves it where the walk stopped.
+            Err((fr, level)) => {
+                self.report_fault(fr, fpd, sid, addr, is_write, false, 0);
+                let mask = if level == 0 { !PAGE_MASK_4K } else { !level_page_mask(level) };
+                Walked::Fault { mask }
+            }
         }
     }
 
@@ -1264,7 +1513,9 @@ impl State {
         let gfn = (addr >> 12) & mask;
         self.iotlb.retain(|_, e| {
             let gfn_tlb = (addr & e.mask) >> 12;
-            !(e.domain_id == domain_id && ((e.gfn & mask) == gfn || e.gfn == gfn_tlb))
+            // First stage entries of the domain all go, as the spec says.
+            !(e.domain_id == domain_id
+                && (e.pgtt == PGTT_FST || (e.gfn & mask) == gfn || e.gfn == gfn_tlb))
         });
     }
 
@@ -1548,7 +1799,8 @@ impl State {
         true
     }
 
-    /// `vtd_process_pasid_desc()`. There is no PASID cache to sync without scalable mode.
+    /// `vtd_process_pasid_desc()`. There is no PASID cache to sync: a translation reads the
+    /// PASID entry each time it walks.
     fn process_pasid_desc(&mut self, d: &[u64; 4]) -> bool {
         let mask = [0xfff0_0000_0000_f1c0, INV_DESC_ALL_ONE, INV_DESC_ALL_ONE, INV_DESC_ALL_ONE];
         if !self.inv_desc_reserved_check(d, mask, true, "vtd_process_pasid_desc", "pasid cache inv")
@@ -1558,17 +1810,37 @@ impl State {
         (d[0] >> 4) & 3 != 2
     }
 
-    /// `vtd_process_piotlb_desc()`. Every IOTLB entry is for PASID 0 without scalable mode.
+    /// `vtd_process_piotlb_desc()`.
     fn process_piotlb_desc(&mut self, d: &[u64; 4]) -> bool {
         let mask = [0xfff0_0000_0000_f1c0, 0xf80, INV_DESC_ALL_ONE, INV_DESC_ALL_ONE];
         if !self.inv_desc_reserved_check(d, mask, true, "vtd_process_piotlb_desc", "piotlb inv") {
             return false;
         }
+        let domain_id = ((d[0] >> 16) & 0xffff) as u16;
+        let pasid = ((d[0] >> 32) & 0xf_ffff) as u32;
         match d[0] & 0x30 {
-            0x20 => true,
-            0x30 => d[1] & 0x3f <= MAMV,
-            _ => false,
+            // vtd_piotlb_pasid_invalidate()
+            0x20 => self.iotlb.retain(|k, e| !(e.domain_id == domain_id && k.pasid == pasid)),
+            // vtd_piotlb_page_invalidate(), which leaves second stage and pass-through entries
+            0x30 => {
+                let am = d[1] & 0x3f;
+                if am > MAMV {
+                    return false;
+                }
+                let addr = d[1] & !0xfff;
+                let mask = !((1u64 << am) - 1);
+                let gfn = (addr >> 12) & mask;
+                self.iotlb.retain(|k, e| {
+                    let gfn_tlb = (addr & e.mask) >> 12;
+                    !(e.pgtt == PGTT_FST
+                        && e.domain_id == domain_id
+                        && k.pasid == pasid
+                        && ((e.gfn & mask) == gfn || e.gfn == gfn_tlb))
+                });
+            }
+            _ => return false,
         }
+        true
     }
 
     /// `vtd_process_wait_desc()`.
@@ -1649,6 +1921,23 @@ impl State {
     }
 
     /// `vtd_handle_iectl_write()`.
+    /// `vtd_handle_prs_write()`.
+    fn handle_prs_write(&mut self) {
+        let prs = self.get_long_raw(DMAR_PRS_REG);
+        if prs & (PR_STATUS_PPR | PR_STATUS_PRO) == 0 {
+            self.set_clear_mask_long(DMAR_PECTL_REG, PR_PECTL_IP, 0);
+        }
+    }
+
+    /// `vtd_handle_pectl_write()`.
+    fn handle_pectl_write(&mut self) {
+        let pectl = self.get_long_raw(DMAR_PECTL_REG);
+        if pectl & PR_PECTL_IP != 0 && pectl & PR_PECTL_IM == 0 {
+            self.set_clear_mask_long(DMAR_PECTL_REG, PR_PECTL_IP, 0);
+            self.generate_interrupt(DMAR_PEADDR_REG, DMAR_PEDATA_REG);
+        }
+    }
+
     fn handle_iectl_write(&mut self) {
         let iectl = self.get_long_raw(DMAR_IECTL_REG);
         if iectl & IECTL_IP != 0 && iectl & IECTL_IM == 0 {
@@ -1668,6 +1957,7 @@ impl State {
             DMAR_RTADDR_REG_HI => self.get_quad_raw(DMAR_RTADDR_REG) >> 32,
             DMAR_IQA_REG => lo32(self.iq | (self.get_quad(DMAR_IQA_REG) & (IQA_QS | IQA_DW_MASK))),
             DMAR_IQA_REG_HI => self.iq >> 32,
+            DMAR_PEUADDR_REG => u64::from(self.get_long_raw(DMAR_PEUADDR_REG)),
             _ if size == 4 => u64::from(self.get_long(addr)),
             _ => self.get_quad(addr),
         }
@@ -1734,6 +2024,14 @@ impl State {
                 self.set_long(addr, long);
                 self.handle_iectl_write();
             }
+            DMAR_PRS_REG => {
+                self.set_long(addr, long);
+                self.handle_prs_write();
+            }
+            DMAR_PECTL_REG => {
+                self.set_long(addr, long);
+                self.handle_pectl_write();
+            }
             DMAR_FRCD_REG_0_2 if size == 4 => self.set_long(addr, long),
             DMAR_FRCD_REG_0_2 => {
                 self.set_quad(addr, val);
@@ -1745,9 +2043,8 @@ impl State {
             }
             DMAR_FEDATA_REG | DMAR_FEUADDR_REG | DMAR_PMEN_REG | DMAR_RTADDR_REG_HI
             | DMAR_IQT_REG_HI | DMAR_IQA_REG_HI | DMAR_IEDATA_REG | DMAR_IEADDR_REG
-            | DMAR_IEUADDR_REG | DMAR_FRCD_REG_0_1 | DMAR_IRTA_REG_HI | DMAR_IVA_REG_HI => {
-                self.set_long(addr, long)
-            }
+            | DMAR_IEUADDR_REG | DMAR_FRCD_REG_0_1 | DMAR_IRTA_REG_HI | DMAR_IVA_REG_HI
+            | DMAR_PEUADDR_REG => self.set_long(addr, long),
             _ => sized(self),
         }
     }
@@ -1761,6 +2058,39 @@ fn ce_level(ce: &ContextEntry) -> u32 {
 /// `vtd_ce_get_agaw()`.
 fn ce_agaw(ce: &ContextEntry) -> u32 {
     30 + (ce[1] & 7) as u32 * 9
+}
+
+/// `VTDPASIDEntry`.
+type PasidEntry = [u64; 8];
+
+/// `VTD_SM_PASID_ENTRY_PGTT()`.
+fn pe_pgtt(pe: &PasidEntry) -> u8 {
+    ((pe[0] >> 6) & 7) as u8
+}
+
+/// `VTD_PE_GET_SS_LEVEL()`.
+fn pe_ss_level(pe: &PasidEntry) -> u32 {
+    2 + ((pe[0] >> 2) & 7) as u32
+}
+
+/// `VTD_PE_GET_FS_LEVEL()`: 4 or 5 level paging.
+fn pe_fs_level(pe: &PasidEntry) -> u32 {
+    4 + ((pe[2] >> 2) & 3) as u32
+}
+
+/// `vtd_get_pdire_from_pdir_table()`: the PASID directory entry of `pasid`, present or not.
+fn pdire_get(m: &Dma<'_>, ce: &ContextEntry, pasid: u32) -> Result<u64, u8> {
+    let addr = (ce[0] & !0xfff) + u64::from((pasid >> 6) & 0x3fff) * 8;
+    m.read_quads::<1>(addr).map(|[q]| q).ok_or(FR_PASID_DIR_ACCESS_ERR)
+}
+
+/// The page table a walk for PASID 0 starts from, with its level, its address width and
+/// the domain its IOTLB entries go to.
+struct Stage {
+    level: u32,
+    agaw: u32,
+    base: u64,
+    did: u16,
 }
 
 thread_local! {
