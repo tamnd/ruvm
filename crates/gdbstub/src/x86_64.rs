@@ -38,16 +38,20 @@ const IDX_ORIG_AX: usize = 66;
 pub(crate) static TARGET: Target = Target {
     name: "x86_64",
     arch: Some("i386:x86-64"),
-    features: &[
-        ("i386-64bit.xml", include_str!("../gdb-xml/i386-64bit.xml")),
-        ("i386-64bit-linux.xml", include_str!("../gdb-xml/i386-64bit-linux.xml")),
-    ],
+    features,
     g_regs: 66,
     abi_digits: 16,
     read,
     write,
     set_pc,
 };
+
+fn features(_: &mut Cx<'_, '_>) -> Vec<(&'static str, String)> {
+    vec![
+        ("i386-64bit.xml", include_str!("../gdb-xml/i386-64bit.xml").to_string()),
+        ("i386-64bit-linux.xml", include_str!("../gdb-xml/i386-64bit-linux.xml").to_string()),
+    ]
+}
 
 fn cs64(env: &[u8]) -> bool {
     ld32(env, HFLAGS) & HF_CS64_MASK != 0

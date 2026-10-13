@@ -1355,6 +1355,11 @@ pub fn vfp_get_fpsr(st: &CpuArmState) -> u32 {
     vfp::get_fpsr(st)
 }
 
+/// `vfp_get_fpcr()`: FPCR as an MRS reads it.
+pub fn vfp_get_fpcr(st: &CpuArmState) -> u32 {
+    vfp::get_fpcr(st)
+}
+
 /// `vfp_set_fpsr()`: write FPSR as an MSR does.
 pub fn vfp_set_fpsr(st: &mut CpuArmState, val: u32) {
     vfp::set_fpsr(st, val);

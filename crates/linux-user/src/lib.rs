@@ -35,8 +35,9 @@
 //! - Guest loads and stores are host accesses at `guest_base`, as in QEMU, rather than lookups
 //!   in the softmmu TLB.
 //! - The vsyscall page is not emulated, `-t`, `-trace` and `-plugin` are not supported yet,
-//!   and `-g` is for x86_64 programs only. With `-g`, the registers of a thread other than the
-//!   stopped one are those it last left, and do not take writes. `/proc/self` is the host's
+//!   and `-g` is for x86_64, aarch64 and riscv64 programs. With `-g`, the registers of a thread
+//!   other than the stopped one are those it last left, and do not take writes; aarch64 has no
+//!   `org.qemu.gdb.arm.sys.regs` feature. `/proc/self` is the host's
 //!   except for `exe`, `maps`, `smaps`, `stat`, `auxv` and `cmdline`, which describe the guest
 //!   as QEMU's do.
 //! - On aarch64 there are no MTE tag storage, no SVE or SME `prctl()`s and no ZA, ZT, GCS or

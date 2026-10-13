@@ -14,7 +14,10 @@ publish = false
 unsafe-budget = 0
 
 [dependencies]
+ruvm-jit.workspace = true
 ruvm-linux-user.workspace = true
+ruvm-target-arm.workspace = true
+ruvm-target-riscv.workspace = true
 ruvm-target-x86.workspace = true
 
 [lints]
