@@ -1219,11 +1219,10 @@ fn plan_amd_iommu(
 /// the devices planned so far. None of them can be an `AMDVI-PCI`, as ruvm does not take that
 /// device.
 fn amd_iommu_pci_id(p: &Plan, id: &str) -> String {
-    let id = Some(id);
-    let found = p.virtio.iter().any(|v| v.transport == Transport::Pci && v.id.as_deref() == id)
-        || p.display.iter().any(|(_, d)| d.id.as_deref() == id)
-        || p.audio.iter().any(|(_, _, a)| a.id.as_deref() == id);
-    let id = id.unwrap_or_default();
+    let is = |plug: &Option<String>| plug.as_deref() == Some(id);
+    let found = p.virtio.iter().any(|v| v.transport == Transport::Pci && is(&v.id))
+        || p.display.iter().any(|(_, d)| is(&d.id))
+        || p.audio.iter().any(|(_, _, a)| is(&a.id));
     if found {
         format!("Device '{id}' must be an {TYPE_AMD_IOMMU_PCI} device type")
     } else {
