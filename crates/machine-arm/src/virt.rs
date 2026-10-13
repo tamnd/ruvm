@@ -141,7 +141,7 @@ use ruvm_hw_virtio::{VirtioBackend, VirtioDeviceClass, VirtioMmio, VirtioPci, Vi
 use ruvm_jit::{Cpu, CpuShared, Jit, Vcpu};
 use ruvm_mem::{
     AccessConstraints, AccessCtx, AccessSize, AddressSpace, Endian, MemResult, MemTxAttrs,
-    MemorySystem, MmioOps, RegionId, RegionType,
+    MemorySystem, MmioOps, RamBlock, RegionId, RegionType,
 };
 use ruvm_target_arm::cpu::{ArmCpuModel, CpuArmState};
 use ruvm_target_arm::tcg::{Arm, PsciConduit, SemihostingHost, TagMemory, create_vcpu};
@@ -375,6 +375,9 @@ pub struct VirtConfig {
     pub max_cpus: Option<usize>,
     /// The RAM size in bytes.
     pub ram_size: u64,
+    /// `memory-backend`: the RAM of the memory backend that is the guest's main memory, which
+    /// is `ram_size` bytes long.
+    pub memdev: Option<Arc<RamBlock>>,
     /// `-kernel`.
     pub kernel: Option<String>,
     /// `-initrd`.
@@ -459,6 +462,7 @@ impl fmt::Debug for VirtConfig {
             .field("smp", &self.smp)
             .field("max_cpus", &self.max_cpus)
             .field("ram_size", &self.ram_size)
+            .field("memdev", &self.memdev.as_ref().map(|b| b.name()))
             .field("kernel", &self.kernel)
             .field("initrd", &self.initrd)
             .field("append", &self.append)
@@ -495,6 +499,7 @@ impl VirtConfig {
             smp: 1,
             max_cpus: None,
             ram_size: VIRT_DEFAULT_RAM_SIZE,
+            memdev: None,
             kernel: None,
             initrd: None,
             append: None,
@@ -1088,7 +1093,12 @@ impl VirtMachine {
         let psci = vms_conduit != PsciConduit::Disabled;
         dt::add_cpu_nodes(&mut fdt, &model, &mpidrs, psci, &topology)?;
 
-        let ram = mem.new_ram(VIRT_RAM_ID, ram_size).map_err(err)?;
+        // machine_consume_memdev(): the backend's region, named after the backend.
+        let ram = match cfg.memdev.clone() {
+            Some(block) => mem.new_ram_from_block(block),
+            None => mem.new_ram(VIRT_RAM_ID, ram_size),
+        }
+        .map_err(err)?;
         mem.add_subregion(system, VIRT_MEM, ram).map_err(err)?;
 
         dt::virt_flash_fdt(&mut fdt, cfg.secure)?;
