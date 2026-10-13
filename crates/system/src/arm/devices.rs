@@ -40,6 +40,7 @@ use ruvm_machine_arm::sbsa_ref::{NUM_SATA_PORTS, SbsaRefMachine};
 use ruvm_machine_arm::virt::VirtMachine;
 use ruvm_machine_x86::{FileBackend, VirtioHandle};
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
+use ruvm_qapi::visit::Visitor;
 
 use super::{ArmBoard, prop_bool};
 use crate::drives::{Plugged, resize_cb};
