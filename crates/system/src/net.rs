@@ -24,6 +24,7 @@ use ruvm_net::{EventSink, MacAddr, Net, NetClient, NetClientOps, NetEvent, NicCo
 use ruvm_qapi::events::{event_netdev_stream_connected, event_netdev_stream_disconnected};
 use ruvm_qapi::types::{NetClientDriver, NetdevStreamConnectedArg, NetdevStreamDisconnectedArg};
 
+use crate::vl::Vm;
 use crate::x86::Located;
 
 /// Frames waiting for one NIC before ruvm-net has to hold them.
@@ -158,6 +159,20 @@ impl Network {
     pub(crate) fn vm_state_change(&self, running: bool) {
         lock(&self.net).vm_state_change(running);
     }
+}
+
+/// `net_init_clients()` for a board whose NICs take their frames on `clock`. The network is
+/// kept on `vm` for the commands that look at it.
+pub(crate) fn init_clients(
+    vm: &Vm,
+    args: &[(NetOption, String, Option<Location>)],
+    board_nics: bool,
+    clock: &Arc<Clock>,
+) -> Result<Arc<Network>, Located> {
+    let net = Network::new(args, board_nics, clock, Some(qmp_events(&vm.qmp)))?;
+    let net = Arc::new(net);
+    let _ = vm.network.set(Arc::clone(&net));
+    Ok(net)
 }
 
 /// Sends the events of the netdevs out on QMP.

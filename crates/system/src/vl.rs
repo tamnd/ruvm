@@ -1275,6 +1275,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             devices: &cfg.x86.devices,
             drives: &drives,
             firmware: cfg.x86.firmware(),
+            netdevs: &cfg.x86.netdevs,
         };
         let running =
             riscv::start_board(&vm, accel, opts, &args, &serial_hds).map_err(|errors| {
@@ -1313,6 +1314,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             semihosting: &cfg.semihosting,
             devices: &cfg.x86.devices,
             drives: &drives,
+            netdevs: &cfg.x86.netdevs,
         };
         let running = match accel {
             Accel::Tcg(tcg) => arm::start_board_tcg(&vm, tcg, opts, &args, &serial_hds),

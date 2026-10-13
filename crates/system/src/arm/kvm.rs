@@ -19,6 +19,7 @@ use super::{
     ArmArgs, ArmBoard, BoardOptions, BuiltVirt, KvmHostCpu, Machine, Running, build_virt, dumpdtb,
     event_handler, kvm_cpu_model, lock,
 };
+use crate::net::Network;
 use crate::vl::Vm;
 use crate::x86::Located;
 
@@ -54,15 +55,18 @@ fn check_gic_version(accel: &KvmAccel, opts: &BoardOptions) -> Result<(), String
         .map_err(|e| e.to_string())
 }
 
-/// Lets the runstate start and stop the vCPUs.
-fn set_cpu_hook(vm: &Arc<Vm>, machine: &Arc<KvmVirtMachine>) {
+/// Lets the runstate start and stop the vCPUs, with the netdevs told first when the VM starts
+/// and last when it stops.
+fn set_cpu_hook(vm: &Arc<Vm>, machine: &Arc<KvmVirtMachine>, net: Arc<Network>) {
     let weak = Arc::downgrade(machine);
     vm.runstate.set_cpu_hook(Some(Arc::new(move |run| {
         if let Some(m) = weak.upgrade() {
             if run {
+                net.vm_state_change(true);
                 m.start();
             } else {
                 m.pause();
+                net.vm_state_change(false);
             }
         }
     })));
@@ -112,7 +116,7 @@ pub(crate) fn start_board_kvm(
         spis = Some(prepare_config(&accel, cfg).map_err(one)?);
         Ok(())
     })?;
-    let BuiltVirt { board, console, attachments, clocks, dumpdtb: dtb_path } = built;
+    let BuiltVirt { board, console, attachments, clocks, dumpdtb: dtb_path, net } = built;
     let spis = spis.expect("build_virt calls prepare");
 
     let cfg =
@@ -132,6 +136,6 @@ pub(crate) fn start_board_kvm(
         dumpdtb(path, &fdt)?;
     }
     let machine = Arc::new(machine);
-    set_cpu_hook(vm, &machine);
+    set_cpu_hook(vm, &machine, net);
     Ok(Running { machine: Machine::Kvm(machine), console, _attachments: attachments })
 }

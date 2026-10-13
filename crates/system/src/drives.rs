@@ -11,7 +11,7 @@ use std::sync::{Arc, Weak};
 
 use ruvm_base::{Error, Result};
 use ruvm_hw_virtio::{VirtioMmio, VirtioPci};
-use ruvm_machine_x86::FileBackend;
+use ruvm_machine_x86::{FileBackend, VirtioHandle};
 
 use crate::x86::{Drive, DriveIf};
 
@@ -115,8 +115,18 @@ impl Drives {
     }
 }
 
+/// `virtio_blk_resize()` of a plugged virtio-blk, or a callback that does nothing if the board
+/// lost the transport.
+pub(crate) fn resize_cb(handle: Option<&VirtioHandle>) -> ResizeCb {
+    match handle {
+        Some(VirtioHandle::Pci(dev)) => pci_resize_cb(dev),
+        Some(VirtioHandle::Mmio(t)) => mmio_resize_cb(Some(Arc::clone(t))),
+        None => mmio_resize_cb(None),
+    }
+}
+
 /// `virtio_blk_resize()` of a virtio-blk on PCI: `virtio_notify_config()`.
-pub(crate) fn pci_resize_cb(dev: &VirtioPci) -> ResizeCb {
+fn pci_resize_cb(dev: &VirtioPci) -> ResizeCb {
     let dev = dev.downgrade();
     Arc::new(move || {
         if let Some(dev) = dev.upgrade() {
@@ -126,7 +136,7 @@ pub(crate) fn pci_resize_cb(dev: &VirtioPci) -> ResizeCb {
 }
 
 /// `virtio_blk_resize()` of a virtio-blk on virtio-mmio.
-pub(crate) fn mmio_resize_cb(t: Option<Arc<VirtioMmio>>) -> ResizeCb {
+fn mmio_resize_cb(t: Option<Arc<VirtioMmio>>) -> ResizeCb {
     let t = t.map(|t| Arc::downgrade(&t));
     Arc::new(move || {
         if let Some(t) = t.as_ref().and_then(Weak::upgrade) {
