@@ -62,7 +62,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | qmp-cmd-test | 59 | 17 | stops at `query-vnc`, see below |
 | qos-test | 113 (5 skipped) | 0 | registers no cases, see below |
 | riscv-csr-test | 1 | 0 | no `veyron-v1` CPU model |
-| iommu-riscv-test | 4 | 0 | `-net none` is not supported, and there is no `riscv-iommu-pci` or `iommu-testdev` |
+| iommu-riscv-test | 4 | 0 | no `riscv-iommu-pci` or `iommu-testdev` |
 | k230-wdt-test | 7 | 0 | no `k230` board |
 | machine-none-test | 1 | 1 | |
 | qmp-test | 9 | 9 | |
@@ -89,7 +89,7 @@ On riscv64, `virt` now runs under the qtest accelerator with no harts and with i
 
 On aarch64, `virt` now runs under the qtest accelerator the same way, and is listed in `query-machines` as `virt-11.1` with the alias `virt` and the values QEMU 11.1 gives. qom-test and test-hmp pass on it. sbsa-ref is not listed yet, because it does not run under qtest. The tests that started to run on `virt` now fail on options ruvm does not take: `-machine memory-backend=` (migration-test), `-no-shutdown` (boot-serial-test), `gic-version=max` (arm-cpu-features) and `-numa` (numa-test).
 
-On both targets the next change is the QOM device types. qos-test, bios-tables-test, cdrom-test and iommu-smmuv3-test decide what to run from `qom-list-types` with `implements=device`, which is empty in ruvm, so they register no cases or skip.
+On both targets `system_reset` now resets `virt` under the qtest accelerator and sends the RESET event QEMU sends, which qos-test needs between cases that share a command line. The next change is the QOM device types. qos-test, bios-tables-test, cdrom-test and iommu-smmuv3-test decide what to run from `qom-list-types` with `implements=device`, which is empty in ruvm, so they register no cases or skip.
 
 `-cdrom` and `-readconfig` are command line options ruvm does not take yet. netdev-socket passes since HMP `info network` came in #234 and the stream netdev events in #239.
 

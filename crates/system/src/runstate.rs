@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use ruvm_base::report::error_report;
 use ruvm_base::{Error, Result};
 use ruvm_monitor::Qmp;
-use ruvm_qapi::events::{event_resume, event_shutdown, event_stop};
-use ruvm_qapi::types::{RunState, ShutdownArg, ShutdownCause, StatusInfo};
+use ruvm_qapi::events::{event_reset, event_resume, event_shutdown, event_stop};
+use ruvm_qapi::types::{ResetArg, RunState, ShutdownArg, ShutdownCause, StatusInfo};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -129,6 +129,9 @@ struct Inner {
     state: RunState,
     vm_was_suspended: bool,
     shutdown_requested: ShutdownCause,
+    reset_requested: ShutdownCause,
+    /// `-no-reboot`: `reboot_action` is shutdown.
+    no_reboot: bool,
     /// `shutdown_exit_code`.
     shutdown_exit_code: i32,
     killed: Option<Killed>,
@@ -138,11 +141,34 @@ struct Inner {
 /// to stop the vCPUs and with true to let them run.
 pub type CpuHook = Arc<dyn Fn(bool) + Send + Sync>;
 
+/// What `qemu_system_reset()` does to the board.
+#[derive(Clone, Default)]
+pub enum MachineReset {
+    /// There is no board, as with machine `none`, so there is nothing to reset.
+    #[default]
+    Nothing,
+    /// The board resets its devices with this.
+    Board(Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>),
+    /// A board ruvm cannot reset from outside the guest yet.
+    Unsupported,
+}
+
+impl std::fmt::Debug for MachineReset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MachineReset::Nothing => "Nothing",
+            MachineReset::Board(_) => "Board(..)",
+            MachineReset::Unsupported => "Unsupported",
+        })
+    }
+}
+
 /// The run state of the machine, with the events QMP clients see when it changes.
 pub struct Runstate {
     inner: Mutex<Inner>,
     qmp: Arc<Qmp>,
     cpus: Mutex<Option<CpuHook>>,
+    reset: Mutex<MachineReset>,
 }
 
 impl std::fmt::Debug for Runstate {
@@ -159,11 +185,14 @@ impl Runstate {
                 state: RunState::Prelaunch,
                 vm_was_suspended: false,
                 shutdown_requested: ShutdownCause::None,
+                reset_requested: ShutdownCause::None,
+                no_reboot: false,
                 shutdown_exit_code: 0,
                 killed: None,
             }),
             qmp,
             cpus: Mutex::new(None),
+            reset: Mutex::new(MachineReset::Nothing),
         })
     }
 
@@ -344,6 +373,80 @@ impl Runstate {
         self.qmp.shutdown();
     }
 
+    /// `-no-reboot`: a reset request becomes a shutdown request.
+    pub fn set_no_reboot(&self, no_reboot: bool) {
+        lock(&self.inner).no_reboot = no_reboot;
+    }
+
+    /// Installs what [`Runstate::system_reset`] does to the board.
+    pub fn set_machine_reset(&self, reset: MachineReset) {
+        *lock(&self.reset) = reset;
+    }
+
+    /// `qmp_system_reset()`.
+    pub fn qmp_system_reset(&self) -> Result<()> {
+        if matches!(*lock(&self.reset), MachineReset::Unsupported) {
+            return Err(Error::generic(
+                "system_reset is not supported with this machine by ruvm yet",
+            ));
+        }
+        self.reset_request(ShutdownCause::HostQmpSystemReset);
+        Ok(())
+    }
+
+    /// `qemu_system_reset_request()`. The main loop does the reset once the dispatcher has
+    /// finished the command it is running.
+    pub fn reset_request(&self, cause: ShutdownCause) {
+        let mut inner = lock(&self.inner);
+        if inner.no_reboot && cause != ShutdownCause::SubsystemReset {
+            drop(inner);
+            self.shutdown_request(cause);
+            return;
+        }
+        inner.reset_requested = cause;
+        drop(inner);
+        self.qmp.kick();
+    }
+
+    /// `qemu_reset_requested()`: takes the pending request, if any.
+    pub fn take_reset_request(&self) -> ShutdownCause {
+        std::mem::take(&mut lock(&self.inner).reset_requested)
+    }
+
+    /// `qemu_system_reset()`: resets the board, then sends the RESET event.
+    pub fn system_reset(&self, cause: ShutdownCause) {
+        let reset = lock(&self.reset).clone();
+        if let MachineReset::Board(f) = reset {
+            if let Err(e) = f() {
+                error_report(&e);
+                self.vm_stop(RunState::InternalError);
+                return;
+            }
+        }
+        if !matches!(
+            cause,
+            ShutdownCause::None | ShutdownCause::SubsystemReset | ShutdownCause::SnapshotLoad
+        ) {
+            let arg = ResetArg { guest: caused_by_guest(cause), reason: cause };
+            self.emit(event_reset(&self.qmp.policy(), arg));
+        }
+        self.set_vm_was_suspended(false);
+    }
+
+    /// What `main_loop_should_exit()` does for a reset request: the reset with the vCPUs
+    /// stopped, and `prelaunch` after it unless the guest runs or migrates.
+    pub fn main_loop_reset(&self, cause: ShutdownCause) {
+        self.cpus(false);
+        self.system_reset(cause);
+        if self.is_running() {
+            self.cpus(true);
+        }
+        let state = self.get();
+        if !matches!(state, RunState::Running | RunState::Inmigrate | RunState::FinishMigrate) {
+            self.set(RunState::Prelaunch);
+        }
+    }
+
     /// `qemu_shutdown_requested()`: takes the pending request, if any.
     pub fn take_shutdown_request(&self) -> ShutdownCause {
         std::mem::take(&mut lock(&self.inner).shutdown_requested)
@@ -410,5 +513,40 @@ mod tests {
         rs.vm_shutdown();
         rs.vm_shutdown();
         assert_eq!(*calls.lock().unwrap(), vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn reset_requests() {
+        let rs = Runstate::new(Qmp::new());
+        // Machine none: nothing to reset, and the state goes back to prelaunch.
+        rs.qmp_system_reset().unwrap();
+        assert_eq!(rs.take_reset_request(), ShutdownCause::HostQmpSystemReset);
+        assert_eq!(rs.take_reset_request(), ShutdownCause::None);
+        rs.qmp_cont().unwrap();
+        rs.set(RunState::Shutdown);
+        rs.main_loop_reset(ShutdownCause::HostQmpSystemReset);
+        assert_eq!(rs.get(), RunState::Prelaunch);
+
+        let resets = Arc::new(Mutex::new(0));
+        let r = Arc::clone(&resets);
+        rs.set_machine_reset(MachineReset::Board(Arc::new(move || {
+            *r.lock().unwrap() += 1;
+            Ok(())
+        })));
+        rs.qmp_cont().unwrap();
+        rs.qmp_system_reset().unwrap();
+        rs.main_loop_reset(rs.take_reset_request());
+        assert_eq!(*resets.lock().unwrap(), 1);
+        assert_eq!(rs.get(), RunState::Running);
+
+        // -no-reboot makes it a shutdown request.
+        rs.set_no_reboot(true);
+        rs.qmp_system_reset().unwrap();
+        assert_eq!(rs.take_reset_request(), ShutdownCause::None);
+        assert_eq!(rs.take_shutdown_request(), ShutdownCause::HostQmpSystemReset);
+
+        rs.set_machine_reset(MachineReset::Unsupported);
+        let e = rs.qmp_system_reset().unwrap_err();
+        assert_eq!(e.message(), "system_reset is not supported with this machine by ruvm yet");
     }
 }

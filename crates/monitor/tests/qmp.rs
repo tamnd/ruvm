@@ -440,3 +440,17 @@ fn serve_through_a_tcp_chardev() {
     qmp.shutdown();
     dispatcher.join().unwrap();
 }
+
+#[test]
+fn kick_returns_from_the_dispatcher() {
+    let qmp = Qmp::new();
+    qmp.kick();
+    qmp.run_dispatcher();
+    // The kick is used up: the next run waits for another one.
+    let dispatcher = {
+        let qmp = qmp.clone();
+        std::thread::spawn(move || qmp.run_dispatcher())
+    };
+    qmp.kick();
+    dispatcher.join().unwrap();
+}

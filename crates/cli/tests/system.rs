@@ -624,6 +624,15 @@ mod sockets {
         qtest.read_exact(&mut got).unwrap();
         assert_eq!(String::from_utf8(got).unwrap(), want);
 
+        // The reply comes first, then the main loop resets the board and sends RESET, which
+        // qos-test relies on between its cases.
+        assert_eq!(qmp.cmd(r#"{"execute": "system_reset"}"#), r#"{"return": {}}"#);
+        let ev = qmp.line();
+        assert!(ev.contains(r#""event": "RESET""#), "{ev}");
+        assert!(ev.contains(r#""data": {"guest": false, "reason": "host-qmp-system-reset"}"#));
+        let status = qmp.cmd(r#"{"execute": "query-status"}"#);
+        assert!(status.contains(r#""status": "running""#), "{status}");
+
         assert_eq!(qmp.cmd(r#"{"execute": "quit"}"#), r#"{"return": {}}"#);
         assert!(child.0.wait().unwrap().success());
         let mut err = String::new();

@@ -59,7 +59,7 @@ use crate::options::{Opt, arch_available, help_text, lookup_opt};
 use crate::qmp_cmds::{self, object_options_dict};
 use crate::qtest::{self, VirtualClock};
 use crate::riscv;
-use crate::runstate::{Killed, Runstate};
+use crate::runstate::{Killed, MachineReset, Runstate};
 use crate::x86::{self, Accel, AccelInitError, Located};
 
 /// Whether KVM is built in for `target`: the host is Linux on x86_64 or AArch64 and the
@@ -1249,6 +1249,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
 
     let mut keep =
         Keep { _qtest: qtest, _accel: None, board: None, arm_board: None, riscv_board: None };
+    vm.runstate.set_no_reboot(cfg.x86.no_reboot);
     if let Some(opts) = rv_virt_opts {
         if cfg.preconfig {
             return Err(fail_msg("-preconfig is not supported with this machine by ruvm yet"));
@@ -1292,6 +1293,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             qtest::add_object(&m.object, log).map_err(|e| fail(&e))?;
             keep._qtest = Some(a);
         }
+        vm.runstate.set_machine_reset(running.machine_reset());
         keep.riscv_board = Some(running);
     } else if let Some(opts) = virt_opts {
         if cfg.preconfig {
@@ -1332,6 +1334,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             qtest::add_object(&m.object, log).map_err(|e| fail(&e))?;
             keep._qtest = Some(a);
         }
+        vm.runstate.set_machine_reset(running.machine_reset());
         keep.arm_board = Some(running);
     } else {
         match (kind, board_opts) {
@@ -1342,6 +1345,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
                     ));
                 }
                 keep = start_x86(&vm, &cfg, accel, kind, opts, &drives, &serial_hds, keep)?;
+                vm.runstate.set_machine_reset(MachineReset::Unsupported);
                 // qtest_server_init() on a board a real accelerator runs.
                 if let (Some(chrdev), Some(board)) = (&cfg.qtest, &keep.board) {
                     let (memory, io) = board.address_spaces();
@@ -1499,8 +1503,16 @@ fn mux_quit_hook(runstate: &Arc<Runstate>) -> ruvm_chardev::Hook {
 /// `qemu_main_loop()` and `qemu_cleanup()`: serve QMP until something asks for a shutdown.
 /// Gives the exit status.
 fn main_loop(vm: &Arc<Vm>, keep: &Keep) -> u8 {
-    vm.qmp.run_dispatcher();
-    let cause = vm.runstate.take_shutdown_request();
+    // main_loop_should_exit(): a shutdown request ends the loop, a reset request is done here.
+    let cause = loop {
+        vm.qmp.run_dispatcher();
+        let cause = vm.runstate.take_shutdown_request();
+        let reset = vm.runstate.take_reset_request();
+        if cause != ShutdownCause::None || reset == ShutdownCause::None {
+            break cause;
+        }
+        vm.runstate.main_loop_reset(reset);
+    };
     // qemu_kill_report()
     if let Some(k) = vm.runstate.take_killed() {
         if !vm.qtest {
