@@ -27,6 +27,7 @@ ruvm-hw-iommu.workspace = true
 ruvm-hw-pci.workspace = true
 ruvm-hw-storage.workspace = true
 ruvm-hw-timer.workspace = true
+ruvm-hw-tpm.workspace = true
 ruvm-hw-virtio.workspace = true
 ruvm-jit.workspace = true
 ruvm-jit-core.workspace = true

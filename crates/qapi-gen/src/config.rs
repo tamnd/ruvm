@@ -64,7 +64,7 @@ const CONDITIONS: &[(&str, Rule)] = &[
     ("CONFIG_SPICE", Rule::Off),
     ("CONFIG_SPICE_PROTOCOL", Rule::Off),
     ("CONFIG_TCG", Rule::On),
-    ("CONFIG_TPM", Rule::Off),
+    ("CONFIG_TPM", Rule::Unix),
     ("CONFIG_TRACE_SIMPLE", Rule::Off),
     ("CONFIG_UADK", Rule::Off),
     ("CONFIG_VDE", Rule::Off),

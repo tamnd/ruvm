@@ -435,6 +435,15 @@ impl SocketChardev {
         lock(&self.state).conn.is_some()
     }
 
+    /// The connected Unix socket, for a frontend that does its own I/O on it.
+    #[cfg(unix)]
+    pub(crate) fn unix_stream(&self) -> Option<UnixStream> {
+        match lock(&self.state).conn.as_ref()? {
+            Stream::Unix(s) => s.try_clone().ok(),
+            _ => None,
+        }
+    }
+
     /// Waits for a client on a server, looking at `stop` now and then.
     fn accept(&self, stop: &AtomicBool) -> Option<Stream> {
         let l = self.listener.as_ref()?;

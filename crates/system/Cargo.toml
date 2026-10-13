@@ -31,6 +31,7 @@ ruvm-hw-iommu.workspace = true
 ruvm-hw-misc.workspace = true
 ruvm-hw-pci.workspace = true
 ruvm-hw-storage.workspace = true
+ruvm-hw-tpm.workspace = true
 ruvm-hw-virtio.workspace = true
 ruvm-machine-arm.workspace = true
 ruvm-machine-riscv.workspace = true

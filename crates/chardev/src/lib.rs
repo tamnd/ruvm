@@ -294,6 +294,20 @@ impl Chardev {
         }
     }
 
+    /// `qemu_chr_fe_init()` for a frontend that talks over the connected Unix socket itself
+    /// and passes descriptors on it, as the TPM emulator backend does with its control
+    /// channel. The chardev is in use afterwards and nothing else reads the socket. `None`
+    /// when this is not a connected Unix socket.
+    #[cfg(unix)]
+    pub fn claim_unix_socket(&self) -> Result<Option<std::os::unix::net::UnixStream>> {
+        if self.is_busy() {
+            return Err(Error::generic(format!("chardev '{}' is already in use", self.label)));
+        }
+        self.busy.store(true, Ordering::Release);
+        let Backend::Socket(s) = &self.backend else { return Ok(None) };
+        Ok(s.unix_stream())
+    }
+
     fn mux(&self) -> Option<&Mux> {
         match &self.backend {
             Backend::Mux(m) => Some(m),

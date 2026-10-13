@@ -24,6 +24,7 @@ mod riscv;
 mod rng;
 pub mod runstate;
 mod snapshot;
+mod tpm;
 pub mod vl;
 mod vnc;
 mod x86;

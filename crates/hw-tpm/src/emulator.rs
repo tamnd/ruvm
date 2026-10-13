@@ -317,17 +317,21 @@ impl TpmEmulator {
 
     /// `tpm_emulator_shutdown()`, which QEMU does when the backend goes away.
     pub fn shutdown(&mut self) -> Result<(), String> {
-        let res = self
-            .simple(CMD_SHUTDOWN)
-            .map_err(|_| "tpm-emulator: Could not cleanly shutdown the TPM")?;
-        if res != 0 {
-            return Err(format!(
-                "tpm-emulator: TPM result for shutdown: 0x{res:x} {}",
-                strerror(res)
-            ));
-        }
-        Ok(())
+        shutdown(&mut self.ctrl)
     }
+}
+
+/// `tpm_emulator_shutdown()` over the control channel `ctrl`, for a backend that failed to
+/// come up after it took the chardev.
+pub fn shutdown(ctrl: &mut UnixStream) -> Result<(), String> {
+    let mut res = [0; 4];
+    ctrlcmd(ctrl, CMD_SHUTDOWN, &mut res, 0, 4, 4)
+        .map_err(|_| "tpm-emulator: Could not cleanly shutdown the TPM")?;
+    let res = u32::from_be_bytes(res);
+    if res != 0 {
+        return Err(format!("tpm-emulator: TPM result for shutdown: 0x{res:x} {}", strerror(res)));
+    }
+    Ok(())
 }
 
 impl TpmBackend for TpmEmulator {
