@@ -46,7 +46,7 @@ fn check_gic_version(accel: &KvmAccel, opts: &BoardOptions) -> Result<(), String
     let in_kernel = accel.kernel_irqchip() != KernelIrqchip::Off;
     let probe = if in_kernel { vgic_probe(accel) } else { 0 };
     let (supported, name) = kvm_gics_supported(in_kernel, probe).map_err(|e| e.to_string())?;
-    let version = match opts.gic_version {
+    let version = match opts.gic_version.unwrap_or_default() {
         VirtGicVersion::V2 => GicVersion::V2,
         VirtGicVersion::V3 => GicVersion::V3,
     };
