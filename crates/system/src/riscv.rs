@@ -850,9 +850,11 @@ pub(crate) fn start_board(
     cfg.acpi = !opts.acpi_off;
     cfg.spcr = !opts.spcr_off;
     cfg.aclint = opts.aclint;
-    for (slot, drive) in cfg.pflash.iter_mut().zip(plan.pflash) {
-        if let Some(backing) = drive {
-            *slot = backing;
+    for (slot, i) in cfg.pflash.iter_mut().zip(plan.pflash) {
+        if let Some(i) = i {
+            let d = &args.drives[i];
+            *slot = crate::drives::pflash_backing(&vm.block, d)
+                .map_err(|e| vec![Located(d.loc.clone(), e)])?;
         }
     }
     cfg.loaders = plan.loaders;

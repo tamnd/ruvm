@@ -8,7 +8,7 @@ The tests come from the QEMU 11.1.0 source tree. QEMU itself was built from that
 
 Each qtest binary was run on its own, once with `QTEST_QEMU_BINARY` pointing at the QEMU build and once pointing at ruvm. libqtest takes the target from the binary name, so ruvm was reached through symlinks named `qemu-system-aarch64` and `qemu-system-riscv64`. The test list, environment and timeouts are the ones meson writes into `tests.json` for the `qtest-aarch64` and `qtest-riscv64` suites, and the counts below are read from the TAP output of each test.
 
-The ruvm binary was a release build of main at #224 plus the human monitor change that follows it, except for netdev-socket and the riscv64 linux-user tests, which were run again with a release build that has #239. The qtest-riscv64 suite was run again with the change that runs riscv64 `virt` under the qtest accelerator, and the qtest-aarch64 suite with the change that does the same for aarch64 `virt`. Both suites were run again with the change that adds `system_reset` and the QOM device types, and again with the virtio-blk device types. qom-test, device-introspect-test and qos-test were run again with the virtio-net device types. Both suites were run again with `query-block` and HMP `info block`.
+The ruvm binary was a release build of main at #224 plus the human monitor change that follows it, except for netdev-socket and the riscv64 linux-user tests, which were run again with a release build that has #239. The qtest-riscv64 suite was run again with the change that runs riscv64 `virt` under the qtest accelerator, and the qtest-aarch64 suite with the change that does the same for aarch64 `virt`. Both suites were run again with the change that adds `system_reset` and the QOM device types, and again with the virtio-blk device types. qom-test, device-introspect-test and qos-test were run again with the virtio-net device types. Both suites were run again with `query-block` and HMP `info block`, and bios-tables-test and cdrom-test again with `snapshot=on`.
 
 A count is the number of TAP cases that passed. A test that registers no cases passes trivially with 0, and that is shown as 0 rather than as a pass, because it means the test found nothing in ruvm to run against.
 
@@ -22,7 +22,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 
 | Test | QEMU | ruvm | Why ruvm is short |
 |---|---|---|---|
-| bios-tables-test | 17 | 0 | the firmware `-drive` with `snapshot=on` is refused |
+| bios-tables-test | 17 | 0 | `ras=on` is refused, and `virt` has no SMBIOS tables yet |
 | qom-test | 90 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | device-introspect-test | 6 | 6 | |
 | cdrom-test | 9 | 1 | the other 8 cases are 32-bit Arm boards ruvm does not have |
@@ -54,7 +54,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 
 | Test | QEMU | ruvm | Why ruvm is short |
 |---|---|---|---|
-| bios-tables-test | 3 | 0 | the firmware `-drive` with `snapshot=on` is refused |
+| bios-tables-test | 3 | 1 | numamem stops at `-numa` |
 | qom-test | 13 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | device-introspect-test | 6 | 6 | |
 | cdrom-test | 1 | 1 | |
@@ -68,7 +68,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 1 | |
 | netdev-socket | 10 | 10 | |
-| Total | 241 | 78 | |
+| Total | 241 | 79 | |
 
 ## qmp-cmd-test and VNC
 
@@ -91,7 +91,7 @@ On aarch64, `virt` now runs under the qtest accelerator the same way, and is lis
 
 On both targets `system_reset` now resets `virt` under the qtest accelerator and sends the RESET event QEMU sends, which qos-test needs between cases that share a command line. qos-test, bios-tables-test, cdrom-test and iommu-smmuv3-test decide what to run from `qom-list-types` with `implements=device`. ruvm now lists the device types with the parents QEMU gives them, but only for the devices whose qos-test cases pass, because a qos-test case that fails stops the whole test. So far that is virtio-rng, virtio-blk, virtio-balloon and virtio-net, on PCI and on virtio-mmio. Their hotplug cases are skipped on both sides, because the generic PCI host does not take hotplug. The virtio-blk cases needed `-drive` to take `auto-read-only` and `file=null-co://` with `file.read-zeroes`, and the QMP `block_resize` command to resize a drive and raise the configuration interrupt of its device. virtio-balloon only needed the boards to plug it, with the same backend as on x86, which leaves the RAM the guest gives back alone. virtio-net needed the boards to take `-netdev`, the QMP `announce-self` command, which sends the RARP frames from a thread of its own because ruvm has no realtime timer list yet, and the NIC timers to run on their own thread under qtest, since the qtest clock only moves when a test steps it and QEMU 11.1's virtio tests no longer do.
 
-With virtio-blk listed, bios-tables-test and cdrom-test now register their cases. ruvm now takes `-cdrom`, `-hda` to `-hdd` and a bare image name as the `-drive` QEMU makes of them. QMP `query-block` now lists the drives of these boards and the devices they are on as QEMU does, with the empty `floppy0` drive QEMU adds when there is no `-nodefaults`, and HMP `info block` prints them the same way, so cdrom-test passes on `virt` and `none`. `info block -v` is not there yet. bios-tables-test stops at the `-drive` of its UEFI variable store, which has `snapshot=on`. On the Arm and RISC-V boards and on `none` a `-drive` image is now opened by the block layer, as `drive_new()` does in QEMU, so a probed qcow2 image such as the CD image of bios-tables-test is read as qcow2. The next devices are virtio-scsi and virtio-serial, which needs `virtconsole` and `virtserialport` on the serial bus. The rest of the qos-test devices (the Intel and other PCI network cards, the SCSI, NVMe and UFS controllers, the sound cards and the IOMMUs) are not built on these boards by ruvm.
+With virtio-blk listed, bios-tables-test and cdrom-test now register their cases. ruvm now takes `-cdrom`, `-hda` to `-hdd` and a bare image name as the `-drive` QEMU makes of them. QMP `query-block` now lists the drives of these boards and the devices they are on as QEMU does, with the empty `floppy0` drive QEMU adds when there is no `-nodefaults`, and HMP `info block` prints them the same way, so cdrom-test passes on `virt` and `none`. `info block -v` is not there yet. `-drive` now takes `snapshot=on`, which puts a temporary qcow2 overlay on the image as QEMU does, and the pflash devices read and write their drives through the block layer, so bios-tables-test boots its UEFI image with the variable store it gives with `snapshot=on`. The RISC-V `virt` case of bios-tables-test passes. The Arm cases stop at `ras=on`, which needs the HEST table and the hardware error memory, and then at the SMBIOS tables, which ruvm does not build for `virt` yet. On the Arm and RISC-V boards and on `none` a `-drive` image is now opened by the block layer, as `drive_new()` does in QEMU, so a probed qcow2 image such as the CD image of bios-tables-test is read as qcow2. The next devices are virtio-scsi and virtio-serial, which needs `virtconsole` and `virtserialport` on the serial bus. The rest of the qos-test devices (the Intel and other PCI network cards, the SCSI, NVMe and UFS controllers, the sound cards and the IOMMUs) are not built on these boards by ruvm.
 
 readconfig-test passes since ruvm takes `-readconfig`, which reads the file the way QEMU's `sscanf()` loop does and handles each group as the command line option it stands for, and has the `rng-builtin` and `rng-random` objects. virtio-rng does not take their `rng` link yet. bios-tables-test also boots the guest from a qcow2 CD image with UEFI firmware. netdev-socket passes since HMP `info network` came in #234 and the stream netdev events in #239.
 

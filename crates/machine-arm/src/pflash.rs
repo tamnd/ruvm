@@ -9,10 +9,10 @@
 //! of romd mode (`memory_region_rom_device_set_romd(false)`), so reads then go to the device and
 //! return status, CFI or ID data, and going back to read array mode switches romd on again.
 //!
-//! The contents come from a [`PflashBacking`]. For a file, the whole image is read into the RAM
-//! block when the device is created and every program or erase is written back at once, widened
-//! to 512 byte sectors like `pflash_update()` does. A read only backing sets `ro`: programs and
-//! erases then only set the error bits in the status register and change nothing.
+//! The contents come from a [`PflashBacking`]. For a file or a drive, the whole image is read
+//! into the RAM block when the device is created and every program or erase is written back at
+//! once, widened to 512 byte sectors like `pflash_update()` does. A read only backing sets `ro`:
+//! programs and erases then only set the error bits in the status register and change nothing.
 //!
 //! This is the device machine-x86 has for the PC system flashes, without the PC placement logic;
 //! the two should become one shared device.
@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use ruvm_base::error::strerror;
 use ruvm_base::error_report;
+use ruvm_hw_storage::BlockBackend;
 use ruvm_mem::{AccessCtx, AccessSize, MemResult, MemorySystem, MmioOps, RamBlock, RegionId};
 
 /// `TYPE_PFLASH_CFI01`.
@@ -100,7 +101,7 @@ impl PflashProps {
 }
 
 /// Where the contents of a flash come from, the `drive` property.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum PflashBacking {
     /// No drive: the flash starts zeroed and writes stay in memory.
     None,
@@ -115,6 +116,16 @@ pub enum PflashBacking {
         /// `readonly=on`: the flash ignores programs and erases and the file is never written.
         read_only: bool,
     },
+    /// The image of a drive of the block layer, which must be exactly the size of the device.
+    /// Unless it is read only, programs and erases are written back to it.
+    Image(Arc<dyn BlockBackend>),
+}
+
+/// Where programs and erases are written back to.
+#[derive(Debug)]
+enum WriteBack {
+    File(File),
+    Image(Arc<dyn BlockBackend>),
 }
 
 /// The command state machine, the part of `PFlashCFI01` that changes at run time.
@@ -129,8 +140,8 @@ struct State {
     blk_bytes: Vec<u8>,
     /// Where `blk_bytes` goes, `blk_offset` with -1 as `None`.
     blk_offset: Option<u64>,
-    /// The image file when it is writable.
-    file: Option<File>,
+    /// The image when it is writable.
+    file: Option<WriteBack>,
 }
 
 /// What a write does after the state machine ran, the labels at the end of `pflash_write()`.
@@ -355,7 +366,10 @@ impl Pflash {
         let end = (offset + size).next_multiple_of(BDRV_SECTOR_SIZE).min(self.total_len);
         let mut buf = vec![0u8; (end - start) as usize];
         let _ = self.ram().read(start, &mut buf);
-        let r = file.seek(SeekFrom::Start(start)).and_then(|_| file.write_all(&buf));
+        let r = match file {
+            WriteBack::File(f) => f.seek(SeekFrom::Start(start)).and_then(|_| f.write_all(&buf)),
+            WriteBack::Image(img) => img.write_at(start, &buf),
+        };
         if let Err(e) = r {
             // QEMU has a TODO to set an error bit in the status here.
             error_report(&format!("Could not update PFLASH: {}", strerror(&e)));
@@ -675,7 +689,7 @@ impl MmioOps for Pflash {
 }
 
 /// Reads the backing into a buffer of `total_len` bytes and opens the file for write back.
-type Loaded = (Option<Vec<u8>>, bool, Option<File>);
+type Loaded = (Option<Vec<u8>>, bool, Option<WriteBack>);
 
 fn load_backing(name: &str, total_len: u64, backing: PflashBacking) -> Result<Loaded, String> {
     let size_error = |len: u64| {
@@ -715,7 +729,24 @@ fn load_backing(name: &str, total_len: u64, backing: PflashBacking) -> Result<Lo
                 return Err(size_error(len));
             }
             data.resize(total_len as usize, 0);
-            Ok((Some(data), read_only, if read_only { None } else { Some(file) }))
+            Ok((Some(data), read_only, if read_only { None } else { Some(WriteBack::File(file)) }))
+        }
+        PflashBacking::Image(img) => {
+            // blk_check_size_and_read_all().
+            let len = img.len();
+            if len != total_len {
+                return Err(size_error(len));
+            }
+            let mut data = vec![0; total_len as usize];
+            img.read_at(0, &mut data).map_err(|e| {
+                format!(
+                    "can't read block backend for {TYPE_PFLASH_CFI01} device '{name}': {}",
+                    strerror(&e)
+                )
+            })?;
+            // blk_supports_write_perm().
+            let ro = img.is_read_only();
+            Ok((Some(data), ro, if ro { None } else { Some(WriteBack::Image(img)) }))
         }
     }
 }

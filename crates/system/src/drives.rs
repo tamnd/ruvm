@@ -17,6 +17,7 @@ use ruvm_block::{
     BLK_PERM_WRITE_UNCHANGED, BlockBackend, BlockGraph, BlockInterfaceType,
 };
 use ruvm_hw_virtio::{VirtioMmio, VirtioPci};
+use ruvm_machine_arm::pflash::PflashBacking;
 use ruvm_machine_x86::VirtioHandle;
 use ruvm_qapi::opts::QemuOptsList;
 use ruvm_qapi::types::{BlockDeviceIoStatus, BlockInfo};
@@ -59,6 +60,20 @@ pub(crate) fn device_image(
     }
     blk.set_perm(perm, shared)?;
     Ok(DriveImage(blk))
+}
+
+/// `pflash_cfi01_realize()` for drive `d`: the flash reads the image through the block layer
+/// and writes to it unless it is read only, `blk_supports_write_perm()`. A drive without a
+/// medium leaves the flash empty.
+pub(crate) fn pflash_backing(graph: &BlockGraph, d: &Drive) -> Result<PflashBacking> {
+    let blk = graph.backend(&d.id).expect("drive_new() added it");
+    if !blk.is_inserted() {
+        return Ok(PflashBacking::None);
+    }
+    let ro = blk.is_read_only();
+    let perm = BLK_PERM_CONSISTENT_READ | if ro { 0 } else { BLK_PERM_WRITE };
+    blk.set_perm(perm, BLK_PERM_ALL)?;
+    Ok(PflashBacking::Image(Arc::new(DriveImage(blk))))
 }
 
 /// The block backend of a drive as the image of a device model.

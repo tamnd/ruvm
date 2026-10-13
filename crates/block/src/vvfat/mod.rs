@@ -431,46 +431,6 @@ fn sector2chs(chs: &mut [u8], spos: u32, cyls: u32, heads: u32, secs: u32) -> bo
     false
 }
 
-/// A unique name for the temporary write target, `create_tmp_file()`.
-fn create_tmp_file() -> Result<String> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let mut tmpdir = std::env::temp_dir().to_string_lossy().into_owned();
-    while tmpdir.len() > 1 && tmpdir.ends_with('/') {
-        tmpdir.pop();
-    }
-    if cfg!(not(windows)) && tmpdir == "/tmp" {
-        // Temporary images can get large; /tmp is often a tmpfs.
-        tmpdir = "/var/tmp".to_string();
-    }
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut last = None;
-    for _ in 0..100 {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
-        let mut v = nanos
-            ^ (u64::from(std::process::id()) << 32)
-            ^ u64::from(COUNTER.fetch_add(1, Ordering::Relaxed))
-                .wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let mut suffix = String::new();
-        for _ in 0..6 {
-            suffix.push(CHARS[(v % CHARS.len() as u64) as usize] as char);
-            v /= CHARS.len() as u64;
-        }
-        let name = format!("{tmpdir}/vl.{suffix}");
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&name) {
-            Ok(_) => return Ok(name),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some((name, e)),
-            Err(e) => {
-                return Err(Error::from_io(format!("Could not open temporary file '{name}'"), e));
-            }
-        }
-    }
-    let (name, e) = last.expect("the loop ran");
-    Err(Error::from_io(format!("Could not open temporary file '{name}'"), e))
-}
-
 impl State {
     /// `enable_write_target()`: creates the temporary qcow image the writes go to and opens
     /// it as the `write-target` child.
@@ -479,7 +439,7 @@ impl State {
         let size = self.sector2cluster(i64::from(self.sector_count));
         self.used_clusters = vec![0; size.max(0) as usize];
 
-        let qcow_filename = create_tmp_file()?;
+        let qcow_filename = crate::open::create_tmp_file()?;
         let r = Self::open_write_target(args, &qcow_filename, self.total_sectors);
         #[cfg(not(windows))]
         let _ = std::fs::remove_file(&qcow_filename);

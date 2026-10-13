@@ -1320,9 +1320,11 @@ fn build_virt(
     if let Some(id) = opts.oem_table_id {
         cfg.oem_table_id = id;
     }
-    for (slot, drive) in cfg.pflash.iter_mut().zip(plan.pflash) {
-        if let Some(backing) = drive {
-            *slot = backing;
+    for (slot, i) in cfg.pflash.iter_mut().zip(plan.pflash) {
+        if let Some(i) = i {
+            let d = &args.drives[i];
+            *slot = crate::drives::pflash_backing(&vm.block, d)
+                .map_err(|e| vec![Located(d.loc.clone(), e)])?;
         }
     }
     // serial_hd(1) makes the second UART exist; its chardev is connected once it does.
@@ -1404,9 +1406,11 @@ fn start_sbsa_ref_tcg(
     cfg.firmware = opts.firmware;
     cfg.max_cpus = Some(opts.max_cpus as usize);
     cfg.topology = opts.topology;
-    for (slot, drive) in cfg.pflash.iter_mut().zip(plan.pflash) {
-        if let Some(backing) = drive {
-            *slot = backing;
+    for (slot, i) in cfg.pflash.iter_mut().zip(plan.pflash) {
+        if let Some(i) = i {
+            let d = &args.drives[i];
+            *slot = crate::drives::pflash_backing(&vm.block, d)
+                .map_err(|e| vec![Located(d.loc.clone(), e)])?;
         }
     }
     cfg.clock = Some(Arc::clone(&clock));
