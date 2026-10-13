@@ -132,6 +132,6 @@ mod tests {
         let t = build(&dmar);
         assert_eq!(t.len(), 36 + 12 + 16 + 16);
         assert_eq!(&t[36..38], &[38, 0]);
-        assert_eq!(&t[56..64], &[2, 8, 0, 0, 0, 0, 2, 0]);
+        assert_eq!(&t[72..80], &[2, 8, 0, 0, 0, 0, 2, 0]);
     }
 }
