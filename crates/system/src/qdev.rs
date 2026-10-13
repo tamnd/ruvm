@@ -6,8 +6,8 @@
 //! qos-test, bios-tables-test and cdrom-test decide what to run from
 //! `qom-list-types implements=device`, and a qos-test case that fails stops the whole test.
 //! So a device is listed here only once its qos-test cases pass under the qtest accelerator.
-//! virtio-rng is the first. The types carry no properties yet: the boards build their devices
-//! from the `-device` options, not from these types.
+//! virtio-rng was the first, then virtio-blk. The types carry no properties yet: the boards
+//! build their devices from the `-device` options, not from these types.
 
 use ruvm_qom::{Registry, TYPE_OBJECT, TypeInfo};
 
@@ -31,6 +31,9 @@ const TYPES: &[(&str, &str, bool)] = &[
     (TYPE_VIRTIO_DEVICE, TYPE_DEVICE, true),
     (TYPE_VIRTIO_PCI, TYPE_PCI_DEVICE, true),
     ("virtio-mmio", TYPE_SYS_BUS_DEVICE, false),
+    ("virtio-blk-device", TYPE_VIRTIO_DEVICE, false),
+    ("virtio-blk-pci-base", TYPE_VIRTIO_PCI, true),
+    ("virtio-blk-pci", "virtio-blk-pci-base", false),
     ("virtio-rng-device", TYPE_VIRTIO_DEVICE, false),
     ("virtio-rng-pci-base", TYPE_VIRTIO_PCI, true),
     ("virtio-rng-pci", "virtio-rng-pci-base", false),
@@ -66,11 +69,24 @@ mod tests {
         register_types(&registry);
         assert_eq!(
             names(&registry, "device", false),
-            ["virtio-mmio", "virtio-rng-device", "virtio-rng-pci"]
+            [
+                "virtio-blk-device",
+                "virtio-blk-pci",
+                "virtio-mmio",
+                "virtio-rng-device",
+                "virtio-rng-pci"
+            ]
         );
         assert_eq!(
             names(&registry, "pci-device", true),
-            ["pci-device", "virtio-pci", "virtio-rng-pci", "virtio-rng-pci-base"]
+            [
+                "pci-device",
+                "virtio-blk-pci",
+                "virtio-blk-pci-base",
+                "virtio-pci",
+                "virtio-rng-pci",
+                "virtio-rng-pci-base"
+            ]
         );
         assert_eq!(names(&registry, "sys-bus-device", true), ["sys-bus-device", "virtio-mmio"]);
         assert!(device_list_properties(&registry, "virtio-rng-pci").is_ok());
