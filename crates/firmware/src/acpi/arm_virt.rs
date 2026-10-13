@@ -10,12 +10,12 @@
 //! functions on the root bus. The MADT describes a GICv3: the distributor, a GICC per CPU,
 //! the redistributor regions and the ITS. The IORT has the ITS group, the SMMUv3 of
 //! `iommu=smmuv3` and the root complex, whose requester IDs go to the SMMU or straight to the
-//! ITS.
+//! ITS. With a virtio-iommu-pci there is also a VIOT after the IORT.
 //!
 //! Not built: the GICv2 and GICv2m forms of the MADT, the IORT of the GICv2m, the SMMUv3
 //! nodes of `-device arm-smmuv3` and their RMR nodes, the
 //! cache nodes of the PPTT (`smp-cache`), HEST (`ras=on`), HMAT, the GWDT and WDAT, CEDT,
-//! NFIT, TPM2 and VIOT, and the memory hotplug and ACPI PCI hotplug AML, since ruvm has none
+//! NFIT and TPM2, and the memory hotplug and ACPI PCI hotplug AML, since ruvm has none
 //! of those devices.
 
 use super::BuildTables;
@@ -28,6 +28,7 @@ use super::q35::{self, PciDevice};
 use super::table::{
     self, AcpiTable, FadtData, Gas, McfgInfo, RsdpData, SpcrData, TABLE_FILE, fadt_flags,
 };
+use super::viot::{self, ViotInfo};
 
 pub use super::riscv_virt::NumaNode;
 
@@ -181,6 +182,8 @@ pub struct ArmVirtAcpi {
     pub numa: Vec<NumaNode>,
     /// The SMMUv3 of `iommu=smmuv3`, `legacy_smmuv3_present`.
     pub smmu: Option<IortSmmu>,
+    /// The VIOT of a virtio-iommu-pci.
+    pub viot: Option<ViotInfo>,
 }
 
 /// The machine wide SMMUv3 as the IORT describes it, `AcpiIortSMMUv3Dev`.
@@ -813,6 +816,11 @@ pub fn build(s: &ArmVirtAcpi) -> BuildTables {
 
     table::add_table(&mut table_offsets, data);
     build_iort(data, linker, s);
+
+    if let Some(v) = &s.viot {
+        table::add_table(&mut table_offsets, data);
+        viot::build_viot(data, linker, v, &s.oem_id, &s.oem_table_id);
+    }
 
     // XSDT is pointed to by RSDP
     let xsdt = data.len() as u32;

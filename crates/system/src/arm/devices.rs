@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use ruvm_base::Error;
 use ruvm_base::report::Location;
+use ruvm_hw_iommu::VirtioIommuConf;
 use ruvm_hw_storage::{BlockBackend, DriveConfig};
 use ruvm_hw_virtio::mmio::VIRTIO_MMIO_FORCE_LEGACY_DEFAULT;
 use ruvm_hw_virtio::pci::virtio_pci_optimal_num_queues;
@@ -46,6 +47,7 @@ enum Model {
     Blk,
     Rng,
     Serial,
+    Iommu,
 }
 
 /// The device types, with the bus they plug into.
@@ -56,6 +58,8 @@ const DEVICE_TYPES: &[(&str, Model, Transport)] = &[
     ("virtio-rng-pci", Model::Rng, Transport::Pci),
     ("virtio-serial-device", Model::Serial, Transport::Mmio),
     ("virtio-serial-pci", Model::Serial, Transport::Pci),
+    ("virtio-iommu-device", Model::Iommu, Transport::Mmio),
+    ("virtio-iommu-pci", Model::Iommu, Transport::Pci),
 ];
 
 /// `qdev_alias_table[]` for Arm, where the default virtio transport is PCI.
@@ -63,6 +67,7 @@ const DEVICE_ALIASES: &[(&str, &str)] = &[
     ("virtio-blk", "virtio-blk-pci"),
     ("virtio-rng", "virtio-rng-pci"),
     ("virtio-serial", "virtio-serial-pci"),
+    ("virtio-iommu", "virtio-iommu-pci"),
     ("virtio-net", "virtio-net-pci"),
     ("virtio-scsi", "virtio-scsi-pci"),
     ("virtio-balloon", "virtio-balloon-pci"),
@@ -94,6 +99,8 @@ pub(crate) struct Plug {
     mmio_bus: Option<usize>,
     /// `iommu_platform` of a PCI function: its DMA goes through the SMMU.
     iommu_platform: bool,
+    /// The properties of a virtio-iommu.
+    iommu: Option<VirtioIommuConf>,
     props: VirtioPciProps,
     loc: Option<Location>,
 }
@@ -179,6 +186,9 @@ fn plan_virtio(
         devfn: None,
         mmio_bus: None,
         iommu_platform: false,
+        // The virt compat property sets aw-bits to 48.
+        iommu: (model == Model::Iommu)
+            .then(|| VirtioIommuConf { aw_bits: 48, ..Default::default() }),
         props: VirtioPciProps::default(),
         loc: loc.clone(),
     };
@@ -191,6 +201,12 @@ fn plan_virtio(
         return Err(Located::new(loc, msg));
     }
     for (k, v) in opts.iter() {
+        if let Some(conf) = plug.iommu.as_mut()
+            && let Some(r) = crate::x86::virtio_iommu_prop(conf, k, v, pci, loc)
+        {
+            r?;
+            continue;
+        }
         match k {
             "driver" => {}
             "id" => plug.props.id = Some(v.to_string()),
@@ -422,6 +438,23 @@ pub(crate) fn plug(
                 Box::new(VirtioRng::new(Box::<RandomFile>::default(), VirtioRngConf::default()))
             }
             Model::Serial => Box::new(VirtioConsole::new(None)),
+            Model::Iommu => {
+                let conf = plug.iommu.as_ref().expect("planned with a config");
+                match (board, plug.transport) {
+                    (Target::Virt(board), Transport::Pci) => {
+                        let id = plug.props.id.clone();
+                        board.attach_virtio_iommu(conf, plug.devfn, id).map_err(at)?;
+                    }
+                    (Target::Virt(_), Transport::Mmio) => {
+                        return Err(at("VIRTIO-IOMMU is not attached to any PCI bus!".into()));
+                    }
+                    (Target::SbsaRef(_), _) => {
+                        let msg = "is not supported with machine sbsa-ref by ruvm yet";
+                        return Err(at(format!("-device {} {msg}", plug.typename)));
+                    }
+                }
+                continue;
+            }
         };
         let (devfn, iommu) = (plug.devfn, plug.iommu_platform);
         match (board, plug.transport, plug.mmio_bus) {
@@ -536,6 +569,33 @@ mod tests {
             err(&["loader,addr=0x40000000,data=1,data-len=4"]),
             "-device loader is not supported with this machine by ruvm yet"
         );
+    }
+
+    #[test]
+    fn virtio_iommu() {
+        let p = plan(V, &[], &[dev("virtio-iommu")]).unwrap();
+        assert_eq!(p.virtio[0].typename, "virtio-iommu-pci");
+        let conf = p.virtio[0].iommu.clone().unwrap();
+        assert_eq!((conf.boot_bypass, conf.aw_bits), (true, 48));
+        let p = plan(V, &[], &[dev("virtio-iommu-pci,aw-bits=40,boot-bypass=off,addr=3")]);
+        let plug = &p.unwrap().virtio[0];
+        let conf = plug.iommu.clone().unwrap();
+        assert_eq!((conf.boot_bypass, conf.aw_bits, plug.devfn), (false, 40, Some(3 << 3)));
+
+        let err = |arg: &str| plan(V, &[], &[dev(arg)]).unwrap_err()[0].1.message().to_string();
+        assert_eq!(
+            err("virtio-iommu-pci,granule=2k"),
+            "Parameter 'granule' does not accept value '2k'"
+        );
+        assert_eq!(
+            err("virtio-iommu-pci,reserved-regions=1"),
+            "Invalid parameter type for 'reserved-regions', expected: array"
+        );
+        assert_eq!(
+            err("virtio-iommu-device,reserved-regions=1"),
+            "Property 'virtio-iommu-device.reserved-regions' not found"
+        );
+        assert_eq!(err("virtio-iommu-pci,aw-bits=abc"), "Parameter 'aw-bits' expects integer");
     }
 
     #[test]

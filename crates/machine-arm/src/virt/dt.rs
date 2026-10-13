@@ -629,6 +629,29 @@ pub(crate) fn create_smmu(fdt: &mut Fdt, iommu_map: bool) -> Result<(), String> 
     fdt.setprop_cells(&pcie, "iommu-map", &[0, phandle, 0, 0x10000])
 }
 
+/// `create_virtio_iommu_dt_bindings()`: the node of the virtio-iommu-pci at requester ID `bdf`
+/// under the PCIe node, then, when the root bus does not bypass it (`iommu_map`), the
+/// `iommu-map` that sends every other requester ID to it.
+pub(crate) fn create_virtio_iommu(fdt: &mut Fdt, bdf: u16, iommu_map: bool) -> Result<(), String> {
+    let phandle = fdt.alloc_phandle();
+    let pcie = format!("/pcie@{VIRT_PCIE_MMIO:x}");
+    let node = format!("{pcie}/virtio_iommu@{:x},{:x}", (bdf >> 3) & 0x1f, bdf & 7);
+    fdt.add_subnode(&node)?;
+    fdt.setprop(&node, "compatible", b"virtio,pci-iommu\0pci1af4,1057\0")?;
+    fdt.setprop_cells(&node, "reg", &[u32::from(bdf) << 8, 0, 0, 0, 0])?;
+    fdt.setprop_cell(&node, "#iommu-cells", 1)?;
+    fdt.setprop_cell(&node, "phandle", phandle)?;
+    if !iommu_map {
+        return Ok(());
+    }
+    let bdf = u32::from(bdf);
+    fdt.setprop_cells(
+        &pcie,
+        "iommu-map",
+        &[0, phandle, 0, bdf, bdf + 1, phandle, bdf + 1, 0xffff - bdf],
+    )
+}
+
 /// The FDT part of `create_virtio_devices()`. The nodes go in from the highest address down
 /// so that the guest kernel, which walks them in reverse, probes the lowest transport first.
 pub(crate) fn add_virtio_nodes(fdt: &mut Fdt) -> Result<(), String> {

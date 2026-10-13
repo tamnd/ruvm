@@ -976,6 +976,34 @@ pub(crate) fn pflash_drives(
     Ok(out)
 }
 
+/// The `virtio-iommu-device` and `virtio-iommu-pci` properties: `None` when `k` is not one of
+/// them. `reserved-regions` is an array, which only JSON `-device` can give.
+pub(crate) fn virtio_iommu_prop(
+    conf: &mut VirtioIommuConf,
+    k: &str,
+    v: &str,
+    pci: bool,
+    loc: &Option<Location>,
+) -> Option<std::result::Result<(), Located>> {
+    let at = |e: Error| Located(loc.clone(), e);
+    let r = match k {
+        "boot-bypass" => crate::display::prop(k, v, |vi, n, out| vi.type_bool(Some(n), out))
+            .map(|b| conf.boot_bypass = b)
+            .map_err(at),
+        "granule" => GranuleMode::parse(v).map(|g| conf.granule = g).ok_or_else(|| {
+            Located::new(loc, format!("Parameter '{k}' does not accept value '{v}'"))
+        }),
+        "aw-bits" => crate::display::prop(k, v, |vi, n, out| vi.type_uint8(Some(n), out))
+            .map(|b| conf.aw_bits = b)
+            .map_err(at),
+        "reserved-regions" if pci => {
+            Err(Located::new(loc, format!("Invalid parameter type for '{k}', expected: array")))
+        }
+        _ => return None,
+    };
+    Some(r)
+}
+
 /// Works out what `-drive` and `-device` plug into a board of kind `kind` (`None` for the
 /// `none` machine). The errors are those of `qdev_device_add()` and
 /// `drive_check_orphaned()`; for orphans every one is listed.
@@ -1195,28 +1223,11 @@ fn plan_device(
                         .map_err(at)?;
                 continue;
             }
-            ("boot-bypass", Some(conf)) => {
-                conf.boot_bypass =
-                    crate::display::prop(k, v, |vi, n, out| vi.type_bool(Some(n), out))
-                        .map_err(at)?;
-                continue;
-            }
-            ("granule", Some(conf)) => {
-                conf.granule = GranuleMode::parse(v).ok_or_else(|| {
-                    Located::new(loc, format!("Parameter '{k}' does not accept value '{v}'"))
-                })?;
-                continue;
-            }
-            ("aw-bits", Some(conf)) => {
-                conf.aw_bits = crate::display::prop(k, v, |vi, n, out| vi.type_uint8(Some(n), out))
-                    .map_err(at)?;
-                continue;
-            }
-            ("reserved-regions", Some(_)) if pci => {
-                return Err(Located::new(
-                    loc,
-                    format!("Invalid parameter type for '{k}', expected: array"),
-                ));
+            (_, Some(conf)) => {
+                if let Some(r) = virtio_iommu_prop(conf, k, v, pci, loc) {
+                    r?;
+                    continue;
+                }
             }
             _ => {}
         }
