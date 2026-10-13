@@ -23,6 +23,7 @@ use ruvm_hw_iommu::virtio_iommu::{
 };
 use ruvm_hw_iommu::{IntelIommu, IntelIommuConf, Viommu, VirtioIommu, VirtioIommuConf};
 use ruvm_hw_tpm::TpmBackend;
+use ruvm_hw_tpm::crb::TpmCrb;
 use ruvm_hw_tpm::tis::TpmTis;
 use ruvm_hw_virtio::virtio::VIRTIO_F_IOMMU_PLATFORM;
 use ruvm_hw_virtio::{
@@ -269,6 +270,18 @@ impl X86Board {
         match self {
             X86Board::Q35(m, _) => m.attach_tpm_tis(be, irq),
             X86Board::Microvm(_) => Err("tpm-tis on microvm is not supported by ruvm yet".into()),
+        }
+    }
+
+    /// The board part of `tpm_crb_realize()`, see [`Q35::attach_tpm_crb`].
+    pub fn attach_tpm_crb(
+        &self,
+        be: Box<dyn TpmBackend>,
+        cap_chunk: bool,
+    ) -> Result<Arc<TpmCrb>, String> {
+        match self {
+            X86Board::Q35(m, _) => m.attach_tpm_crb(be, cap_chunk),
+            X86Board::Microvm(_) => Err("tpm-crb on microvm is not supported by ruvm yet".into()),
         }
     }
 

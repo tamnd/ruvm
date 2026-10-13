@@ -9,9 +9,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use ruvm_base::report::{Location, error_report, push_location, report_error};
 use ruvm_chardev::Chardevs;
 use ruvm_hw_tpm::TpmBackend;
-use ruvm_qapi::opts::{
-    OptsHandle, QemuOptDesc, QemuOptType, QemuOpts, QemuOptsList, is_help_option,
-};
+#[cfg(unix)]
+use ruvm_qapi::opts::{OptsHandle, is_help_option};
+use ruvm_qapi::opts::{QemuOptDesc, QemuOptType, QemuOpts, QemuOptsList};
 
 /// A backend and its id, `TPMBackend`. The device that takes it leaves `None`.
 struct Backend {
@@ -142,7 +142,7 @@ fn emulator_create(_: &Chardevs, _: &QemuOpts) -> Result<Box<dyn TpmBackend>, St
 
 /// What the `tpmdev` property of a TPM device does with the id it is given, `set_tpm()` and
 /// `tpm_backend_init()`: takes the backend. `prop` is `<type>.tpmdev` for the error.
-pub(crate) fn take(prop: &str, id: &str) -> Result<Box<dyn TpmBackend>, String> {
+fn take(prop: &str, id: &str) -> Result<Box<dyn TpmBackend>, String> {
     let mut all = backends();
     let Some(b) = all.iter_mut().find(|b| b.id == id) else {
         return Err(format!("Property '{prop}' can't find value '{id}'"));
@@ -150,8 +150,13 @@ pub(crate) fn take(prop: &str, id: &str) -> Result<Box<dyn TpmBackend>, String> 
     b.be.take().ok_or_else(|| format!("TPM backend '{id}' is already initialized"))
 }
 
-/// The `tpm_find()` check of a TPM device's realize: counts the device, and says whether it is
-/// the only one.
-pub(crate) fn add_device() -> bool {
-    DEVICES.fetch_add(1, Ordering::AcqRel) == 0
+/// The start of a TPM device's realize, given its `tpmdev` property: takes the backend when
+/// the property is set, then does the `tpm_find()` check that this is the only TPM device and
+/// the check that it has a backend.
+pub(crate) fn realize(prop: &str, tpmdev: Option<&str>) -> Result<Box<dyn TpmBackend>, String> {
+    let be = tpmdev.map(|id| take(prop, id)).transpose()?;
+    if DEVICES.fetch_add(1, Ordering::AcqRel) != 0 {
+        return Err("at most one TPM device is permitted".to_string());
+    }
+    be.ok_or_else(|| "'tpmdev' property is required".to_string())
 }

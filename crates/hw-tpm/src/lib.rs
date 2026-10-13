@@ -2,10 +2,11 @@
 
 //! TPM TIS, CRB and the SPAPR vTPM, with the swtpm and passthrough backends.
 //!
-//! What is here so far: the TIS FIFO interface ([`tis`]), the PPI memory ([`ppi`]) and the
-//! swtpm backend ([`emulator`]).
+//! What is here so far: the TIS FIFO interface ([`tis`]), the CRB interface ([`crb`]), the PPI
+//! memory ([`ppi`]) and the swtpm backend ([`emulator`]).
 
 pub mod backend;
+pub mod crb;
 #[cfg(unix)]
 pub mod emulator;
 pub mod ppi;
