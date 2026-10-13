@@ -119,8 +119,8 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
         let (device, node_name) = (arg.device.as_deref(), arg.node_name.as_deref());
         let exists = |n: &str| v.block.node(n).is_some();
         match v.drives.get() {
-            Some(d) => d.block_resize(device, node_name, arg.size, exists),
-            None => Drives::default().block_resize(device, node_name, arg.size, exists),
+            Some(d) => d.block_resize(&v.block, device, node_name, arg.size, exists),
+            None => Drives::default().block_resize(&v.block, device, node_name, arg.size, exists),
         }
     });
     let v = vm.clone();
