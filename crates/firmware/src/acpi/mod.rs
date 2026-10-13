@@ -7,6 +7,7 @@ pub mod aml;
 pub mod arm_virt;
 pub mod cpuhp;
 pub mod devices;
+pub mod dmar;
 pub mod gpex;
 pub mod linker;
 pub mod microvm;

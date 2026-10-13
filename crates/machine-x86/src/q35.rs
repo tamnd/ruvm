@@ -44,6 +44,7 @@ use std::time::SystemTime;
 
 use ruvm_base::ClockType;
 use ruvm_firmware::acpi::devices::IsaDevice;
+use ruvm_firmware::acpi::dmar::{DmarInfo, DmarScope};
 use ruvm_firmware::acpi::pci::CrsRange;
 use ruvm_firmware::acpi::q35::{
     self as acpi_q35, PciDevice as AcpiPciDevice, PciDeviceAml, Q35Acpi,
@@ -71,6 +72,7 @@ use ruvm_hw_intc::i8259::{I8259Pair, i8259_init};
 use ruvm_hw_intc::ioapic::{
     IO_APIC_DEFAULT_ADDRESS, IOAPIC_NUM_PINS, IOAPIC_VER_DEF, IoApic, IoApicMsiHandler, IoApics,
 };
+use ruvm_hw_iommu::{DMAR_REG_BASE, DMAR_REG_SIZE, IntelIommu, TYPE_INTEL_IOMMU_MEMORY_REGION};
 use ruvm_hw_pci::q35::{Q35Config, Q35PciHost};
 use ruvm_hw_pci::regs::{
     PCI_CLASS_DEVICE, PCI_HEADER_TYPE, PCI_HEADER_TYPE_BRIDGE, PCI_SECONDARY_BUS,
@@ -450,6 +452,8 @@ struct AcpiSource {
     serials: Vec<usize>,
     /// The requester ID of the virtio-iommu-pci function, which gets a VIOT.
     virtio_iommu: OnceLock<u16>,
+    /// The intel-iommu, which gets a DMAR.
+    intel_iommu: OnceLock<Arc<IntelIommu>>,
 }
 
 impl AcpiSource {
@@ -546,12 +550,33 @@ impl AcpiSource {
             pci_hole64: (hole64_end > hole64_start)
                 .then(|| CrsRange { base: hole64_start, limit: hole64_end - 1 }),
             pci_devices: self.pci_devices(self.host.bus()),
+            dmar: self.intel_iommu.get().map(|iommu| {
+                let conf = iommu.conf();
+                DmarInfo {
+                    aw_bits: conf.aw_bits,
+                    intr: conf.intr_supported(),
+                    device_iotlb: conf.device_iotlb,
+                    scopes: dmar_scopes(self.host.bus()),
+                }
+            }),
             viot: self
                 .virtio_iommu
                 .get()
                 .map(|&bdf| ViotInfo { bdf, ranges: vec![pci_bus_range(self.host.bus())] }),
         }
     }
+}
+
+/// The DRHD device scopes of the functions on the root bus, `insert_scope()`.
+fn dmar_scopes(bus: &PciBus) -> Vec<DmarScope> {
+    let mut devs = bus.devices();
+    devs.sort_by_key(|d| d.devfn());
+    devs.iter()
+        .map(|d| DmarScope {
+            devfn: d.devfn(),
+            bridge: d.with_config(|c| c.config[PCI_HEADER_TYPE] & 0x7f == PCI_HEADER_TYPE_BRIDGE),
+        })
+        .collect()
 }
 
 /// `pci_bus_range()`: the bus numbers behind `bus`, from its bridges as the firmware set them.
@@ -667,6 +692,8 @@ pub struct Q35 {
     ioapics: IoApics,
     ioapic: Arc<IoApic>,
     msi_hook: Arc<RwLock<Option<IoApicMsiHandler>>>,
+    /// Sends an MSI to the APICs, through `msi_hook` when it is set.
+    msi: IoApicMsiHandler,
     gsi_hook: GsiHookSlot,
     request_hook: Arc<RwLock<Option<SystemRequestHandler>>>,
     pic: Option<I8259Pair>,
@@ -1212,6 +1239,7 @@ impl Q35 {
             hpet: hpet.is_some(),
             serials: (0..MAX_ISA_SERIAL_PORTS).filter(|&i| serials[i].is_some()).collect(),
             virtio_iommu: OnceLock::new(),
+            intel_iommu: OnceLock::new(),
         });
 
         Ok(Q35 {
@@ -1259,6 +1287,7 @@ impl Q35 {
             ioapics,
             ioapic,
             msi_hook,
+            msi,
             gsi_hook,
             request_hook,
             pic,
@@ -1806,6 +1835,26 @@ impl Q35 {
     /// Gives the ACPI tables a VIOT for the virtio-iommu-pci function with requester ID `bdf`.
     pub fn set_virtio_iommu(&self, bdf: u16) {
         let _ = self.acpi_src.virtio_iommu.set(bdf);
+    }
+
+    /// The q35 part of `vtd_realize()`: maps the registers of `iommu`, has it translate the
+    /// DMA of the root bus, sends its own interrupts to the APICs and gives the ACPI tables a
+    /// DMAR.
+    pub fn attach_intel_iommu(&self, iommu: &Arc<IntelIommu>) -> Result<(), String> {
+        let r = self
+            .mem
+            .new_io("intel_iommu", u128::from(DMAR_REG_SIZE), iommu.mmio_ops())
+            .map_err(err)?;
+        self.mem.add_subregion(self.system, DMAR_REG_BASE, r).map_err(err)?;
+        let msi = Arc::clone(&self.msi);
+        iommu.set_msi_sender(move |addr, data| msi(addr, data));
+        let ops = Arc::clone(iommu);
+        self.pci_dma
+            .set_iommu(TYPE_INTEL_IOMMU_MEMORY_REGION, Box::new(move |bdf| ops.device_ops(bdf)));
+        let reset = Arc::clone(iommu);
+        self.add_reset_hook(Box::new(move || reset.system_reset()));
+        let _ = self.acpi_src.intel_iommu.set(Arc::clone(iommu));
+        Ok(())
     }
 
     /// Has `hook` run on every system reset, after the board's own devices.

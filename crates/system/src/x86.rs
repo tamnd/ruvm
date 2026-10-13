@@ -30,7 +30,8 @@ use ruvm_firmware::smbios::{SmbiosOptions, SmbiosTopology, parse_uuid};
 use ruvm_hw_char::serial::{Serial, SerialBackend};
 use ruvm_hw_core::Clock;
 use ruvm_hw_core::timer::TimeSource;
-use ruvm_hw_iommu::{GranuleMode, VirtioIommuConf};
+use ruvm_hw_iommu::intel_iommu::OnOffAuto;
+use ruvm_hw_iommu::{GranuleMode, IntelIommuConf, TYPE_INTEL_IOMMU_DEVICE, VirtioIommuConf};
 use ruvm_hw_misc::debugexit::{
     DEBUG_EXIT_DEFAULT_IOBASE, DEBUG_EXIT_DEFAULT_IOSIZE, IsaDebugExit, IsaDebugExitConfig,
 };
@@ -967,6 +968,8 @@ pub(crate) struct Plan {
     /// The sound cards of `-device`, each with the number of virtio and display plugs
     /// before it.
     pub audio: Vec<(usize, usize, crate::audio::AudioPlug)>,
+    /// The `intel-iommu` devices, each with the number of virtio plugs before it.
+    pub intel_iommu: Vec<(usize, IntelIommuConf, Option<Location>)>,
 }
 
 /// One `-device`, planned.
@@ -978,6 +981,7 @@ enum Planned {
     Console,
     Display(crate::display::DisplayPlug),
     Audio(crate::audio::AudioPlug),
+    IntelIommu(IntelIommuConf),
 }
 
 /// The drives of the q35 system flashes: `-machine pflashN=` names a drive by id, and
@@ -1054,6 +1058,80 @@ pub(crate) fn virtio_iommu_prop(
     Some(r)
 }
 
+/// The `intel-iommu` properties, with the checks `qdev_device_add()` makes before realize.
+fn plan_intel_iommu(
+    kind: Option<BoardKind>,
+    opts: &ruvm_qapi::opts::QemuOpts,
+    loc: &Option<Location>,
+) -> std::result::Result<IntelIommuConf, Located> {
+    if kind != Some(BoardKind::Q35) {
+        return Err(Located::new(
+            loc,
+            "Parameter 'driver' expects a dynamic sysbus device type for the machine",
+        ));
+    }
+    match opts.get("bus") {
+        Some("pcie.0") => {
+            return Err(Located::new(
+                loc,
+                format!("Device '{TYPE_INTEL_IOMMU_DEVICE}' can't go on PCIE bus"),
+            ));
+        }
+        Some(b) => return Err(Located::new(loc, format!("Bus '{b}' not found"))),
+        None => {}
+    }
+    let mut conf = IntelIommuConf::default();
+    let at = |e: Error| Located(loc.clone(), e);
+    let boolean = |k: &str, v: &str| {
+        crate::display::prop(k, v, |vi, n, out| vi.type_bool(Some(n), out)).map_err(at)
+    };
+    for (k, v) in opts.iter() {
+        match k {
+            "driver" | "id" => {}
+            "intremap" | "eim" => {
+                let val = OnOffAuto::parse(v).ok_or_else(|| {
+                    Located::new(loc, format!("Parameter '{k}' does not accept value '{v}'"))
+                })?;
+                if k == "eim" {
+                    conf.eim = val;
+                } else {
+                    conf.intremap = val;
+                }
+            }
+            "device-iotlb" => conf.device_iotlb = boolean(k, v)?,
+            "dma-translation" => conf.dma_translation = boolean(k, v)?,
+            "caching-mode" => conf.caching_mode = boolean(k, v)?,
+            "scalable-mode" => conf.scalable_mode = boolean(k, v)?,
+            "fsts" => conf.fsts = boolean(k, v)?,
+            "snoop-control" => conf.snoop_control = boolean(k, v)?,
+            "svm" => conf.svm = boolean(k, v)?,
+            "stale-tm" => conf.stale_tm = boolean(k, v)?,
+            "fs1gp" => conf.fs1gp = boolean(k, v)?,
+            "aw-bits" | "pasid-bits" => {
+                let b = crate::display::prop(k, v, |vi, n, out| vi.type_uint8(Some(n), out))
+                    .map_err(at)?;
+                if k == "aw-bits" {
+                    conf.aw_bits = b;
+                } else {
+                    conf.pasid_bits = b;
+                }
+            }
+            "version" => {
+                conf.version =
+                    crate::display::prop(k, v, |vi, n, out| vi.type_uint32(Some(n), out))
+                        .map_err(at)?;
+            }
+            _ => {
+                return Err(Located::new(
+                    loc,
+                    format!("Property '{TYPE_INTEL_IOMMU_DEVICE}.{k}' not found"),
+                ));
+            }
+        }
+    }
+    Ok(conf)
+}
+
 /// Works out what `-drive` and `-device` plug into a board of kind `kind` (`None` for the
 /// `none` machine). The errors are those of `qdev_device_add()` and
 /// `drive_check_orphaned()`; for orphans every one is listed.
@@ -1106,6 +1184,7 @@ pub(crate) fn plan(
             Planned::Virtio(plug) => p.virtio.push(plug),
             Planned::Isa(plug) => p.isa.push(plug),
             Planned::Display(plug) => p.display.push((p.virtio.len(), plug)),
+            Planned::IntelIommu(conf) => p.intel_iommu.push((p.virtio.len(), conf, loc.clone())),
             Planned::Audio(plug) => {
                 crate::audio::add_plug(&mut p.audio, p.virtio.len(), p.display.len(), plug)
                     .map_err(|e| vec![e])?;
@@ -1197,6 +1276,9 @@ fn plan_device(
     }
     if driver == TYPE_IDE_HD {
         return plan_ide_hd(kind, drives, used, opts, loc).map(Planned::IdeHd);
+    }
+    if driver == TYPE_INTEL_IOMMU_DEVICE {
+        return plan_intel_iommu(kind, opts, loc).map(Planned::IntelIommu);
     }
     if driver == TYPE_VIRTCONSOLE {
         if let Some((k, _)) = opts.iter().find(|(k, _)| !matches!(*k, "driver" | "id" | "bus")) {
@@ -2042,7 +2124,17 @@ fn build(
             }
         }
     };
+    let mut intel_iommu = p.intel_iommu.iter().peekable();
+    // The intel-iommu devices that come before virtio plug `at`, or all that are left.
+    let mut plug_iommus = |board: &mut X86Board, at: Option<usize>| {
+        while let Some((_, conf, loc)) = intel_iommu.next_if(|(vi, ..)| at.is_none_or(|i| *vi == i))
+        {
+            board.attach_intel_iommu(conf).map_err(|e| one(Located::new(loc, e)))?;
+        }
+        Ok::<(), Vec<Located>>(())
+    };
     for (i, plug) in p.virtio.into_iter().enumerate() {
+        plug_iommus(&mut board, Some(i))?;
         plug_cards(&mut board, Some(i))?;
         if let Some(conf) = &plug.iommu {
             let attached = match plug.transport {
@@ -2078,6 +2170,7 @@ fn build(
             nic.connect(handle);
         }
     }
+    plug_iommus(&mut board, None)?;
     plug_cards(&mut board, None)?;
     let mut attachments = Vec::new();
     for plug in &p.isa {
@@ -2866,6 +2959,43 @@ mod tests {
         );
         let p = plan(k, &d, &[], false).unwrap();
         assert_eq!(p.default_cdrom, None);
+    }
+
+    #[test]
+    fn intel_iommu_properties() {
+        let q = Some(BoardKind::Q35);
+        let err = |kind, args: &[&str]| {
+            plan(kind, &[], &devices(args), true).unwrap_err()[0].1.message().to_string()
+        };
+        let args = ["virtio-rng-pci", "intel-iommu,intremap=off,aw-bits=39,caching-mode=on"];
+        let p = plan(q, &[], &devices(&args), true).unwrap();
+        let (at, conf, _) = &p.intel_iommu[0];
+        assert_eq!(*at, 1);
+        assert_eq!(
+            *conf,
+            IntelIommuConf {
+                intremap: OnOffAuto::Off,
+                aw_bits: 39,
+                caching_mode: true,
+                ..Default::default()
+            }
+        );
+        let dynamic = "Parameter 'driver' expects a dynamic sysbus device type for the machine";
+        assert_eq!(err(Some(BoardKind::Microvm), &["intel-iommu"]), dynamic);
+        assert_eq!(err(None, &["intel-iommu"]), dynamic);
+        assert_eq!(
+            err(q, &["intel-iommu,bus=pcie.0"]),
+            "Device 'intel-iommu' can't go on PCIE bus"
+        );
+        assert_eq!(err(q, &["intel-iommu,bus=foo"]), "Bus 'foo' not found");
+        assert_eq!(err(q, &["intel-iommu,pt=on"]), "Property 'intel-iommu.pt' not found");
+        assert_eq!(err(q, &["intel-iommu,eim=x"]), "Parameter 'eim' does not accept value 'x'");
+        assert_eq!(err(q, &["intel-iommu,aw-bits=300"]), "Parameter 'aw-bits' expects uint8_t");
+        assert_eq!(
+            err(q, &["intel-iommu,caching-mode=x"]),
+            "Parameter 'caching-mode' expects 'on' or 'off'"
+        );
+        assert_eq!(err(q, &["intel-iommu,version=-1"]), "Parameter 'version' expects uint32_t");
     }
 
     #[test]
