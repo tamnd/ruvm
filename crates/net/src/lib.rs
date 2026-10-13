@@ -18,6 +18,7 @@
 
 #![deny(unsafe_code)]
 
+mod announce;
 mod client;
 mod hub;
 mod net;
@@ -46,6 +47,7 @@ mod tap_linux;
 #[cfg(unix)]
 mod vhost_user;
 
+pub use announce::{AnnounceTimers, announce_self_create};
 pub use client::{
     ETH_ZLEN, MAX_QUEUE_NUM, NET_BUFSIZE, NetClient, NetClientOps, NetOffloads, NetQueue,
     PACKET_FLAG_NONE, PACKET_FLAG_RAW, QUEUE_MAXLEN, SentCb, VNET_HDR_LEN, VNET_HDR_MRG_RXBUF_LEN,

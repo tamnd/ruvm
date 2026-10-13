@@ -88,6 +88,12 @@ pub trait NetClientOps: Send + Sync {
         let _ = nc;
     }
 
+    /// `announce`: a NIC model that can have the guest announce itself asks it to, after the
+    /// RARP frame `announce-self` sent for it.
+    fn announce(&self, nc: &NetClient) {
+        let _ = nc;
+    }
+
     /// Called once when the client is deleted.
     fn cleanup(&self, nc: &NetClient) {
         let _ = nc;

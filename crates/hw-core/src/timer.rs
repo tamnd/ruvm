@@ -78,6 +78,11 @@ impl Clock {
         self.kind
     }
 
+    /// Whether the clock only moves when [`Clock::advance_to`] steps it.
+    pub fn is_manual(&self) -> bool {
+        matches!(self.source, TimeSource::Manual)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
