@@ -25,8 +25,8 @@
 //!   The other models, a profile CPU that needs such an extension, and a property that turns
 //!   one on fail with "... is not supported by ruvm yet".
 //! - The machine properties are taken only where their value describes the board that
-//!   exists: `aclint=off` and `iommu-sys=off` or `auto`. Other values fail with "... is not
-//!   supported by ruvm yet". `aia`, `aia-guests`, `acpi` and `spcr` take all of QEMU's
+//!   exists: `iommu-sys=off` or `auto`. Other values fail with "... is not supported by
+//!   ruvm yet". `aclint`, `aia`, `aia-guests`, `acpi` and `spcr` take all of QEMU's
 //!   values. The `pflash0` and `pflash1` properties (block node names) are not there; use
 //!   `-drive if=pflash`.
 //! - Every hart is in one socket: `-smp sockets=` above 1 fails.
@@ -121,6 +121,8 @@ pub(crate) struct BoardOptions {
     pub acpi_off: bool,
     /// `spcr=off`: no SPCR among the ACPI tables.
     pub spcr_off: bool,
+    /// `aclint`: the ACLINT devices instead of the SiFive CLINT.
+    pub aclint: bool,
 }
 
 /// Visits `name` of `machine` as a `T`, the way the machine property setter does.
@@ -181,11 +183,8 @@ fn on_off_auto<'a>(name: &str, value: &'a str) -> Result<&'a str> {
 fn check_virt_prop(o: &mut BoardOptions, name: &str, value: &str) -> Result<()> {
     match name {
         "aclint" => {
-            if prop_bool(name, value)? {
-                Err(not_supported(name, value))
-            } else {
-                Ok(())
-            }
+            o.aclint = prop_bool(name, value)?;
+            Ok(())
         }
         "aia" => {
             o.aia = match value {
@@ -826,6 +825,7 @@ pub(crate) fn start_board(
     cfg.aia_guests = opts.aia_guests;
     cfg.acpi = !opts.acpi_off;
     cfg.spcr = !opts.spcr_off;
+    cfg.aclint = opts.aclint;
     for (slot, drive) in cfg.pflash.iter_mut().zip(plan.pflash) {
         if let Some(backing) = drive {
             *slot = backing;
@@ -975,6 +975,11 @@ mod tests {
         m.put("aia-guests", "3");
         let o = take_board_options(&m).unwrap();
         assert_eq!((o.aia, o.aia_guests), (VirtAia::AplicImsic, 3));
+        assert!(!o.aclint);
+        let mut m = QDict::new();
+        m.put("aclint", "on");
+        m.put("aia", "aplic-imsic");
+        assert!(take_board_options(&m).unwrap().aclint);
         let mut m = QDict::new();
         m.put("aia", "aplic");
         m.put("aia-guests", "2x");

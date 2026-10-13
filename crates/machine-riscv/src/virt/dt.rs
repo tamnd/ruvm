@@ -10,18 +10,23 @@
 use ruvm_hw_misc::sifive_test::{FINISHER_PASS, FINISHER_RESET};
 use ruvm_machine_arm::fdt::{Fdt, sized_cells};
 use ruvm_target_riscv::cfg::RiscvCfg;
-use ruvm_target_riscv::cpu::{IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT};
+use ruvm_target_riscv::cpu::{IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT};
 
+use ruvm_hw_intc::riscv_aclint::{
+    RISCV_ACLINT_DEFAULT_MTIME, RISCV_ACLINT_DEFAULT_MTIMECMP, RISCV_ACLINT_DEFAULT_MTIMER_SIZE,
+    RISCV_ACLINT_SWI_SIZE,
+};
 use ruvm_hw_intc::riscv_imsic::imsic_hart_size;
 
 use super::aia::imsic_num_bits;
 use super::{
-    PCIE_IRQ, RTC_IRQ, UART0_IRQ, VIRT_APLIC_M, VIRT_APLIC_S, VIRT_APLIC_SIZE, VIRT_CLINT,
-    VIRT_CLINT_SIZE, VIRT_DRAM, VIRT_FLASH, VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE,
-    VIRT_IMSIC_M, VIRT_IMSIC_S, VIRT_IRQCHIP_NUM_MSIS, VIRT_IRQCHIP_NUM_SOURCES, VIRT_PCIE_ECAM,
-    VIRT_PCIE_ECAM_SIZE, VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE,
-    VIRT_PLATFORM_BUS, VIRT_PLATFORM_BUS_IRQ, VIRT_PLATFORM_BUS_SIZE, VIRT_PLIC, VIRT_PLIC_SIZE,
-    VIRT_RTC, VIRT_RTC_SIZE, VIRT_TEST, VIRT_TEST_SIZE, VIRT_UART0, VIRT_UART0_SIZE, VIRT_VIRTIO,
+    PCIE_IRQ, RTC_IRQ, UART0_IRQ, VIRT_ACLINT_SSWI, VIRT_ACLINT_SSWI_SIZE, VIRT_APLIC_M,
+    VIRT_APLIC_S, VIRT_APLIC_SIZE, VIRT_CLINT, VIRT_CLINT_SIZE, VIRT_DRAM, VIRT_FLASH,
+    VIRT_FLASH_SIZE, VIRT_FW_CFG, VIRT_FW_CFG_SIZE, VIRT_IMSIC_M, VIRT_IMSIC_S,
+    VIRT_IRQCHIP_NUM_MSIS, VIRT_IRQCHIP_NUM_SOURCES, VIRT_PCIE_ECAM, VIRT_PCIE_ECAM_SIZE,
+    VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE, VIRT_PLATFORM_BUS,
+    VIRT_PLATFORM_BUS_IRQ, VIRT_PLATFORM_BUS_SIZE, VIRT_PLIC, VIRT_PLIC_SIZE, VIRT_RTC,
+    VIRT_RTC_SIZE, VIRT_TEST, VIRT_TEST_SIZE, VIRT_UART0, VIRT_UART0_SIZE, VIRT_VIRTIO,
     VIRT_VIRTIO_SIZE, VIRTIO_COUNT, VIRTIO_IRQ, VirtAia, high_pcie_base,
 };
 
@@ -170,6 +175,8 @@ pub(crate) struct FinalizeArgs<'a> {
     pub(crate) aia: VirtAia,
     /// The guest interrupt files of each S level IMSIC, `aia-guests`.
     pub(crate) aia_guests: u32,
+    /// `aclint`: the ACLINT nodes instead of the SiFive CLINT.
+    pub(crate) aclint: bool,
 }
 
 /// `finalize_fdt()`: the CPU, memory, CLINT, interrupt controller, platform bus, virtio,
@@ -195,8 +202,8 @@ fn set_interrupts(fdt: &mut Fdt, name: &str, aia: VirtAia, irq: u32) -> Result<(
     }
 }
 
-/// `create_fdt_sockets()` for one socket, with the SiFive CLINT and the PLIC or the AIA
-/// devices. Returns the phandle of the interrupt parent of the devices and that of the MSI
+/// `create_fdt_sockets()` for one socket, with the SiFive CLINT or the ACLINT and the PLIC
+/// or the AIA devices. Returns the phandle of the interrupt parent of the devices and that of the MSI
 /// parent of PCIe (0 without IMSICs).
 fn create_fdt_sockets(
     fdt: &mut Fdt,
@@ -215,7 +222,11 @@ fn create_fdt_sockets(
     fdt.add_subnode(&clust_name)?;
     let intc_phandles = create_fdt_socket_cpus(fdt, args, &clust_name, phandle)?;
     create_fdt_socket_memory(fdt, args.ram_size)?;
-    create_fdt_socket_clint(fdt, &intc_phandles)?;
+    if args.aclint {
+        create_fdt_socket_aclint(fdt, args.aia, &intc_phandles)?;
+    } else {
+        create_fdt_socket_clint(fdt, &intc_phandles)?;
+    }
 
     let (mut msi_m_phandle, mut msi_s_phandle) = (0, 0);
     if args.aia == VirtAia::AplicImsic {
@@ -460,6 +471,54 @@ fn create_fdt_socket_clint(fdt: &mut Fdt, intc_phandles: &[u32]) -> Result<(), S
     fdt.setprop(&name, "interrupts-extended", &be_cells(&clint_cells))
 }
 
+/// `create_fdt_socket_aclint()`: the MSWI, MTIMER and SSWI of the harts, or the MTIMER
+/// alone with `aia=aplic-imsic`, where the IMSICs carry the software interrupts.
+fn create_fdt_socket_aclint(
+    fdt: &mut Fdt,
+    aia: VirtAia,
+    intc_phandles: &[u32],
+) -> Result<(), String> {
+    let lines =
+        |irq: u32| be_cells(&intc_phandles.iter().flat_map(|&p| [p, irq]).collect::<Vec<_>>());
+    let imsic = aia == VirtAia::AplicImsic;
+    let swi_size = u64::from(RISCV_ACLINT_SWI_SIZE);
+    if !imsic {
+        let name = format!("/soc/mswi@{VIRT_CLINT:x}");
+        fdt.add_subnode(&name)?;
+        fdt.setprop_string(&name, "compatible", "riscv,aclint-mswi")?;
+        fdt.setprop(&name, "reg", &cells(&[(2, VIRT_CLINT), (2, swi_size)], "mswi reg")?)?;
+        fdt.setprop(&name, "interrupts-extended", &lines(IRQ_M_SOFT))?;
+        fdt.setprop(&name, "interrupt-controller", &[])?;
+        fdt.setprop_cell(&name, "#interrupt-cells", 0)?;
+    }
+
+    let (addr, size) = if imsic {
+        (VIRT_CLINT, u64::from(RISCV_ACLINT_DEFAULT_MTIMER_SIZE))
+    } else {
+        (VIRT_CLINT + swi_size, VIRT_CLINT_SIZE - swi_size)
+    };
+    let (mtime, mtimecmp) =
+        (u64::from(RISCV_ACLINT_DEFAULT_MTIME), u64::from(RISCV_ACLINT_DEFAULT_MTIMECMP));
+    let name = format!("/soc/mtimer@{addr:x}");
+    fdt.add_subnode(&name)?;
+    fdt.setprop_string(&name, "compatible", "riscv,aclint-mtimer")?;
+    let reg = [(2, addr + mtime), (2, size - mtime), (2, addr + mtimecmp), (2, mtime)];
+    fdt.setprop(&name, "reg", &cells(&reg, "mtimer reg")?)?;
+    fdt.setprop(&name, "interrupts-extended", &lines(IRQ_M_TIMER))?;
+
+    if !imsic {
+        let name = format!("/soc/sswi@{VIRT_ACLINT_SSWI:x}");
+        fdt.add_subnode(&name)?;
+        fdt.setprop_string(&name, "compatible", "riscv,aclint-sswi")?;
+        let reg = [(2, VIRT_ACLINT_SSWI), (2, VIRT_ACLINT_SSWI_SIZE)];
+        fdt.setprop(&name, "reg", &cells(&reg, "sswi reg")?)?;
+        fdt.setprop(&name, "interrupts-extended", &lines(IRQ_S_SOFT))?;
+        fdt.setprop(&name, "interrupt-controller", &[])?;
+        fdt.setprop_cell(&name, "#interrupt-cells", 0)?;
+    }
+    Ok(())
+}
+
 /// `create_fdt_plic()`.
 fn create_fdt_plic(
     fdt: &mut Fdt,
@@ -698,7 +757,7 @@ mod tests {
     }
 
     fn build(cpu: &RiscvCfg, smp: usize, ram_size: u64) -> Fdt {
-        build_aia(cpu, smp, ram_size, VirtAia::None, 0, &seed())
+        build_aia(cpu, smp, ram_size, VirtAia::None, 0, false, &seed())
     }
 
     fn build_aia(
@@ -707,23 +766,25 @@ mod tests {
         ram_size: u64,
         aia: VirtAia,
         aia_guests: u32,
+        aclint: bool,
         seed: &[u8; 32],
     ) -> Fdt {
         let mut fdt = Fdt::new();
         create_fdt(&mut fdt, seed, cpu.pmu_mask).unwrap();
-        finalize_fdt(&mut fdt, FinalizeArgs { smp, ram_size, cpu, aia, aia_guests }).unwrap();
+        let args = FinalizeArgs { smp, ram_size, cpu, aia, aia_guests, aclint };
+        finalize_fdt(&mut fdt, args).unwrap();
         fdt_pack(&fdt).unwrap()
     }
 
     /// Build the tree of `golden`, a `dumpdtb` of QEMU 11.1.2 with 128 MiB, `-bios none` and
-    /// the given `-smp` and `-M virt,aia=...,aia-guests=...`, with its `rng-seed`, and check
-    /// that the two are the same bytes.
-    fn check_golden(golden: &[u8], smp: usize, aia: VirtAia, aia_guests: u32) -> Fdt {
+    /// the given `-smp` and `-M virt,aia=...,aia-guests=...,aclint=...`, with its `rng-seed`,
+    /// and check that the two are the same bytes.
+    fn check_golden(golden: &[u8], smp: usize, aia: VirtAia, aia_guests: u32, aclint: bool) -> Fdt {
         let qemu = Fdt::open_into(golden, golden.len()).unwrap();
         let seed: [u8; 32] = qemu.getprop("/chosen", "rng-seed").unwrap().try_into().unwrap();
         let imsic = aia == VirtAia::AplicImsic;
         let cpu = RiscvCfg { ext_smaia: imsic, ext_ssaia: imsic, ..RiscvCfg::default() };
-        let fdt = build_aia(&cpu, smp, 128 << 20, aia, aia_guests, &seed);
+        let fdt = build_aia(&cpu, smp, 128 << 20, aia, aia_guests, aclint, &seed);
         assert_eq!(fdt.as_bytes().len(), golden.len());
         assert!(fdt.as_bytes() == golden, "the tree differs from QEMU's");
         fdt
@@ -732,7 +793,7 @@ mod tests {
     #[test]
     fn aplic_matches_qemu() {
         let golden = include_bytes!("../../tests/data/virt-aplic-smp2.dtb");
-        let fdt = check_golden(golden, 2, VirtAia::Aplic, 0);
+        let fdt = check_golden(golden, 2, VirtAia::Aplic, 0, false);
         // cpu@1 and its controller, cpu@0 and its controller, then the M and S domains.
         assert_eq!(fdt.get_phandle("/soc/interrupt-controller@c000000").unwrap(), 5);
         assert_eq!(fdt.get_phandle("/soc/interrupt-controller@d000000").unwrap(), 6);
@@ -746,7 +807,7 @@ mod tests {
     #[test]
     fn aplic_imsic_matches_qemu() {
         let golden = include_bytes!("../../tests/data/virt-aplic-imsic.dtb");
-        let fdt = check_golden(golden, 1, VirtAia::AplicImsic, 0);
+        let fdt = check_golden(golden, 1, VirtAia::AplicImsic, 0, false);
         let isa = fdt.getprop("/cpus/cpu@0", "riscv,isa").unwrap();
         assert!(isa.windows(13).any(|w| w == b"_smaia_ssaia_"));
         let pci = fdt.getprop_cell("/soc/pci@30000000", "msi-parent").unwrap();
@@ -756,11 +817,31 @@ mod tests {
     #[test]
     fn aplic_imsic_guests_match_qemu() {
         let golden = include_bytes!("../../tests/data/virt-aplic-imsic-smp2-g3.dtb");
-        let fdt = check_golden(golden, 2, VirtAia::AplicImsic, 3);
+        let fdt = check_golden(golden, 2, VirtAia::AplicImsic, 3, false);
         let s = "/soc/interrupt-controller@28000000";
         assert_eq!(fdt.getprop_cell(s, "riscv,guest-index-bits").unwrap(), 2);
         // Two harts of four pages each.
         assert_eq!(fdt.getprop(s, "reg").unwrap(), be_cells(&[0, 0x2800_0000, 0, 0x8000]));
+    }
+
+    #[test]
+    fn aclint_matches_qemu() {
+        let golden = include_bytes!("../../tests/data/virt-aclint-smp2.dtb");
+        let fdt = check_golden(golden, 2, VirtAia::None, 0, true);
+        assert!(fdt.getprop("/soc/clint@2000000", "reg").is_err());
+        let sswi = fdt.getprop("/soc/sswi@2f00000", "interrupts-extended").unwrap();
+        assert_eq!(sswi, be_cells(&[4, 1, 2, 1]));
+        let mtimer = fdt.getprop("/soc/mtimer@2004000", "reg").unwrap();
+        assert_eq!(mtimer, be_cells(&[0, 0x200_bff8, 0, 0x4008, 0, 0x200_4000, 0, 0x7ff8]));
+    }
+
+    #[test]
+    fn aclint_aplic_imsic_matches_qemu() {
+        let golden = include_bytes!("../../tests/data/virt-aclint-aplic-imsic.dtb");
+        let fdt = check_golden(golden, 1, VirtAia::AplicImsic, 0, true);
+        assert!(fdt.getprop("/soc/mswi@2000000", "reg").is_err());
+        let mtimer = fdt.getprop("/soc/mtimer@2000000", "reg").unwrap();
+        assert_eq!(mtimer, be_cells(&[0, 0x200_7ff8, 0, 0x8, 0, 0x200_0000, 0, 0x7ff8]));
     }
 
     #[test]

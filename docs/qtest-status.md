@@ -85,7 +85,7 @@ The QEMU 11.1 build here is softmmu only, so the linux-user reference is the dis
 
 ## What is left
 
-On riscv64, `virt` now runs under the qtest accelerator with no harts and with its timers on the qtest clock, has a `/machine` object, and is listed in `query-machines` with the values QEMU 11.1 gives. qom-test and test-hmp pass on it. qos-test and bios-tables-test still register no cases, and riscv-csr-test and iommu-riscv-test now start and fail on the CPU model and the devices they ask for.
+On riscv64, `virt` now runs under the qtest accelerator with no harts and with its timers on the qtest clock, has a `/machine` object, and is listed in `query-machines` with the values QEMU 11.1 gives. qom-test and test-hmp pass on it. The machine takes `aclint=on` with QEMU's devices and device tree, which every qos-test command line on riscv64 asks for. qos-test still registers no cases, because it looks for the QOM device types of the virtio devices (`virtio-blk-pci` and the others, with `device` among their parents) and ruvm does not list them yet. bios-tables-test registers no cases either. riscv-csr-test and iommu-riscv-test now start and fail on the CPU model and the devices they ask for.
 
 On aarch64, `query-machines` still lists only `none`, although ruvm runs the `virt` machine on TCG. Most qtests choose their machines from that list, so bios-tables-test, cdrom-test, qos-test, arm-cpu-features, numa-test and migration-test register nothing or skip, and qom-test and test-hmp cover one machine instead of many. Running aarch64 `virt` under the qtest accelerator is the next change.
 
