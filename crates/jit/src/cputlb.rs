@@ -912,7 +912,15 @@ fn notdirty_write(
     let jit = cpu.jit();
     let ram_addr = vaddr.wrapping_add(full.xlat_offset);
     if jit.page_has_code(ram_addr) {
-        tb_invalidate_phys_range_fast(cpu, ram_addr, size as u64, ra)?;
+        if jit.config.guest_base.is_some() {
+            // Direct accesses only come here once the host refused the write, so drop all
+            // the code of the page, as QEMU's user mode `page_unprotect` does, to let the host
+            // write it again.
+            let page = ram_addr & jit.page_mask();
+            tb_invalidate_phys_range_fast(cpu, page, jit.page_size(), ra)?;
+        } else {
+            tb_invalidate_phys_range_fast(cpu, ram_addr, size as u64, ra)?;
+        }
     }
     let TlbSection::Ram { block, ram_base } = &full.section else { return Ok(()) };
     let off = ram_addr - ram_base;

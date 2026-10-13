@@ -414,6 +414,11 @@ pub struct FuncConfig {
     /// log2 of the guest page size of the softmmu TLB that the block's `qemu_ld` and `qemu_st`
     /// look up, for host backends that inline the lookup, or `None` when there is no such TLB.
     pub tlb_page_bits: Option<u32>,
+    /// User mode `guest_base`: guest addresses below `1 << bits` are at host address
+    /// `base + addr`, so that host backends that can make `qemu_ld` and `qemu_st` straight
+    /// host accesses do, sending the other addresses, and accesses the host refuses, to the
+    /// slow path. `None` in system mode, and backends that cannot use it ignore it.
+    pub guest_base: Option<(u64, u32)>,
 }
 
 impl Default for FuncConfig {
@@ -427,6 +432,7 @@ impl Default for FuncConfig {
             no_goto_ptr: false,
             fence_mapping: FenceMapping::Qemu,
             tlb_page_bits: None,
+            guest_base: None,
         }
     }
 }

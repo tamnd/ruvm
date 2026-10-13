@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::Instant;
 
 use ruvm_jit_core::hash::{FastHashMap, FastHashSet};
@@ -54,6 +54,13 @@ pub struct JitConfig {
     /// `CONFIG_USER_ONLY`: the guest is one process run by user mode emulation, so exceptions
     /// go back to the caller of `cpu_exec()` instead of being delivered into the guest.
     pub user_only: bool,
+    /// User mode `guest_base`: the host address of guest address 0, and log2 of the bound
+    /// below which guest addresses are host accesses there, for host backends that make
+    /// `qemu_ld` and `qemu_st` direct accesses ([`ruvm_jit_core::ir::FuncConfig::guest_base`]).
+    /// A host fault in such an access must go to [`crate::host_fault_target`]. Writes to pages
+    /// of translated code then invalidate the whole page, so that the caller's code protect
+    /// hook ([`Jit::set_code_protect`]) can let the host write it again.
+    pub guest_base: Option<(u64, u32)>,
 }
 
 impl Default for JitConfig {
@@ -68,6 +75,7 @@ impl Default for JitConfig {
             optimize: true,
             target_long_bits: 64,
             user_only: false,
+            guest_base: None,
         }
     }
 }
@@ -116,7 +124,12 @@ pub struct Jit {
     pub(crate) start: Instant,
     pub(crate) self_ref: Weak<Jit>,
     pub(crate) plugin: crate::plugin::JitPlugin,
+    /// See [`Jit::set_code_protect`].
+    pub(crate) code_protect: OnceLock<CodeProtect>,
 }
+
+/// A hook told when a page of guest RAM starts or stops holding translated code.
+type CodeProtect = Box<dyn Fn(u64, bool) + Send + Sync>;
 
 impl fmt::Debug for Jit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -163,7 +176,18 @@ impl Jit {
             start: Instant::now(),
             self_ref: w.clone(),
             plugin: crate::plugin::JitPlugin::default(),
+            code_protect: OnceLock::new(),
         })
+    }
+
+    /// Call `hook` with the `ram_addr` of a page and `true` when the page starts holding
+    /// translated code, and `false` when it no longer does, QEMU's user mode `page_protect`
+    /// and `page_unprotect`, so that the caller can make the host refuse writes to it while
+    /// direct accesses ([`JitConfig::guest_base`]) skip the TLB's `TLB_NOTDIRTY` check. The
+    /// hook runs with the runtime's page lock held and must not call back into the runtime.
+    /// Only the first hook set is kept; `false` if there was one already.
+    pub fn set_code_protect(&self, hook: impl Fn(u64, bool) + Send + Sync + 'static) -> bool {
+        self.code_protect.set(Box::new(hook)).is_ok()
     }
 
     /// A runtime using the interpreter backend.

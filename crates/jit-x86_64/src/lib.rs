@@ -36,7 +36,7 @@ mod codegen;
 mod features;
 mod runtime;
 
-pub use buffer::{BufferError, CodeBuffer};
+pub use buffer::{BufferError, CodeBuffer, fault_target};
 pub use codegen::GenCodeError;
 pub use features::HostFeatures;
 pub use runtime::{

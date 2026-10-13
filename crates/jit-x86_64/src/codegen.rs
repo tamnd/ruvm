@@ -49,7 +49,11 @@
 //!   `stp` of two X registers) or not at all. One that must be atomic as a whole when aligned
 //!   (`MO_ATOM_IFALIGN`, such as an x86 `movdqu` on a CPU with AVX) is inlined as one
 //!   `vmovdqa` or `vmovdqu` through `VT0` when the host makes those atomic, as QEMU does, and
-//!   takes the slow path otherwise.
+//!   takes the slow path otherwise. With [`GenOptions::guest_base`], user mode accesses are
+//!   host accesses at the guest address plus the base, as in QEMU's user mode, with no lookup.
+//!   QEMU's signal handler sends a faulting one to `cpu_loop_exit_sigsegv`; here each is behind
+//!   a marker `nop` naming its slow path, and the handler resumes there
+//!   ([`crate::fault_target`]), so that the slow path decides, as it does on a TLB miss.
 //! - `insn_start` emits no code. Each service request carries the index of the `insn_start`
 //!   of its instruction, fixed when the block is compiled, and each exit stores it in the run
 //!   context, instead of QEMU's table of host code offsets next to the code; the runtime
@@ -163,6 +167,10 @@ pub(crate) struct GenOptions<'a> {
     /// log2 of the guest page size of the TLB tables at [`TLB_OFFSET`], or `None` to send
     /// every `qemu_ld` and `qemu_st` to the service routine.
     pub(crate) tlb_page_bits: Option<u32>,
+    /// The host address of guest address 0 and log2 of the bound below which guest addresses
+    /// are host accesses at that base, or `None` to look up the TLB. Each host access is then
+    /// behind a fault mark naming its slow path.
+    pub(crate) guest_base: Option<(u64, u32)>,
     /// The routine calls to `lookup_tb_ptr` go to instead of the service routine, or 0. It
     /// takes the same arguments: the context, the request index with the [`Gen::insn`] of the
     /// call in its upper 32 bits, so that neither routine need look it up, and the metadata.
@@ -448,6 +456,7 @@ pub(crate) fn generate(
         carry_live: false,
         err: None,
         tlb_page_bits: opts.tlb_page_bits,
+        guest_base: opts.guest_base,
         ldst: Vec::new(),
         ic_sites: Vec::new(),
         helpers: opts.helpers,
@@ -721,6 +730,8 @@ struct Gen<'h> {
     err: Option<GenCodeError>,
     /// See [`GenOptions::tlb_page_bits`].
     tlb_page_bits: Option<u32>,
+    /// See [`GenOptions::guest_base`].
+    guest_base: Option<(u64, u32)>,
     /// The TLB miss paths, emitted after the body.
     ldst: Vec<LdstSlow>,
     /// See [`Generated::ic_sites`].
@@ -994,6 +1005,9 @@ impl Gen<'_> {
         oi: MemOpIdx,
         store: bool,
     ) -> Option<(Reg, usize)> {
+        if self.guest_base.is_some() {
+            return self.direct_fast_path(f, addr, oi);
+        }
         let page_bits = self.tlb_page_bits?;
         let m = oi.memop();
         let mmu_idx = oi.mmu_idx() as usize;
@@ -1040,12 +1054,54 @@ impl Gen<'_> {
         Some((addr, miss))
     }
 
+    /// [`Gen::tlb_fast_path`] with [`GenOptions::guest_base`]: QEMU's user mode
+    /// `prepare_host_addr`, with the base in `TMP1`. Addresses at or past the bound, and
+    /// accesses less aligned than the op requires, jump to the returned label. The access
+    /// itself must be behind a [`Gen::fault_mark`], so that one the host refuses goes there
+    /// too.
+    fn direct_fast_path(&mut self, f: &Func, addr: Reg, oi: MemOpIdx) -> Option<(Reg, usize)> {
+        let (base, bits) = self.guest_base?;
+        let m = oi.memop();
+        let (s_bits, a_bits) = (m.size(), m.alignment_bits());
+        let atom = m.0 & MemOp::ATOM_MASK.0;
+        let vec_ok = atom == MemOp::ATOM_IFALIGN.0 && self.feat.avx && self.feat.atomic_vmovdqa;
+        if s_bits > 4 || (s_bits == 4 && atomic16(oi) && !vec_ok) || m.is_bswap() || a_bits > 31 {
+            return None;
+        }
+        let miss = self.a.new_label();
+        let (addr, width) = if f.config.addr_type == Type::I32 {
+            self.a.mov(0, TMP2, addr);
+            (TMP2, 32)
+        } else {
+            (addr, 64)
+        };
+        if bits < width {
+            self.a.mov(P_REXW, TMP0, addr);
+            self.a.shifti(shift::SHR, P_REXW, TMP0, bits);
+            self.a.jump(Some(cc::NE), miss, false);
+        }
+        if a_bits > 0 {
+            self.a.testi(0, addr, ((1u64 << a_bits) - 1) as u32);
+            self.a.jump(Some(cc::NE), miss, false);
+        }
+        self.a.movi(true, TMP1, base, false);
+        Some((addr, miss))
+    }
+
+    /// With [`GenOptions::guest_base`], mark the next instruction, a host access of a
+    /// `qemu_ld` or `qemu_st`, as one whose fault goes to `slow`.
+    fn fault_mark(&mut self, slow: usize) {
+        if self.guest_base.is_some() {
+            self.a.fault_mark(slow);
+        }
+    }
+
     /// The vector half of an atomic 128-bit access at `(addr, TMP1)` through `VT0`, QEMU's
     /// `MO_128` case of `tcg_out_qemu_ld_direct` and `tcg_out_qemu_st_direct`: `vmovdqa` when
     /// the op requires 16-byte alignment, `vmovdqu` when the host makes it atomic too, and
     /// otherwise a test of the address that picks `vmovdqa` when it is aligned. The addend is
     /// page aligned, so the guest address tells.
-    fn vec_access16(&mut self, oi: MemOpIdx, addr: Reg, store: bool) {
+    fn vec_access16(&mut self, oi: MemOpIdx, addr: Reg, store: bool, slow: usize) {
         let host = Mem::Index(addr, TMP1, 0);
         let (aligned, unaligned) = if store {
             (op::MOVDQA_WX_VX, op::MOVDQU_WX_VX)
@@ -1053,16 +1109,20 @@ impl Gen<'_> {
             (op::MOVDQA_VX_WX, op::MOVDQU_VX_WX)
         };
         if oi.memop().alignment_bits() >= 4 {
+            self.fault_mark(slow);
             self.a.vex_modrm_mem(aligned, VT0, 0, host);
         } else if self.feat.atomic_vmovdqu {
+            self.fault_mark(slow);
             self.a.vex_modrm_mem(unaligned, VT0, 0, host);
         } else {
             let (other, done) = (self.a.new_label(), self.a.new_label());
             self.a.testi(0, addr, 15);
             self.a.jump(Some(cc::NE), other, true);
+            self.fault_mark(slow);
             self.a.vex_modrm_mem(aligned, VT0, 0, host);
             self.a.jump(None, done, true);
             self.a.bind(other);
+            self.fault_mark(slow);
             self.a.vex_modrm_mem(unaligned, VT0, 0, host);
             self.a.bind(done);
         }
@@ -1629,7 +1689,7 @@ impl Gen<'_> {
                 let oi = MemOpIdx(op.args[3] as u32);
                 match self.tlb_fast_path(f, r(2), oi, false) {
                     Some((addr, label)) if atomic16(oi) => {
-                        self.vec_access16(oi, addr, false);
+                        self.vec_access16(oi, addr, false, label);
                         // `tcg_out_vec_to_pair`: `vmovq` and `vpextrq $1`.
                         self.a.vex_modrm(op::MOVD_EY_VY | P_REXW, VT0, 0, r(0));
                         self.a.vex_modrm(op::PEXTRD | P_REXW, VT0, 0, r(1));
@@ -1649,9 +1709,16 @@ impl Gen<'_> {
                         });
                     }
                     Some((addr, label)) => {
-                        // Load the half whose register is the address last.
-                        let halves = if r(0) == addr { [(1, 8), (0, 0)] } else { [(0, 0), (1, 8)] };
+                        // Load the half whose register is the address last, or the one whose
+                        // register is the address the slow path takes, since the second load
+                        // may fault and go there.
+                        let halves = if r(0) == addr || r(0) == r(2) {
+                            [(1, 8), (0, 0)]
+                        } else {
+                            [(0, 0), (1, 8)]
+                        };
                         for (k, disp) in halves {
+                            self.fault_mark(label);
                             self.a.load(r(k), Mem::Index(addr, TMP1, disp), 8, false, P_REXW);
                         }
                         let back = self.a.new_label();
@@ -1677,6 +1744,7 @@ impl Gen<'_> {
                     Some((addr, label)) => {
                         let m = oi.memop();
                         let host = Mem::Index(addr, TMP1, 0);
+                        self.fault_mark(label);
                         self.a.load(r(0), host, m.size_bytes(), m.is_signed(), w);
                         let back = self.a.new_label();
                         self.a.bind(back);
@@ -1703,6 +1771,7 @@ impl Gen<'_> {
                     Some((addr, label)) => {
                         let host = Mem::Index(addr, TMP1, 0);
                         let size = oi.memop().size_bytes();
+                        self.fault_mark(label);
                         if val.1 {
                             self.a.store_imm(val.0, host, size);
                         } else {
@@ -1747,7 +1816,7 @@ impl Gen<'_> {
                                 self.a.b8(1);
                             }
                         }
-                        self.vec_access16(oi, addr, true);
+                        self.vec_access16(oi, addr, true, label);
                         let back = self.a.new_label();
                         self.a.bind(back);
                         self.ldst.push(LdstSlow {
@@ -1765,6 +1834,7 @@ impl Gen<'_> {
                     Some((addr, label)) => {
                         for (k, (v, is_const)) in val.into_iter().enumerate() {
                             let host = Mem::Index(addr, TMP1, 8 * k as i32);
+                            self.fault_mark(label);
                             if is_const {
                                 self.a.store_imm(v, host, 8);
                             } else {

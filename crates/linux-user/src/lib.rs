@@ -32,7 +32,8 @@
 //! - Threads are `clone()` with QEMU's flags, each a vCPU on its own host thread, with
 //!   `set_tid_address()`, `CLONE_CHILD_CLEARTID` and `exit` of one thread as QEMU has them.
 //!   Robust futex lists are `ENOSYS` there and here. `vfork()` and `posix_spawn()` are forks.
-//! - Guest memory goes through the softmmu TLB rather than straight to host addresses.
+//! - Guest loads and stores are host accesses at `guest_base`, as in QEMU, rather than lookups
+//!   in the softmmu TLB.
 //! - The vsyscall page is not emulated, `-t`, `-trace` and `-plugin` are not supported yet,
 //!   and `-g` is for x86_64 programs only. With `-g`, the registers of a thread other than the
 //!   stopped one are those it last left, and do not take writes. `/proc/self` is the host's

@@ -238,10 +238,10 @@ impl HostMemory {
     /// how a user mode guest's `mmap()` and `munmap()` land in the memory from
     /// [`reserve`](Self::reserve).
     ///
-    /// The new pages are always readable and writable, so the `AtomicU8` view stays valid;
-    /// the guest's own protection is the emulator's to enforce. Pages past the end of the file
-    /// are zero pages instead of the file pages that would raise SIGBUS. A file shrunk later
-    /// still raises it, as a mapped file does for any process.
+    /// The new pages are readable and writable, whatever [`protect`](Self::protect) said
+    /// about the ones they replace. Pages past the end of the file are zero pages instead of
+    /// the file pages that would raise SIGBUS. A file shrunk later still raises it, as a
+    /// mapped file does for any process.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn map_fixed(
         &self,
@@ -308,6 +308,45 @@ impl HostMemory {
             if p == libc::MAP_FAILED {
                 return Err(std::io::Error::last_os_error());
             }
+        }
+        Ok(())
+    }
+
+    /// Sets what the host lets anyone do with `len` bytes at `offset`, page aligned, of a
+    /// [`reserve`](Self::reserve)d guest space: nothing, read, or read and write. This is
+    /// how a user mode guest whose code reaches its memory directly, without the emulator in
+    /// between, gets its own protection enforced by the host, as `target_mprotect()` does.
+    ///
+    /// Bytes the host no longer allows raise SIGSEGV when touched through the `AtomicU8`
+    /// view, the way a shrunk file raises SIGBUS. The view never yields a wrong value, but
+    /// the owner of the space must only touch bytes it allows, or let them back first.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn protect(
+        &self,
+        offset: usize,
+        len: usize,
+        read: bool,
+        write: bool,
+    ) -> std::io::Result<()> {
+        self.check_range(offset, len)?;
+        if self.fd.is_some() {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let prot = match (read, write) {
+            (_, true) => libc::PROT_READ | libc::PROT_WRITE,
+            (true, false) => libc::PROT_READ,
+            (false, false) => libc::PROT_NONE,
+        };
+        // SAFETY: the range is inside the mapping this value owns (checked above), and
+        // mprotect() only changes which accesses fault there: the pages and their contents
+        // stay, so the `AtomicU8` view keeps pointing at the same memory.
+        let ret =
+            unsafe { libc::mprotect(self.ptr.as_ptr().cast::<u8>().add(offset).cast(), len, prot) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
@@ -453,6 +492,25 @@ mod tests {
         } else {
             assert_eq!(s[13 * 4096 + 5000 - 4096 - 1].load(Ordering::Relaxed), 7);
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn protection_keeps_the_pages() {
+        let m = HostMemory::reserve(4 * 4096).unwrap();
+        m.as_slice()[4096 + 9].store(5, Ordering::Relaxed);
+        m.protect(0, 4 * 4096, false, false).unwrap();
+        m.protect(4096, 4096, true, false).unwrap();
+        assert_eq!(m.as_slice()[4096 + 9].load(Ordering::Relaxed), 5);
+        m.protect(4096, 2 * 4096, true, true).unwrap();
+        m.as_slice()[2 * 4096].store(6, Ordering::Relaxed);
+        assert_eq!(m.as_slice()[2 * 4096].load(Ordering::Relaxed), 6);
+        assert!(m.protect(1, 4096, true, true).is_err());
+        assert!(m.protect(4096, 4 * 4096, true, true).is_err());
+        // A fixed mapping over protected pages is readable and writable again.
+        m.map_fixed(3 * 4096, 4096, None, 0, false).unwrap();
+        m.as_slice()[3 * 4096 + 1].store(7, Ordering::Relaxed);
+        assert_eq!(m.as_slice()[3 * 4096 + 1].load(Ordering::Relaxed), 7);
     }
 
     #[test]

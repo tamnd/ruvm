@@ -14,6 +14,7 @@
 //! here, so the unsafe code of the crate stays in this file and in the runtime's entry call.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The buffer could not be set up or used.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +47,74 @@ impl std::error::Error for BufferError {}
 pub struct CodeBuffer {
     addr: usize,
     size: usize,
+    /// The slot of the buffer in [`LIVE`], or `None` if they were all taken.
+    slot: Option<usize>,
+}
+
+/// The first bytes of the `nop dword [rax + disp32]` that [`fault_target`] looks for in front
+/// of a faulting instruction; the displacement says where to go instead.
+pub(crate) const FAULT_MARK: [u8; 3] = [0x0f, 0x1f, 0x80];
+/// The length of the whole `nop`.
+const FAULT_MARK_LEN: u64 = 7;
+
+/// How many buffers [`fault_target`] can know of at once.
+const SLOTS: usize = 64;
+
+/// The start and end of each live buffer, 0 for a free slot, read by a signal handler without
+/// taking a lock. A slot is taken by setting its start and given back by clearing its end
+/// first, so that a reader that sees the same start before and after the end saw a whole
+/// pair.
+static LIVE: [(AtomicU64, AtomicU64); SLOTS] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; SLOTS];
+
+/// Note a buffer of `size` bytes at `addr` in [`LIVE`].
+fn register(addr: u64, size: usize) -> Option<usize> {
+    let slot = LIVE.iter().position(|(start, _)| {
+        start.compare_exchange(0, addr, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    })?;
+    LIVE[slot].1.store(addr + size as u64, Ordering::SeqCst);
+    Some(slot)
+}
+
+/// Give back a slot taken by [`register`].
+fn unregister(slot: Option<usize>) {
+    if let Some(slot) = slot {
+        LIVE[slot].1.store(0, Ordering::SeqCst);
+        LIVE[slot].0.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Where to resume when the instruction at `pc` faulted, if it is in a code buffer behind a
+/// fault mark: the out of line path the mark names, QEMU's `host_signal_handler` reaching the
+/// slow path of a user mode access through `cpu_loop_exit_sigsegv`, done here by jumping to
+/// the slow path the block already has. Safe to call from a signal handler: it takes no lock
+/// and does not allocate.
+pub fn fault_target(pc: u64) -> Option<u64> {
+    let mark = pc.checked_sub(FAULT_MARK_LEN)?;
+    let (start, end) = LIVE.iter().find_map(|(start, end)| {
+        let s = start.load(Ordering::SeqCst);
+        let e = end.load(Ordering::SeqCst);
+        (s != 0 && e != 0 && start.load(Ordering::SeqCst) == s && s <= mark && pc < e)
+            .then_some((s, e))
+    })?;
+    let mut bytes = [0u8; FAULT_MARK_LEN as usize];
+    // SAFETY: `mark..pc` lies in a buffer that was mapped when its slot was read. The
+    // instruction at `pc` was running, so the buffer holding it is still mapped, and blocks
+    // never start with a faulting access, so `mark` is in the same buffer. Buffers are always
+    // readable.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            mark as usize as *const u8,
+            bytes.as_mut_ptr(),
+            FAULT_MARK_LEN as usize,
+        )
+    };
+    if bytes[..3] != FAULT_MARK {
+        return None;
+    }
+    let rel = i32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
+    let to = pc.wrapping_add(rel as i64 as u64);
+    (start <= to && to < end).then_some(to)
 }
 
 #[cfg(windows)]
@@ -86,7 +155,7 @@ impl CodeBuffer {
         if p == libc::MAP_FAILED {
             return Err(BufferError::Map(std::io::Error::last_os_error().to_string()));
         }
-        Ok(CodeBuffer { addr: p as usize, size })
+        Ok(CodeBuffer { addr: p as usize, size, slot: register(p as u64, size) })
     }
 
     /// Allocate `size` bytes of executable memory.
@@ -101,7 +170,7 @@ impl CodeBuffer {
         if p.is_null() {
             return Err(BufferError::Map(std::io::Error::last_os_error().to_string()));
         }
-        Ok(CodeBuffer { addr: p as usize, size })
+        Ok(CodeBuffer { addr: p as usize, size, slot: register(p as u64, size) })
     }
 
     /// Copy `data` to `offset`.
@@ -184,11 +253,17 @@ impl CodeBuffer {
     pub fn size(&self) -> usize {
         self.size
     }
+
+    /// Whether [`fault_target`] knows of the buffer. Only so many buffers fit in its table.
+    pub fn fault_targets(&self) -> bool {
+        self.slot.is_some()
+    }
 }
 
 #[cfg(unix)]
 impl Drop for CodeBuffer {
     fn drop(&mut self) {
+        unregister(self.slot);
         // SAFETY: the mapping was created by `new` with this size and nothing refers to it once
         // the buffer is gone. Compiled blocks hold the region that owns the buffer, so no code
         // in it can still run.
@@ -199,6 +274,7 @@ impl Drop for CodeBuffer {
 #[cfg(windows)]
 impl Drop for CodeBuffer {
     fn drop(&mut self) {
+        unregister(self.slot);
         // SAFETY: the region was allocated by `new` and nothing refers to it once the buffer is
         // gone, as for the unix mapping above.
         unsafe { VirtualFree(self.addr as *mut u8, 0, MEM_RELEASE) };

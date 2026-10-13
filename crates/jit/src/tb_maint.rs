@@ -297,12 +297,20 @@ impl Jit {
         let page = ram_addr & self.page_mask();
         self.code_pages.write().unwrap_or_else(|e| e.into_inner()).insert(self.page_index(page));
         cputlb::tlb_reset_dirty_range_all(self, page, self.page_size());
+        // After the TLBs, so that a store the host refuses finds `TLB_NOTDIRTY` on its slow
+        // path.
+        if let Some(hook) = self.code_protect.get() {
+            hook(page, true);
+        }
     }
 
     /// `tlb_unprotect_code()`.
     pub(crate) fn tlb_unprotect_code(&self, ram_addr: u64) {
         let idx = self.page_index(ram_addr);
         self.code_pages.write().unwrap_or_else(|e| e.into_inner()).remove(&idx);
+        if let Some(hook) = self.code_protect.get() {
+            hook(ram_addr & self.page_mask(), false);
+        }
     }
 
     /// Whether the page holding `ram_addr` holds translated code, the clear

@@ -530,6 +530,18 @@ impl Asm {
         }
     }
 
+    /// A [`crate::buffer::FAULT_MARK`] `nop` naming `l`: if the instruction after it faults,
+    /// [`crate::fault_target`] gives the address of `l`. The displacement is relative to the
+    /// end of the `nop`, as a branch's is.
+    pub(crate) fn fault_mark(&mut self, l: usize) {
+        for b in crate::buffer::FAULT_MARK {
+            self.b8(b);
+        }
+        let at = self.pos();
+        self.fixups.push(Fixup::Rel32(at, l));
+        self.b32(0);
+    }
+
     /// Resolve every branch and append the constant pool.
     pub(crate) fn finish(mut self) -> Result<Vec<u8>, AsmError> {
         for f in std::mem::take(&mut self.fixups) {
