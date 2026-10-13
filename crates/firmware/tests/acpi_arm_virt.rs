@@ -67,6 +67,7 @@ fn base() -> ArmVirtAcpi {
         pci_devices: vec![pci(0), pci(8)],
         numa: Vec::new(),
         smmu: None,
+        viot: None,
     }
 }
 

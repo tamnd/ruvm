@@ -13,6 +13,7 @@ use ruvm_hw_core::fw_cfg::{
     FW_CFG_CMDLINE_DATA, FW_CFG_CMDLINE_SIZE, FW_CFG_INITRD_DATA, FW_CFG_INITRD_SIZE,
     FW_CFG_KERNEL_DATA, FW_CFG_KERNEL_SIZE,
 };
+use ruvm_hw_iommu::VirtioIommuConf;
 use ruvm_hw_virtio::VirtioPciProps;
 use ruvm_hw_virtio::rng::{RandomFile, VirtioRng, VirtioRngConf};
 use ruvm_machine_arm::virt::{
@@ -126,6 +127,29 @@ fn acpi_tables_match_qemu() {
     let tables = load(&m.acpi_tables());
     assert!(table(&tables, "IORT") == expected("IORT"), "IORT differs from QEMU's");
     assert!(table(&tables, "APIC") == expected("APIC.its_off"), "APIC differs from QEMU's");
+}
+
+/// The VIOT test of bios-tables-test: a virtio-iommu-pci in slot 1 and the test disk in slot
+/// 2. The VIOT comes after the IORT and points the root bus at the vIOMMU.
+#[test]
+fn viot_matches_qemu() {
+    let tmp = TmpDir::new("viot");
+    let mut cfg = a57();
+    cfg.firmware = Some(tmp.file("fw.fd", &[0; 0x1000]));
+    let mut m = VirtMachine::new(cfg).unwrap();
+    let conf = VirtioIommuConf { aw_bits: 48, ..VirtioIommuConf::default() };
+    m.attach_virtio_iommu(&conf, Some(1 << 3), None).unwrap();
+    let rng = VirtioRng::new(Box::new(RandomFile::default()), VirtioRngConf::default());
+    m.attach_virtio_pci(Box::new(rng), Some(2 << 3), &VirtioPciProps::default()).unwrap();
+    m.machine_done().unwrap();
+    let tables = load(&m.acpi_tables());
+    let sigs: Vec<&str> = tables.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(
+        sigs,
+        ["DSDT", "FACP", "APIC", "PPTT", "GTDT", "MCFG", "SPCR", "DBG2", "IORT", "VIOT", "XSDT"]
+    );
+    assert!(table(&tables, "VIOT") == expected("VIOT"), "VIOT differs from QEMU's");
+    assert!(table(&tables, "DSDT") == expected("DSDT.viot"), "DSDT differs from QEMU's");
 }
 
 #[test]

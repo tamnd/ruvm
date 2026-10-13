@@ -8,6 +8,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use ruvm_hw_iommu::VirtioIommuConf;
 use ruvm_hw_pci::MsiMessage;
 use ruvm_hw_virtio::rng::{RandomFile, VirtioRng, VirtioRngConf};
 use ruvm_hw_virtio::{VirtioPci, VirtioPciProps};
@@ -207,9 +208,15 @@ fn compare_with_qemu(mut cfg: VirtConfig, dump: &str) {
 }
 
 /// gen.sh dumps every tree with `pmu=off`, so the board leaves its `/pmu` node out too.
-fn compare(mut cfg: VirtConfig, dump: &str) {
+fn compare(cfg: VirtConfig, dump: &str) {
+    compare_with(cfg, dump, |_| {});
+}
+
+/// [`compare`] with devices plugged by `plug` first.
+fn compare_with(mut cfg: VirtConfig, dump: &str, plug: impl FnOnce(&VirtMachine)) {
     cfg.cpu = cfg.cpu.without_pmu();
     let mut m = VirtMachine::new(cfg).unwrap();
+    plug(&m);
     m.machine_done().unwrap();
     let ours = m.fdt().as_bytes().to_vec();
     let qemu = gunzip_file(dump);
@@ -296,6 +303,37 @@ fn dtb_a57_smmuv3_matches_qemu() {
     // default-bus-bypass-iommu=on keeps the SMMU but drops the iommu-map.
     cfg.default_bus_bypass_iommu = true;
     compare(cfg, "virt-a57-smmuv3-bypass.dtb.gz");
+}
+
+#[test]
+fn dtb_a57_viommu_matches_qemu() {
+    // A virtio-iommu-pci in slot 1: its node under the PCIe node and the iommu-map around its
+    // requester ID, which default-bus-bypass-iommu=on drops.
+    let conf = VirtioIommuConf { aw_bits: 48, ..VirtioIommuConf::default() };
+    let plug = |m: &VirtMachine| {
+        m.attach_virtio_iommu(&conf, None, None).unwrap();
+    };
+    let mut cfg = VirtConfig::new(model("cortex-a57"));
+    compare_with(cfg.clone(), "virt-a57-viommu.dtb.gz", plug);
+    cfg.default_bus_bypass_iommu = true;
+    compare_with(cfg, "virt-a57-viommu-bypass.dtb.gz", plug);
+}
+
+#[test]
+fn one_iommu_only() {
+    let conf = VirtioIommuConf::default();
+    let m = VirtMachine::new(a57()).unwrap();
+    m.attach_virtio_iommu(&conf, None, None).unwrap();
+    let e = m.attach_virtio_iommu(&conf, None, None).unwrap_err();
+    assert_eq!(e, "virt machine does not support multiple IOMMUs");
+    let cfg = VirtConfig { iommu: VirtIommu::SmmuV3, ..a57() };
+    let m = VirtMachine::new(cfg).unwrap();
+    let e = m.attach_virtio_iommu(&conf, None, None).unwrap_err();
+    assert_eq!(e, "virt machine does not support multiple IOMMUs");
+    let bad = VirtioIommuConf { aw_bits: 31, ..VirtioIommuConf::default() };
+    let m = VirtMachine::new(a57()).unwrap();
+    let e = m.attach_virtio_iommu(&bad, None, None).unwrap_err();
+    assert!(e.contains("aw-bits must be within [32,64]"), "{e}");
 }
 
 /// A chardev that drops what it is given.

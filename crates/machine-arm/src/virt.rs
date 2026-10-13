@@ -105,6 +105,7 @@ use ruvm_firmware::acpi::q35::{PciDevice as AcpiPciDevice, PciDeviceAml};
 use ruvm_firmware::acpi::table::{
     APPNAME6, APPNAME8, LOADER_FILE, RSDP_FILE, TABLE_FILE, TPMLOG_FILE,
 };
+use ruvm_firmware::acpi::viot::ViotInfo;
 use ruvm_hw_acpi::ged::{ACPI_GED_ERROR_EVT, ACPI_GED_EVT_SEL_LEN, ACPI_GED_PWR_DOWN_EVT};
 use ruvm_hw_acpi::{AcpiGed, AcpiGedProps};
 use ruvm_hw_char::pl011::{PL011_MMIO_SIZE, Pl011};
@@ -121,7 +122,10 @@ use ruvm_hw_intc::gicv3::{
     GICV3_DIST_SIZE, GICV3_REDIST_SIZE, GicV3, GicV3Its, GicV3Props, ITS_CONTROL_SIZE, ITS_SIZE,
     ITS_TRANS_SIZE,
 };
-use ruvm_hw_iommu::{SMMU_SIZE, SmmuStage, SmmuV3};
+use ruvm_hw_iommu::virtio_iommu::{
+    ReservedRegion, TYPE_VIRTIO_IOMMU_MEMORY_REGION, VIRTIO_IOMMU_RESV_MEM_T_MSI,
+};
+use ruvm_hw_iommu::{SMMU_SIZE, SmmuStage, SmmuV3, Viommu, VirtioIommu, VirtioIommuConf};
 use ruvm_hw_misc::pl061::PL061_MMIO_SIZE;
 use ruvm_hw_misc::{GpioKey, Pl061, Pl061Props};
 use ruvm_hw_pci::regs::PCI_NUM_PINS;
@@ -715,6 +719,9 @@ pub(crate) fn msi_store(
     }
 }
 
+/// The bus master address space of a PCI function, set once it is known.
+pub(crate) type LateSpace = Arc<OnceLock<Weak<AddressSpace>>>;
+
 /// What plugging a PCI function needs from the board: the PCIe host, and the SMMU in front of
 /// its root bus with the address spaces it gives the functions.
 pub(crate) struct PciPlug<'a> {
@@ -724,13 +731,16 @@ pub(crate) struct PciPlug<'a> {
     /// The SMMU, unless there is none or the root bus bypasses it.
     pub(crate) smmu: Option<&'a Arc<SmmuV3>>,
     pub(crate) iommu_spaces: &'a Mutex<Vec<Arc<AddressSpace>>>,
+    /// Without an SMMU, the functions whose bus master address space is only picked at machine
+    /// done, since a virtio-iommu-pci may still be plugged.
+    pub(crate) pending: Option<&'a Mutex<Vec<(u8, LateSpace)>>>,
 }
 
 impl PciPlug<'_> {
     /// Plug a virtio device into a new function on the root bus, at `devfn` or the first free
     /// slot. As in `virtio_bus_device_plugged()`, only a device with `iommu_platform` on does
-    /// its DMA through the SMMU; the others use system memory, and only their MSIs go through
-    /// the SMMU.
+    /// its DMA through the IOMMU; the others use system memory, and only their MSIs go through
+    /// the IOMMU.
     pub(crate) fn virtio_pci(
         &self,
         class: Box<dyn VirtioDeviceClass>,
@@ -738,37 +748,53 @@ impl PciPlug<'_> {
         props: &VirtioPciProps,
         iommu_platform: bool,
     ) -> Result<VirtioPci, String> {
-        // pci_device_iommu_address_space(): the SMMU unless the root bus bypasses it.
-        let smmu = self.smmu;
         let late = Arc::new(OnceLock::new());
-        let memory: Arc<dyn GuestMemory + Send + Sync> = match smmu {
-            Some(_) if iommu_platform => Arc::new(LateGuestMemory(Arc::clone(&late))),
-            _ => Arc::new(WeakGuestMemory(Arc::downgrade(self.memory_as))),
+        let iommu = self.smmu.is_some() || self.pending.is_some();
+        let memory: Arc<dyn GuestMemory + Send + Sync> = if iommu_platform && iommu {
+            Arc::new(LateGuestMemory(Arc::clone(&late)))
+        } else {
+            Arc::new(WeakGuestMemory(Arc::downgrade(self.memory_as)))
         };
         let mut backend = VirtioBackend::new(class, memory).map_err(err)?;
         if iommu_platform {
             backend.vdev_mut().set_host_feature(VIRTIO_F_IOMMU_PLATFORM, true);
         }
+        self.plug(backend, devfn, props, late)
+    }
+
+    /// Plug `backend` into a new function, whose bus master address space goes into `late`.
+    pub(crate) fn plug(
+        &self,
+        backend: VirtioBackend,
+        devfn: Option<u8>,
+        props: &VirtioPciProps,
+        late: LateSpace,
+    ) -> Result<VirtioPci, String> {
         let dev = VirtioPci::new(self.gpex.bus(), devfn, backend, props).map_err(err)?;
-        let mut memory_as = Arc::downgrade(self.memory_as);
-        if let Some(smmu) = smmu {
+        let devfn = dev.pci_dev().devfn();
+        if let Some(smmu) = self.smmu {
             // smmu_find_add_as(): an IOMMU region and an address space of the same name for
             // the function, whose stream ID is its requester ID on bus 0.
-            let devfn = dev.pci_dev().devfn();
             let mut spaces = self.iommu_spaces.lock().unwrap_or_else(PoisonError::into_inner);
             let name = format!("smmuv3-iommu-memory-region-{devfn}-{}", spaces.len());
             let ops = smmu.device_ops(u32::from(devfn));
             let r = self.mem.new_iommu(&name, 1 << 64, ops).map_err(err)?;
             let space = self.mem.address_space_init(r, &name).map_err(err)?;
-            memory_as = Arc::downgrade(&space);
             let _ = late.set(Arc::downgrade(&space));
             spaces.push(space);
+        } else if let Some(pending) = self.pending {
+            let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
+            pending.push((devfn, Arc::clone(&late)));
         }
         // msi_send_message() stores with the function's requester ID, which is the device ID
         // the ITS translates, into the function's address space.
         let pci_dev = Arc::downgrade(dev.pci_dev());
+        let system = Arc::downgrade(self.memory_as);
         dev.pci_dev().set_msi_trigger(Some(Arc::new(move |address, data| {
-            let (Some(d), Some(a)) = (pci_dev.upgrade(), memory_as.upgrade()) else { return };
+            let Some(d) = pci_dev.upgrade() else { return };
+            let Some(a) = late.get().map_or_else(|| system.upgrade(), Weak::upgrade) else {
+                return;
+            };
             let attrs = MemTxAttrs::new().with_requester_id(d.requester_id());
             let _ = a.store(address, 4, data.into(), Endian::Little, attrs);
         })));
@@ -887,8 +913,12 @@ pub struct VirtMachine {
     smmu: Option<Arc<SmmuV3>>,
     /// `default-bus-bypass-iommu`: the root bus is not behind the SMMU.
     iommu_bypass: bool,
-    /// The address spaces of the functions behind the SMMU, `SMMUDevice.as`.
+    /// The address spaces of the functions behind the SMMU or the virtio-iommu.
     iommu_spaces: Mutex<Vec<Arc<AddressSpace>>>,
+    /// The virtio-iommu-pci and its requester ID.
+    viommu: OnceLock<(Arc<Viommu>, u16)>,
+    /// The functions whose bus master address space is picked at machine done.
+    pci_pending: Mutex<Vec<(u8, LateSpace)>>,
     pci_devices: Mutex<Vec<VirtioPci>>,
     virtio: Vec<Arc<VirtioSlot>>,
     fw_cfg: FwCfgMem,
@@ -1395,6 +1425,8 @@ impl VirtMachine {
             smmu,
             iommu_bypass: cfg.default_bus_bypass_iommu,
             iommu_spaces: Mutex::new(Vec::new()),
+            viommu: OnceLock::new(),
+            pci_pending: Mutex::new(Vec::new()),
             pci_devices: Mutex::new(Vec::new()),
             virtio,
             fw_cfg,
@@ -1470,16 +1502,99 @@ impl VirtMachine {
         if self.done {
             return Err("PCI devices must be plugged before machine_done".to_string());
         }
-        let plug = PciPlug {
+        let dev = self.pci_plug().virtio_pci(class, devfn, props, iommu_platform)?;
+        self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).push(dev.clone());
+        Ok(dev)
+    }
+
+    fn pci_plug(&self) -> PciPlug<'_> {
+        PciPlug {
             mem: &self.mem,
             memory_as: &self.memory_as,
             gpex: &self.gpex,
             smmu: self.smmu.as_ref().filter(|_| !self.iommu_bypass),
             iommu_spaces: &self.iommu_spaces,
+            pending: self.smmu.is_none().then_some(&self.pci_pending),
+        }
+    }
+
+    /// Plug a `virtio-iommu-pci` into the root bus at `devfn` or the first free slot. As in
+    /// `virt_machine_device_pre_plug_cb()`, the doorbell of the MSI controller is its reserved
+    /// MSI region. The functions' DMA goes through it from machine done on, unless the root
+    /// bus bypasses it.
+    pub fn attach_virtio_iommu(
+        &self,
+        conf: &VirtioIommuConf,
+        devfn: Option<u8>,
+        id: Option<String>,
+    ) -> Result<VirtioPci, String> {
+        if self.done {
+            return Err("PCI devices must be plugged before machine_done".to_string());
+        }
+        if self.smmu.is_some() || self.viommu.get().is_some() {
+            return Err("virt machine does not support multiple IOMMUs".to_string());
+        }
+        let doorbell = if self.its.is_some() {
+            // The GITS_TRANSLATER page.
+            Some((VIRT_GIC_ITS + ITS_CONTROL_SIZE, VIRT_GIC_ITS + ITS_SIZE - 1))
+        } else if self.v2m {
+            // The MSI_SETSPI_NS page.
+            Some((VIRT_GIC_V2M, VIRT_GIC_V2M + GICV2M_SIZE - 1))
+        } else {
+            None
         };
-        let dev = plug.virtio_pci(class, devfn, props, iommu_platform)?;
+        let mut conf = conf.clone();
+        if let Some((low, high)) = doorbell {
+            let kind = VIRTIO_IOMMU_RESV_MEM_T_MSI;
+            conf.reserved_regions = vec![ReservedRegion { low, high, kind }];
+        }
+        conf.check_pci().map_err(err)?;
+        let viommu = Viommu::new(&self.memory_as, &conf);
+        let class = Box::new(VirtioIommu::new(Arc::clone(&viommu), conf));
+        let mem = Arc::new(WeakGuestMemory(Arc::downgrade(&self.memory_as)));
+        let backend = VirtioBackend::new(class, mem).map_err(err)?;
+        // virtio_pci_force_virtio_1()
+        let props = VirtioPciProps { disable_legacy: Some(true), id, ..VirtioPciProps::default() };
+        let dev = self.pci_plug().plug(backend, devfn, &props, Arc::new(OnceLock::new()))?;
+
+        let bus = Arc::downgrade(self.gpex.bus());
+        viommu.set_endpoint_check(move |sid| {
+            bus.upgrade().is_some_and(|b| b.find_device((sid >> 8) as u8, sid as u8).is_some())
+        });
+        let weak = dev.downgrade();
+        viommu.set_fault_sink(move || {
+            if let Some(d) = weak.upgrade() {
+                // Busy on this thread: the device sends the fault when it is done.
+                let _ = d.with_device::<VirtioIommu, _>(|vdev, dev| dev.report_faults(vdev));
+            }
+        });
+        let _ = self.viommu.set((viommu, dev.pci_dev().requester_id()));
         self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).push(dev.clone());
         Ok(dev)
+    }
+
+    /// `pcibus_machine_done()`: the bus master address space of each function, behind the
+    /// virtio-iommu unless there is none or the root bus bypasses it.
+    fn pci_machine_done(&mut self) -> Result<(), String> {
+        let pending =
+            std::mem::take(self.pci_pending.get_mut().unwrap_or_else(PoisonError::into_inner));
+        let viommu = self.viommu.get().filter(|_| !self.iommu_bypass);
+        for (devfn, late) in pending {
+            let space = match viommu {
+                Some((v, _)) => {
+                    let name = format!("{TYPE_VIRTIO_IOMMU_MEMORY_REGION}-0-{devfn}");
+                    let ops = v.device_ops(u32::from(devfn));
+                    let r = self.mem.new_iommu(&name, 1 << 64, ops).map_err(err)?;
+                    let space = self.mem.address_space_init(r, &name).map_err(err)?;
+                    let weak = Arc::downgrade(&space);
+                    self.iommu_spaces.get_mut().unwrap_or_else(PoisonError::into_inner).push(space);
+                    weak
+                }
+                None => Arc::downgrade(&self.memory_as),
+            };
+            let _ = late.set(space);
+        }
+        Ok(())
     }
 
     /// `virt_acpi_build()`: the ACPI tables of the board as it is now.
@@ -1563,6 +1678,11 @@ impl VirtMachine {
                 gsi: spi(VIRT_SMMU_IRQ),
                 rc_id_maps: if self.iommu_bypass { Vec::new() } else { vec![(0, 0x100)] },
             }),
+            // build_viot(): the root bus range, unless the bus bypasses the IOMMU.
+            viot: self.viommu.get().map(|(_, bdf)| ViotInfo {
+                bdf: *bdf,
+                ranges: if self.iommu_bypass { Vec::new() } else { vec![(0, 0)] },
+            }),
         };
         arm_virt::build(&acpi)
     }
@@ -1623,6 +1743,10 @@ impl VirtMachine {
         if self.done {
             return Ok(());
         }
+        if let Some((_, bdf)) = self.viommu.get() {
+            dt::create_virtio_iommu(&mut self.fdt, *bdf, !self.iommu_bypass)?;
+        }
+        self.pci_machine_done()?;
         if self.dtb_filename.is_none() {
             dt::add_platform_bus_node(&mut self.fdt)?;
         }
@@ -1694,6 +1818,9 @@ impl VirtMachine {
         self.gpex.reset();
         if let Some(s) = &self.smmu {
             s.reset();
+        }
+        if let Some((v, _)) = self.viommu.get() {
+            v.system_reset();
         }
         let fwc = self.fw_cfg.state();
         fwc.reset();
