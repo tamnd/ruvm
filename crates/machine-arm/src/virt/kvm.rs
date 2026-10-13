@@ -25,8 +25,9 @@ use super::boot::BootInfo;
 use super::cpus::{PMU_PPI, TIMER_PPIS};
 use super::memmap::{Highmem, virt_set_memmap};
 use super::{
-    SpiSink, VIRT_GIC_DIST, VIRT_GIC_NUM_IRQ, VIRT_GIC_REDIST, VIRT_GICV3_MAX_CPUS, VIRT_MEM,
-    VirtConfig, VirtGicVersion, virt_cpu_mp_affinity,
+    PVTIME_SIZE_PER_CPU, SpiSink, VIRT_GIC_DIST, VIRT_GIC_NUM_IRQ, VIRT_GIC_REDIST,
+    VIRT_GICV3_MAX_CPUS, VIRT_MEM, VIRT_PVTIME_SIZE, VirtConfig, VirtGicVersion,
+    virt_cpu_mp_affinity,
 };
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -169,6 +170,22 @@ impl SpisInner {
     }
 }
 
+/// The host page size. `KvmAccel` refuses hosts whose pages are not 4 KiB.
+const HOST_PAGE_SIZE: u64 = 4096;
+
+/// The size of the steal time RAM for `max_cpus`, `max_cpus * PVTIME_SIZE_PER_CPU` rounded up
+/// to the host page, with QEMU's error when it does not fit in `VIRT_PVTIME`.
+pub fn pvtime_size(max_cpus: u32) -> Result<u64, String> {
+    let size = (u64::from(max_cpus) * PVTIME_SIZE_PER_CPU).next_multiple_of(HOST_PAGE_SIZE);
+    if size > VIRT_PVTIME_SIZE {
+        return Err(format!(
+            "pvtime requires a {size} byte memory region for {max_cpus} CPUs, but only \
+             {VIRT_PVTIME_SIZE} has been reserved"
+        ));
+    }
+    Ok(size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +273,19 @@ mod tests {
         // A second connect is ignored.
         spis.connect(Arc::new(|_, _| panic!("second target")));
         sink(2, true);
+    }
+
+    #[test]
+    fn pvtime_fits_its_window() {
+        assert_eq!(pvtime_size(1), Ok(4096));
+        assert_eq!(pvtime_size(64), Ok(4096));
+        assert_eq!(pvtime_size(65), Ok(8192));
+        assert_eq!(pvtime_size(1024), Ok(65536));
+        assert_eq!(
+            pvtime_size(1025).unwrap_err(),
+            "pvtime requires a 69632 byte memory region for 1025 CPUs, but only 65536 has been \
+             reserved"
+        );
     }
 
     #[test]

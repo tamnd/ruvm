@@ -192,6 +192,12 @@ pub const VIRT_SECURE_GPIO: u64 = 0x090b_0000;
 pub const VIRT_GPIO_SIZE: u64 = 0x1000;
 /// `VIRT_ACPI_GED`.
 pub const VIRT_ACPI_GED: u64 = 0x0908_0000;
+/// `VIRT_PVTIME`, the steal time records of a KVM guest.
+pub const VIRT_PVTIME: u64 = 0x090a_0000;
+/// The size of the steal time window.
+pub const VIRT_PVTIME_SIZE: u64 = 0x1_0000;
+/// `PVTIME_SIZE_PER_CPU`, the size of one vCPU's steal time record.
+pub const PVTIME_SIZE_PER_CPU: u64 = 64;
 /// `VIRT_SMMU`, where the SMMUv3 of `iommu=smmuv3` sits.
 pub const VIRT_SMMU: u64 = 0x0905_0000;
 /// `VIRT_FW_CFG`.

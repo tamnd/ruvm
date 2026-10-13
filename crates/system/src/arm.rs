@@ -719,11 +719,12 @@ pub(crate) fn parse_cpu(board: ArmBoard, arg: Option<&str>) -> Result<ArmCpuMode
     Ok(model)
 }
 
-/// The CPU model for `-cpu` with KVM. Only `host` and `max`, which is `host` under KVM, are
-/// taken, since ruvm inits every vCPU with the target KVM prefers. `host_pmu` says whether
-/// KVM can give the guest a PMU, which `host` has unless `pmu=off`.
+/// The CPU model for `-cpu` with KVM, and its `kvm-steal-time` property, `None` for auto. Only
+/// `host` and `max`, which is `host` under KVM, are taken, since ruvm inits every vCPU with the
+/// target KVM prefers. `host_pmu` says whether KVM can give the guest a PMU, which `host` has
+/// unless `pmu=off`.
 #[cfg_attr(not(all(target_os = "linux", target_arch = "aarch64")), allow(dead_code))]
-fn kvm_cpu_model(arg: Option<&str>, host_pmu: bool) -> Result<ArmCpuModel> {
+fn kvm_cpu_model(arg: Option<&str>, host_pmu: bool) -> Result<(ArmCpuModel, Option<bool>)> {
     // QEMU's default for virt is a cortex-a15, which KVM refuses.
     let Some(arg) = arg else {
         return Err(Error::generic("-accel kvm needs -cpu host or -cpu max in ruvm for now"));
@@ -737,6 +738,7 @@ fn kvm_cpu_model(arg: Option<&str>, host_pmu: bool) -> Result<ArmCpuModel> {
         .hint("Use -cpu host.\n"));
     }
     let mut pmu = host_pmu;
+    let mut steal_time = None;
     for feat in parts.filter(|f| !f.is_empty()) {
         let (prop, value) = match feat.split_once('=') {
             Some((p, v)) => (p, v),
@@ -752,6 +754,7 @@ fn kvm_cpu_model(arg: Option<&str>, host_pmu: bool) -> Result<ArmCpuModel> {
                     return Err(Error::generic("'pmu' feature not supported by KVM on this host"));
                 }
             }
+            "kvm-steal-time" => steal_time = Some(prop_bool(prop, value)?),
             _ => {
                 return Err(Error::generic(format!(
                     "CPU property {prop}={value} with KVM is not supported by ruvm yet"
@@ -763,7 +766,7 @@ fn kvm_cpu_model(arg: Option<&str>, host_pmu: bool) -> Result<ArmCpuModel> {
     let mut model = ArmCpuModel::max();
     model.name = "host";
     model.dtb_compatible = "arm,arm-v8";
-    Ok(if pmu { model } else { model.without_pmu() })
+    Ok((if pmu { model } else { model.without_pmu() }, steal_time))
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1543,12 +1546,15 @@ mod tests {
 
     #[test]
     fn kvm_takes_only_the_host_cpu() {
-        let m = kvm_cpu_model(Some("host"), true).unwrap();
+        let (m, steal_time) = kvm_cpu_model(Some("host"), true).unwrap();
         assert_eq!((m.name, m.dtb_compatible), ("host", "arm,arm-v8"));
         assert_ne!(m.features.pmu, 0);
-        assert_eq!(kvm_cpu_model(Some("max"), true).unwrap().name, "host");
-        assert_eq!(kvm_cpu_model(Some("host"), false).unwrap().features.pmu, 0);
-        assert_eq!(kvm_cpu_model(Some("host,pmu=off"), true).unwrap().features.pmu, 0);
+        assert_eq!(steal_time, None);
+        assert_eq!(kvm_cpu_model(Some("max"), true).unwrap().0.name, "host");
+        assert_eq!(kvm_cpu_model(Some("host"), false).unwrap().0.features.pmu, 0);
+        assert_eq!(kvm_cpu_model(Some("host,pmu=off"), true).unwrap().0.features.pmu, 0);
+        assert_eq!(kvm_cpu_model(Some("host,kvm-steal-time=off"), true).unwrap().1, Some(false));
+        assert_eq!(kvm_cpu_model(Some("max,kvm-steal-time=on"), true).unwrap().1, Some(true));
         let msg = |arg: Option<&str>, pmu: bool| {
             kvm_cpu_model(arg, pmu).unwrap_err().message().to_string()
         };

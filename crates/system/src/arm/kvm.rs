@@ -85,7 +85,12 @@ pub(crate) fn start_board_kvm(
     }
     check_gic_version(&accel, &opts).map_err(one)?;
     let host_pmu = accel.arm_caps().pmu_v3;
-    let cpu = || kvm_cpu_model(args.cpu, host_pmu).map_err(|e| vec![Located(None, e)]);
+    let mut steal_time = None;
+    let cpu = || {
+        let (model, st) = kvm_cpu_model(args.cpu, host_pmu).map_err(|e| vec![Located(None, e)])?;
+        steal_time = st;
+        Ok(model)
+    };
     let mut spis = None;
     let built = build_virt(vm, opts, args, serial_hds, cpu, |cfg| {
         spis = Some(prepare_config(&accel, cfg).map_err(one)?);
@@ -97,7 +102,8 @@ pub(crate) fn start_board_kvm(
     let cfg =
         VirtRunConfig { no_reboot: args.no_reboot, tcg: TcgOptions::default(), backend: None };
     let machine =
-        KvmVirtMachine::new(accel, board, spis, clocks, &cfg, event_handler(vm)).map_err(one)?;
+        KvmVirtMachine::new(accel, board, spis, clocks, &cfg, steal_time, event_handler(vm))
+            .map_err(one)?;
     if let Some(path) = &dtb_path {
         let fdt = lock(machine.board()).fdt().as_bytes().to_vec();
         dumpdtb(path, &fdt)?;

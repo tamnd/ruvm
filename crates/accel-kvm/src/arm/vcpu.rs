@@ -76,6 +76,10 @@ pub const KVM_ARM_VCPU_PMU_V3_CTRL: u32 = 0;
 pub const KVM_ARM_VCPU_PMU_V3_IRQ: u64 = 0;
 /// `KVM_ARM_VCPU_PMU_V3_INIT`.
 pub const KVM_ARM_VCPU_PMU_V3_INIT: u64 = 1;
+/// `KVM_ARM_VCPU_PVTIME_CTRL`: the vCPU attribute group of the steal time area.
+pub const KVM_ARM_VCPU_PVTIME_CTRL: u32 = 2;
+/// `KVM_ARM_VCPU_PVTIME_IPA`: the guest address of the vCPU's steal time record.
+pub const KVM_ARM_VCPU_PVTIME_IPA: u64 = 0;
 
 /// `KVM_MP_STATE_RUNNABLE`.
 pub const KVM_MP_STATE_RUNNABLE: u32 = 0;
@@ -320,6 +324,8 @@ pub trait ArmVcpuOps {
     fn has_device_attr(&mut self, group: u32, attr: u64, value: Option<i32>) -> io::Result<()>;
     /// `KVM_SET_DEVICE_ATTR` on the vCPU, with `value` as for `has_device_attr`.
     fn set_device_attr(&mut self, group: u32, attr: u64, value: Option<i32>) -> io::Result<()>;
+    /// `KVM_SET_DEVICE_ATTR` on the vCPU for an attribute whose address points to a `u64`.
+    fn set_device_attr_u64(&mut self, group: u32, attr: u64, value: u64) -> io::Result<()>;
 }
 
 /// Why an Arm vCPU step failed. The messages are QEMU's.
@@ -350,6 +356,13 @@ pub enum ArmVcpuError {
         ioctl: &'static str,
         /// The step that failed.
         what: &'static str,
+        /// What the kernel said.
+        err: io::Error,
+    },
+    /// The steal time record's address could not be set.
+    Pvtime {
+        /// `KVM_HAS_DEVICE_ATTR` or `KVM_SET_DEVICE_ATTR`.
+        ioctl: &'static str,
         /// What the kernel said.
         err: io::Error,
     },
@@ -395,6 +408,9 @@ impl fmt::Display for ArmVcpuError {
                 version & 0xffff
             ),
             Self::Pmu { ioctl, what, err } => write!(f, "PMU: {ioctl}: {}\n{what}", strerror(err)),
+            Self::Pvtime { ioctl, err } => {
+                write!(f, "PVTIME IPA: {ioctl}: {}\nfailed to init PVTIME IPA", strerror(err))
+            }
             Self::VirtualTime { write } => {
                 write!(f, "Failed to {} KVM_REG_ARM_TIMER_CNT", if *write { "set" } else { "get" })
             }
@@ -831,6 +847,8 @@ pub struct ArmKvmCaps {
     pub inject_serror_esr: bool,
     /// `KVM_CAP_ARM_IRQ_LINE_LAYOUT_2`.
     pub irq_line_layout_2: bool,
+    /// `KVM_CAP_STEAL_TIME`.
+    pub steal_time: bool,
 }
 
 /// What the CPU model and the board ask of one vCPU.
@@ -854,6 +872,9 @@ pub struct ArmVcpuConfig {
     pub el2: bool,
     /// Stop the virtual counter while the VM is stopped, the opposite of `kvm-no-adjvtime`.
     pub adjvtime: bool,
+    /// The guest gets a steal time record, `kvm-steal-time` after
+    /// [`steal_time_finalize`].
+    pub steal_time: bool,
 }
 
 impl ArmVcpuConfig {
@@ -870,7 +891,28 @@ impl ArmVcpuConfig {
             pauth: false,
             el2: false,
             adjvtime: true,
+            steal_time: false,
         }
+    }
+}
+
+/// `kvm_arm_steal_time_finalize()`: the `kvm-steal-time` property, `None` for auto, on a
+/// kernel with or without `KVM_CAP_STEAL_TIME`. Auto turns it on where it can be.
+pub fn steal_time_finalize(
+    setting: Option<bool>,
+    has_steal_time: bool,
+    aarch64: bool,
+) -> Result<bool, String> {
+    match setting {
+        None => Ok(has_steal_time && aarch64),
+        Some(false) => Ok(false),
+        Some(true) if !has_steal_time => {
+            Err("'kvm-steal-time' cannot be enabled on this host".to_string())
+        }
+        Some(true) if !aarch64 => {
+            Err("'kvm-steal-time' cannot be enabled for AArch32 guests".to_string())
+        }
+        Some(true) => Ok(true),
     }
 }
 
@@ -954,6 +996,8 @@ pub struct ArmVcpu {
     pub mp_affinity: u64,
     /// The vCPU has a PMU.
     pub pmu: bool,
+    /// The vCPU has a steal time record.
+    pub steal_time: bool,
     /// The core and vector registers.
     pub regs: CoreRegs,
     /// Every other register.
@@ -1013,6 +1057,7 @@ impl ArmVcpu {
             psci_version,
             mp_affinity,
             pmu: cfg.pmu,
+            steal_time: cfg.steal_time,
             regs,
             cpregs,
             serror: SErrorEvents::default(),
@@ -1120,6 +1165,17 @@ impl ArmVcpu {
             return Ok(());
         }
         Self::pmu_attr(ops, KVM_ARM_VCPU_PMU_V3_INIT, None, "failed to init PMU")
+    }
+
+    /// `kvm_arm_pvtime_init()`: puts the vCPU's steal time record at `ipa`.
+    pub fn pvtime_init(&self, ops: &mut impl ArmVcpuOps, ipa: u64) -> Result<(), ArmVcpuError> {
+        if !self.steal_time {
+            return Ok(());
+        }
+        ops.has_device_attr(KVM_ARM_VCPU_PVTIME_CTRL, KVM_ARM_VCPU_PVTIME_IPA, None)
+            .map_err(|err| ArmVcpuError::Pvtime { ioctl: "KVM_HAS_DEVICE_ATTR", err })?;
+        ops.set_device_attr_u64(KVM_ARM_VCPU_PVTIME_CTRL, KVM_ARM_VCPU_PVTIME_IPA, ipa)
+            .map_err(|err| ArmVcpuError::Pvtime { ioctl: "KVM_SET_DEVICE_ATTR", err })
     }
 
     /// The KVM half of `cpu_pre_save()`: reads the cpreg list and, while the counter is held,
@@ -1275,6 +1331,11 @@ mod tests {
 
         fn set_device_attr(&mut self, group: u32, attr: u64, value: Option<i32>) -> io::Result<()> {
             self.log.push(format!("set_attr {group} {attr} {value:?}"));
+            Ok(())
+        }
+
+        fn set_device_attr_u64(&mut self, group: u32, attr: u64, value: u64) -> io::Result<()> {
+            self.log.push(format!("set_attr {group} {attr} {value:#x}"));
             Ok(())
         }
     }
@@ -1704,6 +1765,41 @@ mod tests {
         let no_pmu = ArmVcpu { pmu: false, ..vcpu };
         fake.log.clear();
         no_pmu.pmu_init(&mut fake).unwrap();
+        assert!(fake.log.is_empty());
+    }
+
+    #[test]
+    fn steal_time() {
+        assert_eq!(steal_time_finalize(None, true, true), Ok(true));
+        assert_eq!(steal_time_finalize(None, false, true), Ok(false));
+        assert_eq!(steal_time_finalize(None, true, false), Ok(false));
+        assert_eq!(steal_time_finalize(Some(false), true, true), Ok(false));
+        assert_eq!(steal_time_finalize(Some(true), true, true), Ok(true));
+        assert_eq!(
+            steal_time_finalize(Some(true), false, true).unwrap_err(),
+            "'kvm-steal-time' cannot be enabled on this host"
+        );
+        assert_eq!(
+            steal_time_finalize(Some(true), true, false).unwrap_err(),
+            "'kvm-steal-time' cannot be enabled for AArch32 guests"
+        );
+
+        let mut fake = Fake::with_list(&[]);
+        let cfg = ArmVcpuConfig { steal_time: true, ..ArmVcpuConfig::host(5, &caps()) };
+        let vcpu = ArmVcpu::init(&mut fake, &cfg, &caps()).unwrap();
+        fake.log.clear();
+        vcpu.pvtime_init(&mut fake, 0x090a_0040).unwrap();
+        assert_eq!(fake.log, ["has_attr 2 0 None", "set_attr 2 0 0x90a0040"]);
+        fake.no_pmu_attr = true;
+        let nxio = strerror(&io::Error::from_raw_os_error(6));
+        assert_eq!(
+            vcpu.pvtime_init(&mut fake, 0x090a_0040).unwrap_err().to_string(),
+            format!("PVTIME IPA: KVM_HAS_DEVICE_ATTR: {nxio}\nfailed to init PVTIME IPA")
+        );
+
+        let off = ArmVcpu { steal_time: false, ..vcpu };
+        fake.log.clear();
+        off.pvtime_init(&mut fake, 0x090a_0040).unwrap();
         assert!(fake.log.is_empty());
     }
 
