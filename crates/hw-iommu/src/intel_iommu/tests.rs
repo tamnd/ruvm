@@ -185,7 +185,14 @@ fn realize_resolves_and_rejects_like_qemu() {
         err(IntelIommuConf { svm: true, ..sm.clone() }, false),
         "Need to set device IOTLB for svm"
     );
-    assert!(err(sm, false).contains("no scalable mode yet"));
+    let c = sm.realize(false, false).unwrap();
+    assert!(c.scalable_mode);
+    let fs = IntelIommuConf { scalable_mode: true, fsts: true, ..Default::default() };
+    assert_eq!(
+        err(IntelIommuConf { aw_bits: 39, ..fs.clone() }, false),
+        "Scalable mode(fsts=on): supported value for aw-bits is: 48"
+    );
+    assert!(fs.realize(false, false).is_ok());
 }
 
 #[test]
@@ -492,4 +499,242 @@ fn turning_remapping_off_passes_through_again() {
     r.w32(DMAR_GCMD_REG, 0);
     assert_eq!(r.r32(DMAR_GSTS_REG) & GSTS_IRES, 0);
     assert_eq!(r.iommu.remap_msi(SID, ir_addr(9, false), 0), Some((ir_addr(9, false), 0)));
+}
+
+const PDIR: u64 = 0x12000;
+const PTBL: u64 = 0x13000;
+
+impl Rig {
+    /// A scalable mode rig with the first stage tables when `fsts`, and fault events unmasked.
+    fn scalable(fsts: bool) -> Rig {
+        let conf = IntelIommuConf { scalable_mode: true, fsts, ..Default::default() };
+        let r = Rig::new(conf.realize(true, true).unwrap());
+        r.w32(DMAR_FEDATA_REG, 0x42);
+        r.w32(DMAR_FEADDR_REG, 0xfee0_0000);
+        r.w32(DMAR_FECTL_REG, 0);
+        r
+    }
+
+    /// The scalable root and context entries for [`SID`], the PASID directory entry and the
+    /// PASID 0 entry with `pe0` and the domain `did`, then SRTP with SMT and TE.
+    fn enable_sm(&self, pe0: u64, did: u64) {
+        self.wq(ROOT, CTX | 1);
+        self.wq(CTX + u64::from(SID) * 32, PDIR | 1);
+        self.wq(PDIR, PTBL | 1);
+        self.wq(PTBL, pe0);
+        self.wq(PTBL + 8, did);
+        self.wq(PTBL + 16, PML4);
+        self.w64(DMAR_RTADDR_REG, ROOT | RTADDR_SMT);
+        self.w32(DMAR_GCMD_REG, GCMD_SRTP);
+        self.w32(DMAR_GCMD_REG, GCMD_TE);
+        assert_ne!(self.r32(DMAR_GSTS_REG) & GSTS_TES, 0);
+    }
+
+    /// Drops the cached context entries and IOTLB, as Linux does after changing a table.
+    fn flush(&self) {
+        self.w64(DMAR_CCMD_REG, CCMD_ICC | CCMD_GLOBAL_INVL);
+        self.w64(DMAR_IOTLB_REG, TLB_IVT | TLB_GLOBAL_FLUSH);
+    }
+
+    /// Turns on a queue of 256-bit descriptors.
+    fn enable_qi256(&mut self) {
+        self.w64(DMAR_IQA_REG, IQ | IQA_DW_MASK);
+        self.w64(DMAR_IQT_REG, 0);
+        self.w32(DMAR_GCMD_REG, GCMD_TE | GCMD_QIE);
+        assert_ne!(self.r32(DMAR_GSTS_REG) & GSTS_QIES, 0);
+    }
+
+    fn submit256(&mut self, lo: u64, hi: u64) {
+        self.wq(IQ + self.tail * 32, lo);
+        self.wq(IQ + self.tail * 32 + 8, hi);
+        self.wq(IQ + self.tail * 32 + 16, 0);
+        self.wq(IQ + self.tail * 32 + 24, 0);
+        self.tail += 1;
+        self.w64(DMAR_IQT_REG, self.tail << 5);
+        assert_eq!(self.r32(DMAR_FSTS_REG) & FSTS_IQE, 0);
+    }
+
+    fn rq(&self, addr: u64) -> u64 {
+        let mut b = [0u8; 8];
+        assert!(self.space.read(addr, U, &mut b).is_ok());
+        u64::from_le_bytes(b)
+    }
+}
+
+/// A present PASID entry of type `pgtt` over a 4-level second stage table.
+fn pe0(pgtt: u64) -> u64 {
+    PML4 | pgtt << 6 | 2 << 2 | 1
+}
+
+#[test]
+fn scalable_capabilities() {
+    let r = Rig::scalable(false);
+    let ecap = r.r64(DMAR_ECAP_REG);
+    assert_eq!(ecap & (ECAP_SMTS | ECAP_SRS | ECAP_SSTS), ECAP_SMTS | ECAP_SRS | ECAP_SSTS);
+    assert_eq!(ecap & ECAP_FSTS, 0);
+    let ecap = Rig::scalable(true).r64(DMAR_ECAP_REG);
+    assert_eq!(ecap & (ECAP_SMTS | ECAP_FSTS | ECAP_SSTS), ECAP_SMTS | ECAP_FSTS);
+}
+
+#[test]
+fn scalable_second_stage_walk() {
+    let r = Rig::scalable(false);
+    r.map(0x5000, DATA, 3);
+    r.wq(DATA, 0xbeef);
+    r.enable_sm(pe0(2), 7);
+    assert_eq!(r.dma_read(0x5000), Some(0xbeef));
+    assert!(r.dma_write(0x5004, 1));
+    assert_eq!(r.rd32(DATA + 4), 1);
+    // A miss in the table faults with the reason of the second stage walk.
+    assert_eq!(r.dma_read(0x6000), None);
+    assert_eq!(r.fault_reason().0, u64::from(FR_READ));
+    assert_eq!(r.msis(), vec![(0xfee0_0000, 0x42)]);
+    // The FPD bit of the PASID entry hides it.
+    r.wq(PTBL, pe0(2) | PASID_ENTRY_FPD);
+    r.flush();
+    assert_eq!(r.dma_read(0x6000), None);
+    assert_eq!(r.r64(DMAR_FRCD_REG_0_2) & FRCD_F, 0);
+    // So does the one of the directory entry.
+    r.wq(PTBL, pe0(2));
+    r.wq(PDIR, PTBL | PASID_DIR_FPD | 1);
+    r.flush();
+    assert_eq!(r.dma_read(0x6000), None);
+    assert_eq!(r.r64(DMAR_FRCD_REG_0_2) & FRCD_F, 0);
+}
+
+#[test]
+fn scalable_pass_through_and_pasid_faults() {
+    let r = Rig::scalable(false);
+    r.wq(DATA, 0x1234);
+    r.enable_sm(pe0(4), 7);
+    assert_eq!(r.dma_read(DATA), Some(0x1234));
+    // Each broken PASID structure gives its own reason.
+    let cases = [
+        (PDIR, PTBL, u64::from(FR_PASID_DIR_ENTRY_P)),
+        (PTBL, pe0(2) & !1, u64::from(FR_PASID_ENTRY_P)),
+        (PTBL, 0, u64::from(FR_PASID_TABLE_ENTRY_INV)),
+        (PTBL, pe0(1), u64::from(FR_PASID_TABLE_ENTRY_INV)),
+        (PTBL, pe0(3), u64::from(FR_PASID_TABLE_ENTRY_INV)),
+        (PTBL, PML4 | 2 << 6 | 7 << 2 | 1, u64::from(FR_PASID_TABLE_ENTRY_INV)),
+    ];
+    for (addr, val, fr) in cases {
+        r.wq(addr, val);
+        r.flush();
+        assert_eq!(r.dma_read(DATA), None, "{fr:#x}");
+        assert_eq!(r.fault_reason().0, fr);
+        r.wq(PDIR, PTBL | 1);
+        r.wq(PTBL, pe0(4));
+    }
+    r.flush();
+    assert_eq!(r.dma_read(DATA), Some(0x1234));
+}
+
+/// Maps the 4K page at `iova` to `gpa` in the first stage table with the bits `bits`, and
+/// the upper levels present, writable and user.
+fn map_fs(r: &Rig, iova: u64, gpa: u64, bits: u64) {
+    r.wq(PML4 + ((iova >> 39) & 0x1ff) * 8, PDPT | 7);
+    r.wq(PDPT + ((iova >> 30) & 0x1ff) * 8, PD | 7);
+    r.wq(PD + ((iova >> 21) & 0x1ff) * 8, PT | 7);
+    r.wq(PT + ((iova >> 12) & 0x1ff) * 8, gpa | bits);
+}
+
+#[test]
+fn first_stage_walk_sets_accessed_and_dirty() {
+    let r = Rig::scalable(true);
+    map_fs(&r, 0x5000, DATA, 7);
+    map_fs(&r, 0x6000, DATA + 0x1000, 7);
+    r.wq(DATA, 0xbeef);
+    r.enable_sm(pe0(1), 7);
+    assert_eq!(r.dma_read(0x5000), Some(0xbeef));
+    assert_eq!(r.rq(PML4) & (FS_A | FS_D), FS_A);
+    assert_eq!(r.rq(PT + 5 * 8) & (FS_A | FS_D), FS_A);
+    assert!(r.dma_write(0x6000, 1));
+    assert_eq!(r.rq(PT + 6 * 8) & (FS_A | FS_D), FS_A | FS_D);
+    assert_eq!(r.rd32(DATA + 0x1000), 1);
+    // A 2M page at the PD level.
+    r.wq(PD + 8, 0x20_0000 | PT_PAGE_SIZE_MASK | 7);
+    r.wq(0x20_0000 + 0x1230, 0x77);
+    assert_eq!(r.dma_read(0x20_1230), Some(0x77));
+}
+
+#[test]
+fn first_stage_faults() {
+    let r = Rig::scalable(true);
+    map_fs(&r, 0x5000, DATA, 1 | 4);
+    map_fs(&r, 0x6000, DATA, 1 | 2);
+    map_fs(&r, 0x8000, DATA | 1 << 50, 7);
+    r.enable_sm(pe0(1), 7);
+    assert!(!r.dma_write(0x5000, 1));
+    assert_eq!(r.fault_reason().0, u64::from(FR_SM_WRITE));
+    assert_eq!(r.dma_read(0x6000), None);
+    assert_eq!(r.fault_reason().0, u64::from(FR_FS_PAGING_ENTRY_US));
+    assert_eq!(r.dma_read(0x7000), None);
+    assert_eq!(r.fault_reason().0, u64::from(FR_FS_PAGING_ENTRY_P));
+    assert_eq!(r.dma_read(0x8000), None);
+    assert_eq!(r.fault_reason().0, u64::from(FR_FS_PAGING_ENTRY_RSVD));
+    assert_eq!(r.dma_read(0x8000_0000_0000), None);
+    assert_eq!(r.fault_reason().0, u64::from(FR_FS_NON_CANONICAL));
+    // A first stage pointer outside of RAM.
+    r.wq(PTBL + 16, 0x1_0000_0000);
+    r.flush();
+    assert_eq!(r.dma_read(0x5000), None);
+    assert_eq!(r.fault_reason().0, u64::from(FR_PASID_ENTRY_FSPTPTR_INV));
+}
+
+#[test]
+fn pasid_based_iotlb_invalidation() {
+    let mut r = Rig::scalable(true);
+    map_fs(&r, 0x5000, DATA, 7);
+    r.wq(DATA, 1);
+    r.wq(DATA + 0x1000, 2);
+    r.enable_sm(pe0(1), 7);
+    r.enable_qi256();
+    assert_eq!(r.dma_read(0x5000), Some(1));
+    map_fs(&r, 0x5000, DATA + 0x1000, 7);
+    assert_eq!(r.dma_read(0x5000), Some(1));
+    // Another domain or PASID leaves the entry.
+    r.submit256(u64::from(INV_DESC_PIOTLB) | 0x30 | 8 << 16, 0x5000);
+    r.submit256(u64::from(INV_DESC_PIOTLB) | 0x30 | 7 << 16 | 1 << 32, 0x5000);
+    r.submit256(u64::from(INV_DESC_PIOTLB) | 0x20 | 7 << 16 | 1 << 32, 0);
+    assert_eq!(r.dma_read(0x5000), Some(1));
+    r.submit256(u64::from(INV_DESC_PIOTLB) | 0x30 | 7 << 16, 0x5000);
+    assert_eq!(r.dma_read(0x5000), Some(2));
+    map_fs(&r, 0x5000, DATA, 7);
+    r.submit256(u64::from(INV_DESC_PIOTLB) | 0x20 | 7 << 16, 0);
+    assert_eq!(r.dma_read(0x5000), Some(1));
+    // A page selective IOTLB invalidation of the domain drops its first stage entries
+    // whatever the address.
+    map_fs(&r, 0x5000, DATA + 0x1000, 7);
+    r.submit256(u64::from(INV_DESC_IOTLB) | 0x30 | 7 << 16, 0x9000);
+    assert_eq!(r.dma_read(0x5000), Some(2));
+}
+
+#[test]
+fn page_request_registers() {
+    let conf = IntelIommuConf {
+        scalable_mode: true,
+        fsts: true,
+        device_iotlb: true,
+        pasid_bits: 8,
+        svm: true,
+        ..Default::default()
+    };
+    let r = Rig::new(conf.realize(true, true).unwrap());
+    assert_ne!(r.r64(DMAR_ECAP_REG) & ECAP_PRS, 0);
+    r.w64(DMAR_PQA_REG, u64::MAX);
+    assert_eq!(r.r64(DMAR_PQA_REG), 0xffff_ffff_ffff_f007);
+    r.w64(DMAR_PQT_REG, u64::MAX);
+    assert_eq!(r.r64(DMAR_PQT_REG), 0x7ffe0);
+    r.w32(DMAR_PEDATA_REG, 0x51);
+    r.w32(DMAR_PEADDR_REG, 0xfee0_0003);
+    r.w32(DMAR_PEUADDR_REG, 0x1);
+    assert_eq!(r.r32(DMAR_PEADDR_REG), 0xfee0_0000);
+    assert_eq!(r.r32(DMAR_PEUADDR_REG), 1);
+    r.w32(DMAR_PECTL_REG, 0);
+    assert_eq!(r.r32(DMAR_PECTL_REG), 0);
+    assert!(r.msis().is_empty());
+    // Without svm the registers are not there.
+    let r = Rig::scalable(true);
+    r.w64(DMAR_PQA_REG, u64::MAX);
+    assert_eq!(r.r64(DMAR_PQA_REG), 0);
 }
