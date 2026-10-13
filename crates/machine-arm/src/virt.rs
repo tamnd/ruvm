@@ -64,9 +64,9 @@
 //! - SMBIOS (`virt_build_smbios()`), so firmware finds no SMBIOS tables in fw_cfg.
 //! - The ACPI tables of the missing devices: HEST (`ras=on`), HMAT, the watchdog's GTDT entry
 //!   and WDAT, TPM2, VIOT, CEDT, NFIT, the PPTT cache nodes of `smp-cache`, the memory and
-//!   ACPI PCI hotplug AML, and SRAT and SLIT, since there is no `-numa`.
+//!   ACPI PCI hotplug AML.
 //!
-//! Also missing: the GED's memory hotplug container at 0x09070000, NUMA, GICv2 and GICv5, the
+//! Also missing: the GED's memory hotplug container at 0x09070000, GICv2 and GICv5, the
 //! tag memory of the secure RAM with `mte=on` (only the RAM has tags), `-shim`, uImage and
 //! u-boot ramdisks, zstd EFI zboot payloads, big-endian and ELF32 kernels, memory hotplug and
 //! device memory, and `dtb-randomness` (the board behaves as with `dtb-randomness=off`: no
@@ -100,8 +100,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use ruvm_base::ClockType;
 use ruvm_firmware::acpi::BuildTables;
 use ruvm_firmware::acpi::arm_virt::{
-    self, ArmVirtAcpi, GicV2Bases, GicV2mFrame, IortSmmu, PsciConduit as AcpiPsci, VirtIrqs,
-    VirtMemmap as AcpiMemmap, VirtTpm,
+    self, ArmVirtAcpi, GicV2Bases, GicV2mFrame, IortSmmu, NumaNode, PsciConduit as AcpiPsci,
+    VirtIrqs, VirtMemmap as AcpiMemmap, VirtTpm,
 };
 use ruvm_firmware::acpi::gpex::Window;
 use ruvm_firmware::acpi::q35::{PciDevice as AcpiPciDevice, PciDeviceAml};
@@ -453,6 +453,31 @@ pub struct VirtConfig {
     pub spi_sink: Option<SpiSink>,
     /// `force-legacy` of the virtio-mmio transports, which `-global` can change.
     pub virtio_force_legacy: bool,
+    /// `-numa`, `None` without nodes.
+    pub numa: Option<VirtNuma>,
+}
+
+/// The NUMA nodes, once `numa_complete_configuration()` and `machine_numa_finish_cpu_init()`
+/// have checked and completed them.
+#[derive(Clone, Default)]
+pub struct VirtNuma {
+    /// `node_mem` of each node, and the RAM of its `memdev`. The sizes add up to the RAM size.
+    pub nodes: Vec<(u64, Option<Arc<RamBlock>>)>,
+    /// The node of each possible CPU.
+    pub cpu_nodes: Vec<u32>,
+    /// `distance[]` of each node to every node, or empty when no `-numa dist` was given.
+    pub distance: Vec<Vec<u8>>,
+}
+
+impl fmt::Debug for VirtNuma {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mem: Vec<u64> = self.nodes.iter().map(|n| n.0).collect();
+        f.debug_struct("VirtNuma")
+            .field("mem", &mem)
+            .field("cpu_nodes", &self.cpu_nodes)
+            .field("distance", &self.distance)
+            .finish()
+    }
 }
 
 /// A `-device tpm-tis-device`, with where its registers and PPI memory are on the platform
@@ -526,6 +551,7 @@ impl fmt::Debug for VirtConfig {
             .field("oem_table_id", &self.oem_table_id)
             .field("topology", &self.topology)
             .field("virtio_force_legacy", &self.virtio_force_legacy)
+            .field("numa", &self.numa)
             .finish_non_exhaustive()
     }
 }
@@ -568,6 +594,7 @@ impl VirtConfig {
             topology: None,
             spi_sink: None,
             virtio_force_legacy: VIRTIO_MMIO_FORCE_LEGACY_DEFAULT,
+            numa: None,
         }
     }
 }
@@ -948,6 +975,7 @@ pub struct VirtMachine {
     oem_id: String,
     oem_table_id: String,
     topology: CpuTopology,
+    numa: Option<VirtNuma>,
     ns_el2_virt_timer_irq: bool,
     virtualization: bool,
     redist2: Option<MemMapEntry>,
@@ -1124,6 +1152,9 @@ impl VirtMachine {
 
         let mut fdt = Fdt::new();
         let clock_phandle = dt::create_fdt(&mut fdt, cfg.secure)?;
+        if let Some(numa) = cfg.numa.as_ref().filter(|n| !n.distance.is_empty()) {
+            dt::add_distance_map(&mut fdt, &numa.distance)?;
+        }
 
         let mpidrs: Vec<u64> = (0..smp).map(virt_cpu_mp_affinity).collect();
         // ns_el2_virt_timer_present().
@@ -1132,12 +1163,27 @@ impl VirtMachine {
         let ppi_cpus = if v2 { Some(smp) } else { None };
         dt::add_timer_nodes(&mut fdt, ns_el2_virt_timer_irq, ppi_cpus)?;
         let psci = vms_conduit != PsciConduit::Disabled;
-        dt::add_cpu_nodes(&mut fdt, &model, &mpidrs, psci, &topology)?;
+        let cpu_nodes = cfg.numa.as_ref().map(|n| &n.cpu_nodes[..]);
+        dt::add_cpu_nodes(&mut fdt, &model, &mpidrs, psci, &topology, cpu_nodes)?;
 
-        // machine_consume_memdev(): the backend's region, named after the backend.
-        let ram = match cfg.memdev.clone() {
-            Some(block) => mem.new_ram_from_block(block),
-            None => mem.new_ram(VIRT_RAM_ID, ram_size),
+        // machine_consume_memdev(): the backend's region, named after the backend. With
+        // -numa memdev, numa_init_memdev_container() puts the backends of the nodes one after
+        // the other in a container.
+        let ram = match (&cfg.numa, cfg.memdev.clone()) {
+            (Some(numa), _) => {
+                let ram = mem.new_container(VIRT_RAM_ID, ram_size.into()).map_err(err)?;
+                let mut addr = 0;
+                for (size, block) in &numa.nodes {
+                    if let Some(block) = block {
+                        let seg = mem.new_ram_from_block(Arc::clone(block)).map_err(err)?;
+                        mem.add_subregion(ram, addr, seg).map_err(err)?;
+                        addr += size;
+                    }
+                }
+                Ok(ram)
+            }
+            (None, Some(block)) => mem.new_ram_from_block(block),
+            (None, None) => mem.new_ram(VIRT_RAM_ID, ram_size),
         }
         .map_err(err)?;
         mem.add_subregion(system, VIRT_MEM, ram).map_err(err)?;
@@ -1478,6 +1524,7 @@ impl VirtMachine {
             oem_id: cfg.oem_id,
             oem_table_id: cfg.oem_table_id,
             topology,
+            numa: cfg.numa,
             ns_el2_virt_timer_irq,
             virtualization: cfg.virtualization,
             redist2,
@@ -1809,12 +1856,16 @@ impl VirtMachine {
             },
             virtio_count: VIRTIO_TRANSPORTS as u32,
             mpidrs: (0..self.smp).map(virt_cpu_mp_affinity).collect(),
-            possible_cpus: arm_virt::possible_cpus(
-                topo.sockets,
-                topo.clusters,
-                topo.cores,
-                topo.threads,
-            ),
+            possible_cpus: {
+                let mut cpus =
+                    arm_virt::possible_cpus(topo.sockets, topo.clusters, topo.cores, topo.threads);
+                if let Some(numa) = &self.numa {
+                    for (cpu, &node) in cpus.iter_mut().zip(&numa.cpu_nodes) {
+                        cpu.node = node;
+                    }
+                }
+                cpus
+            },
             has_clusters: topo.has_clusters,
             threads: topo.threads,
             // The GICC performance interrupt, when the CPU has a PMU.
@@ -1829,7 +1880,16 @@ impl VirtMachine {
             ged_events: self.ged.as_ref().map(|g| g.ged_event_bitmap()),
             spcr: self.spcr,
             pci_devices,
-            numa: Vec::new(),
+            numa: self
+                .numa
+                .iter()
+                .flat_map(|n| {
+                    n.nodes.iter().enumerate().map(|(i, (mem, _))| NumaNode {
+                        mem: *mem,
+                        distance: n.distance.get(i).cloned().unwrap_or_default(),
+                    })
+                })
+                .collect(),
             // populate_smmuv3_legacy_dev(): the bus range of the root bus, which has no bridges
             // under it, goes through the SMMU unless the bus bypasses it. populate_smmuv3_dev()
             // gives the same range for the device, whose identifier counts the ITS node.
@@ -1939,6 +1999,7 @@ impl VirtMachine {
             self.dtb_filename.as_deref(),
             &self.cmdline,
             self.arm.psci_conduit(),
+            self.numa.as_ref().map_or(&[][..], |n| &n.nodes[..]),
         )? {
             self.fdt = fdt;
         }

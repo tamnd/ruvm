@@ -311,8 +311,8 @@ fn register_machine(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
         none_machine(&v, "query-firmware-log")?;
         Err(Error::generic("firmware log buffer not found"))
     });
-    // ruvm has no -numa.
-    register_x_query_numa(cmds, |_: &MonitorQmp| Ok(text("0 nodes\n")));
+    let v = vm.clone();
+    register_x_query_numa(cmds, move |_: &MonitorQmp| Ok(text(crate::numa::x_query_numa(&v))));
     // ram_block_format() with no RAM blocks, the header alone. ruvm does not keep the
     // ram_addr_t offsets the rows show.
     let v = vm.clone();

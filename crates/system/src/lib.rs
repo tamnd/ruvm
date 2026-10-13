@@ -16,6 +16,7 @@ mod hmp;
 mod info;
 mod migration;
 mod net;
+mod numa;
 pub mod options;
 mod qdev;
 mod qmp_cmds;

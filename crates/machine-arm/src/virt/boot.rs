@@ -800,10 +800,31 @@ fn add_psci_node(fdt: &mut Fdt, conduit: PsciConduit) -> Result<(), String> {
     fdt.setprop_cell("/psci", "migrate", QEMU_PSCI_0_2_FN64_MIGRATE)
 }
 
+/// `fdt_add_memory_node()`.
+fn fdt_add_memory_node(
+    fdt: &mut Fdt,
+    acells: u32,
+    mem_base: u64,
+    scells: u32,
+    mem_len: u64,
+    numa_node_id: Option<u32>,
+) -> Result<(), String> {
+    let nodename = format!("/memory@{mem_base:x}");
+    fdt.add_subnode(&nodename)?;
+    fdt.setprop_string(&nodename, "device_type", "memory")?;
+    let reg = sized_cells(&[(acells, mem_base), (scells, mem_len)])
+        .ok_or_else(|| format!("couldn't add /memory@{mem_base:x} node"))?;
+    fdt.setprop(&nodename, "reg", &reg)?;
+    if let Some(id) = numa_node_id {
+        fdt.setprop_cell(&nodename, "numa-node-id", id)?;
+    }
+    Ok(())
+}
+
 /// `arm_load_dtb()`: finish the tree (the board's, or the user's `-dtb`) and add it to the
 /// ROM list at `info.dtb_start`. Returns the tree, or `None` if it does not fit below
 /// `info.dtb_limit`, which QEMU does not treat as an error. `conduit` is the CPUs'
-/// `psci-conduit`.
+/// `psci-conduit` and `numa` the memory of each NUMA node, which gets a memory node of its own.
 pub(crate) fn arm_load_dtb(
     ld: &mut Loader,
     info: &BootInfo,
@@ -811,6 +832,7 @@ pub(crate) fn arm_load_dtb(
     dtb_filename: Option<&str>,
     cmdline: &str,
     conduit: PsciConduit,
+    numa: &[(u64, Option<Arc<RamBlock>>)],
 ) -> Result<Option<Fdt>, String> {
     let addr = info.dtb_start;
     let addr_limit = info.dtb_limit;
@@ -843,13 +865,18 @@ pub(crate) fn arm_load_dtb(
         }
     }
 
-    // fdt_add_memory_node() without NUMA.
-    let nodename = format!("/memory@{:x}", info.loader_start);
-    fdt.add_subnode(&nodename)?;
-    fdt.setprop_string(&nodename, "device_type", "memory")?;
-    let reg = sized_cells(&[(acells, info.loader_start), (scells, info.ram_size)])
-        .ok_or_else(|| format!("couldn't add /memory@{:x} node", info.loader_start))?;
-    fdt.setprop(&nodename, "reg", &reg)?;
+    if numa.is_empty() {
+        fdt_add_memory_node(&mut fdt, acells, info.loader_start, scells, info.ram_size, None)?;
+    } else {
+        let mut mem_base = info.loader_start;
+        for (i, &(mem_len, _)) in numa.iter().enumerate() {
+            if mem_len == 0 {
+                continue;
+            }
+            fdt_add_memory_node(&mut fdt, acells, mem_base, scells, mem_len, Some(i as u32))?;
+            mem_base += mem_len;
+        }
+    }
 
     if !fdt.exists("/chosen") {
         fdt.add_subnode("/chosen")?;
