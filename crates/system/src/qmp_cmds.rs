@@ -111,7 +111,7 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
     });
     let v = vm.clone();
     register_quit(cmds, move |_: &MonitorQmp| {
-        v.runstate.shutdown_request(ShutdownCause::HostQmpQuit);
+        v.runstate.quit_request(ShutdownCause::HostQmpQuit);
         Ok(())
     });
     let v = vm.clone();
