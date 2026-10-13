@@ -320,9 +320,9 @@ pub(crate) struct BoardOptions {
     pub highmem: Highmem,
     /// `msi`, or `its`, whichever came last.
     pub msi: VirtMsi,
-    /// `gic-version`. Without it ruvm uses a GICv3, where QEMU picks a GICv2 for TCG with at
-    /// most 8 CPUs.
-    pub gic_version: VirtGicVersion,
+    /// `gic-version`, `None` when it is not given: TCG and qtest then pick one with
+    /// [`VirtGicVersion::tcg_default`], and KVM uses a GICv3.
+    pub gic_version: Option<VirtGicVersion>,
     /// `iommu`.
     pub iommu: VirtIommu,
     /// `default-bus-bypass-iommu`.
@@ -572,8 +572,8 @@ pub(crate) fn take_board_options(board: ArmBoard, machine: &QDict) -> Result<Boa
             }
             // virt_set_gic_version().
             "gic-version" => match prop_string(name, value)?.as_str() {
-                "2" => o.gic_version = VirtGicVersion::V2,
-                "3" => o.gic_version = VirtGicVersion::V3,
+                "2" => o.gic_version = Some(VirtGicVersion::V2),
+                "3" => o.gic_version = Some(VirtGicVersion::V3),
                 v => check_virt_prop(name, v)?,
             },
             // virt_set_msi() and virt_set_its(). its=off is the GICv2m with a GICv2 and no MSI
@@ -1200,6 +1200,7 @@ pub(crate) fn start_board_tcg(
     }
     let one = |e: Error| vec![Located(None, e)];
     let cpu = || parse_cpu(ArmBoard::Virt, args.cpu).map_err(one);
+    let opts = with_tcg_gic_version(opts);
     let built = build_virt(vm, opts, args, serial_hds, cpu, |_| Ok(()))?;
     let BuiltVirt { mut board, console, attachments, clocks, dumpdtb: dtb_path, net } = built;
     board.machine_done().map_err(|e| one(Error::generic(e)))?;
@@ -1232,6 +1233,7 @@ pub(crate) fn start_board_qtest(
 ) -> std::result::Result<Running, Vec<Located>> {
     let one = |e: Error| vec![Located(None, e)];
     let cpu = || parse_cpu(ArmBoard::Virt, args.cpu).map_err(one);
+    let opts = with_tcg_gic_version(opts);
     let built = build_virt(vm, opts, args, serial_hds, cpu, |cfg| {
         cfg.clock = Some(clock);
         Ok(())
@@ -1251,6 +1253,17 @@ pub(crate) fn start_board_qtest(
         console,
         _attachments: attachments,
     })
+}
+
+/// `finalize_gic_version()` for TCG and qtest, which can do a GICv2 and a GICv3: fills in the
+/// version when `gic-version` is not given.
+fn with_tcg_gic_version(mut opts: BoardOptions) -> BoardOptions {
+    if opts.gic_version.is_none() {
+        let max_cpus = opts.max_cpus as usize;
+        let v = VirtGicVersion::tcg_default(max_cpus, opts.secure, opts.virtualization);
+        opts.gic_version = Some(v);
+    }
+    opts
 }
 
 /// The CPUs of virt as `query-cpus-fast` lists them, with the props
@@ -1329,7 +1342,7 @@ fn build_virt(
     cfg.mte = opts.mte;
     cfg.highmem = opts.highmem;
     cfg.msi = opts.msi;
-    cfg.gic_version = opts.gic_version;
+    cfg.gic_version = opts.gic_version.unwrap_or_default();
     cfg.iommu = opts.iommu;
     cfg.default_bus_bypass_iommu = opts.default_bus_bypass_iommu;
     // machvirt_init() checks maxcpus against the redistributor space.
@@ -1604,11 +1617,13 @@ mod tests {
         assert_eq!(o.kernel.as_deref(), Some("k"));
         assert_eq!(o.dtb.as_deref(), Some("d.dtb"));
         assert_eq!(o.msi, VirtMsi::ItsOff);
-        assert_eq!(o.gic_version, VirtGicVersion::V3);
+        assert_eq!(o.gic_version, Some(VirtGicVersion::V3));
         let mut m = QDict::new();
         m.put("gic-version", "2");
         let o = take_board_options(ArmBoard::Virt, &m).unwrap();
-        assert_eq!(o.gic_version, VirtGicVersion::V2);
+        assert_eq!(o.gic_version, Some(VirtGicVersion::V2));
+        let o = take_board_options(ArmBoard::Virt, &QDict::new()).unwrap();
+        assert_eq!(o.gic_version, None);
         let mut m = QDict::new();
         m.put("gic-version", "max");
         assert_eq!(

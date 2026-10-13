@@ -57,7 +57,8 @@
 //!
 //! - The virtualization and security extensions of the GICv2, so `gic-version=2` with
 //!   `virtualization=on` or `secure=on` fails. Without `gic-version`, QEMU picks a GICv2 for
-//!   TCG when there are at most 8 CPUs; ruvm keeps its GICv3.
+//!   TCG when there are at most 8 CPUs, also with those two on; ruvm picks a GICv3 for them
+//!   ([`VirtGicVersion::tcg_default`]).
 //! - CXL, so the empty `cxl_host_reg` container QEMU maps above the redistributors is not
 //!   there either.
 //! - SMBIOS (`virt_build_smbios()`), so firmware finds no SMBIOS tables in fw_cfg.
@@ -291,10 +292,19 @@ pub enum VirtMsi {
 pub enum VirtGicVersion {
     /// `gic-version=2`.
     V2,
-    /// `gic-version=3`. QEMU picks a GICv2 when the property is not given and there are at
-    /// most 8 CPUs; ruvm keeps the GICv3 it has always had.
+    /// `gic-version=3`.
     #[default]
     V3,
+}
+
+impl VirtGicVersion {
+    /// The version without `gic-version` on TCG and qtest, the `VIRT_GIC_VERSION_NOSEL` case of
+    /// `finalize_gic_version_do()`: a GICv2 for at most 8 CPUs and a GICv3 for more. QEMU
+    /// also picks the GICv2 with `secure=on` or `virtualization=on`, but ruvm's GICv2 has
+    /// neither the security nor the virtualization extensions, so those get the GICv3.
+    pub fn tcg_default(max_cpus: usize, secure: bool, virtualization: bool) -> Self {
+        if max_cpus <= GIC_NCPU && !secure && !virtualization { Self::V2 } else { Self::V3 }
+    }
 }
 
 /// The GIC of a virt board.

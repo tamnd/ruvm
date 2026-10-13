@@ -286,6 +286,17 @@ fn dtb_a57_gicv2_matches_qemu() {
     compare(cfg, "virt-a57-smp8-gicv2-msi-off.dtb.gz");
 }
 
+/// Without `gic-version`, TCG gets a GICv2 for at most 8 CPUs, as in QEMU 11.1, and a GICv3
+/// for more, or where ruvm's GICv2 lacks the security or virtualization extensions.
+#[test]
+fn tcg_default_gic_version() {
+    assert_eq!(VirtGicVersion::tcg_default(1, false, false), VirtGicVersion::V2);
+    assert_eq!(VirtGicVersion::tcg_default(8, false, false), VirtGicVersion::V2);
+    assert_eq!(VirtGicVersion::tcg_default(9, false, false), VirtGicVersion::V3);
+    assert_eq!(VirtGicVersion::tcg_default(2, true, false), VirtGicVersion::V3);
+    assert_eq!(VirtGicVersion::tcg_default(2, false, true), VirtGicVersion::V3);
+}
+
 #[test]
 fn dtb_a57_smp130_matches_qemu() {
     // 123 redistributors fill the low region, so the other 7 go to the high one.

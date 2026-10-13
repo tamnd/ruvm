@@ -2118,6 +2118,7 @@ dependencies = [
  "ruvm-hw-char",
  "ruvm-hw-core",
  "ruvm-hw-intc",
+ "ruvm-hw-iommu",
  "ruvm-hw-misc",
  "ruvm-hw-pci",
  "ruvm-hw-timer",
