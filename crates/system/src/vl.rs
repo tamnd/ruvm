@@ -1212,6 +1212,13 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     } else {
         parse_drives(kind, &cfg.x86.drives)?
     };
+    // The boards that keep the drive list open their images through the block layer.
+    if kind.is_none() {
+        crate::drives::open_drives(&vm.block, &drives, &cfg.x86.drives).map_err(|e| {
+            e.report();
+            Exit(1)
+        })?;
+    }
     crate::audio::create_early_backends(cfg.x86.has_defaults, vm.name.as_deref())
         .map_err(|e| fail(&e))?;
 

@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use ruvm_base::Error;
 use ruvm_base::report::Location;
+use ruvm_block::BlockGraph;
 use ruvm_hw_iommu::smmuv3::OAS_MODES;
 use ruvm_hw_iommu::{SmmuV3Props, VirtioIommuConf};
 use ruvm_hw_storage::{BlockBackend, DriveConfig};
@@ -38,16 +39,15 @@ use ruvm_hw_virtio::{
 use ruvm_machine_arm::pflash::PflashBacking;
 use ruvm_machine_arm::sbsa_ref::{NUM_SATA_PORTS, SbsaRefMachine};
 use ruvm_machine_arm::virt::VirtMachine;
-use ruvm_machine_x86::{FileBackend, VirtioHandle};
+use ruvm_machine_x86::VirtioHandle;
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
 use ruvm_qapi::visit::{Visitor, VisitorExt};
 
 use super::{ArmBoard, prop_bool};
-use crate::drives::{Plugged, resize_cb};
+use crate::drives::{Plugged, device_image, resize_cb};
 use crate::net::Network;
 use crate::x86::{
-    Drive, DriveIf, KeepRam, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive,
-    parse_mac, probe_warning,
+    Drive, DriveIf, KeepRam, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive, parse_mac,
 };
 
 /// The virtio device models virt can plug.
@@ -493,12 +493,7 @@ pub(crate) fn plan(
             Some(_) if d.null_size.is_some() => {
                 return Err(vec![Located::new(&d.loc, NULL_CO_PFLASH)]);
             }
-            Some(file) => {
-                if d.probed && !d.read_only {
-                    eprint!("{}", probe_warning(file));
-                }
-                PflashBacking::File { path: file.into(), read_only: d.read_only }
-            }
+            Some(file) => PflashBacking::File { path: file.into(), read_only: d.read_only },
             None => PflashBacking::None,
         };
         p.pflash[d.unit as usize] = Some(backing);
@@ -524,16 +519,6 @@ pub(crate) fn plan(
         return Err(orphans);
     }
     Ok(p)
-}
-
-/// Opens drive `d` for a device.
-fn open_drive(d: &Drive) -> Result<FileBackend, String> {
-    let file = d.file.as_deref().expect("planned with media");
-    let backend = d.open()?;
-    if d.probed && !d.read_only {
-        eprint!("{}", probe_warning(file));
-    }
-    Ok(backend)
 }
 
 /// The board the virtio devices plug into.
@@ -567,6 +552,7 @@ fn sbsa_ref_display(typename: &str) -> String {
 /// `qdev_device_add()` for the planned devices: builds each one and plugs it into its bus, a
 /// virtio-net joined to its netdev in `net`. Gives the drives it put on virtio-blk devices.
 pub(crate) fn plug(
+    graph: &BlockGraph,
     board: Target<'_>,
     plugs: &[Plug],
     display: &[(usize, crate::display::DisplayPlug)],
@@ -589,8 +575,11 @@ pub(crate) fn plug(
             Model::Blk => {
                 let drive = plug.drive.expect("planned with a drive");
                 let d = &drives[drive];
-                let backend = open_drive(d).map_err(|e| Located::new(&d.loc, e))?;
-                image = Some((drive, backend.clone()));
+                // virtio_blk_device_realize()
+                let readonly = graph.backend(&d.id).is_some_and(|b| b.is_read_only());
+                let backend = device_image(graph, d, readonly, true)
+                    .map_err(|e| Located(plug.loc.clone(), e))?;
+                image = Some(drive);
                 // virtio_blk_pci_realize() turns the automatic num-queues into one queue per
                 // vCPU. virtio-blk-device keeps one.
                 let num_queues = match plug.transport {
@@ -676,8 +665,8 @@ pub(crate) fn plug(
                 )));
             }
         };
-        if let Some((drive, image)) = image {
-            plugged.push(Plugged { drive, image, resize_cb: resize_cb(handle.as_ref()) });
+        if let Some(drive) = image {
+            plugged.push(Plugged { drive, resize_cb: resize_cb(handle.as_ref()) });
         }
         if let (Some(nic), Some(handle)) = (nic, handle) {
             nic.connect(handle);
@@ -692,14 +681,21 @@ pub(crate) fn plug(
 /// `ahci_ide_create_devs()` for the planned IDE drives of sbsa-ref: an `ide-cd` or `ide-hd`
 /// on each AHCI port with a drive.
 pub(crate) fn plug_ahci(
+    graph: &BlockGraph,
     board: &SbsaRefMachine,
     ide: &[(usize, usize)],
     drives: &[Drive],
 ) -> Result<(), Located> {
     for &(port, i) in ide {
         let d = &drives[i];
+        // ide_dev_initfn()
         let blk: Option<Arc<dyn BlockBackend>> = match &d.file {
-            Some(_) => Some(Arc::new(open_drive(d).map_err(|e| Located::new(&d.loc, e))?)),
+            Some(_) => {
+                // The board adds the device, with no location to report.
+                let image =
+                    device_image(graph, d, d.cdrom, !d.cdrom).map_err(|e| Located(None, e))?;
+                Some(Arc::new(image))
+            }
             None => None,
         };
         if !d.cdrom && blk.is_none() {
@@ -859,8 +855,10 @@ mod tests {
         let net = Network::new(&netdevs, false, &Clock::manual(ClockType::Virtual), None).unwrap();
         let p = plan(V, &[], &[dev("virtio-net-pci,netdev=n0")]).unwrap();
         let board = VirtMachine::new(ruvm_machine_arm::virt::VirtConfig::default()).unwrap();
-        plug(Target::Virt(&board), &p.virtio, &p.display, &[], &net).unwrap();
-        let e = plug(Target::Virt(&board), &p.virtio, &p.display, &[], &net).err().unwrap();
+        plug(&BlockGraph::new(), Target::Virt(&board), &p.virtio, &p.display, &[], &net).unwrap();
+        let e = plug(&BlockGraph::new(), Target::Virt(&board), &p.virtio, &p.display, &[], &net)
+            .err()
+            .unwrap();
         assert_eq!(
             e.1.message(),
             "Property 'virtio-net-pci.netdev' can't take value 'n0', it's in use"
@@ -874,13 +872,15 @@ mod tests {
         std::fs::write(&path, vec![0u8; 1 << 16]).unwrap();
         let arg = format!("file={},format=raw", path.display());
         let d = parse_drives(V, &[dev(&arg)]).unwrap();
+        let graph = BlockGraph::new();
+        crate::drives::open_drives(&graph, &d, &[dev(&arg)]).unwrap();
         let p = plan(V, &d, &[dev("virtio-rng-pci")]).unwrap();
         let cfg = ruvm_machine_arm::virt::VirtConfig {
             smp: 2,
             ..ruvm_machine_arm::virt::VirtConfig::default()
         };
         let board = VirtMachine::new(cfg).unwrap();
-        plug(Target::Virt(&board), &p.virtio, &p.display, &d, &no_net()).unwrap();
+        plug(&graph, Target::Virt(&board), &p.virtio, &p.display, &d, &no_net()).unwrap();
         let _ = std::fs::remove_file(&path);
         let vectors: Vec<u32> = board.pci_devices().iter().map(|f| f.nvectors()).collect();
         assert_eq!(vectors, [2, 3]);
@@ -973,10 +973,10 @@ mod tests {
         let board = SbsaRefMachine::new(Default::default()).unwrap();
         let d = parse_drives(S, &[dev("if=ide")]).unwrap();
         let p = plan(S, &d, &[]).unwrap();
-        let e = plug_ahci(&board, &p.ide, &d).unwrap_err();
+        let e = plug_ahci(&BlockGraph::new(), &board, &p.ide, &d).unwrap_err();
         assert_eq!(e.1.message(), "Device needs media, but drive is empty");
         let d = parse_drives(S, &[dev("if=ide,media=cdrom")]).unwrap();
         let p = plan(S, &d, &[]).unwrap();
-        plug_ahci(&board, &p.ide, &d).unwrap();
+        plug_ahci(&BlockGraph::new(), &board, &p.ide, &d).unwrap();
     }
 }

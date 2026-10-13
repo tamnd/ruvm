@@ -19,6 +19,7 @@ use std::collections::HashSet;
 
 use ruvm_base::Error;
 use ruvm_base::report::Location;
+use ruvm_block::BlockGraph;
 use ruvm_hw_virtio::mmio::VIRTIO_MMIO_FORCE_LEGACY_DEFAULT;
 use ruvm_hw_virtio::pci::virtio_pci_optimal_num_queues;
 use ruvm_hw_virtio::{
@@ -27,15 +28,14 @@ use ruvm_hw_virtio::{
 };
 use ruvm_machine_arm::pflash::PflashBacking;
 use ruvm_machine_riscv::virt::{GenericLoader, VirtMachine};
-use ruvm_machine_x86::{FileBackend, VirtioHandle};
+use ruvm_machine_x86::VirtioHandle;
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
 
 use super::{parse_loader, prop_bool};
-use crate::drives::{Plugged, resize_cb};
+use crate::drives::{Plugged, device_image, resize_cb};
 use crate::net::Network;
 use crate::x86::{
-    Drive, DriveIf, KeepRam, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive,
-    parse_mac, probe_warning,
+    Drive, DriveIf, KeepRam, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive, parse_mac,
 };
 
 /// The virtio device models virt can plug.
@@ -312,12 +312,7 @@ pub(crate) fn plan(
             Some(_) if d.null_size.is_some() => {
                 return Err(vec![Located::new(&d.loc, NULL_CO_PFLASH)]);
             }
-            Some(file) => {
-                if d.probed && !d.read_only {
-                    eprint!("{}", probe_warning(file));
-                }
-                PflashBacking::File { path: file.into(), read_only: d.read_only }
-            }
+            Some(file) => PflashBacking::File { path: file.into(), read_only: d.read_only },
             None => PflashBacking::None,
         };
         p.pflash[d.unit as usize] = Some(backing);
@@ -345,20 +340,11 @@ pub(crate) fn plan(
     Ok(p)
 }
 
-/// Opens drive `d` for a device.
-fn open_drive(d: &Drive) -> Result<FileBackend, String> {
-    let file = d.file.as_deref().expect("planned with media");
-    let backend = d.open()?;
-    if d.probed && !d.read_only {
-        eprint!("{}", probe_warning(file));
-    }
-    Ok(backend)
-}
-
 /// `qdev_device_add()` for the planned virtio devices: builds each one and plugs it into its
 /// bus, a virtio-net joined to its netdev in `net`. Gives the drives it put on virtio-blk
 /// devices.
 pub(crate) fn plug(
+    graph: &BlockGraph,
     board: &VirtMachine,
     plugs: &[Plug],
     drives: &[Drive],
@@ -372,8 +358,11 @@ pub(crate) fn plug(
             Model::Blk => {
                 let drive = plug.drive.expect("planned with a drive");
                 let d = &drives[drive];
-                let backend = open_drive(d).map_err(|e| Located::new(&d.loc, e))?;
-                image = Some((drive, backend.clone()));
+                // virtio_blk_device_realize()
+                let readonly = graph.backend(&d.id).is_some_and(|b| b.is_read_only());
+                let backend = device_image(graph, d, readonly, true)
+                    .map_err(|e| Located(plug.loc.clone(), e))?;
+                image = Some(drive);
                 // virtio_blk_pci_realize() turns the automatic num-queues into one queue per
                 // vCPU. virtio-blk-device keeps one.
                 let num_queues = match plug.transport {
@@ -421,8 +410,8 @@ pub(crate) fn plug(
                 board.virtio_transport(n).map(VirtioHandle::Mmio)
             }
         };
-        if let Some((drive, image)) = image {
-            plugged.push(Plugged { drive, image, resize_cb: resize_cb(handle.as_ref()) });
+        if let Some(drive) = image {
+            plugged.push(Plugged { drive, resize_cb: resize_cb(handle.as_ref()) });
         }
         if let (Some(nic), Some(handle)) = (nic, handle) {
             nic.connect(handle);
@@ -519,8 +508,8 @@ mod tests {
         let net = Network::new(&netdevs, false, &Clock::manual(ClockType::Virtual), None).unwrap();
         let p = plan(&[], &[dev("virtio-net-pci,netdev=n0")]).unwrap();
         let board = VirtMachine::new(ruvm_machine_riscv::virt::VirtConfig::default()).unwrap();
-        plug(&board, &p.virtio, &[], &net).unwrap();
-        let e = plug(&board, &p.virtio, &[], &net).err().unwrap();
+        plug(&BlockGraph::new(), &board, &p.virtio, &[], &net).unwrap();
+        let e = plug(&BlockGraph::new(), &board, &p.virtio, &[], &net).err().unwrap();
         assert_eq!(
             e.1.message(),
             "Property 'virtio-net-pci.netdev' can't take value 'n0', it's in use"
@@ -534,13 +523,15 @@ mod tests {
         std::fs::write(&path, vec![0u8; 1 << 16]).unwrap();
         let arg = format!("file={},format=raw", path.display());
         let d = parse_drives(&[dev(&arg)]).unwrap();
+        let graph = BlockGraph::new();
+        crate::drives::open_drives(&graph, &d, &[dev(&arg)]).unwrap();
         let p = plan(&d, &[dev("virtio-rng-pci")]).unwrap();
         let cfg = ruvm_machine_riscv::virt::VirtConfig {
             smp: 2,
             ..ruvm_machine_riscv::virt::VirtConfig::default()
         };
         let board = VirtMachine::new(cfg).unwrap();
-        plug(&board, &p.virtio, &d, &no_net()).unwrap();
+        plug(&graph, &board, &p.virtio, &d, &no_net()).unwrap();
         let _ = std::fs::remove_file(&path);
         let vectors: Vec<u32> = board.pci_devices().iter().map(|f| f.nvectors()).collect();
         assert_eq!(vectors, [2, 3]);
