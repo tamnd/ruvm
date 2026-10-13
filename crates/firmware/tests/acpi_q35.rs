@@ -10,6 +10,7 @@ use ruvm_firmware::acpi::linker::Command;
 use ruvm_firmware::acpi::pci::CrsRange;
 use ruvm_firmware::acpi::q35::{self, PciDevice, PciDeviceAml, Q35Acpi};
 use ruvm_firmware::acpi::table::{APPNAME6, APPNAME8, McfgInfo, TABLE_FILE};
+use ruvm_firmware::acpi::tpm::{TpmInfo, TpmInterface, TpmVersion};
 use ruvm_firmware::acpi::x86::{MadtConfig, PossibleCpu};
 
 use common::load;
@@ -68,6 +69,7 @@ fn base() -> Q35Acpi {
         ],
         dmar: None,
         viot: None,
+        tpm: None,
     }
 }
 
@@ -179,4 +181,66 @@ fn no_hpet_no_mcfg() {
     q.mcfg = None;
     let sigs: Vec<String> = load(&build(&q)).into_iter().map(|(s, _)| s).collect();
     assert_eq!(sigs, ["FACS", "DSDT", "FACP", "APIC", "WAET", "RSDT"]);
+}
+
+/// `-device tpm-tis,tpmdev=dev` on top of [`base`], as bios-tables-test runs it.
+fn tis(version: TpmVersion) -> Q35Acpi {
+    let mut q = base();
+    let info = TpmInfo { version, interface: TpmInterface::TisIsa, ppi: true };
+    q.tpm = Some(info);
+    for d in &mut q.pci_devices {
+        if let PciDeviceAml::Lpc { isa } = &mut d.aml {
+            isa.insert(0, IsaDevice::TpmTis(info));
+        }
+    }
+    q
+}
+
+/// Checks a TPM table after pointing its log area where SeaBIOS put `etc/tpm/log` when
+/// the expected blobs were made, right below the 128 MiB of RAM.
+fn check_tpm(q: &Q35Acpi, sig: &str, file: &str) {
+    let mut t = build(q);
+    for cmd in t.linker.commands() {
+        if let Command::AddPointer { dest_file, src_file, offset, size: 8 } = cmd {
+            if dest_file == TABLE_FILE && src_file == "etc/tpm/log" {
+                let o = offset as usize;
+                let v = u64::from_le_bytes(t.table_data[o..o + 8].try_into().unwrap());
+                t.table_data[o..o + 8].copy_from_slice(&(v + 0x07ff_0000).to_le_bytes());
+            }
+        }
+    }
+    common::check(&t, "q35", sig, file);
+}
+
+#[test]
+fn dsdt_tis_tpm2() {
+    check(&tis(TpmVersion::V2_0), "DSDT", "DSDT.tis.tpm2");
+}
+
+#[test]
+fn tpm2_tis() {
+    check_tpm(&tis(TpmVersion::V2_0), "TPM2", "TPM2.tis.tpm2");
+}
+
+#[test]
+fn dsdt_tis_tpm12() {
+    check(&tis(TpmVersion::V1_2), "DSDT", "DSDT.tis.tpm12");
+}
+
+#[test]
+fn tcpa_tis() {
+    check_tpm(&tis(TpmVersion::V1_2), "TCPA", "TCPA.tis.tpm12");
+}
+
+#[test]
+fn tpm_table_order_and_log() {
+    for (version, sig) in [(TpmVersion::V2_0, "TPM2"), (TpmVersion::V1_2, "TCPA")] {
+        let t = build(&tis(version));
+        let sigs: Vec<String> = load(&t).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(sigs, ["FACS", "DSDT", "FACP", "APIC", "HPET", sig, "MCFG", "WAET", "RSDT"]);
+        assert_eq!(t.tcpalog, vec![0; 64 << 10]);
+        assert!(t.linker.commands().iter().any(
+            |c| matches!(c, Command::Allocate { file, align: 1, fseg: false } if file == "etc/tpm/log")
+        ));
+    }
 }

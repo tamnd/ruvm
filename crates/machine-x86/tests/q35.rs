@@ -660,6 +660,7 @@ fn acpi_tables_match_the_firmware_builder() {
         ],
         dmar: None,
         viot: None,
+        tpm: None,
     };
     assert_eq!(format!("{:?}", m.acpi_input()), format!("{want:?}"));
     let t = acpi_q35::build(&want);
