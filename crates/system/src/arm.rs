@@ -3,7 +3,9 @@
 //! The Arm `virt` and `sbsa-ref` boards from the command line: what `-machine virt` or
 //! `-machine sbsa-ref`, `-m`, `-smp`, `-cpu`, `-kernel`, `-initrd`, `-append`, `-dtb`, `-bios`,
 //! `-drive`, `-device`, `-serial`, `-semihosting` and `-semihosting-config` turn into, and the
-//! board running on TCG.
+//! board running on TCG. Under the qtest accelerator virt is built the same way, but no vCPUs
+//! run and the timers follow the qtest clock, as for QEMU's `-accel qtest`. sbsa-ref does not
+//! run under qtest yet.
 //!
 //! `-drive` and `-device` plug virtio devices into the PCIe root bus or the virtio-mmio
 //! transports, give the flashes their drives and, on sbsa-ref, give the AHCI ports theirs,
@@ -59,8 +61,8 @@ use ruvm_base::{ClockType, Error, Result};
 use ruvm_chardev::{Attachment, Chardev, Chardevs, Connection, Frontend};
 use ruvm_hw_char::pl011::Pl011;
 use ruvm_hw_char::serial::SerialBackend;
-use ruvm_hw_core::Clock;
 use ruvm_hw_core::timer::TimeSource;
+use ruvm_hw_core::{Clock, MachineClassInfo, register_machine_type};
 use ruvm_machine_arm::sbsa_ref::{SBSA_DEFAULT_CPUS, SbsaRefConfig, SbsaRefMachine};
 use ruvm_machine_arm::tcg_run::{
     SbsaRefTcgMachine, ShutdownReason, TcgBoard, TcgMachine, VirtEvent, VirtEventHandler,
@@ -70,13 +72,15 @@ use ruvm_machine_arm::virt::memmap::check_highmem_mmio_size;
 use ruvm_machine_arm::virt::{
     CpuTopology, Highmem, VirtConfig, VirtGicVersion, VirtIommu, VirtMachine, VirtMsi,
 };
+use ruvm_mem::AddressSpace;
 use ruvm_qapi::events::event_reset;
 use ruvm_qapi::opts::{QemuOptDesc, QemuOptType, QemuOptsList};
 use ruvm_qapi::types::{
-    MemorySizeConfiguration, ResetArg, RunState, SMPConfiguration, ShutdownCause,
+    MachineInfo, MemorySizeConfiguration, ResetArg, RunState, SMPConfiguration, ShutdownCause,
 };
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor};
 use ruvm_qapi::{QDict, QValue};
+use ruvm_qom::Registry;
 use ruvm_target_arm::cpu::{ARM_MAX_VQ, ArmCpuModel, PauthAlg};
 use ruvm_target_arm::tcg::SemihostingHost;
 
@@ -98,13 +102,16 @@ pub(crate) fn is_arm(target: &str) -> bool {
 }
 
 /// The versioned name of virt, `virt-11.1`, which `virt` is an alias of.
-const VIRT_NAME: &str = "virt-11.1";
+pub(crate) const VIRT_NAME: &str = "virt-11.1";
 
 /// `mc->desc` of virt.
 const VIRT_DESC: &str = "QEMU 11.1 ARM Virtual Machine";
 
 /// `mc->max_cpus` of virt.
 const VIRT_MAX_CPUS: u64 = 512;
+
+/// `mc->default_ram_id` of virt.
+const VIRT_RAM_ID: &str = "mach-virt.ram";
 
 /// The name of sbsa-ref.
 const SBSA_NAME: &str = "sbsa-ref";
@@ -140,6 +147,39 @@ impl ArmBoard {
             ArmBoard::Virt => VIRT_MAX_CPUS,
             ArmBoard::SbsaRef => SBSA_MAX_CPUS,
         }
+    }
+}
+
+/// The type of the `/machine` object of virt, `virt-11.1-machine`, with the values
+/// `virt_machine_class_init()` gives the machine class.
+pub(crate) fn register_types(registry: &Registry) {
+    register_machine_type(
+        registry,
+        MachineClassInfo {
+            name: VIRT_NAME,
+            desc: VIRT_DESC,
+            max_cpus: VIRT_MAX_CPUS as u32,
+            default_cpus: 1,
+            default_ram_size: 128 << 20,
+            default_ram_id: Some(VIRT_RAM_ID),
+        },
+    );
+}
+
+/// What `query-machines` says about virt, as QEMU 11.1 does.
+pub(crate) fn machine_info(compat_props: bool) -> MachineInfo {
+    MachineInfo {
+        name: VIRT_NAME.into(),
+        alias: Some("virt".into()),
+        is_default: None,
+        cpu_max: VIRT_MAX_CPUS as i64,
+        hotpluggable_cpus: false,
+        numa_mem_supported: false,
+        deprecated: false,
+        default_cpu_type: None,
+        default_ram_id: Some(VIRT_RAM_ID.into()),
+        acpi: true,
+        compat_props: compat_props.then(Vec::new),
     }
 }
 
@@ -934,16 +974,17 @@ impl Frontend for SemiConsoleFrontend {
     }
 }
 
-/// The board on TCG.
+/// The board on TCG or KVM, or virt without vCPUs under the qtest accelerator.
 #[derive(Debug)]
 enum Machine {
     Virt(Arc<VirtTcgMachine>),
     SbsaRef(Arc<SbsaRefTcgMachine>),
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     Kvm(Arc<ruvm_machine_arm::virt::kvm::KvmVirtMachine>),
+    Qtest(Box<VirtMachine>),
 }
 
-/// The board running on its vCPUs, and the chardevs its devices are attached to.
+/// The board, and the chardevs its devices are attached to.
 #[derive(Debug)]
 pub(crate) struct Running {
     machine: Machine,
@@ -967,6 +1008,18 @@ impl Running {
             Machine::SbsaRef(m) => m.quit(),
             #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
             Machine::Kvm(m) => m.quit(),
+            Machine::Qtest(_) => {}
+        }
+    }
+
+    /// The system memory, which a `-qtest` client reads and writes. `None` on KVM.
+    pub(crate) fn memory(&self) -> Option<Arc<AddressSpace>> {
+        match &self.machine {
+            Machine::Virt(m) => Some(Arc::clone(lock(m.board()).memory_as())),
+            Machine::SbsaRef(m) => Some(Arc::clone(lock(m.board()).memory_as())),
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            Machine::Kvm(_) => None,
+            Machine::Qtest(b) => Some(Arc::clone(b.memory_as())),
         }
     }
 }
@@ -1075,6 +1128,29 @@ pub(crate) fn start_board_tcg(
     let machine = Arc::new(machine);
     set_cpu_hook(vm, &machine);
     Ok(Running { machine: Machine::Virt(machine), console, _attachments: attachments })
+}
+
+/// [`start_board_tcg`] for virt under the qtest accelerator: the board is built the same way,
+/// but no vCPUs run and the timers follow `clock`, the virtual clock the test drives.
+pub(crate) fn start_board_qtest(
+    vm: &Arc<Vm>,
+    clock: Arc<Clock>,
+    opts: BoardOptions,
+    args: &ArmArgs<'_>,
+    serial_hds: &[Option<Arc<Chardev>>],
+) -> std::result::Result<Running, Vec<Located>> {
+    let one = |e: Error| vec![Located(None, e)];
+    let cpu = || parse_cpu(ArmBoard::Virt, args.cpu).map_err(one);
+    let built = build_virt(vm, opts, args, serial_hds, cpu, |cfg| {
+        cfg.clock = Some(clock);
+        Ok(())
+    })?;
+    let BuiltVirt { mut board, console, attachments, clocks: _, dumpdtb: dtb_path } = built;
+    board.machine_done().map_err(|e| one(Error::generic(e)))?;
+    if let Some(path) = &dtb_path {
+        dumpdtb(path, board.fdt().as_bytes())?;
+    }
+    Ok(Running { machine: Machine::Qtest(Box::new(board)), console, _attachments: attachments })
 }
 
 /// The virt board built from the command line, before `qemu_machine_creation_done()`.

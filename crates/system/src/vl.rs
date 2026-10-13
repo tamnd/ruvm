@@ -6,19 +6,19 @@
 //!
 //! ruvm behaves like a QEMU build with the `qtest` accelerator, the `none` machine and no
 //! displays, plus, for the x86 targets, the `microvm` and `q35` boards on `tcg` and, on Linux
-//! x86_64 hosts, `kvm`, for aarch64 the `virt` board on `tcg`, and for riscv64 the `virt`
-//! board on `tcg` and `qtest`. Options for things that build would leave out fail with QEMU's
-//! own messages.
+//! x86_64 hosts, `kvm`, for aarch64 the `virt` board on `tcg` and `qtest` and `sbsa-ref` on
+//! `tcg`, and for riscv64 the `virt` board on `tcg` and `qtest`. Options for things that build
+//! would leave out fail with QEMU's own messages.
 //!
 //! Deliberate differences from QEMU:
 //!
 //! - Without `-accel` or `-machine accel=`, a build with both KVM and TCG tries `kvm:tcg`, so
 //!   KVM is used where it works and TCG otherwise (after QEMU's "falling back to tcg"). QEMU
 //!   picks `tcg:kvm` unless its program name ends in `kvm`.
-//! - The aarch64 virt board does not run under qtest yet. The x86 boards take `-qtest` on kvm
-//!   or tcg, but do not run on the qtest accelerator.
-//! - The `/machine` object of riscv64 virt has only the generic machine properties. The board
-//!   itself is built outside QOM from the `-machine` options.
+//! - sbsa-ref does not run under qtest yet, and it is not listed in `query-machines`. The x86
+//!   boards take `-qtest` on kvm or tcg, but do not run on the qtest accelerator.
+//! - The `/machine` object of virt on aarch64 and riscv64 has only the generic machine
+//!   properties. The board itself is built outside QOM from the `-machine` options.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,7 +53,7 @@ use ruvm_qom::{
     Registry, TYPE_OBJECT, TypeInfo, type_print_class_properties, user_creatable_print_types,
 };
 
-use crate::arm;
+use crate::arm::{self, ArmBoard};
 use crate::net::{Network, qmp_events};
 use crate::options::{Opt, arch_available, help_text, lookup_opt};
 use crate::qmp_cmds::{self, object_options_dict};
@@ -360,6 +360,9 @@ fn run(p: &Personality<'_>, args: &[String]) -> Flow<u8> {
     ruvm_hw_core::register_types(&registry);
     if riscv::is_riscv(p.target) {
         riscv::register_types(&registry);
+    }
+    if arm::is_arm(p.target) {
+        arm::register_types(&registry);
     }
     qtest::register_types(&registry);
     ruvm_chardev::qom::register_types(&registry);
@@ -806,7 +809,7 @@ enum MachineChoice {
     /// One of the x86 boards, and its machine type name with an alias resolved.
     X86(BoardKind, &'static str),
     /// One of the Arm boards.
-    ArmVirt(arm::ArmBoard),
+    ArmVirt(ArmBoard),
     /// The RISC-V virt board.
     RiscvVirt,
 }
@@ -1074,11 +1077,17 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     // qemu_create_machine() for a board built outside QOM: the `/machine` object with its
     // containers, and the I/O address space a `-qtest` client sees. The board has its own
     // system memory.
-    let board_machine = if rv_virt {
-        let typename = machine_type_name("virt");
-        Some(create_machine(&vm.registry, &typename, &vm.regions).map_err(|e| fail(&e))?)
-    } else {
-        None
+    let board_name = match arm_board {
+        Some(ArmBoard::Virt) => Some(arm::VIRT_NAME),
+        Some(ArmBoard::SbsaRef) => None,
+        None => rv_virt.then_some("virt"),
+    };
+    let board_machine = match board_name {
+        Some(name) => {
+            let typename = machine_type_name(name);
+            Some(create_machine(&vm.registry, &typename, &vm.regions).map_err(|e| fail(&e))?)
+        }
+        None => None,
     };
     // cpr_state_load(): before any device, which may need the descriptors.
     if let Some(c) = &cfg.incoming_cpr {
@@ -1154,7 +1163,11 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         Accel::Kvm(_) => Accelerator::Kvm,
     });
     let on_qtest = matches!(accel, Accel::Qtest);
-    if (kind.is_some() && on_qtest) || (arm_board.is_some() && (on_qtest || cfg.qtest.is_some())) {
+    let on_kvm = !on_qtest && !matches!(accel, Accel::Tcg(_));
+    if (kind.is_some() && on_qtest)
+        || (arm_board == Some(ArmBoard::SbsaRef) && (on_qtest || cfg.qtest.is_some()))
+        || (arm_board.is_some() && on_kvm && cfg.qtest.is_some())
+    {
         return Err(fail_msg(
             "this machine type is only supported with -accel kvm or tcg by ruvm yet",
         ));
@@ -1271,9 +1284,13 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         };
         let running = match accel {
             Accel::Tcg(tcg) => arm::start_board_tcg(&vm, tcg, opts, &args, &serial_hds),
+            Accel::Qtest => {
+                arm::start_board_qtest(&vm, Arc::clone(&clock), opts, &args, &serial_hds)
+            }
             #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
             Accel::Kvm(accel) => arm::start_board_kvm(&vm, *accel, opts, &args, &serial_hds),
-            _ => unreachable!("checked above"),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Accel::Kvm(_) => unreachable!("no KVM for this target"),
         };
         let running = running.map_err(|errors| {
             for e in &errors {
@@ -1281,6 +1298,18 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             }
             Exit(1)
         })?;
+        // qtest_server_init()
+        if let (Some(chrdev), Some(m), Some(memory)) =
+            (&cfg.qtest, &board_machine, running.memory())
+        {
+            let log = cfg.qtest_log.as_deref();
+            let io = Arc::clone(&m.address_space_io);
+            let clock = on_qtest.then(|| Arc::clone(&clock));
+            let a = qtest::server_init_board(&chardevs, chrdev, log, p.target, memory, io, clock)
+                .map_err(|e| fail(&e))?;
+            qtest::add_object(&m.object, log).map_err(|e| fail(&e))?;
+            keep._qtest = Some(a);
+        }
         keep.arm_board = Some(running);
     } else {
         match (kind, board_opts) {

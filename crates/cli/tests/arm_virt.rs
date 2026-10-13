@@ -158,7 +158,7 @@ fn virt_errors() {
             format!("{p}semihosting chardev 'nope' not found\n"),
         ),
         (
-            &["-M", "virt", "-accel", "qtest"],
+            &["-M", "sbsa-ref", "-accel", "qtest"],
             format!("{p}this machine type is only supported with -accel kvm or tcg by ruvm yet\n"),
         ),
     ] {
