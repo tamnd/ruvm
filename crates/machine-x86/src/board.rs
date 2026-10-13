@@ -21,7 +21,7 @@ use ruvm_hw_intc::ioapic::{IoApic, IoApicMsiHandler, IoApics};
 use ruvm_hw_iommu::virtio_iommu::{
     ReservedRegion, TYPE_VIRTIO_IOMMU_MEMORY_REGION, VIRTIO_IOMMU_RESV_MEM_T_MSI,
 };
-use ruvm_hw_iommu::{Viommu, VirtioIommu, VirtioIommuConf};
+use ruvm_hw_iommu::{IntelIommu, IntelIommuConf, Viommu, VirtioIommu, VirtioIommuConf};
 use ruvm_hw_virtio::virtio::VIRTIO_F_IOMMU_PLATFORM;
 use ruvm_hw_virtio::{
     AddressSpaceMemory, SharedGuestMemory, VirtIODevice, VirtioBackend, VirtioDeviceClass,
@@ -244,6 +244,22 @@ impl X86Board {
         m.set_virtio_iommu(dev.pci_dev().requester_id());
         devs.push(dev.clone());
         Ok(VirtioHandle::Pci(dev))
+    }
+
+    /// Plugs an `intel-iommu` with the properties `conf`: `pc_machine_device_pre_plug_cb()`
+    /// and `vtd_realize()`. KVM is taken to have the whole irqchip in the kernel.
+    pub fn attach_intel_iommu(&mut self, conf: &IntelIommuConf) -> Result<(), String> {
+        let X86Board::Q35(m, _) = self else {
+            return Err(
+                "Parameter 'driver' expects a dynamic sysbus device type for the machine".into()
+            );
+        };
+        if m.pci_dma().has_iommu() {
+            return Err("QEMU does not support multiple vIOMMUs for x86 yet.".to_string());
+        }
+        let conf = conf.realize(m.kvm(), m.kvm())?;
+        let iommu = IntelIommu::new(conf, m.memory_as());
+        m.attach_intel_iommu(&iommu)
     }
 
     /// `pci_add_option_rom()`: gives the PCI function behind `dev` a ROM BAR holding `data`,
