@@ -2,7 +2,7 @@
 
 //! The audio parts of system/vl.c: `-audiodev`, `-audio`, creating the backends before the
 //! machine, and `query-audiodevs`. It also plans and realizes the sound cards of `-device`
-//! and `-audio model=`, virtio-sound-pci among them.
+//! and `-audio model=`, virtio-sound-pci on q35 and virtio-sound-device on microvm among them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -13,14 +13,16 @@ use ruvm_base::{Error, Result};
 use ruvm_hw_audio::{
     Ac97, HdaCodecKind, IntelHda, IsaDma, PcSpkAudio, Sb16, Sb16Config, TYPE_AC97, TYPE_HDA_DUPLEX,
     TYPE_HDA_MICRO, TYPE_HDA_OUTPUT, TYPE_ICH9_INTEL_HDA, TYPE_INTEL_HDA, TYPE_SB16,
-    TYPE_VIRTIO_SND_PCI, VirtioSnd, VirtioSndConf,
+    TYPE_VIRTIO_SND, TYPE_VIRTIO_SND_PCI, VirtioSnd, VirtioSndConf,
 };
 use ruvm_hw_core::fw_cfg::DmaMemory;
 use ruvm_hw_core::timer::Clock;
+use ruvm_hw_virtio::mmio::VIRTIO_MMIO_FORCE_LEGACY_DEFAULT;
 use ruvm_hw_virtio::{
-    AddressSpaceMemory, SharedGuestMemory, VirtIODevice, VirtioBackend, VirtioPci, VirtioPciProps,
+    AddressSpaceMemory, SharedGuestMemory, VirtIODevice, VirtioBackend, VirtioMmio, VirtioPci,
+    VirtioPciProps,
 };
-use ruvm_machine_x86::{Q35, X86Board};
+use ruvm_machine_x86::{Microvm, Q35, X86Board};
 use ruvm_mem::AddressSpace;
 use ruvm_monitor::{Commands, MonitorQmp};
 use ruvm_qapi::commands::register_query_audiodevs;
@@ -156,7 +158,7 @@ pub(crate) struct AudioPlug {
     pub codec: Option<Box<AudioPlug>>,
     /// The properties of an `sb16`.
     pub sb16: Sb16Config,
-    /// The properties of a `virtio-sound-pci`.
+    /// The properties of a `virtio-sound-pci` or `virtio-sound-device`.
     pub snd: VirtioSndConf,
     /// A `virtio-sound-pci`'s `vectors` property.
     pub vectors: u32,
@@ -204,10 +206,21 @@ const AUDIO_TYPES: &[&str] = &[
     TYPE_HDA_MICRO,
     TYPE_SB16,
     TYPE_VIRTIO_SND_PCI,
+    TYPE_VIRTIO_SND,
 ];
 
 fn is_hda_controller(typename: &str) -> bool {
     matches!(typename, TYPE_INTEL_HDA | TYPE_ICH9_INTEL_HDA)
+}
+
+/// The most virtio-mmio transports microvm has, one per pin of its second IOAPIC.
+const MICROVM_MAX_TRANSPORTS: usize = 24;
+
+/// The number `n` of the bus `virtio-mmio-bus.<n>` of microvm's virtio-mmio transport `n`.
+/// Only the exact name finds the bus, so `virtio-mmio-bus.02` does not.
+fn mmio_bus_index(bus: &str) -> Option<usize> {
+    let n = bus.strip_prefix("virtio-mmio-bus.")?;
+    n.parse::<usize>().ok().filter(|i| i.to_string() == n)
 }
 
 /// `qdev_device_add()` up to realize for a sound card or codec: the properties. `None` when
@@ -221,8 +234,12 @@ pub(crate) fn plan_device(
     pci: bool,
     isa: bool,
 ) -> Option<std::result::Result<AudioPlug, Located>> {
-    // The alias of virtio_pci_types_register().
-    let driver = if driver == "virtio-sound" { TYPE_VIRTIO_SND_PCI } else { driver };
+    // The alias from qdev_alias_table and the one of virtio_pci_types_register().
+    let driver = match driver {
+        "ac97" => TYPE_AC97,
+        "virtio-sound" => TYPE_VIRTIO_SND_PCI,
+        _ => driver,
+    };
     let &typename = AUDIO_TYPES.iter().find(|t| **t == driver)?;
     let mut plug = AudioPlug::new(typename, loc.clone(), pci, isa);
     plug.id = opts.id().map(str::to_string);
@@ -264,11 +281,13 @@ fn plan(plug: &mut AudioPlug, opts: &QemuOpts) -> std::result::Result<(), Locate
     let codec = HdaCodecKind::from_type(typename).is_some();
     let ctrl = is_hda_controller(typename);
     let sb16 = typename == TYPE_SB16;
-    let snd = typename == TYPE_VIRTIO_SND_PCI;
+    let snd_pci = typename == TYPE_VIRTIO_SND_PCI;
+    let mmio = typename == TYPE_VIRTIO_SND;
+    let snd = snd_pci || mmio;
     for (k, v) in opts.iter() {
         match k {
             "driver" | "bus" => {}
-            "addr" if !codec && !sb16 => {
+            "addr" if !codec && !sb16 && !mmio => {
                 plug.devfn = Some(crate::display::parse_devfn(v).ok_or_else(|| {
                     Located::new(
                         &loc,
@@ -308,14 +327,14 @@ fn plan(plug: &mut AudioPlug, opts: &QemuOpts) -> std::result::Result<(), Locate
             "jacks" if snd => plug.snd.jacks = prop_u32(k, v).map_err(at)?,
             "streams" if snd => plug.snd.streams = prop_u32(k, v).map_err(at)?,
             "chmaps" if snd => plug.snd.chmaps = prop_u32(k, v).map_err(at)?,
-            "vectors" if snd => plug.vectors = prop_u32(k, v).map_err(at)?,
+            "vectors" if snd_pci => plug.vectors = prop_u32(k, v).map_err(at)?,
             // virtio_pci_force_virtio_1() overrides disable-modern, and ioeventfd is a host
             // detail.
-            "disable-modern" | "ioeventfd" if snd => {
+            "disable-modern" | "ioeventfd" if snd_pci => {
                 prop_bool(k, v).map_err(at)?;
             }
             // An OnOffAuto, which virtio_pci_force_virtio_1() overrides too.
-            "disable-legacy" if snd => {
+            "disable-legacy" if snd_pci => {
                 if !matches!(v, "on" | "off" | "auto") {
                     let msg = format!("Parameter '{k}' does not accept value '{v}'");
                     return Err(Located::new(&loc, msg));
@@ -342,7 +361,8 @@ fn model_is_hda() -> bool {
 
 /// Adds a planned `-device` to the sound cards, after the checks of `qdev_device_add()` that
 /// depend on what came before: the bus, which for a codec is an HDA bus `qbus_find()` or
-/// `qbus_find_recursive()` finds, and then the properties. An HDA controller gets the name
+/// `qbus_find_recursive()` finds, and then the properties. Which virtio-mmio transport is free
+/// is only known when the board is built, so [`realize_x86`] checks that. An HDA controller gets the name
 /// of its bus here, `ID.0`, or `hda.N` with `N` counting the controllers without an id.
 pub(crate) fn add_plug(
     audio: &mut Vec<(usize, usize, AudioPlug)>,
@@ -360,6 +380,9 @@ pub(crate) fn add_plug(
     let t = plug.typename;
     let codec = HdaCodecKind::from_type(t).is_some();
     let isa_dev = t == TYPE_SB16;
+    let mmio = t == TYPE_VIRTIO_SND;
+    // microvm has virtio-mmio transports and no PCI bus.
+    let mmio_buses = plug.isa && !plug.pci;
     let fail = |msg: String| Err(Located::new(&plug.loc, msg));
     match plug.bus.as_deref() {
         Some(b) if buses.iter().any(|h| h == b) => {
@@ -368,13 +391,20 @@ pub(crate) fn add_plug(
             }
         }
         Some("pcie.0") if plug.pci => {
-            if codec || isa_dev {
+            if codec || isa_dev || mmio {
                 return fail(format!("Device '{t}' can't go on PCIE bus"));
             }
         }
         Some("isa.0") if plug.isa => {
             if !isa_dev {
                 return fail(format!("Device '{t}' can't go on ISA bus"));
+            }
+        }
+        // Whether the transport is free is only known once the board is built, but a number
+        // past the last transport of any microvm finds no bus.
+        Some(b) if mmio_buses && mmio_bus_index(b).is_some_and(|i| i < MICROVM_MAX_TRANSPORTS) => {
+            if !mmio {
+                return fail(format!("Device '{t}' can't go on virtio-mmio-bus bus"));
             }
         }
         Some("main-system-bus") => return fail(format!("Device '{t}' can't go on System bus")),
@@ -387,9 +417,12 @@ pub(crate) fn add_plug(
         None if isa_dev && !plug.isa => {
             return fail(format!("No 'ISA' bus found for device '{t}'"));
         }
+        None if mmio && !mmio_buses => {
+            return fail(format!("No 'virtio-bus' bus found for device '{t}'"));
+        }
         None => {}
     }
-    if !codec && !isa_dev && !plug.pci {
+    if !codec && !isa_dev && !mmio && !plug.pci {
         return fail(format!("No 'PCI' bus found for device '{t}'"));
     }
     if let Some((msg, hint)) = plug.err.take() {
@@ -528,6 +561,15 @@ pub(crate) fn realize_x86(board: &X86Board, plug: &AudioPlug) -> std::result::Re
     if plug.typename == TYPE_SB16 {
         return realize_sb16(board, plug).map_err(at);
     }
+    if plug.typename == TYPE_VIRTIO_SND {
+        let X86Board::Microvm(m) = board else {
+            return Err(Located::new(
+                &plug.loc,
+                format!("No 'virtio-bus' bus found for device '{}'", plug.typename),
+            ));
+        };
+        return realize_virtio_snd_mmio(m, plug);
+    }
     let X86Board::Q35(m, _) = board else {
         return Err(Located::new(
             &plug.loc,
@@ -587,6 +629,50 @@ fn realize_virtio_snd(m: &Q35, plug: &AudioPlug) -> Result<()> {
     Ok(())
 }
 
+/// virtio-sound-device on microvm: the device model on a virtio-mmio transport, the one
+/// `bus=virtio-mmio-bus.<n>` names or else the free one with the highest number, as
+/// `qbus_find_recursive()` picks it.
+fn realize_virtio_snd_mmio(m: &Microvm, plug: &AudioPlug) -> std::result::Result<(), Located> {
+    let fail = |msg: String| Err(Located::new(&plug.loc, msg));
+    let n = m.virtio_transport_count();
+    let index = match plug.bus.as_deref() {
+        Some(b) => match mmio_bus_index(b) {
+            Some(i) if i < n && m.virtio_plugged(i) => return fail(format!("Bus '{b}' is full")),
+            Some(i) if i < n => i,
+            _ => return fail(format!("Bus '{b}' not found")),
+        },
+        None => match (0..n).rev().find(|&i| !m.virtio_plugged(i)) {
+            Some(i) => i,
+            None => return fail("A 'virtio-bus' bus was found but is full".to_string()),
+        },
+    };
+    let at = |e: Error| Located(plug.loc.clone(), e);
+    let be = backend(plug).map_err(at)?;
+    m.attach_virtio_at(
+        index,
+        Box::new(VirtioSnd::new(be, plug.snd)),
+        VIRTIO_MMIO_FORCE_LEGACY_DEFAULT,
+    )
+    .map_err(|e| Located::new(&plug.loc, e))?;
+    if let Some(t) = m.virtio_transport(index) {
+        connect_virtio_snd_mmio(&t);
+    }
+    Ok(())
+}
+
+/// Lets the voice callbacks reach the device model and its transport, which they must not
+/// keep alive.
+fn connect_virtio_snd_mmio(t: &Arc<VirtioMmio>) {
+    let weak = Arc::downgrade(t);
+    t.with_device::<VirtioSnd, _>(|_, snd| {
+        snd.connect(Box::new(move |f: &mut dyn FnMut(&mut VirtIODevice, &mut VirtioSnd)| {
+            if let Some(t) = weak.upgrade() {
+                t.with_device::<VirtioSnd, _>(|vdev, snd| f(vdev, snd));
+            }
+        }));
+    });
+}
+
 /// The audio half of `pcspk_realizefn()`: with `-machine pcspk-audiodev=`, the speaker port
 /// of a q35 board plays on that backend. A board without a PIT has no speaker.
 pub(crate) fn realize_pcspk(board: &X86Board, audiodev: Option<&str>) -> Result<()> {
@@ -602,4 +688,59 @@ pub(crate) fn realize_pcspk(board: &X86Board, audiodev: Option<&str>) -> Result<
     let audio = PcSpkAudio::new(Arc::clone(spk.pit()), registry::be_by_name(name)?);
     spk.set_audio(Box::new(move |gate, data_on| audio.io_write(gate, data_on)));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What [`add_plug`] says about `typename` with `bus=`, on q35 or microvm.
+    fn add_err(typename: &'static str, bus: Option<&str>, q35: bool) -> Option<String> {
+        let mut plug = AudioPlug::new(typename, None, q35, true);
+        plug.bus = bus.map(str::to_string);
+        add_plug(&mut Vec::new(), 0, 0, plug).err().map(|Located(_, e)| e.message().to_string())
+    }
+
+    #[test]
+    fn mmio_bus_names() {
+        assert_eq!(mmio_bus_index("virtio-mmio-bus.0"), Some(0));
+        assert_eq!(mmio_bus_index("virtio-mmio-bus.23"), Some(23));
+        assert_eq!(mmio_bus_index("virtio-mmio-bus.02"), None);
+        assert_eq!(mmio_bus_index("virtio-mmio-bus.x"), None);
+        assert_eq!(mmio_bus_index("virtio-mmio-bus."), None);
+        assert_eq!(mmio_bus_index("pcie.0"), None);
+    }
+
+    #[test]
+    fn virtio_sound_device_buses() {
+        let snd = TYPE_VIRTIO_SND;
+        assert_eq!(add_err(snd, None, false), None);
+        assert_eq!(add_err(snd, Some("virtio-mmio-bus.5"), false), None);
+        let no_bus = "No 'virtio-bus' bus found for device 'virtio-sound-device'";
+        assert_eq!(add_err(snd, None, true).as_deref(), Some(no_bus));
+        assert_eq!(
+            add_err(snd, Some("virtio-mmio-bus.0"), true).as_deref(),
+            Some("Bus 'virtio-mmio-bus.0' not found")
+        );
+        assert_eq!(
+            add_err(snd, Some("pcie.0"), true).as_deref(),
+            Some("Device 'virtio-sound-device' can't go on PCIE bus")
+        );
+        assert_eq!(
+            add_err(snd, Some("isa.0"), false).as_deref(),
+            Some("Device 'virtio-sound-device' can't go on ISA bus")
+        );
+        assert_eq!(
+            add_err(TYPE_VIRTIO_SND_PCI, Some("virtio-mmio-bus.0"), false).as_deref(),
+            Some("Device 'virtio-sound-pci' can't go on virtio-mmio-bus bus")
+        );
+        assert_eq!(
+            add_err(TYPE_VIRTIO_SND_PCI, Some("virtio-mmio-bus.40"), false).as_deref(),
+            Some("Bus 'virtio-mmio-bus.40' not found")
+        );
+        assert_eq!(
+            add_err(TYPE_VIRTIO_SND_PCI, None, false).as_deref(),
+            Some("No 'PCI' bus found for device 'virtio-sound-pci'")
+        );
+    }
 }
