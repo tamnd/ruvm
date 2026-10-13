@@ -31,7 +31,10 @@ use ruvm_hw_char::serial::{Serial, SerialBackend};
 use ruvm_hw_core::Clock;
 use ruvm_hw_core::timer::TimeSource;
 use ruvm_hw_iommu::intel_iommu::OnOffAuto;
-use ruvm_hw_iommu::{GranuleMode, IntelIommuConf, TYPE_INTEL_IOMMU_DEVICE, VirtioIommuConf};
+use ruvm_hw_iommu::{
+    AmdIommuConf, GranuleMode, IntelIommuConf, TYPE_AMD_IOMMU_DEVICE, TYPE_AMD_IOMMU_PCI,
+    TYPE_INTEL_IOMMU_DEVICE, VirtioIommuConf,
+};
 use ruvm_hw_misc::debugexit::{
     DEBUG_EXIT_DEFAULT_IOBASE, DEBUG_EXIT_DEFAULT_IOSIZE, IsaDebugExit, IsaDebugExitConfig,
 };
@@ -973,8 +976,16 @@ pub(crate) struct Plan {
     /// The sound cards of `-device`, each with the number of virtio and display plugs
     /// before it.
     pub audio: Vec<(usize, usize, crate::audio::AudioPlug)>,
-    /// The `intel-iommu` devices, each with the number of virtio plugs before it.
-    pub intel_iommu: Vec<(usize, IntelIommuConf, Option<Location>)>,
+    /// The `intel-iommu` and `amd-iommu` devices, each with the number of virtio plugs
+    /// before it.
+    pub iommus: Vec<(usize, X86Iommu, Option<Location>)>,
+}
+
+/// An x86 IOMMU of `-device`, planned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum X86Iommu {
+    Intel(IntelIommuConf),
+    Amd(AmdIommuConf),
 }
 
 /// One `-device`, planned.
@@ -986,7 +997,7 @@ enum Planned {
     Console,
     Display(crate::display::DisplayPlug),
     Audio(crate::audio::AudioPlug),
-    IntelIommu(IntelIommuConf),
+    Iommu(X86Iommu),
 }
 
 impl Planned {
@@ -1086,12 +1097,14 @@ pub(crate) fn virtio_iommu_prop(
     Some(r)
 }
 
-/// The `intel-iommu` properties, with the checks `qdev_device_add()` makes before realize.
-fn plan_intel_iommu(
+/// The checks `qdev_device_add()` makes on an x86 IOMMU sysbus device before it sets the
+/// properties.
+fn check_x86_iommu(
     kind: Option<BoardKind>,
+    typename: &str,
     opts: &ruvm_qapi::opts::QemuOpts,
     loc: &Option<Location>,
-) -> std::result::Result<IntelIommuConf, Located> {
+) -> std::result::Result<(), Located> {
     if kind != Some(BoardKind::Q35) {
         return Err(Located::new(
             loc,
@@ -1100,14 +1113,20 @@ fn plan_intel_iommu(
     }
     match opts.get("bus") {
         Some("pcie.0") => {
-            return Err(Located::new(
-                loc,
-                format!("Device '{TYPE_INTEL_IOMMU_DEVICE}' can't go on PCIE bus"),
-            ));
+            Err(Located::new(loc, format!("Device '{typename}' can't go on PCIE bus")))
         }
-        Some(b) => return Err(Located::new(loc, format!("Bus '{b}' not found"))),
-        None => {}
+        Some(b) => Err(Located::new(loc, format!("Bus '{b}' not found"))),
+        None => Ok(()),
     }
+}
+
+/// The `intel-iommu` properties, with the checks `qdev_device_add()` makes before realize.
+fn plan_intel_iommu(
+    kind: Option<BoardKind>,
+    opts: &ruvm_qapi::opts::QemuOpts,
+    loc: &Option<Location>,
+) -> std::result::Result<IntelIommuConf, Located> {
+    check_x86_iommu(kind, TYPE_INTEL_IOMMU_DEVICE, opts, loc)?;
     let mut conf = IntelIommuConf::default();
     let at = |e: Error| Located(loc.clone(), e);
     let boolean = |k: &str, v: &str| {
@@ -1158,6 +1177,58 @@ fn plan_intel_iommu(
         }
     }
     Ok(conf)
+}
+
+/// The `amd-iommu` properties, with the checks `qdev_device_add()` makes before realize.
+fn plan_amd_iommu(
+    kind: Option<BoardKind>,
+    opts: &ruvm_qapi::opts::QemuOpts,
+    loc: &Option<Location>,
+) -> std::result::Result<AmdIommuConf, Located> {
+    check_x86_iommu(kind, TYPE_AMD_IOMMU_DEVICE, opts, loc)?;
+    let mut conf = AmdIommuConf::default();
+    let at = |e: Error| Located(loc.clone(), e);
+    let boolean = |k: &str, v: &str| {
+        crate::display::prop(k, v, |vi, n, out| vi.type_bool(Some(n), out)).map_err(at)
+    };
+    for (k, v) in opts.iter() {
+        match k {
+            "driver" | "id" => {}
+            "intremap" => {
+                conf.intremap = OnOffAuto::parse(v).ok_or_else(|| {
+                    Located::new(loc, format!("Parameter '{k}' does not accept value '{v}'"))
+                })?;
+            }
+            "device-iotlb" => conf.device_iotlb = boolean(k, v)?,
+            "dma-translation" => conf.dma_translation = boolean(k, v)?,
+            "xtsup" => conf.xtsup = boolean(k, v)?,
+            "dma-remap" => conf.dma_remap = boolean(k, v)?,
+            "pci-id" => conf.pci_id = Some(v.to_string()),
+            _ => {
+                return Err(Located::new(
+                    loc,
+                    format!("Property '{TYPE_AMD_IOMMU_DEVICE}.{k}' not found"),
+                ));
+            }
+        }
+    }
+    Ok(conf)
+}
+
+/// The error of `amdvi_sysbus_realize()` with `pci-id`, from `pci_qdev_find_device()` over
+/// the devices planned so far. None of them can be an `AMDVI-PCI`, as ruvm does not take that
+/// device.
+fn amd_iommu_pci_id(p: &Plan, id: &str) -> String {
+    let id = Some(id);
+    let found = p.virtio.iter().any(|v| v.transport == Transport::Pci && v.id.as_deref() == id)
+        || p.display.iter().any(|(_, d)| d.id.as_deref() == id)
+        || p.audio.iter().any(|(_, _, a)| a.id.as_deref() == id);
+    let id = id.unwrap_or_default();
+    if found {
+        format!("Device '{id}' must be an {TYPE_AMD_IOMMU_PCI} device type")
+    } else {
+        format!("Cannot find PCI device '{id}'")
+    }
 }
 
 /// Works out what `-drive` and `-device` plug into a board of kind `kind` (`None` for the
@@ -1224,7 +1295,12 @@ pub(crate) fn plan(
             Planned::Virtio(plug) => p.virtio.push(plug),
             Planned::Isa(plug) => p.isa.push(plug),
             Planned::Display(plug) => p.display.push((p.virtio.len(), plug)),
-            Planned::IntelIommu(conf) => p.intel_iommu.push((p.virtio.len(), conf, loc.clone())),
+            Planned::Iommu(iommu) => {
+                if let X86Iommu::Amd(AmdIommuConf { pci_id: Some(id), .. }) = &iommu {
+                    return Err(vec![Located::new(loc, amd_iommu_pci_id(&p, id))]);
+                }
+                p.iommus.push((p.virtio.len(), iommu, loc.clone()));
+            }
             Planned::Audio(plug) => {
                 crate::audio::add_plug(&mut p.audio, p.virtio.len(), p.display.len(), plug)
                     .map_err(|e| vec![e])?;
@@ -1318,7 +1394,10 @@ fn plan_device(
         return plan_ide_hd(kind, drives, used, opts, loc).map(Planned::IdeHd);
     }
     if driver == TYPE_INTEL_IOMMU_DEVICE {
-        return plan_intel_iommu(kind, opts, loc).map(Planned::IntelIommu);
+        return plan_intel_iommu(kind, opts, loc).map(|c| Planned::Iommu(X86Iommu::Intel(c)));
+    }
+    if driver == TYPE_AMD_IOMMU_DEVICE {
+        return plan_amd_iommu(kind, opts, loc).map(|c| Planned::Iommu(X86Iommu::Amd(c)));
     }
     if driver == TYPE_VIRTCONSOLE {
         if let Some((k, _)) = opts.iter().find(|(k, _)| !matches!(*k, "driver" | "id" | "bus")) {
@@ -2169,12 +2248,16 @@ fn build(
             }
         }
     };
-    let mut intel_iommu = p.intel_iommu.iter().peekable();
-    // The intel-iommu devices that come before virtio plug `at`, or all that are left.
+    let mut iommus = p.iommus.iter().peekable();
+    // The intel-iommu and amd-iommu devices that come before virtio plug `at`, or all that
+    // are left.
     let mut plug_iommus = |board: &mut X86Board, at: Option<usize>| {
-        while let Some((_, conf, loc)) = intel_iommu.next_if(|(vi, ..)| at.is_none_or(|i| *vi == i))
-        {
-            board.attach_intel_iommu(conf).map_err(|e| one(Located::new(loc, e)))?;
+        while let Some((_, iommu, loc)) = iommus.next_if(|(vi, ..)| at.is_none_or(|i| *vi == i)) {
+            let attached = match iommu {
+                X86Iommu::Intel(conf) => board.attach_intel_iommu(conf),
+                X86Iommu::Amd(conf) => board.attach_amd_iommu(conf),
+            };
+            attached.map_err(|e| one(Located::new(loc, e)))?;
         }
         Ok::<(), Vec<Located>>(())
     };
@@ -3031,16 +3114,16 @@ mod tests {
         };
         let args = ["virtio-rng-pci", "intel-iommu,intremap=off,aw-bits=39,caching-mode=on"];
         let p = plan(q, &[], &devices(&args), true).unwrap();
-        let (at, conf, _) = &p.intel_iommu[0];
+        let (at, conf, _) = &p.iommus[0];
         assert_eq!(*at, 1);
         assert_eq!(
             *conf,
-            IntelIommuConf {
+            X86Iommu::Intel(IntelIommuConf {
                 intremap: OnOffAuto::Off,
                 aw_bits: 39,
                 caching_mode: true,
                 ..Default::default()
-            }
+            })
         );
         let dynamic = "Parameter 'driver' expects a dynamic sysbus device type for the machine";
         assert_eq!(err(Some(BoardKind::Microvm), &["intel-iommu"]), dynamic);
@@ -3058,6 +3141,47 @@ mod tests {
             "Parameter 'caching-mode' expects 'on' or 'off'"
         );
         assert_eq!(err(q, &["intel-iommu,version=-1"]), "Parameter 'version' expects uint32_t");
+    }
+
+    #[test]
+    fn amd_iommu_properties() {
+        let q = Some(BoardKind::Q35);
+        let err = |kind, args: &[&str]| {
+            plan(kind, &[], &devices(args), true).unwrap_err()[0].1.message().to_string()
+        };
+        let args = ["virtio-rng-pci", "amd-iommu,intremap=off,xtsup=on,dma-remap=on"];
+        let p = plan(q, &[], &devices(&args), true).unwrap();
+        let (at, conf, _) = &p.iommus[0];
+        assert_eq!(*at, 1);
+        assert_eq!(
+            *conf,
+            X86Iommu::Amd(AmdIommuConf {
+                intremap: OnOffAuto::Off,
+                xtsup: true,
+                dma_remap: true,
+                ..Default::default()
+            })
+        );
+        let dynamic = "Parameter 'driver' expects a dynamic sysbus device type for the machine";
+        assert_eq!(err(Some(BoardKind::Microvm), &["amd-iommu"]), dynamic);
+        assert_eq!(err(None, &["amd-iommu"]), dynamic);
+        assert_eq!(err(q, &["amd-iommu,bus=pcie.0"]), "Device 'amd-iommu' can't go on PCIE bus");
+        assert_eq!(err(q, &["amd-iommu,bus=foo"]), "Bus 'foo' not found");
+        assert_eq!(err(q, &["amd-iommu,foo=1"]), "Property 'amd-iommu.foo' not found");
+        assert_eq!(
+            err(q, &["amd-iommu,intremap=x"]),
+            "Parameter 'intremap' does not accept value 'x'"
+        );
+        assert_eq!(err(q, &["amd-iommu,xtsup=x"]), "Parameter 'xtsup' expects 'on' or 'off'");
+        assert_eq!(err(q, &["amd-iommu,pci-id=nope"]), "Cannot find PCI device 'nope'");
+        assert_eq!(
+            err(q, &["virtio-rng-pci,id=r", "amd-iommu,pci-id=r"]),
+            "Device 'r' must be an AMDVI-PCI device type"
+        );
+        assert_eq!(
+            err(q, &["amd-iommu,pci-id=r", "virtio-rng-pci,id=r"]),
+            "Cannot find PCI device 'r'"
+        );
     }
 
     #[test]

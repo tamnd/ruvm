@@ -658,6 +658,7 @@ fn acpi_tables_match_the_firmware_builder() {
             PciDevice { devfn: 0xfa, acpi_index: None, aml: PciDeviceAml::Plain },
             PciDevice { devfn: 0xfb, acpi_index: None, aml: PciDeviceAml::Plain },
         ],
+        ivrs: None,
         dmar: None,
         viot: None,
         tpm: None,

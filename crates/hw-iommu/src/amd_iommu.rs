@@ -343,7 +343,9 @@ impl AmdIommuConf {
 
 /// The `AMDVI-PCI` function as the IOMMU uses it.
 pub trait AmdviPci: Send + Sync {
-    /// `msi_get_message(dev, 0)` when `msi_enabled()`, or `None`.
+    /// `msi_get_message(dev, 0)` when `msi_enabled()`, or `None`. In QEMU this message goes
+    /// through the function's own DMA address space, so the board runs it through
+    /// [`AmdIommu::remap_msi`].
     fn msi_message(&self) -> Option<(u64, u32)>;
 
     /// Sets `PCI_STATUS_SIG_TARGET_ABORT` in the status register.

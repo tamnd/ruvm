@@ -39,13 +39,14 @@ pub mod props;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::SystemTime;
 
 use ruvm_base::ClockType;
 use ruvm_base::report::error_report;
 use ruvm_firmware::acpi::devices::IsaDevice;
 use ruvm_firmware::acpi::dmar::{DmarInfo, DmarScope};
+use ruvm_firmware::acpi::ivrs::{IvhdDevice, IvrsInfo};
 use ruvm_firmware::acpi::pci::CrsRange;
 use ruvm_firmware::acpi::q35::{
     self as acpi_q35, PciDevice as AcpiPciDevice, PciDeviceAml, Q35Acpi,
@@ -74,15 +75,21 @@ use ruvm_hw_intc::i8259::{I8259Pair, i8259_init};
 use ruvm_hw_intc::ioapic::{
     IO_APIC_DEFAULT_ADDRESS, IOAPIC_NUM_PINS, IOAPIC_VER_DEF, IoApic, IoApicMsiHandler, IoApics,
 };
+use ruvm_hw_iommu::amd_iommu::{
+    AMDVI_CAPAB_FEATURES, AMDVI_CAPAB_ID_SEC, AMDVI_CAPAB_REG_SIZE, AMDVI_CAPAB_REGS,
+    AMDVI_CAPAB_SIZE, AMDVI_PCI_CLASS, AMDVI_PCI_DEVICE_ID, AMDVI_PCI_VENDOR_ID,
+};
 use ruvm_hw_iommu::{
-    DMAR_REG_BASE, DMAR_REG_SIZE, IntelIommu, SID_INVALID, TYPE_INTEL_IOMMU_MEMORY_REGION,
+    AMDVI_BASE_ADDR, AMDVI_MMIO_SIZE, AmdIommu, AmdviPci, DMAR_REG_BASE, DMAR_REG_SIZE, IntelIommu,
+    SID_INVALID, TYPE_AMD_IOMMU_MEMORY_REGION, TYPE_AMD_IOMMU_PCI, TYPE_INTEL_IOMMU_MEMORY_REGION,
 };
 use ruvm_hw_pci::q35::{Q35Config, Q35PciHost};
 use ruvm_hw_pci::regs::{
-    PCI_CLASS_DEVICE, PCI_HEADER_TYPE, PCI_HEADER_TYPE_BRIDGE, PCI_SECONDARY_BUS,
-    PCI_SUBORDINATE_BUS,
+    PCI_CAP_ID_HT, PCI_CAP_ID_MSI, PCI_CLASS_DEVICE, PCI_CLASS_PROG, PCI_HEADER_TYPE,
+    PCI_HEADER_TYPE_BRIDGE, PCI_SECONDARY_BUS, PCI_STATUS, PCI_STATUS_SIG_TARGET_ABORT,
+    PCI_SUBORDINATE_BUS, pci_get_word, pci_set_long, pci_set_word,
 };
-use ruvm_hw_pci::{MsiRemap, PCIE_BASE_ADDR_UNMAPPED, PciBus};
+use ruvm_hw_pci::{MsiRemap, PCIE_BASE_ADDR_UNMAPPED, PciBus, PciDevice, PciDeviceInfo};
 use ruvm_hw_storage::{BlockBackend, DriveConfig, DriveKind, ICH9_AHCI_PORTS, Ich9Ahci};
 use ruvm_hw_timer::hpet::{HPET_BASE, HPET_LEN, Hpet, HpetFwConfig, HpetProperties};
 use ruvm_hw_timer::i8254::I8254;
@@ -461,6 +468,9 @@ struct AcpiSource {
     virtio_iommu: OnceLock<u16>,
     /// The intel-iommu, which gets a DMAR.
     intel_iommu: OnceLock<Arc<IntelIommu>>,
+    /// The amd-iommu with the devfn and capability offset of its AMDVI-PCI function, which
+    /// gets an IVRS.
+    amd_iommu: OnceLock<(Arc<AmdIommu>, u8, u8)>,
     /// The TPM, which gets a TPM2 or TCPA table and its device in the DSDT.
     tpm: OnceLock<TpmInfo>,
 }
@@ -563,6 +573,19 @@ impl AcpiSource {
             pci_hole64: (hole64_end > hole64_start)
                 .then(|| CrsRange { base: hole64_start, limit: hole64_end - 1 }),
             pci_devices: self.pci_devices(self.host.bus()),
+            ivrs: self.amd_iommu.get().map(|(iommu, devfn, cap_offset)| {
+                let conf = iommu.conf();
+                IvrsInfo {
+                    devfn: *devfn,
+                    cap_offset: *cap_offset,
+                    base: AMDVI_BASE_ADDR,
+                    intr: conf.intr_supported(),
+                    xtsup: conf.xtsup,
+                    dma_translation: conf.dma_translation,
+                    efr: conf.extended_features(),
+                    devices: ivhd_devices(self.host.bus()),
+                }
+            }),
             dmar: self.intel_iommu.get().map(|iommu| {
                 let conf = iommu.conf();
                 DmarInfo {
@@ -591,6 +614,87 @@ fn dmar_scopes(bus: &PciBus) -> Vec<DmarScope> {
             bridge: d.with_config(|c| c.config[PCI_HEADER_TYPE] & 0x7f == PCI_HEADER_TYPE_BRIDGE),
         })
         .collect()
+}
+
+/// The IVHD entries of the functions on the root bus, `insert_ivhd()`. A bridge gets a range
+/// over its buses where QEMU walks the ones that are not leaves, which is the same as long
+/// as there are no nested bridges.
+fn ivhd_devices(bus: &PciBus) -> Vec<IvhdDevice> {
+    let mut devs = bus.devices();
+    devs.sort_by_key(|d| d.devfn());
+    let mut out = Vec::new();
+    for d in &devs {
+        out.push(IvhdDevice::Select(u16::from(d.devfn())));
+        d.with_config(|c| {
+            if c.config[PCI_HEADER_TYPE] & 0x7f == PCI_HEADER_TYPE_BRIDGE {
+                let (sec, sub) = (c.config[PCI_SECONDARY_BUS], c.config[PCI_SUBORDINATE_BUS]);
+                out.push(IvhdDevice::Range(u16::from(sec) << 8, u16::from(sub) << 8 | 0xff));
+            }
+        });
+    }
+    out
+}
+
+/// The `AMDVI-PCI` function.
+struct AmdviPciFunction {
+    dev: AmdviPciDevice,
+    iommu: Weak<AmdIommu>,
+}
+
+impl AmdviPci for AmdviPciFunction {
+    /// `msi_notify()`, whose write goes through the IOMMU's own interrupt remapping.
+    fn msi_message(&self) -> Option<(u64, u32)> {
+        let dev = &self.dev.dev;
+        if !dev.msi_enabled() {
+            return None;
+        }
+        let m = dev.msi_get_message(0);
+        self.iommu.upgrade()?.remap_msi(u16::from(dev.devfn()), m.address, m.data)
+    }
+
+    fn signal_target_abort(&self) {
+        self.dev.dev.with_config(|c| {
+            let status = pci_get_word(c.config, PCI_STATUS) | PCI_STATUS_SIG_TARGET_ABORT;
+            pci_set_word(c.config, PCI_STATUS, status);
+        });
+    }
+}
+
+/// An `AMDVI-PCI` function and `capab_offset`.
+struct AmdviPciDevice {
+    dev: Arc<PciDevice>,
+    capab_offset: u8,
+}
+
+impl AmdviPciDevice {
+    fn devfn(&self) -> u8 {
+        self.dev.devfn()
+    }
+}
+
+/// `amdvi_pci_realize()`: the `AMDVI-PCI` function in the first free slot of `bus`.
+fn amdvi_pci_realize(bus: &Arc<PciBus>) -> Result<AmdviPciDevice, ruvm_base::Error> {
+    let info = PciDeviceInfo {
+        name: TYPE_AMD_IOMMU_PCI.to_string(),
+        vendor_id: AMDVI_PCI_VENDOR_ID,
+        device_id: AMDVI_PCI_DEVICE_ID,
+        class_id: AMDVI_PCI_CLASS,
+        ..PciDeviceInfo::default()
+    };
+    let dev = bus.register_device(&info, None)?;
+    let capab_offset = dev.add_capability(AMDVI_CAPAB_ID_SEC, 0, AMDVI_CAPAB_SIZE)?;
+    dev.add_capability(PCI_CAP_ID_MSI, 0, AMDVI_CAPAB_REG_SIZE)?;
+    dev.add_capability(PCI_CAP_ID_HT, 0, AMDVI_CAPAB_REG_SIZE)?;
+    dev.msi_init(0, 1, true, false)?;
+    dev.with_config(|c| {
+        c.config[PCI_CLASS_PROG] = 0;
+        let cap = usize::from(capab_offset);
+        pci_set_long(c.config, cap, AMDVI_CAPAB_FEATURES);
+        for (off, v) in AMDVI_CAPAB_REGS {
+            pci_set_long(c.config, cap + usize::from(off), v);
+        }
+    });
+    Ok(AmdviPciDevice { dev, capab_offset })
 }
 
 /// `pci_bus_range()`: the bus numbers behind `bus`, from its bridges as the firmware set them.
@@ -1273,6 +1377,7 @@ impl Q35 {
             serials: (0..MAX_ISA_SERIAL_PORTS).filter(|&i| serials[i].is_some()).collect(),
             virtio_iommu: OnceLock::new(),
             intel_iommu: OnceLock::new(),
+            amd_iommu: OnceLock::new(),
             tpm: OnceLock::new(),
         });
 
@@ -1909,6 +2014,34 @@ impl Q35 {
         let reset = Arc::clone(iommu);
         self.add_reset_hook(Box::new(move || reset.system_reset()));
         let _ = self.acpi_src.intel_iommu.set(Arc::clone(iommu));
+        Ok(())
+    }
+
+    /// `amdvi_sysbus_realize()` with the `AMDVI-PCI` function it makes on the root bus. As in
+    /// QEMU every MSI on the root bus and from the IOAPIC goes through the interrupt
+    /// remapping of the IOMMU, which passes them through when it is off, and so does the
+    /// MSI of the `AMDVI-PCI` function.
+    pub fn attach_amd_iommu(&self, iommu: &Arc<AmdIommu>) -> Result<(), String> {
+        let dev = amdvi_pci_realize(self.host.bus()).map_err(err)?;
+        let (devfn, cap_offset) = (dev.devfn(), dev.capab_offset);
+        iommu.set_pci(Arc::new(AmdviPciFunction { dev, iommu: Arc::downgrade(iommu) }));
+        let r = self
+            .mem
+            .new_io("amdvi-mmio", u128::from(AMDVI_MMIO_SIZE), iommu.mmio_ops())
+            .map_err(err)?;
+        self.mem.add_subregion(self.system, AMDVI_BASE_ADDR, r).map_err(err)?;
+        let msi = Arc::clone(&self.msi);
+        iommu.set_msi_sender(move |addr, data| msi(addr, data));
+        let ops = Arc::clone(iommu);
+        self.pci_dma
+            .set_iommu(TYPE_AMD_IOMMU_MEMORY_REGION, Box::new(move |bdf| ops.device_ops(bdf)));
+        let ir = Arc::clone(iommu);
+        let remap: MsiRemap = Arc::new(move |sid, addr, data| ir.remap_msi(sid, addr, data));
+        self.host.bus().set_msi_remap(Some(Arc::clone(&remap)));
+        *self.ioapic_remap.write().unwrap_or_else(PoisonError::into_inner) = Some(remap);
+        let reset = Arc::clone(iommu);
+        self.add_reset_hook(Box::new(move || reset.system_reset()));
+        let _ = self.acpi_src.amd_iommu.set((Arc::clone(iommu), devfn, cap_offset));
         Ok(())
     }
 
