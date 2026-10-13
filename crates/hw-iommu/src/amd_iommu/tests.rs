@@ -197,10 +197,8 @@ fn registers_follow_the_qemu_masks() {
     let r = Rig::new(AmdIommuConf::default());
     assert_eq!(r.r64(MMIO_EXT_FEATURES), 0x29d3);
     assert_eq!(r.r64(MMIO_STATUS), 0);
-    // Only bit 4 of the extended features is writable.
+    // QEMU has no write handler for the extended features.
     r.w64(MMIO_EXT_FEATURES, 0);
-    assert_eq!(r.r64(MMIO_EXT_FEATURES), 0x29c3);
-    r.w64(MMIO_EXT_FEATURES, !0);
     assert_eq!(r.r64(MMIO_EXT_FEATURES), 0x29d3);
     // Byte reads give all ones and byte writes do nothing, word reads work.
     assert_eq!(r.r(MMIO_EXT_FEATURES, 1), 0xff);
