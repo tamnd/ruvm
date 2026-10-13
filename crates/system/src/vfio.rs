@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! `-device vfio-pci` on q35: the properties of hw/vfio/pci.c and the plug.
 //!
 //! Only the root bus `pcie.0` takes the device, and not with a vIOMMU, since nothing maps the

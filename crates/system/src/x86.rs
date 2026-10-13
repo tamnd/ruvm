@@ -3247,9 +3247,9 @@ mod tests {
         );
         assert_eq!(
             err(q, &["vfio-pci,x-pci-vendor-id=abc"]),
-            "Parameter 'x-pci-vendor-id' expects uint32_t"
+            "Parameter 'x-pci-vendor-id' expects integer"
         );
-        assert_eq!(err(q, &["vfio-pci,rombar=x"]), "Parameter 'rombar' expects int32_t");
+        assert_eq!(err(q, &["vfio-pci,rombar=x"]), "Parameter 'rombar' expects integer");
         assert_eq!(err(q, &["vfio-pci,ats=x"]), "Parameter 'ats' does not accept value 'x'");
         assert_eq!(err(q, &["vfio-pci,foo=1"]), "Property 'vfio-pci.foo' not found");
         assert_eq!(
