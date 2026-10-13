@@ -20,6 +20,7 @@ use ruvm_qapi::visit::{QObjectInputVisitor, QObjectOutputVisitor, Visit, Visitor
 use ruvm_qapi::{QDict, QValue};
 use ruvm_qom::qmp as qom;
 
+use crate::drives::Drives;
 use crate::vl::Vm;
 
 /// Reads a reply the QOM code built as a [`QValue`] back into the generated type, so the
@@ -112,6 +113,15 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
     register_quit(cmds, move |_: &MonitorQmp| {
         v.runstate.shutdown_request(ShutdownCause::HostQmpQuit);
         Ok(())
+    });
+    let v = vm.clone();
+    register_block_resize(cmds, move |_: &MonitorQmp, arg| {
+        let (device, node_name) = (arg.device.as_deref(), arg.node_name.as_deref());
+        let exists = |n: &str| v.block.node(n).is_some();
+        match v.drives.get() {
+            Some(d) => d.block_resize(device, node_name, arg.size, exists),
+            None => Drives::default().block_resize(device, node_name, arg.size, exists),
+        }
     });
     let v = vm.clone();
     register_system_reset(cmds, move |_: &MonitorQmp| v.runstate.qmp_system_reset());

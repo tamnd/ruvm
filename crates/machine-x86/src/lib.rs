@@ -31,7 +31,7 @@ pub use board::{
     BoardKind, BoardSpec, KernelFiles, VirtioHandle, X86_BOARDS, X86Board, build_board,
     canonical_machine_name,
 };
-pub use file_backend::FileBackend;
+pub use file_backend::{FileBackend, NULL_CO, NULL_CO_DEFAULT_SIZE};
 pub use firmware::FirmwareSearch;
 pub use ich9_lpc::{Ich9Lpc, Ich9LpcConfig};
 pub use microvm::{Microvm, MicrovmConfig, MicrovmProps};

@@ -38,7 +38,10 @@ use ruvm_machine_x86::FileBackend;
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
 
 use super::{ArmBoard, prop_bool};
-use crate::x86::{Drive, DriveIf, Located, Transport, drive_opts, parse_drive, probe_warning};
+use crate::drives::{Plugged, mmio_resize_cb, pci_resize_cb};
+use crate::x86::{
+    Drive, DriveIf, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive, probe_warning,
+};
 
 /// The virtio device models virt can plug.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,6 +320,9 @@ pub(crate) fn plan(
         }
         used.insert(i);
         let backing = match &d.file {
+            Some(_) if d.null_size.is_some() => {
+                return Err(vec![Located::new(&d.loc, NULL_CO_PFLASH)]);
+            }
             Some(file) => {
                 if d.probed && !d.read_only {
                     eprint!("{}", probe_warning(file));
@@ -353,7 +359,7 @@ pub(crate) fn plan(
 /// Opens drive `d` for a device.
 fn open_drive(d: &Drive) -> Result<FileBackend, String> {
     let file = d.file.as_deref().expect("planned with media");
-    let backend = FileBackend::open(file, d.read_only)?;
+    let backend = d.open()?;
     if d.probed && !d.read_only {
         eprint!("{}", probe_warning(file));
     }
@@ -382,26 +388,31 @@ fn sbsa_ref_display(typename: &str) -> String {
 }
 
 /// `qdev_device_add()` for the planned devices: builds each one and plugs it into its bus.
+/// Gives the drives it put on virtio-blk devices.
 pub(crate) fn plug(
     board: Target<'_>,
     plugs: &[Plug],
     display: &[(usize, crate::display::DisplayPlug)],
     drives: &[Drive],
-) -> Result<(), Located> {
+) -> Result<Vec<Plugged>, Located> {
     let realize = |d: &crate::display::DisplayPlug| match board {
         Target::Virt(b) => crate::display::realize_virt(b, d),
         Target::SbsaRef(_) => Err(Located::new(&d.loc, sbsa_ref_display(d.typename()))),
     };
     let mut display = display.iter().peekable();
+    let mut plugged = Vec::new();
     for (i, plug) in plugs.iter().enumerate() {
         while let Some((_, d)) = display.next_if(|(at, _)| *at == i) {
             realize(d)?;
         }
         let at = |e: String| Located::new(&plug.loc, e);
+        let mut image = None;
         let class: Box<dyn VirtioDeviceClass> = match plug.model {
             Model::Blk => {
-                let d = &drives[plug.drive.expect("planned with a drive")];
+                let drive = plug.drive.expect("planned with a drive");
+                let d = &drives[drive];
                 let backend = open_drive(d).map_err(|e| Located::new(&d.loc, e))?;
+                image = Some((drive, backend.clone()));
                 // virtio_blk_pci_realize() turns the automatic num-queues into one queue per
                 // vCPU. virtio-blk-device keeps one.
                 let num_queues = match plug.transport {
@@ -424,18 +435,26 @@ pub(crate) fn plug(
             Model::Serial => Box::new(VirtioConsole::new(None)),
         };
         let (devfn, iommu) = (plug.devfn, plug.iommu_platform);
-        match (board, plug.transport, plug.mmio_bus) {
+        let resize_cb = match (board, plug.transport, plug.mmio_bus) {
             (Target::Virt(board), Transport::Pci, _) => {
-                board.attach_virtio_pci_with(class, devfn, &plug.props, iommu).map_err(at)?;
+                let dev =
+                    board.attach_virtio_pci_with(class, devfn, &plug.props, iommu).map_err(at)?;
+                pci_resize_cb(&dev)
             }
             (Target::SbsaRef(board), Transport::Pci, _) => {
-                board.attach_virtio_pci_with(class, devfn, &plug.props, iommu).map_err(at)?;
+                let dev =
+                    board.attach_virtio_pci_with(class, devfn, &plug.props, iommu).map_err(at)?;
+                pci_resize_cb(&dev)
             }
             (Target::Virt(board), Transport::Mmio, Some(n)) => {
                 board.attach_virtio_at(n, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT).map_err(at)?;
+                mmio_resize_cb(board.virtio_transport(n))
             }
             (Target::Virt(board), Transport::Mmio, None) => {
-                board.attach_virtio(class).map_err(|e| at(format!("{e} '{}'", plug.typename)))?;
+                let n = board
+                    .attach_virtio(class)
+                    .map_err(|e| at(format!("{e} '{}'", plug.typename)))?;
+                mmio_resize_cb(board.virtio_transport(n))
             }
             (Target::SbsaRef(_), Transport::Mmio, _) => {
                 return Err(at(format!(
@@ -443,12 +462,15 @@ pub(crate) fn plug(
                     plug.typename
                 )));
             }
+        };
+        if let Some((drive, image)) = image {
+            plugged.push(Plugged { drive, image, resize_cb });
         }
     }
     for (_, d) in display {
         realize(d)?;
     }
-    Ok(())
+    Ok(plugged)
 }
 
 /// `ahci_ide_create_devs()` for the planned IDE drives of sbsa-ref: an `ide-cd` or `ide-hd`

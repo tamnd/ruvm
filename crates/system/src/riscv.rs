@@ -71,6 +71,7 @@ use ruvm_target_riscv::cfg::{
 use ruvm_target_riscv::tcg::SemihostingHost;
 
 use crate::arm::{Semihosting, SemihostingTarget};
+use crate::drives::Drives;
 use crate::runstate::{MachineReset, Runstate};
 use crate::vl::Vm;
 use crate::x86::{Drive, Located};
@@ -849,7 +850,8 @@ pub(crate) fn start_board(
     cfg.clock = Some(Arc::clone(&clock));
     cfg.rtc_clock = Some(Arc::clone(&rtc_clock));
     let mut board = VirtMachine::new(cfg).map_err(|e| one(Error::generic(e)))?;
-    devices::plug(&board, &plan.virtio, args.drives).map_err(|e| vec![e])?;
+    let plugged = devices::plug(&board, &plan.virtio, args.drives).map_err(|e| vec![e])?;
+    let _ = vm.drives.set(Drives::new(args.drives, plugged));
 
     let mut attachments = Vec::new();
     if let Some(Some(chr)) = serial_hds.first() {
