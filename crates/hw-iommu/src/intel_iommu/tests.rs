@@ -131,19 +131,25 @@ impl Rig {
 
 #[test]
 fn realize_resolves_and_rejects_like_qemu() {
+    // Remapping is on without KVM, and eim only follows it with a KVM irqchip.
     let c = IntelIommuConf::default().realize(false, false).unwrap();
-    assert_eq!(c.intremap, OnOffAuto::Off);
+    assert_eq!(c.intremap, OnOffAuto::On);
     assert_eq!(c.eim, OnOffAuto::Off);
+    assert!(c.intr_supported());
     let err = |c: IntelIommuConf, all: bool| c.realize(all, all).unwrap_err();
     let on = IntelIommuConf { intremap: OnOffAuto::On, ..Default::default() };
     assert_eq!(
-        err(on.clone(), true),
+        err(on, true),
         "Interrupt Remapping cannot work with kernel-irqchip=on, please use 'split|off'."
     );
-    assert!(err(on, false).contains("no interrupt remapping yet"));
     let eim = IntelIommuConf { eim: OnOffAuto::On, ..Default::default() };
-    assert!(err(eim.clone(), false).contains("no interrupt remapping yet"));
-    // QEMU checks aw-bits first because remapping is on by default without KVM.
+    let c = eim.realize(false, false).unwrap();
+    assert_eq!((c.intremap, c.eim), (OnOffAuto::On, OnOffAuto::On));
+    let c = IntelIommuConf { intremap: OnOffAuto::On, ..Default::default() }
+        .realize(false, true)
+        .unwrap();
+    assert_eq!(c.eim, OnOffAuto::On);
+    // The eim check comes after remapping is decided, so aw-bits is the first error here.
     assert_eq!(
         err(IntelIommuConf { aw_bits: 40, ..eim.clone() }, false),
         "Legacy mode: supported values for aw-bits are: 39, 48"
@@ -197,6 +203,10 @@ fn capabilities_match_qemu_defaults() {
     assert_eq!(r.r64(DMAR_CAP_REG), 0x80d2_008c_2226_0286);
     assert_eq!(r.r64(DMAR_ECAP_REG), 0xf46);
     assert_eq!(r.r32(DMAR_FECTL_REG), FECTL_IM);
+    let ir = IntelIommuConf::default().realize(false, false).unwrap();
+    assert_eq!(Rig::new(ir).r64(DMAR_ECAP_REG), 0xf0_0f4a);
+    let eim = IntelIommuConf { eim: OnOffAuto::On, ..Default::default() };
+    assert_eq!(Rig::new(eim.realize(false, false).unwrap()).r64(DMAR_ECAP_REG), 0xf0_0f5a);
 }
 
 #[test]
@@ -359,4 +369,127 @@ fn reset_clears_the_registers() {
     assert_eq!(r.r32(DMAR_GSTS_REG), 0);
     assert_eq!(r.r64(DMAR_RTADDR_REG), 0);
     assert_eq!(r.r32(DMAR_RTADDR_REG_HI), 0);
+}
+
+const IRT: u64 = 0x50000;
+
+impl Rig {
+    /// A rig with remapping on and a 256 entry table at [`IRT`].
+    fn with_ir(eime: bool) -> Rig {
+        let r = Rig::new(IntelIommuConf::default().realize(false, false).unwrap());
+        r.w64(DMAR_IRTA_REG, IRT | u64::from(eime) << 11 | 7);
+        r.w32(DMAR_GCMD_REG, GCMD_SIRTP);
+        assert_ne!(r.r32(DMAR_GSTS_REG) & GSTS_IRTPS, 0);
+        r.w32(DMAR_GCMD_REG, GCMD_IRE);
+        assert_ne!(r.r32(DMAR_GSTS_REG) & GSTS_IRES, 0);
+        r.w32(DMAR_FEDATA_REG, 0x41);
+        r.w32(DMAR_FEADDR_REG, 0xfee0_0000);
+        r.w32(DMAR_FECTL_REG, 0);
+        r
+    }
+
+    fn irte(&self, index: u64, lo: u64, hi: u64) {
+        self.wq(IRT + index * 16, lo);
+        self.wq(IRT + index * 16 + 8, hi);
+    }
+
+    fn fault_reason(&self) -> (u64, u64) {
+        let lo = self.r64(DMAR_FRCD_REG_0_0);
+        let hi = self.r64(DMAR_FRCD_REG_0_2);
+        self.w64(DMAR_FRCD_REG_0_2, FRCD_F);
+        (hi >> 32 & 0xff, lo >> 48)
+    }
+}
+
+/// The remappable format address for `index`.
+fn ir_addr(index: u32, shv: bool) -> u64 {
+    u64::from(0xfee0_0000 | (index & 0x7fff) << 5 | 1 << 4 | u32::from(shv) << 3)
+        | u64::from(index >> 15 & 1) << 2
+}
+
+#[test]
+fn remapping_off_passes_messages_through() {
+    let r = Rig::new(IntelIommuConf::default().realize(false, false).unwrap());
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(3, false), 0x31), Some((ir_addr(3, false), 0x31)));
+}
+
+#[test]
+fn remaps_through_the_table() {
+    let r = Rig::with_ir(false);
+    // Vector 0x45, fixed, edge, physical, destination 2 in the xAPIC byte.
+    r.irte(3, 0x0000_0200_0045_0001, 0);
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(3, false), 0), Some((0xfee0_2000, 0x4045)));
+    // Compatibility format goes through as it is.
+    assert_eq!(r.iommu.remap_msi(SID, 0xfee0_1000, 0x31), Some((0xfee0_1000, 0x31)));
+    // Level triggered, lowest priority, logical, redirection hint, low address bits kept.
+    r.irte(4, 0x0000_0300_0051_013d, 0);
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(4, false) | 1, 0), Some((0xfee0_300d, 0xc151)));
+    // With the subhandle the data adds to the index.
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(1, true), 2), Some((0xfee0_2000, 0x4045)));
+    assert!(r.msis().is_empty());
+}
+
+#[test]
+fn extended_interrupt_mode_takes_the_whole_destination() {
+    let r = Rig::with_ir(true);
+    r.irte(0, 0x0001_2345_0050_0001, 0);
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(0, false), 0), Some((0x0001_2300_fee4_5000, 0x4050)));
+}
+
+#[test]
+fn bad_messages_and_entries_fault() {
+    let r = Rig::with_ir(false);
+    assert_eq!(r.iommu.remap_msi(SID, 0x1_fee0_0010, 0), None);
+    assert_eq!(r.msis(), vec![(0xfee0_0000, 0x41)]);
+    assert_eq!(r.fault_reason(), (u64::from(FR_IR_REQ_RSVD), 0));
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(300, false), 0), None);
+    assert_eq!(r.fault_reason(), (u64::from(FR_IR_INDEX_OVER), 300));
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(5, false), 0), None);
+    assert_eq!(r.fault_reason(), (u64::from(FR_IR_ENTRY_P), 5));
+    r.irte(5, 0x45_1001, 0);
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(5, false), 0), None);
+    assert_eq!(r.fault_reason(), (u64::from(FR_IR_IRTE_RSVD), 5));
+    r.irte(5, 0x45_0001, 1 << 20);
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(5, false), 0), None);
+    assert_eq!(r.fault_reason(), (u64::from(FR_IR_IRTE_RSVD), 5));
+    r.irte(5, 0x45_0001, 0);
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(5, true), 0x1_0000), None);
+    assert_eq!(r.fault_reason(), (u64::from(FR_IR_REQ_RSVD), 0));
+    // Fault processing disable hides the entry faults but still drops the message.
+    r.irte(6, 0x45_0002, 0);
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(6, false), 0), None);
+    assert_eq!(r.r64(DMAR_FRCD_REG_0_2) & FRCD_F, 0);
+}
+
+#[test]
+fn source_id_checks() {
+    let r = Rig::with_ir(false);
+    let sid = |svt: u64, sq: u64, source: u64| svt << 18 | sq << 16 | source;
+    // Exact match.
+    r.irte(1, 0x45_0001, sid(1, 0, 0x08));
+    assert!(r.iommu.remap_msi(0x08, ir_addr(1, false), 0).is_some());
+    assert_eq!(r.iommu.remap_msi(0x09, ir_addr(1, false), 0), None);
+    assert_eq!(r.fault_reason(), (u64::from(FR_IR_SID_ERR), 1));
+    // The qualifier ignores the low function bits.
+    r.irte(1, 0x45_0001, sid(1, 3, 0x08));
+    assert!(r.iommu.remap_msi(0x0f, ir_addr(1, false), 0).is_some());
+    // A bus range.
+    r.irte(1, 0x45_0001, sid(2, 0, 0x0302));
+    assert!(r.iommu.remap_msi(0x0208, ir_addr(1, false), 0).is_some());
+    assert_eq!(r.iommu.remap_msi(0x0408, ir_addr(1, false), 0), None);
+    assert_eq!(r.fault_reason(), (u64::from(FR_IR_SID_ERR), 1));
+    // The IOAPIC has no source ID to check.
+    assert!(r.iommu.remap_msi(SID_INVALID, ir_addr(1, false), 0).is_some());
+    r.irte(1, 0x45_0001, sid(3, 0, 0));
+    assert_eq!(r.iommu.remap_msi(0x08, ir_addr(1, false), 0), None);
+    assert_eq!(r.fault_reason(), (u64::from(FR_IR_SID_ERR), 1));
+}
+
+#[test]
+fn turning_remapping_off_passes_through_again() {
+    let r = Rig::with_ir(false);
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(9, false), 0), None);
+    r.w32(DMAR_GCMD_REG, 0);
+    assert_eq!(r.r32(DMAR_GSTS_REG) & GSTS_IRES, 0);
+    assert_eq!(r.iommu.remap_msi(SID, ir_addr(9, false), 0), Some((ir_addr(9, false), 0)));
 }

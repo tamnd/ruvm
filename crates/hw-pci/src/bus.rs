@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use ruvm_base::Error;
 use ruvm_mem::{MemorySystem, RegionId};
 
-use crate::device::{MsiTrigger, NewDevice, PciDevice, PciDeviceInfo};
+use crate::device::{MsiRemap, MsiTrigger, NewDevice, PciDevice, PciDeviceInfo};
 use crate::regs::*;
 
 /// Drives interrupt `irq` of the controller behind a bus to `level` (0 or 1), the
@@ -69,6 +69,7 @@ pub struct PciBus {
     inner: Mutex<BusInner>,
     irq: Mutex<BusIrq>,
     msi_handler: RwLock<Option<MsiTrigger>>,
+    msi_remap: RwLock<Option<MsiRemap>>,
     msi_nonbroken: AtomicBool,
     allow_0_address: AtomicBool,
     extended_config: AtomicBool,
@@ -147,6 +148,7 @@ impl PciBus {
             }),
             irq: Mutex::new(BusIrq::default()),
             msi_handler: RwLock::new(None),
+            msi_remap: RwLock::new(None),
             msi_nonbroken: AtomicBool::new(false),
             allow_0_address: AtomicBool::new(false),
             extended_config: AtomicBool::new(false),
@@ -326,6 +328,16 @@ impl PciBus {
 
     pub(crate) fn msi_handler(&self) -> Option<MsiTrigger> {
         self.root().msi_handler.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Puts interrupt remapping in front of the MSIs of the functions below this root bus,
+    /// whether they go to their own trigger or to the root bus handler.
+    pub fn set_msi_remap(&self, remap: Option<MsiRemap>) {
+        *self.root().msi_remap.write().unwrap_or_else(|p| p.into_inner()) = remap;
+    }
+
+    pub(crate) fn msi_remap(&self) -> Option<MsiRemap> {
+        self.root().msi_remap.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// `msi_nonbroken`: whether the interrupt controller takes MSI. QEMU keeps one global flag

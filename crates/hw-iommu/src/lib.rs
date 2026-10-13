@@ -13,7 +13,7 @@ pub mod smmuv3;
 pub mod virtio_iommu;
 
 pub use intel_iommu::{
-    DMAR_REG_BASE, DMAR_REG_SIZE, IntelIommu, IntelIommuConf, TYPE_INTEL_IOMMU_DEVICE,
+    DMAR_REG_BASE, DMAR_REG_SIZE, IntelIommu, IntelIommuConf, SID_INVALID, TYPE_INTEL_IOMMU_DEVICE,
     TYPE_INTEL_IOMMU_MEMORY_REGION,
 };
 pub use smmu_common::Stage as SmmuStage;
