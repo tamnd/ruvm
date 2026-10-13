@@ -29,6 +29,8 @@ pub struct Options {
     pub tb_size: Option<u64>,
     /// `-strace`, or `strace` in `-d`.
     pub strace: bool,
+    /// `-g`, the port or socket path the debugger connects to and its options.
+    pub gdb: Option<String>,
     /// `-D`, where the log goes instead of `stderr`.
     pub log_file: Option<String>,
     /// The guest's environment, in the order `envlist_to_environ()` gives it.
@@ -286,9 +288,10 @@ impl Parser<'_> {
             "d" => self.d_strace = arg.split(',').any(|item| item == "strace" || item == "all"),
             "D" => o.log_file = Some(arg.to_string()),
             "strace" => o.strace = true,
+            "g" => o.gdb = Some(arg.to_string()),
             // The other logs, the random seed and perf maps change nothing a program sees.
             "dfilter" | "seed" | "perfmap" | "jitdump" | "B" => {}
-            "g" | "t" | "trace" | "plugin" => {
+            "t" | "trace" | "plugin" => {
                 return Err(Exit::Error(format!(
                     "qemu: option '-{name}' is not supported by ruvm yet"
                 )));
@@ -314,6 +317,7 @@ pub fn parse(target: &str, env: Vec<(String, String)>, args: &[String]) -> Resul
             one_insn_per_tb: false,
             tb_size: None,
             strace: false,
+            gdb: None,
             log_file: None,
             env: env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
             exec_path: String::new(),

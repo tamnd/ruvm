@@ -37,6 +37,7 @@ use ruvm_target_x86::tcg::{
 use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page};
 
 use crate::elf::{Arch, ImageInfo};
+use crate::gdb;
 use crate::guest::Guest;
 use crate::signal::{self, Sigaction, Task, get32, get64, put32, put64};
 use crate::start;
@@ -619,6 +620,8 @@ pub(crate) fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
                     reg(cpu, a[5]),
                     reg(cpu, a[6]),
                 ];
+                gdb::set_orig_ax(nr);
+                gdb::syscall_entry(t, cpu, nr);
                 let traced = strace::on()
                     .then(|| strace::syscall(p.space(), nr, strace::entry(nr as i64), &args));
                 let ret = syscall::do_syscall(p, t, cpu, nr, args);
@@ -628,6 +631,7 @@ pub(crate) fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
                 if ret == THREAD_EXIT {
                     return;
                 }
+                gdb::syscall_return(t, cpu, nr);
                 if ret == signal::ERESTARTSYS {
                     let eip = env::ld64(cpu.env, EIP);
                     env::st64(cpu.env, EIP, eip.wrapping_sub(2));

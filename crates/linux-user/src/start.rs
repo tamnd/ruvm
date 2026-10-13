@@ -217,6 +217,7 @@ pub(crate) fn main(argv0: &str, args: &[String], target: &mut dyn Target) -> Exi
         brk: info.brk,
         start_stack: info.start_stack,
         auxv: (info.saved_auxv, info.auxv_len),
+        load_bias: info.load_bias,
     };
     let proc = Arc::new(Proc::new(
         Arc::clone(&space),
@@ -229,6 +230,12 @@ pub(crate) fn main(argv0: &str, args: &[String], target: &mut dyn Target) -> Exi
     signal::signal_init(prog);
     let mut task = Task::new(host_mask, cpu.shared());
     host::set_mask(task.run_mask());
+    if let Some(args) = o.gdb.as_deref() {
+        if let Err(e) = crate::gdb::start(&proc, &task, &mut cpu, prog, &o.exec_path, args) {
+            eprintln!("{prog}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     (g.cpu_loop)(&proc, &mut task, &mut cpu);
     // The main thread called exit with others left: it ends, and the process with the last.
     task.exit_thread();

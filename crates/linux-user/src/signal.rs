@@ -606,6 +606,7 @@ pub(crate) fn strsignal(sig: i32) -> &'static str {
 /// `dump_core_and_abort()`: the guest dies of `sig`. QEMU writes no core file when the core
 /// limit is 0, and neither does this, but it prints the same line.
 fn dump_core_and_abort(sig: i32) -> ! {
+    crate::gdb::signalled(sig);
     let host_sig = if sig == SIGABRT { libc::SIGABRT } else { t2h(sig) };
     if core_dump_signal(sig) {
         eprintln!("qemu: uncaught target signal {sig} ({}) - core dumped", strsignal(host_sig));
@@ -613,14 +614,23 @@ fn dump_core_and_abort(sig: i32) -> ! {
     host::die_with_signal(host_sig)
 }
 
-/// `handle_pending_signal()`.
+/// `handle_pending_signal()`: `fault` is QEMU's `QEMU_SI_FAULT`, a signal the CPU raised.
 fn handle_pending_signal(
     space: &GuestSpace,
     t: &mut Task,
     cpu: &mut Cpu<'_>,
     sig: i32,
     info: &Info,
+    fault: bool,
 ) {
+    let sig = crate::gdb::handlesig(t, cpu, sig, info);
+    if strace::on() {
+        strace::taken_signal(space, sig, info, fault);
+    }
+    // The debugger took the signal.
+    if sig == 0 {
+        return;
+    }
     let sa = sigact()[sig as usize - 1];
     match sa.handler {
         SIG_DFL => {
@@ -667,12 +677,9 @@ pub(crate) fn process_pending_signals(space: &GuestSpace, t: &mut Task, cpu: &mu
                         sa[sig as usize - 1].handler = SIG_DFL;
                     }
                 }
-                if strace::on() {
-                    // The CPU's faults carry their own code, force_sig() SI_KERNEL.
-                    let fault = get32(&info, 8) as i32 != SI_KERNEL;
-                    strace::taken_signal(space, sig, &info, fault);
-                }
-                handle_pending_signal(space, t, cpu, sig, &info);
+                // The CPU's faults carry their own code, force_sig() SI_KERNEL.
+                let fault = get32(&info, 8) as i32 != SI_KERNEL;
+                handle_pending_signal(space, t, cpu, sig, &info, fault);
                 continue;
             }
             let blocked = if t.in_sigsuspend { t.sigsuspend_mask } else { t.signal_mask };
@@ -687,10 +694,7 @@ pub(crate) fn process_pending_signals(space: &GuestSpace, t: &mut Task, cpu: &mu
             for (i, w) in k.info.iter().enumerate() {
                 put64(&mut info, 8 * i, w.load(Ordering::Relaxed));
             }
-            if strace::on() {
-                strace::taken_signal(space, sig, &info, false);
-            }
-            handle_pending_signal(space, t, cpu, sig, &info);
+            handle_pending_signal(space, t, cpu, sig, &info, false);
         }
         // Nothing left: unblock, which may take another host signal and set pending again.
         t.ts.pending.store(0, Ordering::SeqCst);

@@ -25,6 +25,8 @@ pub(crate) struct Image {
     pub(crate) start_stack: u64,
     /// `info->saved_auxv` and `info->auxv_len`.
     pub(crate) auxv: (u64, u64),
+    /// `info->load_bias`.
+    pub(crate) load_bias: u64,
 }
 
 /// `is_proc_myself()`: whether `name` is `/proc/self/<entry>` or `/proc/<pid>/<entry>` of

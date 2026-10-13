@@ -15,6 +15,7 @@ use ruvm_jit::cputlb::tlb_flush;
 use ruvm_jit::{Cpu, CpuShared, ENV_TARGET_OFFSET, cf};
 use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page, page_align};
 
+use crate::gdb;
 use crate::guest::{self, guest};
 use crate::host::{self, sys};
 use crate::procfs::{self, Image};
@@ -282,6 +283,16 @@ impl Proc {
     /// What `/proc/self` says about the program.
     pub(crate) fn image(&self) -> &Image {
         &self.image
+    }
+
+    /// `real_exec_path`, the program's full path, which `/proc/self/exe` names.
+    pub(crate) fn exec_path(&self) -> &str {
+        &self.exec_path
+    }
+
+    /// `-L`, where the guest's files are.
+    pub(crate) fn ld_prefix(&self) -> &str {
+        &self.ld_prefix
     }
 
     /// The guest's address space.
@@ -641,8 +652,10 @@ fn do_exit(p: &Proc, t: &Task, code: u64) -> i64 {
             let addr = p.space.g2h(t.child_tidptr) as u64;
             sys(libc::SYS_futex, &[addr, FUTEX_WAKE, i32::MAX as u64, 0, 0, 0]);
         }
+        gdb::unregister();
         return THREAD_EXIT;
     }
+    gdb::exit(code as i32);
     sys(libc::SYS_exit_group, &[code]);
     std::process::exit(code as i32)
 }
@@ -693,6 +706,7 @@ fn new_thread(
     // cpu_copy() and cpu_clone_regs_child().
     let mut v = jit.create_vcpu(cpu.ops(), Arc::clone(cpu.core.address_space()), g.env_size);
     v.core.tcg_cflags = cpu.core.tcg_cflags;
+    v.core.breakpoints.clone_from(&cpu.core.breakpoints);
     v.env[ENV_TARGET_OFFSET..].copy_from_slice(&cpu.env[ENV_TARGET_OFFSET..]);
     {
         let mut c = v.cpu();
@@ -721,6 +735,7 @@ fn new_thread(
             let _ = p.put(ptid, &tid.to_le_bytes());
         }
         host::set_mask(task.run_mask());
+        gdb::register(&cpu);
         let _ = tx.send(tid);
         // Wait until the parent has finished.
         drop(lock(&CLONE_LOCK));
@@ -790,19 +805,24 @@ fn do_fork(
     let clone = lock(&CLONE_LOCK);
     let mm = p.mm();
     jit.start_exclusive();
+    gdb::fork_start();
     let r = host::fork();
-    jit.end_exclusive();
     if r == 0 {
         // The other threads did not come along.
         THREADS.store(1, Ordering::Release);
     }
     drop(mm);
     drop(clone);
+    if r == 0 {
+        (guest().clone_regs)(cpu, newsp);
+    }
+    // fork_end(): the debugger may stop either side before it runs on.
+    gdb::fork_end(t, cpu, r);
+    jit.end_exclusive();
     if r < 0 {
         return r;
     }
     if r == 0 {
-        (guest().clone_regs)(cpu, newsp);
         if flags & CLONE_CHILD_SETTID != 0 {
             let tid = sys(libc::SYS_gettid, &[]) as u32;
             let _ = p.put(ctid, &tid.to_le_bytes());
@@ -1118,6 +1138,7 @@ pub(crate) fn do_syscall(
         }
         libc::SYS_exit => do_exit(p, t, a[0]),
         libc::SYS_exit_group => {
+            gdb::exit(a[0] as i32);
             sys(libc::SYS_exit_group, &[a[0]]);
             std::process::exit(a[0] as i32)
         }
