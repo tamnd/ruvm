@@ -56,6 +56,7 @@ use ruvm_qom::{
 use crate::arm::{self, ArmBoard};
 use crate::net::{NetOption, Network, qmp_events};
 use crate::options::{Opt, arch_available, help_text, lookup_opt};
+use crate::qdev;
 use crate::qmp_cmds::{self, object_options_dict};
 use crate::qtest::{self, VirtualClock};
 use crate::riscv;
@@ -375,6 +376,9 @@ fn run(p: &Personality<'_>, args: &[String]) -> Flow<u8> {
     }
     if arm::is_arm(p.target) {
         arm::register_types(&registry);
+    }
+    if riscv::is_riscv(p.target) || arm::is_arm(p.target) {
+        qdev::register_types(&registry);
     }
     qtest::register_types(&registry);
     ruvm_chardev::qom::register_types(&registry);
