@@ -219,6 +219,7 @@ fn spec(kind: BoardKind, firmware: FirmwareSearch) -> BoardSpec {
         ram_size: Some(256 << 20),
         memdev: None,
         aux_ram_share: false,
+        virtio_force_legacy: true,
         cpus: 1,
         max_cpus: 0,
         kvm: true,

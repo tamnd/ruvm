@@ -178,6 +178,8 @@ pub struct MicrovmConfig {
     pub memdev: Option<Arc<RamBlock>>,
     /// `-machine aux-ram-share=`: the RAM and ROM the board makes are shared memory.
     pub aux_ram_share: bool,
+    /// `force-legacy` of the virtio-mmio transports, which `-global` can change.
+    pub virtio_force_legacy: bool,
 }
 
 impl fmt::Debug for MicrovmConfig {
@@ -186,6 +188,7 @@ impl fmt::Debug for MicrovmConfig {
             .field("ram_size", &self.ram_size)
             .field("memdev", &self.memdev.as_ref().map(|b| b.name()))
             .field("aux_ram_share", &self.aux_ram_share)
+            .field("virtio_force_legacy", &self.virtio_force_legacy)
             .field("cpus", &self.cpus)
             .field("max_cpus", &self.max_cpus)
             .field("kvm", &self.kvm)
@@ -222,6 +225,7 @@ impl Default for MicrovmConfig {
             pit_in_kernel: false,
             memdev: None,
             aux_ram_share: false,
+            virtio_force_legacy: VIRTIO_MMIO_FORCE_LEGACY_DEFAULT,
         }
     }
 }
@@ -357,6 +361,7 @@ pub struct Microvm {
     ged: Option<Arc<AcpiGed>>,
     virtio: Vec<Arc<VirtioSlot>>,
     virtio_irq_base: u32,
+    virtio_force_legacy: bool,
 
     done: bool,
     kernel_cmdline_fixed: bool,
@@ -402,6 +407,7 @@ impl Microvm {
             pit_in_kernel,
             memdev,
             aux_ram_share,
+            virtio_force_legacy,
         } = cfg;
 
         // machine_parse_smp_config(), for a topology given as a CPU count.
@@ -625,7 +631,7 @@ impl Microvm {
         let mut virtio = Vec::new();
         for i in 0..virtio_num_transports {
             let line = gsi[(virtio_irq_base + i) as usize].clone();
-            let t = VirtioMmio::new(None, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT).map_err(err)?;
+            let t = VirtioMmio::new(None, virtio_force_legacy).map_err(err)?;
             t.irq().connect(line.clone());
             let slot = Arc::new(VirtioSlot {
                 gsi: line,
@@ -747,6 +753,7 @@ impl Microvm {
             ged,
             virtio,
             virtio_irq_base,
+            virtio_force_legacy,
             done: false,
             kernel_cmdline_fixed: false,
         })
@@ -764,13 +771,14 @@ impl Microvm {
     }
 
     /// Plugs a virtio device into transport `index` with the transport's `force-legacy`
-    /// property set to `force_legacy`.
+    /// property set to `force_legacy`, unless `-global` turned it off for all of them.
     pub fn attach_virtio_at(
         &self,
         index: usize,
         class: Box<dyn VirtioDeviceClass>,
         force_legacy: bool,
     ) -> Result<(), String> {
+        let force_legacy = force_legacy && self.virtio_force_legacy;
         if self.done {
             return Err("virtio-mmio devices must be plugged before machine_done".to_string());
         }

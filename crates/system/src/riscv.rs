@@ -831,7 +831,11 @@ pub(crate) fn start_board(
             runstate: Arc::downgrade(&vm.runstate),
         })
     });
-    let mut cfg = VirtConfig { smp: opts.cpus as usize, ..VirtConfig::default() };
+    let mut cfg = VirtConfig {
+        smp: opts.cpus as usize,
+        virtio_force_legacy: crate::global::virtio_mmio_force_legacy(),
+        ..VirtConfig::default()
+    };
     if let Some(size) = opts.ram_size {
         cfg.ram_size = size;
     }

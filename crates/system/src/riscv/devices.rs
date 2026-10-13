@@ -246,6 +246,33 @@ fn plan_virtio(
     Ok(plug)
 }
 
+/// What one `-device` plugs.
+enum Planned {
+    Loader(GenericLoader),
+    Virtio(Plug),
+}
+
+/// `qdev_device_add()` for one `-device`, with `-global` merged in.
+fn plan_device(
+    drives: &[Drive],
+    used: &mut HashSet<usize>,
+    arg: &str,
+    loc: &Option<Location>,
+) -> Result<Planned, Located> {
+    let mut list = QemuOptsList::new("device", &[]).with_implied_opt_name("driver");
+    let opts = list.parse(arg, true).map_err(|e| Located(loc.clone(), e))?;
+    let Some(driver) = opts.get("driver") else {
+        return Err(Located::new(loc, "Parameter 'driver' is missing"));
+    };
+    if is_help_option(driver) || opts.has_help_opt() {
+        return Err(Located::new(loc, "-device help is not supported by ruvm yet"));
+    }
+    if driver == "loader" {
+        return parse_loader(opts, loc).map(Planned::Loader);
+    }
+    plan_virtio(drives, used, driver, opts, loc).map(Planned::Virtio)
+}
+
 /// Works out what `-drive` and `-device` plug into virt. The errors are those of
 /// `qdev_device_add()` and `drive_check_orphaned()`; for orphans every one is listed.
 pub(crate) fn plan(
@@ -260,20 +287,18 @@ pub(crate) fn plan(
         queue.push((format!("virtio-blk,drive={}", d.id), d.loc.clone()));
     }
     for (arg, loc) in &queue {
-        let mut list = QemuOptsList::new("device", &[]).with_implied_opt_name("driver");
-        let opts = list.parse(arg, true).map_err(|e| vec![Located(loc.clone(), e)])?;
-        let Some(driver) = opts.get("driver") else {
-            return Err(vec![Located::new(loc, "Parameter 'driver' is missing")]);
+        let plan = |arg: &str, trial: bool| {
+            if trial {
+                plan_device(drives, &mut used.clone(), arg, loc)
+            } else {
+                plan_device(drives, &mut used, arg, loc)
+            }
         };
-        if is_help_option(driver) || opts.has_help_opt() {
-            return Err(vec![Located::new(loc, "-device help is not supported by ruvm yet")]);
+        let planned = crate::global::plan_device(arg, loc, plan, |_, e| Err(e));
+        match planned.map_err(|e| vec![e])? {
+            Planned::Loader(loader) => p.loaders.push(loader),
+            Planned::Virtio(plug) => p.virtio.push(plug),
         }
-        if driver == "loader" {
-            p.loaders.push(parse_loader(opts, loc).map_err(|e| vec![e])?);
-            continue;
-        }
-        let plug = plan_virtio(drives, &mut used, driver, opts, loc).map_err(|e| vec![e])?;
-        p.virtio.push(plug);
     }
 
     // pflash_cfi01_legacy_drive() for the two flashes. The flash reads the image itself and

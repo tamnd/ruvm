@@ -984,6 +984,29 @@ enum Planned {
     IntelIommu(IntelIommuConf),
 }
 
+impl Planned {
+    /// The plan with the error a sound device keeps for later as an error now, for a trial
+    /// with the globals.
+    fn trial(self) -> std::result::Result<Planned, Located> {
+        match &self {
+            Planned::Audio(plug) => plug.deferred_error().map_or(Ok(self), Err),
+            _ => Ok(self),
+        }
+    }
+
+    /// Fails the plan with the error of a global. A sound device keeps it until its bus is
+    /// checked.
+    fn global_error(self, e: Located) -> std::result::Result<Planned, Located> {
+        match self {
+            Planned::Audio(mut plug) => {
+                plug.set_global_error(e.1);
+                Ok(Planned::Audio(plug))
+            }
+            _ => Err(e),
+        }
+    }
+}
+
 /// The drives of the q35 system flashes: `-machine pflashN=` names a drive by id, and
 /// `-drive if=pflash` with unit N is taken the way `pflash_cfi01_legacy_drive()` does. The
 /// images are read into the flash and written back with plain file I/O, so the drive only
@@ -1180,7 +1203,19 @@ pub(crate) fn plan(
     }
     let mut console = false;
     for (arg, loc) in &queue {
-        match plan_device(kind, drives, &mut used, arg, loc).map_err(|e| vec![e])? {
+        let planned = crate::global::plan_device(
+            arg,
+            loc,
+            |arg, trial| {
+                if trial {
+                    plan_device(kind, drives, &mut used.clone(), arg, loc).and_then(Planned::trial)
+                } else {
+                    plan_device(kind, drives, &mut used, arg, loc)
+                }
+            },
+            Planned::global_error,
+        );
+        match planned.map_err(|e| vec![e])? {
             Planned::Virtio(plug) => p.virtio.push(plug),
             Planned::Isa(plug) => p.isa.push(plug),
             Planned::Display(plug) => p.display.push((p.virtio.len(), plug)),
@@ -2051,6 +2086,7 @@ fn build(
         rtc_clock: Arc::clone(&rtc_clock),
         memdev: opts.memdev.map(|m| m.0),
         aux_ram_share: opts.aux_ram_share,
+        virtio_force_legacy: crate::global::virtio_mmio_force_legacy(),
     };
     let (mut board, warnings) = build_board(spec).map_err(board_error)?;
     for w in warnings.iter().chain(board.warnings()) {

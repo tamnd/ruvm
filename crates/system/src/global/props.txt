@@ -1,0 +1,243 @@
+# The properties a global can set on the objects of boards.txt and the devices ruvm plans,
+# from device-list-properties of QEMU 11.1, each with its type. A type has the properties of
+# its line and of its parents' lines.
+AC97 audiodev:str
+ES1370 audiodev:str
+ICH9-LPC acpi-pci-hotplug-with-bridge-support:bool acpi_disable_cmd:uint8 acpi_enable_cmd:uint8 disable_s3:uint8 disable_s4:uint8 enable_tco:bool gpe0_blk:uint32 gpe0_blk_len:uint32 noreboot:bool pm_io_base:uint32 s4_val:uint8 sci_int:uint8 smm-compat:bool smm-enabled:bool x-keep-pci-slot-hpc:bool x-smi-broadcast:bool x-smi-cpu-hotplug:bool x-smi-cpu-hotunplug:bool x-smi-negotiated-features:uint64 x-smi-periodic-timer:bool x-smi-swsmi-timer:bool
+ICH9-SMB
+VGA acpi-index:uint32 addr:str big-endian-framebuffer:bool busnr:other edid:bool failover_pair_id:str mmio:bool multifunction:bool qemu-extended-regs:bool refresh_rate:uint32 rombar:int32 romfile:str romsize:uint32 sriov-pf:str vgamem_mb:uint32 x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-lnksta-dllla:bool xmax:uint32 xres:uint32 ymax:uint32 yres:uint32
+acpi-ged acpi-pci-hotplug-with-bridge-support:bool ged-event:uint32 x-has-hest-addr:bool
+apic
+apic-common id:uint32 vapic:bool version:uint8
+arm-gicv2m base-spi:uint32 num-spi:uint32
+arm-gicv3 first-cpu-index:uint32 force-8-bit-prio:bool has-lpi:bool has-nmi:bool has-security-extensions:bool maintenance-interrupt-id:uint32 num-cpu:uint32 num-irq:uint32 redist-region-count:other revision:uint32
+arm-gicv3-its
+arm-smmuv3 accel:bool ats:OnOffAuto bus_num:uint8 cmdqv:OnOffAuto identifier:uint8 msi-gpa:uint64 oas:other ril:OnOffAuto smmu_per_bus:bool ssidsize:other stage:str
+arm_gic first-cpu-index:uint32 has-security-extensions:bool has-virtualization-extensions:bool num-cpu:uint32 num-irq:uint32 num-priority-bits:uint32 revision:uint32
+base-xhci p2:uint32 p3:uint32 streams:bool
+bochs-display big-endian-framebuffer:bool edid:bool refresh_rate:uint32 vgamem:size xmax:uint32 xres:uint32 ymax:uint32 yres:uint32
+cfi.pflash01 big-endian:bool device-width:uint8 drive:str id0:uint16 id1:uint16 id2:uint16 id3:uint16 max-device-width:uint8 name:str num-blocks:uint32 sector-length:uint64 secure:bool width:uint8
+e1000
+e1000-82544gc
+e1000-82545em
+e1000-base bootindex:int32 init-vet:bool mac:str migrate_tso_props:bool netdev:str
+e1000e bootindex:int32 disable_vnet_hdr:uint8 init-vet:bool mac:str migrate-timadj:bool netdev:str subsys:uint16 subsys_ven:uint16
+floppy account-failed:OnOffAuto account-invalid:OnOffAuto backend_defaults:OnOffAuto discard_granularity:size drive:str drive-type:FloppyDriveType logical_block_size:size min_io_size:size opt_io_size:size physical_block_size:size share-rw:bool stats-intervals:other unit:uint32 write-cache:OnOffAuto
+fw_cfg acpi-mr-restore:bool dma_enabled:bool x-file-slots:uint16
+fw_cfg_io
+fw_cfg_mem data_width:uint32
+goldfish_rtc big-endian:bool
+gpex-pcihost allow-unmapped-accesses:bool num-irqs:uint8 x-above-4g-mmio-base:uint64 x-above-4g-mmio-size:size x-below-4g-mmio-base:uint64 x-below-4g-mmio-size:size x-ecam-base:uint64 x-ecam-size:size x-pio-base:uint64 x-pio-size:size
+gpex-root
+gpio-key
+hda-codec audiodev:str cad:uint32 debug:uint32 mixer:bool
+hda-duplex
+hda-micro
+hda-output
+hpet hpet-intcap:uint32 msi:bool timers:uint8
+i8042 extended-state:bool kbd-irq:uint8 kbd-throttle:bool mouse-irq:uint8
+i82550 bootindex:int32 mac:str netdev:str
+i82551 bootindex:int32 mac:str netdev:str
+i82557a bootindex:int32 mac:str netdev:str
+i82557b bootindex:int32 mac:str netdev:str
+i82557c bootindex:int32 mac:str netdev:str
+i82558a bootindex:int32 mac:str netdev:str
+i82558b bootindex:int32 mac:str netdev:str
+i82559a bootindex:int32 mac:str netdev:str
+i82559b bootindex:int32 mac:str netdev:str
+i82559c bootindex:int32 mac:str netdev:str
+i82559er bootindex:int32 mac:str netdev:str
+i82562 bootindex:int32 mac:str netdev:str
+i8257 base:int32 dshift:int32 page-base:int32 pageh-base:int32
+i82801 bootindex:int32 mac:str netdev:str
+ich9-ahci
+ich9-intel-hda
+ide-cd
+ide-device account-failed:OnOffAuto account-invalid:OnOffAuto backend_defaults:OnOffAuto bootindex:int32 discard_granularity:size drive:str logical_block_size:size min_io_size:size model:str opt_io_size:size physical_block_size:size rerror:other serial:str share-rw:bool stats-intervals:other unit:uint32 ver:str werror:other win2k-install-hack:bool write-cache:OnOffAuto wwn:uint64
+ide-hd bios-chs-trans:other cyls:uint32 heads:uint32 lcyls:uint32 lheads:uint32 lsecs:uint32 rotation_rate:uint16 secs:uint32
+igb bootindex:int32 mac:str netdev:str x-pcie-flr-init:bool
+intel-hda
+intel-hda-generic debug:uint32 msi:OnOffAuto old_msi_addr:bool
+ioapic version:uint8
+isa-debug-exit iobase:uint32 iosize:uint32
+isa-debugcon chardev:str iobase:uint32 readback:uint32
+isa-i8259
+isa-pcspk audiodev:str iobase:uint32
+isa-pit
+isa-serial baudbase:uint32 chardev:str index:uint32 iobase:uint32 irq:uint32 wakeup:bool
+isabus-bridge
+kvm-apic
+kvm-i8259
+kvm-ioapic gsi_base:uint32
+kvm-pit lost_tick_policy:LostTickPolicy
+kvmclock
+kvmvapic
+loader addr:uint64 cpu-num:uint32 data:uint64 data-be:bool data-len:uint8 file:str force-raw:bool
+lsi53c895a
+mc146818rtc base_year:int32 date:other iobase:uint16 irq:uint8 lost_tick_policy:LostTickPolicy
+mch extended-tseg-mbytes:uint16 smbase-smram:bool
+migration announce-initial:size announce-max:size announce-rounds:size announce-step:size avail-switchover-bandwidth:size mapped-ram:bool max-cpu-throttle:uint8 max-postcopy-bandwidth:size mode:MigMode multifd-channels:uint8 multifd-clean-tls-termination:bool multifd-compression:MultiFDCompression multifd-flush-after-each-section:bool multifd-qatzip-level:uint8 multifd-zlib-level:uint8 multifd-zstd-level:uint8 postcopy-blocktime:bool send-configuration:bool send-section-footer:bool send-switchover-start:bool store-global-state:bool switchover-ack-legacy:bool tls-authz:other tls-creds:other tls-hostname:other vcpu-dirty-limit:uint64 x-auto-converge:bool x-background-snapshot:bool x-checkpoint-delay:uint32 x-clear-bitmap-shift:uint8 x-colo:bool x-cpu-throttle-increment:uint8 x-cpu-throttle-initial:uint8 x-cpu-throttle-tailslow:bool x-dirty-limit:bool x-downtime-limit:uint64 x-events:bool x-ignore-shared:bool x-max-bandwidth:size x-multifd:bool x-postcopy-preempt:bool x-postcopy-ram:bool x-preempt-pre-7-2:bool x-rdma-chunk-size:uint64 x-rdma-pin-all:bool x-release-ram:bool x-return-path:bool x-switchover-ack:bool x-throttle-trigger-threshold:uint8 x-vcpu-dirty-limit-period:uint64 x-xbzrle:bool x-zero-copy-send:bool xbzrle-cache-size:size zero-page-detection:ZeroPageDetection
+ne2k_pci bootindex:int32 mac:str netdev:str
+pci-device acpi-index:uint32 addr:str busnr:other failover_pair_id:str multifunction:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-lnksta-dllla:bool
+pci-host-bridge bypass-iommu:bool x-config-reg-migration-enabled:bool
+pcie-root-port acpi-index:uint32 addr:str aer_log_max:uint16 bus-reserve:uint32 busnr:other chassis:uint8 failover_pair_id:str hotplug:bool io-reserve:size mem-reserve:size multifunction:bool port:uint8 power_controller_present:bool pref32-reserve:size pref64-reserve:size rombar:int32 romfile:str romsize:uint32 slot:uint16 sriov-pf:str x-do-not-expose-native-hotplug-cap:bool x-max-bounce-buffer-size:size x-pci-express-writeable-slt-bug:bool x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-lnksta-dllla:bool x-speed:other x-width:other
+pcnet bootindex:int32 mac:str netdev:str
+pic-common elcr_addr:uint32 elcr_mask:uint8 iobase:uint32 master:bool
+pit-common iobase:uint32
+pl011 chardev:str migrate-clk:bool
+pl011_luminary chardev:str migrate-clk:bool
+pl031
+pl061 pulldowns:uint8 pullups:uint8
+platform-bus-device mmio_size:uint32 num_irqs:uint32
+port92
+ps2-kbd
+ps2-mouse
+pvpanic events:uint8 ioport:uint16
+pvpanic-pci events:uint8
+q35-pcihost MCFG:uint64 above-4g-mem-size:size below-4g-mem-size:size mcfg_size:uint64 pci-hole-end:uint32 pci-hole-start:uint32 pci-hole64-end:uint64 pci-hole64-size:size pci-hole64-start:uint64 smm-ranges:bool x-pci-hole64-fix:bool
+ramfb use-legacy-x86-rom:bool x-migrate:bool
+riscv.aclint.mtimer aperture-size:uint32 hartid-base:uint32 num-harts:uint32 time-base:uint32 timebase-freq:uint32 timecmp-base:uint32
+riscv.aclint.swi hartid-base:uint32 num-harts:uint32 sswi:uint32
+riscv.aplic aperture-size:uint32 hartid-base:uint32 iprio-mask:uint32 mmode:bool msimode:bool num-harts:uint32 num-irqs:uint32
+riscv.imsic hartid:uint32 mmode:bool num-irqs:uint32 num-pages:uint32
+riscv.sifive.plic aperture-size:uint32 context-base:uint32 context-stride:uint32 enable-base:uint32 enable-stride:uint32 hart-config:str hartid-base:uint32 num-priorities:uint32 num-sources:uint32 pending-base:uint32 priority-base:uint32
+riscv.sifive.test
+rocker fp_start_macaddr:str name:str ports:other switch_id:uint64 world:str
+rtl8139 bootindex:int32 mac:str netdev:str
+sb16 audiodev:str dma:uint32 dma16:uint32 iobase:uint32 irq:uint32 version:uint32
+sbsa-ec
+sbsa-gwdt clock-frequency:uint64 wdat:bool
+scsi-cd quirk_mode_page_apple_vendor:bool quirk_mode_page_truncated:bool quirk_mode_sense_rom_use_dbd:bool
+scsi-device account-failed:OnOffAuto account-invalid:OnOffAuto backend_defaults:OnOffAuto bootindex:int32 channel:uint32 device_id:str discard_granularity:size drive:str logical_block_size:size lun:uint32 max_io_size:uint64 migrate-emulated-scsi-request:bool min_io_size:size opt_io_size:size physical_block_size:size port_index:uint16 port_wwn:uint64 product:str quirk_mode_page_vendor_specific_apple:bool rerror:other scsi-id:uint32 scsi_version:int32 serial:str share-rw:bool stats-intervals:other vendor:str ver:str werror:other write-cache:OnOffAuto wwn:uint64
+scsi-hd cyls:uint32 dpofua:bool heads:uint32 lcyls:uint32 lheads:uint32 lsecs:uint32 max_unmap_size:uint64 removable:bool rotation_rate:uint16 secs:uint32
+serial baudbase:uint32 chardev:str wakeup:bool
+serial-mm baudbase:uint32 chardev:str endianness:uint8 regshift:uint8 wakeup:bool
+smbus-eeprom address:uint8
+sysbus-ahci num-ports:uint32
+sysbus-xhci intrs:uint32 p2:uint32 p3:uint32 slots:uint32 streams:bool
+tulip bootindex:int32 mac:str netdev:str
+vhost-scsi migratable:bool seg_max_adjust:bool vhostfd:str worker_per_virtqueue:bool wwpn:str
+vhost-scsi-common boot_tpgt:uint32 bootindex:int32 t10_pi:bool
+vhost-scsi-pci disable-legacy:OnOffAuto disable-modern:bool
+vhost-scsi-pci-base boot_tpgt:uint32 bootindex:int32 cmd_per_lun:uint32 hotplug:bool max_sectors:uint32 migratable:bool num_queues:uint32 seg_max_adjust:bool t10_pi:bool vectors:uint32 vhostfd:str virtqueue_size:uint32 worker_per_virtqueue:bool wwpn:str
+vhost-scsi-pci-non-transitional
+vhost-scsi-pci-transitional
+vhost-user-base chardev:str
+vhost-user-blk bootindex:int32 chardev:str config-wce:bool discard:bool inflight-migration:bool num-queues:uint16 queue-size:uint32 seg-max-adjust:bool skip-get-vring-base-on-force-shutdown:bool write-zeroes:bool
+vhost-user-blk-pci disable-legacy:OnOffAuto disable-modern:bool
+vhost-user-blk-pci-base bootindex:int32 chardev:str class:uint32 config-wce:bool discard:bool inflight-migration:bool num-queues:uint16 queue-size:uint32 seg-max-adjust:bool skip-get-vring-base-on-force-shutdown:bool vectors:uint32 write-zeroes:bool
+vhost-user-blk-pci-non-transitional
+vhost-user-blk-pci-transitional
+vhost-user-fs-device bootindex:int32 chardev:str num-request-queues:uint16 queue-size:uint16 tag:str
+vhost-user-fs-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool bootindex:int32 busnr:other chardev:str event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool num-request-queues:uint16 packed:bool page-per-vq:bool queue-size:uint16 queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str tag:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+vhost-user-gpio-device
+vhost-user-gpio-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other chardev:str event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+vhost-user-gpu chardev:other
+vhost-user-gpu-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other chardev:other disable-legacy:OnOffAuto disable-modern:bool edid:bool event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool ioeventfd:bool iommu_platform:bool max_outputs:uint32 modern-pio-notify:bool multifunction:bool notify_on_empty:bool outputs:other packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool xres:uint32 yres:uint32
+vhost-user-i2c-device
+vhost-user-i2c-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other chardev:str event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+vhost-user-input
+vhost-user-input-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other chardev:str disable-legacy:OnOffAuto disable-modern:bool event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+vhost-user-rng
+vhost-user-rng-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other chardev:str event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+vhost-user-rtc
+vhost-user-rtc-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other chardev:str event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+vhost-user-scsi chardev:str param_change:bool
+vhost-user-scsi-pci disable-legacy:OnOffAuto disable-modern:bool
+vhost-user-scsi-pci-base boot_tpgt:uint32 bootindex:int32 chardev:str cmd_per_lun:uint32 hotplug:bool max_sectors:uint32 num_queues:uint32 param_change:bool t10_pi:bool vectors:uint32 virtqueue_size:uint32
+vhost-user-scsi-pci-non-transitional
+vhost-user-scsi-pci-transitional
+vhost-user-snd controls:bool
+vhost-user-snd-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other chardev:str controls:bool event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+vhost-user-spi-device
+vhost-user-spi-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other chardev:str event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+vhost-user-test-device config_size:uint32 num_vqs:uint32 virtio-id:uint16 vq_size:uint32
+vhost-user-test-device-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other chardev:str config_size:uint32 event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool num_vqs:uint32 packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool virtio-id:uint16 virtio-pci-bus-master-bug-migration:bool vq_size:uint32 x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+vhost-user-vga acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool big-endian-framebuffer:bool busnr:other chardev:other disable-legacy:OnOffAuto disable-modern:bool edid:bool event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool ioeventfd:bool iommu_platform:bool max_outputs:uint32 modern-pio-notify:bool multifunction:bool notify_on_empty:bool outputs:other packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool xres:uint32 yres:uint32
+vhost-user-vsock-device chardev:str
+vhost-user-vsock-pci disable-legacy:OnOffAuto disable-modern:bool
+vhost-user-vsock-pci-base chardev:str seqpacket:OnOffAuto vectors:uint32
+vhost-user-vsock-pci-non-transitional
+vhost-vdpa-device bootindex:int32 queue-size:uint16 vhostdev:str
+vhost-vdpa-device-pci disable-legacy:OnOffAuto disable-modern:bool
+vhost-vdpa-device-pci-base bootindex:int32 queue-size:uint16 vhostdev:str
+vhost-vdpa-device-pci-non-transitional
+vhost-vdpa-device-pci-transitional
+vhost-vsock-common seqpacket:OnOffAuto
+vhost-vsock-device guest-cid:uint64 vhostfd:str
+vhost-vsock-pci disable-legacy:OnOffAuto disable-modern:bool
+vhost-vsock-pci-base guest-cid:uint64 seqpacket:OnOffAuto vectors:uint32 vhostfd:str
+vhost-vsock-pci-non-transitional
+virtconsole chardev:str name:str nr:uint32
+virtio-9p-device fsdev:str mount_tag:str
+virtio-9p-pci disable-legacy:OnOffAuto disable-modern:bool
+virtio-9p-pci-base fsdev:str ioeventfd:bool mount_tag:str vectors:uint32
+virtio-9p-pci-non-transitional
+virtio-9p-pci-transitional
+virtio-balloon-device deflate-on-oom:bool free-page-hint:bool free-page-reporting:bool guest-stats:other guest-stats-polling-interval:other page-poison:bool
+virtio-balloon-pci disable-legacy:OnOffAuto disable-modern:bool
+virtio-balloon-pci-base deflate-on-oom:bool free-page-hint:bool free-page-reporting:bool guest-stats:other guest-stats-polling-interval:other ioeventfd:bool page-poison:bool vectors:uint32
+virtio-balloon-pci-non-transitional
+virtio-balloon-pci-transitional
+virtio-blk-device account-failed:OnOffAuto account-invalid:OnOffAuto backend_defaults:OnOffAuto bootindex:int32 config-wce:bool cyls:uint32 discard:bool discard_granularity:size drive:str heads:uint32 iothread-vq-mapping:other lcyls:uint32 lheads:uint32 logical_block_size:size lsecs:uint32 max-discard-sectors:uint32 max-write-zeroes-sectors:uint32 min_io_size:size num-queues:uint16 opt_io_size:size physical_block_size:size queue-size:uint16 report-discard-granularity:bool request-merging:bool rerror:other secs:uint32 seg-max-adjust:bool serial:str share-rw:bool stats-intervals:other werror:other write-cache:OnOffAuto write-zeroes:bool x-enable-wce-if-config-wce:bool
+virtio-blk-pci disable-legacy:OnOffAuto disable-modern:bool
+virtio-blk-pci-base account-failed:OnOffAuto account-invalid:OnOffAuto backend_defaults:OnOffAuto bootindex:int32 class:uint32 config-wce:bool cyls:uint32 discard:bool discard_granularity:size drive:str heads:uint32 ioeventfd:bool iothread-vq-mapping:other lcyls:uint32 lheads:uint32 logical_block_size:size lsecs:uint32 max-discard-sectors:uint32 max-write-zeroes-sectors:uint32 min_io_size:size num-queues:uint16 opt_io_size:size physical_block_size:size queue-size:uint16 report-discard-granularity:bool request-merging:bool rerror:other secs:uint32 seg-max-adjust:bool serial:str share-rw:bool stats-intervals:other vectors:uint32 werror:other write-cache:OnOffAuto write-zeroes:bool x-enable-wce-if-config-wce:bool
+virtio-blk-pci-non-transitional
+virtio-blk-pci-transitional
+virtio-crypto-device
+virtio-crypto-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other disable-legacy:OnOffAuto disable-modern:bool event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool ioeventfd:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+virtio-device any_layout:bool event_idx:bool in_order:bool indirect_desc:bool iommu_platform:bool notify_on_empty:bool packed:bool queue_reset:bool use-disabled-flag:bool use-started:bool x-disable-legacy-check:bool
+virtio-gpu-base edid:bool max_outputs:uint32 outputs:other xres:uint32 yres:uint32
+virtio-gpu-device blob:bool hostmem:size max_hostmem:size x-scanout-vmstate-version:uint8
+virtio-gpu-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool blob:bool busnr:other disable-legacy:OnOffAuto disable-modern:bool edid:bool event_idx:bool failover_pair_id:str hostmem:size in_order:bool indirect_desc:bool ioeventfd:bool iommu_platform:bool max_hostmem:size max_outputs:uint32 modern-pio-notify:bool multifunction:bool notify_on_empty:bool outputs:other packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool x-scanout-vmstate-version:uint8 xres:uint32 yres:uint32
+virtio-gpu-pci-base disable-legacy:OnOffAuto disable-modern:bool edid:bool ioeventfd:bool max_outputs:uint32 outputs:other vectors:uint32 xres:uint32 yres:uint32
+virtio-input-device serial:str
+virtio-input-hid-device display:str head:uint32
+virtio-input-hid-pci display:str head:uint32 serial:str
+virtio-input-host-device evdev:str
+virtio-input-host-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other disable-legacy:OnOffAuto disable-modern:bool evdev:str event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 serial:str sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+virtio-input-pci disable-legacy:OnOffAuto disable-modern:bool vectors:uint32
+virtio-iommu-device aw-bits:uint8 boot-bypass:bool granule:other
+virtio-iommu-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool aw-bits:uint8 boot-bypass:bool busnr:other class:uint32 disable-legacy:OnOffAuto disable-modern:bool event_idx:bool failover_pair_id:str granule:other in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool reserved-regions:other rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+virtio-keyboard-device
+virtio-keyboard-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other disable-legacy:OnOffAuto disable-modern:bool display:str event_idx:bool failover_pair_id:str head:uint32 in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 serial:str sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+virtio-mmio force-legacy:bool ioeventfd:bool x-override-queue-size:uint16
+virtio-mouse-device
+virtio-mouse-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other disable-legacy:OnOffAuto disable-modern:bool display:str event_idx:bool failover_pair_id:str head:uint32 in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 serial:str sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+virtio-multitouch-device
+virtio-multitouch-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other disable-legacy:OnOffAuto disable-modern:bool display:str event_idx:bool failover_pair_id:str head:uint32 in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 serial:str sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+virtio-net-device bootindex:int32 csum:bool ctrl_guest_offloads:bool ctrl_mac_addr:bool ctrl_rx:bool ctrl_rx_extra:bool ctrl_vlan:bool ctrl_vq:bool duplex:str ebpf-rss-fds:other failover:bool gso:bool guest_announce:bool guest_csum:bool guest_ecn:bool guest_rsc_ext:bool guest_tso4:bool guest_tso6:bool guest_tunnel:bool guest_tunnel_csum:bool guest_ufo:bool guest_uso4:bool guest_uso6:bool hash:bool hash-ipv4:OnOffAuto hash-ipv6:OnOffAuto hash-ipv6ex:OnOffAuto hash-tcp4:OnOffAuto hash-tcp6:OnOffAuto hash-tcp6ex:OnOffAuto hash-udp4:OnOffAuto hash-udp6:OnOffAuto hash-udp6ex:OnOffAuto host_ecn:bool host_mtu:uint16 host_tso4:bool host_tso6:bool host_tunnel:bool host_tunnel_csum:bool host_ufo:bool host_uso:bool mac:str mq:bool mrg_rxbuf:bool netdev:str rsc_interval:uint32 rss:bool rx_queue_size:uint16 speed:int32 status:bool tx:str tx_queue_size:uint16 x-txburst:int32 x-txtimer:uint32
+virtio-net-pci disable-legacy:OnOffAuto disable-modern:bool
+virtio-net-pci-base bootindex:int32 csum:bool ctrl_guest_offloads:bool ctrl_mac_addr:bool ctrl_rx:bool ctrl_rx_extra:bool ctrl_vlan:bool ctrl_vq:bool duplex:str ebpf-rss-fds:other failover:bool gso:bool guest_announce:bool guest_csum:bool guest_ecn:bool guest_rsc_ext:bool guest_tso4:bool guest_tso6:bool guest_tunnel:bool guest_tunnel_csum:bool guest_ufo:bool guest_uso4:bool guest_uso6:bool hash:bool hash-ipv4:OnOffAuto hash-ipv6:OnOffAuto hash-ipv6ex:OnOffAuto hash-tcp4:OnOffAuto hash-tcp6:OnOffAuto hash-tcp6ex:OnOffAuto hash-udp4:OnOffAuto hash-udp6:OnOffAuto hash-udp6ex:OnOffAuto host_ecn:bool host_mtu:uint16 host_tso4:bool host_tso6:bool host_tunnel:bool host_tunnel_csum:bool host_ufo:bool host_uso:bool ioeventfd:bool mac:str mq:bool mrg_rxbuf:bool netdev:str rsc_interval:uint32 rss:bool rx_queue_size:uint16 speed:int32 status:bool tx:str tx_queue_size:uint16 vectors:uint32 x-txburst:int32 x-txtimer:uint32
+virtio-net-pci-non-transitional
+virtio-net-pci-transitional
+virtio-pci aer:bool any_layout:bool ats:bool event_idx:bool in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool use-disabled-flag:bool use-started:bool virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-pcie-flr-init:bool x-pcie-pm-no-soft-reset:bool
+virtio-pmem memaddr:uint64
+virtio-pmem-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other disable-legacy:OnOffAuto disable-modern:bool event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool memaddr:uint64 modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+virtio-rng-device max-bytes:uint64 period:uint32
+virtio-rng-pci disable-legacy:OnOffAuto disable-modern:bool
+virtio-rng-pci-base ioeventfd:bool max-bytes:uint64 period:uint32 vectors:uint32
+virtio-rng-pci-non-transitional
+virtio-rng-pci-transitional
+virtio-rtc-device
+virtio-rtc-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+virtio-scsi-common cmd_per_lun:uint32 hotplug:bool max_sectors:uint32 num_queues:uint32 virtqueue_size:uint32
+virtio-scsi-device iothread-vq-mapping:other param_change:bool seg_max_adjust:bool
+virtio-scsi-pci disable-legacy:OnOffAuto disable-modern:bool
+virtio-scsi-pci-base cmd_per_lun:uint32 hotplug:bool ioeventfd:bool iothread-vq-mapping:other max_sectors:uint32 num_queues:uint32 param_change:bool seg_max_adjust:bool vectors:uint32 virtqueue_size:uint32
+virtio-scsi-pci-non-transitional
+virtio-scsi-pci-transitional
+virtio-serial-device max_ports:uint32
+virtio-serial-pci disable-legacy:OnOffAuto disable-modern:bool
+virtio-serial-pci-base class:uint32 ioeventfd:bool max_ports:uint32 vectors:uint32
+virtio-serial-pci-non-transitional
+virtio-serial-pci-transitional
+virtio-sound-device audiodev:str chmaps:uint32 jacks:uint32 streams:uint32
+virtio-sound-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool audiodev:str busnr:other chmaps:uint32 disable-legacy:OnOffAuto disable-modern:bool event_idx:bool failover_pair_id:str in_order:bool indirect_desc:bool ioeventfd:bool iommu_platform:bool jacks:uint32 modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str streams:uint32 use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+virtio-tablet-device
+virtio-tablet-pci acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool busnr:other disable-legacy:OnOffAuto disable-modern:bool display:str event_idx:bool failover_pair_id:str head:uint32 in_order:bool indirect_desc:bool iommu_platform:bool modern-pio-notify:bool multifunction:bool notify_on_empty:bool packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 serial:str sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool
+virtio-vga acpi-index:uint32 addr:str aer:bool any_layout:bool ats:bool big-endian-framebuffer:bool blob:bool busnr:other disable-legacy:OnOffAuto disable-modern:bool edid:bool event_idx:bool failover_pair_id:str hostmem:size in_order:bool indirect_desc:bool ioeventfd:bool iommu_platform:bool max_hostmem:size max_outputs:uint32 modern-pio-notify:bool multifunction:bool notify_on_empty:bool outputs:other packed:bool page-per-vq:bool queue_reset:bool rombar:int32 romfile:str romsize:uint32 sriov-pf:str use-disabled-flag:bool use-started:bool vectors:uint32 virtio-pci-bus-master-bug-migration:bool x-ats-page-aligned:bool x-disable-legacy-check:bool x-max-bounce-buffer-size:size x-pcie-ari-nextfn-1:bool x-pcie-err-unc-mask:bool x-pcie-ext-tag:bool x-pcie-flr-init:bool x-pcie-lnksta-dllla:bool x-pcie-pm-no-soft-reset:bool x-scanout-vmstate-version:uint8 xres:uint32 yres:uint32
+virtio-vga-base big-endian-framebuffer:bool disable-legacy:OnOffAuto disable-modern:bool edid:bool ioeventfd:bool max_outputs:uint32 outputs:other vectors:uint32 xres:uint32 yres:uint32
+vmmouse
+vmport vmware-vmx-type:uint8 vmware-vmx-version:uint32 x-cmds-v2:bool x-read-set-eax:bool x-report-vmx-type:bool x-signal-unsupported-cmd:bool
+vmxnet3 bootindex:int32 mac:str netdev:str
