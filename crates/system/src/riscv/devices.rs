@@ -32,7 +32,7 @@ use ruvm_machine_x86::VirtioHandle;
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
 
 use super::{parse_loader, prop_bool};
-use crate::drives::{Plugged, device_image, resize_cb};
+use crate::drives::{DriveDev, Plugged, device_image, peripheral_path, resize_cb};
 use crate::net::Network;
 use crate::x86::{
     Drive, DriveIf, KeepRam, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive, parse_mac,
@@ -101,6 +101,8 @@ pub(crate) struct Plug {
     /// virtio-net `mac`.
     mac: Option<[u8; 6]>,
     props: VirtioPciProps,
+    /// Where `qdev_set_id()` put the device in the QOM tree.
+    path: String,
     loc: Option<Location>,
 }
 
@@ -174,6 +176,7 @@ fn plan_virtio(
         netdev: None,
         mac: None,
         props: VirtioPciProps::default(),
+        path: String::new(),
         loc: loc.clone(),
     };
     let pci = transport == Transport::Pci;
@@ -286,7 +289,9 @@ pub(crate) fn plan(
     for d in drives.iter().filter(|d| d.iface == DriveIf::Virtio) {
         queue.push((format!("virtio-blk,drive={}", d.id), d.loc.clone()));
     }
+    let mut anon = 0;
     for (arg, loc) in &queue {
+        let path = peripheral_path(arg, &mut anon);
         let plan = |arg: &str, trial: bool| {
             if trial {
                 plan_device(drives, &mut used.clone(), arg, loc)
@@ -297,7 +302,7 @@ pub(crate) fn plan(
         let planned = crate::global::plan_device(arg, loc, plan, |_, e| Err(e));
         match planned.map_err(|e| vec![e])? {
             Planned::Loader(loader) => p.loaders.push(loader),
-            Planned::Virtio(plug) => p.virtio.push(plug),
+            Planned::Virtio(plug) => p.virtio.push(Plug { path, ..plug }),
         }
     }
 
@@ -362,7 +367,16 @@ pub(crate) fn plug(
                 let readonly = graph.backend(&d.id).is_some_and(|b| b.is_read_only());
                 let backend = device_image(graph, d, readonly, true)
                     .map_err(|e| Located(plug.loc.clone(), e))?;
-                image = Some(drive);
+                // blk_get_attached_dev_id(): the id of a virtio-blk-device if it has one.
+                // virtio-blk-pci holds a virtio-blk without an id.
+                let qdev = match plug.transport {
+                    Transport::Pci => format!("{}/virtio-backend", plug.path),
+                    Transport::Mmio => {
+                        let id = plug.path.strip_prefix("/machine/peripheral/");
+                        id.unwrap_or(&plug.path).to_string()
+                    }
+                };
+                image = Some((drive, qdev));
                 // virtio_blk_pci_realize() turns the automatic num-queues into one queue per
                 // vCPU. virtio-blk-device keeps one.
                 let num_queues = match plug.transport {
@@ -410,8 +424,9 @@ pub(crate) fn plug(
                 board.virtio_transport(n).map(VirtioHandle::Mmio)
             }
         };
-        if let Some(drive) = image {
-            plugged.push(Plugged { drive, resize_cb: resize_cb(handle.as_ref()) });
+        if let Some((drive, qdev)) = image {
+            let resize_cb = Some(resize_cb(handle.as_ref()));
+            plugged.push(Plugged { drive, dev: DriveDev::disk(qdev), resize_cb });
         }
         if let (Some(nic), Some(handle)) = (nic, handle) {
             nic.connect(handle);

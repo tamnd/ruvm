@@ -44,7 +44,7 @@ use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
 use ruvm_qapi::visit::{Visitor, VisitorExt};
 
 use super::{ArmBoard, prop_bool};
-use crate::drives::{Plugged, device_image, resize_cb};
+use crate::drives::{DriveDev, Plugged, device_image, peripheral_path, resize_cb};
 use crate::net::Network;
 use crate::x86::{
     Drive, DriveIf, KeepRam, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive, parse_mac,
@@ -125,6 +125,8 @@ pub(crate) struct Plug {
     /// virtio-net `mac`.
     mac: Option<[u8; 6]>,
     props: VirtioPciProps,
+    /// Where `qdev_set_id()` put the device in the QOM tree.
+    path: String,
     loc: Option<Location>,
 }
 
@@ -216,6 +218,7 @@ fn plan_virtio(
         netdev: None,
         mac: None,
         props: VirtioPciProps::default(),
+        path: String::new(),
         loc: loc.clone(),
     };
     let pci = transport == Transport::Pci;
@@ -398,6 +401,7 @@ fn plan_smmuv3(board: ArmBoard, opts: &QemuOpts, loc: &Option<Location>) -> Resu
         netdev: None,
         mac: None,
         props: VirtioPciProps::default(),
+        path: String::new(),
         loc: loc.clone(),
     })
 }
@@ -467,7 +471,9 @@ pub(crate) fn plan(
     for d in drives.iter().filter(|d| d.iface == DriveIf::Virtio) {
         queue.push((format!("virtio-blk,drive={}", d.id), d.loc.clone()));
     }
+    let mut anon = 0;
     for (arg, loc) in &queue {
+        let path = peripheral_path(arg, &mut anon);
         let plan = |arg: &str, trial: bool| {
             if trial {
                 plan_device(board, drives, &mut used.clone(), arg, loc)
@@ -478,7 +484,7 @@ pub(crate) fn plan(
         let planned = crate::global::plan_device(arg, loc, plan, |_, e| Err(e));
         match planned.map_err(|e| vec![e])? {
             Planned::Display(plug) => p.display.push((p.virtio.len(), plug)),
-            Planned::Virtio(plug) => p.virtio.push(plug),
+            Planned::Virtio(plug) => p.virtio.push(Plug { path, ..plug }),
         }
     }
 
@@ -579,7 +585,16 @@ pub(crate) fn plug(
                 let readonly = graph.backend(&d.id).is_some_and(|b| b.is_read_only());
                 let backend = device_image(graph, d, readonly, true)
                     .map_err(|e| Located(plug.loc.clone(), e))?;
-                image = Some(drive);
+                // blk_get_attached_dev_id(): the id of a virtio-blk-device if it has one.
+                // virtio-blk-pci holds a virtio-blk without an id.
+                let qdev = match plug.transport {
+                    Transport::Pci => format!("{}/virtio-backend", plug.path),
+                    Transport::Mmio => {
+                        let id = plug.path.strip_prefix("/machine/peripheral/");
+                        id.unwrap_or(&plug.path).to_string()
+                    }
+                };
+                image = Some((drive, qdev));
                 // virtio_blk_pci_realize() turns the automatic num-queues into one queue per
                 // vCPU. virtio-blk-device keeps one.
                 let num_queues = match plug.transport {
@@ -665,8 +680,9 @@ pub(crate) fn plug(
                 )));
             }
         };
-        if let Some(drive) = image {
-            plugged.push(Plugged { drive, resize_cb: resize_cb(handle.as_ref()) });
+        if let Some((drive, qdev)) = image {
+            let resize_cb = Some(resize_cb(handle.as_ref()));
+            plugged.push(Plugged { drive, dev: DriveDev::disk(qdev), resize_cb });
         }
         if let (Some(nic), Some(handle)) = (nic, handle) {
             nic.connect(handle);
@@ -679,13 +695,14 @@ pub(crate) fn plug(
 }
 
 /// `ahci_ide_create_devs()` for the planned IDE drives of sbsa-ref: an `ide-cd` or `ide-hd`
-/// on each AHCI port with a drive.
+/// on each AHCI port with a drive. Gives the drives it put on them.
 pub(crate) fn plug_ahci(
     graph: &BlockGraph,
     board: &SbsaRefMachine,
     ide: &[(usize, usize)],
     drives: &[Drive],
-) -> Result<(), Located> {
+) -> Result<Vec<Plugged>, Located> {
+    let mut plugged = Vec::new();
     for &(port, i) in ide {
         let d = &drives[i];
         // ide_dev_initfn()
@@ -703,8 +720,18 @@ pub(crate) fn plug_ahci(
         }
         let config = if d.cdrom { DriveConfig::cdrom() } else { DriveConfig::hd() };
         board.attach_drive(port, config, blk).map_err(|e| Located::new(&d.loc, e))?;
+        // The IDE devices come after the CPUs and the ten devices sbsa-ref makes before the
+        // AHCI controller in /machine/unattached, in the order of their ports.
+        let before = ide.iter().filter(|(p, _)| *p < port).count();
+        let qdev = format!("/machine/unattached/device[{}]", board.smp() + 10 + before);
+        let dev = if d.cdrom {
+            DriveDev { qdev, removable: true, iostatus: true }
+        } else {
+            DriveDev::disk(qdev)
+        };
+        plugged.push(Plugged { drive: i, dev, resize_cb: None });
     }
-    Ok(())
+    Ok(plugged)
 }
 
 #[cfg(test)]
@@ -973,7 +1000,7 @@ mod tests {
         let board = SbsaRefMachine::new(Default::default()).unwrap();
         let d = parse_drives(S, &[dev("if=ide")]).unwrap();
         let p = plan(S, &d, &[]).unwrap();
-        let e = plug_ahci(&BlockGraph::new(), &board, &p.ide, &d).unwrap_err();
+        let e = plug_ahci(&BlockGraph::new(), &board, &p.ide, &d).map(drop).unwrap_err();
         assert_eq!(e.1.message(), "Device needs media, but drive is empty");
         let d = parse_drives(S, &[dev("if=ide,media=cdrom")]).unwrap();
         let p = plan(S, &d, &[]).unwrap();
