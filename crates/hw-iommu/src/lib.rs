@@ -17,7 +17,7 @@ pub use intel_iommu::{
     TYPE_INTEL_IOMMU_MEMORY_REGION,
 };
 pub use smmu_common::Stage as SmmuStage;
-pub use smmuv3::{SMMU_NUM_IRQS, SMMU_SIZE, SmmuV3};
+pub use smmuv3::{SMMU_NUM_IRQS, SMMU_SIZE, SmmuV3, SmmuV3Props};
 pub use virtio_iommu::{
     GranuleMode, ReservedRegion, TYPE_VIRTIO_IOMMU, TYPE_VIRTIO_IOMMU_PCI, Viommu, VirtioIommu,
     VirtioIommuConf,

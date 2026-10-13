@@ -66,7 +66,7 @@ fn base() -> ArmVirtAcpi {
         spcr: true,
         pci_devices: vec![pci(0), pci(8)],
         numa: Vec::new(),
-        smmu: None,
+        smmus: Vec::new(),
         viot: None,
     }
 }
@@ -321,12 +321,28 @@ fn madt_gicv2_with_v2m() {
 fn iort_smmuv3_legacy() {
     let mut m = base();
     m.memmap.gic_its = None;
-    m.smmu = Some(IortSmmu {
+    m.smmus = vec![IortSmmu {
+        id: 0,
         base: 0x0905_0000,
         gsi: 74 + 32,
         rc_id_maps: vec![(0, 0x200), (0x1000, 0x100)],
-    });
+    }];
     check(&m, "IORT", "IORT.smmuv3-legacy");
+}
+
+/// The `smmuv3-dev` test: three host bridges as in `smmuv3-legacy`, a `-device arm-smmuv3`
+/// on the root bus (buses 0 and 1) and one on the pxb-pcie at bus 0x10, each on the platform
+/// bus with its four interrupts. The expected table has no ITS, so the identifiers start at
+/// 0 and the root complex has only the two ranges that go to the SMMUs.
+#[test]
+fn iort_smmuv3_dev() {
+    let mut m = base();
+    m.memmap.gic_its = None;
+    m.smmus = vec![
+        IortSmmu { id: 0, base: 0x0c00_0000, gsi: 112 + 32, rc_id_maps: vec![(0, 0x200)] },
+        IortSmmu { id: 1, base: 0x0c02_0000, gsi: 116 + 32, rc_id_maps: vec![(0x1000, 0x100)] },
+    ];
+    check(&m, "IORT", "IORT.smmuv3-dev");
 }
 
 /// `iommu=smmuv3` with the ITS: the SMMU maps its IDs to the ITS group, and the root complex
@@ -334,7 +350,7 @@ fn iort_smmuv3_legacy() {
 #[test]
 fn iort_smmuv3_with_its() {
     let mut m = base();
-    m.smmu = Some(IortSmmu { base: 0x0905_0000, gsi: 106, rc_id_maps: vec![(0, 0x100)] });
+    m.smmus = vec![IortSmmu { id: 0, base: 0x0905_0000, gsi: 106, rc_id_maps: vec![(0, 0x100)] }];
     let iort = common::table(&load(&arm_virt::build(&m)), "IORT");
     let r = |o: usize| u32::from_le_bytes(iort[o..o + 4].try_into().unwrap());
     assert_eq!(iort.len(), 48 + 24 + 88 + 36 + 2 * 20);

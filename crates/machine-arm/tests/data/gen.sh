@@ -68,6 +68,10 @@ dump_its virt-a57-viommu -cpu cortex-a57,pmu=off -device virtio-iommu-pci
 dump_its virt-a57-viommu-bypass -cpu cortex-a57,pmu=off -M default-bus-bypass-iommu=on \
     -device virtio-iommu-pci
 
+# A -device arm-smmuv3 on the root bus: its node at the start of the platform bus and the
+# iommu-map of the PCIe node.
+dump_its virt-a57-smmuv3-dev -cpu cortex-a57,pmu=off -device arm-smmuv3,primary-bus=pcie.0
+
 # gic-version=2: the cortex-a15-gic node, the GICv2m frame under it with msi=auto and the CPU
 # mask in the PPI flags.
 dump_v2() {
