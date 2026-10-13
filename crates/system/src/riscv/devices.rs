@@ -22,8 +22,8 @@ use ruvm_base::report::Location;
 use ruvm_hw_virtio::mmio::VIRTIO_MMIO_FORCE_LEGACY_DEFAULT;
 use ruvm_hw_virtio::pci::virtio_pci_optimal_num_queues;
 use ruvm_hw_virtio::{
-    RandomFile, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass, VirtioPciProps,
-    VirtioRng, VirtioRngConf,
+    RandomFile, VirtioBalloon, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass,
+    VirtioPciProps, VirtioRng, VirtioRngConf,
 };
 use ruvm_machine_arm::pflash::PflashBacking;
 use ruvm_machine_riscv::virt::{GenericLoader, VirtMachine};
@@ -33,7 +33,8 @@ use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
 use super::{parse_loader, prop_bool};
 use crate::drives::{Plugged, mmio_resize_cb, pci_resize_cb};
 use crate::x86::{
-    Drive, DriveIf, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive, probe_warning,
+    Drive, DriveIf, KeepRam, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive,
+    probe_warning,
 };
 
 /// The virtio device models virt can plug.
@@ -42,6 +43,7 @@ enum Model {
     Blk,
     Rng,
     Serial,
+    Balloon,
 }
 
 /// The device types, with the bus they plug into.
@@ -52,6 +54,8 @@ const DEVICE_TYPES: &[(&str, Model, Transport)] = &[
     ("virtio-rng-pci", Model::Rng, Transport::Pci),
     ("virtio-serial-device", Model::Serial, Transport::Mmio),
     ("virtio-serial-pci", Model::Serial, Transport::Pci),
+    ("virtio-balloon-device", Model::Balloon, Transport::Mmio),
+    ("virtio-balloon-pci", Model::Balloon, Transport::Pci),
 ];
 
 /// `qdev_alias_table[]` for RISC-V, where the default virtio transport is PCI.
@@ -349,6 +353,7 @@ pub(crate) fn plug(
                 Box::new(VirtioRng::new(Box::<RandomFile>::default(), VirtioRngConf::default()))
             }
             Model::Serial => Box::new(VirtioConsole::new(None)),
+            Model::Balloon => Box::new(VirtioBalloon::new(board.ram_size(), Box::new(KeepRam))),
         };
         let resize_cb = match (plug.transport, plug.mmio_bus) {
             (Transport::Pci, _) => {
@@ -407,6 +412,9 @@ mod tests {
         assert_eq!(p.virtio[0].transport, Transport::Pci);
         let p = plan(&[], &[dev("virtio-rng-device,bus=virtio-mmio-bus.2")]).unwrap();
         assert_eq!(p.virtio[0].mmio_bus, Some(2));
+        let p = plan(&[], &[dev("virtio-balloon"), dev("virtio-balloon-device")]).unwrap();
+        assert_eq!(p.virtio[0].typename, "virtio-balloon-pci");
+        assert_eq!(p.virtio[1].transport, Transport::Mmio);
         let p =
             plan(&[], &[dev("virtio-serial-pci,disable-legacy=on,vectors=0,addr=1f.7")]).unwrap();
         assert_eq!(p.virtio[0].props.disable_legacy, Some(true));

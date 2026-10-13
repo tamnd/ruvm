@@ -29,8 +29,8 @@ use ruvm_hw_storage::{BlockBackend, DriveConfig};
 use ruvm_hw_virtio::mmio::VIRTIO_MMIO_FORCE_LEGACY_DEFAULT;
 use ruvm_hw_virtio::pci::virtio_pci_optimal_num_queues;
 use ruvm_hw_virtio::{
-    RandomFile, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass, VirtioPciProps,
-    VirtioRng, VirtioRngConf,
+    RandomFile, VirtioBalloon, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass,
+    VirtioPciProps, VirtioRng, VirtioRngConf,
 };
 use ruvm_machine_arm::pflash::PflashBacking;
 use ruvm_machine_arm::sbsa_ref::{NUM_SATA_PORTS, SbsaRefMachine};
@@ -41,7 +41,8 @@ use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
 use super::{ArmBoard, prop_bool};
 use crate::drives::{Plugged, mmio_resize_cb, pci_resize_cb};
 use crate::x86::{
-    Drive, DriveIf, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive, probe_warning,
+    Drive, DriveIf, KeepRam, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive,
+    probe_warning,
 };
 
 /// The virtio device models virt can plug.
@@ -51,6 +52,7 @@ enum Model {
     Rng,
     Serial,
     Iommu,
+    Balloon,
 }
 
 /// The device types, with the bus they plug into.
@@ -63,6 +65,8 @@ const DEVICE_TYPES: &[(&str, Model, Transport)] = &[
     ("virtio-serial-pci", Model::Serial, Transport::Pci),
     ("virtio-iommu-device", Model::Iommu, Transport::Mmio),
     ("virtio-iommu-pci", Model::Iommu, Transport::Pci),
+    ("virtio-balloon-device", Model::Balloon, Transport::Mmio),
+    ("virtio-balloon-pci", Model::Balloon, Transport::Pci),
 ];
 
 /// `qdev_alias_table[]` for Arm, where the default virtio transport is PCI.
@@ -396,6 +400,13 @@ impl Target<'_> {
             Target::SbsaRef(b) => b.smp(),
         }
     }
+
+    fn ram_size(self) -> u64 {
+        match self {
+            Target::Virt(b) => b.ram_size(),
+            Target::SbsaRef(b) => b.ram_size(),
+        }
+    }
 }
 
 /// The error for a display device on sbsa-ref, whose display devices ruvm does not build yet.
@@ -466,6 +477,7 @@ pub(crate) fn plug(
                 }
                 continue;
             }
+            Model::Balloon => Box::new(VirtioBalloon::new(board.ram_size(), Box::new(KeepRam))),
         };
         let (devfn, iommu) = (plug.devfn, plug.iommu_platform);
         let resize_cb = match (board, plug.transport, plug.mmio_bus) {
@@ -558,6 +570,9 @@ mod tests {
         let p = plan(V, &[], &[dev("virtio-rng")]).unwrap();
         assert_eq!(p.virtio[0].typename, "virtio-rng-pci");
         assert_eq!(p.virtio[0].transport, Transport::Pci);
+        let p = plan(V, &[], &[dev("virtio-balloon"), dev("virtio-balloon-device")]).unwrap();
+        assert_eq!(p.virtio[0].typename, "virtio-balloon-pci");
+        assert_eq!(p.virtio[1].transport, Transport::Mmio);
         let p = plan(V, &[], &[dev("virtio-rng-device,bus=virtio-mmio-bus.2")]).unwrap();
         assert_eq!(p.virtio[0].mmio_bus, Some(2));
         let p = plan(V, &[], &[dev("virtio-serial-pci,disable-legacy=on,vectors=0,addr=1f.7")])

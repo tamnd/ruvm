@@ -6,8 +6,8 @@
 //! qos-test, bios-tables-test and cdrom-test decide what to run from
 //! `qom-list-types implements=device`, and a qos-test case that fails stops the whole test.
 //! So a device is listed here only once its qos-test cases pass under the qtest accelerator.
-//! virtio-rng was the first, then virtio-blk. The types carry no properties yet: the boards
-//! build their devices from the `-device` options, not from these types.
+//! virtio-rng was the first, then virtio-blk and virtio-balloon. The types carry no properties
+//! yet: the boards build their devices from the `-device` options, not from these types.
 
 use ruvm_qom::{Registry, TYPE_OBJECT, TypeInfo};
 
@@ -34,6 +34,9 @@ const TYPES: &[(&str, &str, bool)] = &[
     ("virtio-blk-device", TYPE_VIRTIO_DEVICE, false),
     ("virtio-blk-pci-base", TYPE_VIRTIO_PCI, true),
     ("virtio-blk-pci", "virtio-blk-pci-base", false),
+    ("virtio-balloon-device", TYPE_VIRTIO_DEVICE, false),
+    ("virtio-balloon-pci-base", TYPE_VIRTIO_PCI, true),
+    ("virtio-balloon-pci", "virtio-balloon-pci-base", false),
     ("virtio-rng-device", TYPE_VIRTIO_DEVICE, false),
     ("virtio-rng-pci-base", TYPE_VIRTIO_PCI, true),
     ("virtio-rng-pci", "virtio-rng-pci-base", false),
@@ -70,6 +73,8 @@ mod tests {
         assert_eq!(
             names(&registry, "device", false),
             [
+                "virtio-balloon-device",
+                "virtio-balloon-pci",
                 "virtio-blk-device",
                 "virtio-blk-pci",
                 "virtio-mmio",
@@ -81,6 +86,8 @@ mod tests {
             names(&registry, "pci-device", true),
             [
                 "pci-device",
+                "virtio-balloon-pci",
+                "virtio-balloon-pci-base",
                 "virtio-blk-pci",
                 "virtio-blk-pci-base",
                 "virtio-pci",

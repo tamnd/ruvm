@@ -1808,7 +1808,7 @@ fn open_drive(d: &Drive) -> std::result::Result<FileBackend, String> {
 
 /// A balloon that leaves the RAM it is given alone.
 #[derive(Debug)]
-struct KeepRam;
+pub(crate) struct KeepRam;
 
 impl BalloonBackend for KeepRam {
     fn discard(&mut self, _gpa: u64, _len: u64) {}
