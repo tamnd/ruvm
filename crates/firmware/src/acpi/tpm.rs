@@ -157,6 +157,23 @@ pub fn crb_aml(scope: &mut Aml, tpm: &TpmInfo) {
     scope.append(&dev);
 }
 
+/// `acpi_dsdt_add_tpm()` of Arm virt: the tpm-tis-device on the platform bus, its registers
+/// at `base` and its PPI memory, when it has the `ppi` property on, at `ppi_base`.
+pub fn tis_sysbus_aml(scope: &mut Aml, base: u64, ppi_base: Option<u64>) {
+    let mut dev = aml::device("TPM0");
+    dev.append(&aml::name_decl("_HID", &aml::string("MSFT0101")));
+    dev.append(&aml::name_decl("_STR", &aml::string("TPM 2.0 Device")));
+    dev.append(&aml::name_decl("_UID", &aml::int(1)));
+    dev.append(&aml::name_decl("_STA", &aml::int(0xf)));
+    let mut crs = aml::resource_template();
+    crs.append(&aml::memory32_fixed(base as u32, TIS_ADDR_SIZE as u32, ReadWrite::ReadWrite));
+    dev.append(&aml::name_decl("_CRS", &crs));
+    if let Some(ppi_base) = ppi_base {
+        build_ppi_acpi(&mut dev, ppi_base);
+    }
+    scope.append(&dev);
+}
+
 /// `tpm_build_ppi_acpi()`: the PPI registers in the PPI memory and the `_DSM` for the
 /// Physical Presence Interface 1.3 and the TCG Platform Reset Attack Mitigation.
 pub fn build_ppi_acpi(dev: &mut Aml, ppi_base: u64) {

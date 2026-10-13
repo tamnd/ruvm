@@ -58,6 +58,8 @@ enum Model {
     Net,
     /// `arm-smmuv3`, a dynamic sysbus device.
     Smmu,
+    /// `tpm-tis-device`, a dynamic sysbus device.
+    Tpm,
 }
 
 /// The device types, with the bus they plug into.
@@ -117,6 +119,8 @@ pub(crate) struct Plug {
     iommu: Option<VirtioIommuConf>,
     /// The properties of an arm-smmuv3, and whether its `primary-bus` is set.
     smmu: Option<(SmmuV3Props, bool)>,
+    /// The `tpmdev`, `irq` and `ppi` properties of a tpm-tis-device.
+    tpm: Option<(Option<String>, u32, bool)>,
     /// virtio-net `netdev`.
     netdev: Option<String>,
     /// virtio-net `mac`.
@@ -213,6 +217,7 @@ fn plan_virtio(
         iommu: (model == Model::Iommu)
             .then(|| VirtioIommuConf { aw_bits: 48, ..Default::default() }),
         smmu: None,
+        tpm: None,
         netdev: None,
         mac: None,
         props: VirtioPciProps::default(),
@@ -396,6 +401,75 @@ fn plan_smmuv3(board: ArmBoard, opts: &QemuOpts, loc: &Option<Location>) -> Resu
         iommu_platform: false,
         iommu: None,
         smmu: Some((props, primary_bus)),
+        tpm: None,
+        netdev: None,
+        mac: None,
+        props: VirtioPciProps::default(),
+        path: String::new(),
+        loc: loc.clone(),
+    })
+}
+
+/// `TYPE_TPM_TIS_SYSBUS`.
+const TYPE_TPM_TIS_SYSBUS: &str = "tpm-tis-device";
+
+/// The `tpm-tis-device` properties.
+fn plan_tpm_tis_device(
+    board: ArmBoard,
+    opts: &QemuOpts,
+    loc: &Option<Location>,
+) -> Result<Plug, Located> {
+    if board != ArmBoard::Virt {
+        return Err(Located::new(
+            loc,
+            "Parameter 'driver' expects a dynamic sysbus device type for the machine",
+        ));
+    }
+    let at = |e: Error| Located(loc.clone(), e);
+    let (mut tpmdev, mut irq, mut ppi) = (None, 5, true);
+    for (k, v) in opts.iter() {
+        match k {
+            "driver" | "id" => {}
+            "bus" if v == "main-system-bus" => {}
+            "bus" => {
+                let mmio = v.strip_prefix("virtio-mmio-bus.").and_then(|n| n.parse::<u32>().ok());
+                let bus_type = match mmio {
+                    _ if v == PCIE_ROOT_BUS => "PCIE",
+                    Some(n) if n < 32 => "virtio-mmio-bus",
+                    _ => return Err(Located::new(loc, format!("Bus '{v}' not found"))),
+                };
+                let msg = format!("Device '{TYPE_TPM_TIS_SYSBUS}' can't go on {bus_type} bus");
+                return Err(Located::new(loc, msg));
+            }
+            "tpmdev" => tpmdev = Some(v.to_string()),
+            "irq" => {
+                irq = crate::display::prop(k, v, |vi, n, out| vi.type_uint32(Some(n), out))
+                    .map_err(at)?;
+            }
+            "ppi" => {
+                ppi = crate::display::prop(k, v, |vi, n, out| vi.type_bool(Some(n), out))
+                    .map_err(at)?;
+            }
+            _ => {
+                return Err(Located::new(
+                    loc,
+                    format!("Property '{TYPE_TPM_TIS_SYSBUS}.{k}' not found"),
+                ));
+            }
+        }
+    }
+    Ok(Plug {
+        typename: TYPE_TPM_TIS_SYSBUS,
+        model: Model::Tpm,
+        transport: Transport::Mmio,
+        drive: None,
+        serial: None,
+        devfn: None,
+        mmio_bus: None,
+        iommu_platform: false,
+        iommu: None,
+        smmu: None,
+        tpm: Some((tpmdev, irq, ppi)),
         netdev: None,
         mac: None,
         props: VirtioPciProps::default(),
@@ -439,6 +513,9 @@ fn plan_device(
     }
     if driver == TYPE_ARM_SMMUV3 {
         return plan_smmuv3(board, opts, loc).map(Planned::Virtio);
+    }
+    if driver == TYPE_TPM_TIS_SYSBUS {
+        return plan_tpm_tis_device(board, opts, loc).map(Planned::Virtio);
     }
     let mmio = board == ArmBoard::Virt;
     plan_virtio(drives, used, driver, opts, loc, mmio).map(Planned::Virtio)
@@ -631,6 +708,14 @@ pub(crate) fn plug(
                 }
                 continue;
             }
+            Model::Tpm => {
+                let (tpmdev, irq, ppi) = plug.tpm.as_ref().expect("planned with properties");
+                let Target::Virt(board) = board else { unreachable!("planned only on virt") };
+                let prop = format!("{TYPE_TPM_TIS_SYSBUS}.tpmdev");
+                let be = crate::tpm::realize(&prop, tpmdev.as_deref()).map_err(at)?;
+                board.attach_tpm_tis_device(be, *irq, *ppi).map_err(at)?;
+                continue;
+            }
             Model::Balloon => Box::new(VirtioBalloon::new(board.ram_size(), Box::new(KeepRam))),
             Model::Net => {
                 let mut mac = plug.mac.unwrap_or_default();
@@ -821,6 +906,31 @@ mod tests {
         assert_eq!(err("arm-smmuv3,bus=pcie.0"), "Bus 'pcie.0' not found");
         assert_eq!(err("arm-smmuv3,foo=1"), "Property 'arm-smmuv3.foo' not found");
         let e = plan(S, &[], &[dev("arm-smmuv3")]).unwrap_err();
+        assert_eq!(
+            e[0].1.message(),
+            "Parameter 'driver' expects a dynamic sysbus device type for the machine"
+        );
+    }
+
+    #[test]
+    fn tpm_tis_device() {
+        let p = plan(V, &[], &[dev("tpm-tis-device,tpmdev=t0,irq=9,ppi=off")]).unwrap();
+        assert_eq!(p.virtio[0].tpm, Some((Some("t0".to_string()), 9, false)));
+        let p = plan(V, &[], &[dev("tpm-tis-device,bus=main-system-bus")]).unwrap();
+        assert_eq!(p.virtio[0].tpm, Some((None, 5, true)));
+        let err = |arg: &str| plan(V, &[], &[dev(arg)]).unwrap_err()[0].1.message().to_string();
+        assert_eq!(err("tpm-tis-device,ppi=2"), "Parameter 'ppi' expects 'on' or 'off'");
+        assert_eq!(err("tpm-tis-device,foo=1"), "Property 'tpm-tis-device.foo' not found");
+        let msg = "Device 'tpm-tis-device' can't go on PCIE bus";
+        assert_eq!(err("tpm-tis-device,bus=pcie.0"), msg);
+        let msg = "Device 'tpm-tis-device' can't go on virtio-mmio-bus bus";
+        assert_eq!(err("tpm-tis-device,bus=virtio-mmio-bus.31"), msg);
+        assert_eq!(
+            err("tpm-tis-device,bus=virtio-mmio-bus.32"),
+            "Bus 'virtio-mmio-bus.32' not found"
+        );
+        assert_eq!(err("tpm-tis-device,bus=pcie.1"), "Bus 'pcie.1' not found");
+        let e = plan(S, &[], &[dev("tpm-tis-device")]).unwrap_err();
         assert_eq!(
             e[0].1.message(),
             "Parameter 'driver' expects a dynamic sysbus device type for the machine"

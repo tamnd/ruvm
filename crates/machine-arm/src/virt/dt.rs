@@ -687,8 +687,9 @@ pub(crate) fn add_fw_cfg_node(fdt: &mut Fdt) -> Result<(), String> {
     fdt.setprop(&nodename, "dma-coherent", &[])
 }
 
-/// `platform_bus_add_all_fdt_nodes()` with no dynamic sysbus devices: just the bus node.
-pub(crate) fn add_platform_bus_node(fdt: &mut Fdt) -> Result<(), String> {
+/// `platform_bus_add_all_fdt_nodes()`: the bus node, and in it `add_tpm_tis_fdt_node()` for
+/// a tpm-tis-device whose registers are at `tpm` in the bus. The SMMUv3 has its node already.
+pub(crate) fn add_platform_bus_node(fdt: &mut Fdt, tpm: Option<u64>) -> Result<(), String> {
     let addr = VIRT_PLATFORM_BUS;
     let size = VIRT_PLATFORM_BUS_SIZE;
     let node = format!("/platform-bus@{addr:x}");
@@ -699,5 +700,12 @@ pub(crate) fn add_platform_bus_node(fdt: &mut Fdt) -> Result<(), String> {
     fdt.setprop_cell(&node, "#address-cells", 1)?;
     fdt.setprop_cells(&node, "ranges", &[0, (addr >> 32) as u32, addr as u32, size as u32])?;
     let intc = fdt.get_phandle("/intc")?;
-    fdt.setprop_cell(&node, "interrupt-parent", intc)
+    fdt.setprop_cell(&node, "interrupt-parent", intc)?;
+    if let Some(base) = tpm {
+        let tpm = format!("{node}/tpm_tis@{base:x}");
+        fdt.add_subnode(&tpm)?;
+        fdt.setprop_string(&tpm, "compatible", "tcg,tpm-tis-mmio")?;
+        fdt.setprop_cells(&tpm, "reg", &[base as u32, 0x5000])?;
+    }
+    Ok(())
 }

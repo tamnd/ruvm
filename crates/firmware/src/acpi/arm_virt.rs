@@ -29,6 +29,7 @@ use super::q35::{self, PciDevice};
 use super::table::{
     self, AcpiTable, FadtData, Gas, McfgInfo, RsdpData, SpcrData, TABLE_FILE, fadt_flags,
 };
+use super::tpm::{self, TpmVersion};
 use super::viot::{self, ViotInfo};
 
 pub use super::riscv_virt::NumaNode;
@@ -186,6 +187,18 @@ pub struct ArmVirtAcpi {
     pub smmus: Vec<IortSmmu>,
     /// The VIOT of a virtio-iommu-pci.
     pub viot: Option<ViotInfo>,
+    /// The tpm-tis-device, `tpm_find()`.
+    pub tpm: Option<VirtTpm>,
+}
+
+/// The tpm-tis-device on the platform bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtTpm {
+    pub version: TpmVersion,
+    /// The address of its registers.
+    pub base: u64,
+    /// The address of its PPI memory, when the `ppi` property is on.
+    pub ppi_base: Option<u64>,
 }
 
 /// The SMMUv3 as the IORT describes it, `AcpiIortSMMUv3Dev`.
@@ -319,6 +332,9 @@ fn build_dsdt(tbl: &mut Vec<u8>, linker: &mut BiosLinker, s: &ArmVirtAcpi) {
     }
     devices::power_button(&mut scope);
     devices::error_device(&mut scope);
+    if let Some(t) = &s.tpm {
+        tpm::tis_sysbus_aml(&mut scope, t.base, t.ppi_base);
+    }
     dsdt.append(&scope);
 
     let mut pci0_scope = aml::scope("\\_SB.PCI0");
@@ -818,6 +834,12 @@ pub fn build(s: &ArmVirtAcpi) -> BuildTables {
 
     table::add_table(&mut table_offsets, data);
     build_iort(data, linker, s);
+
+    if s.tpm.is_some_and(|t| t.version == TpmVersion::V2_0) {
+        table::add_table(&mut table_offsets, data);
+        let interface = tpm::TpmInterface::TisSysbus;
+        tpm::build_tpm2(data, linker, &mut t.tcpalog, interface, &s.oem_id, &s.oem_table_id);
+    }
 
     if let Some(v) = &s.viot {
         table::add_table(&mut table_offsets, data);
