@@ -43,6 +43,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::SystemTime;
 
 use ruvm_base::ClockType;
+use ruvm_base::report::error_report;
 use ruvm_firmware::acpi::devices::IsaDevice;
 use ruvm_firmware::acpi::dmar::{DmarInfo, DmarScope};
 use ruvm_firmware::acpi::pci::CrsRange;
@@ -50,6 +51,7 @@ use ruvm_firmware::acpi::q35::{
     self as acpi_q35, PciDevice as AcpiPciDevice, PciDeviceAml, Q35Acpi,
 };
 use ruvm_firmware::acpi::table::{LOADER_FILE, McfgInfo, RSDP_FILE, TABLE_FILE, TPMLOG_FILE};
+use ruvm_firmware::acpi::tpm::{TpmInfo, TpmInterface, TpmVersion as AcpiTpmVersion};
 use ruvm_firmware::acpi::viot::ViotInfo;
 use ruvm_firmware::acpi::x86::{MadtConfig, PossibleCpu};
 use ruvm_firmware::e820::{E820_FILE, E820_RAM, E820_RESERVED, E820Table};
@@ -85,6 +87,9 @@ use ruvm_hw_storage::{BlockBackend, DriveConfig, DriveKind, ICH9_AHCI_PORTS, Ich
 use ruvm_hw_timer::hpet::{HPET_BASE, HPET_LEN, Hpet, HpetFwConfig, HpetProperties};
 use ruvm_hw_timer::i8254::I8254;
 use ruvm_hw_timer::mc146818::{Mc146818Props, Mc146818Rtc};
+use ruvm_hw_tpm::TpmBackend;
+use ruvm_hw_tpm::ppi::{TPM_PPI_ADDR_BASE, TPM_PPI_ADDR_SIZE, TpmPpi};
+use ruvm_hw_tpm::tis::{TPM_TIS_ADDR_BASE, TPM_TIS_ADDR_SIZE, TpmTis};
 use ruvm_mem::{AddressSpace, MemTxAttrs, MemorySystem, MmioOps, RamBlock, RegionId, RegionType};
 
 use crate::ich9_lpc::{Ich9Lpc, Ich9LpcConfig, SmiHandler};
@@ -456,6 +461,8 @@ struct AcpiSource {
     virtio_iommu: OnceLock<u16>,
     /// The intel-iommu, which gets a DMAR.
     intel_iommu: OnceLock<Arc<IntelIommu>>,
+    /// The TPM, which gets a TPM2 or TCPA table and its device in the DSDT.
+    tpm: OnceLock<TpmInfo>,
 }
 
 impl AcpiSource {
@@ -480,6 +487,10 @@ impl AcpiSource {
                     // qbus_build_aml() walks the ISA bus newest first. pc_superio_init()
                     // creates the serial ports in index order and the i8042 after them, and
                     // the RTC came with the LPC bridge before all of them.
+                    // A tpm-tis from -device is the newest of all.
+                    if let Some(&tpm) = self.tpm.get() {
+                        isa.push(IsaDevice::TpmTis(tpm));
+                    }
                     if self.i8042 {
                         isa.push(IsaDevice::I8042 { kbd_irq: 1, mouse_irq: 12 });
                     }
@@ -565,7 +576,7 @@ impl AcpiSource {
                 .virtio_iommu
                 .get()
                 .map(|&bdf| ViotInfo { bdf, ranges: vec![pci_bus_range(self.host.bus())] }),
-            tpm: None,
+            tpm: self.tpm.get().copied(),
         }
     }
 }
@@ -1262,6 +1273,7 @@ impl Q35 {
             serials: (0..MAX_ISA_SERIAL_PORTS).filter(|&i| serials[i].is_some()).collect(),
             virtio_iommu: OnceLock::new(),
             intel_iommu: OnceLock::new(),
+            tpm: OnceLock::new(),
         });
 
         Ok(Q35 {
@@ -1417,8 +1429,21 @@ impl Q35 {
         };
         add(TABLE_FILE, AcpiBlob::Table, t.table_data)?;
         add(LOADER_FILE, AcpiBlob::Loader, loader)?;
-        // QEMU built with TPM support always adds the event log, empty without a TPM.
-        fwc.add_file(TPMLOG_FILE, Vec::new()).map_err(err)?;
+        // QEMU built with TPM support always adds the event log, empty without a TPM. With
+        // one, it is the log area the TPM table points at, where the firmware logs what it
+        // measures.
+        fwc.add_file(TPMLOG_FILE, t.tcpalog).map_err(err)?;
+        // FwCfgTPMConfig: where the PPI memory is, for the firmware.
+        if let Some(tpm) = self.acpi_src.tpm.get().filter(|t| t.ppi) {
+            let mut config = (TPM_PPI_ADDR_BASE as u32).to_le_bytes().to_vec();
+            config.push(match tpm.version {
+                AcpiTpmVersion::V1_2 => 1,
+                AcpiTpmVersion::V2_0 => 2,
+            });
+            // TPM_PPI_VERSION_1_30
+            config.push(1);
+            fwc.add_file("etc/tpm/config", config).map_err(err)?;
+        }
         add(RSDP_FILE, AcpiBlob::Rsdp, t.rsdp)?;
         Ok(())
     }
@@ -1885,6 +1910,35 @@ impl Q35 {
         self.add_reset_hook(Box::new(move || reset.system_reset()));
         let _ = self.acpi_src.intel_iommu.set(Arc::clone(iommu));
         Ok(())
+    }
+
+    /// `tpm_tis_isa_realizefn()`: maps the TIS over `be` and its PPI memory, wires its
+    /// interrupt to ISA IRQ `irq` and gives the ACPI tables the TPM. The TIS starts the TPM on
+    /// every reset and, as in QEMU, the process exits when that fails. The PPI memory clear
+    /// on reset is not done yet.
+    pub fn attach_tpm_tis(&self, be: Box<dyn TpmBackend>, irq: u32) -> Result<Arc<TpmTis>, String> {
+        let version = match be.version() {
+            ruvm_hw_tpm::TpmVersion::V1_2 => AcpiTpmVersion::V1_2,
+            ruvm_hw_tpm::TpmVersion::V2_0 => AcpiTpmVersion::V2_0,
+        };
+        let tis = TpmTis::new(be, irq);
+        tis.irq().connect(self.gsi[irq as usize].clone());
+        let ops: Arc<dyn MmioOps> = tis.clone();
+        let r = self.mem.new_io("tpm-tis-mmio", u128::from(TPM_TIS_ADDR_SIZE), ops).map_err(err)?;
+        self.mem.add_subregion(self.system, TPM_TIS_ADDR_BASE, r).map_err(err)?;
+        let ppi: Arc<dyn MmioOps> = Arc::new(TpmPpi::default());
+        let r = self.mem.new_io("tpm-ppi", TPM_PPI_ADDR_SIZE as u128, ppi).map_err(err)?;
+        self.mem.add_subregion(self.system, TPM_PPI_ADDR_BASE, r).map_err(err)?;
+        let reset = Arc::clone(&tis);
+        self.add_reset_hook(Box::new(move || {
+            if let Err(e) = reset.reset() {
+                error_report(&e);
+                std::process::exit(1);
+            }
+        }));
+        let info = TpmInfo { version, interface: TpmInterface::TisIsa, ppi: true };
+        let _ = self.acpi_src.tpm.set(info);
+        Ok(tis)
     }
 
     /// Has `hook` run on every system reset, after the board's own devices.

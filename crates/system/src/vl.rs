@@ -299,6 +299,8 @@ struct Config {
     semihosting: arm::Semihosting,
     /// `-machine kernel-irqchip=`, the sugar for the kvm property.
     kernel_irqchip: Option<String>,
+    /// `-tpmdev`.
+    tpmdev: QemuOptsList,
 }
 
 impl Config {
@@ -326,6 +328,7 @@ impl Config {
             x86: x86::Cmdline::default(),
             semihosting: arm::Semihosting::default(),
             kernel_irqchip: None,
+            tpmdev: crate::tpm::tpmdev_opts(),
         }
     }
 
@@ -628,6 +631,11 @@ fn parse_options(
             Opt::Vnc => crate::vnc::parse(arg).map_err(Exit)?,
             Opt::Audiodev => crate::audio::parse_audiodev(arg).map_err(Exit)?,
             Opt::Audio => crate::audio::parse_audio(arg).map_err(Exit)?,
+            #[cfg(unix)]
+            Opt::Tpmdev => {
+                let h = crate::tpm::config_parse(&mut cfg.tpmdev, arg).map_err(Exit)?;
+                cfg.remember("tpmdev", h);
+            }
             Opt::Qtest => cfg.qtest = Some(arg.to_string()),
             Opt::QtestLog => cfg.qtest_log = Some(arg.to_string()),
             #[cfg(unix)]
@@ -1270,6 +1278,12 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         let _ = vm.network.set(net);
     }
     create_objects(&vm, &mut cfg, |ty| !object_create_early(ty))?;
+    // tpm_init()
+    let mut tpmdevs: Vec<_> =
+        cfg.tpmdev.iter().map(|o| (o.clone(), cfg.loc("tpmdev", o.handle()))).collect();
+    if !crate::tpm::init(&chardevs, &mut tpmdevs) {
+        return Err(Exit(1));
+    }
     let handles: Vec<OptsHandle> = cfg.mon.iter().map(|o| o.handle()).collect();
     for h in handles {
         let _loc = cfg.loc("mon", h).map(push_location);

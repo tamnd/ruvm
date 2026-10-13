@@ -937,10 +937,15 @@ pub(crate) enum IsaModel {
     Debugcon { chardev: Option<String>, iobase: u32, readback: u32 },
     /// `isa-debug-exit`.
     DebugExit { iobase: u32, iosize: u32 },
+    /// `tpm-tis`, with the id of its backend.
+    TpmTis { tpmdev: Option<String>, irq: u32 },
 }
 
 /// `TYPE_ISA_DEBUG_EXIT`.
 const TYPE_ISA_DEBUG_EXIT: &str = "isa-debug-exit";
+
+/// `TYPE_TPM_TIS_ISA`.
+const TYPE_TPM_TIS_ISA: &str = "tpm-tis";
 
 /// An ISA device to plug.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1303,7 +1308,7 @@ fn plan_device(
     if is_help_option(driver) || opts.has_help_opt() {
         return Err(Located::new(loc, "-device help is not supported by ruvm yet"));
     }
-    if driver == TYPE_ISA_DEBUGCON || driver == TYPE_ISA_DEBUG_EXIT {
+    if driver == TYPE_ISA_DEBUGCON || driver == TYPE_ISA_DEBUG_EXIT || driver == TYPE_TPM_TIS_ISA {
         return plan_isa_device(kind, driver, opts, loc).map(Planned::Isa);
     }
     if driver == TYPE_SCSI_HD {
@@ -1655,7 +1660,7 @@ fn prop_u32(name: &str, value: &str) -> Result<u32> {
     Ok(out)
 }
 
-/// `qdev_device_add()` for `isa-debugcon` and `isa-debug-exit`: the bus first, then the
+/// `qdev_device_add()` for `isa-debugcon`, `isa-debug-exit` and `tpm-tis`: the bus first, then the
 /// properties. Whether the chardev exists is checked when the device is realized.
 fn plan_isa_device(
     kind: Option<BoardKind>,
@@ -1681,6 +1686,8 @@ fn plan_isa_device(
             iobase: DEBUGCON_DEFAULT_IOBASE,
             readback: DEBUGCON_DEFAULT_READBACK,
         }
+    } else if typename == TYPE_TPM_TIS_ISA {
+        IsaModel::TpmTis { tpmdev: None, irq: ruvm_hw_tpm::tis::TPM_TIS_IRQ }
     } else {
         IsaModel::DebugExit { iobase: DEBUG_EXIT_DEFAULT_IOBASE, iosize: DEBUG_EXIT_DEFAULT_IOSIZE }
     };
@@ -1693,6 +1700,8 @@ fn plan_isa_device(
             | ("iobase", IsaModel::DebugExit { iobase, .. }) => *iobase = num(k, v)?,
             ("readback", IsaModel::Debugcon { readback, .. }) => *readback = num(k, v)?,
             ("iosize", IsaModel::DebugExit { iosize, .. }) => *iosize = num(k, v)?,
+            ("tpmdev", IsaModel::TpmTis { tpmdev, .. }) => *tpmdev = Some(v.to_string()),
+            ("irq", IsaModel::TpmTis { irq, .. }) => *irq = num(k, v)?,
             _ => {
                 return Err(Located::new(loc, format!("Property '{typename}.{k}' not found")));
             }
@@ -2274,6 +2283,23 @@ fn realize_isa(
             let config = IsaDebugExitConfig { iobase: *iobase, iosize: *iosize };
             IsaDebugExit::realize(mem, io, config, handler)
                 .map_err(|e| Located(plug.loc.clone(), e))?;
+        }
+        IsaModel::TpmTis { tpmdev, irq } => {
+            let located = |e: String| Located::new(&plug.loc, e);
+            let be = match tpmdev {
+                Some(id) => Some(crate::tpm::take("tpm-tis.tpmdev", id).map_err(located)?),
+                None => None,
+            };
+            if !crate::tpm::add_device() {
+                return Err(located("at most one TPM device is permitted".to_string()));
+            }
+            let Some(be) = be else {
+                return Err(located("'tpmdev' property is required".to_string()));
+            };
+            if *irq > 15 {
+                return Err(located(format!("IRQ {irq} is outside valid range of 0 to 15")));
+            }
+            board.attach_tpm_tis(be, *irq).map_err(located)?;
         }
     }
     Ok(())
