@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.5.7
+
+This patch starts M8 with virtio-iommu and intel-iommu, adds `-global`, and keeps moving the qtest work on the arm and riscv virt boards.
+
+For M8: virtio-iommu is in on q35 (#264) and arm virt (#266). intel-iommu is in with legacy DMA remapping and the DMAR table (#270) and interrupt remapping (#274). Both were compared against QEMU 11.1 with Linux guests on server2.
+
+For M6: `-global` is in with QEMU's qdev global property semantics and errors (#271). The QMP `system_reset` command (#261), null-co drives and QMP `block_resize` (#265) are in. The QOM types of the virtio-rng and virtio-blk devices are listed as QEMU lists them (#262, #267). The arm and riscv virt boards now take virtio-balloon (#268), `-netdev` with virtio-net (#269) and announce-self (#272). virtio-sound-device works on microvm with QEMU's bus placement and errors, and the `ac97` alias is accepted (#263). Two flaky net tests are fixed: the passt test no longer hits ETXTBSY when it runs its scripts (#273), and the two queue tap test uses its own device name (#275).
+
 ## 0.5.6
 
 This patch runs the Arm virt board on KVM, brings in virtio-sound and puts both riscv64 and aarch64 virt under the qtest accelerator.
