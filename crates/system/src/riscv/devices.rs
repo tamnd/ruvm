@@ -31,7 +31,10 @@ use ruvm_machine_x86::FileBackend;
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
 
 use super::{parse_loader, prop_bool};
-use crate::x86::{Drive, DriveIf, Located, Transport, drive_opts, parse_drive, probe_warning};
+use crate::drives::{Plugged, mmio_resize_cb, pci_resize_cb};
+use crate::x86::{
+    Drive, DriveIf, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive, probe_warning,
+};
 
 /// The virtio device models virt can plug.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,6 +266,9 @@ pub(crate) fn plan(
         }
         used.insert(i);
         let backing = match &d.file {
+            Some(_) if d.null_size.is_some() => {
+                return Err(vec![Located::new(&d.loc, NULL_CO_PFLASH)]);
+            }
             Some(file) => {
                 if d.probed && !d.read_only {
                     eprint!("{}", probe_warning(file));
@@ -299,7 +305,7 @@ pub(crate) fn plan(
 /// Opens drive `d` for a device.
 fn open_drive(d: &Drive) -> Result<FileBackend, String> {
     let file = d.file.as_deref().expect("planned with media");
-    let backend = FileBackend::open(file, d.read_only)?;
+    let backend = d.open()?;
     if d.probed && !d.read_only {
         eprint!("{}", probe_warning(file));
     }
@@ -307,14 +313,22 @@ fn open_drive(d: &Drive) -> Result<FileBackend, String> {
 }
 
 /// `qdev_device_add()` for the planned virtio devices: builds each one and plugs it into its
-/// bus.
-pub(crate) fn plug(board: &VirtMachine, plugs: &[Plug], drives: &[Drive]) -> Result<(), Located> {
+/// bus. Gives the drives it put on virtio-blk devices.
+pub(crate) fn plug(
+    board: &VirtMachine,
+    plugs: &[Plug],
+    drives: &[Drive],
+) -> Result<Vec<Plugged>, Located> {
+    let mut plugged = Vec::new();
     for plug in plugs {
         let at = |e: String| Located::new(&plug.loc, e);
+        let mut image = None;
         let class: Box<dyn VirtioDeviceClass> = match plug.model {
             Model::Blk => {
-                let d = &drives[plug.drive.expect("planned with a drive")];
+                let drive = plug.drive.expect("planned with a drive");
+                let d = &drives[drive];
                 let backend = open_drive(d).map_err(|e| Located::new(&d.loc, e))?;
+                image = Some((drive, backend.clone()));
                 // virtio_blk_pci_realize() turns the automatic num-queues into one queue per
                 // vCPU. virtio-blk-device keeps one.
                 let num_queues = match plug.transport {
@@ -336,19 +350,27 @@ pub(crate) fn plug(board: &VirtMachine, plugs: &[Plug], drives: &[Drive]) -> Res
             }
             Model::Serial => Box::new(VirtioConsole::new(None)),
         };
-        match (plug.transport, plug.mmio_bus) {
+        let resize_cb = match (plug.transport, plug.mmio_bus) {
             (Transport::Pci, _) => {
-                board.attach_virtio_pci(class, plug.devfn, &plug.props).map_err(at)?;
+                let dev = board.attach_virtio_pci(class, plug.devfn, &plug.props).map_err(at)?;
+                pci_resize_cb(&dev)
             }
             (Transport::Mmio, Some(n)) => {
                 board.attach_virtio_at(n, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT).map_err(at)?;
+                mmio_resize_cb(board.virtio_transport(n))
             }
             (Transport::Mmio, None) => {
-                board.attach_virtio(class).map_err(|e| at(format!("{e} '{}'", plug.typename)))?;
+                let n = board
+                    .attach_virtio(class)
+                    .map_err(|e| at(format!("{e} '{}'", plug.typename)))?;
+                mmio_resize_cb(board.virtio_transport(n))
             }
+        };
+        if let Some((drive, image)) = image {
+            plugged.push(Plugged { drive, image, resize_cb });
         }
     }
-    Ok(())
+    Ok(plugged)
 }
 
 #[cfg(test)]

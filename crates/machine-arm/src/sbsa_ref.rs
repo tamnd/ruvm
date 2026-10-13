@@ -713,18 +713,19 @@ impl SbsaRefMachine {
 
     /// Plug a virtio device into a new function on the root bus, at the first free slot.
     pub fn attach_virtio_pci(&self, class: Box<dyn VirtioDeviceClass>) -> Result<(), String> {
-        self.attach_virtio_pci_with(class, None, &VirtioPciProps::default(), false)
+        self.attach_virtio_pci_with(class, None, &VirtioPciProps::default(), false).map(drop)
     }
 
     /// Plug a virtio device into a new function on the root bus, at `devfn` or the first
-    /// free slot, with `props`. With `iommu_platform` its DMA goes through the SMMU.
+    /// free slot, with `props`. With `iommu_platform` its DMA goes through the SMMU. Gives the
+    /// function.
     pub fn attach_virtio_pci_with(
         &self,
         class: Box<dyn VirtioDeviceClass>,
         devfn: Option<u8>,
         props: &VirtioPciProps,
         iommu_platform: bool,
-    ) -> Result<(), String> {
+    ) -> Result<VirtioPci, String> {
         if self.done {
             return Err("devices are plugged before machine_done".to_string());
         }
@@ -736,8 +737,8 @@ impl SbsaRefMachine {
             iommu_spaces: &self.iommu_spaces,
         };
         let dev = plug.virtio_pci(class, devfn, props, iommu_platform)?;
-        self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).push(dev);
-        Ok(())
+        self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).push(dev.clone());
+        Ok(dev)
     }
 
     /// `sbsa_ref_powerdown_req()`: a press of the power key.

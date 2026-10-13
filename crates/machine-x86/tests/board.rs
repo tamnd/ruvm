@@ -12,7 +12,7 @@ use ruvm_machine_x86::board::{
     BoardKind, BoardSpec, KernelFiles, build_board, canonical_machine_name, load_kernel,
 };
 use ruvm_machine_x86::firmware::{DEFAULT_FIRMWARE_DIRS, QEMU_BINARY, qemu_data_dir};
-use ruvm_machine_x86::{FileBackend, FirmwareSearch};
+use ruvm_machine_x86::{FileBackend, FirmwareSearch, NULL_CO_DEFAULT_SIZE};
 
 /// A fresh directory under the system temp directory, removed on drop.
 struct TempDir(PathBuf);
@@ -117,6 +117,38 @@ fn file_backend_reads_and_writes() {
     assert_eq!(ruvm_hw_storage::BlockBackend::len(&f), 4096);
     ruvm_hw_storage::BlockBackend::read_at(&f, 512, &mut buf).unwrap();
     assert_eq!(&buf, b"hello");
+}
+
+#[test]
+fn null_co_reads_zeroes_and_drops_writes() {
+    let f = FileBackend::null(NULL_CO_DEFAULT_SIZE, false);
+    assert_eq!(f.size(), 1 << 30);
+    assert_eq!(f.path(), Path::new("null-co://"));
+    f.write_at(512, b"hello").unwrap();
+    let mut buf = [1u8; 5];
+    f.read_at(512, &mut buf).unwrap();
+    assert_eq!(buf, [0; 5]);
+    f.flush().unwrap();
+    assert!(f.read_at((1 << 30) - 2, &mut buf).is_err());
+    let f = FileBackend::null(4096, true);
+    assert!(f.write_at(0, b"x").is_err());
+}
+
+#[test]
+fn truncate_resizes_every_clone() {
+    let t = TempDir::new("resize");
+    let p = t.file("disk.img", &[0u8; 4096]);
+    let f = FileBackend::open(&p, false).unwrap();
+    let device = f.clone();
+    f.truncate(1000).unwrap();
+    assert_eq!(device.size(), 1000);
+    assert_eq!(std::fs::metadata(&p).unwrap().len(), 1000);
+    f.truncate(8192).unwrap();
+    assert_eq!(ruvm_hw_storage::BlockBackend::len(&device), 8192);
+    let e = FileBackend::open(&p, true).unwrap().truncate(1).unwrap_err();
+    assert_eq!(e, "Image is read-only");
+    let e = FileBackend::null(4096, false).truncate(1).unwrap_err();
+    assert_eq!(e, "Image format driver does not support resize");
 }
 
 #[test]

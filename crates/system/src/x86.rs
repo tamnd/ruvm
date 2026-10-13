@@ -53,8 +53,8 @@ use ruvm_machine_x86::q35::{CpuIdent, PflashDrive, Q35_MAX_CPUS};
 use ruvm_machine_x86::run_event::{EventHandler, GuestEvent, ShutdownReason};
 use ruvm_machine_x86::tcg_run::{TCG_SMM_AVAILABLE, TcgCpuModel, TcgMachine, TcgRunConfig};
 use ruvm_machine_x86::{
-    BoardKind, BoardSpec, FileBackend, FirmwareSearch, KernelFiles, MicrovmProps, PflashBacking,
-    Q35Props, X86Board, build_board,
+    BoardKind, BoardSpec, FileBackend, FirmwareSearch, KernelFiles, MicrovmProps, NULL_CO,
+    NULL_CO_DEFAULT_SIZE, PflashBacking, Q35Props, X86Board, build_board,
 };
 use ruvm_mem::{AddressSpace, RamBlock};
 use ruvm_migration::Migration;
@@ -598,7 +598,20 @@ pub(crate) struct Drive {
     pub cdrom: bool,
     /// No `format=`: QEMU would probe, ruvm takes the file as raw and says so.
     pub probed: bool,
+    /// The size of a `file=null-co://` image, `file.size`.
+    pub null_size: Option<u64>,
     pub loc: Option<Location>,
+}
+
+impl Drive {
+    /// Opens the image of the drive, which must have one.
+    pub(crate) fn open(&self) -> std::result::Result<FileBackend, String> {
+        let file = self.file.as_deref().expect("a drive with media");
+        if let Some(size) = self.null_size {
+            return Ok(FileBackend::null(size, self.read_only));
+        }
+        FileBackend::open(file, self.read_only)
+    }
 }
 
 fn opt_number(opts: &ruvm_qapi::opts::QemuOpts, name: &str) -> Result<Option<u64>> {
@@ -619,9 +632,17 @@ fn opt_bool(opts: &ruvm_qapi::opts::QemuOpts, name: &str) -> Result<Option<bool>
     }
 }
 
-/// The `-drive` options ruvm takes but has no use for.
+/// The `-drive` options ruvm takes but has no use for. `auto-read-only` lets QEMU open the
+/// image read-only when it cannot write it, but a device that writes then fails to realize,
+/// as ruvm fails to open it.
 const DRIVE_IGNORED: &[&str] =
     &["cache", "aio", "discard", "detect-zeroes", "werror", "rerror", "copy-on-read"];
+
+/// The error for a `null-co` image on a flash, which reads its image from a file.
+pub(crate) const NULL_CO_PFLASH: &str = "a null-co image is not supported for pflash by ruvm yet";
+
+/// The options of the `null-co` protocol, block/null.c, that ruvm takes.
+const NULL_CO_OPTS: &[&str] = &["size", "read-zeroes"];
 
 /// `drive_new()`: parses one `-drive` for a machine of kind `kind` (`None` for `none`),
 /// given the drives before it.
@@ -633,7 +654,18 @@ pub(crate) fn parse_drive(
     loc: Option<Location>,
 ) -> Result<Drive> {
     let opts = list.parse(arg, false)?;
+    let null = opts.get("file") == Some(NULL_CO);
     for (name, _) in opts.iter() {
+        if let Some(name) = name.strip_prefix("file.") {
+            let (protocol, known) =
+                if null { ("null-co", NULL_CO_OPTS) } else { ("file", &[][..]) };
+            if !known.contains(&name) {
+                return Err(Error::generic(format!(
+                    "Block protocol '{protocol}' doesn't support the option '{name}'"
+                )));
+            }
+            continue;
+        }
         let known = matches!(
             name,
             "file"
@@ -646,6 +678,7 @@ pub(crate) fn parse_drive(
                 | "readonly"
                 | "read-only"
                 | "snapshot"
+                | "auto-read-only"
         ) || DRIVE_IGNORED.contains(&name);
         if !known {
             return Err(Error::generic(format!(
@@ -663,6 +696,20 @@ pub(crate) fn parse_drive(
         }
         probed = false;
     }
+    opt_bool(opts, "auto-read-only")?;
+    let null_size = if null {
+        opt_bool(opts, "file.read-zeroes")
+            .map_err(|_| Error::generic("Parameter 'read-zeroes' expects 'on' or 'off'"))?;
+        let size = match opts.get("file.size") {
+            None => NULL_CO_DEFAULT_SIZE,
+            Some(v) => ruvm_qapi::cutils::strtosz(v).map_err(|_| {
+                Error::generic("Parameter 'size' expects a non-negative number below 2^64")
+            })?,
+        };
+        Some(size)
+    } else {
+        None
+    };
     if opt_bool(opts, "snapshot")? == Some(true) {
         return Err(Error::generic("snapshot=on is not supported by ruvm yet"));
     }
@@ -747,7 +794,7 @@ pub(crate) fn parse_drive(
         }
     };
     let file = opts.get("file").filter(|f| !f.is_empty()).map(str::to_string);
-    Ok(Drive { id, file, iface, bus, unit, read_only, cdrom, probed, loc })
+    Ok(Drive { id, file, iface, bus, unit, read_only, cdrom, probed, null_size, loc })
 }
 
 /// The `-drive` option list: anything goes, with an id.
@@ -951,6 +998,9 @@ pub(crate) fn pflash_drives(
             // No medium: blk_getlength() fails and the size check catches it.
             return Ok(PflashDrive { name: d.id.clone(), size: 0, backing: PflashBacking::None });
         };
+        if d.null_size.is_some() {
+            return Err(Located::new(&d.loc, NULL_CO_PFLASH));
+        }
         let size =
             FileBackend::open(file, d.read_only).map_err(|e| Located::new(&d.loc, e))?.size();
         Ok(PflashDrive {
@@ -1738,7 +1788,7 @@ struct ClassEnv<'a> {
 /// Opens drive `d` for a device.
 fn open_drive(d: &Drive) -> std::result::Result<FileBackend, String> {
     let file = d.file.as_deref().expect("planned with media");
-    let backend = FileBackend::open(file, d.read_only)?;
+    let backend = d.open()?;
     if d.probed && !d.read_only {
         eprint!("{}", probe_warning(file));
     }
@@ -1919,8 +1969,7 @@ fn build(
         let d = &drives[i];
         let blk: Option<Arc<dyn BlockBackend>> = match &d.file {
             Some(f) => {
-                let b =
-                    FileBackend::open(f, d.read_only).map_err(|e| one(Located::new(&d.loc, e)))?;
+                let b = d.open().map_err(|e| one(Located::new(&d.loc, e)))?;
                 if d.probed && !d.read_only {
                     eprint!("{}", probe_warning(f));
                 }
@@ -2550,6 +2599,36 @@ mod tests {
         assert_eq!(msg(&["file=a,format=qcow2"]), "format 'qcow2' is not supported by ruvm yet");
         assert_eq!(msg(&["file=a,id=d", "file=b,id=d"]), "Duplicate ID 'd' for drive");
         assert_eq!(msg(&["file=a,index=x"]), "Parameter 'index' expects a number");
+    }
+
+    #[test]
+    fn null_co_drives() {
+        let msg = |arg: &str| drives(None, &[arg]).unwrap_err().message().to_string();
+        let d = drives(None, &["if=none,id=d1,file=null-co://,file.read-zeroes=on,format=raw"]);
+        assert_eq!(d.unwrap()[0].null_size, Some(1 << 30));
+        let d = drives(None, &["if=none,file=null-co://,file.size=1M,auto-read-only=off"]);
+        assert_eq!(d.unwrap()[0].null_size, Some(1 << 20));
+        assert_eq!(drives(None, &["if=none,file=a,auto-read-only=on"]).unwrap()[0].null_size, None);
+        assert_eq!(
+            msg("file=a,file.read-zeroes=on"),
+            "Block protocol 'file' doesn't support the option 'read-zeroes'"
+        );
+        assert_eq!(
+            msg("file=null-co://,file.foo=1"),
+            "Block protocol 'null-co' doesn't support the option 'foo'"
+        );
+        assert_eq!(
+            msg("file=null-co://,file.read-zeroes=x"),
+            "Parameter 'read-zeroes' expects 'on' or 'off'"
+        );
+        assert_eq!(
+            msg("file=null-co://,file.size=1x"),
+            "Parameter 'size' expects a non-negative number below 2^64"
+        );
+        assert_eq!(
+            msg("file=a,auto-read-only=x"),
+            "Parameter 'auto-read-only' expects 'on' or 'off'"
+        );
     }
 
     fn devices(args: &[&str]) -> Vec<(String, Option<Location>)> {

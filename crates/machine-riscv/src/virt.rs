@@ -1038,6 +1038,11 @@ impl VirtMachine {
         Ok(dev)
     }
 
+    /// The virtio-mmio transport at `index`, plugged or not.
+    pub fn virtio_transport(&self, index: usize) -> Option<Arc<VirtioMmio>> {
+        self.virtio.get(index).map(|slot| slot.current())
+    }
+
     /// The PCIe host bridge.
     pub fn gpex(&self) -> &GpexHost {
         &self.gpex

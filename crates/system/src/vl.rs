@@ -54,6 +54,7 @@ use ruvm_qom::{
 };
 
 use crate::arm::{self, ArmBoard};
+use crate::drives::Drives;
 use crate::net::{NetOption, Network, qmp_events};
 use crate::options::{Opt, arch_available, help_text, lookup_opt};
 use crate::qdev;
@@ -121,6 +122,8 @@ pub struct Vm {
     pub(crate) accel: OnceLock<Accelerator>,
     /// The netdevs `net_init_clients()` made, on a machine that has them.
     pub(crate) network: OnceLock<Arc<Network>>,
+    /// The `-drive` images by id, on a machine that keeps them.
+    pub(crate) drives: OnceLock<Drives>,
     machine_initialized: AtomicBool,
     /// `qtest_driver()`: a test drives the machine over `-qtest`.
     qtest: bool,
@@ -1054,6 +1057,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         migration: OnceLock::new(),
         accel: OnceLock::new(),
         network: OnceLock::new(),
+        drives: OnceLock::new(),
         machine_initialized: AtomicBool::new(false),
         qtest: cfg.qtest.is_some(),
     });
@@ -1361,7 +1365,11 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
                     keep._qtest = Some(a);
                 }
             }
-            _ => keep._accel = Some(accel),
+            _ => {
+                // Machine none: its drives are on no device.
+                let _ = vm.drives.set(Drives::new(&drives, Vec::new()));
+                keep._accel = Some(accel);
+            }
         }
     }
     crate::display::check_vga_created(cfg.x86.vga);
