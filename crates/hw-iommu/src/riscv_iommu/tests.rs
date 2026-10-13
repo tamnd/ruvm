@@ -142,6 +142,7 @@ impl Rig {
     }
 
     /// A one level device directory with an extended device context for [`SID`].
+    #[allow(clippy::too_many_arguments)]
     fn dc(&self, tc: u64, iohgatp: u64, ta: u64, fsc: u64, msiptp: u64, mask: u64, pattern: u64) {
         let at = DDT + u64::from(SID) * 64;
         for (i, v) in [tc, iohgatp, ta, fsc, msiptp, mask, pattern, 0].into_iter().enumerate() {
@@ -626,7 +627,7 @@ fn ats_requests() {
     assert_eq!(t.perm, IommuAccessFlags::NONE);
     assert_eq!(r.r32(REG_PQT), 1);
     assert_eq!(get_field(r.rq(DATA2), PREQ_HDR_DID), u64::from(SID));
-    assert_eq!(r.rq(DATA2 + 8), IOVA + 0x1000 | PREQ_PAYLOAD_M);
+    assert_eq!(r.rq(DATA2 + 8), (IOVA + 0x1000) | PREQ_PAYLOAD_M);
     assert_eq!(r.irqs(), vec![3]);
 }
 
