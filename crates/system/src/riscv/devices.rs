@@ -32,6 +32,7 @@ use ruvm_machine_riscv::virt::{
 };
 use ruvm_machine_x86::VirtioHandle;
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
+use ruvm_qapi::visit::{Visitor, VisitorExt};
 
 use super::{parse_loader, prop_bool};
 use crate::drives::{DriveDev, Plugged, device_image, peripheral_path, resize_cb};
