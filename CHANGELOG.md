@@ -6,6 +6,14 @@ The minor version is the number of milestones finished. 0.1.0 is the release whe
 
 ## Unreleased
 
+## 0.5.6
+
+This patch runs the Arm virt board on KVM, brings in virtio-sound and puts both riscv64 and aarch64 virt under the qtest accelerator.
+
+For M6: the virt board now runs on KVM on Arm Linux hosts (#244) with `-accel kvm`, `-enable-kvm` and `-machine accel=kvm` and QEMU's errors (#248). The VM's IPA space is sized from `KVM_CAP_ARM_VM_IPA_SIZE` and the memory map follows it (#249, #255). Arm KVM guests get a steal time record per vCPU (#257), and `-cpu host` gets SVE and pointer authentication when the host has them (#258). None of the Arm KVM work has run on an Arm host with /dev/kvm yet, which #227 tracks. virtio-sound is in on q35 (#246), and in a Linux guest its playback into the wav backend matched QEMU 11.1 byte for byte. riscv64 virt (#251) and aarch64 virt (#256) now run under the qtest accelerator, and riscv64 virt takes the `aclint` property (#253). `-nic none` and `-net none` are accepted (#259), and the firmware and kernel load errors on x86 read as QEMU's do (#250). ruvm builds and passes clippy on macOS and Windows again, and tests that wait on a guest now time out instead of hanging (#254). The root tap test accepts EIO from a tap that is down (#247).
+
+For M7: mremap of part of a merged mapping and failed host moves now behave as on Linux (#245).
+
 ## 0.5.5
 
 This patch brings the riscv64 guest to user mode for M7, and for M6 adds Arm KVM, the emulated GICv2, the macOS, Windows and PipeWire audio backends and a large step in the qtest work.
