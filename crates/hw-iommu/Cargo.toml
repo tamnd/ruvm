@@ -14,8 +14,14 @@ publish = false
 unsafe-budget = 0
 
 [dependencies]
+ruvm-base.workspace = true
 ruvm-hw-core.workspace = true
+ruvm-hw-virtio.workspace = true
 ruvm-mem.workspace = true
+ruvm-virtio-queue.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["param"] }
 
 [lints]
 workspace = true

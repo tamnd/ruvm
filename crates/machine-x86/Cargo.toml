@@ -23,6 +23,7 @@ ruvm-hw-core.workspace = true
 ruvm-hw-i2c.workspace = true
 ruvm-hw-input.workspace = true
 ruvm-hw-intc.workspace = true
+ruvm-hw-iommu.workspace = true
 ruvm-hw-pci.workspace = true
 ruvm-hw-storage.workspace = true
 ruvm-hw-timer.workspace = true

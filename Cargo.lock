@@ -1869,8 +1869,12 @@ dependencies = [
 name = "ruvm-hw-iommu"
 version = "0.5.5"
 dependencies = [
+ "rustix",
+ "ruvm-base",
  "ruvm-hw-core",
+ "ruvm-hw-virtio",
  "ruvm-mem",
+ "ruvm-virtio-queue",
 ]
 
 [[package]]
@@ -2131,6 +2135,7 @@ dependencies = [
  "ruvm-hw-i2c",
  "ruvm-hw-input",
  "ruvm-hw-intc",
+ "ruvm-hw-iommu",
  "ruvm-hw-misc",
  "ruvm-hw-pci",
  "ruvm-hw-storage",
@@ -2300,6 +2305,7 @@ dependencies = [
  "ruvm-hw-core",
  "ruvm-hw-display",
  "ruvm-hw-input",
+ "ruvm-hw-iommu",
  "ruvm-hw-misc",
  "ruvm-hw-pci",
  "ruvm-hw-storage",

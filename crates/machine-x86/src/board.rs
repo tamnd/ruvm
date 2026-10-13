@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ruvm_firmware::smbios::{SmbiosOptions, SmbiosTopology};
 use ruvm_firmware::x86_linux::{LINUXBOOT_DMA_ROM, PVH_ROM};
@@ -18,6 +18,11 @@ use ruvm_hw_char::serial::{Serial, SerialBackend};
 use ruvm_hw_core::{Clock, IrqPin};
 use ruvm_hw_intc::i8259::I8259Pair;
 use ruvm_hw_intc::ioapic::{IoApic, IoApicMsiHandler, IoApics};
+use ruvm_hw_iommu::virtio_iommu::{
+    ReservedRegion, TYPE_VIRTIO_IOMMU_MEMORY_REGION, VIRTIO_IOMMU_RESV_MEM_T_MSI,
+};
+use ruvm_hw_iommu::{Viommu, VirtioIommu, VirtioIommuConf};
+use ruvm_hw_virtio::virtio::VIRTIO_F_IOMMU_PLATFORM;
 use ruvm_hw_virtio::{
     AddressSpaceMemory, SharedGuestMemory, VirtIODevice, VirtioBackend, VirtioDeviceClass,
     VirtioMmio, VirtioPci, VirtioPciProps,
@@ -145,6 +150,17 @@ impl X86Board {
         &mut self,
         class: Box<dyn VirtioDeviceClass>,
     ) -> Result<VirtioHandle, String> {
+        self.attach_virtio_with(class, &VirtioPciProps::default(), false)
+    }
+
+    /// [`attach_virtio`](Self::attach_virtio) with the virtio PCI properties and
+    /// `iommu_platform`, which puts the device's DMA behind the vIOMMU. microvm has neither.
+    pub fn attach_virtio_with(
+        &mut self,
+        class: Box<dyn VirtioDeviceClass>,
+        props: &VirtioPciProps,
+        iommu_platform: bool,
+    ) -> Result<VirtioHandle, String> {
         match self {
             X86Board::Microvm(m) => {
                 let i = m.attach_virtio(class)?;
@@ -152,15 +168,82 @@ impl X86Board {
                 Ok(VirtioHandle::Mmio(t))
             }
             X86Board::Q35(m, devs) => {
-                let mem: SharedGuestMemory =
-                    Arc::new(AddressSpaceMemory::new(Arc::clone(m.memory_as())));
-                let backend = VirtioBackend::new(class, mem).map_err(err)?;
-                let dev = VirtioPci::new(m.pci_bus(), None, backend, &VirtioPciProps::default())
-                    .map_err(err)?;
+                // virtio_bus_device_plugged(): with iommu_platform the device's DMA goes to
+                // its PCI address space, otherwise to system memory.
+                let bdf = Arc::new(OnceLock::new());
+                let mem: SharedGuestMemory = if iommu_platform {
+                    Arc::new(m.pci_dma().bus_master(Arc::clone(&bdf)))
+                } else {
+                    Arc::new(AddressSpaceMemory::new(Arc::clone(m.memory_as())))
+                };
+                let mut backend = VirtioBackend::new(class, mem).map_err(err)?;
+                if iommu_platform {
+                    backend.vdev_mut().set_host_feature(VIRTIO_F_IOMMU_PLATFORM, true);
+                }
+                let dev = VirtioPci::new(m.pci_bus(), None, backend, props).map_err(err)?;
+                let _ = bdf.set(dev.pci_dev().requester_id());
                 devs.push(dev.clone());
                 Ok(VirtioHandle::Pci(dev))
             }
         }
+    }
+
+    /// Plugs a `virtio-iommu-pci` with the properties `conf`: `pc_machine_device_pre_plug_cb()`
+    /// and the realize of the PCI proxy and of the device. The function translates the DMA of
+    /// every function on the root bus and gets a VIOT.
+    pub fn attach_virtio_iommu(
+        &mut self,
+        conf: &VirtioIommuConf,
+        id: Option<String>,
+    ) -> Result<VirtioHandle, String> {
+        let X86Board::Q35(m, devs) = self else {
+            return Err("No 'PCI' bus found for device 'virtio-iommu-pci'".to_string());
+        };
+        // Declare the APIC range as the reserved MSI region.
+        let conf = VirtioIommuConf {
+            reserved_regions: vec![ReservedRegion {
+                low: 0xfee0_0000,
+                high: 0xfeef_ffff,
+                kind: VIRTIO_IOMMU_RESV_MEM_T_MSI,
+            }],
+            ..conf.clone()
+        };
+        if m.pci_dma().has_iommu() {
+            return Err("QEMU does not support multiple vIOMMUs for x86 yet.".to_string());
+        }
+        conf.check_pci().map_err(err)?;
+        let viommu = Viommu::new(m.memory_as(), &conf);
+        let class = Box::new(VirtioIommu::new(Arc::clone(&viommu), conf));
+        let mem: SharedGuestMemory = Arc::new(AddressSpaceMemory::new(Arc::clone(m.memory_as())));
+        let backend = VirtioBackend::new(class, mem).map_err(err)?;
+        // virtio_pci_force_virtio_1()
+        let props = VirtioPciProps {
+            disable_legacy: Some(true),
+            disable_modern: false,
+            id,
+            ..VirtioPciProps::default()
+        };
+        let dev = VirtioPci::new(m.pci_bus(), None, backend, &props).map_err(err)?;
+
+        let bus = Arc::downgrade(m.pci_bus());
+        viommu.set_endpoint_check(move |sid| {
+            bus.upgrade().is_some_and(|b| b.find_device((sid >> 8) as u8, sid as u8).is_some())
+        });
+        let weak = dev.downgrade();
+        viommu.set_fault_sink(move || {
+            if let Some(d) = weak.upgrade() {
+                // Busy on this thread: the device sends the fault when it is done.
+                let _ = d.with_device::<VirtioIommu, _>(|vdev, dev| dev.report_faults(vdev));
+            }
+        });
+        let ops = Arc::clone(&viommu);
+        let factory = Box::new(move |bdf: u16| ops.device_ops(u32::from(bdf)));
+        m.pci_dma().set_iommu(TYPE_VIRTIO_IOMMU_MEMORY_REGION, factory);
+        let reset = Arc::clone(&viommu);
+        m.add_reset_hook(Box::new(move || reset.system_reset()));
+        m.set_virtio_iommu(dev.pci_dev().requester_id());
+        devs.push(dev.clone());
+        Ok(VirtioHandle::Pci(dev))
     }
 
     /// `pci_add_option_rom()`: gives the PCI function behind `dev` a ROM BAR holding `data`,

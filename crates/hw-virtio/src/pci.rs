@@ -259,6 +259,7 @@ fn device_table(id: u16) -> (Option<u16>, u16, Option<&'static str>) {
         19 => (None, PCI_CLASS_COMMUNICATION_OTHER, Some("vhost-vsock")),
         20 => (None, PCI_CLASS_OTHERS, Some("virtio-crypto")),
         // virtio-sound-pci sets its class in its class_init too.
+        23 => (None, PCI_CLASS_OTHERS, Some("virtio-iommu")),
         25 => (None, PCI_CLASS_MULTIMEDIA_AUDIO, Some("virtio-sound")),
         26 => (None, PCI_CLASS_STORAGE_OTHER, Some("vhost-user-fs")),
         _ => (None, PCI_CLASS_OTHERS, None),
