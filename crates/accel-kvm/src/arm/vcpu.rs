@@ -879,7 +879,7 @@ pub struct ArmVcpuConfig {
 
 impl ArmVcpuConfig {
     /// `-cpu host` on a kernel with `caps`: a PMU when the kernel has one, and no SVE, pointer
-    /// authentication or EL2 until ruvm reads the host's ID registers.
+    /// authentication, steal time or EL2. The board sets those from the CPU properties.
     pub fn host(target: u32, caps: &ArmKvmCaps) -> Self {
         ArmVcpuConfig {
             target,
@@ -893,6 +893,134 @@ impl ArmVcpuConfig {
             adjvtime: true,
             steal_time: false,
         }
+    }
+}
+
+/// `ARM_MAX_VQ`: the largest SVE vector length QEMU and ruvm give a guest, in quadwords.
+pub const ARM_MAX_VQ: u32 = 16;
+
+/// `KVM_ARM64_SVE_VLS_WORDS`: the size of `KVM_REG_ARM64_SVE_VLS` in 64-bit words.
+pub const KVM_ARM64_SVE_VLS_WORDS: usize = 8;
+
+/// The part of `kvm_arm_sve_get_vls()` after the read: the vector lengths in `vls` up to
+/// [`ARM_MAX_VQ`] quadwords, one bit per quadword count less one, and whether the kernel has
+/// longer ones too, which QEMU warns about.
+pub fn sve_vls(vls: &[u64; KVM_ARM64_SVE_VLS_WORDS]) -> (u32, bool) {
+    let max_vq = vls
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, w)| **w != 0)
+        .map_or(0, |(i, w)| 64 - w.leading_zeros() + i as u32 * 64);
+    ((vls[0] & ((1 << ARM_MAX_VQ) - 1)) as u32, max_vq > ARM_MAX_VQ)
+}
+
+/// An error from a CPU property check: QEMU's message and the hint it appends, which is empty
+/// or ends in a newline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuPropError {
+    /// The message.
+    pub message: String,
+    /// The hint lines.
+    pub hint: String,
+}
+
+fn prop_error(message: String, hint: String) -> CpuPropError {
+    CpuPropError { message, hint }
+}
+
+/// `aarch64_cpu_sve_finalize()` under KVM, where `sve-max-vq` does not exist. `sve` is the
+/// `sve` property, `map` and `init` the `sve<N>` properties that were set (`init`) and those
+/// set to on (`map`), and `supported` the lengths the host has. Without explicit lengths every
+/// supported one is on, and turning one off turns off every longer one. Gives the lengths for
+/// `KVM_REG_ARM64_SVE_VLS`, or `None` with SVE off.
+pub fn sve_finalize(
+    sve: bool,
+    map: u32,
+    init: u32,
+    supported: u32,
+) -> Result<Option<u32>, CpuPropError> {
+    let mask_of = |max_vq: u32| if max_vq == 0 { 0 } else { u32::MAX >> (32 - max_vq) };
+    let mut map = map;
+    let mut max_vq;
+    if map != 0 {
+        max_vq = 32 - map.leading_zeros();
+        // KVM needs every supported length below the longest one, so the ones not set are on.
+        map |= supported & !init & mask_of(max_vq);
+    } else {
+        if !sve {
+            return Ok(None);
+        }
+        // Turning a supported length off turns off every longer one.
+        let vq = (init & supported).trailing_zeros() + 1;
+        max_vq = if vq <= ARM_MAX_VQ { vq - 1 } else { ARM_MAX_VQ };
+        map = supported & !init & mask_of(max_vq);
+        if map == 0 {
+            return Err(prop_error(
+                format!("cannot disable sve{}", vq * 128),
+                format!(
+                    "Disabling sve{} results in all vector lengths being disabled.\nWith SVE \
+                     enabled, at least one vector length must be enabled.\n",
+                    vq * 128
+                ),
+            ));
+        }
+        max_vq = 32 - map.leading_zeros();
+    }
+    let mask = mask_of(max_vq);
+    map &= mask;
+    let diff = map ^ (supported & mask);
+    if diff != 0 {
+        let vq = 32 - diff.leading_zeros();
+        let bits = vq * 128;
+        return Err(if map & (1 << (vq - 1)) != 0 {
+            let hint = if supported != 0 {
+                format!("This CPU does not support the vector length {bits}-bits.\n")
+            } else {
+                "SVE not supported by KVM on this host\n".to_string()
+            };
+            prop_error(format!("cannot enable sve{bits}"), hint)
+        } else {
+            prop_error(
+                format!("cannot disable sve{bits}"),
+                format!(
+                    "The KVM host requires all supported vector lengths smaller than {} bits \
+                     to also be enabled.\n",
+                    max_vq * 128
+                ),
+            )
+        });
+    }
+    if !sve {
+        return Err(prop_error(
+            format!("cannot enable sve{}", max_vq * 128),
+            "SVE must be enabled to enable vector lengths.\nAdd sve=on to the CPU property \
+             list.\n"
+                .to_string(),
+        ));
+    }
+    Ok(Some(map))
+}
+
+/// What `-cpu host` asks of every vCPU beyond the model: the `kvm-steal-time` property,
+/// `None` for auto, the SVE vector lengths from [`sve_finalize`] and pointer authentication.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct KvmCpuProps {
+    /// `kvm-steal-time`, `None` for auto.
+    pub steal_time: Option<bool>,
+    /// The SVE vector lengths, or `None` without SVE.
+    pub sve_vq_map: Option<u64>,
+    /// Pointer authentication, the `pauth` property.
+    pub pauth: bool,
+}
+
+/// `arm_cpu_pauth_finalize()` under KVM: the `pauth` property, `None` when not given, on a
+/// host that has pointer authentication for its guests or not. It follows the host by default.
+pub fn pauth_finalize(setting: Option<bool>, host: bool) -> Result<bool, String> {
+    match setting {
+        Some(true) if !host => Err("'pauth' feature not supported by KVM on this host".to_string()),
+        Some(on) => Ok(on),
+        None => Ok(host),
     }
 }
 
@@ -1766,6 +1894,71 @@ mod tests {
         fake.log.clear();
         no_pmu.pmu_init(&mut fake).unwrap();
         assert!(fake.log.is_empty());
+    }
+
+    #[test]
+    fn sve_lengths_from_the_kernel() {
+        let mut vls = [0u64; KVM_ARM64_SVE_VLS_WORDS];
+        assert_eq!(sve_vls(&vls), (0, false));
+        // 128, 256 and 512 bits.
+        vls[0] = 0b1011;
+        assert_eq!(sve_vls(&vls), (0b1011, false));
+        vls[0] = 0x1_ffff;
+        assert_eq!(sve_vls(&vls), (0xffff, true));
+        vls[0] = 1;
+        vls[3] = 1;
+        assert_eq!(sve_vls(&vls), (1, true));
+    }
+
+    #[test]
+    fn sve_finalize_matches_qemu() {
+        // 128, 256 and 512 bits, as on a Neoverse V1 with 256-bit SVE and the shorter lengths.
+        let host = 0b1011;
+        let err = |e: CpuPropError| format!("{}\n{}", e.message, e.hint);
+        assert_eq!(sve_finalize(true, 0, 0, host), Ok(Some(host)));
+        assert_eq!(sve_finalize(false, 0, 0, host), Ok(None));
+        assert_eq!(sve_finalize(false, 0, 0, 0), Ok(None));
+        // sve512=off leaves 128 and 256.
+        assert_eq!(sve_finalize(true, 0, 0b1000, host), Ok(Some(0b11)));
+        // sve256=off turns off 512 too.
+        assert_eq!(sve_finalize(true, 0, 0b10, host), Ok(Some(0b1)));
+        // sve256=on brings in 128 and leaves 512 out.
+        assert_eq!(sve_finalize(true, 0b10, 0b10, host), Ok(Some(0b11)));
+        assert_eq!(
+            err(sve_finalize(true, 0, 0b1, host).unwrap_err()),
+            "cannot disable sve128\nDisabling sve128 results in all vector lengths being \
+             disabled.\nWith SVE enabled, at least one vector length must be enabled.\n"
+        );
+        assert_eq!(
+            err(sve_finalize(true, 0b100, 0b100, host).unwrap_err()),
+            "cannot enable sve384\nThis CPU does not support the vector length 384-bits.\n"
+        );
+        assert_eq!(
+            err(sve_finalize(true, 0b1000, 0b1010, host).unwrap_err()),
+            "cannot disable sve256\nThe KVM host requires all supported vector lengths smaller \
+             than 512 bits to also be enabled.\n"
+        );
+        assert_eq!(
+            err(sve_finalize(false, 0b10, 0b10, 0).unwrap_err()),
+            "cannot enable sve256\nSVE not supported by KVM on this host\n"
+        );
+        assert_eq!(
+            err(sve_finalize(false, 0b10, 0b10, host).unwrap_err()),
+            "cannot enable sve256\nSVE must be enabled to enable vector lengths.\nAdd sve=on to \
+             the CPU property list.\n"
+        );
+    }
+
+    #[test]
+    fn pauth_follows_the_host() {
+        assert_eq!(pauth_finalize(None, true), Ok(true));
+        assert_eq!(pauth_finalize(None, false), Ok(false));
+        assert_eq!(pauth_finalize(Some(false), true), Ok(false));
+        assert_eq!(pauth_finalize(Some(true), true), Ok(true));
+        assert_eq!(
+            pauth_finalize(Some(true), false).unwrap_err(),
+            "'pauth' feature not supported by KVM on this host"
+        );
     }
 
     #[test]
