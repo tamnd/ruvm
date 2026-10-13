@@ -21,7 +21,9 @@ use ruvm_hw_intc::ioapic::{IoApic, IoApicMsiHandler, IoApics};
 use ruvm_hw_iommu::virtio_iommu::{
     ReservedRegion, TYPE_VIRTIO_IOMMU_MEMORY_REGION, VIRTIO_IOMMU_RESV_MEM_T_MSI,
 };
-use ruvm_hw_iommu::{IntelIommu, IntelIommuConf, Viommu, VirtioIommu, VirtioIommuConf};
+use ruvm_hw_iommu::{
+    AmdIommu, AmdIommuConf, IntelIommu, IntelIommuConf, Viommu, VirtioIommu, VirtioIommuConf,
+};
 use ruvm_hw_tpm::TpmBackend;
 use ruvm_hw_tpm::crb::TpmCrb;
 use ruvm_hw_tpm::tis::TpmTis;
@@ -263,6 +265,23 @@ impl X86Board {
         let conf = conf.realize(m.kvm(), m.kvm())?;
         let iommu = IntelIommu::new(conf, m.memory_as());
         m.attach_intel_iommu(&iommu)
+    }
+
+    /// Plugs an `amd-iommu` with the properties `conf`: `pc_machine_device_pre_plug_cb()`,
+    /// `x86_iommu_realize()` and `amdvi_sysbus_realize()`. KVM is taken to have the whole
+    /// irqchip in the kernel.
+    pub fn attach_amd_iommu(&mut self, conf: &AmdIommuConf) -> Result<(), String> {
+        let X86Board::Q35(m, _) = self else {
+            return Err(
+                "Parameter 'driver' expects a dynamic sysbus device type for the machine".into()
+            );
+        };
+        if m.pci_dma().has_iommu() {
+            return Err("QEMU does not support multiple vIOMMUs for x86 yet.".to_string());
+        }
+        let conf = conf.realize(m.kvm())?;
+        let iommu = AmdIommu::new(conf, m.memory_as());
+        m.attach_amd_iommu(&iommu)
     }
 
     /// The board part of `tpm_tis_isa_realizefn()`, see [`Q35::attach_tpm_tis`].

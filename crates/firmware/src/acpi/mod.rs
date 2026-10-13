@@ -9,6 +9,7 @@ pub mod cpuhp;
 pub mod devices;
 pub mod dmar;
 pub mod gpex;
+pub mod ivrs;
 pub mod linker;
 pub mod microvm;
 pub mod pci;

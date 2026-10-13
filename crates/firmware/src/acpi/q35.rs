@@ -14,6 +14,7 @@ use super::aml::{
 };
 use super::devices::{self, IsaDevice};
 use super::dmar::{self, DmarInfo};
+use super::ivrs::{self, IvrsInfo};
 use super::linker::BiosLinker;
 use super::pci::{self, CrsRange, CrsRangeSet};
 use super::table::{self, AcpiTable, FadtData, Gas, McfgInfo, RsdpData, TABLE_FILE, fadt_flags};
@@ -106,6 +107,8 @@ pub struct Q35Acpi {
     pub pci_hole64: Option<CrsRange>,
     /// The devices on the root bus in devfn order.
     pub pci_devices: Vec<PciDevice>,
+    /// The IVRS contents when there is an amd-iommu.
+    pub ivrs: Option<IvrsInfo>,
     /// The DMAR contents when there is an intel-iommu.
     pub dmar: Option<DmarInfo>,
     /// The VIOT contents when there is a virtio-iommu-pci.
@@ -700,6 +703,10 @@ pub fn build(q: &Q35Acpi) -> BuildTables {
     if let Some(mcfg) = &q.mcfg {
         table::add_table(&mut table_offsets, data);
         table::build_mcfg(data, linker, mcfg, &q.oem_id, &q.oem_table_id);
+    }
+    if let Some(ivrs) = &q.ivrs {
+        table::add_table(&mut table_offsets, data);
+        ivrs::build_ivrs(data, linker, ivrs, &q.oem_id, &q.oem_table_id);
     }
     if let Some(dmar) = &q.dmar {
         table::add_table(&mut table_offsets, data);
