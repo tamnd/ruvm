@@ -1138,9 +1138,31 @@ fn plan_device(
     let Some(&(typename, model, transport)) = DEVICE_TYPES.iter().find(|(t, ..)| *t == name) else {
         return Err(Located::new(loc, format!("'{driver}' is not a valid device model name")));
     };
+    // qdev_device_add() finds the bus before it sets any property.
+    let bus_type = match transport {
+        Transport::Mmio => "virtio-bus",
+        Transport::Pci => "PCI",
+    };
+    let has_bus = matches!(
+        (kind, transport),
+        (Some(BoardKind::Microvm), Transport::Mmio) | (Some(BoardKind::Q35), Transport::Pci)
+    );
+    match opts.get("bus") {
+        Some(b)
+            if !(kind == Some(BoardKind::Q35) && transport == Transport::Pci && b == "pcie.0") =>
+        {
+            return Err(Located::new(loc, format!("Bus '{b}' not found")));
+        }
+        _ => {}
+    }
+    if !has_bus {
+        return Err(Located::new(
+            loc,
+            format!("No '{bus_type}' bus found for device '{typename}'"),
+        ));
+    }
     let mut drive = None;
     let mut serial = None;
-    let mut bus = None;
     let mut netdev = None;
     let mut mac = None;
     // virtio_net_pci_class_init() sets the romfile; an empty one means none.
@@ -1199,8 +1221,7 @@ fn plan_device(
             _ => {}
         }
         match k {
-            "driver" | "id" => {}
-            "bus" => bus = Some(v.to_string()),
+            "driver" | "id" | "bus" => {}
             "netdev" if model == VirtioModel::Net => netdev = Some(v.to_string()),
             "mac" if model == VirtioModel::Net => {
                 mac = Some(parse_mac(v).ok_or_else(|| {
@@ -1233,29 +1254,6 @@ fn plan_device(
                 return Err(Located::new(loc, format!("Property '{typename}.{k}' not found")));
             }
         }
-    }
-    // qdev_device_add() finds the bus before the device is realized.
-    let bus_type = match transport {
-        Transport::Mmio => "virtio-bus",
-        Transport::Pci => "PCI",
-    };
-    let has_bus = matches!(
-        (kind, transport),
-        (Some(BoardKind::Microvm), Transport::Mmio) | (Some(BoardKind::Q35), Transport::Pci)
-    );
-    match bus {
-        Some(b)
-            if !(kind == Some(BoardKind::Q35) && transport == Transport::Pci && b == "pcie.0") =>
-        {
-            return Err(Located::new(loc, format!("Bus '{b}' not found")));
-        }
-        _ => {}
-    }
-    if !has_bus {
-        return Err(Located::new(
-            loc,
-            format!("No '{bus_type}' bus found for device '{typename}'"),
-        ));
     }
     if model == VirtioModel::Blk {
         let Some(i) = drive else {
@@ -2778,6 +2776,69 @@ mod tests {
         );
         let p = plan(k, &d, &[], false).unwrap();
         assert_eq!(p.default_cdrom, None);
+    }
+
+    #[test]
+    fn virtio_iommu_properties() {
+        let m = Some(BoardKind::Microvm);
+        let q = Some(BoardKind::Q35);
+        let err = |kind, args: &[&str]| {
+            plan(kind, &[], &devices(args), true).unwrap_err()[0].1.message().to_string()
+        };
+        let p = plan(q, &[], &devices(&["virtio-iommu"]), true).unwrap();
+        let conf = p.virtio[0].iommu.clone().unwrap();
+        assert_eq!(p.virtio[0].typename, "virtio-iommu-pci");
+        assert_eq!((conf.boot_bypass, conf.granule, conf.aw_bits), (true, GranuleMode::Host, 39));
+        let args = ["virtio-iommu-pci,boot-bypass=off,granule=64k,aw-bits=0x30,disable-legacy=off"];
+        let conf = plan(q, &[], &devices(&args), true).unwrap().virtio[0].iommu.clone().unwrap();
+        assert_eq!((conf.boot_bypass, conf.granule, conf.aw_bits), (false, GranuleMode::G64k, 48));
+        let p =
+            plan(q, &[], &devices(&["virtio-rng-pci,iommu_platform=on,disable-legacy=on"]), true);
+        let plug = &p.unwrap().virtio[0];
+        assert_eq!((plug.iommu_platform, plug.disable_legacy), (true, Some(true)));
+
+        assert_eq!(
+            err(q, &["virtio-iommu-pci,granule=2k"]),
+            "Parameter 'granule' does not accept value '2k'"
+        );
+        assert_eq!(
+            err(q, &["virtio-iommu-pci,aw-bits=abc"]),
+            "Parameter 'aw-bits' expects integer"
+        );
+        assert_eq!(
+            err(q, &["virtio-iommu-pci,aw-bits=300"]),
+            "Parameter 'aw-bits' expects uint8_t"
+        );
+        assert_eq!(
+            err(q, &["virtio-iommu-pci,boot-bypass=x"]),
+            "Parameter 'boot-bypass' expects 'on' or 'off'"
+        );
+        assert_eq!(
+            err(q, &["virtio-iommu-pci,reserved-regions=1"]),
+            "Invalid parameter type for 'reserved-regions', expected: array"
+        );
+        assert_eq!(
+            err(q, &["virtio-rng-pci,iommu_platform=x"]),
+            "Parameter 'iommu_platform' expects 'on' or 'off'"
+        );
+        assert_eq!(
+            err(q, &["virtio-rng-pci,disable-legacy=x"]),
+            "Parameter 'disable-legacy' does not accept value 'x'"
+        );
+        // The bus is looked up before any property is set.
+        assert_eq!(
+            err(q, &["virtio-iommu-device,boot-bypass=x"]),
+            "No 'virtio-bus' bus found for device 'virtio-iommu-device'"
+        );
+        assert_eq!(err(q, &["virtio-iommu-pci,bus=foo"]), "Bus 'foo' not found");
+        assert_eq!(
+            err(m, &["virtio-iommu-pci"]),
+            "No 'PCI' bus found for device 'virtio-iommu-pci'"
+        );
+        assert_eq!(
+            err(m, &["virtio-iommu-device,reserved-regions=1"]),
+            "Property 'virtio-iommu-device.reserved-regions' not found"
+        );
     }
 
     #[test]
