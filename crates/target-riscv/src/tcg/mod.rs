@@ -1317,6 +1317,21 @@ pub fn save_vcpu(v: &Vcpu) -> CpuRiscvState {
     CpuRiscvState::load(&v.env)
 }
 
+/// The configuration of the hart `cpu` runs, which picks the registers the gdbstub offers.
+pub fn cpu_cfg(cpu: &Cpu<'_>) -> RiscvCfg {
+    let ops = cpu.ops();
+    *riscv_of(&ops).cfg()
+}
+
+/// `riscv_csrrw_debug()` in user mode: read CSR `csrno`, or with `write` set it to that
+/// value. `None` when the access raises an exception.
+pub fn csrrw_debug(cpu: &mut Cpu<'_>, csrno: u32, write: Option<u64>) -> Option<u64> {
+    match write {
+        None => csr::csrr(cpu, csrno).ok(),
+        Some(v) => csr::csrrw(cpu, csrno, v, u64::MAX).ok(),
+    }
+}
+
 /// Whether `v` is halted in WFI.
 pub fn vcpu_halted(v: &Vcpu) -> bool {
     v.shared().halted.load(Ordering::Acquire) != 0

@@ -327,6 +327,11 @@ fn ptr_mask(param: &Param) -> u64 {
     mask(bot, top - bot)
 }
 
+/// `pauth_ptr_mask()` of the parameters for `ptr`.
+pub(crate) fn va_ptr_mask(f: &ArmFeatures, st: &CpuArmState, ptr: u64, data: bool) -> u64 {
+    ptr_mask(&va_params(f, st, ptr, data))
+}
+
 /// `pauth_original_ptr()`.
 fn original_ptr(ptr: u64, param: &Param) -> u64 {
     let m = ptr_mask(param);

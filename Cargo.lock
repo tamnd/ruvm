@@ -1760,7 +1760,10 @@ version = "0.5.7"
 name = "ruvm-gdbstub"
 version = "0.5.7"
 dependencies = [
+ "ruvm-jit",
  "ruvm-linux-user",
+ "ruvm-target-arm",
+ "ruvm-target-riscv",
  "ruvm-target-x86",
 ]
 

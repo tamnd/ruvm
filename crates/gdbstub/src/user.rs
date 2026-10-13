@@ -29,8 +29,9 @@ pub(crate) struct Target {
     pub(crate) name: &'static str,
     /// `gdb_arch_name()`, for `<architecture>`.
     pub(crate) arch: Option<&'static str>,
-    /// The XML of each register feature, the core one first.
-    pub(crate) features: &'static [(&'static str, &'static str)],
+    /// `gdb_register_coprocessor()` for each register feature of the vCPU, the core one
+    /// first: the name of its XML and the XML.
+    pub(crate) features: fn(&mut Cx<'_, '_>) -> Vec<(&'static str, String)>,
     /// `gdb_num_g_regs`: how many registers `g` and `G` carry.
     pub(crate) g_regs: usize,
     /// The hex digits of `TARGET_ABI_FMT_lx`: 8 for a 32-bit ABI, 16 for a 64-bit one.
@@ -38,20 +39,76 @@ pub(crate) struct Target {
     /// `gdb_read_register()`: appends register `n` of a thread, returning its size, 0 for no
     /// such register.
     pub(crate) read: fn(&mut Cx<'_, '_>, u32, usize, &mut Vec<u8>) -> usize,
-    /// `gdb_write_register()`: sets register `n` from at least 16 bytes, returning its size.
+    /// `gdb_write_register()`: sets register `n` from at least [`MAX_REG_BYTES`] bytes,
+    /// returning its size.
     pub(crate) write: fn(&mut Cx<'_, '_>, u32, usize, &[u8]) -> usize,
     /// `set_pc()`.
     pub(crate) set_pc: fn(&mut [u8], u64),
+}
+
+/// `GDBFeatureBuilder`: the XML of a register feature made at run time, numbering its
+/// registers from `base`.
+pub(crate) struct FeatureBuilder {
+    xml: String,
+    base: usize,
+    regs: usize,
+}
+
+impl FeatureBuilder {
+    /// `gdb_feature_builder_init()`.
+    pub(crate) fn new(name: &str, base: usize) -> FeatureBuilder {
+        let xml = format!(
+            "<?xml version=\"1.0\"?><!DOCTYPE feature SYSTEM \"gdb-target.dtd\"><feature name=\"{name}\">"
+        );
+        FeatureBuilder { xml, base, regs: 0 }
+    }
+
+    /// `gdb_feature_builder_append_tag()`.
+    pub(crate) fn tag(&mut self, tag: &str) {
+        self.xml.push_str(tag);
+    }
+
+    /// `gdb_feature_builder_append_reg()`: register `regnum` of the feature.
+    pub(crate) fn reg(
+        &mut self,
+        name: &str,
+        bitsize: usize,
+        regnum: usize,
+        ty: &str,
+        group: Option<&str>,
+    ) {
+        self.regs = self.regs.max(regnum + 1);
+        let n = self.base + regnum;
+        let _ = write!(
+            self.xml,
+            "<reg name=\"{name}\" bitsize=\"{bitsize}\" regnum=\"{n}\" type=\"{ty}\""
+        );
+        if let Some(g) = group {
+            let _ = write!(self.xml, " group=\"{g}\"");
+        }
+        self.xml.push_str("/>");
+    }
+
+    /// `gdb_feature_builder_end()`: the XML, and how many register numbers it takes.
+    pub(crate) fn end(mut self) -> (String, usize) {
+        self.xml.push_str("</feature>");
+        (self.xml, self.regs)
+    }
 }
 
 /// The target for `uname -m` of the guest.
 fn target_of(machine: &str) -> Option<&'static Target> {
     match machine {
         "x86_64" => Some(&crate::x86_64::TARGET),
+        "aarch64" => Some(&crate::aarch64::TARGET),
+        "riscv64" => Some(&crate::riscv64::TARGET),
         _ => None,
     }
 }
 
+/// The largest register, an SVE Z register of 2048 bits, which the buffer a register is
+/// written from always holds.
+const MAX_REG_BYTES: usize = 256;
 /// `TARGET_SIGTRAP`, the same on every target.
 const TARGET_SIGTRAP: i32 = 5;
 /// `SSTEP_ENABLE`, `SSTEP_NOIRQ` and `SSTEP_NOTIMER`, all of which TCG has.
@@ -131,6 +188,8 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 /// The target, from when `-g` started the stub.
 static TARGET: OnceLock<&'static Target> = OnceLock::new();
+/// Its register features, from the vCPU of the first thread.
+static FEATURES: OnceLock<Vec<(&'static str, String)>> = OnceLock::new();
 
 thread_local! {
     /// The state, held from `gdbserver_fork_start()` to `gdbserver_fork_end()` so that the
@@ -239,6 +298,11 @@ impl User {
     }
 }
 
+/// The register features of the target.
+fn features() -> &'static [(&'static str, String)] {
+    FEATURES.get().map_or(&[], Vec::as_slice)
+}
+
 /// `gdbserver_start()`.
 fn gdbserver_start(cx: &mut Cx<'_, '_>, args: &str) -> Result<(), String> {
     let mut port_or_path = None;
@@ -266,6 +330,7 @@ fn gdbserver_start(cx: &mut Cx<'_, '_>, args: &str) -> Result<(), String> {
         return Err(format!("gdbstub: -g is not supported for {} by ruvm yet", cx.machine()));
     };
     let _ = TARGET.set(target);
+    let _ = FEATURES.set((target.features)(cx));
     // g_ascii_strtoull() then a cast to int.
     let port = strtoul(port_or_path.as_bytes(), 10).0.unwrap_or(u64::MAX) as i32;
     let listener = if port > 0 {
@@ -878,7 +943,7 @@ impl State {
     /// `gdb_write_register()` from `mem`, padded so that a short value reads as zeros.
     fn write_register(&mut self, cx: &mut Cx<'_, '_>, mem: &[u8], n: usize) -> usize {
         let mut m = mem.to_vec();
-        m.resize(mem.len().max(16), 0);
+        m.resize(mem.len().max(MAX_REG_BYTES), 0);
         let tid = self.g_tid(cx);
         (self.target.write)(cx, tid, n, &m)
     }
@@ -1337,7 +1402,7 @@ impl State {
                 if let Some(a) = t.arch {
                     let _ = write!(x, "<architecture>{a}</architecture>");
                 }
-                for (name, _) in t.features {
+                for (name, _) in features() {
                     let _ = write!(x, "<xi:include href=\"{name}\"/>");
                 }
                 x.push_str("</target>");
@@ -1345,9 +1410,8 @@ impl State {
             });
             return Some(xml.clone());
         }
-        let found =
-            self.target.features.iter().find(|(name, _)| name.as_bytes().starts_with(annex));
-        found.map(|(_, xml)| (*xml).to_string())
+        let found = features().iter().find(|(name, _)| name.as_bytes().starts_with(annex));
+        found.map(|(_, xml)| xml.clone())
     }
 
     fn query_xfer_features(&mut self, params: &[Param<'_>]) {

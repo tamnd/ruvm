@@ -13,8 +13,8 @@ use ruvm_jit::{Cpu, CpuLoopExit, MmuAccessType, Ra};
 
 use super::{Arm, ptw};
 use crate::cpu::{
-    ArmCpuModel, CpuArmState, PSTATE_MODE_EL0T, SCTLR_ATA0, SCTLR_DZE, SCTLR_ENDA, SCTLR_ENDB,
-    SCTLR_ENIA, SCTLR_ENIB, SCTLR_UCI, SCTLR_UCT,
+    ArmCpuModel, ArmFeatures, CpuArmState, PSTATE_MODE_EL0T, SCTLR_ATA0, SCTLR_DZE, SCTLR_ENDA,
+    SCTLR_ENDB, SCTLR_ENIA, SCTLR_ENIB, SCTLR_UCI, SCTLR_UCT,
 };
 use crate::syndrome::fsc;
 
@@ -142,6 +142,24 @@ pub fn sve_vq(cpu: &Cpu<'_>, st: &CpuArmState) -> Option<u32> {
     let ops = cpu.ops();
     let f = super::arm_of(&ops).features();
     f.sve.then(|| super::sve_vqm1_for_el(f, st, 0) + 1)
+}
+
+/// The features of the model `cpu` runs, which pick the registers the gdbstub offers.
+pub fn features(cpu: &Cpu<'_>) -> ArmFeatures {
+    let ops = cpu.ops();
+    *super::arm_of(&ops).features()
+}
+
+/// `sve_vqm1_for_el()` at EL0 plus one: the vector length a program runs with, in
+/// quadwords, for a model with SVE.
+pub fn sve_vq_el0(f: &ArmFeatures, st: &CpuArmState) -> u32 {
+    super::sve_vqm1_for_el(f, st, 0) + 1
+}
+
+/// `pauth_ptr_mask()` of `aa64_va_parameters()` at `arm_stage1_mmu_idx()`, for data or
+/// instruction pointers in the low half of the address space or, with `high`, the high one.
+pub fn pauth_ptr_mask(f: &ArmFeatures, st: &CpuArmState, high: bool, data: bool) -> u64 {
+    super::pauth::va_ptr_mask(f, st, if high { u64::MAX } else { 0 }, data)
 }
 
 /// Store `st` into `cpu` with its TB flags rebuilt, after a signal frame changes it.
