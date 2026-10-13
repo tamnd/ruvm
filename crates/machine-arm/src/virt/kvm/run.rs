@@ -13,8 +13,7 @@
 //! a reset stops every vCPU, resets the board and the in-kernel GIC, loads each vCPU with its
 //! reset state and the boot PC, and lets them go again. With `-no-reboot` it is a shutdown.
 //!
-//! Not done yet: EL2 for the guest, SVE and pointer authentication, which need the host's ID
-//! registers, and migration of the GIC and ITS state.
+//! Not done yet: EL2 for the guest and migration of the GIC and ITS state.
 
 use std::cell::Cell;
 use std::fmt;
@@ -23,7 +22,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ruvm_accel_kvm::arm::vcpu::{ArmVcpu, ArmVcpuConfig, PutLevel, steal_time_finalize};
+use ruvm_accel_kvm::arm::vcpu::{
+    ArmVcpu, ArmVcpuConfig, KvmCpuProps, PutLevel, steal_time_finalize,
+};
 use ruvm_accel_kvm::arm::{GITS_TRANSLATER, GicV2State, GicV3State, ItsState};
 use ruvm_accel_kvm::{
     KernelIrqchip, KvmAccel, KvmGicV2, KvmGicV3, KvmIts, KvmVcpu, VcpuKick, VcpuStop,
@@ -408,15 +409,15 @@ impl fmt::Debug for KvmVirtMachine {
 impl KvmVirtMachine {
     /// Puts `board`, built from a config that went through [`prepare_config`], on the VM of
     /// `accel`. `spis` is what [`prepare_config`] gave. `clocks` are the clocks the board's
-    /// timers run on; a thread fires them. Only `cfg.no_reboot` is looked at. `steal_time` is
-    /// the `kvm-steal-time` CPU property, `None` for auto.
+    /// timers run on; a thread fires them. Only `cfg.no_reboot` is looked at. `props` are the
+    /// CPU properties, SVE and pointer authentication already checked against the host.
     pub fn new(
         accel: KvmAccel,
         board: VirtMachine,
         spis: KvmSpis,
         clocks: Vec<Arc<Clock>>,
         cfg: &VirtRunConfig,
-        steal_time: Option<bool>,
+        props: KvmCpuProps,
         handler: VirtEventHandler,
     ) -> Result<KvmVirtMachine, String> {
         let accel = Arc::new(accel);
@@ -438,7 +439,7 @@ impl KvmVirtMachine {
         let target = accel.arm_preferred_target().map_err(err)?;
         let caps = accel.arm_caps();
         // arm_cpu_finalize_features() when the CPUs are realized.
-        let steal_time = steal_time_finalize(steal_time, caps.steal_time, true)?;
+        let steal_time = steal_time_finalize(props.steal_time, caps.steal_time, true)?;
         let mut vcpus = Vec::with_capacity(smp);
         for i in 0..smp {
             let mut vcpu = accel.create_vcpu(i as u32).map_err(err)?;
@@ -446,6 +447,8 @@ impl KvmVirtMachine {
             vcfg.start_powered_off = i != 0 && board.secondaries_off;
             vcfg.pmu = caps.pmu_v3 && board.model.features.pmu != 0;
             vcfg.steal_time = steal_time;
+            vcfg.sve_vq_map = props.sve_vq_map;
+            vcfg.pauth = props.pauth;
             let arm = ArmVcpu::init(&mut vcpu, &vcfg, &caps)
                 .map_err(|e| format!("kvm_init_vcpu: kvm_arch_init_vcpu failed ({i}): {e}"))?;
             vcpus.push((vcpu, arm));

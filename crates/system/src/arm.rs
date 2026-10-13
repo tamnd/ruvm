@@ -759,12 +759,40 @@ pub(crate) fn parse_cpu(board: ArmBoard, arg: Option<&str>) -> Result<ArmCpuMode
     Ok(model)
 }
 
-/// The CPU model for `-cpu` with KVM, and its `kvm-steal-time` property, `None` for auto. Only
-/// `host` and `max`, which is `host` under KVM, are taken, since ruvm inits every vCPU with the
-/// target KVM prefers. `host_pmu` says whether KVM can give the guest a PMU, which `host` has
-/// unless `pmu=off`.
+/// What the host's KVM can give a `-cpu host` vCPU, the parts of `arm_host_cpu_features` the
+/// properties look at.
 #[cfg_attr(not(all(target_os = "linux", target_arch = "aarch64")), allow(dead_code))]
-fn kvm_cpu_model(arg: Option<&str>, host_pmu: bool) -> Result<(ArmCpuModel, Option<bool>)> {
+#[derive(Copy, Clone, Debug, Default)]
+struct KvmHostCpu {
+    /// `KVM_CAP_ARM_PMU_V3`.
+    pmu: bool,
+    /// The host has SVE vector lengths for its guests.
+    sve: bool,
+}
+
+/// `-cpu host` under KVM: the model for the device tree and the properties as given. SVE and
+/// pointer authentication are checked against the host when the CPU is finalized.
+#[cfg_attr(not(all(target_os = "linux", target_arch = "aarch64")), allow(dead_code))]
+#[derive(Debug)]
+struct KvmCpu {
+    model: ArmCpuModel,
+    /// `kvm-steal-time`, `None` for auto.
+    steal_time: Option<bool>,
+    /// `sve`, on by default when the host has SVE.
+    sve: bool,
+    /// The `sve<N>` properties set to on, one bit per quadword count less one.
+    sve_map: u32,
+    /// The `sve<N>` properties given at all.
+    sve_init: u32,
+    /// `pauth`, `None` to follow the host.
+    pauth: Option<bool>,
+}
+
+/// The CPU model and properties for `-cpu` with KVM. Only `host` and `max`, which is `host`
+/// under KVM, are taken, since ruvm inits every vCPU with the target KVM prefers. `host` has a
+/// PMU unless `pmu=off` when KVM can give the guest one.
+#[cfg_attr(not(all(target_os = "linux", target_arch = "aarch64")), allow(dead_code))]
+fn kvm_cpu_model(arg: Option<&str>, host: KvmHostCpu) -> Result<KvmCpu> {
     // QEMU's default for virt is a cortex-a15, which KVM refuses.
     let Some(arg) = arg else {
         return Err(Error::generic("-accel kvm needs -cpu host or -cpu max in ruvm for now"));
@@ -777,8 +805,15 @@ fn kvm_cpu_model(arg: Option<&str>, host_pmu: bool) -> Result<(ArmCpuModel, Opti
         ))
         .hint("Use -cpu host.\n"));
     }
-    let mut pmu = host_pmu;
-    let mut steal_time = None;
+    let mut pmu = host.pmu;
+    let mut cpu = KvmCpu {
+        model: ArmCpuModel::max(),
+        steal_time: None,
+        sve: host.sve,
+        sve_map: 0,
+        sve_init: 0,
+        pauth: None,
+    };
     for feat in parts.filter(|f| !f.is_empty()) {
         let (prop, value) = match feat.split_once('=') {
             Some((p, v)) => (p, v),
@@ -790,11 +825,28 @@ fn kvm_cpu_model(arg: Option<&str>, host_pmu: bool) -> Result<(ArmCpuModel, Opti
         match prop {
             "pmu" => {
                 pmu = prop_bool(prop, value)?;
-                if pmu && !host_pmu {
+                if pmu && !host.pmu {
                     return Err(Error::generic("'pmu' feature not supported by KVM on this host"));
                 }
             }
-            "kvm-steal-time" => steal_time = Some(prop_bool(prop, value)?),
+            "kvm-steal-time" => cpu.steal_time = Some(prop_bool(prop, value)?),
+            // A stub without host SVE, so that sve=off is always taken.
+            "sve" if !host.sve => {
+                if prop_bool(prop, value)? {
+                    return Err(Error::generic("'sve' feature not supported by KVM on this host"));
+                }
+            }
+            "sve" => cpu.sve = prop_bool(prop, value)?,
+            "pauth" => cpu.pauth = Some(prop_bool(prop, value)?),
+            _ if sve_vq(prop).is_some() => {
+                let bit = 1 << (sve_vq(prop).unwrap_or(1) - 1);
+                if prop_bool(prop, value)? {
+                    cpu.sve_map |= bit;
+                } else {
+                    cpu.sve_map &= !bit;
+                }
+                cpu.sve_init |= bit;
+            }
             _ => {
                 return Err(Error::generic(format!(
                     "CPU property {prop}={value} with KVM is not supported by ruvm yet"
@@ -803,10 +855,18 @@ fn kvm_cpu_model(arg: Option<&str>, host_pmu: bool) -> Result<(ArmCpuModel, Opti
         }
     }
     // aarch64_host_initfn(): the host's ID registers, a generic v8 node in the device tree.
-    let mut model = ArmCpuModel::max();
-    model.name = "host";
-    model.dtb_compatible = "arm,arm-v8";
-    Ok((if pmu { model } else { model.without_pmu() }, steal_time))
+    cpu.model.name = "host";
+    cpu.model.dtb_compatible = "arm,armv8";
+    if !pmu {
+        cpu.model = cpu.model.without_pmu();
+    }
+    Ok(cpu)
+}
+
+/// The quadword count of an `sve<N>` property, `sve128` to `sve2048` in steps of 128.
+fn sve_vq(prop: &str) -> Option<u32> {
+    let bits: u32 = prop.strip_prefix("sve")?.parse().ok()?;
+    (bits % 128 == 0 && (1..=ARM_MAX_VQ as u32).contains(&(bits / 128))).then_some(bits / 128)
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1622,30 +1682,45 @@ mod tests {
 
     #[test]
     fn kvm_takes_only_the_host_cpu() {
-        let (m, steal_time) = kvm_cpu_model(Some("host"), true).unwrap();
-        assert_eq!((m.name, m.dtb_compatible), ("host", "arm,arm-v8"));
-        assert_ne!(m.features.pmu, 0);
-        assert_eq!(steal_time, None);
-        assert_eq!(kvm_cpu_model(Some("max"), true).unwrap().0.name, "host");
-        assert_eq!(kvm_cpu_model(Some("host"), false).unwrap().0.features.pmu, 0);
-        assert_eq!(kvm_cpu_model(Some("host,pmu=off"), true).unwrap().0.features.pmu, 0);
-        assert_eq!(kvm_cpu_model(Some("host,kvm-steal-time=off"), true).unwrap().1, Some(false));
-        assert_eq!(kvm_cpu_model(Some("max,kvm-steal-time=on"), true).unwrap().1, Some(true));
-        let msg = |arg: Option<&str>, pmu: bool| {
-            kvm_cpu_model(arg, pmu).unwrap_err().message().to_string()
+        let host = KvmHostCpu { pmu: true, sve: true };
+        let cpu = |arg: &str, host: KvmHostCpu| kvm_cpu_model(Some(arg), host).unwrap();
+        let c = cpu("host", host);
+        assert_eq!((c.model.name, c.model.dtb_compatible), ("host", "arm,armv8"));
+        assert_ne!(c.model.features.pmu, 0);
+        assert_eq!((c.steal_time, c.sve, c.sve_map, c.sve_init, c.pauth), (None, true, 0, 0, None));
+        assert_eq!(cpu("max", host).model.name, "host");
+        assert_eq!(cpu("host", KvmHostCpu::default()).model.features.pmu, 0);
+        assert!(!cpu("host", KvmHostCpu::default()).sve);
+        assert_eq!(cpu("host,pmu=off", host).model.features.pmu, 0);
+        assert_eq!(cpu("host,kvm-steal-time=off", host).steal_time, Some(false));
+        assert_eq!(cpu("max,kvm-steal-time=on", host).steal_time, Some(true));
+        assert!(!cpu("host,sve=off", host).sve);
+        assert!(!cpu("host,sve=off", KvmHostCpu::default()).sve);
+        assert_eq!(cpu("host,pauth=off", host).pauth, Some(false));
+        let c = cpu("host,sve256=on,sve384=on,sve384=off,sve512=off", host);
+        assert_eq!((c.sve_map, c.sve_init), (0b0010, 0b1110));
+        assert_eq!(cpu("host,sve2048=on", host).sve_map, 1 << 15);
+        let msg = |arg: Option<&str>, host: KvmHostCpu| {
+            kvm_cpu_model(arg, host).unwrap_err().message().to_string()
         };
         assert_eq!(
-            msg(Some("host,pmu=on"), false),
+            msg(Some("host,pmu=on"), KvmHostCpu::default()),
             "'pmu' feature not supported by KVM on this host"
         );
-        assert_eq!(msg(None, true), "-accel kvm needs -cpu host or -cpu max in ruvm for now");
         assert_eq!(
-            msg(Some("cortex-a57"), true),
+            msg(Some("host,sve=on"), KvmHostCpu::default()),
+            "'sve' feature not supported by KVM on this host"
+        );
+        assert_eq!(msg(None, host), "-accel kvm needs -cpu host or -cpu max in ruvm for now");
+        assert_eq!(
+            msg(Some("cortex-a57"), host),
             "CPU model 'cortex-a57' with KVM is not supported by ruvm yet"
         );
-        assert_eq!(
-            msg(Some("host,sve=off"), true),
-            "CPU property sve=off with KVM is not supported by ruvm yet"
-        );
+        for bad in ["sve0", "sve100", "sve2176", "sve-max-vq"] {
+            assert_eq!(
+                msg(Some(&format!("host,{bad}=on")), host),
+                format!("CPU property {bad}=on with KVM is not supported by ruvm yet")
+            );
+        }
     }
 }

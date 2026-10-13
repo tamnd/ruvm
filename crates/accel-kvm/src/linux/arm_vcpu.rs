@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The Arm vCPU sequences of `crate::arm::vcpu` on a real vCPU, and the VM queries they need:
-//! the preferred target and the capabilities.
+//! the preferred target, the capabilities and the host's SVE vector lengths.
 
 use std::io;
 use std::mem::offset_of;
@@ -12,9 +12,13 @@ use kvm_bindings::{
     user_pt_regs,
 };
 
-use super::{KvmAccel, KvmVcpu, os_error};
+use super::{KvmAccel, KvmVcpu, arm_max_vm_ipa_size, os_error};
 use crate::KvmError;
-use crate::arm::vcpu::{self, ArmKvmCaps, ArmVcpuOps, SErrorEvents, core_offset};
+use crate::arm::default_vm_type;
+use crate::arm::vcpu::{
+    self, ArmKvmCaps, ArmVcpuOps, KVM_ARM64_SVE_VLS_WORDS, KVM_REG_ARM64_SVE_VLS, SErrorEvents,
+    core_offset, sve_vls,
+};
 
 // The pure code spells out the kernel ABI by hand so it builds on every host. Tie it to the
 // bindings here.
@@ -197,5 +201,39 @@ impl KvmAccel {
             irq_line_layout_2: has(b::KVM_CAP_ARM_IRQ_LINE_LAYOUT_2),
             steal_time: has(b::KVM_CAP_STEAL_TIME),
         }
+    }
+
+    /// The SVE vector lengths the host can give a guest, the `kvm_arm_sve_get_vls()` part of
+    /// `kvm_arm_get_host_cpu_features()`: one bit per quadword count less one, 0 when the kernel
+    /// has no SVE. Like QEMU this asks a scratch vCPU in a VM of its own, since the lengths can
+    /// only be read before the vCPU is finalized. The second value says the kernel has lengths
+    /// longer than [`vcpu::ARM_MAX_VQ`], which QEMU warns about.
+    pub fn arm_sve_vls(&self) -> Result<(u32, bool), String> {
+        if !self.arm_caps().sve {
+            return Ok((0, false));
+        }
+        let probe = || "Failed to retrieve host CPU features".to_string();
+        let kvm = self.kvm();
+        let (max, fixed) = arm_max_vm_ipa_size(kvm);
+        let vm = loop {
+            match kvm.create_vm_with_type(default_vm_type(max, fixed)) {
+                Err(e) if e.errno() == libc::EINTR => continue,
+                r => break r.map_err(|_| probe())?,
+            }
+        };
+        let scratch = vm.create_vcpu(0).map_err(|_| probe())?;
+        let mut init = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut init).map_err(|_| probe())?;
+        init.features[0] |= 1 << vcpu::KVM_ARM_VCPU_SVE;
+        scratch.vcpu_init(&init).map_err(|_| probe())?;
+        let mut buf = [0u8; KVM_ARM64_SVE_VLS_WORDS * 8];
+        scratch.get_one_reg(KVM_REG_ARM64_SVE_VLS, &mut buf).map_err(|e| {
+            format!("failed to get KVM_REG_ARM64_SVE_VLS: {}", crate::strerror(&os_error(e)))
+        })?;
+        let mut vls = [0u64; KVM_ARM64_SVE_VLS_WORDS];
+        for (w, b) in vls.iter_mut().zip(buf.chunks_exact(8)) {
+            *w = u64::from_ne_bytes(b.try_into().expect("8 byte chunk"));
+        }
+        Ok(sve_vls(&vls))
     }
 }
