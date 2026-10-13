@@ -29,6 +29,25 @@ pub use vcpu::{KvmVcpu, VcpuKick, VcpuStop, spawn_vcpu_thread};
 #[cfg(target_arch = "aarch64")]
 pub use vgic::{KvmGicV2, KvmGicV3, KvmIts, vgic_probe};
 
+/// `kvm_arm_get_max_vm_ipa_size()`: the largest IPA size a VM can have on this host, and
+/// whether it is the fixed 40 bits of a kernel without `KVM_CAP_ARM_VM_IPA_SIZE`.
+#[cfg(target_arch = "aarch64")]
+pub fn arm_max_vm_ipa_size(kvm: &Kvm) -> (u32, bool) {
+    let cap = kvm.check_extension_raw(libc::c_ulong::from(kvm_bindings::KVM_CAP_ARM_VM_IPA_SIZE));
+    crate::arm::max_vm_ipa_size(cap)
+}
+
+/// `kvm_arch_get_default_type()`: 0 on x86, the largest IPA size on Arm.
+fn default_vm_type(_kvm: &Kvm) -> Result<u64, KvmError> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (max, fixed) = arm_max_vm_ipa_size(_kvm);
+        Ok(crate::arm::default_vm_type(max, fixed))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    Ok(0)
+}
+
 /// The capability numbers behind [`crate::REQUIRED_CAPS`].
 const REQUIRED: &[(&str, u32)] = &[
     ("KVM_CAP_USER_MEMORY", kvm_bindings::KVM_CAP_USER_MEMORY),
@@ -87,6 +106,16 @@ impl KvmAccel {
     /// `default_split` is the machine class's `default_kernel_irqchip_split`, used when the
     /// property was not given.
     pub fn new(opts: &KvmOptions, default_split: bool) -> Result<Self, KvmError> {
+        Self::with_vm_type(opts, default_split, &default_vm_type)
+    }
+
+    /// [`KvmAccel::new`] for a machine with a `kvm_type` hook: `vm_type` gives the
+    /// `KVM_CREATE_VM` type, which on Arm is the IPA size the machine's memory map needs.
+    pub fn with_vm_type(
+        opts: &KvmOptions,
+        default_split: bool,
+        vm_type: &dyn Fn(&Kvm) -> Result<u64, KvmError>,
+    ) -> Result<Self, KvmError> {
         check_host_page()?;
         let path = opts.device.as_deref().unwrap_or(Path::new("/dev/kvm"));
         let path = CString::new(path.as_os_str().as_bytes())
@@ -100,8 +129,9 @@ impl KvmAccel {
             return Err(KvmError::VersionNotSupported);
         }
 
+        let vm_type = vm_type(&kvm)?;
         let vm = loop {
-            match kvm.create_vm() {
+            match kvm.create_vm_with_type(vm_type) {
                 Err(e) if e.errno() == libc::EINTR => continue,
                 r => break r.map_err(|e| KvmError::Ioctl("KVM_CREATE_VM", os_error(e)))?,
             }

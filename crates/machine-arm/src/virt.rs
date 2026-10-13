@@ -377,6 +377,9 @@ pub struct VirtConfig {
     pub mte: bool,
     /// The `highmem*` properties, which place the regions above RAM.
     pub highmem: Highmem,
+    /// The physical address bits the memory map is laid out for, `None` for the CPU model's.
+    /// KVM sets it to the largest IPA size of the host, as `virt_kvm_type()` does.
+    pub pa_bits: Option<u32>,
     /// The `msi` property.
     pub msi: VirtMsi,
     /// The `gic-version` property.
@@ -448,6 +451,7 @@ impl fmt::Debug for VirtConfig {
             .field("secure", &self.secure)
             .field("mte", &self.mte)
             .field("highmem", &self.highmem)
+            .field("pa_bits", &self.pa_bits)
             .field("msi", &self.msi)
             .field("iommu", &self.iommu)
             .field("default_bus_bypass_iommu", &self.default_bus_bypass_iommu)
@@ -482,6 +486,7 @@ impl VirtConfig {
             secure: false,
             mte: false,
             highmem: Highmem::default(),
+            pa_bits: None,
             msi: VirtMsi::Auto,
             gic_version: VirtGicVersion::V3,
             iommu: VirtIommu::None,
@@ -927,7 +932,8 @@ impl VirtMachine {
         let smp = cfg.smp;
         let ram_size = cfg.ram_size;
 
-        let memmap = memmap::virt_set_memmap(VIRT_MEM, ram_size, model.pamax(), &cfg.highmem)?;
+        let pa_bits = cfg.pa_bits.unwrap_or_else(|| model.pamax());
+        let memmap = memmap::virt_set_memmap(VIRT_MEM, ram_size, pa_bits, &cfg.highmem)?;
         // finalize_msi_controller(): auto is the ITS with a GICv3 and the GICv2m with a GICv2.
         let v2 = cfg.gic_version == VirtGicVersion::V2;
         let msi = match cfg.msi {

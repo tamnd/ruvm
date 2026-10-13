@@ -6,13 +6,13 @@
 use std::sync::Arc;
 
 use ruvm_accel::tcg::TcgOptions;
-use ruvm_accel_kvm::arm::{GicVersion, finalize_gic_version, kvm_gics_supported};
-use ruvm_accel_kvm::{KernelIrqchip, KvmAccel, vgic_probe};
+use ruvm_accel_kvm::arm::{GicVersion, default_vm_type, finalize_gic_version, kvm_gics_supported};
+use ruvm_accel_kvm::{KernelIrqchip, Kvm, KvmAccel, KvmError, arm_max_vm_ipa_size, vgic_probe};
 use ruvm_base::Error;
 use ruvm_chardev::Chardev;
 use ruvm_machine_arm::tcg_run::VirtRunConfig;
-use ruvm_machine_arm::virt::VirtGicVersion;
-use ruvm_machine_arm::virt::kvm::{KvmVirtMachine, prepare_config};
+use ruvm_machine_arm::virt::kvm::{KvmVirtMachine, prepare_config, virt_kvm_type};
+use ruvm_machine_arm::virt::{VIRT_DEFAULT_RAM_SIZE, VirtGicVersion};
 
 use super::{
     ArmArgs, ArmBoard, BoardOptions, BuiltVirt, Machine, Running, build_virt, dumpdtb,
@@ -20,6 +20,23 @@ use super::{
 };
 use crate::vl::Vm;
 use crate::x86::Located;
+
+/// The `kvm_type` hook of the board of `opts`, which `kvm_init()` calls for the type of the VM
+/// it creates: `virt_kvm_type()` for virt, the IPA size of its memory map, and
+/// `kvm_arch_get_default_type()` for sbsa-ref, which has no hook.
+pub(crate) fn kvm_vm_type(opts: &BoardOptions) -> impl Fn(&Kvm) -> Result<u64, KvmError> + use<> {
+    let virt = opts.board == ArmBoard::Virt;
+    let ram_size = opts.ram_size.unwrap_or(VIRT_DEFAULT_RAM_SIZE);
+    let hm = opts.highmem;
+    move |kvm| {
+        let (max, fixed) = arm_max_vm_ipa_size(kvm);
+        if virt {
+            virt_kvm_type(ram_size, &hm, max, fixed)
+        } else {
+            Ok(default_vm_type(max, fixed))
+        }
+    }
+}
 
 /// `finalize_gic_version()` for KVM: checks the GIC the board asks for is one the host's KVM
 /// can give the guest, with QEMU's errors.
