@@ -22,6 +22,11 @@
 //! memory, where nothing takes it without AIA, and the device tree gives the bridge no
 //! `msi-parent`, so Linux uses INTx.
 //!
+//! A `riscv-iommu-pci` ([`VirtMachine::attach_riscv_iommu_pci`]) puts the RISC-V IOMMU on the
+//! root bus. The first one translates the DMA of the virtio functions with `iommu_platform`
+//! on and the MSIs of every function but the IOMMUs, and the device tree gets its
+//! `riscv,pci-iommu` node and the bridge's `iommu-map`.
+//!
 //! `aia=aplic` replaces the PLIC with two APLIC domains in direct mode ([`Aia`]): the M level
 //! one at 0xc000000 takes the device interrupts on the same sources and can delegate them to
 //! the S level one at 0xd000000. `aia=aplic-imsic` puts both domains in MSI mode and gives
@@ -79,7 +84,9 @@
 //!
 //! # Not modelled
 //!
-//! - The RISC-V IOMMU (`iommu-sys=on`); that property is taken only with its default value.
+//! - The platform RISC-V IOMMU (`iommu-sys=on`); that property is taken only with its
+//!   default value.
+//! - The RIMT ACPI table of a `riscv-iommu-pci`.
 //! - SMBIOS (`virt_build_smbios()`).
 //! - NUMA and more than one socket: every hart is in socket 0.
 //! - uImage kernels, Intel HEX files for `-device loader`, u-boot ramdisks.
@@ -106,11 +113,12 @@ mod aia;
 mod boot;
 mod cpus;
 mod dt;
+mod iommu;
 
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ruvm_base::ClockType;
@@ -135,11 +143,13 @@ use ruvm_hw_intc::riscv_aclint::{
 use ruvm_hw_intc::riscv_aplic::aplic_size;
 use ruvm_hw_intc::riscv_imsic::imsic_hart_size;
 use ruvm_hw_intc::sifive_plic::{SiFivePlic, SiFivePlicConfig, TYPE_SIFIVE_PLIC};
+use ruvm_hw_iommu::RiscvIommu;
 use ruvm_hw_misc::sifive_test::{SiFiveTest, SiFiveTestRequest, TYPE_SIFIVE_TEST};
-use ruvm_hw_pci::regs::PCI_NUM_PINS;
-use ruvm_hw_pci::{GpexConfig, GpexHost, GpexWindow, MsiTrigger};
+use ruvm_hw_pci::regs::{PCI_CLASS_DEVICE, PCI_NUM_PINS};
+use ruvm_hw_pci::{GpexConfig, GpexHost, GpexWindow, MsiRemap, MsiTrigger};
 use ruvm_hw_timer::goldfish_rtc::{GOLDFISH_RTC_MMIO_SIZE, GoldfishRtc, TYPE_GOLDFISH_RTC};
 use ruvm_hw_virtio::mmio::{VIRTIO_MMIO_FORCE_LEGACY_DEFAULT, VIRTIO_MMIO_REGION_SIZE};
+use ruvm_hw_virtio::virtio::VIRTIO_F_IOMMU_PLATFORM;
 use ruvm_hw_virtio::{VirtioBackend, VirtioDeviceClass, VirtioMmio, VirtioPci, VirtioPciProps};
 use ruvm_jit::{Cpu, CpuShared, Jit, Vcpu};
 use ruvm_machine_arm::fdt::Fdt;
@@ -162,6 +172,10 @@ pub use boot::{
     riscv_find_firmware,
 };
 pub use dt::QEMU_RV64_ISA;
+pub use iommu::{
+    PCI_CLASS_SYSTEM_IOMMU, PCI_DEVICE_ID_REDHAT_RISCV_IOMMU, RiscvIommuPciProps,
+    TYPE_RISCV_IOMMU_PCI,
+};
 
 use boot::{KernelFiles, Loader, LoaderReset};
 use cpus::{CpuHub, VirtSemihost};
@@ -480,6 +494,35 @@ impl GuestMemory for WeakGuestMemory {
     }
 }
 
+/// The bus master address space of a PCI function, set at machine done.
+type LateSpace = Arc<OnceLock<Weak<AddressSpace>>>;
+
+/// The DMA of a virtio PCI function with `iommu_platform` on: its bus master address space,
+/// which is only picked at machine done, through a weak reference.
+struct LateGuestMemory(LateSpace);
+
+impl LateGuestMemory {
+    fn space(&self) -> Option<Arc<AddressSpace>> {
+        self.0.get().and_then(Weak::upgrade)
+    }
+}
+
+impl GuestMemory for LateGuestMemory {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryError> {
+        match self.space() {
+            Some(a) if a.read(addr, MemTxAttrs::UNSPECIFIED, buf).is_ok() => Ok(()),
+            _ => Err(MemoryError::OutOfRange { addr, len: buf.len() as u64 }),
+        }
+    }
+
+    fn write(&self, addr: u64, buf: &[u8]) -> Result<(), MemoryError> {
+        match self.space() {
+            Some(a) if a.write(addr, MemTxAttrs::UNSPECIFIED, buf).is_ok() => Ok(()),
+            _ => Err(MemoryError::OutOfRange { addr, len: buf.len() as u64 }),
+        }
+    }
+}
+
 /// One virtio-mmio transport. The device behind a `VirtioMmio` is fixed when it is created,
 /// so the region forwards to whichever transport is current and plugging a device swaps it.
 struct VirtioSlot {
@@ -614,6 +657,13 @@ pub struct VirtMachine {
     virtio_force_legacy: bool,
     gpex: GpexHost,
     pci_devices: Mutex<Vec<VirtioPci>>,
+    /// The `riscv-iommu-pci` functions in plug order, with their devfn. The first one
+    /// translates for the whole root bus, as `riscv_iommu_find_as()` picks it.
+    iommus: Mutex<Vec<(Arc<RiscvIommu>, u8)>>,
+    /// The virtio functions with `iommu_platform` on, whose bus master address space is
+    /// picked at machine done.
+    pci_pending: Mutex<Vec<(u8, LateSpace)>>,
+    iommu_spaces: Vec<Arc<AddressSpace>>,
     fw_cfg: FwCfgMem,
     fdt: Fdt,
     loader: Loader,
@@ -976,6 +1026,9 @@ impl VirtMachine {
             virtio_force_legacy: cfg.virtio_force_legacy,
             gpex,
             pci_devices: Mutex::new(Vec::new()),
+            iommus: Mutex::new(Vec::new()),
+            pci_pending: Mutex::new(Vec::new()),
+            iommu_spaces: Vec::new(),
             fw_cfg,
             fdt,
             loader,
@@ -1035,15 +1088,117 @@ impl VirtMachine {
         devfn: Option<u8>,
         props: &VirtioPciProps,
     ) -> Result<VirtioPci, String> {
+        self.attach_virtio_pci_with(class, devfn, props, false)
+    }
+
+    /// [`VirtMachine::attach_virtio_pci`] with the `iommu_platform` property of the virtio
+    /// device. As in `virtio_bus_device_plugged()`, only a device with it on does its DMA
+    /// through the IOMMU; the others use system memory, and only their MSIs go through it.
+    pub fn attach_virtio_pci_with(
+        &self,
+        class: Box<dyn VirtioDeviceClass>,
+        devfn: Option<u8>,
+        props: &VirtioPciProps,
+        iommu_platform: bool,
+    ) -> Result<VirtioPci, String> {
         if self.done {
             return Err("PCI devices must be plugged before machine_done".to_string());
         }
-        let memory: Arc<dyn GuestMemory + Send + Sync> =
-            Arc::new(WeakGuestMemory(Arc::downgrade(&self.memory_as)));
-        let backend = VirtioBackend::new(class, memory).map_err(err)?;
+        let late: LateSpace = Arc::new(OnceLock::new());
+        let memory: Arc<dyn GuestMemory + Send + Sync> = if iommu_platform {
+            Arc::new(LateGuestMemory(Arc::clone(&late)))
+        } else {
+            Arc::new(WeakGuestMemory(Arc::downgrade(&self.memory_as)))
+        };
+        let mut backend = VirtioBackend::new(class, memory).map_err(err)?;
+        if iommu_platform {
+            backend.vdev_mut().set_host_feature(VIRTIO_F_IOMMU_PLATFORM, true);
+        }
         let dev = VirtioPci::new(self.gpex.bus(), devfn, backend, props).map_err(err)?;
+        if iommu_platform {
+            let devfn = dev.pci_dev().devfn();
+            self.pci_pending.lock().unwrap_or_else(PoisonError::into_inner).push((devfn, late));
+        }
         self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).push(dev.clone());
         Ok(dev)
+    }
+
+    /// Plug a `riscv-iommu-pci` into the root bus at `devfn` or the first free slot. As
+    /// `riscv_iommu_pci_setup_iommu()` makes it, the first one translates the DMA and MSIs
+    /// of every other function on the bus from machine done on, plugged before it or after,
+    /// and the ones after it are only linked behind it. Each gets its device tree node at
+    /// machine done, as `virt_machine_device_plug_cb()` would add it, and the bus's
+    /// `iommu-map` points at the last one.
+    pub fn attach_riscv_iommu_pci(
+        &self,
+        props: &RiscvIommuPciProps,
+        devfn: Option<u8>,
+    ) -> Result<Arc<RiscvIommu>, String> {
+        if self.done {
+            return Err("PCI devices must be plugged before machine_done".to_string());
+        }
+        let bus = self.gpex.bus();
+        let (iommu, dev) =
+            iommu::riscv_iommu_pci_realize(bus, devfn, props, &self.memory_as, &self.clock)
+                .map_err(err)?;
+        let mut iommus = self.iommus.lock().unwrap_or_else(PoisonError::into_inner);
+        if iommus.is_empty() {
+            // The MSIs of the functions go through the IOMMU, except its own and those of
+            // the other IOMMUs, which pci_is_iommu() sends to its downstream memory.
+            let weak_bus = Arc::downgrade(bus);
+            let first = Arc::downgrade(&iommu);
+            let remap: MsiRemap = Arc::new(move |rid, addr, data| {
+                let is_iommu = weak_bus
+                    .upgrade()
+                    .and_then(|b| b.find_device((rid >> 8) as u8, rid as u8))
+                    .is_some_and(|d| {
+                        d.config_read(PCI_CLASS_DEVICE as u32, 2) as u16 == PCI_CLASS_SYSTEM_IOMMU
+                    });
+                match first.upgrade() {
+                    Some(i) if !is_iommu => i.remap_msi(rid, addr, data),
+                    _ => Some((addr, data)),
+                }
+            });
+            bus.set_msi_remap(Some(remap));
+        }
+        iommus.push((Arc::clone(&iommu), dev.devfn()));
+        Ok(iommu)
+    }
+
+    /// The `riscv-iommu-pci` IOMMUs, in plug order.
+    pub fn riscv_iommus(&self) -> Vec<Arc<RiscvIommu>> {
+        let iommus = self.iommus.lock().unwrap_or_else(PoisonError::into_inner);
+        iommus.iter().map(|(i, _)| Arc::clone(i)).collect()
+    }
+
+    /// `pcibus_machine_done()`: the bus master address space of each virtio function with
+    /// `iommu_platform` on, behind the first IOMMU if there is one.
+    fn pci_machine_done(&mut self) -> Result<(), String> {
+        let pending =
+            std::mem::take(self.pci_pending.get_mut().unwrap_or_else(PoisonError::into_inner));
+        let first = self.iommus.get_mut().unwrap_or_else(PoisonError::into_inner).first().cloned();
+        for (devfn, late) in pending {
+            let space = match &first {
+                Some((iommu, _)) => {
+                    // riscv_iommu_space()
+                    let name = format!(
+                        "riscv-iommu-{:04x}:{:02x}.{}-iova",
+                        self.gpex.bus().bus_num(),
+                        devfn >> 3,
+                        devfn & 7
+                    );
+                    let ops = iommu.device_ops(u16::from(devfn));
+                    let r = self.mem.new_iommu("riscv_iommu", 1 << 64, ops).map_err(err)?;
+                    let space = self.mem.address_space_init(r, &name).map_err(err)?;
+                    let weak = Arc::downgrade(&space);
+                    self.iommu_spaces.push(space);
+                    weak
+                }
+                None => Arc::downgrade(&self.memory_as),
+            };
+            let _ = late.set(space);
+        }
+        Ok(())
     }
 
     /// The virtio-mmio transport at `index`, plugged or not.
@@ -1073,6 +1228,15 @@ impl VirtMachine {
         if self.done {
             return Ok(());
         }
+        // virt_machine_device_plug_cb() for each riscv-iommu-pci.
+        let bdfs: Vec<u16> = {
+            let iommus = self.iommus.get_mut().unwrap_or_else(PoisonError::into_inner);
+            iommus.iter().map(|&(_, devfn)| u16::from(devfn)).collect()
+        };
+        for bdf in bdfs {
+            dt::create_fdt_iommu(&mut self.fdt, bdf)?;
+        }
+        self.pci_machine_done()?;
         // A user provided dtb must include everything; ours needs to be finalized.
         if self.dtb_filename.is_none() {
             let riscv = self.riscv.clone();
@@ -1281,6 +1445,9 @@ impl VirtMachine {
             s.current().reset();
         }
         self.gpex.reset();
+        for (iommu, _) in self.iommus.get_mut().unwrap_or_else(PoisonError::into_inner).iter() {
+            iommu.reset();
+        }
         let fwc = self.fw_cfg.state();
         fwc.reset();
         fwc.machine_reset(Vec::new(), Vec::new()).map_err(err)?;
@@ -1802,6 +1969,24 @@ mod tests {
     #[test]
     fn pci_allows_bars_at_0() {
         assert!(board(VirtConfig::default()).gpex().bus().allows_0_address());
+    }
+
+    #[test]
+    fn riscv_iommu_pci() {
+        let cfg = VirtConfig { rng_seed: Some([7; 32]), ..VirtConfig::default() };
+        let mut m = VirtMachine::new(cfg).unwrap();
+        m.attach_riscv_iommu_pci(&RiscvIommuPciProps::default(), None).unwrap();
+        m.machine_done().unwrap();
+        let dev = m.gpex().bus().find_device(0, 1 << 3).unwrap();
+        assert_eq!(dev.config_read(0, 4), 0x0014_1b36);
+        assert_eq!(dev.config_read(PCI_CLASS_DEVICE as u32, 2), 0x0806);
+        let node = "/soc/pci@30000000/iommu@8";
+        let ph = m.fdt().getprop_cell(node, "phandle").unwrap();
+        assert_eq!(m.fdt().getprop(node, "compatible").unwrap(), b"riscv,pci-iommu\0");
+        let map: Vec<u8> =
+            [0, ph, 0, 8, 9, ph, 9, 0xfff7].iter().flat_map(|c: &u32| c.to_be_bytes()).collect();
+        assert_eq!(m.fdt().getprop("/soc/pci@30000000", "iommu-map").unwrap(), map);
+        assert!(m.attach_riscv_iommu_pci(&RiscvIommuPciProps::default(), None).is_err());
     }
 
     #[test]

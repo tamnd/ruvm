@@ -632,6 +632,25 @@ fn create_fdt_pcie(
     fdt.setprop_cells(&name, "interrupt-map-mask", &[0x1800, 0, 0, 0x7])
 }
 
+/// `create_fdt_iommu()`: the node of a `riscv-iommu-pci` at `bdf` and the `iommu-map` of
+/// the bridge that sends every other requester ID to it.
+pub(crate) fn create_fdt_iommu(fdt: &mut Fdt, bdf: u16) -> Result<(), String> {
+    let pci = format!("/soc/pci@{VIRT_PCIE_ECAM:x}");
+    let node = format!("{pci}/iommu@{bdf:x}");
+    let phandle = fdt.alloc_phandle();
+    fdt.add_subnode(&node)?;
+    fdt.setprop(&node, "compatible", b"riscv,pci-iommu\0")?;
+    fdt.setprop_cell(&node, "#iommu-cells", 1)?;
+    fdt.setprop_cell(&node, "phandle", phandle)?;
+    let bdf = u32::from(bdf);
+    fdt.setprop_cells(&node, "reg", &[bdf << 8, 0, 0, 0, 0])?;
+    fdt.setprop_cells(
+        &pci,
+        "iommu-map",
+        &[0, phandle, 0, bdf, bdf + 1, phandle, bdf + 1, 0xffff - bdf],
+    )
+}
+
 /// `create_fdt_reset()`: the test finisher and the syscon reboot and poweroff nodes on it.
 fn create_fdt_reset(fdt: &mut Fdt, phandle: &mut u32) -> Result<(), String> {
     let test_phandle = *phandle;
