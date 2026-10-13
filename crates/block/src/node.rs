@@ -1342,7 +1342,8 @@ impl Node {
     fn attach_child_locked(&self, name: &str, child: Arc<Node>, role: u32) -> Result<Child> {
         let c = Child { name: name.to_string(), node: child.clone(), role, edge: new_edge_id() };
         let (cum_perm, cum_shared) = self.cumulative_perm();
-        self.children.write().unwrap().push(c.clone());
+        // QLIST_INSERT_HEAD(): the newest child comes first.
+        self.children.write().unwrap().insert(0, c.clone());
         let (perm, shared) = self.child_perm_of(&c, cum_perm, cum_shared, None);
         child.add_parent(self.parent_entry(&c, perm, shared));
         let mut tran = PermTran::default();
@@ -1465,7 +1466,8 @@ impl Node {
         tran: &mut PermTran,
     ) -> Child {
         let c = Child { name: name.to_string(), node: child.clone(), role, edge: new_edge_id() };
-        self.children.write().unwrap().push(c.clone());
+        // QLIST_INSERT_HEAD(): the newest child comes first.
+        self.children.write().unwrap().insert(0, c.clone());
         child.add_parent(self.parent_entry(&c, 0, BLK_PERM_ALL));
         tran.child_added(self.arc(), c.edge);
         c

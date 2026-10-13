@@ -478,9 +478,6 @@ impl BlockGraph {
             werror.map_or(Ok(BlockdevOnError::Enospc), |v| parse_error_action(&v, false))?;
         let rerror =
             rerror.map_or(Ok(BlockdevOnError::Report), |v| parse_error_action(&v, true))?;
-        if snapshot {
-            return Err(Error::generic("snapshot=on is not supported yet"));
-        }
 
         let filename = filename.filter(|f| !f.is_empty());
         let (blk, node_name, blockdev) = if filename.is_none() && format.is_none() && o.0.is_empty()
@@ -489,14 +486,25 @@ impl BlockGraph {
             let blk = BlockBackend::new_empty(Some(id.clone()), 0, BLK_PERM_ALL, read_only);
             (blk, None, None)
         } else {
-            let d = self.drive_options(o, filename.is_some(), format, read_only)?;
+            let mut d = self.drive_options(o, filename.is_some(), format, read_only)?;
+            let parent = d.clone();
+            if snapshot {
+                // bdrv_open_inherit() with BDRV_O_SNAPSHOT: the image is opened as the backing
+                // file of the overlay, so read-only.
+                d.put("read-only", "on");
+            }
             let ctx = OpenCtx {
                 inherit: Inherited { auto_read_only: true, native_aio, ..Inherited::default() },
-                detect_zeroes: Some(detect_zeroes),
+                detect_zeroes: (!snapshot).then_some(detect_zeroes),
                 ..OpenCtx::default()
             };
-            let (node, opts, w) = self.open_nodes_qdict(filename.as_deref(), d, ctx)?;
+            let (mut node, mut opts, w) = self.open_nodes_qdict(filename.as_deref(), d, ctx)?;
             warnings.extend(w);
+            if snapshot {
+                let w;
+                (node, opts, w) = self.append_temp_snapshot(&node, &parent, Some(detect_zeroes))?;
+                warnings.extend(w);
+            }
             if copy_on_read {
                 // bdrv_open_common() with BDRV_O_COPY_ON_READ.
                 if node.read_only() {
@@ -679,5 +687,31 @@ mod tests {
         assert!(!blk.is_inserted() && blk.is_read_only());
         let e = g.drive_new("if=none,id=cd", BlockInterfaceType::Ide).unwrap_err();
         assert_eq!(e.message(), "Device with id 'cd' already exists");
+    }
+
+    #[test]
+    fn snapshot_overlay() {
+        use crate::perm::BLK_PERM_WRITE;
+        let path = std::env::temp_dir().join(format!("ruvm-drive-snap-{}", std::process::id()));
+        std::fs::write(&path, vec![0x5a; 64 * 1024]).unwrap();
+        let g = BlockGraph::new();
+        let arg = format!("if=none,id=s,format=raw,snapshot=on,file={}", path.display());
+        g.drive_new(&arg, BlockInterfaceType::Ide).unwrap();
+        let blk = g.backend("s").unwrap();
+        let top = blk.root().unwrap();
+        let base = top.backing().unwrap().node;
+        assert_eq!(top.def.map(|d| d.format_name), Some("qcow2"));
+        assert_eq!(base.def.map(|d| d.format_name), Some("raw"));
+        assert!(!top.read_only() && base.read_only());
+
+        blk.set_perm(BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE, BLK_PERM_ALL).unwrap();
+        blk.pwrite(512, &[1; 512]).unwrap();
+        let mut buf = [0; 1024];
+        blk.pread(0, &mut buf).unwrap();
+        assert!(buf[..512].iter().all(|&b| b == 0x5a) && buf[512..].iter().all(|&b| b == 1));
+        drop((blk, top, base));
+        drop(g);
+        assert!(std::fs::read(&path).unwrap().iter().all(|&b| b == 0x5a));
+        std::fs::remove_file(&path).unwrap();
     }
 }

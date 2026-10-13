@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use ruvm_base::{Error, Result, report};
-use ruvm_qapi::types::BlockdevOptions;
+use ruvm_qapi::types::{BlockdevDetectZeroesOptions, BlockdevOptions};
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit, qapi_bool_parse};
 use ruvm_qapi::{QDict, QValue, json};
 
@@ -268,6 +268,47 @@ pub(crate) fn dirname(bs: &Node) -> Result<String> {
     Ok(exact[..colon.max(slash)].to_string())
 }
 
+/// `create_tmp_file()`: creates an empty file with a unique name for a temporary image and
+/// returns the name.
+pub(crate) fn create_tmp_file() -> Result<String> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let mut tmpdir = std::env::temp_dir().to_string_lossy().into_owned();
+    while tmpdir.len() > 1 && tmpdir.ends_with('/') {
+        tmpdir.pop();
+    }
+    if cfg!(not(windows)) && tmpdir == "/tmp" {
+        // Temporary images can get large; /tmp is often a tmpfs.
+        tmpdir = "/var/tmp".to_string();
+    }
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut last = None;
+    for _ in 0..100 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        let mut v = nanos
+            ^ (u64::from(std::process::id()) << 32)
+            ^ u64::from(COUNTER.fetch_add(1, Ordering::Relaxed))
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mut suffix = String::new();
+        for _ in 0..6 {
+            suffix.push(CHARS[(v % CHARS.len() as u64) as usize] as char);
+            v /= CHARS.len() as u64;
+        }
+        let name = format!("{tmpdir}/vl.{suffix}");
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&name) {
+            Ok(_) => return Ok(name),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some((name, e)),
+            Err(e) => {
+                return Err(Error::from_io(format!("Could not open temporary file '{name}'"), e));
+            }
+        }
+    }
+    let (name, e) = last.expect("the loop ran");
+    Err(Error::from_io(format!("Could not open temporary file '{name}'"), e))
+}
+
 impl BlockGraph {
     /// `bdrv_open()`: opens `filename` with `options` as the top of a new tree and puts the
     /// nodes in the name table. Returns the root, the typed options it was opened with and
@@ -282,6 +323,62 @@ impl BlockGraph {
         let (root, opts) = self.open_qdict_opts(filename, options, ctx, &mut pending, true)?;
         let (root, warnings) = self.commit(root, pending, ctx)?;
         Ok((root, opts, warnings))
+    }
+
+    /// `bdrv_append_temp_snapshot()`: puts a temporary qcow2 overlay of the same size on top
+    /// of `bs` for `snapshot=on`, so that writes go to the overlay and `bs` stays as it is.
+    /// The overlay takes `read-only` and `discard` from `parent`, the options of `bs`, and
+    /// `detect_zeroes` as `blockdev_init()` sets it on the root.
+    pub(crate) fn append_temp_snapshot(
+        &self,
+        bs: &Arc<Node>,
+        parent: &QDict,
+        detect_zeroes: Option<BlockdevDetectZeroesOptions>,
+    ) -> Result<(Arc<Node>, BlockdevOptions, Vec<String>)> {
+        let total_size =
+            bs.getlength().map_err(|e| Error::from_io("Could not get image size", e))?;
+        let tmp_filename = create_tmp_file()?;
+        let r = self.open_temp_snapshot(&tmp_filename, total_size, parent, detect_zeroes);
+        // file-posix unlinks a BDRV_O_TEMPORARY file once it is open. Windows deletes it on
+        // close in QEMU; here it stays.
+        #[cfg(not(windows))]
+        let _ = std::fs::remove_file(&tmp_filename);
+        let (overlay, opts, warnings) = r?;
+        Node::append(&overlay, bs)?;
+        Ok((overlay, opts, warnings))
+    }
+
+    fn open_temp_snapshot(
+        &self,
+        tmp_filename: &str,
+        total_size: u64,
+        parent: &QDict,
+        detect_zeroes: Option<BlockdevDetectZeroesOptions>,
+    ) -> Result<(Arc<Node>, BlockdevOptions, Vec<String>)> {
+        let mut opts = QDict::new();
+        opts.put("size", total_size);
+        self.create_image("qcow2", tmp_filename, &mut opts).map_err(|e| {
+            e.prepend(format!("Could not create temporary overlay '{tmp_filename}': "))
+        })?;
+
+        // bdrv_temp_snapshot_options(): cache=unsafe, and no aio=native, which needs
+        // cache.direct.
+        let mut cache = QDict::new();
+        cache.put("direct", "off");
+        cache.put("no-flush", "on");
+        let mut file = QDict::new();
+        file.put("driver", "file");
+        file.put("filename", tmp_filename);
+        let mut d = QDict::new();
+        d.put("cache", cache);
+        for k in ["read-only", "discard"] {
+            if let Some(v) = parent.get(k) {
+                d.put(k, v.clone());
+            }
+        }
+        d.put("file", file);
+        d.put("driver", "qcow2");
+        self.open_nodes_qdict(None, d, OpenCtx { detect_zeroes, ..OpenCtx::default() })
     }
 
     /// `bdrv_open_inherit()` without the name table.

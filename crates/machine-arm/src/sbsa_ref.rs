@@ -437,7 +437,7 @@ impl SbsaRefMachine {
         // sbsa_firmware_init(). There is one address space, so the first flash, secure only,
         // is in the system memory too.
         let [pflash0, pflash1] = cfg.pflash;
-        let pflash0_given = pflash0 != PflashBacking::None;
+        let pflash0_given = !matches!(pflash0, PflashBacking::None);
         let half = SBSA_FLASH_SIZE / 2;
         let flash0 = Pflash::new(&mem, "sbsa.flash0", PflashProps::virt_flash(half), pflash0)?;
         let flash1 = Pflash::new(&mem, "sbsa.flash1", PflashProps::virt_flash(half), pflash1)?;

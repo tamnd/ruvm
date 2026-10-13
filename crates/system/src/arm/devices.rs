@@ -36,7 +36,6 @@ use ruvm_hw_virtio::{
     RandomFile, VirtioBalloon, VirtioBlk, VirtioBlkConf, VirtioConsole, VirtioDeviceClass,
     VirtioNet, VirtioNetConf, VirtioPciProps, VirtioRng, VirtioRngConf,
 };
-use ruvm_machine_arm::pflash::PflashBacking;
 use ruvm_machine_arm::sbsa_ref::{NUM_SATA_PORTS, SbsaRefMachine};
 use ruvm_machine_arm::virt::VirtMachine;
 use ruvm_machine_x86::VirtioHandle;
@@ -46,9 +45,7 @@ use ruvm_qapi::visit::{Visitor, VisitorExt};
 use super::{ArmBoard, prop_bool};
 use crate::drives::{DriveDev, Plugged, device_image, peripheral_path, resize_cb};
 use crate::net::Network;
-use crate::x86::{
-    Drive, DriveIf, KeepRam, Located, NULL_CO_PFLASH, Transport, drive_opts, parse_drive, parse_mac,
-};
+use crate::x86::{Drive, DriveIf, KeepRam, Located, Transport, drive_opts, parse_drive, parse_mac};
 
 /// The virtio device models virt can plug.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,8 +132,9 @@ pub(crate) struct Plug {
 pub(crate) struct Plan {
     /// The virtio devices, `-device` first and then the ones `-drive if=virtio` adds.
     pub virtio: Vec<Plug>,
-    /// The drives of the two flashes, `None` where there is no `-drive if=pflash`.
-    pub pflash: [Option<PflashBacking>; 2],
+    /// The drives of the two flashes as indices into the drives, `None` where there is no
+    /// `-drive if=pflash`.
+    pub pflash: [Option<usize>; 2],
     /// The AHCI ports of sbsa-ref with a drive, as (port, index into the drives).
     pub ide: Vec<(usize, usize)>,
     /// The display devices of `-device` on virt, each with the number of virtio plugs before
@@ -488,21 +486,14 @@ pub(crate) fn plan(
         }
     }
 
-    // pflash_cfi01_legacy_drive() for the two flashes. The flash reads the image itself and
-    // checks its size; a drive without a medium leaves the flash empty.
+    // pflash_cfi01_legacy_drive() for the two flashes, which read their drives through the
+    // block layer.
     for (i, d) in drives.iter().enumerate() {
         if d.iface != DriveIf::Pflash || d.bus != 0 || d.unit >= 2 {
             continue;
         }
         used.insert(i);
-        let backing = match &d.file {
-            Some(_) if d.null_size.is_some() => {
-                return Err(vec![Located::new(&d.loc, NULL_CO_PFLASH)]);
-            }
-            Some(file) => PflashBacking::File { path: file.into(), read_only: d.read_only },
-            None => PflashBacking::None,
-        };
-        p.pflash[d.unit as usize] = Some(backing);
+        p.pflash[d.unit as usize] = Some(i);
     }
 
     let orphans: Vec<Located> = drives
@@ -924,13 +915,7 @@ mod tests {
         )
         .unwrap();
         let p = plan(V, &d, &[]).unwrap();
-        assert_eq!(
-            p.pflash,
-            [
-                Some(PflashBacking::File { path: "code.fd".into(), read_only: true }),
-                Some(PflashBacking::File { path: "vars.fd".into(), read_only: false }),
-            ]
-        );
+        assert_eq!(p.pflash, [Some(0), Some(1)]);
         let p = plan(V, &[], &[]).unwrap();
         assert_eq!(p.pflash, [None, None]);
     }

@@ -604,6 +604,8 @@ pub(crate) struct Drive {
     pub probed: bool,
     /// The size of a `file=null-co://` image, `file.size`.
     pub null_size: Option<u64>,
+    /// `snapshot=on`: writes go to a temporary overlay.
+    pub snapshot: bool,
     pub loc: Option<Location>,
 }
 
@@ -714,7 +716,10 @@ pub(crate) fn parse_drive(
     } else {
         None
     };
-    if opt_bool(opts, "snapshot")? == Some(true) {
+    // The block layer puts a temporary overlay on the image of a drive of the boards that
+    // open their drives through it. The x86 boards open the image themselves.
+    let snapshot = opt_bool(opts, "snapshot")? == Some(true);
+    if snapshot && kind.is_some() {
         return Err(Error::generic("snapshot=on is not supported by ruvm yet"));
     }
     let mut cdrom = false;
@@ -798,7 +803,7 @@ pub(crate) fn parse_drive(
         }
     };
     let file = opts.get("file").filter(|f| !f.is_empty()).map(str::to_string);
-    Ok(Drive { id, file, iface, bus, unit, read_only, cdrom, probed, null_size, loc })
+    Ok(Drive { id, file, iface, bus, unit, read_only, cdrom, probed, null_size, snapshot, loc })
 }
 
 /// The `-drive` option list: anything goes, with an id.
