@@ -803,7 +803,7 @@ mod tests {
         );
         assert_eq!(err("arm-smmuv3,ats=yes"), "Parameter 'ats' does not accept value 'yes'");
         assert_eq!(err("arm-smmuv3,accel=2"), "Parameter 'accel' expects 'on' or 'off'");
-        assert_eq!(err("arm-smmuv3,identifier=256"), "Parameter 'identifier' expects uint8");
+        assert_eq!(err("arm-smmuv3,identifier=256"), "Parameter 'identifier' expects uint8_t");
         assert_eq!(err("arm-smmuv3,bus=pcie.0"), "Bus 'pcie.0' not found");
         assert_eq!(err("arm-smmuv3,foo=1"), "Property 'arm-smmuv3.foo' not found");
         let e = plan(S, &[], &[dev("arm-smmuv3")]).unwrap_err();
