@@ -107,7 +107,7 @@ pub(crate) struct Plug {
     /// `iommu_platform` of a PCI function: its DMA goes through the IOMMU.
     iommu_platform: bool,
     /// The properties of a `riscv-iommu-pci`.
-    iommu: RiscvIommuPciProps,
+    iommu: Box<RiscvIommuPciProps>,
     /// Where `qdev_set_id()` put the device in the QOM tree.
     path: String,
     loc: Option<Location>,
@@ -185,7 +185,7 @@ fn plan_virtio(
         mac: None,
         props: VirtioPciProps::default(),
         iommu_platform: false,
-        iommu: RiscvIommuPciProps::default(),
+        iommu: Box::default(),
         path: String::new(),
         loc: loc.clone(),
     };
@@ -287,7 +287,7 @@ fn plan_riscv_iommu(opts: &QemuOpts, loc: &Option<Location>) -> Result<Plug, Loc
         mac: None,
         props: VirtioPciProps::default(),
         iommu_platform: false,
-        iommu: RiscvIommuPciProps::default(),
+        iommu: Box::default(),
         path: String::new(),
         loc: loc.clone(),
     };

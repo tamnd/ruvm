@@ -1984,7 +1984,7 @@ mod tests {
         let ph = m.fdt().getprop_cell(node, "phandle").unwrap();
         assert_eq!(m.fdt().getprop(node, "compatible").unwrap(), b"riscv,pci-iommu\0");
         let map: Vec<u8> =
-            [0, ph, 0, 8, 9, ph, 9, 0xfff6].iter().flat_map(|c: &u32| c.to_be_bytes()).collect();
+            [0, ph, 0, 8, 9, ph, 9, 0xfff7].iter().flat_map(|c: &u32| c.to_be_bytes()).collect();
         assert_eq!(m.fdt().getprop("/soc/pci@30000000", "iommu-map").unwrap(), map);
         assert!(m.attach_riscv_iommu_pci(&RiscvIommuPciProps::default(), None).is_err());
     }
