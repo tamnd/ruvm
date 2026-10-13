@@ -304,9 +304,13 @@ fn first_stage_translation_and_faults() {
     r.s_map(IOVA, DATA, LEAF);
     r.wd(DATA + 0x10, 0xcafe_f00d);
     assert_eq!(r.dma_read(IOVA + 0x10), Some(0xcafe_f00d));
-    assert!(r.dma_write(IOVA + 0x20, 0x55));
-    assert_eq!(r.rd(DATA + 0x20), 0x55);
+    // The IOTLB keeps the permission of the access that filled it, as QEMU does, so a write
+    // to a page that was only read fails, with no fault record, until the entry goes.
+    assert!(!r.dma_write(IOVA + 0x20, 0x55));
     assert_eq!(r.r32(REG_FQT), 0);
+    r.s_map(IOVA + 0x4000, DATA2, LEAF);
+    assert!(r.dma_write(IOVA + 0x4020, 0x55));
+    assert_eq!(r.rd(DATA2 + 0x20), 0x55);
 
     // Nothing mapped at the next page.
     assert_eq!(r.dma_read(IOVA + 0x1008), None);
