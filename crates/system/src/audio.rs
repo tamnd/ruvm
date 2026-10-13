@@ -172,6 +172,23 @@ pub(crate) struct AudioPlug {
 }
 
 impl AudioPlug {
+    /// The property error kept for later, if there is one.
+    pub(crate) fn deferred_error(&self) -> Option<Located> {
+        let (msg, hint) = self.err.as_ref()?;
+        let e = Error::generic(msg.as_str());
+        let e = match hint {
+            Some(h) => e.hint(h),
+            None => e,
+        };
+        Some(Located(self.loc.clone(), e))
+    }
+
+    /// Keeps the error of a global instead of a property error, as `object_apply_global_props()`
+    /// runs before the properties are set.
+    pub(crate) fn set_global_error(&mut self, e: Error) {
+        self.err = Some((e.message().to_string(), e.hint_text().map(str::to_string)));
+    }
+
     fn new(typename: &'static str, loc: Option<Location>, pci: bool, isa: bool) -> AudioPlug {
         AudioPlug {
             typename,

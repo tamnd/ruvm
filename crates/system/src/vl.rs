@@ -150,6 +150,7 @@ impl Vm {
                 net.check_clients();
             }
         }
+        crate::global::check_globals();
         self.qmp.set_machine_ready(true);
         if let Some(uri) = &self.incoming {
             if uri != "defer" {
@@ -559,6 +560,11 @@ fn parse_options(
                 crate::display::set_display_none();
             }
             Opt::Drive => cfg.x86.drives.push((arg.to_string(), current_location())),
+            Opt::Global => {
+                if !crate::global::global_option(arg) {
+                    return Err(Exit(1));
+                }
+            }
             Opt::Device => {
                 let driver = arg.split(',').next().unwrap_or_default();
                 if is_help_option(driver) || arg.split(',').skip(1).any(is_help_option) {
@@ -1253,6 +1259,41 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     }
     if let (Some(id), Some(opts)) = (&memdev, board_opts.as_mut()) {
         opts.memdev = Some(x86::consume_memdev(&vm, id).map_err(|e| fail(&e))?);
+    }
+
+    // The globals the board's own objects take, as qdev_prop_set_globals() applies them while
+    // the board is built.
+    if let Some(arch) = crate::global::Arch::of_target(p.target) {
+        let name = match (kind, arm_board) {
+            (Some(BoardKind::Q35), _) => "q35",
+            (Some(BoardKind::Microvm), _) => "microvm",
+            (None, Some(ArmBoard::Virt)) => "virt",
+            (None, Some(ArmBoard::SbsaRef)) => "sbsa-ref",
+            (None, None) if rv_virt => "virt",
+            (None, None) => "none",
+        };
+        let cpu = (name != "none").then(|| {
+            let (model, suffix) = match arch {
+                crate::global::Arch::X86 => ("qemu64", "-x86_64-cpu"),
+                crate::global::Arch::Arm if name == "sbsa-ref" => ("neoverse-n1", "-arm-cpu"),
+                crate::global::Arch::Arm => ("cortex-a57", "-arm-cpu"),
+                crate::global::Arch::Riscv => ("rv64", "-riscv-cpu"),
+            };
+            let model = cfg.x86.cpu.as_deref().map_or(model, |c| c.split(',').next().unwrap_or(c));
+            format!("{model}{suffix}")
+        });
+        let board = crate::global::Board {
+            arch,
+            name,
+            serial: serial_hds.iter().any(Option::is_some),
+            cpu,
+            vga: kind == Some(BoardKind::Q35)
+                && cfg.x86.vga == Some(crate::display::VgaInterface::Std),
+            defaults: cfg.x86.has_defaults,
+        };
+        crate::global::apply_board(&board).map_err(|e| fail(&e))?;
+    } else if crate::global::any() {
+        return Err(fail_msg("-global is not supported for this target by ruvm yet"));
     }
 
     let mut keep =

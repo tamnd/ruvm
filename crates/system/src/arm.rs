@@ -1288,6 +1288,7 @@ fn build_virt(
         })
     });
     let mut cfg = VirtConfig::new(cpu);
+    cfg.virtio_force_legacy = crate::global::virtio_mmio_force_legacy();
     cfg.smp = opts.cpus as usize;
     if let Some(size) = opts.ram_size {
         cfg.ram_size = size;

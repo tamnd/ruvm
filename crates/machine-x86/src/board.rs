@@ -508,6 +508,8 @@ pub struct BoardSpec {
     /// `-machine aux-ram-share=`: the RAM and ROM the board makes are shared memory that CPR
     /// can hand to the next process.
     pub aux_ram_share: bool,
+    /// `force-legacy` of microvm's virtio-mmio transports, from `-global`.
+    pub virtio_force_legacy: bool,
     /// `-smp cpus=`.
     pub cpus: u32,
     /// `-smp maxcpus=`, 0 for the same as `cpus`.
@@ -554,6 +556,7 @@ impl fmt::Debug for BoardSpec {
             .field("ram_size", &self.ram_size)
             .field("memdev", &self.memdev.as_ref().map(|b| b.name()))
             .field("aux_ram_share", &self.aux_ram_share)
+            .field("virtio_force_legacy", &self.virtio_force_legacy)
             .field("cpus", &self.cpus)
             .field("bios", &self.bios)
             .field("kernel", &self.kernel)
@@ -668,6 +671,7 @@ pub fn build_board(mut spec: BoardSpec) -> Result<(X86Board, Vec<String>), Strin
                 pit_in_kernel: spec.pit_in_kernel,
                 memdev: spec.memdev,
                 aux_ram_share: spec.aux_ram_share,
+                virtio_force_legacy: spec.virtio_force_legacy,
                 ..MicrovmConfig::default()
             };
             if let Some(size) = spec.ram_size {

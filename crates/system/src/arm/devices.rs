@@ -295,6 +295,43 @@ fn plan_virtio(
     Ok(plug)
 }
 
+/// What one `-device` plugs.
+enum Planned {
+    Display(crate::display::DisplayPlug),
+    Virtio(Plug),
+}
+
+/// `qdev_device_add()` for one `-device` on `board`, with `-global` merged in.
+fn plan_device(
+    board: ArmBoard,
+    drives: &[Drive],
+    used: &mut HashSet<usize>,
+    arg: &str,
+    loc: &Option<Location>,
+) -> Result<Planned, Located> {
+    let mut list = QemuOptsList::new("device", &[]).with_implied_opt_name("driver");
+    let opts = list.parse(arg, true).map_err(|e| Located(loc.clone(), e))?;
+    let Some(driver) = opts.get("driver") else {
+        return Err(Located::new(loc, "Parameter 'driver' is missing"));
+    };
+    if is_help_option(driver) || opts.has_help_opt() {
+        return Err(Located::new(loc, "-device help is not supported by ruvm yet"));
+    }
+    if driver == "loader" {
+        let msg = "-device loader is not supported with this machine by ruvm yet";
+        return Err(Located::new(loc, msg));
+    }
+    if let Some(plug) = crate::display::plan_device(driver, opts, loc, true, true) {
+        let plug = plug?;
+        if board == ArmBoard::SbsaRef {
+            return Err(Located::new(loc, sbsa_ref_display(plug.typename())));
+        }
+        return Ok(Planned::Display(plug));
+    }
+    let mmio = board == ArmBoard::Virt;
+    plan_virtio(drives, used, driver, opts, loc, mmio).map(Planned::Virtio)
+}
+
 /// Works out what `-drive` and `-device` plug into `board`. The errors are those of
 /// `qdev_device_add()` and `drive_check_orphaned()`; for orphans every one is listed.
 pub(crate) fn plan(
@@ -321,29 +358,18 @@ pub(crate) fn plan(
         queue.push((format!("virtio-blk,drive={}", d.id), d.loc.clone()));
     }
     for (arg, loc) in &queue {
-        let mut list = QemuOptsList::new("device", &[]).with_implied_opt_name("driver");
-        let opts = list.parse(arg, true).map_err(|e| vec![Located(loc.clone(), e)])?;
-        let Some(driver) = opts.get("driver") else {
-            return Err(vec![Located::new(loc, "Parameter 'driver' is missing")]);
-        };
-        if is_help_option(driver) || opts.has_help_opt() {
-            return Err(vec![Located::new(loc, "-device help is not supported by ruvm yet")]);
-        }
-        if driver == "loader" {
-            let msg = "-device loader is not supported with this machine by ruvm yet";
-            return Err(vec![Located::new(loc, msg)]);
-        }
-        if let Some(plug) = crate::display::plan_device(driver, opts, loc, true, true) {
-            let plug = plug.map_err(|e| vec![e])?;
-            if board == ArmBoard::SbsaRef {
-                return Err(vec![Located::new(loc, sbsa_ref_display(plug.typename()))]);
+        let plan = |arg: &str, trial: bool| {
+            if trial {
+                plan_device(board, drives, &mut used.clone(), arg, loc)
+            } else {
+                plan_device(board, drives, &mut used, arg, loc)
             }
-            p.display.push((p.virtio.len(), plug));
-            continue;
+        };
+        let planned = crate::global::plan_device(arg, loc, plan, |_, e| Err(e));
+        match planned.map_err(|e| vec![e])? {
+            Planned::Display(plug) => p.display.push((p.virtio.len(), plug)),
+            Planned::Virtio(plug) => p.virtio.push(plug),
         }
-        let mmio = board == ArmBoard::Virt;
-        let plug = plan_virtio(drives, &mut used, driver, opts, loc, mmio).map_err(|e| vec![e])?;
-        p.virtio.push(plug);
     }
 
     // pflash_cfi01_legacy_drive() for the two flashes. The flash reads the image itself and

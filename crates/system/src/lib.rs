@@ -10,6 +10,7 @@ mod audio;
 mod config_qmp;
 mod display;
 mod drives;
+mod global;
 mod hmp;
 mod info;
 mod migration;

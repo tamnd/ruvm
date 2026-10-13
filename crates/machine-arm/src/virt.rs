@@ -430,6 +430,8 @@ pub struct VirtConfig {
     pub topology: Option<CpuTopology>,
     /// Where the SPIs go instead of the board's GIC, for a GIC that KVM keeps in the kernel.
     pub spi_sink: Option<SpiSink>,
+    /// `force-legacy` of the virtio-mmio transports, which `-global` can change.
+    pub virtio_force_legacy: bool,
 }
 
 /// Takes SPI `n` and its new level, for [`VirtConfig::spi_sink`].
@@ -476,6 +478,7 @@ impl fmt::Debug for VirtConfig {
             .field("oem_id", &self.oem_id)
             .field("oem_table_id", &self.oem_table_id)
             .field("topology", &self.topology)
+            .field("virtio_force_legacy", &self.virtio_force_legacy)
             .finish_non_exhaustive()
     }
 }
@@ -516,6 +519,7 @@ impl VirtConfig {
             oem_table_id: APPNAME8.to_string(),
             topology: None,
             spi_sink: None,
+            virtio_force_legacy: VIRTIO_MMIO_FORCE_LEGACY_DEFAULT,
         }
     }
 }
@@ -921,6 +925,7 @@ pub struct VirtMachine {
     pci_pending: Mutex<Vec<(u8, LateSpace)>>,
     pci_devices: Mutex<Vec<VirtioPci>>,
     virtio: Vec<Arc<VirtioSlot>>,
+    virtio_force_legacy: bool,
     fw_cfg: FwCfgMem,
     fdt: Fdt,
     loader: Loader,
@@ -1344,7 +1349,7 @@ impl VirtMachine {
         // create_virtio_devices().
         let mut virtio = Vec::with_capacity(VIRTIO_TRANSPORTS);
         for i in 0..VIRTIO_TRANSPORTS {
-            let t = VirtioMmio::new(None, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT).map_err(err)?;
+            let t = VirtioMmio::new(None, cfg.virtio_force_legacy).map_err(err)?;
             let slot = Arc::new(VirtioSlot {
                 gsi: spi(VIRT_MMIO_IRQ + i as u32),
                 transport: RwLock::new(Arc::new(t)),
@@ -1429,6 +1434,7 @@ impl VirtMachine {
             pci_pending: Mutex::new(Vec::new()),
             pci_devices: Mutex::new(Vec::new()),
             virtio,
+            virtio_force_legacy: cfg.virtio_force_legacy,
             fw_cfg,
             fdt,
             loader,
@@ -1452,13 +1458,15 @@ impl VirtMachine {
         Ok(index)
     }
 
-    /// Plug a virtio device into transport `index`, `bus=virtio-mmio-bus.<index>`.
+    /// Plug a virtio device into transport `index`, `bus=virtio-mmio-bus.<index>`. The
+    /// transport is legacy when `force_legacy` is and `-global` did not turn it off.
     pub fn attach_virtio_at(
         &self,
         index: usize,
         class: Box<dyn VirtioDeviceClass>,
         force_legacy: bool,
     ) -> Result<(), String> {
+        let force_legacy = force_legacy && self.virtio_force_legacy;
         if self.done {
             return Err("virtio-mmio devices must be plugged before machine_done".to_string());
         }

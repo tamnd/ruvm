@@ -345,6 +345,8 @@ pub struct VirtConfig {
     /// `aclint`: the ACLINT MSWI, MTIMER and SSWI instead of the SiFive CLINT, or the
     /// MTIMER alone with [`VirtAia::AplicImsic`].
     pub aclint: bool,
+    /// `force-legacy` of the virtio-mmio transports, which `-global` can change.
+    pub virtio_force_legacy: bool,
 }
 
 /// `RISCVVirtAIAType`, the `aia` property.
@@ -391,6 +393,7 @@ impl fmt::Debug for VirtConfig {
             .field("acpi", &self.acpi)
             .field("spcr", &self.spcr)
             .field("aclint", &self.aclint)
+            .field("virtio_force_legacy", &self.virtio_force_legacy)
             .finish_non_exhaustive()
     }
 }
@@ -421,6 +424,7 @@ impl Default for VirtConfig {
             acpi: true,
             spcr: true,
             aclint: false,
+            virtio_force_legacy: VIRTIO_MMIO_FORCE_LEGACY_DEFAULT,
         }
     }
 }
@@ -607,6 +611,7 @@ pub struct VirtMachine {
     rtc: Arc<GoldfishRtc>,
     flash: [Arc<Pflash>; 2],
     virtio: Vec<Arc<VirtioSlot>>,
+    virtio_force_legacy: bool,
     gpex: GpexHost,
     pci_devices: Mutex<Vec<VirtioPci>>,
     fw_cfg: FwCfgMem,
@@ -876,7 +881,7 @@ impl VirtMachine {
         // The virtio-mmio transports.
         let mut virtio = Vec::with_capacity(VIRTIO_COUNT);
         for i in 0..VIRTIO_COUNT {
-            let t = VirtioMmio::new(None, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT).map_err(err)?;
+            let t = VirtioMmio::new(None, cfg.virtio_force_legacy).map_err(err)?;
             let slot = Arc::new(VirtioSlot {
                 irq: irqchip.input(VIRTIO_IRQ + i as u32),
                 transport: RwLock::new(Arc::new(t)),
@@ -968,6 +973,7 @@ impl VirtMachine {
             rtc,
             flash: [flash0, flash1],
             virtio,
+            virtio_force_legacy: cfg.virtio_force_legacy,
             gpex,
             pci_devices: Mutex::new(Vec::new()),
             fw_cfg,
@@ -993,13 +999,15 @@ impl VirtMachine {
         Ok(index)
     }
 
-    /// Plug a virtio device into transport `index`, `bus=virtio-mmio-bus.<index>`.
+    /// Plug a virtio device into transport `index`, `bus=virtio-mmio-bus.<index>`. The
+    /// transport is legacy when `force_legacy` is and `-global` did not turn it off.
     pub fn attach_virtio_at(
         &self,
         index: usize,
         class: Box<dyn VirtioDeviceClass>,
         force_legacy: bool,
     ) -> Result<(), String> {
+        let force_legacy = force_legacy && self.virtio_force_legacy;
         if self.done {
             return Err("virtio-mmio devices must be plugged before machine_done".to_string());
         }

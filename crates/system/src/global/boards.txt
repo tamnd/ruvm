@@ -1,0 +1,231 @@
+# The objects QEMU 11.1 creates for each board with -nodefaults, which -global applies to: for
+# each type, the first object of that type or a subtype. s marks the ones that come with a serial
+# port, t the NIC models that only exist while the board looks up NIC types. The CPUs are not here.
+[x86 q35]
+device cfi.pflash01
+sys-bus-device cfi.pflash01
+isa-device isa-pcspk
+isa-pcspk isa-pcspk
+migration migration
+apic apic
+apic-common apic
+kvmvapic kvmvapic
+mch mch
+pci-device mch
+pci-host-bridge q35-pcihost
+pcie-host-bridge q35-pcihost
+q35-pcihost q35-pcihost
+fw_cfg fw_cfg_io
+fw_cfg_io fw_cfg_io
+mc146818rtc mc146818rtc
+ICH9-LPC ICH9-LPC
+i8257 i8257
+isa-i8259 isa-i8259
+pic-common isa-i8259
+ioapic ioapic
+ioapic-common ioapic
+hpet hpet
+isa-pit isa-pit
+pit-common isa-pit
+serial serial s
+isa-serial isa-serial s
+ps2-device ps2-kbd
+ps2-kbd ps2-kbd
+ps2-mouse ps2-mouse
+i8042 i8042
+vmport vmport
+vmmouse vmmouse
+port92 port92
+ich9-ahci ich9-ahci
+ICH9-SMB ICH9-SMB
+i2c-slave smbus-eeprom
+smbus-device smbus-eeprom
+smbus-eeprom smbus-eeprom
+e1000 e1000 t
+e1000-base e1000 t
+e1000-82544gc e1000-82544gc t
+e1000-82545em e1000-82545em t
+e1000e e1000e t
+i82550 i82550 t
+i82551 i82551 t
+i82557a i82557a t
+i82557b i82557b t
+i82557c i82557c t
+i82558a i82558a t
+i82558b i82558b t
+i82559a i82559a t
+i82559b i82559b t
+i82559c i82559c t
+i82559er i82559er t
+i82562 i82562 t
+i82801 i82801 t
+igb igb t
+ne2k_pci ne2k_pci t
+pcnet pcnet t
+rocker rocker
+rtl8139 rtl8139 t
+tulip tulip t
+virtio-device virtio-net-device t
+virtio-net-device virtio-net-device t
+virtio-net-pci virtio-net-pci t
+virtio-net-pci-base virtio-net-pci t
+virtio-pci virtio-net-pci t
+virtio-net-pci-non-transitional virtio-net-pci-non-transitional t
+virtio-net-pci-transitional virtio-net-pci-transitional t
+vmxnet3 vmxnet3 t
+[x86 microvm]
+device migration
+migration migration
+fw_cfg fw_cfg_io
+fw_cfg_io fw_cfg_io
+sys-bus-device fw_cfg_io
+apic apic
+apic-common apic
+kvmvapic kvmvapic
+isabus-bridge isabus-bridge
+ioapic ioapic
+ioapic-common ioapic
+virtio-mmio virtio-mmio
+acpi-ged acpi-ged
+isa-device isa-i8259
+isa-i8259 isa-i8259
+pic-common isa-i8259
+isa-pit isa-pit
+pit-common isa-pit
+mc146818rtc mc146818rtc
+serial serial s
+isa-serial isa-serial s
+[x86 none]
+device migration
+migration migration
+[arm virt]
+device cfi.pflash01
+sys-bus-device cfi.pflash01
+migration migration
+arm_gic arm_gic
+arm_gic_common arm_gic
+arm-gicv2m arm-gicv2m
+pl011 pl011
+pl031 pl031
+gpex-root gpex-root
+pci-device gpex-root
+gpex-pcihost gpex-pcihost
+pci-host-bridge gpex-pcihost
+pcie-host-bridge gpex-pcihost
+e1000 e1000 t
+e1000-base e1000 t
+e1000-82544gc e1000-82544gc t
+e1000-82545em e1000-82545em t
+e1000e e1000e t
+i82550 i82550 t
+i82551 i82551 t
+i82557a i82557a t
+i82557b i82557b t
+i82557c i82557c t
+i82558a i82558a t
+i82558b i82558b t
+i82559a i82559a t
+i82559b i82559b t
+i82559c i82559c t
+i82559er i82559er t
+i82562 i82562 t
+i82801 i82801 t
+igb igb t
+ne2k_pci ne2k_pci t
+pcnet pcnet t
+rocker rocker
+rtl8139 rtl8139 t
+tulip tulip t
+virtio-device virtio-net-device t
+virtio-net-device virtio-net-device t
+virtio-net-pci virtio-net-pci t
+virtio-net-pci-base virtio-net-pci t
+virtio-pci virtio-net-pci t
+virtio-net-pci-non-transitional virtio-net-pci-non-transitional t
+virtio-net-pci-transitional virtio-net-pci-transitional t
+vmxnet3 vmxnet3 t
+pl061 pl061
+gpio-key gpio-key
+virtio-mmio virtio-mmio
+fw_cfg fw_cfg_mem
+fw_cfg_mem fw_cfg_mem
+platform-bus-device platform-bus-device
+[arm sbsa-ref]
+device cfi.pflash01
+sys-bus-device cfi.pflash01
+migration migration
+arm-gicv3 arm-gicv3
+arm-gicv3-common arm-gicv3
+arm-gicv3-its arm-gicv3-its
+arm-gicv3-its-common arm-gicv3-its
+pl011 pl011
+pl031 pl031
+sbsa-gwdt sbsa-gwdt
+pl061 pl061
+gpio-key gpio-key
+sysbus-ahci sysbus-ahci
+base-xhci base-xhci
+sysbus-xhci sysbus-xhci
+gpex-root gpex-root
+pci-device gpex-root
+gpex-pcihost gpex-pcihost
+pci-host-bridge gpex-pcihost
+pcie-host-bridge gpex-pcihost
+e1000 e1000 t
+e1000-base e1000 t
+e1000-82544gc e1000-82544gc t
+e1000-82545em e1000-82545em t
+e1000e e1000e t
+i82550 i82550 t
+i82551 i82551 t
+i82557a i82557a t
+i82557b i82557b t
+i82557c i82557c t
+i82558a i82558a t
+i82558b i82558b t
+i82559a i82559a t
+i82559b i82559b t
+i82559c i82559c t
+i82559er i82559er t
+i82562 i82562 t
+i82801 i82801 t
+igb igb t
+ne2k_pci ne2k_pci t
+pcnet pcnet t
+rocker rocker
+rtl8139 rtl8139 t
+tulip tulip t
+virtio-device virtio-net-device t
+virtio-net-device virtio-net-device t
+virtio-net-pci virtio-net-pci t
+virtio-net-pci-base virtio-net-pci t
+virtio-pci virtio-net-pci t
+virtio-net-pci-non-transitional virtio-net-pci-non-transitional t
+virtio-net-pci-transitional virtio-net-pci-transitional t
+vmxnet3 vmxnet3 t
+bochs-display bochs-display
+arm-smmu arm-smmuv3
+arm-smmuv3 arm-smmuv3
+sbsa-ec sbsa-ec
+[arm none]
+device migration
+migration migration
+[riscv virt]
+device cfi.pflash01
+sys-bus-device cfi.pflash01
+migration migration
+fw_cfg fw_cfg_mem
+fw_cfg_mem fw_cfg_mem
+virtio-mmio virtio-mmio
+gpex-root gpex-root
+pci-device gpex-root
+gpex-pcihost gpex-pcihost
+pci-host-bridge gpex-pcihost
+pcie-host-bridge gpex-pcihost
+platform-bus-device platform-bus-device
+serial serial
+serial-mm serial-mm
+goldfish_rtc goldfish_rtc
+[riscv none]
+device migration
+migration migration
