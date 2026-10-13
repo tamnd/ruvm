@@ -27,6 +27,7 @@ mod rng;
 pub mod runstate;
 mod snapshot;
 mod tpm;
+mod vfio;
 pub mod vl;
 mod vnc;
 mod x86;
