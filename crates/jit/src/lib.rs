@@ -94,7 +94,7 @@ pub use cpu::{
 };
 pub use cputlb::{TlbEntryFull, TlbSection};
 pub use jit::{Jit, JitConfig};
-pub use native::{BackendKind, NativeBackend, host_backend};
+pub use native::{BackendKind, NativeBackend, host_backend, host_fault_target};
 pub use tb::{Tb, TbCpuState};
 pub use translator::{DisasContextBase, DisasJumpType, TranslatorOps, translator_loop};
 

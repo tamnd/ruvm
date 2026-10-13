@@ -109,6 +109,7 @@ pub fn tb_gen_code(cpu: &mut Cpu<'_>, s: TbCpuState) -> Result<Arc<Tb>, CpuLoopE
                 no_goto_ptr: cflags & cf::NO_GOTO_PTR != 0,
                 fence_mapping: jit.backend.fence_mapping(ops.guest_default_memory_order()),
                 tlb_page_bits: Some(jit.config.page_bits),
+                guest_base: jit.config.guest_base,
             };
             let mut b = TbBuild {
                 f: Func::new(config),

@@ -9,10 +9,16 @@
 //! (first fit from `task_unmapped_base`, then from `mmap_min_addr`) and replaces the pages
 //! with [`HostMemory::map_fixed`], and `munmap()` puts fresh zero pages back.
 //!
-//! The host pages always stay readable and writable. The guest's protection lives in the page
-//! flags, which the CPU checks when it fills its TLB and the syscall layer checks for every
-//! pointer it is given, as `access_ok()` does. So a store to a read only page is a SIGSEGV for
-//! the guest and never a host fault.
+//! The guest's protection lives in the page flags, which the CPU checks when it fills its TLB
+//! and the syscall layer checks for every pointer it is given, as `access_ok()` does. The host
+//! pages follow them too, as `target_mprotect()` makes them: nothing where the guest has
+//! nothing mapped or mapped `PROT_NONE`, read where it may read or run, and read and write
+//! where it may write. Generated code that reaches guest memory directly, without the TLB,
+//! then faults on the host exactly where the guest must, and the emulator finds out why from
+//! the flags. A page with translated code on it stays read only on the host while the code
+//! lives ([`GuestSpace::protect_code`]), so that stores to it fault and drop the code first,
+//! as `page_protect()` arranges. The reservation ends with a page the guest never gets, so
+//! that an access at its last byte faults rather than run past it.
 //!
 //! Deliberate differences from QEMU:
 //!
@@ -23,7 +29,7 @@
 //!   someone else writes the file.
 //! - Pages of a file mapping past the end of the file read as zero where Linux raises SIGBUS.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -40,6 +46,10 @@ pub const DEFAULT_RESERVE: u64 = 1 << 46;
 
 /// The smallest reservation tried before giving up.
 const MIN_RESERVE: u64 = 1 << 32;
+
+/// The inaccessible bytes past the end of the guest space, enough for the widest access that
+/// starts inside it.
+const GUARD: u64 = PAGE_SIZE;
 
 /// `PAGE_READ`, `PAGE_WRITE`, `PAGE_EXEC` and the bookkeeping flags of a guest page.
 pub mod page {
@@ -85,6 +95,8 @@ struct Range {
 struct Inner {
     /// Non-overlapping ranges keyed by their start.
     ranges: BTreeMap<u64, Range>,
+    /// The pages with translated code on them, which the host keeps read only.
+    code: BTreeSet<u64>,
 }
 
 impl Inner {
@@ -139,14 +151,24 @@ impl Inner {
 
     /// Whether every page of `start..end` is mapped with all of `need`.
     fn check(&self, start: u64, end: u64, need: u32) -> bool {
+        self.all(start, end, |f| f & need == need)
+    }
+
+    /// Whether every page of `start..end` is mapped with flags for which `ok` holds.
+    fn all(&self, start: u64, end: u64, ok: impl Fn(u32) -> bool) -> bool {
         let mut at = start;
         while at < end {
             match self.first_overlap(at, at + 1) {
-                Some((_, r)) if r.flags & need == need => at = r.end,
+                Some((_, r)) if ok(r.flags) => at = r.end,
                 _ => return false,
             }
         }
         true
+    }
+
+    /// Whether the host lets every page of `start..end` be written as it is.
+    fn host_writable(&self, start: u64, end: u64) -> bool {
+        self.check(start, end, page::WRITE) && self.code.range(start..end).next().is_none()
     }
 
     /// `page_find_range_empty()`: the lowest `align`ed address from `min` where `len` bytes
@@ -229,12 +251,14 @@ impl GuestSpace {
     ) -> std::io::Result<GuestSpace> {
         let mut size = want.max(MIN_RESERVE);
         let mem = loop {
-            match HostMemory::reserve(size as usize) {
+            match HostMemory::reserve((size + GUARD) as usize) {
                 Ok(m) => break m,
                 Err(e) if size / 2 < MIN_RESERVE => return Err(e),
                 Err(_) => size /= 2,
             }
         };
+        // Nothing is mapped yet.
+        mem.protect(0, mem.len(), false, false)?;
         let block = Arc::new(RamBlock::from_memory("guest", mem, 12));
         let reserved_va = size - 1;
         let third = page_align(reserved_va / 3).unwrap_or(0);
@@ -248,7 +272,7 @@ impl GuestSpace {
         Ok(GuestSpace {
             block,
             size,
-            inner: Mutex::new(Inner { ranges: BTreeMap::new() }),
+            inner: Mutex::new(Inner { ranges: BTreeMap::new(), code: BTreeSet::new() }),
             min_addr: mmap_min_addr(),
             unmapped_base,
             et_dyn_base,
@@ -273,6 +297,12 @@ impl GuestSpace {
     /// `g2h()`: the host address of guest address `g`.
     pub fn g2h(&self, g: u64) -> usize {
         self.block.host_addr() + g as usize
+    }
+
+    /// `guest_base` and the number of low address bits that are always inside the space:
+    /// an access at an address below `1 << bits` that faults on the host faults for the guest.
+    pub fn guest_base(&self) -> (u64, u32) {
+        (self.g2h(0) as u64, 63 - self.size.leading_zeros())
     }
 
     /// `task_unmapped_base`.
@@ -314,7 +344,8 @@ impl GuestSpace {
     }
 
     /// `page_check_range()`: whether every byte of `len` at `addr` is mapped with all of the
-    /// [`page`] bits in `need`. An empty range always is.
+    /// [`page`] bits in `need`. An empty range always is. When `need` has [`page::WRITE`],
+    /// translated code in the range is dropped, so that the host lets the bytes be written.
     pub fn check(&self, addr: u64, len: u64, need: u32) -> bool {
         if len == 0 {
             return true;
@@ -324,7 +355,73 @@ impl GuestSpace {
             return false;
         }
         let start = addr & !(PAGE_SIZE - 1);
-        self.lock().check(start, end, need)
+        let ok = self.lock().check(start, end, need);
+        if ok && need & page::WRITE != 0 {
+            self.drop_code(start, end);
+        }
+        ok
+    }
+
+    /// `page_unprotect()` for every page of `start..end` with translated code on it: the code
+    /// goes, and with it the host's write protection.
+    fn drop_code(&self, start: u64, end: u64) {
+        let pages: Vec<u64> = self.lock().code.range(start..end).copied().collect();
+        for p in pages {
+            self.notify_write(p, PAGE_SIZE);
+        }
+    }
+
+    /// `page_protect()` when `protect`, else the end of it: translated code from the page at
+    /// `addr` now exists, or no longer does. While it does, the host keeps the page read only,
+    /// so that a store from generated code faults and the emulator drops the code before it
+    /// lets the store happen.
+    pub fn protect_code(&self, addr: u64, protect: bool) {
+        let page = addr & !(PAGE_SIZE - 1);
+        if page >= self.size {
+            return;
+        }
+        let mut inner = self.lock();
+        let changed = if protect { inner.code.insert(page) } else { inner.code.remove(&page) };
+        if changed {
+            let _ = self.sync_host(&inner, page, page + PAGE_SIZE);
+        }
+    }
+
+    /// Gives the host pages of `start..end` the protection the flags and the translated code
+    /// call for.
+    fn sync_host(&self, inner: &Inner, start: u64, end: u64) -> Result<(), i32> {
+        let mem = self.block.host_memory();
+        let set = |s: u64, e: u64, flags: u32| {
+            let read = flags & page::RWX != 0;
+            mem.protect(s as usize, (e - s) as usize, read, flags & page::WRITE != 0)
+                .map_err(|e| errno_of(&e))
+        };
+        let mut at = start;
+        while at < end {
+            match inner.first_overlap(at, end) {
+                Some((s, r)) if s <= at => {
+                    let e = r.end.min(end);
+                    set(at, e, r.flags)?;
+                    at = e;
+                }
+                Some((s, _)) => {
+                    set(at, s, 0)?;
+                    at = s;
+                }
+                None => {
+                    set(at, end, 0)?;
+                    at = end;
+                }
+            }
+        }
+        for &p in inner.code.range(start..end) {
+            if let Some((_, r)) = inner.first_overlap(p, p + 1) {
+                if r.flags & page::WRITE != 0 {
+                    set(p, p + PAGE_SIZE, page::READ)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `page_check_range_empty()`.
@@ -339,9 +436,17 @@ impl GuestSpace {
 
     /// `page_set_flags()` for memory the caller filled itself.
     pub fn set_flags(&self, start: u64, len: u64, flags: u32) {
-        if len != 0 {
-            self.lock().set(start, start + len, flags);
+        let _ = self.try_set_flags(start, len, flags);
+    }
+
+    /// [`set_flags`](Self::set_flags), failing when the host cannot protect the pages so.
+    fn try_set_flags(&self, start: u64, len: u64, flags: u32) -> Result<(), i32> {
+        if len == 0 {
+            return Ok(());
         }
+        let mut inner = self.lock();
+        inner.set(start, start + len, flags);
+        self.sync_host(&inner, start, start + len)
     }
 
     /// `mmap_find_vma()` with `reserved_va`: room for `size` bytes `align`ed, searching up
@@ -427,7 +532,7 @@ impl GuestSpace {
         if kind.shared {
             flags |= page::SHARED;
         }
-        self.set_flags(start, len, flags);
+        self.try_set_flags(start, len, flags)?;
         Ok(start)
     }
 
@@ -462,8 +567,9 @@ impl GuestSpace {
         for (s, e) in mapped {
             self.replace(s, e - s, None, 0, false)?;
         }
-        self.lock().clear(start, end);
-        Ok(())
+        let mut inner = self.lock();
+        inner.clear(start, end);
+        self.sync_host(&inner, start, end)
     }
 
     /// `target_mprotect()`.
@@ -490,7 +596,7 @@ impl GuestSpace {
         for (s, r) in parts {
             inner.set(s, r.end, (r.flags & !page::RWX) | prot);
         }
-        Ok(())
+        self.sync_host(&inner, start, end)
     }
 
     /// `target_mremap()` with `reserved_va`. `new_addr` is only used with `fixed`.
@@ -571,6 +677,9 @@ impl GuestSpace {
     fn move_range(&self, from: u64, to: u64, len: u64) {
         let mem = self.block.host_memory();
         if mem.move_pages(from as usize, to as usize, len as usize).is_err() {
+            // The caller gives both ranges the protection of their flags afterwards.
+            let _ = mem.protect(from as usize, len as usize, true, false);
+            let _ = mem.protect(to as usize, len as usize, true, true);
             let mut buf = vec![0u8; 1 << 20];
             let mut done = 0;
             while done < len {
@@ -583,16 +692,52 @@ impl GuestSpace {
         self.notify_write(to, len);
     }
 
-    /// Reads guest memory without looking at the page flags, as the emulator itself may.
+    /// Reads guest memory the guest may not read, as the emulator itself may. Only pages the
+    /// host can read, mapped with some access, can be read so.
     pub fn read_raw(&self, addr: u64, buf: &mut [u8]) -> bool {
-        self.range_valid(addr, buf.len() as u64) && self.block.read(addr, buf).is_ok()
+        let len = buf.len() as u64;
+        if !self.range_valid(addr, len) {
+            return false;
+        }
+        if len == 0 {
+            return true;
+        }
+        let inner = self.lock();
+        inner.all(addr & !(PAGE_SIZE - 1), addr + len, |f| f & page::RWX != 0)
+            && self.block.read(addr, buf).is_ok()
     }
 
-    /// Writes guest memory without looking at the page flags.
+    /// Writes mapped guest memory the guest may not write. The host protection is lifted
+    /// while the bytes are written, so another thread of the guest could write the pages
+    /// then too; only the loader and the signal code use this.
     pub fn write_raw(&self, addr: u64, buf: &[u8]) -> bool {
-        let ok = self.range_valid(addr, buf.len() as u64) && self.block.write(addr, buf).is_ok();
+        let len = buf.len() as u64;
+        if !self.range_valid(addr, len) {
+            return false;
+        }
+        if len == 0 {
+            return true;
+        }
+        let (start, end) = (addr & !(PAGE_SIZE - 1), page_align(addr + len).unwrap_or(self.size));
+        self.drop_code(start, end);
+        let ok = {
+            let inner = self.lock();
+            if !inner.check(start, end, 0) {
+                return false;
+            }
+            let lift = !inner.host_writable(start, end);
+            let mem = self.block.host_memory();
+            if lift && mem.protect(start as usize, (end - start) as usize, true, true).is_err() {
+                return false;
+            }
+            let ok = self.block.write(addr, buf).is_ok();
+            if lift {
+                let _ = self.sync_host(&inner, start, end);
+            }
+            ok
+        };
         if ok {
-            self.notify_write(addr, buf.len() as u64);
+            self.notify_write(addr, len);
         }
         ok
     }
@@ -771,5 +916,73 @@ mod tests {
         assert!(s.write(a + PAGE_SIZE - 3, b"abcdef\0"));
         assert_eq!(s.read_cstr(a + PAGE_SIZE - 3, 100).unwrap(), b"abcdef");
         assert!(s.read_cstr(a + PAGE_SIZE - 3, 4).is_none());
+    }
+    /// The host's permissions of the page holding `h`, as `/proc/self/maps` shows them.
+    fn host_perms(h: usize) -> String {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        for line in maps.lines() {
+            let (range, rest) = line.split_once(' ').unwrap();
+            let (lo, hi) = range.split_once('-').unwrap();
+            let (lo, hi) =
+                (usize::from_str_radix(lo, 16).unwrap(), usize::from_str_radix(hi, 16).unwrap());
+            if lo <= h && h < hi {
+                return rest[..3].to_string();
+            }
+        }
+        panic!("{h:#x} is not mapped");
+    }
+
+    #[test]
+    fn host_protection_follows_the_flags() {
+        let s = Arc::new(space());
+        let w = Arc::downgrade(&s);
+        s.set_code_hook(Box::new(move |a, l| {
+            // What the translator does when the code of a page goes.
+            if let Some(s) = w.upgrade() {
+                let mut p = a & !(PAGE_SIZE - 1);
+                while p < a + l {
+                    s.protect_code(p, false);
+                    p += PAGE_SIZE;
+                }
+            }
+        }));
+        let rw = page::READ | page::WRITE;
+        let a = s.mmap(0, 3 * PAGE_SIZE, rw, ANON, None, 0).unwrap();
+        let h = |g: u64| host_perms(s.g2h(g));
+        assert_eq!(h(a), "rw-");
+        assert_eq!(h(a + 3 * PAGE_SIZE), "---");
+        let (base, bits) = s.guest_base();
+        assert_eq!(base as usize, s.g2h(0));
+        assert_eq!(1u64 << bits, s.size());
+        assert_eq!(host_perms(s.g2h(s.size())), "---");
+        s.mprotect(a + PAGE_SIZE, PAGE_SIZE, page::READ).unwrap();
+        s.mprotect(a + 2 * PAGE_SIZE, PAGE_SIZE, page::EXEC).unwrap();
+        assert_eq!(
+            (h(a), h(a + PAGE_SIZE), h(a + 2 * PAGE_SIZE)),
+            ("rw-".into(), "r--".into(), "r--".into())
+        );
+        // The loader may still write what the guest cannot.
+        assert!(!s.write(a + PAGE_SIZE, b"no"));
+        assert!(s.write_raw(a + PAGE_SIZE + 1, b"ro"));
+        assert_eq!(h(a + PAGE_SIZE), "r--");
+        let mut buf = [0u8; 2];
+        assert!(s.read(a + PAGE_SIZE + 1, &mut buf));
+        assert_eq!(&buf, b"ro");
+        // Code on a writable page keeps it read only until something writes it.
+        s.protect_code(a, true);
+        assert_eq!(h(a), "r--");
+        s.mprotect(a, PAGE_SIZE, rw).unwrap();
+        assert_eq!(h(a), "r--");
+        assert!(s.write(a + 8, b"x"));
+        assert_eq!(h(a), "rw-");
+        s.protect_code(a, true);
+        assert!(s.check(a, 1, page::WRITE));
+        assert_eq!(h(a), "rw-");
+        s.mprotect(a, PAGE_SIZE, 0).unwrap();
+        assert_eq!(h(a), "---");
+        assert!(!s.read_raw(a, &mut buf));
+        assert!(!s.write_raw(a + 3 * PAGE_SIZE, b"no"));
+        s.munmap(a, 3 * PAGE_SIZE).unwrap();
+        assert_eq!(h(a + PAGE_SIZE), "---");
     }
 }

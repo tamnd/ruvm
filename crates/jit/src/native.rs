@@ -112,6 +112,19 @@ pub(crate) fn env_override(backend: Arc<dyn Backend>, code_size: usize) -> Arc<d
     }
 }
 
+/// Where generated code that faulted at `pc` resumes: the slow path of a direct user mode
+/// access ([`crate::JitConfig::guest_base`]), or `None` when `pc` is not such an access. For a
+/// host signal handler: it takes no lock and does not allocate.
+pub fn host_fault_target(pc: u64) -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    return ruvm_jit_x86_64::fault_target(pc);
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = pc;
+        None
+    }
+}
+
 /// The code of one block.
 enum Body {
     Native(host::CompiledTb),
@@ -596,6 +609,7 @@ mod host {
             helpers: Some(helpers),
             icount_decr_offset: Some(ENV_ICOUNT_DECR_OFFSET),
             tlb_page_bits: f.config.tlb_page_bits,
+            guest_base: f.config.guest_base,
         };
         r.compile_with(f, &opts)
     }

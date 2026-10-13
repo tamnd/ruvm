@@ -51,6 +51,10 @@
 //!   the run context, not at a fixed offset from `env`. A run whose guest memory has no TLB of
 //!   the chain's page size gives them a descriptor that never matches, so every access takes
 //!   the slow path through the service routine.
+//! - Direct user mode accesses ([`CompileOptions::guest_base`]) that fault resume at their
+//!   slow path through [`crate::fault_target`], which the caller's signal handler must call;
+//!   QEMU's handler instead unwinds to `cpu_loop_exit_sigsegv` and lets the guest see the
+//!   fault, or unprotects a page of translated code and retries.
 //! - `lookup_and_goto_ptr` calls its own lookup routine, which finds the block through a
 //!   per-CPU cache that also keeps the address to jump to, so a hit costs no reference count
 //!   and no chain check; QEMU's `helper_lookup_tb_ptr` reads `tb->tc.ptr` from its jump cache.
@@ -273,6 +277,13 @@ pub struct CompileOptions<'a> {
     /// such TLB, every access takes the slow path. All blocks of a region chain must give the
     /// same value; a block that gives another is refused with [`GenCodeError::Unsupported`].
     pub tlb_page_bits: Option<u32>,
+    /// Make `qemu_ld` and `qemu_st` straight host accesses at the guest address plus a base,
+    /// as QEMU's user mode does with `guest_base`, instead of looking up a TLB: see
+    /// [`ruvm_jit_core::ir::FuncConfig::guest_base`]. Addresses at or past the bound, and
+    /// misaligned accesses that must be aligned, take the slow path, and so do accesses that
+    /// fault, through [`crate::fault_target`]. A region whose buffer [`crate::fault_target`]
+    /// does not know of refuses such blocks with [`GenCodeError::Unsupported`].
+    pub guest_base: Option<(u64, u32)>,
 }
 
 impl CodeRegion {
@@ -370,11 +381,17 @@ impl CodeRegion {
                 )));
             }
         }
+        if opts.guest_base.is_some() && !self.buf.fault_targets() {
+            return Err(GenCodeError::Unsupported(
+                "too many code buffers for direct accesses".into(),
+            ));
+        }
         let mut meta = Arc::new(BlockMeta::default());
         let gen_opts = GenOptions {
             meta: Arc::as_ptr(&meta) as usize as u64,
             icount_decr: opts.icount_decr_offset,
             tlb_page_bits: opts.tlb_page_bits,
+            guest_base: opts.guest_base,
             lookup: {
                 let f: extern "C" fn(&mut RunCtx<'_>, u64, *const BlockMeta) -> u64 =
                     lookup_service;

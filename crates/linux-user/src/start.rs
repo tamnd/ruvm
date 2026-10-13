@@ -177,6 +177,11 @@ pub(crate) fn main(argv0: &str, args: &[String], target: &mut dyn Target) -> Exi
         if o.one_insn_per_tb {
             config.one_insn_per_tb = true;
         }
+        // Guest loads and stores are host accesses at `guest_base` where the backend can make
+        // them so, as in QEMU.
+        if cfg!(target_arch = "x86_64") {
+            config.guest_base = Some(space.guest_base());
+        }
     });
 
     let ms = MemorySystem::new();
@@ -201,6 +206,17 @@ pub(crate) fn main(argv0: &str, args: &[String], target: &mut dyn Target) -> Exi
                 j.tb_invalidate_phys_block(&block, s, l);
             }
         }));
+    }
+    if jit.config.guest_base.is_some() {
+        // Direct accesses skip the TLB's check for pages of translated code, so the host
+        // refuses writes to those instead, as QEMU's `page_protect` makes it.
+        let base = jit.ram_addr_base(space.block());
+        let s = Arc::downgrade(&space);
+        jit.set_code_protect(move |ram, protect| {
+            if let Some(s) = s.upgrade() {
+                s.protect_code(ram.wrapping_sub(base), protect);
+            }
+        });
     }
 
     let mut v = match target.create_vcpu(&jit, &space, as_, &info) {

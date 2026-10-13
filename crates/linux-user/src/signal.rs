@@ -438,6 +438,15 @@ pub(crate) fn signal_init(prog: &str) {
 /// siginfo `raw`, interrupting the thread at `pc`, whose mask after the handler is `mask`.
 /// Only atomics and the stack are used here.
 pub(crate) fn host_signal(sig: i32, raw: &[u64; 16], pc: &mut i64, mask: &mut u64) {
+    // A direct guest access the host refused resumes at its slow path, which finds out why,
+    // as a TLB miss would, and raises the guest's fault if there is one.
+    let kernel = raw[1] as u32 as i32 > 0;
+    if kernel && matches!(sig, libc::SIGSEGV | libc::SIGBUS) {
+        if let Some(to) = ruvm_jit::host_fault_target(*pc as u64) {
+            *pc = to as i64;
+            return;
+        }
+    }
     let Some(tab) = TABLES.get() else { return };
     let Some(ts) = CURRENT.get() else { return };
     if sig == tab.interrupt {
@@ -449,9 +458,9 @@ pub(crate) fn host_signal(sig: i32, raw: &[u64; 16], pc: &mut i64, mask: &mut u6
     for (i, w) in raw.iter().enumerate() {
         put64(&mut info, 8 * i, *w);
     }
-    // Faults the kernel raised are the emulator's own: guest memory is always mapped on the
-    // host, and guest faults are found by the softmmu.
-    if (get32(&info, 8) as i32) > 0
+    // Other faults the kernel raised are the emulator's own: guest faults are found by the
+    // softmmu, or by the slow path of a direct access.
+    if kernel
         && matches!(sig, libc::SIGSEGV | libc::SIGBUS | libc::SIGILL | libc::SIGFPE | libc::SIGTRAP)
     {
         die_from_signal(&info);
