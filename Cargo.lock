@@ -2079,6 +2079,7 @@ dependencies = [
  "ruvm-hw-pci",
  "ruvm-hw-storage",
  "ruvm-hw-timer",
+ "ruvm-hw-tpm",
  "ruvm-hw-virtio",
  "ruvm-jit",
  "ruvm-mem",

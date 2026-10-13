@@ -10,12 +10,13 @@ mod common;
 
 use ruvm_firmware::acpi::arm_virt::{
     self, ArmVirtAcpi, GicV2Bases, GicV2mFrame, IortSmmu, NumaNode, PossibleCpu, PsciConduit,
-    VIRTUAL_PMU_IRQ, VirtIrqs, VirtMemmap,
+    VIRTUAL_PMU_IRQ, VirtIrqs, VirtMemmap, VirtTpm,
 };
 use ruvm_firmware::acpi::gpex::Window;
 use ruvm_firmware::acpi::linker::Command;
 use ruvm_firmware::acpi::q35::{PciDevice, PciDeviceAml};
 use ruvm_firmware::acpi::table::{APPNAME6, APPNAME8, RSDP_FILE, TABLE_FILE};
+use ruvm_firmware::acpi::tpm::TpmVersion;
 
 use common::load;
 
@@ -68,6 +69,7 @@ fn base() -> ArmVirtAcpi {
         numa: Vec::new(),
         smmus: Vec::new(),
         viot: None,
+        tpm: None,
     }
 }
 
@@ -234,6 +236,40 @@ fn layout() {
     let cmds = t.linker.commands();
     assert!(cmds.iter().any(|c| matches!(c, Command::Allocate { file, .. } if file == TABLE_FILE)));
     assert!(cmds.iter().any(|c| matches!(c, Command::Allocate { file, .. } if file == RSDP_FILE)));
+}
+
+/// A tpm-tis-device at the start of the platform bus with its PPI memory right after: the
+/// TPM2 table after the IORT with the MMIO start method and the TPM0 device in the DSDT.
+#[test]
+fn tpm_tis_device() {
+    let mut m = base();
+    let tpm = VirtTpm { version: TpmVersion::V2_0, base: 0xc00_0000, ppi_base: Some(0xc00_8000) };
+    m.tpm = Some(tpm);
+    let t = arm_virt::build(&m);
+    let tables = load(&t);
+    let sigs: Vec<&str> = tables.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(
+        sigs,
+        ["DSDT", "FACP", "APIC", "PPTT", "GTDT", "MCFG", "SPCR", "DBG2", "IORT", "TPM2", "XSDT"]
+    );
+    let tpm2 = common::table(&tables, "TPM2");
+    assert_eq!(tpm2.len(), 76);
+    assert_eq!(u64::from_le_bytes(tpm2[40..48].try_into().unwrap()), 0, "control area");
+    assert_eq!(u32::from_le_bytes(tpm2[48..52].try_into().unwrap()), 6, "start method");
+    assert_eq!(u32::from_le_bytes(tpm2[64..68].try_into().unwrap()), 0x10000, "LAML");
+    let dsdt = common::table(&tables, "DSDT");
+    assert!(dsdt.windows(8).any(|w| w == b"MSFT0101"));
+    assert!(dsdt.windows(4).any(|w| w == b"TPP2"));
+    assert_eq!(t.tcpalog.len(), 0x10000);
+
+    m.tpm = Some(VirtTpm { ppi_base: None, ..tpm });
+    let dsdt = common::table(&load(&arm_virt::build(&m)), "DSDT");
+    assert!(dsdt.windows(8).any(|w| w == b"MSFT0101"));
+    assert!(!dsdt.windows(4).any(|w| w == b"TPP2"));
+
+    m.tpm = Some(VirtTpm { version: TpmVersion::V1_2, ..tpm });
+    let tables = load(&arm_virt::build(&m));
+    assert!(!tables.iter().any(|(s, _)| s == "TPM2" || s == "TCPA"));
 }
 
 /// With `spcr=off` QEMU still reserves the SPCR's XSDT entry, so the DBG2 is listed twice.

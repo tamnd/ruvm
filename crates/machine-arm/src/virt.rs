@@ -100,13 +100,14 @@ use ruvm_base::ClockType;
 use ruvm_firmware::acpi::BuildTables;
 use ruvm_firmware::acpi::arm_virt::{
     self, ArmVirtAcpi, GicV2Bases, GicV2mFrame, IortSmmu, PsciConduit as AcpiPsci, VirtIrqs,
-    VirtMemmap as AcpiMemmap,
+    VirtMemmap as AcpiMemmap, VirtTpm,
 };
 use ruvm_firmware::acpi::gpex::Window;
 use ruvm_firmware::acpi::q35::{PciDevice as AcpiPciDevice, PciDeviceAml};
 use ruvm_firmware::acpi::table::{
     APPNAME6, APPNAME8, LOADER_FILE, RSDP_FILE, TABLE_FILE, TPMLOG_FILE,
 };
+use ruvm_firmware::acpi::tpm::TpmVersion as AcpiTpmVersion;
 use ruvm_firmware::acpi::viot::ViotInfo;
 use ruvm_hw_acpi::ged::{ACPI_GED_ERROR_EVT, ACPI_GED_EVT_SEL_LEN, ACPI_GED_PWR_DOWN_EVT};
 use ruvm_hw_acpi::{AcpiGed, AcpiGedProps};
@@ -135,6 +136,9 @@ use ruvm_hw_misc::{GpioKey, Pl061, Pl061Props};
 use ruvm_hw_pci::regs::PCI_NUM_PINS;
 use ruvm_hw_pci::{GpexConfig, GpexHost, GpexWindow, MsiTrigger};
 use ruvm_hw_timer::pl031::{PL031_MMIO_SIZE, Pl031};
+use ruvm_hw_tpm::TpmBackend;
+use ruvm_hw_tpm::ppi::{TPM_PPI_ADDR_SIZE, TpmPpi};
+use ruvm_hw_tpm::tis::{TPM_TIS_ADDR_SIZE, TpmTis};
 use ruvm_hw_virtio::mmio::{VIRTIO_MMIO_FORCE_LEGACY_DEFAULT, VIRTIO_MMIO_REGION_SIZE};
 use ruvm_hw_virtio::virtio::VIRTIO_F_IOMMU_PLATFORM;
 use ruvm_hw_virtio::{VirtioBackend, VirtioDeviceClass, VirtioMmio, VirtioPci, VirtioPciProps};
@@ -439,6 +443,31 @@ pub struct VirtConfig {
     pub spi_sink: Option<SpiSink>,
     /// `force-legacy` of the virtio-mmio transports, which `-global` can change.
     pub virtio_force_legacy: bool,
+}
+
+/// A `-device tpm-tis-device`, with where its registers and PPI memory are on the platform
+/// bus.
+struct PlatformTpm {
+    tis: Arc<TpmTis>,
+    version: ruvm_hw_tpm::TpmVersion,
+    base: u64,
+    ppi_base: Option<u64>,
+}
+
+/// `platform_bus_map_mmio()`: the first offset in the platform bus, aligned to `size`
+/// rounded up to a power of two, where `size` bytes overlap nothing in `used`. The space is
+/// then used.
+fn platform_bus_place(used: &mut Vec<(u64, u64)>, size: u64) -> Result<u64, String> {
+    let align = size.next_power_of_two();
+    let mut off = 0;
+    while off < VIRT_PLATFORM_BUS_SIZE {
+        if used.iter().all(|&(at, n)| off + size <= at || at + n <= off) {
+            used.push((off, size));
+            return Ok(off);
+        }
+        off += align;
+    }
+    Err(format!("Platform Bus: Can not fit MMIO region of size {size:x}"))
 }
 
 /// Takes SPI `n` and its new level, for [`VirtConfig::spi_sink`].
@@ -928,6 +957,8 @@ pub struct VirtMachine {
     dev_smmu: OnceLock<Arc<SmmuV3>>,
     /// The platform bus window, `create_platform_bus()`.
     pbus: RegionId,
+    /// The `-device tpm-tis-device` on the platform bus.
+    tpm: OnceLock<PlatformTpm>,
     spi_sink: Option<SpiSink>,
     /// `default-bus-bypass-iommu`: the root bus is not behind the SMMU.
     iommu_bypass: bool,
@@ -1450,6 +1481,7 @@ impl VirtMachine {
             smmu,
             dev_smmu: OnceLock::new(),
             pbus,
+            tpm: OnceLock::new(),
             spi_sink: cfg.spi_sink.clone(),
             iommu_bypass: cfg.default_bus_bypass_iommu,
             iommu_spaces: Mutex::new(Vec::new()),
@@ -1631,6 +1663,9 @@ impl VirtMachine {
         if self.dev_smmu.get().is_some() {
             return Err("An iommu is already attached to this bus".to_string());
         }
+        if self.tpm.get().is_some() {
+            return Err("arm-smmuv3 after tpm-tis-device is not supported by ruvm yet".to_string());
+        }
         if self.iommu_bypass {
             return Err("Bypass option cannot be set for SMMUv3 associated PCIe RC".to_string());
         }
@@ -1642,6 +1677,49 @@ impl VirtMachine {
         self.mem.add_subregion(self.pbus, 0, r).map_err(err)?;
         let _ = self.dev_smmu.set(smmu);
         Ok(())
+    }
+
+    /// Plug a `-device tpm-tis-device` over `be`, `tpm_tis_sysbus_realizefn()` and
+    /// `platform_bus_link_device()`: its registers, then its PPI memory when `ppi` is on, go
+    /// in the first naturally aligned free space of the platform bus, after an SMMUv3 plugged
+    /// before it, and its interrupt is the first free one of the bus. The TPM starts on every
+    /// reset and, as in QEMU, the process exits when that fails.
+    pub fn attach_tpm_tis_device(
+        &self,
+        be: Box<dyn TpmBackend>,
+        irq: u32,
+        ppi: bool,
+    ) -> Result<Arc<TpmTis>, String> {
+        if self.done {
+            return Err("sysbus devices must be plugged before machine_done".to_string());
+        }
+        let version = be.version();
+        let tis = TpmTis::new(be, irq);
+        // The SMMUv3 is the only other device on the bus, at its start with four interrupts.
+        let mut used = Vec::new();
+        let mut first_irq = 0;
+        if self.dev_smmu.get().is_some() {
+            used.push((0, SMMU_SIZE));
+            first_irq = 4;
+        }
+        let base = platform_bus_place(&mut used, TPM_TIS_ADDR_SIZE)?;
+        let ppi_base =
+            if ppi { Some(platform_bus_place(&mut used, TPM_PPI_ADDR_SIZE as u64)?) } else { None };
+        tis.irq().connect(spi_line(
+            &self.gic,
+            self.spi_sink.as_ref(),
+            VIRT_PLATFORM_BUS_IRQ + first_irq,
+        ));
+        let ops: Arc<dyn MmioOps> = tis.clone();
+        let r = self.mem.new_io("tpm-tis-mmio", u128::from(TPM_TIS_ADDR_SIZE), ops).map_err(err)?;
+        self.mem.add_subregion(self.pbus, base, r).map_err(err)?;
+        if let Some(at) = ppi_base {
+            let ops: Arc<dyn MmioOps> = Arc::new(TpmPpi::default());
+            let r = self.mem.new_io("tpm-ppi", TPM_PPI_ADDR_SIZE as u128, ops).map_err(err)?;
+            self.mem.add_subregion(self.pbus, at, r).map_err(err)?;
+        }
+        let _ = self.tpm.set(PlatformTpm { tis: Arc::clone(&tis), version, base, ppi_base });
+        Ok(tis)
     }
 
     /// `pcibus_machine_done()`: the bus master address space of each function, behind the
@@ -1765,6 +1843,14 @@ impl VirtMachine {
                 bdf: *bdf,
                 ranges: if self.iommu_bypass { Vec::new() } else { vec![(0, 0)] },
             }),
+            tpm: self.tpm.get().map(|t| VirtTpm {
+                version: match t.version {
+                    ruvm_hw_tpm::TpmVersion::V1_2 => AcpiTpmVersion::V1_2,
+                    ruvm_hw_tpm::TpmVersion::V2_0 => AcpiTpmVersion::V2_0,
+                },
+                base: VIRT_PLATFORM_BUS + t.base,
+                ppi_base: t.ppi_base.map(|b| VIRT_PLATFORM_BUS + b),
+            }),
         };
         arm_virt::build(&acpi)
     }
@@ -1834,7 +1920,7 @@ impl VirtMachine {
         }
         self.pci_machine_done()?;
         if self.dtb_filename.is_none() {
-            dt::add_platform_bus_node(&mut self.fdt)?;
+            dt::add_platform_bus_node(&mut self.fdt, self.tpm.get().map(|t| t.base))?;
         }
         if let Some(fdt) = boot::arm_load_dtb(
             &mut self.loader,
@@ -1854,7 +1940,7 @@ impl VirtMachine {
             fwc.add_file(TABLE_FILE, tables.table_data).map_err(err)?;
             fwc.add_file(LOADER_FILE, tables.linker.cmd_blob().to_vec()).map_err(err)?;
             // The TPM log, empty without a TPM.
-            fwc.add_file(TPMLOG_FILE, Vec::new()).map_err(err)?;
+            fwc.add_file(TPMLOG_FILE, tables.tcpalog).map_err(err)?;
             fwc.add_file(RSDP_FILE, tables.rsdp).map_err(err)?;
         }
         self.ram = ram_ranges(&self.mem, self.system)?;
@@ -1907,6 +1993,12 @@ impl VirtMachine {
         }
         if let Some((v, _)) = self.viommu.get() {
             v.system_reset();
+        }
+        if let Some(t) = self.tpm.get() {
+            if let Err(e) = t.tis.reset() {
+                ruvm_base::error_report(&e);
+                std::process::exit(1);
+            }
         }
         let fwc = self.fw_cfg.state();
         fwc.reset();
