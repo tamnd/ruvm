@@ -71,7 +71,7 @@ use ruvm_target_riscv::cfg::{
 use ruvm_target_riscv::tcg::SemihostingHost;
 
 use crate::arm::{Semihosting, SemihostingTarget};
-use crate::runstate::Runstate;
+use crate::runstate::{MachineReset, Runstate};
 use crate::vl::Vm;
 use crate::x86::{Drive, Located};
 
@@ -616,7 +616,7 @@ impl Frontend for SemiConsoleFrontend {
 #[derive(Debug)]
 enum Board {
     Tcg(Arc<VirtTcgMachine>),
-    Qtest(Box<VirtMachine>),
+    Qtest(Arc<Mutex<VirtMachine>>),
 }
 
 /// The virt board, and the chardevs its devices are attached to.
@@ -643,10 +643,22 @@ impl Running {
         }
     }
 
+    /// What `qemu_system_reset()` does to the board from outside the guest, which ruvm has
+    /// only under the qtest accelerator so far.
+    pub(crate) fn machine_reset(&self) -> MachineReset {
+        match &self.board {
+            Board::Qtest(b) => {
+                let b = Arc::clone(b);
+                MachineReset::Board(Arc::new(move || lock(&b).system_reset()))
+            }
+            _ => MachineReset::Unsupported,
+        }
+    }
+
     /// The system memory, which a `-qtest` client reads and writes.
     pub(crate) fn memory(&self) -> Arc<AddressSpace> {
         match &self.board {
-            Board::Qtest(b) => Arc::clone(b.memory_as()),
+            Board::Qtest(b) => Arc::clone(lock(b).memory_as()),
             Board::Tcg(m) => Arc::clone(lock(m.board()).memory_as()),
         }
     }
@@ -864,7 +876,7 @@ pub(crate) fn start_board(
         BoardAccel::Tcg(tcg) => tcg,
         BoardAccel::Qtest(_) => {
             return Ok(Running {
-                board: Board::Qtest(Box::new(board)),
+                board: Board::Qtest(Arc::new(Mutex::new(board))),
                 console,
                 _attachments: attachments,
             });

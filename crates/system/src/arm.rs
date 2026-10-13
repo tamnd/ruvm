@@ -84,7 +84,7 @@ use ruvm_qom::Registry;
 use ruvm_target_arm::cpu::{ARM_MAX_VQ, ArmCpuModel, PauthAlg};
 use ruvm_target_arm::tcg::SemihostingHost;
 
-use crate::runstate::Runstate;
+use crate::runstate::{MachineReset, Runstate};
 use crate::vl::Vm;
 use crate::x86::{Drive, Located};
 
@@ -1044,7 +1044,7 @@ enum Machine {
     SbsaRef(Arc<SbsaRefTcgMachine>),
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     Kvm(Arc<ruvm_machine_arm::virt::kvm::KvmVirtMachine>),
-    Qtest(Box<VirtMachine>),
+    Qtest(Arc<Mutex<VirtMachine>>),
 }
 
 /// The board, and the chardevs its devices are attached to.
@@ -1075,6 +1075,18 @@ impl Running {
         }
     }
 
+    /// What `qemu_system_reset()` does to the board from outside the guest, which ruvm has
+    /// only under the qtest accelerator so far.
+    pub(crate) fn machine_reset(&self) -> MachineReset {
+        match &self.machine {
+            Machine::Qtest(b) => {
+                let b = Arc::clone(b);
+                MachineReset::Board(Arc::new(move || lock(&b).system_reset()))
+            }
+            _ => MachineReset::Unsupported,
+        }
+    }
+
     /// The system memory, which a `-qtest` client reads and writes. `None` on KVM.
     pub(crate) fn memory(&self) -> Option<Arc<AddressSpace>> {
         match &self.machine {
@@ -1082,7 +1094,7 @@ impl Running {
             Machine::SbsaRef(m) => Some(Arc::clone(lock(m.board()).memory_as())),
             #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
             Machine::Kvm(_) => None,
-            Machine::Qtest(b) => Some(Arc::clone(b.memory_as())),
+            Machine::Qtest(b) => Some(Arc::clone(lock(b).memory_as())),
         }
     }
 }
@@ -1213,7 +1225,11 @@ pub(crate) fn start_board_qtest(
     if let Some(path) = &dtb_path {
         dumpdtb(path, board.fdt().as_bytes())?;
     }
-    Ok(Running { machine: Machine::Qtest(Box::new(board)), console, _attachments: attachments })
+    Ok(Running {
+        machine: Machine::Qtest(Arc::new(Mutex::new(board))),
+        console,
+        _attachments: attachments,
+    })
 }
 
 /// The virt board built from the command line, before `qemu_machine_creation_done()`.

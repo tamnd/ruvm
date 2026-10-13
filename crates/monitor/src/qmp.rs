@@ -394,6 +394,8 @@ struct Monitors {
     /// to the back, so no client can starve another.
     list: VecDeque<Arc<MonitorQmp>>,
     shutdown: bool,
+    /// [`Qmp::kick`] was called and the dispatcher has not returned for it yet.
+    kicked: bool,
 }
 
 /// The QMP state of the process.
@@ -432,7 +434,11 @@ impl Qmp {
         Arc::new(Qmp {
             commands: RwLock::new(Arc::new(commands)),
             cap_commands: Arc::new(cap_commands),
-            monitors: Mutex::new(Monitors { list: VecDeque::new(), shutdown: false }),
+            monitors: Mutex::new(Monitors {
+                list: VecDeque::new(),
+                shutdown: false,
+                kicked: false,
+            }),
             work: Condvar::new(),
             throttle: Mutex::new(EventThrottle::new()),
             event_clock: RwLock::new(Arc::new(move || start.elapsed().as_nanos() as i64)),
@@ -588,13 +594,17 @@ impl Qmp {
         }
     }
 
-    /// Runs the dispatcher on this thread until [`Qmp::shutdown`].
+    /// Runs the dispatcher on this thread until [`Qmp::shutdown`] or [`Qmp::kick`].
     pub fn run_dispatcher(self: &Arc<Self>) {
         loop {
             let next = {
                 let mut m = lock(&self.monitors);
                 loop {
                     if m.shutdown {
+                        return;
+                    }
+                    if m.kicked {
+                        m.kicked = false;
                         return;
                     }
                     if let Some(next) = Self::pop_any(&mut m) {
@@ -626,6 +636,13 @@ impl Qmp {
     /// Stops [`Qmp::run_dispatcher`], `qmp_dispatcher_co_shutdown`.
     pub fn shutdown(&self) {
         lock(&self.monitors).shutdown = true;
+        self.work.notify_all();
+    }
+
+    /// Makes [`Qmp::run_dispatcher`] return once the command it is running is done, so that the
+    /// main loop can act on a request, as `qemu_notify_event()` wakes `main_loop_wait()`.
+    pub fn kick(&self) {
+        lock(&self.monitors).kicked = true;
         self.work.notify_all();
     }
 

@@ -114,6 +114,8 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
         Ok(())
     });
     let v = vm.clone();
+    register_system_reset(cmds, move |_: &MonitorQmp| v.runstate.qmp_system_reset());
+    let v = vm.clone();
     register_query_name(cmds, move |_: &MonitorQmp| Ok(NameInfo { name: v.name.clone() }));
     let v = vm.clone();
     register_x_exit_preconfig(cmds, move |_: &MonitorQmp| v.exit_preconfig());
