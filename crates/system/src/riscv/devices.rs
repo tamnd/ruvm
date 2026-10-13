@@ -614,10 +614,17 @@ mod tests {
         );
 
         let board = VirtMachine::new(ruvm_machine_riscv::virt::VirtConfig::default()).unwrap();
-        let p =
-            plan(&[], &[dev("riscv-iommu-pci"), dev("virtio-rng-pci,iommu_platform=on")]).unwrap();
+        let rng = dev("virtio-rng-pci,iommu_platform=on,disable-legacy=on");
+        let p = plan(&[], &[dev("riscv-iommu-pci"), rng]).unwrap();
         plug(&BlockGraph::new(), &board, &p.virtio, &[], &no_net()).unwrap();
         assert_eq!(board.riscv_iommus().len(), 1);
+        // A transitional device cannot negotiate VIRTIO_F_IOMMU_PLATFORM.
+        let p = plan(&[], &[dev("virtio-rng-pci,iommu_platform=on")]).unwrap();
+        let e = plug(&BlockGraph::new(), &board, &p.virtio, &[], &no_net()).err().unwrap();
+        assert_eq!(
+            e.1.message(),
+            "VIRTIO_F_IOMMU_PLATFORM was supported by neither legacy nor transitional device"
+        );
     }
 
     fn no_net() -> Network {
