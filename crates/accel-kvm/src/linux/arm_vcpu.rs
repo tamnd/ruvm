@@ -47,6 +47,8 @@ const _: () = {
     assert!(vcpu::KVM_ARM_VCPU_PMU_V3_CTRL == b::KVM_ARM_VCPU_PMU_V3_CTRL);
     assert!(vcpu::KVM_ARM_VCPU_PMU_V3_IRQ == b::KVM_ARM_VCPU_PMU_V3_IRQ as u64);
     assert!(vcpu::KVM_ARM_VCPU_PMU_V3_INIT == b::KVM_ARM_VCPU_PMU_V3_INIT as u64);
+    assert!(vcpu::KVM_ARM_VCPU_PVTIME_CTRL == b::KVM_ARM_VCPU_PVTIME_CTRL);
+    assert!(vcpu::KVM_ARM_VCPU_PVTIME_IPA == b::KVM_ARM_VCPU_PVTIME_IPA as u64);
     assert!(vcpu::KVM_MP_STATE_RUNNABLE == b::KVM_MP_STATE_RUNNABLE);
     assert!(vcpu::KVM_MP_STATE_STOPPED == b::KVM_MP_STATE_STOPPED);
 
@@ -155,6 +157,11 @@ impl ArmVcpuOps for KvmVcpu {
         let raw = device_attr(group, attr, &value);
         self.fd().set_device_attr(&raw).map_err(os_error)
     }
+
+    fn set_device_attr_u64(&mut self, group: u32, attr: u64, value: u64) -> io::Result<()> {
+        let raw = kvm_device_attr { flags: 0, group, attr, addr: &value as *const u64 as u64 };
+        self.fd().set_device_attr(&raw).map_err(os_error)
+    }
 }
 
 /// A vCPU attribute whose address points at `value`. The PMU attributes that take no value
@@ -188,6 +195,7 @@ impl KvmAccel {
             vcpu_events: has(b::KVM_CAP_VCPU_EVENTS),
             inject_serror_esr: has(b::KVM_CAP_ARM_INJECT_SERROR_ESR),
             irq_line_layout_2: has(b::KVM_CAP_ARM_IRQ_LINE_LAYOUT_2),
+            steal_time: has(b::KVM_CAP_STEAL_TIME),
         }
     }
 }

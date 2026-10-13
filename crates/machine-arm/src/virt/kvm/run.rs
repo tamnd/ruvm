@@ -6,15 +6,15 @@
 //! [`prepare_config`] points the board's SPIs at KVM before the board is built.
 //! [`KvmVirtMachine::new`] then registers the memory slot listener, creates and initializes one
 //! vCPU per CPU (the secondaries powered off when PSCI starts them), creates the in-kernel GIC
-//! with its ITS, sets up the PMUs, finishes the board and starts the vCPU threads, named
-//! `CPU n/KVM`, paused. [`KvmVirtMachine::start`] lets them run.
+//! with its ITS, sets up the PMUs and the steal time records, finishes the board and starts the
+//! vCPU threads, named `CPU n/KVM`, paused. [`KvmVirtMachine::start`] lets them run.
 //!
 //! PSCI is handled by the kernel. Its SYSTEM_OFF and SYSTEM_RESET come back as system events:
 //! a reset stops every vCPU, resets the board and the in-kernel GIC, loads each vCPU with its
 //! reset state and the boot PC, and lets them go again. With `-no-reboot` it is a shutdown.
 //!
 //! Not done yet: EL2 for the guest, SVE and pointer authentication, which need the host's ID
-//! registers, the steal time area, and migration of the GIC and ITS state.
+//! registers, and migration of the GIC and ITS state.
 
 use std::cell::Cell;
 use std::fmt;
@@ -23,7 +23,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ruvm_accel_kvm::arm::vcpu::{ArmVcpu, ArmVcpuConfig, PutLevel};
+use ruvm_accel_kvm::arm::vcpu::{ArmVcpu, ArmVcpuConfig, PutLevel, steal_time_finalize};
 use ruvm_accel_kvm::arm::{GITS_TRANSLATER, GicV2State, GicV3State, ItsState};
 use ruvm_accel_kvm::{
     KernelIrqchip, KvmAccel, KvmGicV2, KvmGicV3, KvmIts, KvmVcpu, VcpuKick, VcpuStop,
@@ -34,12 +34,14 @@ use ruvm_hw_intc::gicv2::GicV2;
 use ruvm_hw_intc::gicv3::{ITS_CONTROL_SIZE, ITS_TRANS_SIZE};
 use ruvm_mem::{AccessCtx, AccessSize, AddressSpace, MemResult, MmioOps};
 
-use super::{KvmSpis, boot_pc, check_config, device_irq_ppi, gicv3_config, gicv3_typers};
+use super::{
+    KvmSpis, boot_pc, check_config, device_irq_ppi, gicv3_config, gicv3_typers, pvtime_size,
+};
 use crate::tcg_run::{ShutdownReason, VirtEvent, VirtEventHandler, VirtRunConfig};
 use crate::virt::boot::BootInfo;
 use crate::virt::{
-    VIRT_GIC_CPU, VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_NUM_IRQ, VirtConfig, VirtGic, VirtMachine,
-    err,
+    PVTIME_SIZE_PER_CPU, VIRT_GIC_CPU, VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_NUM_IRQ, VIRT_PVTIME,
+    VirtConfig, VirtGic, VirtMachine, err,
 };
 
 /// The longest the timer thread sleeps, since arming a timer does not wake it.
@@ -406,13 +408,15 @@ impl fmt::Debug for KvmVirtMachine {
 impl KvmVirtMachine {
     /// Puts `board`, built from a config that went through [`prepare_config`], on the VM of
     /// `accel`. `spis` is what [`prepare_config`] gave. `clocks` are the clocks the board's
-    /// timers run on; a thread fires them. Only `cfg.no_reboot` is looked at.
+    /// timers run on; a thread fires them. Only `cfg.no_reboot` is looked at. `steal_time` is
+    /// the `kvm-steal-time` CPU property, `None` for auto.
     pub fn new(
         accel: KvmAccel,
         board: VirtMachine,
         spis: KvmSpis,
         clocks: Vec<Arc<Clock>>,
         cfg: &VirtRunConfig,
+        steal_time: Option<bool>,
         handler: VirtEventHandler,
     ) -> Result<KvmVirtMachine, String> {
         let accel = Arc::new(accel);
@@ -433,12 +437,15 @@ impl KvmVirtMachine {
         // kvm_arch_init_vcpu() for each CPU, before the GIC as in QEMU.
         let target = accel.arm_preferred_target().map_err(err)?;
         let caps = accel.arm_caps();
+        // arm_cpu_finalize_features() when the CPUs are realized.
+        let steal_time = steal_time_finalize(steal_time, caps.steal_time, true)?;
         let mut vcpus = Vec::with_capacity(smp);
         for i in 0..smp {
             let mut vcpu = accel.create_vcpu(i as u32).map_err(err)?;
             let mut vcfg = ArmVcpuConfig::host(target, &caps);
             vcfg.start_powered_off = i != 0 && board.secondaries_off;
             vcfg.pmu = caps.pmu_v3 && board.model.features.pmu != 0;
+            vcfg.steal_time = steal_time;
             let arm = ArmVcpu::init(&mut vcpu, &vcfg, &caps)
                 .map_err(|e| format!("kvm_init_vcpu: kvm_arch_init_vcpu failed ({i}): {e}"))?;
             vcpus.push((vcpu, arm));
@@ -518,12 +525,19 @@ impl KvmVirtMachine {
             }
         };
 
-        // virt_cpu_post_init(): the PMU, which needs the GIC.
-        for (vcpu, arm) in &mut vcpus {
+        // virt_post_cpus_gic_realized(): the steal time RAM, then the PMU, which needs the GIC,
+        // and the steal time record of each vCPU, which needs the RAM in a memory slot.
+        if steal_time {
+            let size = pvtime_size(board.topology.max_cpus())?;
+            let ram = board.mem.new_ram("pvtime", size).map_err(err)?;
+            board.mem.add_subregion(board.system, VIRT_PVTIME, ram).map_err(err)?;
+        }
+        for (i, (vcpu, arm)) in vcpus.iter_mut().enumerate() {
             if in_kernel {
                 arm.pmu_set_irq(vcpu, super::PMU_PPI).map_err(err)?;
             }
             arm.pmu_init(vcpu).map_err(err)?;
+            arm.pvtime_init(vcpu, VIRT_PVTIME + i as u64 * PVTIME_SIZE_PER_CPU).map_err(err)?;
         }
 
         board.machine_done()?;
