@@ -439,6 +439,16 @@ struct Keep {
     riscv_board: Option<riscv::Running>,
 }
 
+const HD_OPTS: &str = "media=disk";
+const CDROM_OPTS: &str = "media=cdrom";
+
+/// `drive_add()` for the board's default interface: the `-drive` of `-hda` to `-hdd`,
+/// `-cdrom` and a bare image name. The image name is taken as it is, so its commas are
+/// doubled.
+fn drive_add(index: u32, file: &str, optstr: &str) -> String {
+    format!("{optstr},index={index},file={}", file.replace(',', ",,"))
+}
+
 /// The option loop of `qemu_init()`.
 fn parse_options(
     p: &Personality<'_>,
@@ -454,7 +464,9 @@ fn parse_options(
         let from_config = optind < config_end;
         if !args[optind].starts_with('-') {
             let _loc = push_location(Location::CmdLine { option: args[optind].clone(), arg: None });
-            return Err(fail_msg("disk images are not supported by ruvm yet"));
+            cfg.x86.drives.push((drive_add(0, &args[optind], HD_OPTS), current_location()));
+            optind += 1;
+            continue;
         }
         let found = lookup_opt(&args, &mut optind).map_err(|e| {
             eprintln!("{}: {}", p.prgname, e.message());
@@ -572,6 +584,16 @@ fn parse_options(
                 crate::display::set_display_none();
             }
             Opt::Drive => cfg.x86.drives.push((arg.to_string(), current_location())),
+            Opt::Hda | Opt::Hdb | Opt::Hdc | Opt::Hdd => {
+                let index = match found.option.index {
+                    Opt::Hda => 0,
+                    Opt::Hdb => 1,
+                    Opt::Hdc => 2,
+                    _ => 3,
+                };
+                cfg.x86.drives.push((drive_add(index, arg, HD_OPTS), current_location()));
+            }
+            Opt::Cdrom => cfg.x86.drives.push((drive_add(2, arg, CDROM_OPTS), current_location())),
             Opt::Global => {
                 if !crate::global::global_option(arg) {
                     return Err(Exit(1));
@@ -1664,6 +1686,16 @@ fn pid_name(pid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_drives() {
+        assert_eq!(drive_add(2, "cd.iso", CDROM_OPTS), "media=cdrom,index=2,file=cd.iso");
+        assert_eq!(drive_add(1, "a,b.img", HD_OPTS), "media=disk,index=1,file=a,,b.img");
+        let mut list = x86::drive_opts();
+        let opts = list.parse(&drive_add(0, "x,,y,if=none", HD_OPTS), false).unwrap();
+        assert_eq!(opts.get("file"), Some("x,,y,if=none"));
+        assert_eq!(opts.get("if"), None);
+    }
 
     #[test]
     fn nic_model_help_is_spotted() {

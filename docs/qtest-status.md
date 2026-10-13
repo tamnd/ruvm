@@ -22,10 +22,10 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 
 | Test | QEMU | ruvm | Why ruvm is short |
 |---|---|---|---|
-| bios-tables-test | 17 | 0 | `-cdrom` is not supported |
+| bios-tables-test | 17 | 0 | the firmware `-drive` with `snapshot=on` is refused |
 | qom-test | 90 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | device-introspect-test | 6 | 6 | |
-| cdrom-test | 9 | 0 | `-cdrom` is not supported |
+| cdrom-test | 9 | 0 | HMP `info block` is missing |
 | migration-test | 12 | 0 | stops at the first case: ruvm cannot migrate `virt` yet |
 | boot-serial-test | 1 | 1 | |
 | test-hmp | 90 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
@@ -54,10 +54,10 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 
 | Test | QEMU | ruvm | Why ruvm is short |
 |---|---|---|---|
-| bios-tables-test | 3 | 0 | `-cdrom` is not supported |
+| bios-tables-test | 3 | 0 | the firmware `-drive` with `snapshot=on` is refused |
 | qom-test | 13 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | device-introspect-test | 6 | 6 | |
-| cdrom-test | 1 | 0 | `-cdrom` is not supported |
+| cdrom-test | 1 | 0 | HMP `info block` is missing |
 | test-hmp | 13 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | qmp-cmd-test | 59 | 17 | stops at `query-vnc`, see below |
 | qos-test | 113 (5 skipped) | 27 (3 skipped) | runs the virtio-rng, virtio-blk, virtio-balloon and virtio-net cases only, see below |
@@ -91,9 +91,9 @@ On aarch64, `virt` now runs under the qtest accelerator the same way, and is lis
 
 On both targets `system_reset` now resets `virt` under the qtest accelerator and sends the RESET event QEMU sends, which qos-test needs between cases that share a command line. qos-test, bios-tables-test, cdrom-test and iommu-smmuv3-test decide what to run from `qom-list-types` with `implements=device`. ruvm now lists the device types with the parents QEMU gives them, but only for the devices whose qos-test cases pass, because a qos-test case that fails stops the whole test. So far that is virtio-rng, virtio-blk, virtio-balloon and virtio-net, on PCI and on virtio-mmio. Their hotplug cases are skipped on both sides, because the generic PCI host does not take hotplug. The virtio-blk cases needed `-drive` to take `auto-read-only` and `file=null-co://` with `file.read-zeroes`, and the QMP `block_resize` command to resize a drive and raise the configuration interrupt of its device. virtio-balloon only needed the boards to plug it, with the same backend as on x86, which leaves the RAM the guest gives back alone. virtio-net needed the boards to take `-netdev`, the QMP `announce-self` command, which sends the RARP frames from a thread of its own because ruvm has no realtime timer list yet, and the NIC timers to run on their own thread under qtest, since the qtest clock only moves when a test steps it and QEMU 11.1's virtio tests no longer do.
 
-With virtio-blk listed, bios-tables-test and cdrom-test now register their cases, and both stop at `-cdrom`, which ruvm does not take yet. The next devices are virtio-scsi and virtio-serial, which needs `virtconsole` and `virtserialport` on the serial bus. The rest of the qos-test devices (the Intel and other PCI network cards, the SCSI, NVMe and UFS controllers, the sound cards and the IOMMUs) are not built on these boards by ruvm.
+With virtio-blk listed, bios-tables-test and cdrom-test now register their cases. ruvm now takes `-cdrom`, `-hda` to `-hdd` and a bare image name as the `-drive` QEMU makes of them. cdrom-test then stops at HMP `info block`. bios-tables-test stops at the `-drive` of its UEFI variable store, which has `snapshot=on`, and after that it needs its CD image, which is in the qcow2 format that a `-drive` cannot open in ruvm yet. The next devices are virtio-scsi and virtio-serial, which needs `virtconsole` and `virtserialport` on the serial bus. The rest of the qos-test devices (the Intel and other PCI network cards, the SCSI, NVMe and UFS controllers, the sound cards and the IOMMUs) are not built on these boards by ruvm.
 
-`-cdrom` is a command line option ruvm does not take yet. readconfig-test passes since ruvm takes `-readconfig`, which reads the file the way QEMU's `sscanf()` loop does and handles each group as the command line option it stands for, and has the `rng-builtin` and `rng-random` objects. virtio-rng does not take their `rng` link yet. bios-tables-test also boots the guest from a qcow2 CD image with UEFI firmware. netdev-socket passes since HMP `info network` came in #234 and the stream netdev events in #239.
+readconfig-test passes since ruvm takes `-readconfig`, which reads the file the way QEMU's `sscanf()` loop does and handles each group as the command line option it stands for, and has the `rng-builtin` and `rng-random` objects. virtio-rng does not take their `rng` link yet. bios-tables-test also boots the guest from a qcow2 CD image with UEFI firmware. netdev-socket passes since HMP `info network` came in #234 and the stream netdev events in #239.
 
 The Xilinx, Raspberry Pi, Aspeed, Nuvoton and Kendryte K230 boards are not in ruvm. Those tests fail because the machine type is unknown. Each board is its own piece of work and none of them is planned for M6.
 
