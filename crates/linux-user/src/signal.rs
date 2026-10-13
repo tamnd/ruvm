@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use ruvm_jit::{Cpu, CpuShared};
 use ruvm_user_common::GuestSpace;
 
-use crate::host;
+use crate::{host, strace};
 
 /// `TARGET_NSIG`, and the host's `_NSIG - 1`: signals are 1 to 64.
 pub(crate) const NSIG: i32 = 64;
@@ -667,6 +667,11 @@ pub(crate) fn process_pending_signals(space: &GuestSpace, t: &mut Task, cpu: &mu
                         sa[sig as usize - 1].handler = SIG_DFL;
                     }
                 }
+                if strace::on() {
+                    // The CPU's faults carry their own code, force_sig() SI_KERNEL.
+                    let fault = get32(&info, 8) as i32 != SI_KERNEL;
+                    strace::taken_signal(space, sig, &info, fault);
+                }
                 handle_pending_signal(space, t, cpu, sig, &info);
                 continue;
             }
@@ -681,6 +686,9 @@ pub(crate) fn process_pending_signals(space: &GuestSpace, t: &mut Task, cpu: &mu
             let mut info = [0u8; 128];
             for (i, w) in k.info.iter().enumerate() {
                 put64(&mut info, 8 * i, w.load(Ordering::Relaxed));
+            }
+            if strace::on() {
+                strace::taken_signal(space, sig, &info, false);
             }
             handle_pending_signal(space, t, cpu, sig, &info);
         }

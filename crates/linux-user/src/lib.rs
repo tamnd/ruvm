@@ -33,8 +33,8 @@
 //!   `set_tid_address()`, `CLONE_CHILD_CLEARTID` and `exit` of one thread as QEMU has them.
 //!   Robust futex lists are `ENOSYS` there and here. `vfork()` and `posix_spawn()` are forks.
 //! - Guest memory goes through the softmmu TLB rather than straight to host addresses.
-//! - The vsyscall page is not emulated, `-g`, `-strace`, `-t`, `-trace` and `-plugin` are not
-//!   supported yet. `/proc/self` is the host's except for `exe`, `maps`, `smaps`, `stat`,
+//! - The vsyscall page is not emulated, `-g`, `-t`, `-trace` and `-plugin` are not supported
+//!   yet. `/proc/self` is the host's except for `exe`, `maps`, `smaps`, `stat`,
 //!   `auxv` and `cmdline`, which describe the guest as QEMU's do.
 //! - On aarch64 there are no MTE tag storage, no SVE or SME `prctl()`s and no ZA, ZT, GCS or
 //!   FPMR signal frame records, and `rt_sigreturn()` keeps the program at EL0t whatever the
@@ -63,6 +63,8 @@ mod riscv64;
 mod signal;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod start;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod strace;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod syscall;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

@@ -40,6 +40,7 @@ use crate::elf::{Arch, ImageInfo};
 use crate::guest::Guest;
 use crate::signal::{self, Sigaction, Task, get32, get64, put32, put64};
 use crate::start;
+use crate::strace;
 use crate::syscall::{self, Proc, THREAD_EXIT};
 
 /// `TASK_UNMAPPED_BASE` for x86_64, `TASK_SIZE / 3` page aligned.
@@ -618,7 +619,12 @@ pub(crate) fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
                     reg(cpu, a[5]),
                     reg(cpu, a[6]),
                 ];
+                let traced = strace::on()
+                    .then(|| strace::syscall(p.space(), nr, strace::entry(nr as i64), &args));
                 let ret = syscall::do_syscall(p, t, cpu, nr, args);
+                if let Some(e) = traced {
+                    strace::syscall_ret(p.space(), e, ret, &args);
+                }
                 if ret == THREAD_EXIT {
                     return;
                 }

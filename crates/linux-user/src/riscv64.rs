@@ -37,6 +37,7 @@ use crate::guest::Guest;
 use crate::host;
 use crate::signal::{self, Sigaction, Task, get32, get64, put32, put64};
 use crate::start;
+use crate::strace;
 use crate::syscall::{self, Proc, THREAD_EXIT};
 
 /// `TASK_UNMAPPED_BASE` for riscv64: a third of the 48-bit space, page aligned.
@@ -592,6 +593,15 @@ pub(crate) fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
                 for (i, a) in args.iter_mut().enumerate() {
                     *a = gpr(cpu, X_A0 + i);
                 }
+                let orig = args;
+                let traced = strace::on().then(|| {
+                    let e = match nr {
+                        NR_RISCV_HWPROBE => Some(strace::riscv_hwprobe()),
+                        NR_RISCV_FLUSH_ICACHE | NR_RENAMEAT => None,
+                        _ => generic::to_host(nr).and_then(strace::entry),
+                    };
+                    strace::syscall(p.space(), nr, e, &orig)
+                });
                 let ret = match (nr, generic::to_host(nr)) {
                     // A no-op: self-modifying code is detected anyway.
                     (NR_RISCV_FLUSH_ICACHE, _) => 0,
@@ -605,6 +615,9 @@ pub(crate) fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
                         syscall::do_syscall(p, t, cpu, n as u64, args)
                     }
                 };
+                if let Some(e) = traced {
+                    strace::syscall_ret(p.space(), e, ret, &orig);
+                }
                 if ret == THREAD_EXIT {
                     return;
                 }
