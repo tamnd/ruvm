@@ -302,6 +302,12 @@ fn errors_and_help_match_qemu() {
     let Some(real) = qemu_tool("qemu-storage-daemon") else {
         return;
     };
+    // The messages changed between releases, so only 11.1 is a fair reference.
+    let (version, _, _) = run(&real, &["--version"]);
+    if !version.starts_with("qemu-storage-daemon version 11.1") {
+        eprintln!("skipping, {real:?} is not QEMU 11.1: {}", version.lines().next().unwrap_or(""));
+        return;
+    }
     let s = Scratch::new("errors");
     let img = s.image();
     let bd = format!("driver=file,filename={img},node-name=n");
