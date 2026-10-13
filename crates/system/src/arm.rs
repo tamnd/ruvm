@@ -88,7 +88,7 @@ use crate::drives::Drives;
 use crate::net::{NetOption, Network, init_clients};
 use crate::runstate::{MachineReset, Runstate};
 use crate::vl::Vm;
-use crate::x86::{Drive, Located};
+use crate::x86::{Drive, Located, MemdevRam};
 
 mod devices;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -296,6 +296,8 @@ pub(crate) struct BoardOptions {
     pub board: ArmBoard,
     /// `memory.size`, rounded up to 8 KiB like `machine_set_mem()` does.
     pub ram_size: Option<u64>,
+    /// `memory-backend`, whose RAM is the guest's main memory on virt.
+    pub memdev: Option<MemdevRam>,
     pub cpus: u32,
     pub max_cpus: u32,
     pub kernel: Option<String>,
@@ -1293,6 +1295,7 @@ fn build_virt(
     if let Some(size) = opts.ram_size {
         cfg.ram_size = size;
     }
+    cfg.memdev = opts.memdev.map(|m| m.0);
     cfg.kernel = opts.kernel;
     cfg.initrd = opts.initrd;
     cfg.append = opts.append;

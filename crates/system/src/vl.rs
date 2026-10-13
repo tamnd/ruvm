@@ -1191,7 +1191,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     let mut rv_virt_opts = None;
     let mut board_opts = match (kind, machine) {
         (None, None) if virt => {
-            if memdev.is_some() {
+            if memdev.is_some() && arm_board != Some(ArmBoard::Virt) {
                 return Err(fail_msg("memory-backend is not supported by ruvm yet"));
             }
             if let Some(board) = arm_board {
@@ -1282,6 +1282,18 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     }
     if let (Some(id), Some(opts)) = (&memdev, board_opts.as_mut()) {
         opts.memdev = Some(x86::consume_memdev(&vm, id).map_err(|e| fail(&e))?);
+    }
+    if let (Some(id), Some(opts)) = (&memdev, virt_opts.as_mut()) {
+        let ram = x86::consume_memdev(&vm, id).map_err(|e| fail(&e))?;
+        // qemu_resolve_machine_memdev() takes the backend's size when there is no -m, and
+        // machine_run_board_init() wants the two to agree otherwise.
+        let size = ram.0.len();
+        if *opts.ram_size.get_or_insert(size) != size {
+            return Err(fail_msg(
+                "Machine memory size does not match the size of the memory backend",
+            ));
+        }
+        opts.memdev = Some(ram);
     }
 
     // The globals the board's own objects take, as qdev_prop_set_globals() applies them while

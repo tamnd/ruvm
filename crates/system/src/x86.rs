@@ -288,8 +288,8 @@ impl PartialEq for MemdevRam {
 
 impl Eq for MemdevRam {}
 
-/// `qemu_resolve_machine_memdev()` and `machine_consume_memdev()` for an x86 board: the RAM of
-/// the memory backend `id`, which is the board's from now on.
+/// `qemu_resolve_machine_memdev()` and `machine_consume_memdev()` for an x86 board or Arm
+/// virt: the RAM of the memory backend `id`, which is the board's from now on.
 pub(crate) fn consume_memdev(vm: &Vm, id: &str) -> Result<MemdevRam> {
     let (backend, _) = vm.registry.resolve_path_type(id, "memory-backend");
     let Some(backend) = backend else {
