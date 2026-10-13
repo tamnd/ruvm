@@ -8,7 +8,7 @@ The tests come from the QEMU 11.1.0 source tree. QEMU itself was built from that
 
 Each qtest binary was run on its own, once with `QTEST_QEMU_BINARY` pointing at the QEMU build and once pointing at ruvm. libqtest takes the target from the binary name, so ruvm was reached through symlinks named `qemu-system-aarch64` and `qemu-system-riscv64`. The test list, environment and timeouts are the ones meson writes into `tests.json` for the `qtest-aarch64` and `qtest-riscv64` suites, and the counts below are read from the TAP output of each test.
 
-The ruvm binary was a release build of main at #224 plus the human monitor change that follows it, except for netdev-socket and the riscv64 linux-user tests, which were run again with a release build that has #239. The qtest-riscv64 suite was run again with the change that runs riscv64 `virt` under the qtest accelerator, and the qtest-aarch64 suite with the change that does the same for aarch64 `virt`.
+The ruvm binary was a release build of main at #224 plus the human monitor change that follows it, except for netdev-socket and the riscv64 linux-user tests, which were run again with a release build that has #239. The qtest-riscv64 suite was run again with the change that runs riscv64 `virt` under the qtest accelerator, and the qtest-aarch64 suite with the change that does the same for aarch64 `virt`. Both suites were run again with the change that adds `system_reset` and the QOM device types.
 
 A count is the number of TAP cases that passed. A test that registers no cases passes trivially with 0, and that is shown as 0 rather than as a pass, because it means the test found nothing in ruvm to run against.
 
@@ -30,7 +30,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | boot-serial-test | 1 | 0 | `-no-shutdown` is not supported |
 | test-hmp | 90 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | qmp-cmd-test | 59 | 17 | stops at `query-vnc`, see below |
-| qos-test | 90 (5 skipped) | 0 | registers no cases, see below |
+| qos-test | 90 (5 skipped) | 2 (1 skipped) | runs the virtio-rng cases only, see below |
 | xlnx-canfd-test | 3 | 0 | no `xlnx-zcu102` board |
 | xlnx-versal-trng-test | 5 | 0 | no `xlnx-versal-virt` board |
 | bcm2835-dma-test | 1 | 0 | no Raspberry Pi boards |
@@ -48,7 +48,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 0 | `-readconfig` is not supported |
 | netdev-socket | 10 | 10 | |
-| Total | 447 | 49 | |
+| Total | 447 | 51 | |
 
 ## qtest-riscv64
 
@@ -60,7 +60,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | cdrom-test | 1 | 0 | `-cdrom` is not supported |
 | test-hmp | 13 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | qmp-cmd-test | 59 | 17 | stops at `query-vnc`, see below |
-| qos-test | 113 (5 skipped) | 0 | registers no cases, see below |
+| qos-test | 113 (5 skipped) | 3 (1 skipped) | runs the virtio-rng cases only, see below |
 | riscv-csr-test | 1 | 0 | no `veyron-v1` CPU model |
 | iommu-riscv-test | 4 | 0 | no `riscv-iommu-pci` or `iommu-testdev` |
 | k230-wdt-test | 7 | 0 | no `k230` board |
@@ -68,7 +68,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 0 | `-readconfig` is not supported |
 | netdev-socket | 10 | 10 | |
-| Total | 241 | 49 | |
+| Total | 241 | 52 | |
 
 ## qmp-cmd-test and VNC
 
@@ -85,11 +85,13 @@ The QEMU 11.1 build here is softmmu only, so the linux-user reference is the dis
 
 ## What is left
 
-On riscv64, `virt` now runs under the qtest accelerator with no harts and with its timers on the qtest clock, has a `/machine` object, and is listed in `query-machines` with the values QEMU 11.1 gives. qom-test and test-hmp pass on it. The machine takes `aclint=on` with QEMU's devices and device tree, which every qos-test command line on riscv64 asks for. qos-test still registers no cases, because it looks for the QOM device types of the virtio devices (`virtio-blk-pci` and the others, with `device` among their parents) and ruvm does not list them yet. bios-tables-test registers no cases either. riscv-csr-test and iommu-riscv-test now start and fail on the CPU model and the devices they ask for.
+On riscv64, `virt` now runs under the qtest accelerator with no harts and with its timers on the qtest clock, has a `/machine` object, and is listed in `query-machines` with the values QEMU 11.1 gives. qom-test and test-hmp pass on it. The machine takes `aclint=on` with QEMU's devices and device tree, which every qos-test command line on riscv64 asks for. bios-tables-test registers no cases, because it needs `virtio-blk-pci` among the device types. riscv-csr-test and iommu-riscv-test now start and fail on the CPU model and the devices they ask for.
 
 On aarch64, `virt` now runs under the qtest accelerator the same way, and is listed in `query-machines` as `virt-11.1` with the alias `virt` and the values QEMU 11.1 gives. qom-test and test-hmp pass on it. sbsa-ref is not listed yet, because it does not run under qtest. The tests that started to run on `virt` now fail on options ruvm does not take: `-machine memory-backend=` (migration-test), `-no-shutdown` (boot-serial-test), `gic-version=max` (arm-cpu-features) and `-numa` (numa-test).
 
-On both targets `system_reset` now resets `virt` under the qtest accelerator and sends the RESET event QEMU sends, which qos-test needs between cases that share a command line. The next change is the QOM device types. qos-test, bios-tables-test, cdrom-test and iommu-smmuv3-test decide what to run from `qom-list-types` with `implements=device`, which is empty in ruvm, so they register no cases or skip.
+On both targets `system_reset` now resets `virt` under the qtest accelerator and sends the RESET event QEMU sends, which qos-test needs between cases that share a command line. qos-test, bios-tables-test, cdrom-test and iommu-smmuv3-test decide what to run from `qom-list-types` with `implements=device`. ruvm now lists the device types with the parents QEMU gives them, but only for the devices whose qos-test cases pass, because a qos-test case that fails stops the whole test. So far that is virtio-rng on PCI and on virtio-mmio. Its hotplug case is skipped on both sides, because the generic PCI host does not take hotplug.
+
+The next device is virtio-blk, with 8 cases on each target and 4 more on virtio-mmio on riscv64. It needs `-drive` to take `auto-read-only` and `file=null-co://` with `file.read-zeroes`, and the QMP `block_resize` command. After it come virtio-serial, which needs `virtconsole` and `virtserialport` on the serial bus, and virtio-balloon, which ruvm does not plug on these boards yet. The rest of the qos-test devices (the Intel and other PCI network cards, the SCSI, NVMe and UFS controllers, the sound cards and the IOMMUs) are not built on these boards by ruvm.
 
 `-cdrom` and `-readconfig` are command line options ruvm does not take yet. netdev-socket passes since HMP `info network` came in #234 and the stream netdev events in #239.
 

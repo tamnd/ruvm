@@ -14,6 +14,7 @@ mod info;
 mod migration;
 mod net;
 pub mod options;
+mod qdev;
 mod qmp_cmds;
 pub mod qtest;
 mod riscv;
