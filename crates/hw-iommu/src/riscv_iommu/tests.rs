@@ -35,6 +35,8 @@ const MSI_ADDR: u64 = 0x2800_0000;
 const SID: u16 = 0x08;
 const AVAIL: u64 = 0x3333;
 const LEAF: u64 = PTE_V | PTE_R | PTE_W | PTE_U | PTE_A | PTE_D;
+/// QEMU wants U on inner PTEs too when there is no process ID.
+const NODE: u64 = PTE_V | PTE_U;
 
 struct Rig {
     _sys: MemorySystem,
@@ -150,8 +152,8 @@ impl Rig {
 
     /// Maps the 4K page at `iova` to `pa` in the Sv39 tables at [`S_ROOT`].
     fn s_map(&self, iova: u64, pa: u64, leaf: u64) {
-        self.wq(S_ROOT + ((iova >> 30) & 0x1ff) * 8, ppn_down(S_L1) << 10 | PTE_V);
-        self.wq(S_L1 + ((iova >> 21) & 0x1ff) * 8, ppn_down(S_L0) << 10 | PTE_V);
+        self.wq(S_ROOT + ((iova >> 30) & 0x1ff) * 8, ppn_down(S_L1) << 10 | NODE);
+        self.wq(S_L1 + ((iova >> 21) & 0x1ff) * 8, ppn_down(S_L0) << 10 | NODE);
         self.wq(S_L0 + ((iova >> 12) & 0x1ff) * 8, ppn_down(pa) << 10 | leaf);
     }
 
@@ -396,8 +398,8 @@ fn g_stage_and_nested_translation() {
     r.queues();
     // G-stage: GPA IOVA goes to DATA2.
     let gatp = ATP_MODE_SV39 << 60 | 3 << 44 | ppn_down(G_ROOT);
-    r.wq(G_ROOT + ((IOVA >> 30) & 0x7ff) * 8, ppn_down(G_L1) << 10 | PTE_V);
-    r.wq(G_L1 + ((IOVA >> 21) & 0x1ff) * 8, ppn_down(G_L0) << 10 | PTE_V);
+    r.wq(G_ROOT + ((IOVA >> 30) & 0x7ff) * 8, ppn_down(G_L1) << 10 | NODE);
+    r.wq(G_L1 + ((IOVA >> 21) & 0x1ff) * 8, ppn_down(G_L0) << 10 | NODE);
     r.wq(G_L0 + ((IOVA >> 12) & 0x1ff) * 8, ppn_down(DATA2) << 10 | LEAF);
     r.dc(DC_TC_V, gatp, 0, 0, 0, 0, 0);
     r.wd(DATA2 + 8, 0x600d);
