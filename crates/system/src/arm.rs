@@ -71,7 +71,7 @@ use ruvm_machine_arm::tcg_run::{
 };
 use ruvm_machine_arm::virt::memmap::check_highmem_mmio_size;
 use ruvm_machine_arm::virt::{
-    CpuTopology, Highmem, VirtConfig, VirtGicVersion, VirtIommu, VirtMachine, VirtMsi,
+    CpuTopology, Highmem, VirtConfig, VirtGicVersion, VirtIommu, VirtMachine, VirtMsi, VirtNuma,
 };
 use ruvm_mem::AddressSpace;
 use ruvm_qapi::events::event_reset;
@@ -339,6 +339,8 @@ pub(crate) struct BoardOptions {
     pub oem_table_id: Option<String>,
     /// The `-smp` topology.
     pub topology: Option<CpuTopology>,
+    /// `-numa`: the memory of each node and the RAM of its `memdev`.
+    pub numa_ram: Vec<(u64, Option<MemdevRam>)>,
 }
 
 /// Visits `name` of `machine` as a `T`, the way the machine property setter does.
@@ -1207,7 +1209,7 @@ pub(crate) fn start_board_tcg(
         dumpdtb(path, board.fdt().as_bytes())?;
     }
 
-    let slots = virt_cpu_slots(&board);
+    let slots = virt_cpu_slots(vm, &board);
     let cfg = VirtRunConfig { no_reboot: args.no_reboot, tcg, backend: None };
     let (machine, warnings) = VirtTcgMachine::new(board, clocks, &cfg, event_handler(vm))
         .map_err(|e| one(Error::generic(e)))?;
@@ -1244,7 +1246,7 @@ pub(crate) fn start_board_qtest(
     // With no vCPUs only the netdevs follow the run state.
     vm.runstate.set_cpu_hook(Some(Arc::new(move |run| net.vm_state_change(run))));
     let threads = DummyVcpus::start(board.smp()).map_err(|e| one(Error::generic(e.to_string())))?;
-    let slots = virt_cpu_slots(&board);
+    let slots = virt_cpu_slots(vm, &board);
     let _ = vm.cpus.set(Cpus::new(slots, CpuInfoFastU::Aarch64, Threads::Dummy(threads)));
     Ok(Running {
         machine: Machine::Qtest(Arc::new(Mutex::new(board))),
@@ -1254,15 +1256,18 @@ pub(crate) fn start_board_qtest(
 }
 
 /// The CPUs of virt as `query-cpus-fast` lists them, with the props
-/// `virt_possible_cpu_arch_ids()` gives.
-fn virt_cpu_slots(board: &VirtMachine) -> Vec<CpuSlot> {
+/// `virt_possible_cpu_arch_ids()` gives and their NUMA node.
+fn virt_cpu_slots(vm: &Vm, board: &VirtMachine) -> Vec<CpuSlot> {
     let topo = board.topology();
     let qom_type = format!("{}-arm-cpu", board.cpu_model().name);
     (0..board.smp() as u32)
         .map(|n| CpuSlot {
             qom_path: format!("/machine/unattached/device[{n}]"),
             qom_type: qom_type.clone(),
-            props: topology_props(n, topo.clusters, topo.cores, topo.threads),
+            props: match vm.numa.get() {
+                Some(numa) => numa.cpus[n as usize].clone(),
+                None => topology_props(n, topo.clusters, topo.cores, topo.threads),
+            },
         })
         .collect()
 }
@@ -1319,6 +1324,17 @@ fn build_virt(
         cfg.ram_size = size;
     }
     cfg.memdev = opts.memdev.map(|m| m.0);
+    if let Some(numa) = vm.numa.get() {
+        cfg.numa = Some(VirtNuma {
+            nodes: opts.numa_ram.into_iter().map(|(mem, ram)| (mem, ram.map(|r| r.0))).collect(),
+            cpu_nodes: numa.cpus.iter().map(|c| c.node_id.unwrap_or_default() as u32).collect(),
+            distance: if numa.have_numa_distance {
+                numa.nodes.iter().map(|n| n.distance.clone()).collect()
+            } else {
+                Vec::new()
+            },
+        });
+    }
     cfg.kernel = opts.kernel;
     cfg.initrd = opts.initrd;
     cfg.append = opts.append;

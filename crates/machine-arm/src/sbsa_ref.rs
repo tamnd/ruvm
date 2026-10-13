@@ -760,6 +760,7 @@ impl SbsaRefMachine {
             self.dtb_filename.as_deref(),
             &self.cmdline,
             self.arm.psci_conduit(),
+            &[],
         )? {
             self.fdt = fdt;
         }

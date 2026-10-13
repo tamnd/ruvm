@@ -127,6 +127,8 @@ pub struct Vm {
     pub(crate) drives: OnceLock<Drives>,
     /// The CPUs `query-cpus-fast` lists, on a board that has them listed.
     pub(crate) cpus: OnceLock<crate::cpus::Cpus>,
+    /// The NUMA nodes of `-numa`, when there are any.
+    pub(crate) numa: OnceLock<crate::numa::NumaState>,
     machine_initialized: AtomicBool,
     /// `qtest_driver()`: a test drives the machine over `-qtest`.
     qtest: bool,
@@ -303,6 +305,8 @@ struct Config {
     kernel_irqchip: Option<String>,
     /// `-tpmdev`.
     tpmdev: QemuOptsList,
+    /// `-numa`.
+    numa: QemuOptsList,
 }
 
 impl Config {
@@ -331,6 +335,7 @@ impl Config {
             semihosting: arm::Semihosting::default(),
             kernel_irqchip: None,
             tpmdev: crate::tpm::tpmdev_opts(),
+            numa: QemuOptsList::new("numa", &[]).with_implied_opt_name("type"),
         }
     }
 
@@ -659,6 +664,10 @@ fn parse_options(
             Opt::Tpmdev => {
                 let h = crate::tpm::config_parse(&mut cfg.tpmdev, arg).map_err(Exit)?;
                 cfg.remember("tpmdev", h);
+            }
+            Opt::Numa => {
+                let h = cfg.numa.parse_noisily(arg, true).map(|o| o.handle()).ok_or(Exit(1))?;
+                cfg.remember("numa", h);
             }
             Opt::Qtest => cfg.qtest = Some(arg.to_string()),
             Opt::QtestLog => cfg.qtest_log = Some(arg.to_string()),
@@ -1120,6 +1129,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         network: OnceLock::new(),
         drives: OnceLock::new(),
         cpus: OnceLock::new(),
+        numa: OnceLock::new(),
         machine_initialized: AtomicBool::new(false),
         qtest: cfg.qtest.is_some(),
     });
@@ -1346,6 +1356,28 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             ));
         }
         opts.memdev = Some(ram);
+    }
+    // parse_numa_opts(), and the NUMA part of machine_run_board_init().
+    let numa: Vec<_> = cfg.numa.iter().map(|o| (o.clone(), cfg.loc("numa", o.handle()))).collect();
+    if let Some((opts, loc)) = numa.first() {
+        let located = |Located(loc, e): Located| {
+            let _loc = loc.map(push_location);
+            fail(&e)
+        };
+        match virt_opts.as_mut() {
+            Some(board) if board.board == ArmBoard::Virt => {
+                crate::numa::virt_numa(&vm, &numa, board, memdev.is_some(), on_qtest)
+                    .map_err(located)?;
+            }
+            // Machine none has no NUMA state.
+            None if kind.is_none() && machine.is_some() => {
+                let e = crate::numa::visit(opts).err().unwrap_or_else(|| {
+                    Error::generic("NUMA is not supported by this machine-type")
+                });
+                return Err(located(Located(loc.clone(), e)));
+            }
+            _ => return Err(fail_msg("-numa is not supported with this machine by ruvm yet")),
+        }
     }
 
     // The globals the board's own objects take, as qdev_prop_set_globals() applies them while

@@ -90,6 +90,21 @@ pub(crate) fn create_fdt(fdt: &mut Fdt, secure: bool) -> Result<u32, String> {
     Ok(clock)
 }
 
+/// The end of `create_fdt()` with `-numa dist`: the distance of each node to every node.
+pub(crate) fn add_distance_map(fdt: &mut Fdt, distance: &[Vec<u8>]) -> Result<(), String> {
+    let mut matrix = Vec::new();
+    for (i, row) in distance.iter().enumerate() {
+        for (j, &d) in row.iter().enumerate() {
+            for cell in [i as u32, j as u32, d.into()] {
+                matrix.extend_from_slice(&cell.to_be_bytes());
+            }
+        }
+    }
+    fdt.add_subnode("/distance-map")?;
+    fdt.setprop_string("/distance-map", "compatible", "numa-distance-map-v1")?;
+    fdt.setprop("/distance-map", "distance-matrix", &matrix)
+}
+
 /// The flags cell of a PPI. With a GICv2, `gicv2_cpus` is the number of CPUs, whose mask goes
 /// in bits 8 to 15.
 fn ppi_flags(gicv2_cpus: Option<usize>) -> u32 {
@@ -182,6 +197,7 @@ pub(crate) fn add_cpu_nodes(
     mpidrs: &[u64],
     psci: bool,
     topo: &CpuTopology,
+    numa_nodes: Option<&[u32]>,
 ) -> Result<(), String> {
     let smp_cpus = mpidrs.len();
     let caches = virt_get_caches(model)?;
@@ -204,6 +220,9 @@ pub(crate) fn add_cpu_nodes(
             fdt.setprop_u64(&nodename, "reg", mpidrs[cpu])?;
         } else {
             fdt.setprop_cell(&nodename, "reg", mpidrs[cpu] as u32)?;
+        }
+        if let Some(node) = numa_nodes.and_then(|n| n.get(cpu)) {
+            fdt.setprop_cell(&nodename, "numa-node-id", *node)?;
         }
         let phandle = fdt.alloc_phandle();
         fdt.setprop_cell(&nodename, "phandle", phandle)?;
