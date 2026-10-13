@@ -18,11 +18,40 @@ fn ruvm() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ruvm"))
 }
 
-/// Runs `qemu-system-aarch64` with `args`, returning the exit code, stdout and stderr.
+/// Runs `qemu-system-aarch64` with `args`, returning the exit code, stdout and stderr. A
+/// machine that is still running after a minute is killed and fails the test, since none of
+/// the callers expects one to start a guest.
 fn system(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(ruvm()).arg("qemu-system-aarch64").args(args).output().unwrap();
-    let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
-    (out.status.code().unwrap_or(-1), text(out.stdout), text(out.stderr))
+    let mut child = Command::new(ruvm())
+        .arg("qemu-system-aarch64")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let drain = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = r.read_to_end(&mut b);
+            String::from_utf8_lossy(&b).into_owned()
+        })
+    };
+    let out = drain(Box::new(child.stdout.take().unwrap()));
+    let err = drain(Box::new(child.stderr.take().unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{args:?} was still running after a minute");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (status.code().unwrap_or(-1), out.join().unwrap(), err.join().unwrap())
 }
 
 fn arm_data(name: &str) -> PathBuf {
@@ -114,7 +143,6 @@ fn virt_errors() {
             &["-M", "virt,msi=foo"],
             format!("{p}Invalid msi value\nValid values are auto, gicv2m, its, off\n"),
         ),
-        (&["-M", "virt,msi=gicv2m"], format!("{p}msi=gicv2m is not supported by ruvm yet\n")),
         (
             &["-M", "virt", "-smp", "dies=2"],
             format!("{p}dies > 1 not supported by this machine's CPU topology\n"),

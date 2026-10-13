@@ -2,16 +2,45 @@
 
 //! The dispatcher as a user meets it: the real binary, started under QEMU's names.
 
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn ruvm() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ruvm"))
 }
 
+/// Runs the binary with `args`, returning whether it succeeded and its stdout. One that is
+/// still running after a minute is killed and fails the test, since none of these should
+/// start a guest.
 fn run(args: &[&str]) -> (bool, String) {
-    let out = Command::new(ruvm()).args(args).output().unwrap();
-    (out.status.success(), String::from_utf8(out.stdout).unwrap())
+    let mut child = Command::new(ruvm())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = stdout.read_to_end(&mut b);
+        b
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{args:?} was still running after a minute");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (status.success(), String::from_utf8(out.join().unwrap()).unwrap())
 }
 
 #[test]
@@ -58,7 +87,7 @@ fn list_names_every_system_target() {
 
 #[test]
 fn unimplemented_programs_fail_rather_than_pretend() {
-    let (ok, _) = run(&["qemu-system-x86_64", "-machine", "q35"]);
+    let (ok, _) = run(&["qemu-system-x86_64", "-hda", "x.img"]);
     assert!(!ok);
     let (ok, _) = run(&["qemu-nonsense"]);
     assert!(!ok);

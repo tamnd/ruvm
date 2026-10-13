@@ -655,9 +655,10 @@ fn socket_address(addr: &SocketAddrAny) -> Option<SocketAddress> {
         }
         None => (None, None),
     };
-    #[cfg(not(target_os = "linux"))]
-    let (abstract_, tight) = (None, None);
+    #[cfg(target_os = "linux")]
     let unix = UnixSocketAddress { path: unix_path(&u), abstract_, tight };
+    #[cfg(not(target_os = "linux"))]
+    let unix = UnixSocketAddress { path: unix_path(&u) };
     Some(SocketAddress { u: SocketAddressU::Unix(unix) })
 }
 
@@ -854,7 +855,13 @@ pub(crate) fn inet_connect(addr: &InetSocketAddress) -> Result<OwnedFd> {
 
 /// `saddr_is_abstract()`: abstract names are Linux only, elsewhere the path is a file.
 pub(crate) fn is_abstract(saddr: &UnixSocketAddress) -> bool {
-    cfg!(target_os = "linux") && saddr.abstract_ == Some(true)
+    #[cfg(target_os = "linux")]
+    return saddr.abstract_ == Some(true);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = saddr;
+        false
+    }
 }
 
 /// The address `unix_listen_saddr()` and `unix_connect_saddr()` bind or connect to. An

@@ -3,9 +3,12 @@
 //! The system emulator started the way QEMU's tests start it: errors from startup, the help
 //! texts, and a machine driven over QMP and qtest sockets like libqtest does.
 
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 
 fn ruvm() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ruvm"))

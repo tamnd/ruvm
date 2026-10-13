@@ -396,12 +396,10 @@ fn pid_file_init(path: &str) -> Flow<PidFileHandle> {
     #[cfg(not(unix))]
     let lock = std::fs::write(path, format!("{}\n", std::process::id()))
         .map_err(|e| Error::from_io(format!("Could not create '{path}'"), e));
-    let lock = match lock {
-        Ok(l) => l,
-        Err(e) => {
-            error_report(&format!("cannot create PID file: {}", e.message()));
-            return Err(Exit(1));
-        }
+    let Ok(lock) =
+        lock.map_err(|e| error_report(&format!("cannot create PID file: {}", e.message())))
+    else {
+        return Err(Exit(1));
     };
     match std::fs::canonicalize(path) {
         Ok(real) => Ok((lock, real)),
