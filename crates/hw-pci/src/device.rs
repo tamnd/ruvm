@@ -30,6 +30,11 @@ use crate::regs::*;
 /// `address_space_stl_le()` on the device's bus master address space does in QEMU.
 pub type MsiTrigger = Arc<dyn Fn(u64, u32) + Send + Sync>;
 
+/// Interrupt remapping of the MSIs below a root bus: takes the requester ID, the address and
+/// the data, and gives the message to send instead or `None` to drop it. It stands for the
+/// interrupt window that an IOMMU puts in the DMA address space of the devices.
+pub type MsiRemap = Arc<dyn Fn(u16, u64, u32) -> Option<(u64, u32)> + Send + Sync>;
+
 /// An MSI or MSI-X message, `MSIMessage`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct MsiMessage {
@@ -554,8 +559,16 @@ impl PciDevice {
     }
 
     fn msi_deliver(&self, address: u64, data: u32) {
+        let bus = self.bus();
+        let (address, data) = match bus.as_ref().and_then(|b| b.msi_remap()) {
+            Some(remap) => match remap(self.requester_id(), address, data) {
+                Some(m) => m,
+                None => return,
+            },
+            None => (address, data),
+        };
         let own = self.msi_trigger.read().unwrap_or_else(|p| p.into_inner()).clone();
-        let trigger = own.or_else(|| self.bus().and_then(|b| b.msi_handler()));
+        let trigger = own.or_else(|| bus.and_then(|b| b.msi_handler()));
         if let Some(t) = trigger {
             t(address, data);
         }

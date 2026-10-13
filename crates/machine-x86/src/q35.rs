@@ -72,13 +72,15 @@ use ruvm_hw_intc::i8259::{I8259Pair, i8259_init};
 use ruvm_hw_intc::ioapic::{
     IO_APIC_DEFAULT_ADDRESS, IOAPIC_NUM_PINS, IOAPIC_VER_DEF, IoApic, IoApicMsiHandler, IoApics,
 };
-use ruvm_hw_iommu::{DMAR_REG_BASE, DMAR_REG_SIZE, IntelIommu, TYPE_INTEL_IOMMU_MEMORY_REGION};
+use ruvm_hw_iommu::{
+    DMAR_REG_BASE, DMAR_REG_SIZE, IntelIommu, SID_INVALID, TYPE_INTEL_IOMMU_MEMORY_REGION,
+};
 use ruvm_hw_pci::q35::{Q35Config, Q35PciHost};
 use ruvm_hw_pci::regs::{
     PCI_CLASS_DEVICE, PCI_HEADER_TYPE, PCI_HEADER_TYPE_BRIDGE, PCI_SECONDARY_BUS,
     PCI_SUBORDINATE_BUS,
 };
-use ruvm_hw_pci::{PCIE_BASE_ADDR_UNMAPPED, PciBus};
+use ruvm_hw_pci::{MsiRemap, PCIE_BASE_ADDR_UNMAPPED, PciBus};
 use ruvm_hw_storage::{BlockBackend, DriveConfig, DriveKind, ICH9_AHCI_PORTS, Ich9Ahci};
 use ruvm_hw_timer::hpet::{HPET_BASE, HPET_LEN, Hpet, HpetFwConfig, HpetProperties};
 use ruvm_hw_timer::i8254::I8254;
@@ -694,6 +696,8 @@ pub struct Q35 {
     msi_hook: Arc<RwLock<Option<IoApicMsiHandler>>>,
     /// Sends an MSI to the APICs, through `msi_hook` when it is set.
     msi: IoApicMsiHandler,
+    /// Interrupt remapping of the IOAPIC's messages, set by an IOMMU with `intremap=on`.
+    ioapic_remap: Arc<RwLock<Option<MsiRemap>>>,
     gsi_hook: GsiHookSlot,
     request_hook: Arc<RwLock<Option<SystemRequestHandler>>>,
     pic: Option<I8259Pair>,
@@ -1024,9 +1028,26 @@ impl Q35 {
                 }
             })
         };
+        // QEMU's IOAPIC writes its messages to the IOMMU's address space, where they get
+        // remapped with no source ID.
+        let ioapic_remap: Arc<RwLock<Option<MsiRemap>>> = Arc::new(RwLock::new(None));
+        let ioapic_msi: IoApicMsiHandler = {
+            let m = Arc::clone(&msi);
+            let remap = Arc::clone(&ioapic_remap);
+            Arc::new(move |addr, data| {
+                let r = remap.read().unwrap_or_else(PoisonError::into_inner).clone();
+                match r {
+                    Some(r) => {
+                        if let Some((addr, data)) = r(SID_INVALID, addr, data) {
+                            m(addr, data);
+                        }
+                    }
+                    None => m(addr, data),
+                }
+            })
+        };
         let ioapics = IoApics::new();
-        let ioapic =
-            IoApic::realize(&clock, IOAPIC_VER_DEF, &ioapics, Arc::clone(&msi)).map_err(err)?;
+        let ioapic = IoApic::realize(&clock, IOAPIC_VER_DEF, &ioapics, ioapic_msi).map_err(err)?;
         if let Some(p) = &pic {
             let master = Arc::clone(&p.master);
             ioapic.set_pic_read_irq(Some(Arc::new(move || master.pic_read_irq())));
@@ -1288,6 +1309,7 @@ impl Q35 {
             ioapic,
             msi_hook,
             msi,
+            ioapic_remap,
             gsi_hook,
             request_hook,
             pic,
@@ -1839,7 +1861,8 @@ impl Q35 {
 
     /// The q35 part of `vtd_realize()`: maps the registers of `iommu`, has it translate the
     /// DMA of the root bus, sends its own interrupts to the APICs and gives the ACPI tables a
-    /// DMAR.
+    /// DMAR. With `intremap=on` it also remaps the MSIs of the PCI devices and the IOAPIC; the
+    /// HPET's and its own go to the APICs as they are, as in QEMU.
     pub fn attach_intel_iommu(&self, iommu: &Arc<IntelIommu>) -> Result<(), String> {
         let r = self
             .mem
@@ -1851,6 +1874,12 @@ impl Q35 {
         let ops = Arc::clone(iommu);
         self.pci_dma
             .set_iommu(TYPE_INTEL_IOMMU_MEMORY_REGION, Box::new(move |bdf| ops.device_ops(bdf)));
+        if iommu.conf().intr_supported() {
+            let ir = Arc::clone(iommu);
+            let remap: MsiRemap = Arc::new(move |sid, addr, data| ir.remap_msi(sid, addr, data));
+            self.host.bus().set_msi_remap(Some(Arc::clone(&remap)));
+            *self.ioapic_remap.write().unwrap_or_else(PoisonError::into_inner) = Some(remap);
+        }
         let reset = Arc::clone(iommu);
         self.add_reset_hook(Box::new(move || reset.system_reset()));
         let _ = self.acpi_src.intel_iommu.set(Arc::clone(iommu));

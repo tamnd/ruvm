@@ -11,17 +11,21 @@
 //! What is there: legacy mode translation with second stage page tables, pass-through and
 //! device-IOTLB context entries, the fault recording register with its fault event interrupt,
 //! the context cache and the IOTLB with register based and queued invalidation, and the
-//! invalidation wait descriptor with its completion interrupt.
+//! invalidation wait descriptor with its completion interrupt. Interrupt remapping takes the
+//! MSIs of the PCI devices and the IOAPIC through [`IntelIommu::remap_msi`], with the
+//! remapping table, its source ID checks and its faults.
 //!
 //! # Differences from QEMU
 //!
-//! - Interrupt remapping and scalable mode are not there yet. `intremap=auto` resolves to off
-//!   where QEMU turns it on without a KVM irqchip, and `intremap=on`, `eim=on` and
-//!   `scalable-mode=on` are errors after QEMU's own checks.
+//! - Scalable mode is not there yet, and `scalable-mode=on` is an error after QEMU's own checks.
 //! - There are no IOMMU notifiers and no replay, so nothing like vhost or VFIO can sit behind
 //!   the IOMMU, and `caching-mode` only sets the capability bit.
 //! - DMA to the interrupt range, 0xfee00000 to 0xfeefffff, is not translated. QEMU puts its
-//!   `vtd-ir` region over the IOMMU region there; ruvm delivers MSIs without a DMA write.
+//!   `vtd-ir` region over the IOMMU region there; ruvm delivers MSIs without a DMA write, and
+//!   the board hands them to [`IntelIommu::remap_msi`] instead. A plain DMA write there does
+//!   not raise an interrupt.
+//! - The interrupt entry cache invalidation is a no-op, since there is no cache and no KVM
+//!   routes to update.
 //! - There is no VMState.
 //! - Guest errors that QEMU logs with `error_report_once()` are silent. The invalidation
 //!   descriptor checks that use `error_report()` print the same lines.
@@ -219,6 +223,12 @@ const FR_ROOT_ENTRY_RSVD: u8 = 0xa;
 const FR_CONTEXT_ENTRY_RSVD: u8 = 0xb;
 const FR_PAGING_ENTRY_RSVD: u8 = 0xc;
 const FR_INTERRUPT_ADDR: u8 = 0xe;
+const FR_IR_REQ_RSVD: u8 = 0x20;
+const FR_IR_INDEX_OVER: u8 = 0x21;
+const FR_IR_ENTRY_P: u8 = 0x22;
+const FR_IR_ROOT_INVAL: u8 = 0x23;
+const FR_IR_IRTE_RSVD: u8 = 0x24;
+const FR_IR_SID_ERR: u8 = 0x26;
 const FR_SM_INTERRUPT_ADDR: u8 = 0x87;
 
 /// `vtd_qualified_faults[]`: the faults that the FPD bit suppresses.
@@ -336,7 +346,6 @@ impl IntelIommuConf {
     /// in the kernel, and `kvm_irqchip` is KVM with any part of it there.
     pub fn realize(&self, irq_all_kernel: bool, kvm_irqchip: bool) -> Result<Self, String> {
         let mut c = self.clone();
-        let asked = c.intremap == OnOffAuto::On || c.eim == OnOffAuto::On;
         let ir = match c.intremap {
             OnOffAuto::Auto => !irq_all_kernel,
             v => v == OnOffAuto::On,
@@ -385,18 +394,10 @@ impl IntelIommuConf {
                 return Err("Need to set PASID support for svm".into());
             }
         }
-        if ir && asked {
-            return Err(
-                "ruvm's intel-iommu has no interrupt remapping yet, use intremap=off".into()
-            );
-        }
         if c.scalable_mode {
             return Err("ruvm's intel-iommu has no scalable mode yet".into());
         }
-        // QEMU turns remapping on unless the whole irqchip is in KVM; ruvm leaves it off
-        // until it has it.
-        c.intremap = OnOffAuto::Off;
-        c.eim = OnOffAuto::Off;
+        c.intremap = if ir { OnOffAuto::On } else { OnOffAuto::Off };
         Ok(c)
     }
 
@@ -436,6 +437,36 @@ impl Dma<'_> {
     /// `vtd_get_pte()`: all ones when the read fails.
     fn pte(&self, base: u64, index: u64) -> u64 {
         self.read_quads::<1>(base + index * 8).map_or(u64::MAX, |[q]| q)
+    }
+}
+
+/// `X86_IOMMU_SID_INVALID`: the source ID of interrupts without one, like the IOAPIC's.
+pub const SID_INVALID: u16 = 0xffff;
+
+const IRTE_P: u64 = 1 << 0;
+const IRTE_FPD: u64 = 1 << 1;
+/// `__reserved_0` and `__reserved_1` of `VTD_IR_TableEntry`.
+const IRTE_RSVD_LO: u64 = 0xff00_7000;
+/// `__reserved_2`.
+const IRTE_RSVD_HI: u64 = !0xf_ffff;
+const MSI_ADDR_IR_SHV: u32 = 1 << 3;
+const MSI_ADDR_IR_INT_MODE: u32 = 1 << 4;
+
+/// The source ID check of `vtd_irte_get()` on the high quad of an IRTE.
+fn irte_sid_ok(hi: u64, sid: u16) -> bool {
+    const SVT_MASK: [u16; 4] = [0xffff, 0xfffb, 0xfff9, 0xfff8];
+    let source_id = hi as u16;
+    match (hi >> 18) & 3 {
+        0 => true,
+        1 => {
+            let mask = SVT_MASK[((hi >> 16) & 3) as usize];
+            source_id & mask == sid & mask
+        }
+        2 => {
+            let bus = (sid >> 8) as u8;
+            (source_id as u8..=(source_id >> 8) as u8).contains(&bus)
+        }
+        _ => false,
     }
 }
 
@@ -872,6 +903,105 @@ impl State {
             hi |= FRCD_T;
         }
         self.report_frcd_fault(u64::from(source_id), hi, lo);
+    }
+
+    /// `vtd_report_ir_fault()`.
+    fn report_ir_fault(&mut self, source_id: u16, fault: u8, index: u16) {
+        let lo = u64::from(index) << 48;
+        let hi = u64::from(source_id) | u64::from(fault) << 32;
+        self.report_frcd_fault(u64::from(source_id), hi, lo);
+    }
+
+    /// `vtd_irte_get()`: the low quad of remapping table entry `index`, checked against the
+    /// source ID unless that is [`SID_INVALID`].
+    fn irte_get(&mut self, m: &Dma<'_>, index: u16, sid: u16, mut do_fault: bool) -> Option<u64> {
+        if u32::from(index) >= self.intr_size {
+            if do_fault {
+                self.report_ir_fault(sid, FR_IR_INDEX_OVER, index);
+            }
+            return None;
+        }
+        let Some([lo, hi]) = m.read_quads::<2>(self.intr_root + u64::from(index) * 16) else {
+            if do_fault {
+                self.report_ir_fault(sid, FR_IR_ROOT_INVAL, index);
+            }
+            return None;
+        };
+        // The remaining faults are qualified by the Fault Processing Disable bit, even "not
+        // present".
+        if lo & IRTE_FPD != 0 {
+            do_fault = false;
+        }
+        let fault = if lo & IRTE_P == 0 {
+            Some(FR_IR_ENTRY_P)
+        } else if lo & IRTE_RSVD_LO != 0 || hi & IRTE_RSVD_HI != 0 {
+            Some(FR_IR_IRTE_RSVD)
+        } else if sid != SID_INVALID && !irte_sid_ok(hi, sid) {
+            Some(FR_IR_SID_ERR)
+        } else {
+            None
+        };
+        if let Some(f) = fault {
+            if do_fault {
+                self.report_ir_fault(sid, f, index);
+            }
+            return None;
+        }
+        Some(lo)
+    }
+
+    /// `vtd_interrupt_remap_msi()` with `vtd_remap_irq_get()` and
+    /// `x86_iommu_irq_to_msi_message()`: the message to send in place of `addr` and `data`,
+    /// or `None` to drop it.
+    fn interrupt_remap_msi(
+        &mut self,
+        m: &Dma<'_>,
+        sid: u16,
+        addr: u64,
+        data: u32,
+        do_fault: bool,
+    ) -> Option<(u64, u32)> {
+        if !self.intr_enabled {
+            return Some((addr, data));
+        }
+        if addr >> 32 != 0 || (addr >> 20) & 0xfff != 0xfee {
+            if do_fault {
+                self.report_ir_fault(sid, FR_IR_REQ_RSVD, 0);
+            }
+            return None;
+        }
+        let lo = addr as u32;
+        if lo & MSI_ADDR_IR_INT_MODE == 0 {
+            // Compatibility format.
+            return Some((addr, data));
+        }
+        let shv = lo & MSI_ADDR_IR_SHV != 0;
+        let mut index = ((((lo >> 2) & 1) << 15) | ((lo >> 5) & 0x7fff)) as u16;
+        if shv {
+            index = index.wrapping_add(data as u16);
+        }
+        let irte = self.irte_get(m, index, sid, do_fault)?;
+        if shv && data & 0xffff_0000 != 0 {
+            if do_fault {
+                self.report_ir_fault(sid, FR_IR_REQ_RSVD, 0);
+            }
+            return None;
+        }
+        // QEMU only traces a vector or trigger mode that differs from the IRTE.
+        let mut dest = (irte >> 32) as u32;
+        if !self.intr_eime {
+            dest = (dest & 0xff00) >> 8;
+        }
+        let out_addr = 0xfee0_0000
+            | u64::from(dest & 0xff) << 12
+            | ((irte >> 3) & 1) << 3
+            | ((irte >> 2) & 1) << 2
+            | u64::from(lo & 3)
+            | u64::from(dest & 0xffff_ff00) << 32;
+        let vector = ((irte >> 16) & 0xff) as u32;
+        let delivery = ((irte >> 5) & 7) as u32;
+        let trigger = ((irte >> 4) & 1) as u32;
+        Some((out_addr, vector | delivery << 8 | 1 << 14 | trigger << 15))
     }
 
     /// `vtd_dev_to_context_entry()`: the context entry, or the fault with the low quad of the
@@ -1732,6 +1862,12 @@ impl IntelIommu {
     /// `PCI_BUILD_BDF(bus, devfn)`.
     pub fn device_ops(self: &Arc<Self>, sid: u16) -> Arc<dyn IommuOps> {
         Arc::new(VtdDevice { iommu: Arc::clone(self), sid })
+    }
+
+    /// `vtd_mem_ir_write()`: remaps an MSI from the device with source ID `sid`, or from the
+    /// IOAPIC with [`SID_INVALID`]. `None` drops the interrupt, after recording the fault.
+    pub fn remap_msi(&self, sid: u16, addr: u64, data: u32) -> Option<(u64, u32)> {
+        self.with_state(|s, m| s.interrupt_remap_msi(m, sid, addr, data, true))
     }
 
     /// `vtd_iommu_translate()`.

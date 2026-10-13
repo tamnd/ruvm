@@ -744,6 +744,21 @@ fn msi_delivery_and_masking() {
     dev.msi_notify(0);
     assert_eq!(*own.lock().unwrap(), vec![(0x1_fee0_0000, 0x4040)]);
 
+    // Remapping on the root bus sees the requester ID and can rewrite or drop the message,
+    // whichever trigger it then goes to.
+    let seen: Arc<Mutex<Vec<u16>>> = Arc::default();
+    let s = Arc::clone(&seen);
+    env.bus.set_msi_remap(Some(Arc::new(move |sid, a, d| {
+        s.lock().unwrap().push(sid);
+        (d != 0x4041).then_some((a & 0xffff_ffff, d | 0x100))
+    })));
+    own.lock().unwrap().clear();
+    dev.msi_notify(0);
+    dev.msi_notify(1);
+    assert_eq!(*own.lock().unwrap(), vec![(0xfee0_0000, 0x4140)]);
+    assert_eq!(*seen.lock().unwrap(), vec![u16::from(devfn), u16::from(devfn)]);
+    env.bus.set_msi_remap(None);
+
     // Reset turns MSI off and clears the message.
     dev.reset();
     assert!(!dev.msi_enabled());

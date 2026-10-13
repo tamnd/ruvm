@@ -59,8 +59,8 @@ pub mod regs;
 pub use bridge::{PciBridge, PciBridgeWindow, pci_bridge_get_base, pci_bridge_get_limit};
 pub use bus::{PciBus, PciBusVmState, PciMapIrqFn, PciSetIrqFn, pci_swizzle_map_irq_fn};
 pub use device::{
-    MsiMessage, MsiTrigger, PciBarInfo, PciConfigMut, PciDevice, PciDeviceInfo, PciDeviceOps,
-    PciDeviceVmState,
+    MsiMessage, MsiRemap, MsiTrigger, PciBarInfo, PciConfigMut, PciDevice, PciDeviceInfo,
+    PciDeviceOps, PciDeviceVmState,
 };
 pub use gpex::{
     GPEX_IOPORT_SIZE, GpexConfig, GpexHost, GpexWindow, PCI_DEVICE_ID_REDHAT_PCIE_HOST,
