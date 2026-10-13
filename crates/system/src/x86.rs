@@ -1521,13 +1521,20 @@ pub(crate) fn parse_dirty_ring_size(value: &str) -> Result<u32> {
     Ok(n)
 }
 
+/// A machine's `kvm_type` hook, which gives the type of the VM `kvm_init()` creates.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) type KvmVmType<'a> =
+    &'a dyn Fn(&ruvm_accel_kvm::Kvm) -> std::result::Result<u64, ruvm_accel_kvm::KvmError>;
+
 /// `do_configure_accelerator()` for kvm: the `-accel kvm` properties, with
-/// `-machine kernel-irqchip=` as the default for the property of that name.
+/// `-machine kernel-irqchip=` as the default for the property of that name, and the
+/// machine's `kvm_type` hook if it has one.
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn kvm_init(
     props: &[(String, String)],
     irqchip_sugar: Option<&str>,
     default_split: bool,
+    vm_type: Option<KvmVmType<'_>>,
 ) -> std::result::Result<ruvm_accel_kvm::KvmAccel, AccelInitError> {
     use ruvm_accel_kvm::{KernelIrqchip, KvmError, KvmOptions};
 
@@ -1551,9 +1558,15 @@ pub(crate) fn kvm_init(
             }
         }
     }
-    let accel = ruvm_accel_kvm::KvmAccel::new(&opts, default_split).map_err(|e| match e {
-        // kvm_arch_irqchip_create() on Arm exits right there.
-        KvmError::ArmSplitIrqchip => AccelInitError::Fatal(Error::generic(e.to_string())),
+    let accel = match vm_type {
+        Some(t) => ruvm_accel_kvm::KvmAccel::with_vm_type(&opts, default_split, t),
+        None => ruvm_accel_kvm::KvmAccel::new(&opts, default_split),
+    };
+    let accel = accel.map_err(|e| match e {
+        // kvm_arch_irqchip_create() on Arm and virt_set_memmap() exit right there.
+        KvmError::ArmSplitIrqchip | KvmError::Machine(_) => {
+            AccelInitError::Fatal(Error::generic(e.to_string()))
+        }
         e => AccelInitError::Failed(e.init_error_lines()),
     })?;
     for w in accel.warnings() {

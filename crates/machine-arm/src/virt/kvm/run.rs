@@ -27,7 +27,7 @@ use ruvm_accel_kvm::arm::vcpu::{ArmVcpu, ArmVcpuConfig, PutLevel};
 use ruvm_accel_kvm::arm::{GITS_TRANSLATER, GicV2State, GicV3State, ItsState};
 use ruvm_accel_kvm::{
     KernelIrqchip, KvmAccel, KvmGicV2, KvmGicV3, KvmIts, KvmVcpu, VcpuKick, VcpuStop,
-    spawn_vcpu_thread,
+    arm_max_vm_ipa_size, spawn_vcpu_thread,
 };
 use ruvm_hw_core::{Clock, IrqLine};
 use ruvm_hw_intc::gicv2::GicV2;
@@ -55,10 +55,12 @@ thread_local! {
 }
 
 /// Points the SPIs of `cfg` at KVM when `accel` keeps the GIC in the kernel, after the
-/// `machvirt_init()` checks for KVM. Pass the result to [`KvmVirtMachine::new`].
+/// `machvirt_init()` checks for KVM, and lays the memory map out for the host's largest IPA
+/// size as `virt_kvm_type()` did. Pass the result to [`KvmVirtMachine::new`].
 pub fn prepare_config(accel: &KvmAccel, cfg: &mut VirtConfig) -> Result<KvmSpis, String> {
     let irqchip = accel.kernel_irqchip();
     check_config(cfg, irqchip)?;
+    cfg.pa_bits = Some(arm_max_vm_ipa_size(accel.kvm()).0);
     let spis = KvmSpis::new();
     if irqchip != KernelIrqchip::Off {
         cfg.spi_sink = Some(spis.sink());

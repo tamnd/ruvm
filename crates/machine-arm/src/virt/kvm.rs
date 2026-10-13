@@ -17,15 +17,16 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use ruvm_accel_kvm::KernelIrqchip;
-use ruvm_accel_kvm::arm::{DeviceIrq, GicV3Config, gicr_typer};
+use ruvm_accel_kvm::arm::{DeviceIrq, GicV3Config, gicr_typer, vm_type_for_map};
+use ruvm_accel_kvm::{KernelIrqchip, KvmError};
 use ruvm_target_arm::cpu::{GTIMER_PHYS, GTIMER_VIRT};
 
 use super::boot::BootInfo;
 use super::cpus::{PMU_PPI, TIMER_PPIS};
+use super::memmap::{Highmem, virt_set_memmap};
 use super::{
-    SpiSink, VIRT_GIC_DIST, VIRT_GIC_NUM_IRQ, VIRT_GIC_REDIST, VIRT_GICV3_MAX_CPUS, VirtConfig,
-    VirtGicVersion, virt_cpu_mp_affinity,
+    SpiSink, VIRT_GIC_DIST, VIRT_GIC_NUM_IRQ, VIRT_GIC_REDIST, VIRT_GICV3_MAX_CPUS, VIRT_MEM,
+    VirtConfig, VirtGicVersion, virt_cpu_mp_affinity,
 };
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -50,6 +51,15 @@ pub fn check_config(cfg: &VirtConfig, irqchip: KernelIrqchip) -> Result<(), Stri
         return Err("KVM with kernel-irqchip=off does not support GICv3 emulation".to_string());
     }
     Ok(())
+}
+
+/// `virt_kvm_type()`: the `KVM_CREATE_VM` type for a board with `ram_size` bytes of RAM and
+/// the `highmem*` properties `hm`, on a host whose largest IPA size is `max`, `fixed` when the
+/// kernel has no `KVM_CAP_ARM_VM_IPA_SIZE`. The map is laid out for `max` bits, as
+/// `prepare_config()` lays out the board's, and the VM gets the bits its highest address needs.
+pub fn virt_kvm_type(ram_size: u64, hm: &Highmem, max: u32, fixed: bool) -> Result<u64, KvmError> {
+    let map = virt_set_memmap(VIRT_MEM, ram_size, max, hm).map_err(KvmError::Machine)?;
+    vm_type_for_map(map.highest_gpa, max, fixed)
 }
 
 /// The GIC interrupt ID a KVM device output drives when the GIC is in userspace: the timer
@@ -246,5 +256,26 @@ mod tests {
         // A second connect is ignored.
         spis.connect(Arc::new(|_, _| panic!("second target")));
         sink(2, true);
+    }
+
+    #[test]
+    fn vm_type_fits_the_map() {
+        let hm = Highmem::default();
+        // 128 MiB of RAM: the high regions end at 1 TiB, so 40 bits.
+        assert_eq!(virt_kvm_type(128 << 20, &hm, 48, false).unwrap(), 40);
+        assert_eq!(virt_kvm_type(128 << 20, &hm, 40, true).unwrap(), 0);
+        // With 36 bits none of the high regions fit, so they are dropped as in QEMU.
+        assert_eq!(virt_kvm_type(128 << 20, &hm, 36, false).unwrap(), 32);
+        let off = Highmem { highmem: false, ..Highmem::default() };
+        assert_eq!(virt_kvm_type(128 << 20, &off, 48, false).unwrap(), 32);
+        // 512 GiB of RAM moves the high regions past 1 TiB.
+        assert_eq!(virt_kvm_type(512 << 30, &hm, 48, false).unwrap(), 41);
+        // On a 40-bit host the high MMIO window no longer fits and the rest stays in 40 bits.
+        assert_eq!(virt_kvm_type(512 << 30, &hm, 40, true).unwrap(), 0);
+        let e = virt_kvm_type(2 << 40, &hm, 40, true).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "Addressing limited to 40 bits, but memory exceeds it by 1100585369600 bytes"
+        );
     }
 }

@@ -32,9 +32,11 @@ pub mod arm;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod linux;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use kvm_ioctls::Kvm;
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use linux::{KvmAccel, KvmVcpu, SlotListener, VcpuKick, VcpuStop, spawn_vcpu_thread};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-pub use linux::{KvmGicV2, KvmGicV3, KvmIts, vgic_probe};
+pub use linux::{KvmGicV2, KvmGicV3, KvmIts, arm_max_vm_ipa_size, vgic_probe};
 
 /// `KVM_API_VERSION`. Anything else is refused, like QEMU does.
 pub const KVM_API_VERSION: i32 = 12;
@@ -143,6 +145,10 @@ pub enum KvmError {
     ArmSplitIrqchip,
     /// The host pages are not 4 KiB. The slot and dirty ring code assumes they are.
     HostPageSize(u64),
+    /// The memory map needs more IPA bits than the host's KVM has, from `virt_kvm_type()`.
+    IpaTooSmall { requested: u32, max: u32 },
+    /// The machine could not lay out its memory map for the VM. QEMU exits right there.
+    Machine(String),
 }
 
 /// `strerror()` text, without the `(os error N)` that Rust appends.
@@ -187,6 +193,12 @@ impl fmt::Display for KvmError {
             Self::HostPageSize(size) => {
                 write!(f, "kvm: host page size {size} is not supported, ruvm needs 4096 for now")
             }
+            Self::IpaTooSmall { requested, max } => write!(
+                f,
+                "-m and ,maxmem option values require an IPA range ({requested} bits) larger \
+                 than the one supported by the host ({max} bits)"
+            ),
+            Self::Machine(msg) => f.write_str(msg),
         }
     }
 }

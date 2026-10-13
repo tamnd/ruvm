@@ -24,6 +24,36 @@ use std::io;
 
 use crate::{KernelIrqchip, KvmError, strerror};
 
+/// The IPA size of a VM made with type 0, the only one a kernel without
+/// `KVM_CAP_ARM_VM_IPA_SIZE` has.
+pub const KVM_DEFAULT_IPA_BITS: u32 = 40;
+
+/// `kvm_arm_get_max_vm_ipa_size()` for what `KVM_CAP_ARM_VM_IPA_SIZE` returned: the largest
+/// IPA size a VM can have, and whether it is the fixed 40 bits of a kernel without the
+/// capability.
+pub fn max_vm_ipa_size(cap: i32) -> (u32, bool) {
+    match u32::try_from(cap) {
+        Ok(bits) if bits > 0 => (bits, false),
+        _ => (KVM_DEFAULT_IPA_BITS, true),
+    }
+}
+
+/// `kvm_arch_get_default_type()`: the largest IPA size, or type 0 when it is fixed.
+pub fn default_vm_type(max: u32, fixed: bool) -> u64 {
+    if fixed { 0 } else { u64::from(max) }
+}
+
+/// The end of `virt_kvm_type()`: the `KVM_CREATE_VM` type for a memory map whose highest
+/// address is `highest_gpa`, on a host whose largest IPA size is `max`. The type is the IPA
+/// size the map needs, at least the 32 bits KVM asks for, or 0 when the size is fixed.
+pub fn vm_type_for_map(highest_gpa: u64, max: u32, fixed: bool) -> Result<u64, KvmError> {
+    let requested = (64 - highest_gpa.leading_zeros()).max(32);
+    if requested > max {
+        return Err(KvmError::IpaTooSmall { requested, max });
+    }
+    Ok(if fixed { 0 } else { u64::from(requested) })
+}
+
 /// `GIC_INTERNAL`: the SGIs and PPIs, which are banked per CPU.
 pub const GIC_INTERNAL: u32 = 32;
 /// `GIC_NR_SGIS`.
@@ -2120,5 +2150,27 @@ mod tests {
         let mut one = GicV2State::new(64, 1);
         one.reset();
         assert!(one.targets.iter().all(|&t| t == 1));
+    }
+
+    #[test]
+    fn vm_ipa_size() {
+        assert_eq!(max_vm_ipa_size(0), (40, true));
+        assert_eq!(max_vm_ipa_size(-22), (40, true));
+        assert_eq!(max_vm_ipa_size(48), (48, false));
+        assert_eq!(default_vm_type(40, true), 0);
+        assert_eq!(default_vm_type(48, false), 48);
+        // The default virt map, 128 MiB of RAM and the high regions up to 1 TiB.
+        assert_eq!(vm_type_for_map((1 << 40) - 1, 48, false).unwrap(), 40);
+        assert_eq!(vm_type_for_map((1 << 40) - 1, 40, true).unwrap(), 0);
+        // highmem=off keeps everything under 4 GiB, and KVM wants at least 32 bits.
+        assert_eq!(vm_type_for_map(0x3fff_ffff, 48, false).unwrap(), 32);
+        assert_eq!(vm_type_for_map(1 << 40, 48, false).unwrap(), 41);
+        let e = vm_type_for_map(1 << 40, 40, true).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "-m and ,maxmem option values require an IPA range (41 bits) larger than the one \
+             supported by the host (40 bits)"
+        );
+        assert_eq!(e.init_error_lines()[1], "failed to initialize kvm: Invalid argument");
     }
 }

@@ -876,8 +876,14 @@ fn resolve_machine_memdev(vm: &Vm, machine: &Machine, cfg: &Config, id: &str) ->
 }
 
 /// `configure_accelerators()`. `kind` is the x86 board, if that is the machine; it decides
-/// the default of `kernel-irqchip`.
-fn configure_accelerators(target: &str, kind: Option<BoardKind>, cfg: &mut Config) -> Flow<Accel> {
+/// the default of `kernel-irqchip`. `arm_board` is the Arm board, whose memory map decides the
+/// type of a KVM VM.
+fn configure_accelerators(
+    target: &str,
+    kind: Option<BoardKind>,
+    arm_board: Option<&arm::BoardOptions>,
+    cfg: &mut Config,
+) -> Flow<Accel> {
     let accels = accels(target);
     let mut init_failed = false;
     if cfg.accel.is_empty() {
@@ -927,7 +933,7 @@ fn configure_accelerators(target: &str, kind: Option<BoardKind>, cfg: &mut Confi
             .filter(|(name, _)| *name != "accel")
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        match init_accel(acc, &props, cfg.kernel_irqchip.as_deref(), split) {
+        match init_accel(acc, &props, cfg.kernel_irqchip.as_deref(), split, arm_board) {
             Ok(a) => {
                 chosen = Some((acc.to_string(), a));
                 break;
@@ -954,19 +960,26 @@ fn configure_accelerators(target: &str, kind: Option<BoardKind>, cfg: &mut Confi
 }
 
 /// `accel_init_machine()` for `acc`, given its `-accel` properties and the
-/// `-machine kernel-irqchip=` sugar.
+/// `-machine kernel-irqchip=` sugar, and for kvm the Arm board whose `kvm_type` hook it calls.
 fn init_accel(
     acc: &str,
     props: &[(String, String)],
     kernel_irqchip: Option<&str>,
     default_split: bool,
+    arm_board: Option<&arm::BoardOptions>,
 ) -> std::result::Result<Accel, AccelInitError> {
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     if acc == "kvm" {
-        return x86::kvm_init(props, kernel_irqchip, default_split)
+        #[cfg(target_arch = "aarch64")]
+        let hook = arm_board.map(arm::kvm_vm_type);
+        #[cfg(target_arch = "aarch64")]
+        let vm_type = hook.as_ref().map(|h| h as x86::KvmVmType<'_>);
+        #[cfg(not(target_arch = "aarch64"))]
+        let vm_type = None;
+        return x86::kvm_init(props, kernel_irqchip, default_split, vm_type)
             .map(|a| Accel::Kvm(Box::new(a)));
     }
-    let _ = (kernel_irqchip, default_split);
+    let _ = (kernel_irqchip, default_split, arm_board);
     if acc == "tcg" {
         return x86::tcg_init(props).map(Accel::Tcg);
     }
@@ -1133,7 +1146,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         }
         (None, None) => unreachable!("a QOM machine was created"),
     };
-    let accel = configure_accelerators(p.target, kind, &mut cfg)?;
+    let accel = configure_accelerators(p.target, kind, virt_opts.as_ref(), &mut cfg)?;
     let _ = vm.accel.set(match &accel {
         Accel::Qtest => Accelerator::Qtest,
         Accel::Tcg(_) => Accelerator::Tcg,
@@ -1208,7 +1221,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         let accel = match accel {
             Accel::Tcg(tcg) => riscv::BoardAccel::Tcg(tcg),
             Accel::Qtest => riscv::BoardAccel::Qtest(Arc::clone(&clock)),
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
             Accel::Kvm(_) => unreachable!("no KVM for this target"),
         };
         let args = riscv::RiscvArgs {
