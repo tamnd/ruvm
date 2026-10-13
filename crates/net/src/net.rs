@@ -5,6 +5,7 @@
 //! [`Net`] owns what QEMU keeps in globals: the list of clients, the hubs, the NIC table the
 //! old `-net nic` and `-nic` options fill, and the `netdev`, `nic` and `net` option lists.
 
+use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::BuildHasher;
@@ -18,7 +19,7 @@ use std::sync::{Arc, Mutex, Weak};
 use ruvm_base::error::ErrorClass;
 use ruvm_base::{Error, Result, warn_report};
 use ruvm_qapi::cutils::id_wellformed;
-use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
+use ruvm_qapi::opts::{OptsHandle, QemuOpts, QemuOptsList, is_help_option};
 use ruvm_qapi::types::{NetClientDriver, Netdev, NetdevHubPortOptions, NetdevU, SocketAddress};
 use ruvm_qapi::visit::QObjectInputVisitor;
 use ruvm_qapi::visit::Visit;
@@ -200,7 +201,11 @@ pub struct Net {
     netdev_opts: QemuOptsList,
     nic_opts: QemuOptsList,
     net_opts: QemuOptsList,
-    modern: Vec<Netdev>,
+    modern: Vec<(Netdev, usize)>,
+    /// The `parse_*` call each option list entry came from, counting from 0.
+    arg_of: HashMap<(OptsKind, OptsHandle), usize>,
+    nargs: usize,
+    failed_arg: Option<usize>,
     vm_running: Arc<AtomicBool>,
     fd_resolver: Option<FdResolver>,
     pub(crate) event_sink: Option<EventSink>,
@@ -252,6 +257,9 @@ impl Net {
             nic_opts: opts_list("nic"),
             net_opts: opts_list("net"),
             modern: Vec::new(),
+            arg_of: HashMap::new(),
+            nargs: 0,
+            failed_arg: None,
             vm_running: Arc::new(AtomicBool::new(true)),
             fd_resolver: None,
             event_sink: None,
@@ -750,32 +758,54 @@ impl Net {
     /// `-netdev`: JSON and the `stream` and `dgram` types go the modern way, the rest into the
     /// `netdev` option list.
     pub fn parse_netdev(&mut self, optarg: &str) -> Result<()> {
+        let arg = self.next_arg();
         if netdev_is_modern(optarg) {
             let nd = parse_modern(optarg)?;
-            self.modern.push(nd);
+            self.modern.push((nd, arg));
             return Ok(());
         }
-        self.netdev_opts.parse(optarg, true)?;
+        let h = self.netdev_opts.parse(optarg, true)?.handle();
+        self.arg_of.insert((OptsKind::Netdev, h), arg);
         Ok(())
     }
 
     /// `-nic`.
     pub fn parse_nic(&mut self, optarg: &str) -> Result<()> {
-        self.nic_opts.parse(optarg, true)?;
+        let arg = self.next_arg();
+        let h = self.nic_opts.parse(optarg, true)?.handle();
+        self.arg_of.insert((OptsKind::Nic, h), arg);
         Ok(())
     }
 
     /// `-net`.
     pub fn parse_net(&mut self, optarg: &str) -> Result<()> {
-        self.net_opts.parse(optarg, true)?;
+        let arg = self.next_arg();
+        let h = self.net_opts.parse(optarg, true)?.handle();
+        self.arg_of.insert((OptsKind::Net, h), arg);
         Ok(())
+    }
+
+    fn next_arg(&mut self) -> usize {
+        self.nargs += 1;
+        self.nargs - 1
+    }
+
+    /// The option [`Net::init_clients`] failed on, as the number of the `parse_*` call that
+    /// gave it, counting from 0. QEMU reports the error at that option's place on the command
+    /// line.
+    pub fn failed_arg(&self) -> Option<usize> {
+        self.failed_arg
     }
 
     /// `net_init_clients()`: creates what the options asked for, modern `-netdev` first, then
     /// the other `-netdev`s, then `-nic`, then `-net`. Stops at the first error.
     pub fn init_clients(&mut self) -> Result<()> {
-        for nd in std::mem::take(&mut self.modern) {
-            self.client_init1(&nd, true)?;
+        self.failed_arg = None;
+        for (nd, arg) in std::mem::take(&mut self.modern) {
+            if let Err(e) = self.client_init1(&nd, true) {
+                self.failed_arg = Some(arg);
+                return Err(e);
+            }
         }
         self.foreach_opts(OptsKind::Netdev)?;
         self.foreach_opts(OptsKind::Nic)?;
@@ -799,6 +829,7 @@ impl Net {
                 OptsKind::Net => self.init_net(opts),
             };
             if result.is_err() {
+                self.failed_arg = self.arg_of.get(&(kind, opts.handle())).copied();
                 break;
             }
         }
@@ -1055,7 +1086,7 @@ impl Net {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum OptsKind {
     Netdev,
     Nic,

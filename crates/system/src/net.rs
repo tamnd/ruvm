@@ -14,6 +14,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
+use ruvm_base::Error;
 use ruvm_base::report::Location;
 use ruvm_hw_core::{Clock, Timer};
 use ruvm_hw_virtio::{NetPeer, RxOutcome, VirtioNet, VirtioNetHdr};
@@ -32,6 +33,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Which network option an argument came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NetOption {
+    Netdev,
+    Nic,
+    Net,
+}
+
 /// The netdevs and NICs of a machine.
 pub(crate) struct Network {
     net: Mutex<Net>,
@@ -45,20 +54,39 @@ impl fmt::Debug for Network {
 }
 
 impl Network {
-    /// Parses the `-netdev` options and makes the backends, `net_init_clients()`. The VM
-    /// counts as stopped until [`Network::vm_state_change`] says otherwise. The backends send
-    /// their QAPI events to `events`.
+    /// Parses the `-netdev`, `-nic` and `-net` options and makes the backends,
+    /// `net_init_clients()`. The VM counts as stopped until [`Network::vm_state_change`] says
+    /// otherwise. The backends send their QAPI events to `events`.
+    ///
+    /// `board_nics` says the board would make on-board NICs for `-nic` and `-net nic`, as
+    /// `pc_nic_init()` does on q35. ruvm cannot do that yet, so those fail there. `-nic none`
+    /// and `-net none` make nothing and work everywhere.
     pub(crate) fn new(
-        netdevs: &[(String, Option<Location>)],
+        args: &[(NetOption, String, Option<Location>)],
+        board_nics: bool,
         clock: &Arc<Clock>,
         events: Option<EventSink>,
     ) -> Result<Network, Located> {
         let mut net = Net::new();
         net.set_event_sink(events);
-        for (arg, loc) in netdevs {
-            net.parse_netdev(arg).map_err(|e| Located(loc.clone(), e))?;
+        for (opt, arg, loc) in args {
+            let r = match opt {
+                NetOption::Netdev => net.parse_netdev(arg),
+                NetOption::Nic => net.parse_nic(arg),
+                NetOption::Net => net.parse_net(arg),
+            };
+            r.map_err(|e| Located(loc.clone(), e))?;
         }
-        net.init_clients().map_err(|e| Located(None, e))?;
+        net.init_clients().map_err(|e| {
+            let loc = net.failed_arg().and_then(|i| args.get(i)).and_then(|a| a.2.clone());
+            Located(loc, e)
+        })?;
+        if board_nics && net.nd_table().iter().any(|nd| nd.used) {
+            return Err(Located(
+                None,
+                Error::generic("-nic and -net nic are not supported with this machine by ruvm yet"),
+            ));
+        }
         net.vm_state_change(false);
         Ok(Network { net: Mutex::new(net), clock: Arc::clone(clock) })
     }
@@ -252,16 +280,15 @@ impl NetPeer for NicPeer {
 mod tests {
     use super::*;
 
-    fn args(a: &[&str]) -> Vec<(String, Option<Location>)> {
-        a.iter().map(|s| (s.to_string(), None)).collect()
+    fn args(a: &[&str]) -> Vec<(NetOption, String, Option<Location>)> {
+        a.iter().map(|s| (NetOption::Netdev, s.to_string(), None)).collect()
     }
 
     #[test]
     fn nics_join_their_netdevs() {
         let clock = Clock::manual(ruvm_base::ClockType::Virtual);
-        let net =
-            Network::new(&args(&["hubport,id=a,hubid=0", "hubport,id=b,hubid=0"]), &clock, None)
-                .unwrap();
+        let netdevs = args(&["hubport,id=a,hubid=0", "hubport,id=b,hubid=0"]);
+        let net = Network::new(&netdevs, true, &clock, None).unwrap();
         let mut mac = [0; 6];
         let (_, port) = net.new_nic("virtio-net-pci", None, Some("a"), &mut mac).unwrap();
         assert_eq!(mac, [0x52, 0x54, 0, 0x12, 0x34, 0x56]);
@@ -282,6 +309,25 @@ mod tests {
         port.0.run();
         assert_eq!(lock(&port.0.queue).len(), 1);
 
-        assert!(Network::new(&args(&["bogus,id=x"]), &clock, None).is_err());
+        assert!(Network::new(&args(&["bogus,id=x"]), true, &clock, None).is_err());
+    }
+
+    #[test]
+    fn nic_none_makes_nothing() {
+        let clock = Clock::manual(ruvm_base::ClockType::Virtual);
+        let a = |opt, s: &str| (opt, s.to_string(), None);
+        let none = [a(NetOption::Nic, "none"), a(NetOption::Net, "none")];
+        let net = Network::new(&none, true, &clock, None).unwrap();
+        assert!(lock(&net.net).check_clients().is_empty());
+
+        let e = Network::new(&[a(NetOption::Net, "none,foo=bar")], true, &clock, None);
+        assert_eq!(e.unwrap_err().1.to_string(), "Invalid parameter 'foo'");
+        let e = Network::new(&[a(NetOption::Net, "nic")], true, &clock, None);
+        assert_eq!(
+            e.unwrap_err().1.to_string(),
+            "-nic and -net nic are not supported with this machine by ruvm yet"
+        );
+        // A board without on-board NICs leaves it to net_check_clients() to warn.
+        assert!(Network::new(&[a(NetOption::Net, "nic")], false, &clock, None).is_ok());
     }
 }

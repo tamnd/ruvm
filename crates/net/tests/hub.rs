@@ -147,6 +147,15 @@ fn nic_option_records_a_nic() {
     let mut net = Net::new();
     net.parse_nic("hubport,hubid=0,mac=01:00:00:00:00:00").unwrap();
     assert_eq!(net.init_clients().unwrap_err().message(), "NIC cannot have multicast MAC address");
+    assert_eq!(net.failed_arg(), Some(0));
+
+    // The failure is placed on the option that caused it, in the order they were given.
+    let mut net = Net::new();
+    net.parse_netdev("hubport,id=h,hubid=0").unwrap();
+    net.parse_net("none,foo=bar").unwrap();
+    net.parse_nic("none").unwrap();
+    assert_eq!(net.init_clients().unwrap_err().message(), "Invalid parameter 'foo'");
+    assert_eq!(net.failed_arg(), Some(1));
 }
 
 #[test]

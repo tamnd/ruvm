@@ -54,7 +54,7 @@ use ruvm_qom::{
 };
 
 use crate::arm::{self, ArmBoard};
-use crate::net::{Network, qmp_events};
+use crate::net::{NetOption, Network, qmp_events};
 use crate::options::{Opt, arch_available, help_text, lookup_opt};
 use crate::qmp_cmds::{self, object_options_dict};
 use crate::qtest::{self, VirtualClock};
@@ -178,6 +178,18 @@ type Flow<T> = std::result::Result<T, Exit>;
 fn fail(e: &Error) -> Exit {
     report_error(e);
     Exit(1)
+}
+
+/// Whether a `-nic` or `-net` argument asks for QEMU's list of NIC models, with `-nic help`
+/// or `model=help`.
+fn wants_nic_models(opt: Opt, arg: &str) -> bool {
+    let nic = opt == Opt::Nic;
+    arg.split(',').enumerate().any(|(i, p)| match p.split_once('=') {
+        Some(("model", v)) => is_help_option(v),
+        Some(("type", v)) => nic && is_help_option(v),
+        Some(_) => false,
+        None => nic && i == 0 && is_help_option(p),
+    })
 }
 
 fn fail_msg(msg: &str) -> Exit {
@@ -547,7 +559,17 @@ fn parse_options(
                 }
                 cfg.x86.devices.push((arg.to_string(), current_location()));
             }
-            Opt::Netdev => cfg.x86.netdevs.push((arg.to_string(), current_location())),
+            Opt::Netdev | Opt::Nic | Opt::Net => {
+                if wants_nic_models(found.option.index, arg) {
+                    return Err(fail_msg("listing the NIC models is not supported by ruvm yet"));
+                }
+                let opt = match found.option.index {
+                    Opt::Nic => NetOption::Nic,
+                    Opt::Net => NetOption::Net,
+                    _ => NetOption::Netdev,
+                };
+                cfg.x86.netdevs.push((opt, arg.to_string(), current_location()));
+            }
             Opt::NoReboot => cfg.x86.no_reboot = true,
             Opt::Uuid => cfg.x86.set_uuid(arg).map_err(|e| fail_msg(&e))?,
             Opt::Smbios => cfg.x86.add_smbios(arg).map_err(|e| fail_msg(&e))?,
@@ -1199,7 +1221,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     // net_init_clients(). The boards make their netdevs with their NICs.
     if machine.is_some() {
         let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
-        let net = Network::new(&cfg.x86.netdevs, &clock, Some(qmp_events(&vm.qmp))).map_err(
+        let net = Network::new(&cfg.x86.netdevs, true, &clock, Some(qmp_events(&vm.qmp))).map_err(
             |Located(loc, e)| {
                 let _loc = loc.map(push_location);
                 fail(&e)
@@ -1531,6 +1553,16 @@ fn pid_name(pid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nic_model_help_is_spotted() {
+        assert!(wants_nic_models(Opt::Nic, "help"));
+        assert!(wants_nic_models(Opt::Nic, "user,model=?"));
+        assert!(wants_nic_models(Opt::Net, "nic,model=help"));
+        assert!(!wants_nic_models(Opt::Net, "help"));
+        assert!(!wants_nic_models(Opt::Nic, "none"));
+        assert!(!wants_nic_models(Opt::Netdev, "user,id=help"));
+    }
 
     struct Env {
         registry: Registry,

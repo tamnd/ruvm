@@ -66,7 +66,7 @@ use ruvm_qapi::types::{
 use ruvm_qapi::visit::{QObjectInputVisitor, StringInputVisitor, Visit, Visitor, VisitorExt};
 use ruvm_qapi::{QDict, QValue};
 
-use crate::net::{Network, NicPort, qmp_events};
+use crate::net::{NetOption, Network, NicPort, qmp_events};
 use crate::vl::Vm;
 
 /// Whether `target` is one the x86 boards exist for.
@@ -162,8 +162,8 @@ pub(crate) struct Cmdline {
     pub drives: Vec<(String, Option<Location>)>,
     /// `-device`.
     pub devices: Vec<(String, Option<Location>)>,
-    /// `-netdev`.
-    pub netdevs: Vec<(String, Option<Location>)>,
+    /// `-netdev`, `-nic` and `-net`, in order.
+    pub netdevs: Vec<(NetOption, String, Option<Location>)>,
     /// `-nographic`.
     pub nographic: bool,
     /// `default_serial`: no `-serial` and no `-nodefaults`.
@@ -1884,7 +1884,9 @@ fn build(
         attach_ide(&board, plug.port, config, Some(Arc::new(blk)))
             .map_err(|e| one(Located::new(&d.loc, e)))?;
     }
-    let net = Arc::new(Network::new(&cmd.netdevs, &clock, Some(qmp_events(&vm.qmp))).map_err(one)?);
+    let q35 = kind == BoardKind::Q35;
+    let net = Network::new(&cmd.netdevs, q35, &clock, Some(qmp_events(&vm.qmp))).map_err(one)?;
+    let net = Arc::new(net);
     let _ = vm.network.set(Arc::clone(&net));
     ruvm_audio::registry::attach_clock(&clock);
     crate::audio::realize_isa_dma(&board, &clock).map_err(|e| one(Located(None, e)))?;
