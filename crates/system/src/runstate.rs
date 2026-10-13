@@ -132,6 +132,8 @@ struct Inner {
     reset_requested: ShutdownCause,
     /// `-no-reboot`: `reboot_action` is shutdown.
     no_reboot: bool,
+    /// `-no-shutdown`: `shutdown_action` is pause.
+    no_shutdown: bool,
     /// `shutdown_exit_code`.
     shutdown_exit_code: i32,
     killed: Option<Killed>,
@@ -187,6 +189,7 @@ impl Runstate {
                 shutdown_requested: ShutdownCause::None,
                 reset_requested: ShutdownCause::None,
                 no_reboot: false,
+                no_shutdown: false,
                 shutdown_exit_code: 0,
                 killed: None,
             }),
@@ -345,10 +348,17 @@ impl Runstate {
     }
 
     /// `qemu_system_shutdown_request()`. The main loop picks the request up once the
-    /// dispatcher has finished the command it is running.
+    /// dispatcher has finished the command it is running. It only kicks the dispatcher, because
+    /// with `-no-shutdown` the main loop goes on serving QMP afterwards.
     pub fn shutdown_request(&self, cause: ShutdownCause) {
         lock(&self.inner).shutdown_requested = cause;
-        self.qmp.shutdown();
+        self.qmp.kick();
+    }
+
+    /// `qmp_quit()`: a shutdown request that ends the process even with `-no-shutdown`.
+    pub fn quit_request(&self, cause: ShutdownCause) {
+        lock(&self.inner).no_shutdown = false;
+        self.shutdown_request(cause);
     }
 
     /// `qemu_system_shutdown_request_with_code()`: a shutdown request that also sets the
@@ -368,14 +378,25 @@ impl Runstate {
     pub fn killed(&self, killed: Killed) {
         let mut inner = lock(&self.inner);
         inner.killed = Some(killed);
+        inner.no_shutdown = false;
         inner.shutdown_requested = ShutdownCause::HostSignal;
         drop(inner);
-        self.qmp.shutdown();
+        self.qmp.kick();
     }
 
     /// `-no-reboot`: a reset request becomes a shutdown request.
     pub fn set_no_reboot(&self, no_reboot: bool) {
         lock(&self.inner).no_reboot = no_reboot;
+    }
+
+    /// `-no-shutdown`: a shutdown request stops the machine instead of ending the process.
+    pub fn set_no_shutdown(&self, no_shutdown: bool) {
+        lock(&self.inner).no_shutdown = no_shutdown;
+    }
+
+    /// `shutdown_action == SHUTDOWN_ACTION_PAUSE`.
+    pub fn shutdown_pauses(&self) -> bool {
+        lock(&self.inner).no_shutdown
     }
 
     /// Installs what [`Runstate::system_reset`] does to the board.
@@ -548,5 +569,21 @@ mod tests {
         rs.set_machine_reset(MachineReset::Unsupported);
         let e = rs.qmp_system_reset().unwrap_err();
         assert_eq!(e.message(), "system_reset is not supported with this machine by ruvm yet");
+    }
+
+    #[test]
+    fn quit_ends_the_process_with_no_shutdown() {
+        let rs = Runstate::new(Qmp::new());
+        rs.set_no_shutdown(true);
+        rs.shutdown_request(ShutdownCause::GuestShutdown);
+        assert!(rs.shutdown_pauses());
+        assert_eq!(rs.take_shutdown_request(), ShutdownCause::GuestShutdown);
+        rs.quit_request(ShutdownCause::HostQmpQuit);
+        assert!(!rs.shutdown_pauses());
+        assert_eq!(rs.take_shutdown_request(), ShutdownCause::HostQmpQuit);
+
+        rs.set_no_shutdown(true);
+        rs.killed(Killed { signo: 15, pid: 0 });
+        assert!(!rs.shutdown_pauses());
     }
 }

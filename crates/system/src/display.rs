@@ -404,7 +404,7 @@ impl ruvm_ui::gtk::Hooks for GtkHooks {
 
     fn quit(&self) {
         if let Some(r) = self.0.upgrade() {
-            r.shutdown_request(ruvm_qapi::types::ShutdownCause::HostQmpQuit);
+            r.quit_request(ruvm_qapi::types::ShutdownCause::HostQmpQuit);
         }
     }
 }
@@ -460,11 +460,10 @@ impl ruvm_ui::cocoa::Hooks for CocoaHooks {
 
     fn powerdown(&self) {}
 
-    /// There is no `-no-shutdown` or `-action shutdown=pause`, so the shutdown action is
-    /// `poweroff` already.
+    /// The shutdown action becomes `poweroff`, so the process ends even with `-no-shutdown`.
     fn quit(&self) {
         if let Some(r) = self.0.upgrade() {
-            r.shutdown_request(ruvm_qapi::types::ShutdownCause::HostUi);
+            r.quit_request(ruvm_qapi::types::ShutdownCause::HostUi);
         }
     }
 }

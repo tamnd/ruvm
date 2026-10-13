@@ -275,6 +275,8 @@ struct Config {
     /// `accelerators`, from `-machine accel=`.
     accelerators: Option<String>,
     autostart: bool,
+    /// `-no-shutdown`.
+    no_shutdown: bool,
     /// `-incoming`: the main channel, or `defer`.
     incoming: Option<String>,
     /// `-incoming` with the `cpr` channel.
@@ -310,6 +312,7 @@ impl Config {
             machine: QDict::new(),
             accelerators: None,
             autostart: true,
+            no_shutdown: false,
             incoming: None,
             incoming_cpr: None,
             preconfig: false,
@@ -584,6 +587,7 @@ fn parse_options(
                 cfg.x86.netdevs.push((opt, arg.to_string(), current_location()));
             }
             Opt::NoReboot => cfg.x86.no_reboot = true,
+            Opt::NoShutdown => cfg.no_shutdown = true,
             Opt::Uuid => cfg.x86.set_uuid(arg).map_err(|e| fail_msg(&e))?,
             Opt::Smbios => cfg.x86.add_smbios(arg).map_err(|e| fail_msg(&e))?,
             Opt::Vga => cfg.x86.vga_model = Some(arg.to_string()),
@@ -1299,6 +1303,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
     let mut keep =
         Keep { _qtest: qtest, _accel: None, board: None, arm_board: None, riscv_board: None };
     vm.runstate.set_no_reboot(cfg.x86.no_reboot);
+    vm.runstate.set_no_shutdown(cfg.no_shutdown);
     if let Some(opts) = rv_virt_opts {
         if cfg.preconfig {
             return Err(fail_msg("-preconfig is not supported with this machine by ruvm yet"));
@@ -1550,7 +1555,7 @@ fn mux_quit_hook(runstate: &Arc<Runstate>) -> ruvm_chardev::Hook {
     let rs = Arc::downgrade(runstate);
     Arc::new(move || {
         if let Some(rs) = rs.upgrade() {
-            rs.shutdown_request(ShutdownCause::HostQmpQuit);
+            rs.quit_request(ShutdownCause::HostQmpQuit);
         }
     })
 }
@@ -1558,23 +1563,31 @@ fn mux_quit_hook(runstate: &Arc<Runstate>) -> ruvm_chardev::Hook {
 /// `qemu_main_loop()` and `qemu_cleanup()`: serve QMP until something asks for a shutdown.
 /// Gives the exit status.
 fn main_loop(vm: &Arc<Vm>, keep: &Keep) -> u8 {
-    // main_loop_should_exit(): a shutdown request ends the loop, a reset request is done here.
-    let cause = loop {
+    // main_loop_should_exit(): a shutdown request ends the loop unless -no-shutdown makes
+    // it stop the machine, a reset request is done here.
+    loop {
         vm.qmp.run_dispatcher();
         let cause = vm.runstate.take_shutdown_request();
         let reset = vm.runstate.take_reset_request();
-        if cause != ShutdownCause::None || reset == ShutdownCause::None {
-            break cause;
+        if cause == ShutdownCause::None && reset != ShutdownCause::None {
+            vm.runstate.main_loop_reset(reset);
+            continue;
         }
-        vm.runstate.main_loop_reset(reset);
-    };
-    // qemu_kill_report()
-    if let Some(k) = vm.runstate.take_killed() {
-        if !vm.qtest {
-            kill_report(k);
+        // qemu_kill_report()
+        if let Some(k) = vm.runstate.take_killed() {
+            if !vm.qtest {
+                kill_report(k);
+            }
+        }
+        vm.runstate.send_shutdown_event(cause);
+        if cause == ShutdownCause::None || !vm.runstate.shutdown_pauses() {
+            break;
+        }
+        vm.runstate.vm_stop(RunState::Shutdown);
+        if reset != ShutdownCause::None {
+            vm.runstate.main_loop_reset(reset);
         }
     }
-    vm.runstate.send_shutdown_event(cause);
     if let Some(board) = &keep.arm_board {
         // A vCPU waiting for semihosting console input would never stop otherwise.
         board.wake_console();
