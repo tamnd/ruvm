@@ -69,6 +69,8 @@ fn run(personality: &Personality, argv0: &str, args: &[String]) -> ExitCode {
         }
     }
     if let Personality::User(target) = personality {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        ruvm_linux_user::gdb::set_stub(&ruvm_gdbstub::user::STUB);
         if let Some(code) = ruvm_linux_user::run(target, argv0, args) {
             return code;
         }

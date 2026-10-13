@@ -19,6 +19,7 @@ unsafe-budget = 0
 
 [dependencies]
 ruvm-base.workspace = true
+ruvm-gdbstub.workspace = true
 ruvm-img.workspace = true
 ruvm-io.workspace = true
 ruvm-linux-user.workspace = true

@@ -32,6 +32,7 @@ use ruvm_target_riscv::tcg::{Riscv, RiscvBoard, helper_registry, jit_config};
 use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page};
 
 use crate::elf::{Arch, ImageInfo};
+use crate::gdb;
 use crate::generic;
 use crate::guest::Guest;
 use crate::host;
@@ -594,6 +595,7 @@ pub(crate) fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
                     *a = gpr(cpu, X_A0 + i);
                 }
                 let orig = args;
+                gdb::syscall_entry(t, cpu, nr);
                 let traced = strace::on().then(|| {
                     let e = match nr {
                         NR_RISCV_HWPROBE => Some(strace::riscv_hwprobe()),
@@ -621,6 +623,7 @@ pub(crate) fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
                 if ret == THREAD_EXIT {
                     return;
                 }
+                gdb::syscall_return(t, cpu, nr);
                 if ret == signal::ERESTARTSYS {
                     let pc = ld64(cpu.env, PC);
                     st64(cpu.env, PC, pc.wrapping_sub(4));

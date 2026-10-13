@@ -1707,6 +1707,7 @@ version = "0.5.7"
 dependencies = [
  "flate2",
  "ruvm-base",
+ "ruvm-gdbstub",
  "ruvm-img",
  "ruvm-io",
  "ruvm-linux-user",
@@ -1758,6 +1759,10 @@ version = "0.5.7"
 [[package]]
 name = "ruvm-gdbstub"
 version = "0.5.7"
+dependencies = [
+ "ruvm-linux-user",
+ "ruvm-target-x86",
+]
 
 [[package]]
 name = "ruvm-helpers"
