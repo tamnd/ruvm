@@ -16,6 +16,8 @@
 //! The other virtio types and `loader` fail with "... is not supported with this machine by
 //! ruvm yet". The PCI types take `addr`, `bus=pcie.0`, `disable-legacy`,
 //! `disable-modern` and `vectors`; the virtio-mmio ones take `bus=virtio-mmio-bus.<n>`.
+//! On virt, `-device arm-smmuv3,primary-bus=pcie.0` is the SMMUv3 on the platform bus that
+//! translates the functions plugged after it.
 //! `-drive if=pflash` with unit 0 or 1 on bus 0 is the drive of the flash of that number, as
 //! `pflash_cfi01_legacy_drive()` takes it.
 
@@ -24,7 +26,8 @@ use std::sync::Arc;
 
 use ruvm_base::Error;
 use ruvm_base::report::Location;
-use ruvm_hw_iommu::VirtioIommuConf;
+use ruvm_hw_iommu::smmuv3::OAS_MODES;
+use ruvm_hw_iommu::{SmmuV3Props, VirtioIommuConf};
 use ruvm_hw_storage::{BlockBackend, DriveConfig};
 use ruvm_hw_virtio::mmio::VIRTIO_MMIO_FORCE_LEGACY_DEFAULT;
 use ruvm_hw_virtio::pci::virtio_pci_optimal_num_queues;
@@ -37,6 +40,7 @@ use ruvm_machine_arm::sbsa_ref::{NUM_SATA_PORTS, SbsaRefMachine};
 use ruvm_machine_arm::virt::VirtMachine;
 use ruvm_machine_x86::{FileBackend, VirtioHandle};
 use ruvm_qapi::opts::{QemuOpts, QemuOptsList, is_help_option};
+use ruvm_qapi::visit::{Visitor, VisitorExt};
 
 use super::{ArmBoard, prop_bool};
 use crate::drives::{Plugged, resize_cb};
@@ -55,6 +59,8 @@ enum Model {
     Iommu,
     Balloon,
     Net,
+    /// `arm-smmuv3`, a dynamic sysbus device.
+    Smmu,
 }
 
 /// The device types, with the bus they plug into.
@@ -112,6 +118,8 @@ pub(crate) struct Plug {
     iommu_platform: bool,
     /// The properties of a virtio-iommu.
     iommu: Option<VirtioIommuConf>,
+    /// The properties of an arm-smmuv3, and whether its `primary-bus` is set.
+    smmu: Option<(SmmuV3Props, bool)>,
     /// virtio-net `netdev`.
     netdev: Option<String>,
     /// virtio-net `mac`.
@@ -204,6 +212,7 @@ fn plan_virtio(
         // The virt compat property sets aw-bits to 48.
         iommu: (model == Model::Iommu)
             .then(|| VirtioIommuConf { aw_bits: 48, ..Default::default() }),
+        smmu: None,
         netdev: None,
         mac: None,
         props: VirtioPciProps::default(),
@@ -295,6 +304,104 @@ fn plan_virtio(
     Ok(plug)
 }
 
+/// The `arm-smmuv3` type name.
+const TYPE_ARM_SMMUV3: &str = "arm-smmuv3";
+
+/// The `arm-smmuv3` properties, with the checks `qdev_device_add()` makes before realize.
+fn plan_smmuv3(board: ArmBoard, opts: &QemuOpts, loc: &Option<Location>) -> Result<Plug, Located> {
+    if board != ArmBoard::Virt {
+        return Err(Located::new(
+            loc,
+            "Parameter 'driver' expects a dynamic sysbus device type for the machine",
+        ));
+    }
+    let at = |e: Error| Located(loc.clone(), e);
+    let not_accepted = |k: &str, v: &str| {
+        Located::new(loc, format!("Parameter '{k}' does not accept value '{v}'"))
+    };
+    let on_off_auto = |k: &str, v: &str| match v {
+        "on" => Ok(Some(true)),
+        "off" => Ok(Some(false)),
+        "auto" => Ok(None),
+        _ => Err(not_accepted(k, v)),
+    };
+    let mut props = SmmuV3Props::default();
+    let mut primary_bus = false;
+    for (k, v) in opts.iter() {
+        match k {
+            "driver" | "id" => {}
+            "bus" if v == "main-system-bus" => {}
+            "bus" => return Err(Located::new(loc, format!("Bus '{v}' not found"))),
+            // object_resolve_link(): the root bus is the only PCI bus.
+            "primary-bus" if v == PCIE_ROOT_BUS => primary_bus = true,
+            "primary-bus" => return Err(Located::new(loc, format!("Device '{v}' not found"))),
+            "stage" => props.stage = Some(v.to_string()),
+            "accel" | "smmu_per_bus" => {
+                let b = crate::display::prop(k, v, |vi, n, out| vi.type_bool(Some(n), out))
+                    .map_err(at)?;
+                if k == "accel" {
+                    props.accel = b;
+                }
+            }
+            "ril" => props.ril = on_off_auto(k, v)?,
+            "ats" => props.ats = on_off_auto(k, v)?,
+            "cmdqv" => props.cmdqv = on_off_auto(k, v)?,
+            "oas" => {
+                props.oas = match v {
+                    "auto" => None,
+                    _ => Some(
+                        v.parse()
+                            .ok()
+                            .filter(|b| OAS_MODES.contains(b))
+                            .ok_or_else(|| not_accepted(k, v))?,
+                    ),
+                }
+            }
+            "ssidsize" => {
+                props.ssidsize = match v {
+                    "auto" => None,
+                    _ => Some(
+                        v.parse()
+                            .ok()
+                            .filter(|&b: &u8| b <= 20 && b.to_string() == v)
+                            .ok_or_else(|| not_accepted(k, v))?,
+                    ),
+                }
+            }
+            // virt sets the identifier and the memory itself.
+            "identifier" | "bus_num" => {
+                crate::display::prop(k, v, |vi, n, out| vi.type_uint8(Some(n), out)).map_err(at)?;
+            }
+            "msi-gpa" => {
+                crate::display::prop(k, v, |vi, n, out| vi.type_uint64(Some(n), out))
+                    .map_err(at)?;
+            }
+            _ => {
+                return Err(Located::new(
+                    loc,
+                    format!("Property '{TYPE_ARM_SMMUV3}.{k}' not found"),
+                ));
+            }
+        }
+    }
+    Ok(Plug {
+        typename: TYPE_ARM_SMMUV3,
+        model: Model::Smmu,
+        transport: Transport::Mmio,
+        drive: None,
+        serial: None,
+        devfn: None,
+        mmio_bus: None,
+        iommu_platform: false,
+        iommu: None,
+        smmu: Some((props, primary_bus)),
+        netdev: None,
+        mac: None,
+        props: VirtioPciProps::default(),
+        loc: loc.clone(),
+    })
+}
+
 /// What one `-device` plugs.
 enum Planned {
     Display(crate::display::DisplayPlug),
@@ -327,6 +434,9 @@ fn plan_device(
             return Err(Located::new(loc, sbsa_ref_display(plug.typename())));
         }
         return Ok(Planned::Display(plug));
+    }
+    if driver == TYPE_ARM_SMMUV3 {
+        return plan_smmuv3(board, opts, loc).map(Planned::Virtio);
     }
     let mmio = board == ArmBoard::Virt;
     plan_virtio(drives, used, driver, opts, loc, mmio).map(Planned::Virtio)
@@ -518,6 +628,14 @@ pub(crate) fn plug(
                 }
                 continue;
             }
+            Model::Smmu => {
+                let (props, primary_bus) = plug.smmu.as_ref().expect("planned with properties");
+                match board {
+                    Target::Virt(board) => board.attach_smmuv3(props, *primary_bus).map_err(at)?,
+                    Target::SbsaRef(_) => unreachable!("planned only on virt"),
+                }
+                continue;
+            }
             Model::Balloon => Box::new(VirtioBalloon::new(board.ram_size(), Box::new(KeepRam))),
             Model::Net => {
                 let mut mac = plug.mac.unwrap_or_default();
@@ -662,6 +780,36 @@ mod tests {
         assert_eq!(
             err(&["loader,addr=0x40000000,data=1,data-len=4"]),
             "-device loader is not supported with this machine by ruvm yet"
+        );
+    }
+
+    #[test]
+    fn arm_smmuv3() {
+        let p = plan(V, &[], &[dev("arm-smmuv3,primary-bus=pcie.0,stage=nested,oas=44")]);
+        let (props, primary) = p.unwrap().virtio[0].smmu.clone().unwrap();
+        assert!(primary);
+        assert_eq!((props.stage.as_deref(), props.oas), (Some("nested"), Some(44)));
+        let p = plan(V, &[], &[dev("arm-smmuv3,ril=off,ssidsize=20,cmdqv=auto,identifier=7")]);
+        let (props, primary) = p.unwrap().virtio[0].smmu.clone().unwrap();
+        assert!(!primary);
+        assert_eq!((props.ril, props.ssidsize, props.cmdqv), (Some(false), Some(20), None));
+
+        let err = |arg: &str| plan(V, &[], &[dev(arg)]).unwrap_err()[0].1.message().to_string();
+        assert_eq!(err("arm-smmuv3,primary-bus=pcie.1"), "Device 'pcie.1' not found");
+        assert_eq!(err("arm-smmuv3,oas=45"), "Parameter 'oas' does not accept value '45'");
+        assert_eq!(
+            err("arm-smmuv3,ssidsize=21"),
+            "Parameter 'ssidsize' does not accept value '21'"
+        );
+        assert_eq!(err("arm-smmuv3,ats=yes"), "Parameter 'ats' does not accept value 'yes'");
+        assert_eq!(err("arm-smmuv3,accel=2"), "Parameter 'accel' expects 'on' or 'off'");
+        assert_eq!(err("arm-smmuv3,identifier=256"), "Parameter 'identifier' expects uint8_t");
+        assert_eq!(err("arm-smmuv3,bus=pcie.0"), "Bus 'pcie.0' not found");
+        assert_eq!(err("arm-smmuv3,foo=1"), "Property 'arm-smmuv3.foo' not found");
+        let e = plan(S, &[], &[dev("arm-smmuv3")]).unwrap_err();
+        assert_eq!(
+            e[0].1.message(),
+            "Parameter 'driver' expects a dynamic sysbus device type for the machine"
         );
     }
 

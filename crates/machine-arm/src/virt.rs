@@ -17,6 +17,8 @@
 //! first one holding `-bios`. `iommu=smmuv3` puts the SMMUv3 (stage 1, stage 2 and nested) at
 //! 0x09050000 (SPIs 74 to 77) in front of the root bus: each PCIe function does its DMA and
 //! sends its MSIs through an address space of its own that the SMMU translates. A
+//! `-device arm-smmuv3,primary-bus=pcie.0` goes on the platform bus instead, at 0x0c000000
+//! (SPIs 112 to 115), and translates the functions plugged after it. A
 //! second `-serial` adds the second PL011 at 0x09040000 (SPI 8). `virtualization=on` keeps EL2
 //! and `secure=on` keeps EL3 and adds the secure UART at 0x09040000 and the secure RAM at
 //! 0x0e000000. `gic-version=2` puts a GICv2 in place of the GICv3, its distributor at
@@ -125,7 +127,9 @@ use ruvm_hw_intc::gicv3::{
 use ruvm_hw_iommu::virtio_iommu::{
     ReservedRegion, TYPE_VIRTIO_IOMMU_MEMORY_REGION, VIRTIO_IOMMU_RESV_MEM_T_MSI,
 };
-use ruvm_hw_iommu::{SMMU_SIZE, SmmuStage, SmmuV3, Viommu, VirtioIommu, VirtioIommuConf};
+use ruvm_hw_iommu::{
+    SMMU_SIZE, SmmuStage, SmmuV3, SmmuV3Props, Viommu, VirtioIommu, VirtioIommuConf,
+};
 use ruvm_hw_misc::pl061::PL061_MMIO_SIZE;
 use ruvm_hw_misc::{GpioKey, Pl061, Pl061Props};
 use ruvm_hw_pci::regs::PCI_NUM_PINS;
@@ -915,6 +919,11 @@ pub struct VirtMachine {
     gpex: GpexHost,
     /// The SMMUv3 of `iommu=smmuv3`.
     smmu: Option<Arc<SmmuV3>>,
+    /// The `-device arm-smmuv3` on the root bus.
+    dev_smmu: OnceLock<Arc<SmmuV3>>,
+    /// The platform bus window, `create_platform_bus()`.
+    pbus: RegionId,
+    spi_sink: Option<SpiSink>,
     /// `default-bus-bypass-iommu`: the root bus is not behind the SMMU.
     iommu_bypass: bool,
     /// The address spaces of the functions behind the SMMU or the virtio-iommu.
@@ -1285,7 +1294,8 @@ impl VirtMachine {
             let smmu = SmmuV3::new(SmmuStage::Nested, &memory_as, irqs);
             let r = mem.new_io("smmuv3", SMMU_SIZE.into(), smmu.mmio_ops()).map_err(err)?;
             mem.add_subregion(system, VIRT_SMMU, r).map_err(err)?;
-            dt::create_smmu(&mut fdt, !cfg.default_bus_bypass_iommu)?;
+            let iommu_map = !cfg.default_bus_bypass_iommu;
+            dt::create_smmu(&mut fdt, VIRT_SMMU, VIRT_SMMU_IRQ, iommu_map)?;
             Some(smmu)
         } else {
             None
@@ -1428,6 +1438,9 @@ impl VirtMachine {
             memmap,
             gpex,
             smmu,
+            dev_smmu: OnceLock::new(),
+            pbus,
+            spi_sink: cfg.spi_sink.clone(),
             iommu_bypass: cfg.default_bus_bypass_iommu,
             iommu_spaces: Mutex::new(Vec::new()),
             viommu: OnceLock::new(),
@@ -1520,9 +1533,10 @@ impl VirtMachine {
             mem: &self.mem,
             memory_as: &self.memory_as,
             gpex: &self.gpex,
-            smmu: self.smmu.as_ref().filter(|_| !self.iommu_bypass),
+            smmu: self.smmu.as_ref().filter(|_| !self.iommu_bypass).or(self.dev_smmu.get()),
             iommu_spaces: &self.iommu_spaces,
-            pending: self.smmu.is_none().then_some(&self.pci_pending),
+            pending: (self.smmu.is_none() && self.dev_smmu.get().is_none())
+                .then_some(&self.pci_pending),
         }
     }
 
@@ -1539,7 +1553,7 @@ impl VirtMachine {
         if self.done {
             return Err("PCI devices must be plugged before machine_done".to_string());
         }
-        if self.smmu.is_some() || self.viommu.get().is_some() {
+        if self.smmu.is_some() || self.dev_smmu.get().is_some() || self.viommu.get().is_some() {
             return Err("virt machine does not support multiple IOMMUs".to_string());
         }
         let doorbell = if self.its.is_some() {
@@ -1579,6 +1593,45 @@ impl VirtMachine {
         let _ = self.viommu.set((viommu, dev.pci_dev().requester_id()));
         self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).push(dev.clone());
         Ok(dev)
+    }
+
+    /// Plug a `-device arm-smmuv3` whose `primary-bus` is the root bus, or none when
+    /// `primary_bus` is false. The checks are those of `virt_machine_device_pre_plug_cb()`,
+    /// `smmu_realize()`, `smmu_base_realize()` and `virt_machine_device_plug_cb()`, in that
+    /// order. It is the only device on the platform bus, so `platform_bus_link_device()` puts
+    /// it at the start of the window with the first four interrupts. The functions plugged
+    /// after it do their DMA through it, as `pci_setup_iommu_per_bus()` makes them.
+    pub fn attach_smmuv3(&self, props: &SmmuV3Props, primary_bus: bool) -> Result<(), String> {
+        if self.done {
+            return Err("sysbus devices must be plugged before machine_done".to_string());
+        }
+        if self.smmu.is_some() || self.viommu.get().is_some() {
+            let what = if self.smmu.is_some() { "iommu=smmuv3" } else { "virtio-iommu" };
+            return Err(format!(
+                "virt machine already has {what} set. Doesn't support incompatible iommus"
+            ));
+        }
+        if props.accel {
+            return Err("SMMUv3 accel=on requires KVM with kernel-irqchip=on support".to_string());
+        }
+        props.validate()?;
+        if !primary_bus {
+            return Err("SMMU is not attached to any PCI bus!".to_string());
+        }
+        if self.dev_smmu.get().is_some() {
+            return Err("An iommu is already attached to this bus".to_string());
+        }
+        if self.iommu_bypass {
+            return Err("Bypass option cannot be set for SMMUv3 associated PCIe RC".to_string());
+        }
+        let irqs = std::array::from_fn(|i| {
+            spi_line(&self.gic, self.spi_sink.as_ref(), VIRT_PLATFORM_BUS_IRQ + i as u32)
+        });
+        let smmu = SmmuV3::new(props.stages(), &self.memory_as, irqs);
+        let r = self.mem.new_io("arm-smmuv3", SMMU_SIZE.into(), smmu.mmio_ops()).map_err(err)?;
+        self.mem.add_subregion(self.pbus, 0, r).map_err(err)?;
+        let _ = self.dev_smmu.set(smmu);
+        Ok(())
     }
 
     /// `pcibus_machine_done()`: the bus master address space of each function, behind the
@@ -1680,12 +1733,23 @@ impl VirtMachine {
             pci_devices,
             numa: Vec::new(),
             // populate_smmuv3_legacy_dev(): the bus range of the root bus, which has no bridges
-            // under it, goes through the SMMU unless the bus bypasses it.
-            smmu: self.smmu.as_ref().map(|_| IortSmmu {
-                base: VIRT_SMMU,
-                gsi: spi(VIRT_SMMU_IRQ),
-                rc_id_maps: if self.iommu_bypass { Vec::new() } else { vec![(0, 0x100)] },
-            }),
+            // under it, goes through the SMMU unless the bus bypasses it. populate_smmuv3_dev()
+            // gives the same range for the device, whose identifier counts the ITS node.
+            smmus: match (&self.smmu, self.dev_smmu.get()) {
+                (Some(_), _) => vec![IortSmmu {
+                    id: 0,
+                    base: VIRT_SMMU,
+                    gsi: spi(VIRT_SMMU_IRQ),
+                    rc_id_maps: if self.iommu_bypass { Vec::new() } else { vec![(0, 0x100)] },
+                }],
+                (None, Some(_)) => vec![IortSmmu {
+                    id: u32::from(self.its.is_some()),
+                    base: VIRT_PLATFORM_BUS,
+                    gsi: spi(VIRT_PLATFORM_BUS_IRQ),
+                    rc_id_maps: vec![(0, 0x100)],
+                }],
+                (None, None) => Vec::new(),
+            },
             // build_viot(): the root bus range, unless the bus bypasses the IOMMU.
             viot: self.viommu.get().map(|(_, bdf)| ViotInfo {
                 bdf: *bdf,
@@ -1750,6 +1814,10 @@ impl VirtMachine {
     pub fn machine_done(&mut self) -> Result<(), String> {
         if self.done {
             return Ok(());
+        }
+        // create_smmuv3_dev_dtb(), which QEMU runs as the device is plugged.
+        if self.dev_smmu.get().is_some() {
+            dt::create_smmu(&mut self.fdt, VIRT_PLATFORM_BUS, VIRT_PLATFORM_BUS_IRQ, true)?;
         }
         if let Some((_, bdf)) = self.viommu.get() {
             dt::create_virtio_iommu(&mut self.fdt, *bdf, !self.iommu_bypass)?;
@@ -1824,7 +1892,7 @@ impl VirtMachine {
             s.current().reset();
         }
         self.gpex.reset();
-        if let Some(s) = &self.smmu {
+        if let Some(s) = self.smmu.as_ref().or(self.dev_smmu.get()) {
             s.reset();
         }
         if let Some((v, _)) = self.viommu.get() {

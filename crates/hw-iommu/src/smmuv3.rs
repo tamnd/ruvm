@@ -43,6 +43,64 @@ pub const SMMU_SIZE: u64 = 0x20000;
 /// The number of interrupt lines: eventq, priq, cmdq-sync and gerror.
 pub const SMMU_NUM_IRQS: usize = 4;
 
+/// The values of the `oas` property, `OasMode`, after `auto`.
+pub const OAS_MODES: [u8; 8] = [32, 36, 40, 42, 44, 48, 52, 56];
+
+/// The properties of a `-device arm-smmuv3` that `smmu_validate_property()` checks. The
+/// automatic `OnOffAuto` and `OasMode` values are `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SmmuV3Props {
+    /// `stage`: `2` and `nested` pick those, anything else stage 1.
+    pub stage: Option<String>,
+    pub accel: bool,
+    pub ril: Option<bool>,
+    pub ats: Option<bool>,
+    /// `oas`, in bits.
+    pub oas: Option<u8>,
+    /// `ssidsize`, in bits.
+    pub ssidsize: Option<u8>,
+    pub cmdqv: Option<bool>,
+}
+
+impl SmmuV3Props {
+    /// `smmu_validate_property()`.
+    pub fn validate(&self) -> Result<(), String> {
+        if !matches!(self.oas, None | Some(44 | 48)) {
+            return Err("QEMU SMMUv3 model only implements auto, 44 bit, or 48 bit OAS. Other OasMode values are not supported.".into());
+        }
+        if !self.accel {
+            let msg = if self.ril == Some(false) {
+                "ril can only be disabled if accel=on"
+            } else if self.ats == Some(true) {
+                "ats can only be enabled if accel=on"
+            } else if self.oas.is_some_and(|b| b > 44) {
+                "oas must be 44 bits when accel=off"
+            } else if self.ssidsize.is_some_and(|b| b > 0) {
+                "ssidsize can only be greater than 0 bits if accel=on"
+            } else if self.cmdqv == Some(true) {
+                "cmdqv can only be enabled if accel=on"
+            } else {
+                return Ok(());
+            };
+            return Err(msg.into());
+        }
+        // If no stage is given, the SMMU has stage 1.
+        if self.stage.as_deref().is_some_and(|s| s != "1") {
+            return Err("Only stage1 is supported for SMMUv3 with accel=on".into());
+        }
+        Ok(())
+    }
+
+    /// The stages `smmuv3_init_id_regs()` advertises.
+    pub fn stages(&self) -> Stage {
+        match self.stage.as_deref() {
+            Some("2") => Stage::S2,
+            Some("nested") => Stage::Nested,
+            _ => Stage::S1,
+        }
+    }
+}
+
 /// `SMMU_IRQ_EVTQ`.
 const IRQ_EVTQ: usize = 0;
 /// `SMMU_IRQ_CMD_SYNC`.

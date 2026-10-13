@@ -13,8 +13,8 @@ use super::{
     VIRT_GIC_V2M, VIRT_GIC_VCPU, VIRT_GPIO_SIZE, VIRT_MMIO, VIRT_MMIO_IRQ, VIRT_MMIO_SIZE,
     VIRT_PCIE_MMIO, VIRT_PCIE_MMIO_SIZE, VIRT_PCIE_PIO, VIRT_PCIE_PIO_SIZE, VIRT_PLATFORM_BUS,
     VIRT_PLATFORM_BUS_SIZE, VIRT_RTC, VIRT_RTC_IRQ, VIRT_RTC_SIZE, VIRT_SECURE_MEM,
-    VIRT_SECURE_MEM_SIZE, VIRT_SMMU, VIRT_SMMU_IRQ, VIRT_UART, VIRT_UART_IRQ, VIRT_UART_SIZE,
-    VIRT_UART1, VIRT_UART1_IRQ, VIRTIO_TRANSPORTS, VirtMemmap,
+    VIRT_SECURE_MEM_SIZE, VIRT_UART, VIRT_UART_IRQ, VIRT_UART_SIZE, VIRT_UART1, VIRT_UART1_IRQ,
+    VIRTIO_TRANSPORTS, VirtMemmap,
 };
 use crate::fdt::{Fdt, sized_cells};
 use ruvm_hw_intc::gicv2m::GICV2M_SIZE;
@@ -604,18 +604,24 @@ pub(crate) fn create_pcie(
     create_pcie_irq_map(fdt, gic_phandle, first_irq, &nodename)
 }
 
-/// The FDT end of `create_pcie()` with `iommu=smmuv3`: `create_smmuv3_dt_bindings()` for the
-/// SMMUv3 at `VIRT_SMMU`, then, when the root bus does not bypass it (`iommu_map`), the
-/// `iommu-map` that sends every requester ID of the PCIe node to it.
-pub(crate) fn create_smmu(fdt: &mut Fdt, iommu_map: bool) -> Result<(), String> {
+/// `create_smmuv3_dt_bindings()` for the SMMUv3 at `base` with its interrupts from SPI `irq`,
+/// then, when the root bus does not bypass it (`iommu_map`), the `iommu-map` that sends every
+/// requester ID of the PCIe node to it. `iommu=smmuv3` has it at `VIRT_SMMU` as the end of
+/// `create_pcie()`, and `create_smmuv3_dev_dtb()` on the platform bus.
+pub(crate) fn create_smmu(
+    fdt: &mut Fdt,
+    base: u64,
+    irq: u32,
+    iommu_map: bool,
+) -> Result<(), String> {
     let phandle = fdt.alloc_phandle();
-    let node = format!("/smmuv3@{VIRT_SMMU:x}");
+    let node = format!("/smmuv3@{base:x}");
     fdt.add_subnode(&node)?;
     fdt.setprop(&node, "compatible", b"arm,smmu-v3\0")?;
-    setprop_sized_cells(fdt, &node, "reg", &[(2, VIRT_SMMU), (2, SMMU_SIZE)])?;
+    setprop_sized_cells(fdt, &node, "reg", &[(2, base), (2, SMMU_SIZE)])?;
     let mut irqs = Vec::with_capacity(12);
     for i in 0..4 {
-        irqs.extend([GIC_FDT_IRQ_TYPE_SPI, VIRT_SMMU_IRQ + i, GIC_FDT_IRQ_FLAGS_EDGE_LO_HI]);
+        irqs.extend([GIC_FDT_IRQ_TYPE_SPI, irq + i, GIC_FDT_IRQ_FLAGS_EDGE_LO_HI]);
     }
     fdt.setprop_cells(&node, "interrupts", &irqs)?;
     fdt.setprop(&node, "interrupt-names", b"eventq\0priq\0cmdq-sync\0gerror\0")?;

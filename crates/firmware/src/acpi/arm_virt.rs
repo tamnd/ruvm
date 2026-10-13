@@ -9,11 +9,12 @@
 //! GPIO controller that raises the power button, the power button, the error device and the
 //! functions on the root bus. The MADT describes a GICv3: the distributor, a GICC per CPU,
 //! the redistributor regions and the ITS. The IORT has the ITS group, the SMMUv3 of
-//! `iommu=smmuv3` and the root complex, whose requester IDs go to the SMMU or straight to the
-//! ITS. With a virtio-iommu-pci there is also a VIOT after the IORT.
+//! `iommu=smmuv3` or those of `-device arm-smmuv3`, and the root complex, whose requester IDs
+//! go to an SMMU or straight to the ITS. With a virtio-iommu-pci there is also a VIOT after
+//! the IORT.
 //!
-//! Not built: the GICv2 and GICv2m forms of the MADT, the IORT of the GICv2m, the SMMUv3
-//! nodes of `-device arm-smmuv3` and their RMR nodes, the
+//! Not built: the GICv2 and GICv2m forms of the MADT, the IORT of the GICv2m, the RMR nodes
+//! and the ATS attribute of an SMMUv3 with `accel=on`, the
 //! cache nodes of the PPTT (`smp-cache`), HEST (`ras=on`), HMAT, the GWDT and WDAT, CEDT,
 //! NFIT and TPM2, and the memory hotplug and ACPI PCI hotplug AML, since ruvm has none
 //! of those devices.
@@ -180,15 +181,18 @@ pub struct ArmVirtAcpi {
     /// The functions on the PCIe root bus.
     pub pci_devices: Vec<PciDevice>,
     pub numa: Vec<NumaNode>,
-    /// The SMMUv3 of `iommu=smmuv3`, `legacy_smmuv3_present`.
-    pub smmu: Option<IortSmmu>,
+    /// The SMMUv3 of `iommu=smmuv3` (`legacy_smmuv3_present`), or those of `-device
+    /// arm-smmuv3` sorted by their first requester ID.
+    pub smmus: Vec<IortSmmu>,
     /// The VIOT of a virtio-iommu-pci.
     pub viot: Option<ViotInfo>,
 }
 
-/// The machine wide SMMUv3 as the IORT describes it, `AcpiIortSMMUv3Dev`.
+/// The SMMUv3 as the IORT describes it, `AcpiIortSMMUv3Dev`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IortSmmu {
+    /// The node identifier: 0 for `iommu=smmuv3`, the `identifier` property for the device.
+    pub id: u32,
     /// The base of its register frame.
     pub base: u64,
     /// The GSI of its first interrupt, the event queue. PRI, sync and global error follow.
@@ -636,12 +640,12 @@ fn append_iort_id_mapping(
     append_int_noprefix(tbl, flags.into(), 4); // Flags
 }
 
-/// `create_rc_its_idmaps()`: the requester ID ranges outside those of `smmu`, which go
+/// `create_rc_its_idmaps()`: the requester ID ranges outside those of `smmus`, which go
 /// straight to the ITS group.
-fn rc_its_idmaps(smmu: &IortSmmu) -> Vec<(u32, u32)> {
+fn rc_its_idmaps(smmus: &[IortSmmu]) -> Vec<(u32, u32)> {
     let mut maps = Vec::new();
     let mut next = 0;
-    for &(input_base, id_count) in &smmu.rc_id_maps {
+    for &(input_base, id_count) in smmus.iter().flat_map(|s| &s.rc_id_maps) {
         if next < input_base {
             maps.push((next, input_base - next));
         }
@@ -654,27 +658,23 @@ fn rc_its_idmaps(smmu: &IortSmmu) -> Vec<(u32, u32)> {
     maps
 }
 
-/// `build_iort()` with the legacy SMMUv3 only (IO Remapping Table, E.b).
+/// `build_iort()` (IO Remapping Table, E.b).
 fn build_iort(tbl: &mut Vec<u8>, linker: &mut BiosLinker, s: &ArmVirtAcpi) {
     let its = s.memmap.gic_its.is_some();
     let table = AcpiTable::begin("IORT", 5, &s.oem_id, &s.oem_table_id, tbl);
     let mut id = 0u64;
 
-    let its_maps = match &s.smmu {
-        Some(smmu) if its => rc_its_idmaps(smmu),
-        _ => Vec::new(),
-    };
-    let (nb_nodes, rc_mapping_count) = match &s.smmu {
-        // RC and SMMUv3, and the ITS with the IDs that bypass the SMMU.
-        Some(smmu) => {
-            let n = smmu.rc_id_maps.len() as u32;
-            if its { (3, n + its_maps.len() as u32) } else { (2, n) }
-        }
+    let its_maps = if its && !s.smmus.is_empty() { rc_its_idmaps(&s.smmus) } else { Vec::new() };
+    let (nb_nodes, rc_mapping_count) = if s.smmus.is_empty() {
         // RC and ITS with a direct map to the ITS, or the RC alone with no output mapping.
-        None if its => (2, 1),
-        None => (1, 0),
+        if its { (2, 1) } else { (1, 0) }
+    } else {
+        // RC and the SMMUv3s, and the ITS with the IDs that bypass them.
+        let n = s.smmus.iter().map(|s| s.rc_id_maps.len() as u32).sum::<u32>();
+        let smmus = s.smmus.len() as u32;
+        if its { (smmus + 2, n + its_maps.len() as u32) } else { (smmus + 1, n) }
     };
-    append_int_noprefix(tbl, nb_nodes, 4); // Number of IORT Nodes
+    append_int_noprefix(tbl, nb_nodes.into(), 4); // Number of IORT Nodes
     append_int_noprefix(tbl, IORT_NODE_OFFSET.into(), 4); // Offset to Array of IORT Nodes
     append_int_noprefix(tbl, 0, 4); // Reserved
 
@@ -692,18 +692,18 @@ fn build_iort(tbl: &mut Vec<u8>, linker: &mut BiosLinker, s: &ArmVirtAcpi) {
         append_int_noprefix(tbl, 0, 4); // GIC ITS Identifier Array: MADT translation_id
     }
 
-    let mut smmu_offset = 0;
-    if let Some(smmu) = &s.smmu {
+    let mut smmu_offsets = Vec::with_capacity(s.smmus.len());
+    for smmu in &s.smmus {
         // The ITS group node when there is an ITS, or no ID mappings at all.
         let (mapping_count, offset_to_id_array) =
             if its { (1, SMMU_V3_ENTRY_SIZE) } else { (0, 0) };
-        smmu_offset = (tbl.len() - table.offset()) as u32;
+        smmu_offsets.push((tbl.len() - table.offset()) as u32);
         // Table 9 SMMUv3 Format
         tbl.push(4); // Type: SMMUv3
         let node_size = SMMU_V3_ENTRY_SIZE + ID_MAPPING_ENTRY_SIZE * mapping_count;
         append_int_noprefix(tbl, node_size.into(), 2); // Length
         tbl.push(4); // Revision
-        append_int_noprefix(tbl, 0, 4); // Identifier
+        append_int_noprefix(tbl, smmu.id.into(), 4); // Identifier
         id += 1; // advance the shared counter for the uniqueness of the RC node
         append_int_noprefix(tbl, mapping_count.into(), 4); // Number of ID mappings
         append_int_noprefix(tbl, offset_to_id_array.into(), 4); // Reference to ID Array
@@ -744,11 +744,13 @@ fn build_iort(tbl: &mut Vec<u8>, linker: &mut BiosLinker, s: &ArmVirtAcpi) {
     tbl.push(64); // Memory address size limit
     append_int_noprefix(tbl, 0, 3); // Reserved
 
-    if let Some(smmu) = &s.smmu {
-        // The requester IDs that go through the SMMU: RC -> SMMUv3. The SMMUv3 node maps its
-        // IDs on to the ITS group.
-        for &(input_base, id_count) in &smmu.rc_id_maps {
-            append_iort_id_mapping(tbl, input_base, id_count, smmu_offset, 0);
+    if !s.smmus.is_empty() {
+        // The requester IDs that go through each SMMU: RC -> SMMUv3. The SMMUv3 nodes map
+        // their IDs on to the ITS group.
+        for (smmu, &offset) in s.smmus.iter().zip(&smmu_offsets) {
+            for &(input_base, id_count) in &smmu.rc_id_maps {
+                append_iort_id_mapping(tbl, input_base, id_count, offset, 0);
+            }
         }
         // The bypassed ones go to the ITS group directly: RC -> ITS.
         for &(input_base, id_count) in &its_maps {

@@ -8,7 +8,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use ruvm_hw_iommu::VirtioIommuConf;
+use ruvm_hw_iommu::{SmmuV3Props, VirtioIommuConf};
 use ruvm_hw_pci::MsiMessage;
 use ruvm_hw_virtio::rng::{RandomFile, VirtioRng, VirtioRngConf};
 use ruvm_hw_virtio::{VirtioPci, VirtioPciProps};
@@ -16,8 +16,8 @@ use ruvm_jit::cpu_exec::cpu_exec;
 use ruvm_jit::{Vcpu, excp};
 use ruvm_machine_arm::virt::{
     VIRT_FW_CFG, VIRT_GIC_DIST, VIRT_GIC_ITS, VIRT_GIC_REDIST, VIRT_GIC_V2M, VIRT_GPIO, VIRT_MEM,
-    VIRT_MMIO, VIRT_PCIE_MMIO, VIRT_PCIE_PIO, VIRT_RTC, VIRT_SECURE_GPIO, VIRT_SMMU, VIRT_UART,
-    VirtConfig, VirtGicVersion, VirtIommu, VirtMachine, VirtMsi, VirtRequest,
+    VIRT_MMIO, VIRT_PCIE_MMIO, VIRT_PCIE_PIO, VIRT_PLATFORM_BUS, VIRT_RTC, VIRT_SECURE_GPIO,
+    VIRT_SMMU, VIRT_UART, VirtConfig, VirtGicVersion, VirtIommu, VirtMachine, VirtMsi, VirtRequest,
 };
 use ruvm_mem::{Endian, MemTxAttrs};
 use ruvm_target_arm::cpu::ArmCpuModel;
@@ -317,6 +317,46 @@ fn dtb_a57_viommu_matches_qemu() {
     compare_with(cfg.clone(), "virt-a57-viommu.dtb.gz", plug);
     cfg.default_bus_bypass_iommu = true;
     compare_with(cfg, "virt-a57-viommu-bypass.dtb.gz", plug);
+}
+
+#[test]
+fn dtb_a57_smmuv3_dev_matches_qemu() {
+    // -device arm-smmuv3,primary-bus=pcie.0: the SMMUv3 node at the start of the platform bus
+    // and the iommu-map of the PCIe node.
+    let plug = |m: &VirtMachine| m.attach_smmuv3(&SmmuV3Props::default(), true).unwrap();
+    compare_with(VirtConfig::new(model("cortex-a57")), "virt-a57-smmuv3-dev.dtb.gz", plug);
+}
+
+/// The checks of `-device arm-smmuv3`, in the order QEMU makes them.
+#[test]
+fn smmuv3_device_checks() {
+    let props = SmmuV3Props::default();
+    let cfg = VirtConfig { iommu: VirtIommu::SmmuV3, ..a57() };
+    let m = VirtMachine::new(cfg).unwrap();
+    let e = m.attach_smmuv3(&props, true).unwrap_err();
+    assert_eq!(e, "virt machine already has iommu=smmuv3 set. Doesn't support incompatible iommus");
+    let m = VirtMachine::new(a57()).unwrap();
+    m.attach_virtio_iommu(&VirtioIommuConf::default(), None, None).unwrap();
+    let e = m.attach_smmuv3(&props, true).unwrap_err();
+    assert_eq!(e, "virt machine already has virtio-iommu set. Doesn't support incompatible iommus");
+
+    let m = VirtMachine::new(a57()).unwrap();
+    let accel = SmmuV3Props { accel: true, ril: Some(false), ..SmmuV3Props::default() };
+    let e = m.attach_smmuv3(&accel, true).unwrap_err();
+    assert_eq!(e, "SMMUv3 accel=on requires KVM with kernel-irqchip=on support");
+    let ril = SmmuV3Props { ril: Some(false), ..SmmuV3Props::default() };
+    assert_eq!(m.attach_smmuv3(&ril, false).unwrap_err(), "ril can only be disabled if accel=on");
+    assert_eq!(m.attach_smmuv3(&props, false).unwrap_err(), "SMMU is not attached to any PCI bus!");
+    m.attach_smmuv3(&props, true).unwrap();
+    let e = m.attach_smmuv3(&props, true).unwrap_err();
+    assert_eq!(e, "An iommu is already attached to this bus");
+    let e = m.attach_virtio_iommu(&VirtioIommuConf::default(), None, None).unwrap_err();
+    assert_eq!(e, "virt machine does not support multiple IOMMUs");
+
+    let cfg = VirtConfig { default_bus_bypass_iommu: true, ..a57() };
+    let m = VirtMachine::new(cfg).unwrap();
+    let e = m.attach_smmuv3(&props, true).unwrap_err();
+    assert_eq!(e, "Bypass option cannot be set for SMMUv3 associated PCIe RC");
 }
 
 #[test]
@@ -1109,6 +1149,64 @@ fn msi_through_the_smmu() {
     assert_eq!(r(72 + 44), 106);
     assert_eq!([r(196), r(200), r(208)], [0, 0xff, 72]);
     assert_eq!([r(216), r(220), r(228)], [0x100, 0xfeff, 48]);
+}
+
+/// A `-device arm-smmuv3` translates the functions plugged after it but not those plugged
+/// before: an aborting stream table entry drops the MSIs of the one after only. It has stage 1
+/// only, and the IORT has its node with identifier 1, after the ITS group.
+#[test]
+fn msi_through_the_smmuv3_device() {
+    let smmu = VIRT_PLATFORM_BUS;
+    // Whether an MSI of the function gets to the ITS with the SMMU on and the stream table
+    // entry of the function aborting.
+    let delivered = |smmu_first: bool| {
+        let rng =
+            Box::new(VirtioRng::new(Box::new(RandomFile::default()), VirtioRngConf::default()));
+        let mut m = VirtMachine::new(VirtConfig::default()).unwrap();
+        if smmu_first {
+            m.attach_smmuv3(&SmmuV3Props::default(), true).unwrap();
+        }
+        let dev = m.attach_virtio_pci(rng, Some(2 << 3), &VirtioPciProps::default()).unwrap();
+        if !smmu_first {
+            m.attach_smmuv3(&SmmuV3Props::default(), true).unwrap();
+        }
+        m.machine_done().unwrap();
+        // SMMU_IDR0: two level stream tables, stage 1 and the AArch64 tables.
+        assert_eq!(r32(&m, smmu) & 0xf, 0xa);
+        let devid = u64::from(dev.pci_dev().requester_id());
+        let lpi_pending = its_map_lpi(&m, devid);
+        let ecam = m.memmap().ecam.base;
+        w(&m, ecam + (2 << 15) + 4, 2, 0x6);
+        // A linear stream table of 32 entries whose entry for the function is valid and aborts.
+        let strtab = VIRT_MEM + 0x150_0000;
+        w(&m, strtab + devid * 64, 8, 1);
+        w(&m, smmu + 0x80, 8, strtab);
+        w(&m, smmu + 0x88, 4, 5);
+        w(&m, smmu + 0x20, 4, 1);
+        assert_eq!(r32(&m, smmu + 0x24), 1, "CR0ACK");
+        let msg = MsiMessage { address: VIRT_GIC_ITS + 0x1_0040, data: 0 };
+        dev.pci_dev().msi_send_message(msg);
+        let pending = lpi_pending(&m);
+        m.system_reset().unwrap();
+        assert_eq!(r32(&m, smmu + 0x24), 0);
+        (pending, m)
+    };
+    assert!(delivered(false).0);
+    let (pending, m) = delivered(true);
+    assert!(!pending);
+
+    let tables = m.acpi_tables();
+    let data = &tables.table_data;
+    let at = data.windows(4).position(|w| w == b"IORT").unwrap();
+    let len = u32::from_le_bytes(data[at + 4..at + 8].try_into().unwrap()) as usize;
+    let iort = &data[at..at + len];
+    let r = |o: usize| u32::from_le_bytes(iort[o..o + 4].try_into().unwrap());
+    // The ITS group, the SMMUv3 node with identifier 1 at the platform bus with GSIs 144 to
+    // 147, and the root complex with bus 0 to the SMMU and the rest to the ITS.
+    assert_eq!(len, 48 + 24 + 88 + 36 + 2 * 20);
+    assert_eq!(iort[72..76], [4, 88, 0, 4]);
+    assert_eq!([r(72 + 4), r(72 + 16), r(72 + 44)], [1, VIRT_PLATFORM_BUS as u32, 144]);
+    assert_eq!([r(196), r(200), r(208)], [0, 0xff, 72]);
 }
 
 /// `iommu_platform` offers VIRTIO_F_IOMMU_PLATFORM, which a legacy capable function refuses.

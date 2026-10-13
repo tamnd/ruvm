@@ -421,3 +421,38 @@ fn registers_of_the_engaged_smmu_fail() {
     r.w32(A_CMDQ_PROD, 1);
     assert_eq!(r.r32(A_CMDQ_CONS), CERROR_ABT << 24);
 }
+
+#[test]
+fn property_checks() {
+    let p = |f: fn(&mut SmmuV3Props)| {
+        let mut p = SmmuV3Props::default();
+        f(&mut p);
+        p.validate()
+    };
+    assert_eq!(p(|_| {}), Ok(()));
+    assert_eq!(p(|p| p.oas = Some(44)), Ok(()));
+    assert_eq!(p(|p| p.ssidsize = Some(0)), Ok(()));
+    assert_eq!(p(|p| p.ril = Some(true)), Ok(()));
+    assert_eq!(p(|p| p.stage = Some("foo".into())), Ok(()));
+    let oas = "QEMU SMMUv3 model only implements auto, 44 bit, or 48 bit OAS. Other OasMode values are not supported.";
+    assert_eq!(p(|p| p.oas = Some(40)).unwrap_err(), oas);
+    assert_eq!(p(|p| p.oas = Some(48)).unwrap_err(), "oas must be 44 bits when accel=off");
+    assert_eq!(p(|p| p.ril = Some(false)).unwrap_err(), "ril can only be disabled if accel=on");
+    assert_eq!(p(|p| p.ats = Some(true)).unwrap_err(), "ats can only be enabled if accel=on");
+    let ssid = "ssidsize can only be greater than 0 bits if accel=on";
+    assert_eq!(p(|p| p.ssidsize = Some(8)).unwrap_err(), ssid);
+    assert_eq!(p(|p| p.cmdqv = Some(true)).unwrap_err(), "cmdqv can only be enabled if accel=on");
+    let accel = |stage: &str| {
+        let p = SmmuV3Props { accel: true, stage: Some(stage.into()), ..Default::default() };
+        p.validate()
+    };
+    assert_eq!(accel("1"), Ok(()));
+    assert_eq!(accel("nested").unwrap_err(), "Only stage1 is supported for SMMUv3 with accel=on");
+
+    let stages = |s: Option<&str>| SmmuV3Props { stage: s.map(Into::into), ..Default::default() };
+    assert_eq!(stages(None).stages(), Stage::S1);
+    assert_eq!(stages(Some("1")).stages(), Stage::S1);
+    assert_eq!(stages(Some("2")).stages(), Stage::S2);
+    assert_eq!(stages(Some("nested")).stages(), Stage::Nested);
+    assert_eq!(stages(Some("x")).stages(), Stage::S1);
+}
