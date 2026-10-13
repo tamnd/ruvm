@@ -571,7 +571,21 @@ mod sockets {
     /// gives.
     #[test]
     fn riscv_virt_under_qtest() {
-        let dir = std::env::temp_dir().join(format!("ruvm-rvqtest-{}", std::process::id()));
+        let virt = r#"{"hotpluggable-cpus": false, "name": "virt", "numa-mem-supported": true, "default-cpu-type": "rv64-riscv-cpu", "acpi": true, "cpu-max": 512, "deprecated": false, "default-ram-id": "riscv_virt_board.ram"}"#;
+        board_under_qtest("riscv64", virt, "virt-machine", 0x8000_0000);
+    }
+
+    /// The same for aarch64 virt, whose RAM starts at 1 GiB.
+    #[test]
+    fn arm_virt_under_qtest() {
+        let virt = r#"{"hotpluggable-cpus": false, "name": "virt-11.1", "numa-mem-supported": false, "acpi": true, "cpu-max": 512, "deprecated": false, "default-ram-id": "mach-virt.ram", "alias": "virt"}"#;
+        board_under_qtest("aarch64", virt, "virt-11.1-machine", 0x4000_0000);
+    }
+
+    /// Runs `-machine virt -accel qtest` for `target` and checks the `query-machines` entry
+    /// `info`, the type of `/machine` and a qtest write and read of the RAM at `ram`.
+    fn board_under_qtest(target: &str, info: &str, typename: &str, ram: u64) {
+        let dir = std::env::temp_dir().join(format!("ruvm-{target}qtest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (qs, ms) = (dir.join("qtest.sock"), dir.join("qmp.sock"));
         let _ = std::fs::remove_file(&qs);
@@ -579,7 +593,7 @@ mod sockets {
         let lq = UnixListener::bind(&qs).unwrap();
         let lm = UnixListener::bind(&ms).unwrap();
         let child = Command::new(ruvm())
-            .arg("qemu-system-riscv64")
+            .arg(format!("qemu-system-{target}"))
             .args(["-qtest", &format!("unix:{}", qs.display()), "-qtest-log", "/dev/null"])
             .args(["-chardev", &format!("socket,path={},id=char0", ms.display())])
             .args(["-object", "monitor-qmp,id=qmp0,chardev=char0"])
@@ -596,16 +610,14 @@ mod sockets {
         qmp.line();
         assert_eq!(qmp.cmd(r#"{"execute": "qmp_capabilities"}"#), r#"{"return": {}}"#);
         let machines = qmp.cmd(r#"{"execute": "query-machines"}"#);
-        let virt = r#"{"hotpluggable-cpus": false, "name": "virt", "numa-mem-supported": true, "default-cpu-type": "rv64-riscv-cpu", "acpi": true, "cpu-max": 512, "deprecated": false, "default-ram-id": "riscv_virt_board.ram"}"#;
-        assert!(machines.contains(virt), "{machines}");
+        assert!(machines.contains(info), "{machines}");
         let c = r#"{"execute": "qom-get", "arguments": {"path": "/machine", "property": "type"}}"#;
-        assert_eq!(qmp.cmd(c), r#"{"return": "virt-machine"}"#);
+        assert_eq!(qmp.cmd(c), format!(r#"{{"return": "{typename}"}}"#));
         let list = qmp.cmd(r#"{"execute": "qom-list", "arguments": {"path": "/machine"}}"#);
         assert!(list.contains(r#"{"name": "type", "type": "string"}"#), "{list}");
 
-        qtest
-            .write_all(b"writel 0x80000000 0x12345678\nreadl 0x80000000\nclock_step 100\n")
-            .unwrap();
+        let cmds = format!("writel {ram:#x} 0x12345678\nreadl {ram:#x}\nclock_step 100\n");
+        qtest.write_all(cmds.as_bytes()).unwrap();
         let want = "OK\nOK 0x0000000012345678\nOK 100\n";
         let mut got = vec![0; want.len()];
         qtest.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
