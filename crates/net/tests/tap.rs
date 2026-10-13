@@ -114,8 +114,11 @@ fn tap_device_as_root() {
     net.cleanup();
     net.del_nic(&nic);
 
-    // Two queues on one device.
+    // Two queues on one device. It gets a name of its own: a child that another test forks
+    // can still hold the first device's descriptor, and then the kernel keeps that device as a
+    // single queue one and TUNSETIFF fails with EINVAL.
     let mut net = Net::new();
+    let ifname = format!("rvq{}", std::process::id() % 100_000);
     netdev(&mut net, &format!("tap,id=mq,ifname={ifname},queues=2,script=no,downscript=no"))
         .unwrap();
     assert_eq!(net.clients().iter().filter(|c| c.name() == "mq").count(), 2);
