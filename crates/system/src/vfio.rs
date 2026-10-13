@@ -9,7 +9,7 @@ use ruvm_hw_iommu::intel_iommu::OnOffAuto;
 use ruvm_hw_vfio::{PciHostDeviceAddress, VfioPciConf};
 use ruvm_machine_x86::{FirmwareSearch, X86Board};
 use ruvm_qapi::opts::QemuOpts;
-use ruvm_qapi::visit::Visitor;
+use ruvm_qapi::visit::{Visitor, VisitorExt};
 
 use crate::x86::Located;
 
