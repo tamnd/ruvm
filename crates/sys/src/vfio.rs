@@ -149,7 +149,7 @@ fn ioctl_ptr<T: Arg>(file: &File, req: u64, arg: *mut T) -> io::Result<i32> {
 }
 
 fn argsz<T>() -> u32 {
-    std::mem::size_of::<T>() as u32
+    size_of::<T>() as u32
 }
 
 fn open_rw(path: &str) -> io::Result<File> {
@@ -276,9 +276,9 @@ mod tests {
         assert_eq!(VFIO_GET_API_VERSION, 0x3b64);
         assert_eq!(VFIO_GROUP_GET_DEVICE_FD, 0x3b6a);
         assert_eq!(VFIO_DEVICE_RESET, 0x3b6f);
-        assert_eq!(std::mem::size_of::<DeviceInfo>(), 24);
-        assert_eq!(std::mem::size_of::<RegionInfo>(), 32);
-        assert_eq!(std::mem::size_of::<IrqInfo>(), 16);
+        assert_eq!(size_of::<DeviceInfo>(), 24);
+        assert_eq!(size_of::<RegionInfo>(), 32);
+        assert_eq!(size_of::<IrqInfo>(), 16);
     }
 
     #[test]
