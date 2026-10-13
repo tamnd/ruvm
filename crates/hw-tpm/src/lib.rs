@@ -2,4 +2,15 @@
 
 //! TPM TIS, CRB and the SPAPR vTPM, with the swtpm and passthrough backends.
 //!
-//! Empty for now. The plan for this crate is in `spec/24-workspace-layout.md`.
+//! What is here so far: the TIS FIFO interface ([`tis`]), the PPI memory ([`ppi`]) and the
+//! swtpm backend ([`emulator`]).
+
+pub mod backend;
+#[cfg(unix)]
+pub mod emulator;
+pub mod ppi;
+pub mod tis;
+pub mod util;
+
+pub use backend::{TpmBackend, TpmCmd};
+pub use util::TpmVersion;
