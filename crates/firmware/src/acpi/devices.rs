@@ -294,6 +294,8 @@ pub enum IsaDevice {
     I8042 { kbd_irq: u8, mouse_irq: u8 },
     /// isa-parallel, see [`parallel_isa`].
     Parallel { index: u32, iobase: u16, irq: u8 },
+    /// tpm-tis, see [`super::tpm::tis_isa_aml`].
+    TpmTis(super::tpm::TpmInfo),
 }
 
 impl IsaDevice {
@@ -304,6 +306,7 @@ impl IsaDevice {
             IsaDevice::Rtc { io_base, irq } => rtc_mc146818(scope, io_base, irq),
             IsaDevice::I8042 { kbd_irq, mouse_irq } => i8042(scope, kbd_irq, mouse_irq),
             IsaDevice::Parallel { index, iobase, irq } => parallel_isa(scope, index, iobase, irq),
+            IsaDevice::TpmTis(ref tpm) => super::tpm::tis_isa_aml(scope, tpm),
         }
     }
 }

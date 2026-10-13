@@ -4,7 +4,7 @@
 //! bridge supplies the PM block, so unlike microvm there is a FACS, a real PM timer and the
 //! classic fixed feature registers.
 //!
-//! Not covered yet: PCI expander buses, CXL, TPM, SGX EPC, VMBus, NVDIMM, memory hotplug and
+//! Not covered yet: PCI expander buses, CXL, SGX EPC, VMBus, NVDIMM, memory hotplug and
 //! ACPI hotplug slots below bridges.
 
 use super::BuildTables;
@@ -17,6 +17,7 @@ use super::dmar::{self, DmarInfo};
 use super::linker::BiosLinker;
 use super::pci::{self, CrsRange, CrsRangeSet};
 use super::table::{self, AcpiTable, FadtData, Gas, McfgInfo, RsdpData, TABLE_FILE, fadt_flags};
+use super::tpm::{self, TpmInfo, TpmInterface, TpmVersion};
 use super::viot::{self, ViotInfo};
 use super::x86::{self, HPET_BASE, MadtConfig};
 use super::{cpuhp, pcihp};
@@ -109,6 +110,8 @@ pub struct Q35Acpi {
     pub dmar: Option<DmarInfo>,
     /// The VIOT contents when there is a virtio-iommu-pci.
     pub viot: Option<ViotInfo>,
+    /// The TPM, `tpm_find()`. A tpm-tis also has to be in the LPC's ISA devices.
+    pub tpm: Option<TpmInfo>,
 }
 
 impl Q35Acpi {
@@ -509,6 +512,13 @@ fn pci0_crs(q: &Q35Acpi, ranges: &mut CrsRangeSet) -> Aml {
             ));
         }
     }
+    if q.tpm.is_some_and(|t| t.interface == TpmInterface::TisIsa) {
+        crs.append(&aml::memory32_fixed(
+            tpm::TIS_ADDR_BASE as u32,
+            tpm::TIS_ADDR_SIZE as u32,
+            ReadWrite::ReadWrite,
+        ));
+    }
     crs
 }
 
@@ -628,6 +638,9 @@ fn build_dsdt(table_data: &mut Vec<u8>, linker: &mut BiosLinker, q: &Q35Acpi) {
     let mut pci0 = aml::scope("PCI0");
     pci_bus_devices(&mut pci0, &q.pci_devices);
     sb_scope.append(&pci0);
+    if let Some(t) = q.tpm.filter(|t| t.interface == TpmInterface::Crb) {
+        tpm::crb_aml(&mut sb_scope, &t);
+    }
     dsdt.append(&sb_scope);
 
     if q.pcihp_bridge {
@@ -671,6 +684,18 @@ pub fn build(q: &Q35Acpi) -> BuildTables {
     if q.hpet {
         table::add_table(&mut table_offsets, data);
         x86::build_hpet(data, linker, &q.oem_id, &q.oem_table_id);
+    }
+    if let Some(info) = &q.tpm {
+        table::add_table(&mut table_offsets, data);
+        let log = &mut t.tcpalog;
+        match info.version {
+            TpmVersion::V1_2 => {
+                tpm::build_tcpa(data, linker, log, &q.oem_id, &q.oem_table_id);
+            }
+            TpmVersion::V2_0 => {
+                tpm::build_tpm2(data, linker, log, info.interface, &q.oem_id, &q.oem_table_id);
+            }
+        }
     }
     if let Some(mcfg) = &q.mcfg {
         table::add_table(&mut table_offsets, data);

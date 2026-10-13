@@ -565,6 +565,7 @@ impl AcpiSource {
                 .virtio_iommu
                 .get()
                 .map(|&bdf| ViotInfo { bdf, ranges: vec![pci_bus_range(self.host.bus())] }),
+            tpm: None,
         }
     }
 }
