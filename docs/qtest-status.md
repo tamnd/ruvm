@@ -30,7 +30,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | boot-serial-test | 1 | 0 | `-no-shutdown` is not supported |
 | test-hmp | 90 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | qmp-cmd-test | 59 | 17 | stops at `query-vnc`, see below |
-| qos-test | 90 (5 skipped) | 9 (2 skipped) | runs the virtio-rng and virtio-blk cases only, see below |
+| qos-test | 90 (5 skipped) | 11 (2 skipped) | runs the virtio-rng, virtio-blk and virtio-balloon cases only, see below |
 | xlnx-canfd-test | 3 | 0 | no `xlnx-zcu102` board |
 | xlnx-versal-trng-test | 5 | 0 | no `xlnx-versal-virt` board |
 | bcm2835-dma-test | 1 | 0 | no Raspberry Pi boards |
@@ -48,7 +48,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 0 | `-readconfig` is not supported |
 | netdev-socket | 10 | 10 | |
-| Total | 447 | 58 | |
+| Total | 447 | 60 | |
 
 ## qtest-riscv64
 
@@ -60,7 +60,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | cdrom-test | 1 | 0 | `-cdrom` is not supported |
 | test-hmp | 13 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
 | qmp-cmd-test | 59 | 17 | stops at `query-vnc`, see below |
-| qos-test | 113 (5 skipped) | 14 (2 skipped) | runs the virtio-rng and virtio-blk cases only, see below |
+| qos-test | 113 (5 skipped) | 17 (2 skipped) | runs the virtio-rng, virtio-blk and virtio-balloon cases only, see below |
 | riscv-csr-test | 1 | 0 | no `veyron-v1` CPU model |
 | iommu-riscv-test | 4 | 0 | no `riscv-iommu-pci` or `iommu-testdev` |
 | k230-wdt-test | 7 | 0 | no `k230` board |
@@ -68,7 +68,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 0 | `-readconfig` is not supported |
 | netdev-socket | 10 | 10 | |
-| Total | 241 | 63 | |
+| Total | 241 | 66 | |
 
 ## qmp-cmd-test and VNC
 
@@ -89,9 +89,9 @@ On riscv64, `virt` now runs under the qtest accelerator with no harts and with i
 
 On aarch64, `virt` now runs under the qtest accelerator the same way, and is listed in `query-machines` as `virt-11.1` with the alias `virt` and the values QEMU 11.1 gives. qom-test and test-hmp pass on it. sbsa-ref is not listed yet, because it does not run under qtest. The tests that started to run on `virt` now fail on options ruvm does not take: `-machine memory-backend=` (migration-test), `-no-shutdown` (boot-serial-test), `gic-version=max` (arm-cpu-features) and `-numa` (numa-test).
 
-On both targets `system_reset` now resets `virt` under the qtest accelerator and sends the RESET event QEMU sends, which qos-test needs between cases that share a command line. qos-test, bios-tables-test, cdrom-test and iommu-smmuv3-test decide what to run from `qom-list-types` with `implements=device`. ruvm now lists the device types with the parents QEMU gives them, but only for the devices whose qos-test cases pass, because a qos-test case that fails stops the whole test. So far that is virtio-rng and virtio-blk, on PCI and on virtio-mmio. Their hotplug cases are skipped on both sides, because the generic PCI host does not take hotplug. The virtio-blk cases needed `-drive` to take `auto-read-only` and `file=null-co://` with `file.read-zeroes`, and the QMP `block_resize` command to resize a drive and raise the configuration interrupt of its device.
+On both targets `system_reset` now resets `virt` under the qtest accelerator and sends the RESET event QEMU sends, which qos-test needs between cases that share a command line. qos-test, bios-tables-test, cdrom-test and iommu-smmuv3-test decide what to run from `qom-list-types` with `implements=device`. ruvm now lists the device types with the parents QEMU gives them, but only for the devices whose qos-test cases pass, because a qos-test case that fails stops the whole test. So far that is virtio-rng, virtio-blk and virtio-balloon, on PCI and on virtio-mmio. Their hotplug cases are skipped on both sides, because the generic PCI host does not take hotplug. The virtio-blk cases needed `-drive` to take `auto-read-only` and `file=null-co://` with `file.read-zeroes`, and the QMP `block_resize` command to resize a drive and raise the configuration interrupt of its device. virtio-balloon only needed the boards to plug it, with the same backend as on x86, which leaves the RAM the guest gives back alone.
 
-With virtio-blk listed, bios-tables-test and cdrom-test now register their cases, and both stop at `-cdrom`, which ruvm does not take yet. The next devices are virtio-balloon, which ruvm does not plug on these boards yet, virtio-net, which needs networking on these boards and the QMP `announce-self` command, virtio-scsi, and virtio-serial, which needs `virtconsole` and `virtserialport` on the serial bus. The rest of the qos-test devices (the Intel and other PCI network cards, the SCSI, NVMe and UFS controllers, the sound cards and the IOMMUs) are not built on these boards by ruvm.
+With virtio-blk listed, bios-tables-test and cdrom-test now register their cases, and both stop at `-cdrom`, which ruvm does not take yet. The next devices are virtio-net, which needs networking on these boards and the QMP `announce-self` command, virtio-scsi, and virtio-serial, which needs `virtconsole` and `virtserialport` on the serial bus. The rest of the qos-test devices (the Intel and other PCI network cards, the SCSI, NVMe and UFS controllers, the sound cards and the IOMMUs) are not built on these boards by ruvm.
 
 `-cdrom` and `-readconfig` are command line options ruvm does not take yet. bios-tables-test also boots the guest from a qcow2 CD image with UEFI firmware. netdev-socket passes since HMP `info network` came in #234 and the stream netdev events in #239.
 
