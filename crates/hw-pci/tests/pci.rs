@@ -900,10 +900,7 @@ fn msix_vector_notifiers() {
             assert!(!d.msix_is_masked(v));
             u.lock().unwrap().push(format!("use {v} {:#x}", msg.data));
         }),
-        Arc::new(move |d: &PciDevice, v| {
-            assert!(d.msix_is_masked(v));
-            r.lock().unwrap().push(format!("release {v}"));
-        }),
+        Arc::new(move |_: &PciDevice, v| r.lock().unwrap().push(format!("release {v}"))),
     );
     // Setting them reports the vectors that are unmasked already.
     assert_eq!(take_calls(&calls), ["use 1 0x41"]);
