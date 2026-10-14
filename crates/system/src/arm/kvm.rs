@@ -16,8 +16,8 @@ use ruvm_machine_arm::virt::kvm::{KvmVirtMachine, prepare_config, virt_kvm_type}
 use ruvm_machine_arm::virt::{VIRT_DEFAULT_RAM_SIZE, VirtGicVersion};
 
 use super::{
-    ArmArgs, ArmBoard, BoardOptions, BuiltVirt, KvmHostCpu, Machine, Running, build_virt, dumpdtb,
-    event_handler, kvm_cpu_model, lock,
+    ArmArgs, ArmBoard, BoardOptions, BuiltVirt, GicAuto, KvmHostCpu, Machine, Running, build_virt,
+    dumpdtb, event_handler, kvm_cpu_model, lock,
 };
 use crate::net::Network;
 use crate::vl::Vm;
@@ -42,17 +42,22 @@ pub(crate) fn kvm_vm_type(opts: &BoardOptions) -> impl Fn(&Kvm) -> Result<u64, K
 
 /// `finalize_gic_version()` for KVM: checks the GIC the board asks for is one the host's KVM
 /// can give the guest, with QEMU's errors.
-fn check_gic_version(accel: &KvmAccel, opts: &BoardOptions) -> Result<(), String> {
+fn check_gic_version(accel: &KvmAccel, opts: &BoardOptions) -> Result<VirtGicVersion, String> {
     let in_kernel = accel.kernel_irqchip() != KernelIrqchip::Off;
     let probe = if in_kernel { vgic_probe(accel) } else { 0 };
     let (supported, name) = kvm_gics_supported(in_kernel, probe).map_err(|e| e.to_string())?;
-    let version = match opts.gic_version.unwrap_or_default() {
-        VirtGicVersion::V2 => GicVersion::V2,
-        VirtGicVersion::V3 => GicVersion::V3,
+    let version = match (opts.gic_version, opts.gic_auto) {
+        (Some(VirtGicVersion::V2), _) => GicVersion::V2,
+        (None, Some(GicAuto::Max)) => GicVersion::Max,
+        (None, Some(GicAuto::Host)) => GicVersion::Host,
+        _ => GicVersion::V3,
     };
-    finalize_gic_version(name, true, version, supported, opts.max_cpus)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    // KVM gives the guest a GICv2 or a GICv3.
+    match finalize_gic_version(name, true, version, supported, opts.max_cpus) {
+        Ok(GicVersion::V2) => Ok(VirtGicVersion::V2),
+        Ok(_) => Ok(VirtGicVersion::V3),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Lets the runstate start and stop the vCPUs, with the netdevs told first when the VM starts
@@ -77,7 +82,7 @@ fn set_cpu_hook(vm: &Arc<Vm>, machine: &Arc<KvmVirtMachine>, net: Arc<Network>) 
 pub(crate) fn start_board_kvm(
     vm: &Arc<Vm>,
     accel: KvmAccel,
-    opts: BoardOptions,
+    mut opts: BoardOptions,
     args: &ArmArgs<'_>,
     serial_hds: &[Option<Arc<Chardev>>],
 ) -> Result<Running, Vec<Located>> {
@@ -88,7 +93,7 @@ pub(crate) fn start_board_kvm(
     if args.semihosting.enabled {
         return Err(one("semihosting with KVM is not supported by ruvm yet".to_string()));
     }
-    check_gic_version(&accel, &opts).map_err(one)?;
+    opts.gic_version = Some(check_gic_version(&accel, &opts).map_err(one)?);
     let (vls, too_long) = accel.arm_sve_vls().map_err(one)?;
     if too_long {
         warn_report("KVM supports vector lengths larger than QEMU can enable");
