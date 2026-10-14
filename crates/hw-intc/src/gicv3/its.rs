@@ -207,6 +207,17 @@ struct ItsState {
     cq: CmdQDesc,
 }
 
+/// The registers QEMU's `arm_gicv3_its` section carries, `vmstate_its`.
+#[derive(Clone, Debug, Default)]
+pub struct ItsVmState {
+    pub ctlr: u32,
+    pub iidr: u32,
+    pub cbaser: u64,
+    pub cwriter: u64,
+    pub creadr: u64,
+    pub baser: [u64; 8],
+}
+
 /// The `arm-gicv3-its` device.
 pub struct GicV3Its {
     gic: Arc<GicV3>,
@@ -746,6 +757,36 @@ impl GicV3Its {
         let pagesize = GITS_BASER_PAGESIZE_64K << 8;
         s.baser[0] = (GITS_BASER_TYPE_DEVICE << 56) | pagesize | entrysize;
         s.baser[1] = (GITS_BASER_TYPE_COLLECTION << 56) | pagesize | entrysize;
+    }
+
+    /// The state for the `arm_gicv3_its` section. QEMU's TCG ITS leaves `iidr` at 0 and
+    /// answers GITS_IIDR from a constant, so 0 goes out.
+    pub fn vmstate_save(&self) -> ItsVmState {
+        let s = self.lock();
+        ItsVmState {
+            ctlr: s.ctlr,
+            iidr: 0,
+            cbaser: s.cbaser,
+            cwriter: s.cwriter,
+            creadr: s.creadr,
+            baser: s.baser,
+        }
+    }
+
+    /// Put in the state of an `arm_gicv3_its` section, then `gicv3_its_post_load()`: an
+    /// enabled ITS decodes its tables and command queue again.
+    pub fn vmstate_load(&self, v: &ItsVmState) {
+        self.with_exec(|e| {
+            e.s.ctlr = v.ctlr;
+            e.s.cbaser = v.cbaser;
+            e.s.cwriter = v.cwriter;
+            e.s.creadr = v.creadr;
+            e.s.baser = v.baser;
+            if e.s.ctlr & GITS_CTLR_ENABLED != 0 {
+                e.extract_table_params(self.typer);
+                e.extract_cmdq_params();
+            }
+        });
     }
 
     /// GITS_TYPER.

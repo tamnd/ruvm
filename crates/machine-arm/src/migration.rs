@@ -31,8 +31,10 @@ use ruvm_vmstate::info::Timer;
 use ruvm_vmstate::{VmStateDescription, VmStateField};
 
 use crate::tcg_run::VirtTcgMachine;
+use crate::virt::VirtGic;
 
 mod cpu;
+mod gic;
 
 /// The registered sections of a machine and the handles the migration code needs.
 #[derive(Debug)]
@@ -79,6 +81,14 @@ pub fn virt_savevm(
     savevm.reserve_section_id();
     savevm.reserve_section_id();
     register_cpus(&mut savevm, machine);
+    let board = machine.board().lock().unwrap_or_else(PoisonError::into_inner);
+    if let VirtGic::V3(g) = board.gic() {
+        gic::register_gicv3(&mut savevm, g, board.cpu_model().features.el2);
+    }
+    if let Some(its) = board.its() {
+        gic::register_its(&mut savevm, its);
+    }
+    drop(board);
     let global_state = GlobalState::register(&mut savevm);
     ArmMigration { savevm, ram_stats, global_state }
 }

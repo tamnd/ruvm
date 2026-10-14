@@ -2184,6 +2184,11 @@ impl VirtMachine {
         &self.gic
     }
 
+    /// The GICv3 ITS, there with `its=on` and a GICv3.
+    pub fn its(&self) -> Option<&Arc<GicV3Its>> {
+        self.its.as_ref()
+    }
+
     /// The UART.
     pub fn uart(&self) -> &Arc<Pl011> {
         &self.uart
