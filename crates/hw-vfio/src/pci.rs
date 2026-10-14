@@ -6,11 +6,15 @@
 //! in a container, then the group hands out the device. The config space is copied from the
 //! host and the parts QEMU emulates are marked in `emulated`, the BARs and the ROM are trapped
 //! and go to the device with `pread()` and `pwrite()`, and the capabilities are rebuilt the way
-//! `vfio_pci_add_capabilities()` rebuilds them. DMA mapping, INTx, MSI and MSI-X delivery,
-//! mmap of the BARs, hot reset and the device quirks are not here yet.
+//! `vfio_pci_add_capabilities()` rebuilds them. A container listens to the address space its
+//! devices DMA into and maps the guest's RAM for them, as hw/vfio/listener.c does. INTx, MSI
+//! and MSI-X delivery, DMA through a vIOMMU, mmap of the BARs, hot reset and the device quirks
+//! are not here yet.
 
+use std::fmt;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ruvm_base::error::{Error, Result, strerror};
@@ -34,7 +38,10 @@ use ruvm_hw_pci::regs::{
     PCI_VENDOR_ID, PCIE_CONFIG_SPACE_SIZE, pci_get_long, pci_get_word, pci_set_long, pci_set_word,
 };
 use ruvm_hw_pci::{MsixLayout, PciBus, PciDevice, PciDeviceInfo, PciDeviceOps};
-use ruvm_mem::{AccessConstraints, AccessCtx, AccessSize, MemError, MemResult, MmioOps, RegionId};
+use ruvm_mem::{
+    AccessConstraints, AccessCtx, AccessSize, AddressSpace, FlatRange, ListenerId, MemError,
+    MemResult, MemoryListener, MemorySystem, MmioOps, RegionId, RegionType,
+};
 use ruvm_sys::vfio::{
     API_VERSION, DEVICE_FLAGS_PCI, DEVICE_FLAGS_RESET, DeviceInfo, GROUP_FLAGS_VIABLE,
     PCI_CONFIG_REGION_INDEX, PCI_ERR_IRQ_INDEX, PCI_MSIX_IRQ_INDEX, PCI_ROM_REGION_INDEX,
@@ -75,13 +82,154 @@ const MAX_EXT_CAPS: u32 = 960;
 /// `rom_denylist` of hw/vfio/pci-quirks.c: option ROMs that hang the guest.
 const ROM_DENYLIST: [(u16, u16); 1] = [(0x14e4, 0x168e)];
 
-/// An open group and the container it is in, `VFIOGroup`.
+/// An open group and the container it is in, `VFIOGroup`. The container comes first so that
+/// it is dropped first: QEMU unregisters the listener before the group leaves the container.
 #[derive(Debug)]
 struct Group {
     id: u32,
+    container: Arc<Container>,
     group: VfioGroup,
-    container: Arc<VfioContainer>,
     devices: Vec<String>,
+}
+
+/// A container and the address space its devices DMA into, `VFIOContainer` with its
+/// `VFIOAddressSpace`. When the last group leaves, the listener is unregistered, which unmaps
+/// the guest's RAM, and then the container is closed.
+struct Container {
+    memory: Arc<MemorySystem>,
+    space: Arc<AddressSpace>,
+    listener: ListenerId,
+    dma: Arc<DmaListener>,
+}
+
+impl fmt::Debug for Container {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Container")
+            .field("space", &self.space.name())
+            .field("listener", &self.listener)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Container {
+    fn drop(&mut self) {
+        // vfio_listener_unregister(). The listener is registered while the container exists.
+        let _ = self.memory.unregister_listener(self.listener);
+    }
+}
+
+/// `vfio_memory_listener`: maps each page aligned RAM range of the address space into the
+/// container with the same bus address as the guest physical one.
+struct DmaListener {
+    fd: VfioContainer,
+    page_size: u64,
+    /// `bcontainer->error`: the first failure while the listener is registered.
+    error: Mutex<Option<Error>>,
+    /// `bcontainer->initialized`: registration is over, so a failure is fatal.
+    initialized: AtomicBool,
+}
+
+/// `vfio_get_section_iova_range()`: the part of `addr..addr + size` made of whole host pages,
+/// as start and length, if there is one.
+fn section_iova_range(addr: u64, size: u128, page_size: u64) -> Option<(u64, u64)> {
+    let mask = !u128::from(page_size - 1);
+    let iova = (u128::from(addr) + u128::from(page_size - 1)) & mask;
+    let llend = (u128::from(addr) + size) & mask;
+    if iova >= llend {
+        return None;
+    }
+    Some((u64::try_from(iova).ok()?, u64::try_from(llend - iova).ok()?))
+}
+
+impl DmaListener {
+    /// `vfio_listener_valid_section()` and `vfio_get_section_iova_range()`.
+    fn section(&self, fr: &FlatRange) -> Option<(u64, u64)> {
+        // vfio_listener_skipped_section(): ROM devices are not RAM to QEMU either, and an
+        // address with bit 63 set is a 64-bit BAR being sized.
+        if fr.region_type() != RegionType::Ram || fr.addr() & (1 << 63) != 0 {
+            return None;
+        }
+        let off = self.page_size - 1;
+        if fr.addr() & off != fr.offset_in_region() & off {
+            error_report(&format!(
+                "vfio_listener_valid_section received unaligned region {} iova={:#x} \
+                 offset_within_region={:#x} qemu_real_host_page_size={:#x}",
+                fr.name(),
+                fr.addr(),
+                fr.offset_in_region(),
+                self.page_size
+            ));
+            return None;
+        }
+        section_iova_range(fr.addr(), fr.size(), self.page_size)
+    }
+
+    /// `vfio_legacy_dma_map()`: an `EBUSY` is answered with an unmap and a second try.
+    fn map(&self, iova: u64, size: u64, vaddr: usize, readonly: bool) -> io::Result<()> {
+        let mut retried = false;
+        loop {
+            // SAFETY: `vaddr` is guest RAM held by the range being added, and region_del
+            // unmaps it before the range, and so the block, can go away. Guest RAM is only
+            // reached through raw accesses that already expect it to change underneath them.
+            match unsafe { self.fd.map_dma(iova, size, vaddr, readonly) } {
+                Err(e) if !retried && e.kind() == io::ErrorKind::ResourceBusy => {
+                    retried = true;
+                    self.fd.unmap_dma(iova, size)?;
+                }
+                r => return r,
+            }
+        }
+    }
+
+    /// The `fail:` path of `vfio_container_region_add()`.
+    fn fail(&self, name: &str, err: Error) {
+        if self.initialized.load(Ordering::Acquire) {
+            report_error(&err);
+            ruvm_base::fatal!("vfio: DMA mapping failed, unable to continue");
+        }
+        let mut first = self.error.lock().unwrap_or_else(PoisonError::into_inner);
+        if first.is_none() {
+            *first = Some(err.prepend(format_args!("Region {name}: ")));
+        }
+    }
+}
+
+impl MemoryListener for DmaListener {
+    fn name(&self) -> &str {
+        "vfio"
+    }
+
+    fn region_add(&self, _space: &AddressSpace, fr: &FlatRange) {
+        let Some((iova, size)) = self.section(fr) else {
+            return;
+        };
+        let Some(block) = fr.ram_block() else {
+            return;
+        };
+        // memory_region_get_ram_ptr() + offset_within_region + (iova - offset_within_address_space).
+        let vaddr = block.host_addr() + (fr.offset_in_region() + (iova - fr.addr())) as usize;
+        if let Err(e) = self.map(iova, size, vaddr, fr.readonly()) {
+            let ret = -e.raw_os_error().unwrap_or(0);
+            let msg = format!(
+                "vfio_container_dma_map({self:p}, {iova:#x}, {size:#x}, {vaddr:#x}) = {ret} ({})",
+                strerror(&e)
+            );
+            self.fail(fr.name(), Error::generic(msg));
+        }
+    }
+
+    fn region_del(&self, _space: &AddressSpace, fr: &FlatRange) {
+        let Some((iova, size)) = self.section(fr) else {
+            return;
+        };
+        if let Err(e) = self.fd.unmap_dma(iova, size) {
+            let ret = -e.raw_os_error().unwrap_or(0);
+            error_report(&format!(
+                "vfio_container_dma_unmap({self:p}, {iova:#x}, {size:#x}) = {ret} ({})",
+                strerror(&e)
+            ));
+        }
+    }
 }
 
 /// `vfio_group_list`.
@@ -125,16 +273,23 @@ fn group_id(sysfsdev: &str) -> Result<u32> {
     })
 }
 
-/// `vfio_container_connect()`: puts `group` in a container it shares with the groups already
-/// open, or in a new one.
-fn container_connect(groups: &[Group], group: &VfioGroup) -> Result<Arc<VfioContainer>> {
-    let mut tried: Vec<&Arc<VfioContainer>> = Vec::new();
+/// `vfio_container_connect()`: puts `group` in a container for `space` it shares with the
+/// groups already open, or in a new one that maps the RAM of `space`.
+fn container_connect(
+    groups: &[Group],
+    group: &VfioGroup,
+    memory: &Arc<MemorySystem>,
+    space: &Arc<AddressSpace>,
+) -> Result<Arc<Container>> {
+    let mut tried: Vec<&Arc<Container>> = Vec::new();
     for g in groups {
-        if tried.iter().any(|c| Arc::ptr_eq(c, &g.container)) {
+        if !Arc::ptr_eq(&g.container.space, space)
+            || tried.iter().any(|c| Arc::ptr_eq(c, &g.container))
+        {
             continue;
         }
         tried.push(&g.container);
-        if group.set_container(&g.container).is_ok() {
+        if group.set_container(&g.container.dma.fd).is_ok() {
             return Ok(Arc::clone(&g.container));
         }
     }
@@ -157,11 +312,34 @@ fn container_connect(groups: &[Group], group: &VfioGroup) -> Result<Arc<VfioCont
     container
         .set_iommu(model)
         .map_err(|e| Error::from_io("Failed to set iommu for container", e))?;
+    // vfio_listener_register().
+    let dma = Arc::new(DmaListener {
+        fd: container,
+        page_size: rustix::param::page_size() as u64,
+        error: Mutex::new(None),
+        initialized: AtomicBool::new(false),
+    });
+    let listener = memory
+        .register_listener(Arc::clone(&dma) as Arc<dyn MemoryListener>, space)
+        .map_err(mem_error)?;
+    let container =
+        Container { memory: Arc::clone(memory), space: Arc::clone(space), listener, dma };
+    let failed = container.dma.error.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(e) = failed {
+        return Err(e.prepend("memory listener initialization failed: "));
+    }
+    container.dma.initialized.store(true, Ordering::Release);
     Ok(Arc::new(container))
 }
 
-/// `vfio_group_get()`: the index of group `id` in `groups`, opened and connected if it is new.
-fn group_get(groups: &mut Vec<Group>, id: u32) -> Result<usize> {
+/// `vfio_group_get()`: the index of group `id` in `groups`, opened and connected to a container
+/// for `space` if it is new.
+fn group_get(
+    groups: &mut Vec<Group>,
+    id: u32,
+    memory: &Arc<MemorySystem>,
+    space: &Arc<AddressSpace>,
+) -> Result<usize> {
     if let Some(i) = groups.iter().position(|g| g.id == id) {
         return Ok(i);
     }
@@ -176,18 +354,23 @@ fn group_get(groups: &mut Vec<Group>, id: u32) -> Result<usize> {
              driver.\n",
         ));
     }
-    let container = container_connect(groups, &group)
+    let container = container_connect(groups, &group, memory, space)
         .map_err(|e| e.prepend(format_args!("failed to setup container for group {id}: ")))?;
-    groups.push(Group { id, group, container, devices: Vec::new() });
+    groups.push(Group { id, container, group, devices: Vec::new() });
     Ok(groups.len() - 1)
 }
 
 /// `vfio_device_attach()` with the legacy container: the device called `name` in the group
-/// of `sysfsdev`.
-fn attach(sysfsdev: &str, name: &str) -> Result<(Attachment, VfioDevice, DeviceInfo)> {
+/// of `sysfsdev`, which does DMA into `space`.
+fn attach(
+    sysfsdev: &str,
+    name: &str,
+    memory: &Arc<MemorySystem>,
+    space: &Arc<AddressSpace>,
+) -> Result<(Attachment, VfioDevice, DeviceInfo)> {
     let id = group_id(sysfsdev)?;
     let mut groups = groups();
-    let i = group_get(&mut groups, id)?;
+    let i = group_get(&mut groups, id, memory, space)?;
     let g = &groups[i];
     let got = if g.devices.iter().any(|d| d == name) {
         Err(Error::generic("device is already attached"))
@@ -553,11 +736,13 @@ struct Populated {
 }
 
 /// `vfio_pci_realize()`: puts the host function of `conf` on `bus` at `devfn`, or the first
-/// free slot. `express_bus` says whether `bus` is PCI Express, `pci_bus_is_express()`.
+/// free slot. `express_bus` says whether `bus` is PCI Express, `pci_bus_is_express()`, and
+/// `dma_as` is the address space the device's DMA goes to, `pci_device_iommu_address_space()`.
 pub fn realize(
     bus: &Arc<PciBus>,
     devfn: Option<u8>,
     express_bus: bool,
+    dma_as: &Arc<AddressSpace>,
     conf: &VfioPciConf,
 ) -> Result<Arc<PciDevice>> {
     let sysfsdev = match (&conf.sysfsdev, conf.host) {
@@ -587,7 +772,7 @@ pub fn realize(
             "x-balloon-allowed only potentially compatible with mdev devices",
         )));
     }
-    let p = populate(&sysfsdev, &name).map_err(prefix)?;
+    let p = populate(&sysfsdev, &name, bus.memory(), dma_as).map_err(prefix)?;
     let info = PciDeviceInfo {
         name: "vfio-pci".to_string(),
         id: conf.id.clone(),
@@ -617,8 +802,13 @@ pub fn realize(
 
 /// `vfio_device_attach()`, `vfio_pci_populate_device()` and the config read of
 /// `vfio_pci_config_setup()`.
-fn populate(sysfsdev: &str, name: &str) -> Result<Populated> {
-    let (attachment, device, info) = attach(sysfsdev, name)?;
+fn populate(
+    sysfsdev: &str,
+    name: &str,
+    memory: &Arc<MemorySystem>,
+    space: &Arc<AddressSpace>,
+) -> Result<Populated> {
+    let (attachment, device, info) = attach(sysfsdev, name, memory, space)?;
 
     if info.flags & DEVICE_FLAGS_PCI == 0 {
         return Err(Error::generic("this isn't a PCI device"));
@@ -1325,5 +1515,16 @@ mod tests {
         pci_set_long(&mut config, 0x140, pci_ext_cap(0x15, 1, 0));
         assert_eq!(ext_cap_max_size(&config, 0x100), 0x40);
         assert_eq!(ext_cap_max_size(&config, 0x140), 0xec0);
+    }
+
+    #[test]
+    fn iova_ranges() {
+        assert_eq!(section_iova_range(0, 0xa0000, 0x1000), Some((0, 0xa0000)));
+        assert_eq!(section_iova_range(0x100000, 0x7ff00000, 0x1000), Some((0x100000, 0x7ff00000)));
+        // Only the whole pages inside.
+        assert_eq!(section_iova_range(0x800, 0x2000, 0x1000), Some((0x1000, 0x1000)));
+        assert_eq!(section_iova_range(0x800, 0x1000, 0x1000), None);
+        assert_eq!(section_iova_range(0xfee00000, 0x10, 0x1000), None);
+        assert_eq!(section_iova_range(0, 0x1_0000_0000_0000_0000, 0x1000), None);
     }
 }

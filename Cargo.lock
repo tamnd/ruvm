@@ -1950,6 +1950,7 @@ version = "0.5.7"
 name = "ruvm-hw-vfio"
 version = "0.5.7"
 dependencies = [
+ "rustix",
  "ruvm-base",
  "ruvm-hw-pci",
  "ruvm-mem",

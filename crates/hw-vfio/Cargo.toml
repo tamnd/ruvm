@@ -11,7 +11,8 @@ authors.workspace = true
 publish = false
 
 [package.metadata.ruvm]
-unsafe-budget = 0
+# The one VFIO_IOMMU_MAP_DMA call, which lets the device write guest RAM.
+unsafe-budget = 1
 
 [dependencies]
 ruvm-base.workspace = true
@@ -20,6 +21,7 @@ ruvm-mem.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ruvm-sys.workspace = true
+rustix = { workspace = true, features = ["param"] }
 
 [lints]
 workspace = true

@@ -55,6 +55,11 @@ pub const PCI_MSIX_IRQ_INDEX: u32 = 2;
 /// `VFIO_PCI_ERR_IRQ_INDEX`.
 pub const PCI_ERR_IRQ_INDEX: u32 = 3;
 
+/// `VFIO_DMA_MAP_FLAG_READ`: the device may read the mapping.
+pub const DMA_MAP_FLAG_READ: u32 = 1;
+/// `VFIO_DMA_MAP_FLAG_WRITE`: the device may write the mapping.
+pub const DMA_MAP_FLAG_WRITE: u32 = 1 << 1;
+
 /// `VFIO_IRQ_INFO_NORESIZE`: the MSI-X vector count cannot change while enabled.
 pub const IRQ_INFO_NORESIZE: u32 = 1 << 3;
 
@@ -73,6 +78,8 @@ const VFIO_DEVICE_GET_INFO: u64 = io(7);
 const VFIO_DEVICE_GET_REGION_INFO: u64 = io(8);
 const VFIO_DEVICE_GET_IRQ_INFO: u64 = io(9);
 const VFIO_DEVICE_RESET: u64 = io(11);
+const VFIO_IOMMU_MAP_DMA: u64 = io(13);
+const VFIO_IOMMU_UNMAP_DMA: u64 = io(14);
 
 #[repr(C)]
 #[derive(Default)]
@@ -121,12 +128,35 @@ pub struct IrqInfo {
     pub count: u32,
 }
 
+/// `struct vfio_iommu_type1_dma_map`.
+#[repr(C)]
+#[derive(Default)]
+struct DmaMap {
+    argsz: u32,
+    flags: u32,
+    vaddr: u64,
+    iova: u64,
+    size: u64,
+}
+
+/// `struct vfio_iommu_type1_dma_unmap`, without the dirty bitmap.
+#[repr(C)]
+#[derive(Default)]
+struct DmaUnmap {
+    argsz: u32,
+    flags: u32,
+    iova: u64,
+    size: u64,
+}
+
 /// The argument structures of the ioctls this module issues.
 trait Arg {}
 impl Arg for GroupStatus {}
 impl Arg for DeviceInfo {}
 impl Arg for RegionInfo {}
 impl Arg for IrqInfo {}
+impl Arg for DmaMap {}
+impl Arg for DmaUnmap {}
 impl Arg for libc::c_int {}
 impl Arg for libc::c_char {}
 
@@ -182,6 +212,38 @@ impl VfioContainer {
     /// `VFIO_SET_IOMMU`: picks the IOMMU model. A group must be in the container first.
     pub fn set_iommu(&self, model: u32) -> io::Result<()> {
         ioctl_val(&self.file, VFIO_SET_IOMMU, model.into()).map(drop)
+    }
+
+    /// `VFIO_IOMMU_MAP_DMA`: lets the devices in the container reach the `size` bytes at
+    /// `vaddr` through bus address `iova`, read only or read and write. The kernel pins the
+    /// pages until they are unmapped.
+    ///
+    /// # Safety
+    ///
+    /// The devices write the memory behind the program's back for as long as it is mapped, so
+    /// nothing may hold a Rust reference to it in that time. Guest RAM, which is only reached
+    /// through raw accesses, is the memory this is for.
+    pub unsafe fn map_dma(
+        &self,
+        iova: u64,
+        size: u64,
+        vaddr: usize,
+        readonly: bool,
+    ) -> io::Result<()> {
+        let mut flags = DMA_MAP_FLAG_READ;
+        if !readonly {
+            flags |= DMA_MAP_FLAG_WRITE;
+        }
+        let mut map = DmaMap { argsz: argsz::<DmaMap>(), flags, vaddr: vaddr as u64, iova, size };
+        ioctl_ptr(&self.file, VFIO_IOMMU_MAP_DMA, &mut map).map(drop)
+    }
+
+    /// `VFIO_IOMMU_UNMAP_DMA`: removes the mappings in `iova..iova + size`. Returns how many
+    /// bytes were unmapped.
+    pub fn unmap_dma(&self, iova: u64, size: u64) -> io::Result<u64> {
+        let mut unmap = DmaUnmap { argsz: argsz::<DmaUnmap>(), flags: 0, iova, size };
+        ioctl_ptr(&self.file, VFIO_IOMMU_UNMAP_DMA, &mut unmap)?;
+        Ok(unmap.size)
     }
 }
 
@@ -276,6 +338,10 @@ mod tests {
         assert_eq!(VFIO_GET_API_VERSION, 0x3b64);
         assert_eq!(VFIO_GROUP_GET_DEVICE_FD, 0x3b6a);
         assert_eq!(VFIO_DEVICE_RESET, 0x3b6f);
+        assert_eq!(VFIO_IOMMU_MAP_DMA, 0x3b71);
+        assert_eq!(VFIO_IOMMU_UNMAP_DMA, 0x3b72);
+        assert_eq!(size_of::<DmaMap>(), 32);
+        assert_eq!(size_of::<DmaUnmap>(), 24);
         assert_eq!(size_of::<DeviceInfo>(), 24);
         assert_eq!(size_of::<RegionInfo>(), 32);
         assert_eq!(size_of::<IrqInfo>(), 16);

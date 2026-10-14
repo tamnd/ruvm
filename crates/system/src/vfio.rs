@@ -2,8 +2,8 @@
 
 //! `-device vfio-pci` on q35: the properties of hw/vfio/pci.c and the plug.
 //!
-//! Only the root bus `pcie.0` takes the device, and not with a vIOMMU, since nothing maps the
-//! guest's memory for the device's DMA yet.
+//! Only the root bus `pcie.0` takes the device, and not with a vIOMMU yet, since the container
+//! maps guest RAM at its guest physical address and nothing follows a vIOMMU's mappings.
 
 use ruvm_base::error::Error;
 use ruvm_base::report::Location;
@@ -162,7 +162,7 @@ pub(crate) fn realize_x86(
             format!("No 'PCI' bus found for device '{TYPE_VFIO_PCI}'"),
         ));
     };
-    let dev = ruvm_hw_vfio::pci::realize(m.pci_bus(), plug.devfn, true, &plug.conf)
+    let dev = ruvm_hw_vfio::pci::realize(m.pci_bus(), plug.devfn, true, m.memory_as(), &plug.conf)
         .map_err(|e| Located(plug.loc.clone(), e))?;
     // pci_add_option_rom()
     if let Some(name) = plug.conf.romfile.as_deref().filter(|f| !f.is_empty()) {
