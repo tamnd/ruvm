@@ -71,6 +71,7 @@ use ruvm_hw_core::{Clock, IrqLine, IrqPin, irq};
 use ruvm_hw_i2c::smbus_eeprom::SmbusEepromSlave;
 use ruvm_hw_i2c::smbus_ich9::{Ich9Smbus, ich9_smbus_q35_init};
 use ruvm_hw_input::pckbd::{I8042, I8042Props};
+use ruvm_hw_intc::apic::{APIC_DEFAULT_ADDRESS, APIC_SPACE_SIZE};
 use ruvm_hw_intc::i8259::{I8259Pair, i8259_init};
 use ruvm_hw_intc::ioapic::{
     IO_APIC_DEFAULT_ADDRESS, IOAPIC_NUM_PINS, IOAPIC_VER_DEF, IoApic, IoApicMsiHandler, IoApics,
@@ -1138,9 +1139,14 @@ impl Q35 {
             let weak = Arc::downgrade(&memory_as);
             Arc::new(move |addr, data| {
                 let h = hook.read().unwrap_or_else(PoisonError::into_inner).clone();
+                // An MSI is a memory write in QEMU, and only the ones that land in the 1 MiB
+                // window of the local APIC reach apic_send_msi(). The high word of the address
+                // carries the extended destination ID, so only the low word is checked.
+                let apic =
+                    u64::from(addr as u32).wrapping_sub(APIC_DEFAULT_ADDRESS) < APIC_SPACE_SIZE;
                 match h {
-                    Some(h) => h(addr, data),
-                    None => {
+                    Some(h) if apic => h(addr, data),
+                    _ => {
                         if let Some(a) = weak.upgrade() {
                             let _ = a.write_u32(addr, MemTxAttrs::UNSPECIFIED, data);
                         }
@@ -1932,9 +1938,8 @@ impl Q35 {
         &self.ioapic
     }
 
-    /// Where MSIs go: those of the IOAPIC, the HPET and PCI devices. Without a handler they
-    /// are written to system memory, which only reaches something once a local APIC is mapped
-    /// there.
+    /// Where MSIs go: those of the IOAPIC, the HPET and PCI devices. Without a handler, and
+    /// for any address outside the local APIC window, they are written to system memory.
     pub fn set_msi_handler(&self, handler: Option<IoApicMsiHandler>) {
         *self.msi_hook.write().unwrap_or_else(PoisonError::into_inner) = handler;
     }
