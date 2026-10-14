@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Exception syndromes for ESR_ELx: the AArch64 parts of QEMU's `target/arm/syndrome.h`.
+//! Exception syndromes for ESR_ELx: the parts of QEMU's `target/arm/syndrome.h` this port
+//! raises.
 
 /// `ARM_EL_EC_SHIFT`.
 pub const EC_SHIFT: u32 = 26;
@@ -35,6 +36,10 @@ pub const EC_SERROR: u32 = 0x2f;
 pub const EC_SVEACCESSTRAP: u32 = 0x19;
 /// `EC_AA64_BKPT`.
 pub const EC_AA64_BKPT: u32 = 0x3c;
+/// `EC_AA32_SVC`.
+pub const EC_AA32_SVC: u32 = 0x11;
+/// `EC_AA32_BKPT`.
+pub const EC_AA32_BKPT: u32 = 0x38;
 
 /// The exception class of a syndrome, `syn_get_ec()`.
 pub const fn syn_get_ec(syn: u32) -> u32 {
@@ -74,6 +79,16 @@ pub const fn syn_aa64_smc(imm16: u32) -> u32 {
 /// `syn_aa64_bkpt()`.
 pub const fn syn_aa64_bkpt(imm16: u32) -> u32 {
     (EC_AA64_BKPT << EC_SHIFT) | IL | (imm16 & 0xffff)
+}
+
+/// `syn_aa32_svc()`: `is_16bit` for the Thumb encoding.
+pub const fn syn_aa32_svc(imm16: u32, is_16bit: bool) -> u32 {
+    (EC_AA32_SVC << EC_SHIFT) | if is_16bit { 0 } else { IL } | (imm16 & 0xffff)
+}
+
+/// `syn_aa32_bkpt()`: `is_16bit` for the Thumb encoding.
+pub const fn syn_aa32_bkpt(imm16: u32, is_16bit: bool) -> u32 {
+    (EC_AA32_BKPT << EC_SHIFT) | if is_16bit { 0 } else { IL } | (imm16 & 0xffff)
 }
 
 /// `syn_aa64_sysregtrap()`.

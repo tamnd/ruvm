@@ -60,10 +60,10 @@ const EC_GCS: u32 = 0x2d;
 const TPIDR_EL0: usize = env_off(offset_of!(CpuArmState, tpidr_el));
 
 /// The vCPU of a user mode guest: the AArch64 front end, with guest pages checked against the
-/// guest's mappings instead of page tables.
-struct UserCpu {
-    arm: Arc<Arm>,
-    space: Arc<GuestSpace>,
+/// guest's mappings instead of page tables. The arm target uses it for AArch32 code too.
+pub(crate) struct UserCpu {
+    pub(crate) arm: Arc<Arm>,
+    pub(crate) space: Arc<GuestSpace>,
 }
 
 impl fmt::Debug for UserCpu {
@@ -469,11 +469,17 @@ static CPUINFO: OnceLock<(u64, u64, u64)> = OnceLock::new();
 
 /// `open_cpuinfo()` of `target_proc.h` for aarch64.
 fn cpuinfo() -> String {
-    use std::fmt::Write;
     let (h, h2, midr) = CPUINFO.get().copied().unwrap_or_default();
+    format_cpuinfo(&[(HWCAP_NAMES, h), (HWCAP2_NAMES, h2)], midr)
+}
+
+/// `open_cpuinfo()` of an ARMv8 CPU, which aarch64 and arm share: an entry for each host CPU,
+/// with the names in `caps` of the hardware capabilities set, by bit.
+pub(crate) fn format_cpuinfo(caps: &[(&[&str], u64)], midr: u64) -> String {
+    use std::fmt::Write;
     let rev = midr & 0xf;
     let mut features = String::new();
-    for (names, caps) in [(HWCAP_NAMES, h), (HWCAP2_NAMES, h2)] {
+    for &(names, caps) in caps {
         for (bit, name) in names.iter().enumerate() {
             if caps & (1 << bit) != 0 {
                 features.push(' ');
@@ -982,6 +988,7 @@ pub(crate) static GUEST: Guest = Guest {
     env_size: ENV_SIZE,
     generic_abi: true,
     abi32: false,
+    eabi: false,
     sa_restorer: true,
     // O_DIRECTORY, O_NOFOLLOW, O_DIRECT and O_LARGEFILE.
     open_flags: &[

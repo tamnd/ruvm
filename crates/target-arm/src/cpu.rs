@@ -118,6 +118,19 @@ arm_state! {
         pub cf: u32,
         /// V in bit 31.
         pub vf: u32,
+        /// R0 to R14 while the CPU is in AArch32 state, QEMU's `regs[]` without the PC,
+        /// which stays in `pc`. In AArch32 state `pstate` holds the CPSR bits QEMU keeps in
+        /// `uncached_cpsr` (M, E, IL, PAN, SSBS and DIT) and `daif` holds A, I and F.
+        pub regs: [u32; 15],
+        /// CPSR.T: 1 in Thumb state.
+        pub thumb: u32,
+        /// The IT state, `condexec_bits`: the condition in bits 7 to 4 and the mask in bits 3
+        /// to 0, as CPSR.IT orders them.
+        pub condexec_bits: u32,
+        /// CPSR.GE, in bits 3 to 0.
+        pub ge: u32,
+        /// CPSR.Q: nonzero when set.
+        pub qf: u32,
         /// The cached TB flags, QEMU's `env->hflags`: what `tcg::tb_flags()` computes from the
         /// rest of the state, rebuilt by [`CpuArmState::rebuild_hflags`] whenever something
         /// it depends on changes, so that looking up a TB only reads this word and the PC.
@@ -318,6 +331,18 @@ pub const ZF: usize = env_off(offset_of!(CpuArmState, zf));
 pub const CF: usize = env_off(offset_of!(CpuArmState, cf));
 /// The `env` offset of `vf`.
 pub const VF: usize = env_off(offset_of!(CpuArmState, vf));
+/// The `env` offset of `regs[n]`, AArch32 R0 to R14.
+pub const fn reg_off(n: usize) -> usize {
+    env_off(offset_of!(CpuArmState, regs)) + 4 * n
+}
+/// The `env` offset of `thumb`.
+pub const THUMB: usize = env_off(offset_of!(CpuArmState, thumb));
+/// The `env` offset of `condexec_bits`.
+pub const CONDEXEC_BITS: usize = env_off(offset_of!(CpuArmState, condexec_bits));
+/// The `env` offset of `ge`.
+pub const GE: usize = env_off(offset_of!(CpuArmState, ge));
+/// The `env` offset of `qf`.
+pub const QF: usize = env_off(offset_of!(CpuArmState, qf));
 /// The `env` offset of `hflags`.
 pub const HFLAGS: usize = env_off(offset_of!(CpuArmState, hflags));
 /// The `env` offset of `rgsr_el1`.
@@ -471,6 +496,8 @@ pub const EXCP_IRQ: i32 = 5;
 pub const EXCP_FIQ: i32 = 6;
 /// `EXCP_BKPT`.
 pub const EXCP_BKPT: i32 = 7;
+/// `EXCP_KERNEL_TRAP`: an AArch32 jump into the commpage the user mode emulator handles.
+pub const EXCP_KERNEL_TRAP: i32 = 9;
 /// `EXCP_HVC`.
 pub const EXCP_HVC: i32 = 11;
 /// `EXCP_SMC`.
@@ -487,6 +514,45 @@ pub const EXCP_SEMIHOST: i32 = 16;
 pub const EXCP_VSERR: i32 = 24;
 /// `EXCP_GPC`: a granule protection check fault reported to EL3.
 pub const EXCP_GPC: i32 = 25;
+
+/// `CPSR_M`: the AArch32 mode, with bit 4 set.
+pub const CPSR_M: u32 = 0x1f;
+/// `ARM_CPU_MODE_USR`.
+pub const ARM_CPU_MODE_USR: u32 = 0x10;
+/// `CPSR_T`.
+pub const CPSR_T: u32 = 1 << 5;
+/// `CPSR_F`.
+pub const CPSR_F: u32 = 1 << 6;
+/// `CPSR_I`.
+pub const CPSR_I: u32 = 1 << 7;
+/// `CPSR_A`.
+pub const CPSR_A: u32 = 1 << 8;
+/// `CPSR_AIF`.
+pub const CPSR_AIF: u32 = CPSR_A | CPSR_I | CPSR_F;
+/// `CPSR_E`: big endian data accesses.
+pub const CPSR_E: u32 = 1 << 9;
+/// `CPSR_IT_2_7`.
+pub const CPSR_IT_2_7: u32 = 0xfc00;
+/// `CPSR_GE`.
+pub const CPSR_GE: u32 = 0xf << 16;
+/// `CPSR_IL`.
+pub const CPSR_IL: u32 = 1 << 20;
+/// `CPSR_J`.
+pub const CPSR_J: u32 = 1 << 24;
+/// `CPSR_IT_0_1`.
+pub const CPSR_IT_0_1: u32 = 3 << 25;
+/// `CPSR_IT`.
+pub const CPSR_IT: u32 = CPSR_IT_0_1 | CPSR_IT_2_7;
+/// `CPSR_Q`.
+pub const CPSR_Q: u32 = 1 << 27;
+/// `CPSR_NZCV`.
+pub const CPSR_NZCV: u32 = PSTATE_NZCV;
+/// `CPSR_USER`: the bits an `MSR` at PL0 may write.
+pub const CPSR_USER: u32 = CPSR_NZCV | CPSR_Q | CPSR_GE | CPSR_E;
+/// `CPSR_EXEC`: the execution state bits, which `MSR` never writes.
+pub const CPSR_EXEC: u32 = CPSR_T | CPSR_IT | CPSR_J | CPSR_IL;
+/// `CACHED_CPSR_BITS`: the CPSR bits kept outside `pstate`.
+const CACHED_CPSR_BITS: u32 = CPSR_T | CPSR_AIF | CPSR_GE | CPSR_IT | CPSR_Q | CPSR_NZCV;
 
 /// `PSTATE_MODE_EL2t`.
 pub const PSTATE_MODE_EL2T: u32 = 8;
@@ -707,6 +773,55 @@ impl CpuArmState {
         self.vf = (val << 3) & 0x8000_0000;
         self.daif = val & PSTATE_DAIF;
         self.pstate = val & !(PSTATE_NZCV | PSTATE_DAIF);
+    }
+
+    /// `is_a64()`: whether the CPU is in AArch64 state.
+    pub fn is_a64(&self) -> bool {
+        self.pstate & PSTATE_NRW == 0
+    }
+
+    /// `cpsr_read()`: the AArch32 CPSR.
+    pub fn cpsr_read(&self) -> u32 {
+        let z = u32::from(self.zf == 0);
+        (self.pstate & !CACHED_CPSR_BITS)
+            | (self.nf & 0x8000_0000)
+            | (z << 30)
+            | ((self.cf & 1) << 29)
+            | ((self.vf & 0x8000_0000) >> 3)
+            | (u32::from(self.qf != 0) << 27)
+            | ((self.thumb & 1) << 5)
+            | ((self.condexec_bits & 3) << 25)
+            | ((self.condexec_bits & 0xfc) << 8)
+            | ((self.ge & 0xf) << 16)
+            | (self.daif & CPSR_AIF)
+    }
+
+    /// `cpsr_write()` of the bits in `mask`, without the mode switch, which nothing that
+    /// runs at PL0 can ask for: the M bits are left alone. The caller rebuilds the TB flags.
+    pub fn cpsr_write(&mut self, val: u32, mask: u32) {
+        if mask & CPSR_NZCV != 0 {
+            self.set_nzcv(val);
+        }
+        if mask & CPSR_Q != 0 {
+            self.qf = u32::from(val & CPSR_Q != 0);
+        }
+        if mask & CPSR_T != 0 {
+            self.thumb = u32::from(val & CPSR_T != 0);
+        }
+        if mask & CPSR_IT_0_1 != 0 {
+            self.condexec_bits = (self.condexec_bits & !3) | ((val >> 25) & 3);
+        }
+        if mask & CPSR_IT_2_7 != 0 {
+            self.condexec_bits = (self.condexec_bits & 3) | ((val >> 8) & 0xfc);
+        }
+        if mask & CPSR_GE != 0 {
+            self.ge = (val >> 16) & 0xf;
+        }
+        if mask & CPSR_AIF != 0 {
+            self.daif = (self.daif & !CPSR_AIF) | (val & CPSR_AIF);
+        }
+        let mask = mask & !(CACHED_CPSR_BITS | CPSR_M);
+        self.pstate = (self.pstate & !mask) | (val & mask);
     }
 
     /// The NZCV flags in bits 31 to 28.
@@ -1189,8 +1304,27 @@ pub struct ArmCpuModel {
     pub id_aa64mmfr3: u64,
     /// ID_AA64MMFR4_EL1.
     pub id_aa64mmfr4: u64,
+    /// The AArch32 ID registers, for a model that runs AArch32 code at EL0.
+    pub aa32: Option<Aa32Ids>,
     /// The features, derived from the ID registers.
     pub features: ArmFeatures,
+}
+
+/// The AArch32 identification registers of a model, QEMU's `isar` fields for them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Aa32Ids {
+    /// FPSID.
+    pub fpsid: u32,
+    /// ID_PFR0 to ID_PFR2.
+    pub id_pfr: [u32; 3],
+    /// ID_DFR0.
+    pub id_dfr0: u32,
+    /// ID_MMFR0 to ID_MMFR5.
+    pub id_mmfr: [u32; 6],
+    /// ID_ISAR0 to ID_ISAR6.
+    pub id_isar: [u32; 7],
+    /// MVFR0 to MVFR2.
+    pub mvfr: [u32; 3],
 }
 
 /// `ID_AA64PFR0_EL1` for a CPU with AArch64 only EL0 and EL1, no EL2 or EL3 (until
@@ -1261,6 +1395,7 @@ impl ArmCpuModel {
             id_aa64mmfr2: 0,
             id_aa64mmfr3: 0,
             id_aa64mmfr4: 0,
+            aa32: None,
             features: ArmFeatures {
                 crc32: true,
                 aes: true,
@@ -1325,6 +1460,7 @@ impl ArmCpuModel {
             id_aa64mmfr2: 0x11,
             id_aa64mmfr3: 0,
             id_aa64mmfr4: 0,
+            aa32: None,
             features: ArmFeatures {
                 lse: true,
                 crc32: true,
@@ -1426,6 +1562,7 @@ impl ArmCpuModel {
             id_aa64mmfr2: 0,
             id_aa64mmfr3: 0,
             id_aa64mmfr4: 0,
+            aa32: None,
             features: ArmFeatures {
                 crc32: true,
                 aes: true,
@@ -1522,6 +1659,34 @@ impl ArmCpuModel {
                 ..a76.features
             },
             ..a76
+        }
+    }
+
+    /// `max` as `qemu-arm` has it: the Cortex-A57 that `aarch64_aa32_a57_init()` sets up,
+    /// with QEMU's `max` MIDR and the extra AArch32 features of `aa32_max_features()` and,
+    /// for the user mode emulator, VFP short vectors. It runs AArch32 code at EL0 only.
+    pub fn max_aa32() -> ArmCpuModel {
+        let a57 = ArmCpuModel::cortex_a57();
+        ArmCpuModel {
+            name: "max",
+            midr: 0x411f_d070,
+            aa32: Some(Aa32Ids {
+                fpsid: 0x4103_4070,
+                id_pfr: [0x1210_0131, 0x0001_1011, 0x11],
+                id_dfr0: 0x0601_00aa,
+                id_mmfr: [0x1010_1105, 0x4000_0000, 0x0126_0000, 0x0212_2211, 0x2002_1110, 2],
+                id_isar: [
+                    0x0210_1110,
+                    0x1311_2111,
+                    0x2123_2042,
+                    0x0111_2131,
+                    0x0001_1142,
+                    0x1101_1121,
+                    0x0111_1111,
+                ],
+                mvfr: [0x1111_0222, 0x1321_1111, 0x43],
+            }),
+            ..a57
         }
     }
 

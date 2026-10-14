@@ -13,7 +13,8 @@
 //!   `cpu_loop()`, the signal frames and what else differs between them, behind `guest`.
 //!   `generic` numbers the system calls of aarch64 as the host does. `i386` is the 32-bit
 //!   x86 target, whose system calls `compat` converts to the host's, as the kernel's compat
-//!   layer does.
+//!   layer does. `arm` is the 32-bit Arm EABI target, with the same conversions and the
+//!   EABI's register pairs and structures.
 //!
 //! The guest's address space is one reservation of host memory ([`ruvm_user_common::GuestSpace`])
 //! with guest address `g` at offset `g`, always mapped readable and writable on the host.
@@ -21,7 +22,7 @@
 //! flags, and every pointer a system call passes to the host kernel is checked against them and
 //! against the size of the reservation first, so the kernel only ever sees memory inside it.
 //!
-//! What this version runs: x86_64, aarch64, riscv64 and i386 programs on an x86_64 Linux host,
+//! What this version runs: x86_64, aarch64, riscv64, i386 and arm programs on an x86_64 Linux host,
 //! static or dynamic, threaded or not, with the system calls of files, memory, processes, time
 //! and signals. The differences from QEMU are:
 //!
@@ -49,8 +50,14 @@
 //! - i386 programs cannot set signal handlers yet: `rt_sigaction()`, `sigaltstack()` and the
 //!   old signal calls are `ENOSYS`, as are the socket, System V IPC, POSIX timer and message
 //!   queue calls, `vm86()` and `modify_ldt()`.
+//! - arm programs are EABI ones, little endian, with the same limits as i386 programs: no
+//!   signal handlers and `ENOSYS` for the calls i386 does not have. An OABI call, an SVC with
+//!   a nonzero immediate, is `ENOSYS` but for the private calls (`set_tls` and the others).
+//!   There is no commpage, so the kuser helpers are not there, no FPA emulation, no FDPIC
+//!   and no `-g`. The hardware capabilities leave out Advanced SIMD and the crypto
+//!   instructions.
 //! - The guest space is a 64 TiB reservation, as QEMU lays it out with `-R`, so addresses
-//!   differ from QEMU's default layout. For i386 it is the whole 4 GiB, as in QEMU.
+//!   differ from QEMU's default layout. For i386 and arm it is the whole 4 GiB, as in QEMU.
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod elf;
@@ -58,6 +65,8 @@ pub mod opts;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod aarch64;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod arm;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod compat;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -115,6 +124,7 @@ pub fn run(target: &str, argv0: &str, args: &[String]) -> Option<ExitCode> {
         "i386" => return Some(start::main(argv0, args, &mut i386::Target::default())),
         "aarch64" => return Some(start::main(argv0, args, &mut aarch64::Target::default())),
         "riscv64" => return Some(start::main(argv0, args, &mut riscv64::Target::default())),
+        "arm" => return Some(start::main(argv0, args, &mut arm::Target::default())),
         _ => {}
     }
     let _ = (target, argv0, args);

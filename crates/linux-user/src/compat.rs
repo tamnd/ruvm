@@ -33,6 +33,14 @@ fn pair(lo: u64, hi: u64) -> u64 {
     (lo & 0xffff_ffff) | (hi << 32)
 }
 
+/// The 64-bit argument that would be in registers `i` and `i + 1`, and the index of the
+/// argument after it. On the ARM EABI the pair starts at an even register, so an odd `i`
+/// moves up by one, `regpairs_aligned()`.
+fn arg64(a: &[u64; 6], i: usize, eabi: bool) -> (u64, usize) {
+    let i = if eabi { (i + 1) & !1 } else { i };
+    (pair(a[i], a[i + 1]), i + 2)
+}
+
 fn read<const N: usize>(p: &Proc, addr: u64) -> Result<[u8; N], i64> {
     let mut b = [0u8; N];
     if p.space().read(addr, &mut b) { Ok(b) } else { Err(-EFAULT) }
@@ -99,10 +107,14 @@ fn host_stat(p: &Proc, fd: u64, path: Option<u64>, flags: u64) -> Result<[u8; 14
     if r < 0 { Err(r) } else { Ok(st) }
 }
 
-/// `struct stat64` from the host's `struct stat`, laid out as the i386 kernel's
-/// `cp_new_stat64()` writes it.
-fn stat64(h: &[u8; 144]) -> [u8; 96] {
-    let mut t = [0u8; 96];
+/// `struct stat64` from the host's `struct stat`, laid out as the kernel's `cp_new_stat64()`
+/// writes it: i386's, or with `eabi` the ARM EABI one, `struct target_eabi_stat64`, whose
+/// 64-bit members from `st_size` on are 8-byte aligned.
+fn stat64(h: &[u8; 144], eabi: bool) -> Vec<u8> {
+    // st_size, st_blksize, st_blocks, st_atime, st_ino and the size.
+    let (size, blksize, blocks, times, ino_at, len) =
+        if eabi { (48, 56, 64, 72, 96, 104) } else { (44, 52, 56, 64, 88, 96) };
+    let mut t = vec![0u8; len];
     let ino = get64(h, 8);
     put64(&mut t, 0, get64(h, 0));
     put32(&mut t, 12, ino as u32);
@@ -111,13 +123,13 @@ fn stat64(h: &[u8; 144]) -> [u8; 96] {
     put32(&mut t, 24, get32(h, 28));
     put32(&mut t, 28, get32(h, 32));
     put64(&mut t, 32, get64(h, 40));
-    put64(&mut t, 44, get64(h, 48));
-    put32(&mut t, 52, get64(h, 56) as u32);
-    put64(&mut t, 56, get64(h, 64));
+    put64(&mut t, size, get64(h, 48));
+    put32(&mut t, blksize, get64(h, 56) as u32);
+    put64(&mut t, blocks, get64(h, 64));
     for i in 0..6 {
-        put32(&mut t, 64 + 4 * i, get64(h, 72 + 8 * i) as u32);
+        put32(&mut t, times + 4 * i, get64(h, 72 + 8 * i) as u32);
     }
-    put64(&mut t, 88, ino);
+    put64(&mut t, ino_at, ino);
     t
 }
 
@@ -295,23 +307,35 @@ fn flock_cmd(cmd: u64) -> Option<(u64, bool)> {
     })
 }
 
+/// The offsets of `l_start`, `l_len` and `l_pid` in the target's `struct flock`, or with `wide`
+/// its `struct flock64`, and the size. i386 packs `struct flock64`; the ARM EABI aligns its
+/// 64-bit members to 8 bytes, `struct target_eabi_flock64`.
+fn flock_layout(wide: bool, eabi: bool) -> [usize; 4] {
+    match (wide, eabi) {
+        (false, _) => [4, 8, 12, 16],
+        (true, false) => [4, 12, 20, 24],
+        (true, true) => [8, 16, 24, 32],
+    }
+}
+
 /// `fcntl()` and `fcntl64()`: the locks are converted, the rest go to the host as they are.
-fn do_fcntl(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>, a: [u64; 6]) -> i64 {
+fn do_fcntl(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>, a: [u64; 6], eabi: bool) -> i64 {
     let Some((cmd, wide)) = flock_cmd(a[1]) else {
         return syscall::do_syscall(p, t, cpu, libc::SYS_fcntl as u64, a);
     };
+    let [start_at, len_at, pid_at, size] = flock_layout(wide, eabi);
     let r = (|| {
         let mut fl = [0u8; 32];
-        let size = if wide { 24 } else { 16 };
-        let mut b = [0u8; 24];
+        let mut b = [0u8; 32];
         if !p.space().read(a[2], &mut b[..size]) {
             return Err(-EFAULT);
         }
         fl[..4].copy_from_slice(&b[..4]);
         let (start, len, pid) = if wide {
-            (get64(&b, 4), get64(&b, 12), get32(&b, 20))
+            (get64(&b, start_at), get64(&b, len_at), get32(&b, pid_at))
         } else {
-            (sx(u64::from(get32(&b, 4))), sx(u64::from(get32(&b, 8))), get32(&b, 12))
+            let start = sx(u64::from(get32(&b, start_at)));
+            (start, sx(u64::from(get32(&b, len_at))), get32(&b, pid_at))
         };
         put64(&mut fl, 8, start);
         put64(&mut fl, 16, len);
@@ -323,14 +347,13 @@ fn do_fcntl(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>, a: [u64; 6]) -> i64 
         if cmd == 5 || cmd == 36 {
             b[..4].copy_from_slice(&fl[..4]);
             if wide {
-                put64(&mut b, 4, get64(&fl, 8));
-                put64(&mut b, 12, get64(&fl, 16));
-                put32(&mut b, 20, get32(&fl, 24));
+                put64(&mut b, start_at, get64(&fl, 8));
+                put64(&mut b, len_at, get64(&fl, 16));
             } else {
-                put32(&mut b, 4, get64(&fl, 8) as u32);
-                put32(&mut b, 8, get64(&fl, 16) as u32);
-                put32(&mut b, 12, get32(&fl, 24));
+                put32(&mut b, start_at, get64(&fl, 8) as u32);
+                put32(&mut b, len_at, get64(&fl, 16) as u32);
             }
+            put32(&mut b, pid_at, get32(&fl, 24));
             p.put(a[2], &b[..size])?;
         }
         Ok(r)
@@ -485,6 +508,7 @@ pub(crate) fn do_syscall(
     host_nr: Option<i64>,
     a: [u64; 6],
 ) -> i64 {
+    let eabi = crate::guest::guest().eabi;
     let r = (|| -> Res {
         Ok(match name {
             "waitpid" => return wait4(p, a[0], a[1], a[2], 0),
@@ -507,15 +531,33 @@ pub(crate) fn do_syscall(
             }
             "truncate" => call(p, t, cpu, libc::SYS_truncate, [a[0], sx(a[1]), 0, 0, 0, 0]),
             "ftruncate" => call(p, t, cpu, libc::SYS_ftruncate, [a[0], sx(a[1]), 0, 0, 0, 0]),
-            "truncate64" => {
-                call(p, t, cpu, libc::SYS_truncate, [a[0], pair(a[1], a[2]), 0, 0, 0, 0])
-            }
-            "ftruncate64" => {
-                call(p, t, cpu, libc::SYS_ftruncate, [a[0], pair(a[1], a[2]), 0, 0, 0, 0])
+            "truncate64" | "ftruncate64" => {
+                let n = if name == "truncate64" { libc::SYS_truncate } else { libc::SYS_ftruncate };
+                let (len, _) = arg64(&a, 1, eabi);
+                call(p, t, cpu, n, [a[0], len, 0, 0, 0, 0])
             }
             "pread64" | "pwrite64" => {
                 let n = if name == "pread64" { libc::SYS_pread64 } else { libc::SYS_pwrite64 };
-                call(p, t, cpu, n, [a[0], a[1], a[2], pair(a[3], a[4]), 0, 0])
+                let (pos, _) = arg64(&a, 3, eabi);
+                call(p, t, cpu, n, [a[0], a[1], a[2], pos, 0, 0])
+            }
+            "readahead" => {
+                let (off, i) = arg64(&a, 1, eabi);
+                call(p, t, cpu, libc::SYS_readahead, [a[0], off, a[i], 0, 0, 0])
+            }
+            // The ARM calls that take the 32-bit argument before the 64-bit ones, so that
+            // these need no padding.
+            "arm_fadvise64_64" => {
+                let h = [a[0], pair(a[2], a[3]), pair(a[4], a[5]), a[1], 0, 0];
+                call(p, t, cpu, libc::SYS_fadvise64, h)
+            }
+            "arm_sync_file_range" => {
+                let h = [a[0], pair(a[2], a[3]), pair(a[4], a[5]), a[1], 0, 0];
+                call(p, t, cpu, libc::SYS_sync_file_range, h)
+            }
+            "sync_file_range" => {
+                let h = [a[0], pair(a[1], a[2]), pair(a[3], a[4]), a[5], 0, 0];
+                call(p, t, cpu, libc::SYS_sync_file_range, h)
             }
             "fadvise64" => {
                 call(p, t, cpu, libc::SYS_fadvise64, [a[0], pair(a[1], a[2]), a[3], a[4], 0, 0])
@@ -525,8 +567,15 @@ pub(crate) fn do_syscall(
                 call(p, t, cpu, libc::SYS_fadvise64, h)
             }
             "fallocate" => {
-                let h = [a[0], a[1], pair(a[2], a[3]), pair(a[4], a[5]), 0, 0];
-                call(p, t, cpu, libc::SYS_fallocate, h)
+                let (off, i) = arg64(&a, 2, eabi);
+                let (len, _) = arg64(&a, i, eabi);
+                call(p, t, cpu, libc::SYS_fallocate, [a[0], a[1], off, len, 0, 0])
+            }
+            "send" => call(p, t, cpu, libc::SYS_sendto, [a[0], a[1], a[2], a[3], 0, 0]),
+            "recv" => call(p, t, cpu, libc::SYS_recvfrom, [a[0], a[1], a[2], a[3], 0, 0]),
+            // The EABI `struct epoll_event` is not the host's, which `epoll_pwait()` converts.
+            "epoll_wait" if eabi => {
+                call(p, t, cpu, libc::SYS_epoll_pwait, [a[0], a[1], a[2], a[3], 0, 0])
             }
             "readv" | "writev" => {
                 let n = if name == "readv" { libc::SYS_readv } else { libc::SYS_writev };
@@ -571,7 +620,7 @@ pub(crate) fn do_syscall(
                     _ => (host_stat(p, sx(a[0]), Some(a[1]), a[3])?, a[2]),
                 };
                 if name.ends_with('4') {
-                    p.put(out, &stat64(&st))?;
+                    p.put(out, &stat64(&st, eabi))?;
                 } else {
                     p.put(out, &stat32(&st))?;
                 }
@@ -593,7 +642,7 @@ pub(crate) fn do_syscall(
                 r
             }
             "getdents" => return getdents(p, a[0], a[1], a[2]),
-            "fcntl" | "fcntl64" => do_fcntl(p, t, cpu, a),
+            "fcntl" | "fcntl64" => do_fcntl(p, t, cpu, a, eabi),
             "clone" => call(p, t, cpu, libc::SYS_clone, [a[0], a[1], a[2], a[4], a[3], 0]),
             "execve" => call(p, t, cpu, libc::SYS_execve, a),
             "execveat" => {
@@ -798,4 +847,54 @@ pub(crate) fn do_syscall(
         })
     })();
     r.unwrap_or_else(|e| e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eabi_register_pairs_start_even() {
+        let a = [1, 2, 3, 4, 5, 6];
+        // pread64(fd, buf, count, pos): the i386 pair is R3 and R4, the EABI one R4 and R5.
+        assert_eq!(arg64(&a, 3, false), (4 | 5 << 32, 5));
+        assert_eq!(arg64(&a, 3, true), (5 | 6 << 32, 6));
+        // An even index stays where it is.
+        assert_eq!(arg64(&a, 2, true), (3 | 4 << 32, 4));
+        assert_eq!(pair(0xffff_ffff_8000_0000, 1), 0x1_8000_0000);
+    }
+
+    #[test]
+    fn stat64_layouts() {
+        let mut h = [0u8; 144];
+        put64(&mut h, 8, 0x1_0000_0002);
+        put64(&mut h, 48, 0x1234_5678_9abc);
+        put64(&mut h, 56, 4096);
+        put64(&mut h, 64, 77);
+        put64(&mut h, 72, 1000);
+        put64(&mut h, 104, 3000);
+        let i386 = stat64(&h, false);
+        assert_eq!(i386.len(), 96);
+        assert_eq!(get64(&i386, 44), 0x1234_5678_9abc);
+        assert_eq!(get32(&i386, 52), 4096);
+        assert_eq!(get64(&i386, 56), 77);
+        assert_eq!(get32(&i386, 64), 1000);
+        assert_eq!(get64(&i386, 88), 0x1_0000_0002);
+        let eabi = stat64(&h, true);
+        assert_eq!(eabi.len(), 104);
+        assert_eq!(get32(&eabi, 12), 2);
+        assert_eq!(get64(&eabi, 48), 0x1234_5678_9abc);
+        assert_eq!(get32(&eabi, 56), 4096);
+        assert_eq!(get64(&eabi, 64), 77);
+        assert_eq!(get32(&eabi, 72), 1000);
+        assert_eq!(get32(&eabi, 88), 3000);
+        assert_eq!(get64(&eabi, 96), 0x1_0000_0002);
+    }
+
+    #[test]
+    fn flock64_layouts() {
+        assert_eq!(flock_layout(false, true), flock_layout(false, false));
+        assert_eq!(flock_layout(true, false), [4, 12, 20, 24]);
+        assert_eq!(flock_layout(true, true), [8, 16, 24, 32]);
+    }
 }
