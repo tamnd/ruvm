@@ -2,10 +2,8 @@
 
 //! The i386 target, `qemu-i386`: the x86 front end with a 32-bit code segment, the
 //! `TARGET_ABI32` parts of `linux-user/i386/cpu_loop.c` and `do_set_thread_area()`. The
-//! system calls go through [`compat`](crate::compat).
-//!
-//! Signal frames are not there yet: a signal with a handler kills the program with `SIGSEGV`,
-//! as a frame that does not fit on the stack would.
+//! system calls go through [`compat`](crate::compat), and the signal frames are the
+//! `TARGET_X86_64`-less ones of `linux-user/i386/signal.c`.
 
 mod syscalls;
 
@@ -22,12 +20,14 @@ use ruvm_target_x86::state::{
     R_EAX, R_EBP, R_EBX, R_ECX, R_EDI, R_EDX, R_ES, R_ESI, R_ESP, R_FS, R_GS, R_SS, SegmentCache,
 };
 use ruvm_target_x86::tcg::env::{self, EIP, HF_OSFXSR_MASK, SEG_BASE, SEG_SIZE, SEGS};
-use ruvm_target_x86::tcg::user::cpu_x86_load_seg;
+use ruvm_target_x86::tcg::user::{
+    cpu_x86_frstor, cpu_x86_fsave, cpu_x86_fxrstor, cpu_x86_load_seg,
+};
 use ruvm_target_x86::tcg::{
     EXCP_SYSCALL, EXCP00_DIVZ, EXCP0B_NOSEG, EXCP0C_STACK, EXCP0D_GPF, EXCP0E_PAGE, EXCP01_DB,
     EXCP03_INT3, EXCP04_INTO, EXCP05_BOUND, EXCP06_ILLOP, X86, helper_registry, jit_config,
 };
-use ruvm_user_common::GuestSpace;
+use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page};
 
 use crate::compat;
 use crate::elf::{Arch, ImageInfo};
@@ -38,7 +38,7 @@ use crate::start;
 use crate::strace;
 use crate::syscall::{Proc, THREAD_EXIT};
 use crate::x86_64::{
-    IF_MASK, USER_DS, UserCpu, cpuid, flat_descriptor, gate64, map_rw, reg, set_reg,
+    self, IF_MASK, USER_DS, UserCpu, cpuid, flat_descriptor, gate64, map_rw, reg, set_reg,
 };
 
 use syscalls::SYSCALLS;
@@ -262,22 +262,361 @@ fn initial_state(
     Ok(s)
 }
 
-/// What a 32-bit program's signal handler would be entered with; the frames are not written
-/// yet, so the program gets `SIGSEGV`.
-fn setup_rt_frame(
-    _space: &GuestSpace,
-    t: &mut Task,
-    _cpu: &mut Cpu<'_>,
-    sig: i32,
-    _sa: &Sigaction,
-    _info: &signal::Info,
-    _old: u64,
-) {
-    signal::force_sigsegv(t, sig);
+/// The sigreturn trampolines, `setup_sigtramp()`: QEMU has them in the vDSO.
+static SIGTRAMP: OnceLock<u64> = OnceLock::new();
+/// Whether the CPU has FXSR, for `get_fpstate_kind()`.
+static FXSR: OnceLock<bool> = OnceLock::new();
+
+/// `TARGET_NR_sigreturn` and `TARGET_NR_rt_sigreturn`.
+const NR_SIGRETURN: u32 = 119;
+const NR_RT_SIGRETURN: u32 = 173;
+
+/// `install_sigtramp()`: `popl %eax; movl $119, %eax; int $0x80`.
+fn sigtramp() -> [u8; 8] {
+    let mut c = [0x58, 0xb8, 0, 0, 0, 0, 0xcd, 0x80];
+    put32(&mut c, 2, NR_SIGRETURN);
+    c
 }
 
-fn do_rt_sigreturn(_space: &GuestSpace, t: &mut Task, _cpu: &mut Cpu<'_>) -> i64 {
-    signal::force_sig(t, signal::SIGSEGV);
+/// `install_rt_sigtramp()`: `movl $173, %eax; int $0x80`.
+fn rt_sigtramp() -> [u8; 8] {
+    let mut c = [0xb8, 0, 0, 0, 0, 0xcd, 0x80, 0];
+    put32(&mut c, 1, NR_RT_SIGRETURN);
+    c
+}
+
+/// The page of the trampolines, where QEMU loads the vDSO: `sigreturn` at the start and
+/// `rt_sigreturn` 8 bytes in.
+fn map_sigtramp(space: &GuestSpace) -> Result<u64, String> {
+    let kind = MapKind { anon: true, ..MapKind::default() };
+    let err = |e| format!("mmap: {}", crate::strerror(e));
+    let addr = space.mmap(0, PAGE_SIZE, page::READ | page::WRITE, kind, None, 0).map_err(err)?;
+    space.write_raw(addr, &sigtramp());
+    space.write_raw(addr + 8, &rt_sigtramp());
+    space.mprotect(addr, PAGE_SIZE, page::READ | page::EXEC).map_err(err)?;
+    Ok(addr)
+}
+
+/// `struct sigframe`: the return address, the signal, the `sigcontext`, the unused
+/// `fpstate`, the high word of the mask and the return code.
+const FRAME_SIZE: u32 = 732;
+const SIGFRAME_SC: usize = 8;
+const EXTRAMASK: usize = 720;
+const RETCODE: usize = 724;
+/// `struct rt_sigframe`: the return address, the signal, the pointers to the `siginfo` and
+/// the `ucontext`, which follow, and the return code.
+const RT_FRAME_SIZE: u32 = 268;
+const INFO: usize = 16;
+const UC: usize = 144;
+const UC_STACK: usize = UC + 8;
+const UC_MCONTEXT: usize = UC + 20;
+const UC_SIGMASK: usize = UC + 108;
+const RT_RETCODE: usize = 260;
+/// `struct target_sigcontext_32`, after GS, FS, ES and DS: EDI to EAX, in this order.
+const SC_REGS: [usize; 8] = [R_EDI, R_ESI, R_EBP, R_ESP, R_EBX, R_EDX, R_ECX, R_EAX];
+const SC_TRAPNO: usize = 48;
+const SC_ERR: usize = 52;
+const SC_EIP: usize = 56;
+const SC_CS: usize = 60;
+const SC_EFLAGS: usize = 64;
+const SC_ESP_AT_SIGNAL: usize = 68;
+const SC_SS: usize = 72;
+const SC_FPSTATE: usize = 76;
+const SC_OLDMASK: usize = 80;
+const SC_CR2: usize = 84;
+/// `struct target_fregs_state`, what FSAVE writes with `status` and `magic` after it.
+const FREGS_SIZE: u32 = 112;
+
+/// `FPStateKind`.
+#[derive(Clone, Copy, PartialEq)]
+enum FpKind {
+    Fsave,
+    Fxsave,
+    Xsave,
+}
+
+/// `get_fpstate_kind()`.
+fn fpstate_kind(cpu: &Cpu<'_>) -> FpKind {
+    if x86_64::uses_xsave(cpu) {
+        FpKind::Xsave
+    } else if FXSR.get().copied().unwrap_or(false) {
+        FpKind::Fxsave
+    } else {
+        FpKind::Fsave
+    }
+}
+
+/// `get_fpstate_size()`.
+fn fpstate_size(cpu: &Cpu<'_>, kind: FpKind) -> u32 {
+    match kind {
+        FpKind::Xsave => x86_64::fpstate_size(cpu, true) as u32,
+        FpKind::Fxsave => 512,
+        FpKind::Fsave => FREGS_SIZE,
+    }
+}
+
+/// `get_sigframe()`: the frame, the FSAVE state, the FXSAVE or XSAVE state and the end.
+fn get_sigframe(
+    t: &Task,
+    cpu: &Cpu<'_>,
+    sa: &Sigaction,
+    size: u32,
+    kind: FpKind,
+) -> (u32, u32, u32, u32) {
+    let mut sp = reg(cpu, R_ESP) as u32;
+    if sa.flags & signal::SA_ONSTACK != 0 {
+        sp = signal::target_sigsp(t, sp.into(), sa) as u32;
+    } else if env::ld32(cpu.env, SEGS + R_SS * SEG_SIZE) & 0xffff != USER_DS
+        && sa.flags & signal::SA_RESTORER == 0
+        && sa.restorer != 0
+    {
+        // The legacy stack switch.
+        sp = sa.restorer as u32;
+    }
+    let math = fpstate_size(cpu, kind);
+    sp = sp.wrapping_sub(math) & !63;
+    let fpend = sp.wrapping_add(math);
+    let fxstate = sp;
+    if kind != FpKind::Fsave {
+        sp = sp.wrapping_sub(FREGS_SIZE);
+    }
+    let fpstate = sp;
+    sp = sp.wrapping_sub(size).wrapping_add(4) & !15;
+    (sp.wrapping_sub(4), fpstate, fxstate, fpend)
+}
+
+/// `setup_sigcontext()` into `sc`, and the floating point state into guest memory; false
+/// when that does not write.
+#[allow(clippy::too_many_arguments)]
+fn setup_sigcontext(
+    space: &GuestSpace,
+    cpu: &mut Cpu<'_>,
+    sc: &mut [u8],
+    mask: u32,
+    kind: FpKind,
+    fpstate: u32,
+    fxstate: u32,
+    fpend: u32,
+) -> bool {
+    let sel = |cpu: &Cpu<'_>, s: usize| env::ld32(cpu.env, SEGS + s * SEG_SIZE);
+    for (i, s) in [R_GS, R_FS, R_ES, R_DS].into_iter().enumerate() {
+        put32(sc, 4 * i, sel(cpu, s));
+    }
+    for (i, r) in SC_REGS.into_iter().enumerate() {
+        put32(sc, 16 + 4 * i, reg(cpu, r) as u32);
+    }
+    put32(sc, SC_TRAPNO, cpu.core.exception_index as u32);
+    put32(sc, SC_ERR, env::ld32(cpu.env, env::ERROR_CODE));
+    put32(sc, SC_EIP, env::ld64(cpu.env, EIP) as u32);
+    put32(sc, SC_CS, sel(cpu, R_CS));
+    put32(sc, SC_EFLAGS, env::ld64(cpu.env, env::EFLAGS) as u32);
+    put32(sc, SC_ESP_AT_SIGNAL, reg(cpu, R_ESP) as u32);
+    put32(sc, SC_SS, sel(cpu, R_SS));
+
+    // FSAVE resets the FPU, and QEMU saves the FXSAVE or XSAVE state after it.
+    let (fp, fx) = (u64::from(fpstate), u64::from(fxstate));
+    // status repeats the status word; magic is 0xffff when FXSAVE or XSAVE state follows.
+    let mut tail = [0u8; 4];
+    if kind != FpKind::Fsave {
+        tail[2..].fill(0xff);
+    }
+    let ok = cpu_x86_fsave(cpu, fp).is_ok()
+        && space.read(fp + 4, &mut tail[..2])
+        && space.write_raw(fp + u64::from(FREGS_SIZE) - 4, &tail)
+        && (kind == FpKind::Fsave
+            || x86_64::save_fpstate(space, cpu, kind == FpKind::Xsave, fp, fx, fpend.into()));
+    put32(sc, SC_FPSTATE, fpstate);
+    put32(sc, SC_OLDMASK, mask);
+    put32(sc, SC_CR2, env::ld64(cpu.env, env::cr(2)) as u32);
+    ok
+}
+
+/// The registers both frames enter the handler with.
+fn enter_handler(cpu: &mut Cpu<'_>, frame: u32, handler: u64, sig: i32, rt: bool) {
+    set_reg(cpu, R_ESP, frame.into());
+    env::st64(cpu.env, EIP, handler & 0xffff_ffff);
+    set_reg(cpu, R_EAX, sig as u64);
+    let (edx, ecx) = if rt { (frame + INFO as u32, frame + UC as u32) } else { (0, 0) };
+    set_reg(cpu, R_EDX, edx.into());
+    set_reg(cpu, R_ECX, ecx.into());
+    let segs = if rt {
+        [(R_DS, USER_DS), (R_ES, USER_DS), (R_CS, USER_CS), (R_SS, USER_DS)]
+    } else {
+        [(R_DS, USER_DS), (R_ES, USER_DS), (R_SS, USER_DS), (R_CS, USER_CS)]
+    };
+    for (seg, s) in segs {
+        if cpu_x86_load_seg(cpu, seg, s).is_err() {
+            break;
+        }
+    }
+    let fl = env::ld64(cpu.env, env::EFLAGS);
+    env::st64(cpu.env, env::EFLAGS, fl & !x86_64::TF_MASK);
+}
+
+/// `setup_frame()`: the frame of a handler without `SA_SIGINFO`. `old` is the guest mask to
+/// return to.
+fn setup_frame(
+    space: &GuestSpace,
+    t: &mut Task,
+    cpu: &mut Cpu<'_>,
+    sig: i32,
+    sa: &Sigaction,
+    _info: &signal::Info,
+    old: u64,
+) {
+    let kind = fpstate_kind(cpu);
+    let (frame, fpstate, fxstate, fpend) = get_sigframe(t, cpu, sa, FRAME_SIZE, kind);
+    let mut f = [0u8; FRAME_SIZE as usize];
+    let addr = u64::from(frame);
+    if fpend < frame
+        || !space.check(addr, u64::from(fpend - frame), page::WRITE)
+        || !space.read_raw(addr, &mut f)
+    {
+        signal::force_sigsegv(t, sig);
+        return;
+    }
+    let sc = &mut f[SIGFRAME_SC..SIGFRAME_SC + 88];
+    if !setup_sigcontext(space, cpu, sc, old as u32, kind, fpstate, fxstate, fpend) {
+        cpu.core.exception_index = -1;
+        signal::force_sigsegv(t, sig);
+        return;
+    }
+    put32(&mut f, EXTRAMASK, (old >> 32) as u32);
+    if sa.flags & signal::SA_RESTORER != 0 {
+        put32(&mut f, 0, sa.restorer as u32);
+    } else {
+        f[RETCODE..].copy_from_slice(&sigtramp());
+        put32(&mut f, 0, *SIGTRAMP.get().expect("the vCPU is created first") as u32);
+    }
+    put32(&mut f, 4, sig as u32);
+    space.write_raw(addr, &f);
+    enter_handler(cpu, frame, sa.handler, sig, false);
+}
+
+/// `setup_rt_frame()`.
+fn setup_rt_frame(
+    space: &GuestSpace,
+    t: &mut Task,
+    cpu: &mut Cpu<'_>,
+    sig: i32,
+    sa: &Sigaction,
+    info: &signal::Info,
+    old: u64,
+) {
+    let kind = fpstate_kind(cpu);
+    let (frame, fpstate, fxstate, fpend) = get_sigframe(t, cpu, sa, RT_FRAME_SIZE, kind);
+    let mut f = [0u8; RT_FRAME_SIZE as usize];
+    let addr = u64::from(frame);
+    if fpend < frame
+        || !space.check(addr, u64::from(fpend - frame), page::WRITE)
+        || !space.read_raw(addr, &mut f)
+    {
+        signal::force_sigsegv(t, sig);
+        return;
+    }
+    if sa.flags & signal::SA_SIGINFO != 0 {
+        f[INFO..UC].copy_from_slice(&signal::guest_siginfo(info));
+    }
+    put32(&mut f, UC, u32::from(kind == FpKind::Xsave));
+    put32(&mut f, UC + 4, 0);
+    let esp = reg(cpu, R_ESP) & 0xffff_ffff;
+    f[UC_STACK..UC_MCONTEXT].copy_from_slice(&signal::save_altstack(t, esp)[..12]);
+    let sc = &mut f[UC_MCONTEXT..UC_SIGMASK];
+    if !setup_sigcontext(space, cpu, sc, old as u32, kind, fpstate, fxstate, fpend) {
+        cpu.core.exception_index = -1;
+        signal::force_sigsegv(t, sig);
+        return;
+    }
+    put32(&mut f, UC_SIGMASK, old as u32);
+    put32(&mut f, UC_SIGMASK + 4, (old >> 32) as u32);
+    if sa.flags & signal::SA_RESTORER != 0 {
+        put32(&mut f, 0, sa.restorer as u32);
+    } else {
+        f[RT_RETCODE..].copy_from_slice(&rt_sigtramp());
+        put32(&mut f, 0, *SIGTRAMP.get().expect("the vCPU is created first") as u32 + 8);
+    }
+    put32(&mut f, 4, sig as u32);
+    put32(&mut f, 8, frame + INFO as u32);
+    put32(&mut f, 12, frame + UC as u32);
+    space.write_raw(addr, &f);
+    enter_handler(cpu, frame, sa.handler, sig, true);
+}
+
+/// `restore_sigcontext()` from `sc`, false when the floating point state does not load.
+fn restore_sigcontext(space: &GuestSpace, cpu: &mut Cpu<'_>, sc: &[u8]) -> bool {
+    // A selector that does not load leaves a #GP for the next instruction.
+    let seg = |i: usize| u32::from(get32(sc, i) as u16);
+    let _ = [R_GS, R_FS, R_ES, R_DS]
+        .into_iter()
+        .enumerate()
+        .try_for_each(|(i, s)| cpu_x86_load_seg(cpu, s, seg(4 * i)));
+    for (i, r) in SC_REGS.into_iter().enumerate() {
+        set_reg(cpu, r, get32(sc, 16 + 4 * i).into());
+    }
+    env::st64(cpu.env, EIP, get32(sc, SC_EIP).into());
+    if cpu_x86_load_seg(cpu, R_CS, seg(SC_CS) | 3).is_ok() {
+        let _ = cpu_x86_load_seg(cpu, R_SS, seg(SC_SS) | 3);
+    }
+    let fl = env::ld64(cpu.env, env::EFLAGS);
+    let tmp = u64::from(get32(sc, SC_EFLAGS));
+    let fix = x86_64::FIX_EFLAGS;
+    env::st64(cpu.env, env::EFLAGS, (fl & !fix) | (tmp & fix));
+
+    let fp = u64::from(get32(sc, SC_FPSTATE));
+    if fp == 0 {
+        return true;
+    }
+    // frstor_sigcontext(): the FXSAVE or XSAVE state, then the FSAVE state over it.
+    let kind = fpstate_kind(cpu);
+    let mut math = u64::from(fpstate_size(cpu, kind));
+    if kind != FpKind::Fsave {
+        math += u64::from(FREGS_SIZE);
+    }
+    if !space.check(fp, math, page::READ) {
+        return false;
+    }
+    let fx = fp + u64::from(FREGS_SIZE);
+    let fx_ok = match kind {
+        FpKind::Xsave => x86_64::restore_fpstate(space, cpu, fx),
+        FpKind::Fxsave => cpu_x86_fxrstor(cpu, fx).is_ok(),
+        FpKind::Fsave => true,
+    };
+    fx_ok && cpu_x86_frstor(cpu, fp).is_ok()
+}
+
+/// `do_sigreturn()`.
+fn do_sigreturn(space: &GuestSpace, t: &mut Task, cpu: &mut Cpu<'_>) -> i64 {
+    let frame = reg(cpu, R_ESP).wrapping_sub(8) & 0xffff_ffff;
+    let mut f = [0u8; FRAME_SIZE as usize];
+    if !space.read(frame, &mut f) {
+        signal::force_sig(t, signal::SIGSEGV);
+        return signal::ESIGRETURN;
+    }
+    let sc = &f[SIGFRAME_SC..SIGFRAME_SC + 88];
+    let mask = u64::from(get32(sc, SC_OLDMASK)) | (u64::from(get32(&f, EXTRAMASK)) << 32);
+    signal::set_sigmask(t, signal::t2h_set(mask));
+    if !restore_sigcontext(space, cpu, sc) {
+        signal::force_sig(t, signal::SIGSEGV);
+    }
+    signal::ESIGRETURN
+}
+
+/// `do_rt_sigreturn()`.
+fn do_rt_sigreturn(space: &GuestSpace, t: &mut Task, cpu: &mut Cpu<'_>) -> i64 {
+    let frame = reg(cpu, R_ESP).wrapping_sub(4) & 0xffff_ffff;
+    let mut f = [0u8; RT_FRAME_SIZE as usize];
+    if !space.read(frame, &mut f) {
+        signal::force_sig(t, signal::SIGSEGV);
+        return signal::ESIGRETURN;
+    }
+    let mask = u64::from(get32(&f, UC_SIGMASK)) | (u64::from(get32(&f, UC_SIGMASK + 4)) << 32);
+    signal::set_sigmask(t, signal::t2h_set(mask));
+    if !restore_sigcontext(space, cpu, &f[UC_MCONTEXT..UC_SIGMASK]) {
+        signal::force_sig(t, signal::SIGSEGV);
+        return signal::ESIGRETURN;
+    }
+    let sp = reg(cpu, R_ESP);
+    let _ = signal::restore_altstack(t, &f[UC_STACK..UC_MCONTEXT], sp);
     signal::ESIGRETURN
 }
 
@@ -296,6 +635,12 @@ fn do_syscall(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>, nr: u64, a: [u64; 
     match name {
         "set_thread_area" => set_thread_area(p.space(), cpu, a[0]),
         "get_thread_area" => get_thread_area(p.space(), cpu, a[0]),
+        "sigreturn" => {
+            if signal::block_signals(t) {
+                return signal::ERESTARTSYS;
+            }
+            do_sigreturn(p.space(), t, cpu)
+        }
         _ => compat::do_syscall(p, t, cpu, name, (host >= 0).then_some(i64::from(host)), a),
     }
 }
@@ -388,6 +733,7 @@ pub(crate) static GUEST: Guest = Guest {
     },
     set_tls,
     cpu_loop,
+    setup_frame: Some(setup_frame),
     setup_rt_frame,
     rt_sigreturn: do_rt_sigreturn,
 };
@@ -464,6 +810,8 @@ impl start::Target for Target {
         info: &ImageInfo,
     ) -> Result<Vcpu, String> {
         let model = self.model.take().expect("the CPU is selected first");
+        let _ = FXSR.set(cpuid(&model, 1, 0)[3] & (1 << 24) != 0);
+        let _ = SIGTRAMP.set(map_sigtramp(space)?);
         let state = initial_state(&model, space, info.entry, info.start_stack)?;
         let _ = SPACE.set(Arc::clone(space));
         let x86 = Arc::new(X86::new(model).with_user_mode());

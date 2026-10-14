@@ -47,15 +47,15 @@
 //!   FPMR signal frame records, and `rt_sigreturn()` keeps the program at EL0t whatever the
 //!   frame says. Handlers without `SA_RESTORER` return through a page QEMU maps when it has
 //!   no vDSO.
-//! - i386 programs cannot set signal handlers yet: `rt_sigaction()`, `sigaltstack()` and the
-//!   old signal calls are `ENOSYS`, as are the socket, System V IPC, POSIX timer and message
-//!   queue calls, `vm86()` and `modify_ldt()`.
-//! - arm programs are EABI ones, little endian, with the same limits as i386 programs: no
-//!   signal handlers and `ENOSYS` for the calls i386 does not have. An OABI call, an SVC with
-//!   a nonzero immediate, is `ENOSYS` but for the private calls (`set_tls` and the others).
-//!   There is no commpage, so the kuser helpers are not there, no FPA emulation, no FDPIC
-//!   and no `-g`. The hardware capabilities leave out Advanced SIMD and the crypto
-//!   instructions.
+//! - On i386 the socket, System V IPC, POSIX timer and message queue calls, `vm86()` and
+//!   `modify_ldt()` are `ENOSYS`. There is no vDSO: the signal return trampolines are on a
+//!   page where QEMU loads it.
+//! - arm programs are EABI ones, little endian. They cannot set signal handlers yet:
+//!   `rt_sigaction()`, `sigaltstack()` and the old signal calls are `ENOSYS`, as are the calls
+//!   i386 does not have. An OABI call, an SVC with a nonzero immediate, is `ENOSYS` but for
+//!   the private calls (`set_tls` and the others). There is no commpage, so the kuser helpers
+//!   are not there, no FPA emulation, no FDPIC and no `-g`. The hardware capabilities leave
+//!   out Advanced SIMD and the crypto instructions.
 //! - The guest space is a 64 TiB reservation, as QEMU lays it out with `-R`, so addresses
 //!   differ from QEMU's default layout. For i386 and arm it is the whole 4 GiB, as in QEMU.
 

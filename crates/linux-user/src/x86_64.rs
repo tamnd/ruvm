@@ -425,18 +425,45 @@ const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
 /// The legacy area and the XSAVE header.
 const XSAVE_MIN: u64 = 512 + 64;
 /// `TF_MASK`.
-const TF_MASK: u64 = 1 << 8;
+pub(crate) const TF_MASK: u64 = 1 << 8;
 /// The flags `sigreturn()` takes from the frame: CF, PF, AF, ZF, SF, TF, DF, OF and AC.
-const FIX_EFLAGS: u64 = 0x40DD5;
+pub(crate) const FIX_EFLAGS: u64 = 0x40DD5;
 
 /// `get_fpstate_kind()`: whether frames carry XSAVE state rather than FXSAVE state.
-fn uses_xsave(cpu: &Cpu<'_>) -> bool {
+pub(crate) fn uses_xsave(cpu: &Cpu<'_>) -> bool {
     env::ld64(cpu.env, env::cr(4)) & CR4_OSXSAVE_MASK != 0
 }
 
 /// `get_fpstate_size()`.
-fn fpstate_size(cpu: &Cpu<'_>, xsave: bool) -> u64 {
+pub(crate) fn fpstate_size(cpu: &Cpu<'_>, xsave: bool) -> u64 {
     if xsave { xsave_area_size(cpu, env::ld64(cpu.env, env::XCR0)) as u64 + 4 } else { 512 }
+}
+
+/// `xsave_sigcontext()` or `fxsave_sigcontext()`: the state at `fxstate`, in the frame's
+/// floating point area from `fpstate` to `fpend`, false when it does not write.
+pub(crate) fn save_fpstate(
+    space: &GuestSpace,
+    cpu: &mut Cpu<'_>,
+    xsave: bool,
+    fpstate: u64,
+    fxstate: u64,
+    fpend: u64,
+) -> bool {
+    if !xsave {
+        return cpu_x86_fxsave(cpu, fxstate).is_ok() && space.write_raw(fxstate + FP_SW, &[0u8; 4]);
+    }
+    // XSAVE adds to the header, so it starts out zero.
+    let xcr0 = env::ld64(cpu.env, env::XCR0);
+    let xstate_size = fpend - fxstate - 4;
+    space.write_raw(fxstate + 512, &[0u8; 64]) && cpu_x86_xsave(cpu, fxstate, xcr0).is_ok() && {
+        let mut sw = [0u8; 24];
+        put32(&mut sw, 0, FP_XSTATE_MAGIC1);
+        put32(&mut sw, 4, (fpend - fpstate) as u32);
+        put64(&mut sw, 8, xcr0);
+        put32(&mut sw, 16, xstate_size as u32);
+        space.write_raw(fxstate + FP_SW, &sw)
+            && space.write_raw(fxstate + xstate_size, &FP_XSTATE_MAGIC2.to_le_bytes())
+    }
 }
 
 /// `setup_rt_frame()`: the frame for the handler of `sig` on the guest stack, and the
@@ -488,23 +515,7 @@ fn setup_rt_frame(
     f[SC_CS..SC_CS + 2].copy_from_slice(&sel(cpu, R_CS).to_le_bytes());
     f[SC_CS + 2..SC_SS].fill(0);
     f[SC_SS..SC_SS + 2].copy_from_slice(&sel(cpu, R_SS).to_le_bytes());
-    let fp_ok = if xsave {
-        // xsave_sigcontext(): XSAVE adds to the header, so it starts out zero.
-        let xcr0 = env::ld64(cpu.env, env::XCR0);
-        let xstate_size = fpend - fpstate - 4;
-        space.write_raw(fpstate + 512, &[0u8; 64]) && cpu_x86_xsave(cpu, fpstate, xcr0).is_ok() && {
-            let mut sw = [0u8; 24];
-            put32(&mut sw, 0, FP_XSTATE_MAGIC1);
-            put32(&mut sw, 4, (fpend - fpstate) as u32);
-            put64(&mut sw, 8, xcr0);
-            put32(&mut sw, 16, xstate_size as u32);
-            space.write_raw(fpstate + FP_SW, &sw)
-                && space.write_raw(fpstate + xstate_size, &FP_XSTATE_MAGIC2.to_le_bytes())
-        }
-    } else {
-        cpu_x86_fxsave(cpu, fpstate).is_ok() && space.write_raw(fpstate + FP_SW, &[0u8; 4])
-    };
-    if !fp_ok {
+    if !save_fpstate(space, cpu, xsave, fpstate, fpstate, fpend) {
         cpu.core.exception_index = -1;
         signal::force_sigsegv(t, sig);
         return;
@@ -538,7 +549,7 @@ fn setup_rt_frame(
 }
 
 /// `xrstor_sigcontext()` of the state at `fp`, false when the frame is bad.
-fn restore_fpstate(space: &GuestSpace, cpu: &mut Cpu<'_>, fp: u64) -> bool {
+pub(crate) fn restore_fpstate(space: &GuestSpace, cpu: &mut Cpu<'_>, fp: u64) -> bool {
     let xsave = uses_xsave(cpu);
     let math = fpstate_size(cpu, xsave);
     let mut img = vec![0u8; 512];
@@ -698,6 +709,7 @@ pub(crate) static GUEST: Guest = Guest {
     },
     set_tls,
     cpu_loop,
+    setup_frame: None,
     setup_rt_frame,
     rt_sigreturn: do_rt_sigreturn,
 };
