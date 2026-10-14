@@ -83,7 +83,6 @@
 //! - The default CPU is cortex-a57; QEMU's is the 32-bit cortex-a15, which is not modelled.
 //! - A gzip stream that ends early reports `inflate()` error -5 and corrupt data reports -3,
 //!   as zlib would, but other zlib codes are not reproduced.
-//! - The generic timer deadlines are host [`Instant`]s converted onto the board clock.
 //! - Cache sizes in the CPU nodes come from the legacy CCSIDR layout of each model, which is
 //!   what the four models use.
 

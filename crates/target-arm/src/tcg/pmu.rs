@@ -16,13 +16,9 @@
 //!
 //! Differences from QEMU:
 //!
-//! - The cycle counter counts host nanoseconds since the CPU was made, at QEMU's 1 GHz
-//!   `ARM_CPU_FREQ`, where QEMU counts `QEMU_CLOCK_VIRTUAL`.
 //! - INST_RETIRED needs precise icount in QEMU, which this port does not have, so it is
 //!   never supported, as in QEMU without icount.
 //! - Only the AArch64 views exist, and there are no fine grained traps.
-
-use std::time::{Duration, Instant};
 
 use ruvm_jit::CpuShared;
 
@@ -341,10 +337,8 @@ impl<'a> Pmu<'a> {
         if overflow_in <= 0 {
             return;
         }
-        let Some(at) = Instant::now().checked_add(Duration::from_nanos(overflow_in as u64)) else {
-            return;
-        };
         if let Some(board) = &self.arm.board {
+            let at = self.arm.now_ns().saturating_add(overflow_in);
             board.pmu_timer_anticipate(self.shared, at);
         }
     }

@@ -264,14 +264,15 @@ pub enum PsciConduit {
 pub trait ArmBoard: Send + Sync {
     /// The output of generic timer `timer` (a `GTIMER_*` index) of the vCPU `shared` is now
     /// `level`, as `gt_update_irq()` drives `gt_timer_outputs[]`. `deadline` is when the
-    /// timer next needs recalculating, as QEMU arms `gt_timer[]`; the board calls
+    /// timer next needs recalculating, in nanoseconds of [`ArmBoard::clock_ns`], as QEMU
+    /// arms `gt_timer[]`; the board calls
     /// [`Arm::gt_timer_expired`] then. `None` means the timer is off or will not change.
     fn gt_timer_update(
         &self,
         shared: &CpuShared,
         timer: usize,
         level: bool,
-        deadline: Option<Instant>,
+        deadline: Option<i64>,
     ) {
         let _ = (shared, timer, level, deadline);
     }
@@ -290,12 +291,19 @@ pub trait ArmBoard: Send + Sync {
         let _ = (shared, level);
     }
 
-    /// A PMU counter of the vCPU `shared` may overflow at `deadline`:
-    /// `timer_mod_anticipate()` on `pmu_timer`, so the board moves its timer to `deadline`
-    /// if that is earlier than the one it has (or it has none), and calls
-    /// [`Arm::pmu_timer_expired`] then.
-    fn pmu_timer_anticipate(&self, shared: &CpuShared, deadline: Instant) {
+    /// A PMU counter of the vCPU `shared` may overflow at `deadline`, in nanoseconds of
+    /// [`ArmBoard::clock_ns`]: `timer_mod_anticipate()` on `pmu_timer`, so the board moves
+    /// its timer to `deadline` if that is earlier than the one it has (or it has none), and
+    /// calls [`Arm::pmu_timer_expired`] then.
+    fn pmu_timer_anticipate(&self, shared: &CpuShared, deadline: i64) {
         let _ = (shared, deadline);
+    }
+
+    /// `qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)`: the time the generic timers and the PMU
+    /// cycle counter count, which stops while the VM is stopped and which migration carries.
+    /// The default, `None`, makes them count host time since the [`Arm`] was made.
+    fn clock_ns(&self) -> Option<i64> {
+        None
     }
 
     /// PSCI CPU_ON, `arm_set_cpu_on()`: start the CPU whose MPIDR is `mpidr` at `entry` in
@@ -678,21 +686,30 @@ impl Arm {
         });
     }
 
-    /// The generic timer count at `freq` Hz: host time since the CPU was made.
+    /// The time the generic timers count, in nanoseconds: [`ArmBoard::clock_ns`], or host
+    /// time since the CPU was made when the board has no clock.
+    pub(crate) fn now_ns(&self) -> i64 {
+        match self.board.as_ref().and_then(|b| b.clock_ns()) {
+            Some(ns) => ns,
+            None => i64::try_from(self.start.elapsed().as_nanos()).unwrap_or(i64::MAX),
+        }
+    }
+
+    /// The generic timer count at `freq` Hz, `gt_get_countervalue()`.
     pub(crate) fn counter(&self, freq: u64) -> u64 {
-        let ns = self.start.elapsed().as_nanos();
+        let ns = u128::from(self.now_ns().max(0) as u64);
         (ns * u128::from(freq) / 1_000_000_000) as u64
     }
 
-    /// The host time at which the counter at `freq` Hz reaches `count`, or `None` when that
-    /// is too far away to represent.
-    pub(crate) fn counter_deadline(&self, freq: u64, count: u64) -> Option<Instant> {
+    /// The time, as [`Arm::now_ns`] gives it, at which the counter at `freq` Hz reaches
+    /// `count`, or `None` when that is too far away to represent. It is rounded up, so the
+    /// counter has reached `count` by then.
+    pub(crate) fn counter_deadline(&self, freq: u64, count: u64) -> Option<i64> {
         if freq == 0 {
             return None;
         }
-        let ns = u128::from(count) * 1_000_000_000 / u128::from(freq);
-        let ns = u64::try_from(ns).ok()?;
-        self.start.checked_add(std::time::Duration::from_nanos(ns))
+        let ns = (u128::from(count) * 1_000_000_000).div_ceil(u128::from(freq));
+        i64::try_from(ns).ok()
     }
 }
 
@@ -1378,4 +1395,50 @@ pub fn vfp_set_fpcr(st: &mut CpuArmState, val: u32, f: &ArmFeatures) {
 /// Whether `v` is halted in WFI.
 pub fn vcpu_halted(v: &Vcpu) -> bool {
     v.shared().halted.load(Ordering::Acquire) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use super::*;
+
+    /// A board whose clock reads what the test stores.
+    #[derive(Default)]
+    struct Clocked(AtomicI64);
+
+    impl ArmBoard for Clocked {
+        fn clock_ns(&self) -> Option<i64> {
+            Some(self.0.load(Ordering::Relaxed))
+        }
+    }
+
+    /// The counter counts the board's clock, as QEMU's counts `QEMU_CLOCK_VIRTUAL`.
+    #[test]
+    fn counter_follows_the_board_clock() {
+        let board = Arc::new(Clocked::default());
+        let arm = Arm::new(ArmCpuModel::cortex_a57()).with_board(board.clone());
+        board.0.store(2_000_000_000, Ordering::Relaxed);
+        assert_eq!(arm.counter(62_500_000), 125_000_000);
+        // A destination whose clock the migration set carries on from the source's count.
+        board.0.store(5_000_000_016, Ordering::Relaxed);
+        assert_eq!(arm.counter(62_500_000), 312_500_001);
+        assert_eq!(arm.counter_deadline(62_500_000, 312_500_001), Some(5_000_000_016));
+    }
+
+    /// The deadline is rounded up, so the counter has reached the count by then.
+    #[test]
+    fn counter_deadline_rounds_up() {
+        let board = Arc::new(Clocked::default());
+        let arm = Arm::new(ArmCpuModel::cortex_a57()).with_board(board.clone());
+        let freq = 24_000_000;
+        let ns = arm.counter_deadline(freq, 7).unwrap();
+        assert_eq!(ns, 292);
+        board.0.store(ns, Ordering::Relaxed);
+        assert_eq!(arm.counter(freq), 7);
+        board.0.store(ns - 1, Ordering::Relaxed);
+        assert_eq!(arm.counter(freq), 6);
+        assert_eq!(arm.counter_deadline(0, 7), None);
+        assert_eq!(arm.counter_deadline(1, u64::MAX), None);
+    }
 }

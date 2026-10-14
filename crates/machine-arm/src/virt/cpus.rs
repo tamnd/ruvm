@@ -6,7 +6,6 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
-use std::time::Instant;
 
 use ruvm_hw_core::{Clock, IrqLine, Timer};
 use ruvm_hw_intc::gicv3::{GicV3, IccAccess, IccCpuCtx, IccReg};
@@ -159,7 +158,7 @@ impl ArmBoard for CpuHub {
         shared: &CpuShared,
         timer: usize,
         level: bool,
-        deadline: Option<Instant>,
+        deadline: Option<i64>,
     ) {
         let cpu = shared.cpu_index;
         if let Some(line) = self.ppis.get(cpu).and_then(|l| l.get(timer)) {
@@ -173,10 +172,7 @@ impl ArmBoard for CpuHub {
             return;
         };
         match deadline {
-            Some(d) => {
-                let wait = d.saturating_duration_since(Instant::now());
-                let ns = i64::try_from(wait.as_nanos()).unwrap_or(i64::MAX);
-                let when = self.clock.get_ns().saturating_add(ns);
+            Some(when) => {
                 let t = t.get_or_insert_with(|| {
                     let weak = slot.shared.clone();
                     self.clock.new_timer(move || {
@@ -207,14 +203,11 @@ impl ArmBoard for CpuHub {
         }
     }
 
-    fn pmu_timer_anticipate(&self, shared: &CpuShared, deadline: Instant) {
+    fn pmu_timer_anticipate(&self, shared: &CpuShared, when: i64) {
         let mut slots = lock(&self.slots);
         let Some(slot) = slots.get_mut(shared.cpu_index) else {
             return;
         };
-        let wait = deadline.saturating_duration_since(Instant::now());
-        let ns = i64::try_from(wait.as_nanos()).unwrap_or(i64::MAX);
-        let when = self.clock.get_ns().saturating_add(ns);
         let weak = slot.shared.clone();
         let t = slot.pmu_timer.get_or_insert_with(|| {
             self.clock.new_timer(move || {
@@ -224,6 +217,10 @@ impl ArmBoard for CpuHub {
             })
         });
         t.modify_anticipate(when);
+    }
+
+    fn clock_ns(&self) -> Option<i64> {
+        Some(self.clock.get_ns())
     }
 
     fn psci_cpu_on(&self, mpidr: u64, entry: u64, context_id: u64, target_el: u32) -> i64 {
