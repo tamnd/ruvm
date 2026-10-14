@@ -97,7 +97,10 @@ fn virt_errors() {
         ),
         (
             &["-M", "virt", "-cpu", "max,sve-max-vq=17"],
-            format!("{p}unsupported SVE vector length\nValid sve-max-vq in range [1-16]\n"),
+            format!(
+                "{p}can't apply global max-arm-cpu.sve-max-vq=17: unsupported SVE vector \
+                 length\nValid sve-max-vq in range [1-16]\n"
+            ),
         ),
         (&["-M", "virt,ras=on"], format!("{p}ras=on is not supported by ruvm yet\n")),
         (

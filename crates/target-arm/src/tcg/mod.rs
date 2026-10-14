@@ -949,7 +949,8 @@ pub(crate) fn sve_exception_el(f: &ArmFeatures, st: &CpuArmState, el: u32) -> u3
 }
 
 /// `sve_vqm1_for_el()`: the vector length at `el` in quadwords minus one, from the ZCR_ELx
-/// LEN fields and the supported lengths (every length up to `sve-max-vq`).
+/// LEN fields and the supported lengths. A length that is not supported gets the next smaller
+/// one that is.
 pub(crate) fn sve_vqm1_for_el(f: &ArmFeatures, st: &CpuArmState, el: u32) -> u32 {
     let mut len = crate::cpu::ARM_MAX_VQ as u32 - 1;
     if el <= 1 && !el_is_in_host(f, st, el) {
@@ -961,7 +962,10 @@ pub(crate) fn sve_vqm1_for_el(f: &ArmFeatures, st: &CpuArmState, el: u32) -> u32
     if f.el3 {
         len = len.min(st.zcr_el[3] as u32 & 0xf);
     }
-    len.min(f.sve_max_vq.max(1) - 1)
+    let len = len.min(f.sve_max_vq.max(1) - 1);
+    let map = !f.sve_vq_gaps & ((2 << len) - 1);
+    // sve128 is always there.
+    31 - map.leading_zeros()
 }
 
 /// `aarch64_sve_narrow_vq()`: zero the parts of the Z and P registers and FFR above `vq`

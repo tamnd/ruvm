@@ -65,6 +65,27 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
         let arch = arch.ok_or_else(|| Error::generic("unknown target"))?;
         Ok(QemuTargetInfo { arch })
     });
+    if crate::arm::is_arm(target) {
+        let v = vm.clone();
+        register_query_cpu_model_expansion(cmds, move |_: &MonitorQmp, arg| {
+            let tcg = match current_accel(&v)? {
+                Accelerator::Tcg => true,
+                Accelerator::Qtest => false,
+                _ => {
+                    return Err(Error::generic(
+                        "query-cpu-model-expansion is not supported with this accelerator by \
+                         ruvm yet",
+                    ));
+                }
+            };
+            crate::arm::cpu_props::query_cpu_model_expansion(
+                arg.type_,
+                arg.model,
+                v.cpu_opt.as_deref(),
+                tcg,
+            )
+        });
+    }
     register_query_uuid(cmds, |_: &MonitorQmp| {
         Ok(UuidInfo { UUID: crate::display::qemu_uuid_string() })
     });

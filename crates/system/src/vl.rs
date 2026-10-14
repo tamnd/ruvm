@@ -129,6 +129,8 @@ pub struct Vm {
     pub(crate) cpus: OnceLock<crate::cpus::Cpus>,
     /// The NUMA nodes of `-numa`, when there are any.
     pub(crate) numa: OnceLock<crate::numa::NumaState>,
+    /// The `-cpu` option, whose properties apply to the CPU objects of its type.
+    pub(crate) cpu_opt: Option<String>,
     machine_initialized: AtomicBool,
     /// `qtest_driver()`: a test drives the machine over `-qtest`.
     qtest: bool,
@@ -1130,6 +1132,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
         drives: OnceLock::new(),
         cpus: OnceLock::new(),
         numa: OnceLock::new(),
+        cpu_opt: cfg.x86.cpu.clone(),
         machine_initialized: AtomicBool::new(false),
         qtest: cfg.qtest.is_some(),
     });

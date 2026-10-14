@@ -422,6 +422,19 @@ fn vector_length_from_zcr_and_max_vq() {
     }
 }
 
+/// With `sve128`, `sve256` and `sve512` only (`-cpu max,sve512=on`), a ZCR_EL1.LEN asking for
+/// 384 bits gets the next smaller length, 256 bits, as `sve_vqm1_for_el()` gives.
+#[test]
+fn vector_length_skips_unsupported_lengths() {
+    for (len, want) in [(0, 16), (1, 32), (2, 32), (3, 64), (15, 64)] {
+        let w = World::new(ArmCpuModel::max().with_sve_vq_map(0b1011));
+        let mut st = w.state(1);
+        st.zcr_el[1] = len;
+        let st = w.run(st, CODE, &[RDVL_X0, WFI]);
+        assert_eq!(st.xregs[0], want, "ZCR_EL1.LEN {len}");
+    }
+}
+
 /// A write to ZCR_EL1 changes the vector length of the following instructions, reads back
 /// the LEN field and zeroes the Z register bits above the new length.
 #[test]
