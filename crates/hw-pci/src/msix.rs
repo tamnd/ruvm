@@ -11,8 +11,9 @@
 //! [`PciDevice::msix_notify`]. A masked vector (or any vector while the function mask is set or
 //! MSI-X is disabled) gets its PBA bit set instead, and fires once unmasked.
 //!
-//! The vector use, release and poll notifiers (used by vhost and VFIO) and the Xen paths are
-//! not ported.
+//! A model that hands vectors to something outside, as VFIO does, sets vector use and release
+//! notifiers with [`PciDevice::msix_set_vector_notifiers`] and hears when the guest unmasks or
+//! masks a vector. The poll notifier and the Xen paths are not ported.
 
 use std::fmt;
 use std::sync::{Arc, Weak};
@@ -20,12 +21,19 @@ use std::sync::{Arc, Weak};
 use ruvm_base::Error;
 use ruvm_mem::{AccessConstraints, AccessCtx, AccessSize, Endian, MemResult, MmioOps, RegionId};
 
-use crate::device::{DevState, Effects, MsiMessage, PciDevice};
+use crate::device::{DevState, Effect, Effects, MsiMessage, PciDevice};
 use crate::regs::*;
 
 const MSIX_CONTROL_OFFSET: usize = PCI_MSIX_FLAGS + 1;
 const MSIX_ENABLE_MASK: u8 = (PCI_MSIX_FLAGS_ENABLE >> 8) as u8;
 const MSIX_MASKALL_MASK: u8 = (PCI_MSIX_FLAGS_MASKALL >> 8) as u8;
+
+/// `MSIVectorUseNotifier`: the guest unmasked `vector`, whose message is the third argument.
+/// QEMU lets it fail and asserts that it did not, so here it cannot.
+pub type MsixVectorUse = Arc<dyn Fn(&PciDevice, u32, MsiMessage) + Send + Sync>;
+
+/// `MSIVectorReleaseNotifier`: the guest masked `vector` again.
+pub type MsixVectorRelease = Arc<dyn Fn(&PciDevice, u32) + Send + Sync>;
 
 pub(crate) struct Msix {
     cap: u8,
@@ -40,6 +48,8 @@ pub(crate) struct Msix {
     pba_mmio: RegionId,
     /// The BAR created by `msix_init_exclusive_bar()`.
     exclusive_bar: Option<(usize, RegionId)>,
+    /// `msix_vector_use_notifier` and `msix_vector_release_notifier`.
+    notifiers: Option<(MsixVectorUse, MsixVectorRelease)>,
 }
 
 impl Msix {
@@ -71,6 +81,22 @@ impl Msix {
     /// `msix_is_masked()`.
     fn is_masked(&self, vector: u32) -> bool {
         self.vector_masked(vector, self.function_masked)
+    }
+
+    /// `msix_fire_vector_notifier()`. The notifier runs once the device lock is dropped.
+    fn fire_vector_notifier(&self, fx: &mut Effects, vector: u32, is_masked: bool) {
+        let Some((use_, release)) = &self.notifiers else { return };
+        if is_masked {
+            fx.push(Effect::VectorRelease { f: Arc::clone(release), vector });
+        } else {
+            fx.push(Effect::VectorUse { f: Arc::clone(use_), vector, msg: self.message(vector) });
+        }
+    }
+
+    /// The vectors the guest can fire, which `msix_set_vector_notifiers()` and
+    /// `msix_unset_vector_notifiers()` walk when MSI-X is on and the function is not masked.
+    fn unmasked_vectors(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.entries).filter(|&v| !self.is_masked(v))
     }
 
     /// `msix_prepare_message()`.
@@ -139,6 +165,8 @@ impl DevState {
         if is_masked == was_masked {
             return;
         }
+        m.fire_vector_notifier(fx, vector, is_masked);
+        let m = self.msix_mut();
         if !is_masked && m.is_pending(vector) {
             m.clr_pending(vector);
             self.msix_notify(fx, vector);
@@ -356,6 +384,7 @@ impl PciDevice {
                 pba_bar: layout.pba_bar,
                 pba_mmio,
                 exclusive_bar: None,
+                notifiers: None,
             });
             s.msix_mask_all(&mut fx);
             let _t = mem.transaction();
@@ -593,6 +622,45 @@ impl PciDevice {
         }
         self.run(fx);
         Ok(())
+    }
+
+    /// `msix_set_vector_notifiers()`: from now on `use_` hears when a vector is unmasked and
+    /// `release` when it is masked. If MSI-X is on and the function is not masked, `use_` is
+    /// called right away for every vector that is unmasked already.
+    pub fn msix_set_vector_notifiers(&self, use_: MsixVectorUse, release: MsixVectorRelease) {
+        let mut fx = Effects::new();
+        {
+            let mut s = self.lock();
+            let on = s.msix_enabled() && !s.msix_masked();
+            let m = s.msix_mut();
+            m.notifiers = Some((use_, release));
+            if on {
+                // msix_set_notifier_for_vector() for each vector.
+                for vector in m.unmasked_vectors() {
+                    m.fire_vector_notifier(&mut fx, vector, false);
+                }
+            }
+        }
+        self.run(fx);
+    }
+
+    /// `msix_unset_vector_notifiers()`: calls the release notifier for every vector the guest
+    /// can still fire, then forgets both notifiers.
+    pub fn msix_unset_vector_notifiers(&self) {
+        let mut fx = Effects::new();
+        {
+            let mut s = self.lock();
+            let on = s.msix_enabled() && !s.msix_masked();
+            let Some(m) = s.msix.as_mut() else { return };
+            if on {
+                // msix_unset_notifier_for_vector() for each vector.
+                for vector in m.unmasked_vectors() {
+                    m.fire_vector_notifier(&mut fx, vector, true);
+                }
+            }
+            m.notifiers = None;
+        }
+        self.run(fx);
     }
 
     /// The BAR index created by [`PciDevice::msix_init_exclusive_bar`], if any.

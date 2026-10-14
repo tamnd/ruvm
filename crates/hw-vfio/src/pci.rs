@@ -11,8 +11,10 @@
 //! in through an eventfd the kernel signals, which a thread of the device turns into a raised
 //! pin, and the first BAR access after it lowers the pin and unmasks the host interrupt. When the
 //! guest turns MSI on, each vector it enabled gets an eventfd of its own and the thread sends
-//! the vector's message when the kernel signals it. MSI-X delivery, DMA through a vIOMMU, mmap
-//! of the BARs, hot reset and the device quirks are not here yet.
+//! the vector's message when the kernel signals it. MSI-X works the same way, except that a
+//! vector gets its eventfd when the guest first unmasks it, and one that fires while masked
+//! goes into the emulated PBA. DMA through a vIOMMU, mmap of the BARs, hot reset and the device
+//! quirks are not here yet.
 
 use std::fmt;
 use std::io;
@@ -47,16 +49,17 @@ use ruvm_hw_pci::regs::{
     PCI_SUBSYSTEM_VENDOR_ID, PCI_VENDOR_ID, PCIE_CONFIG_SPACE_SIZE, pci_get_long, pci_get_word,
     pci_set_long, pci_set_word,
 };
-use ruvm_hw_pci::{MsixLayout, PciBus, PciDevice, PciDeviceInfo, PciDeviceOps};
+use ruvm_hw_pci::{MsiMessage, MsixLayout, PciBus, PciDevice, PciDeviceInfo, PciDeviceOps};
 use ruvm_mem::{
     AccessConstraints, AccessCtx, AccessSize, AddressSpace, FlatRange, ListenerId, MemError,
     MemResult, MemoryListener, MemorySystem, MmioOps, RegionId, RegionType,
 };
 use ruvm_sys::vfio::{
     API_VERSION, DEVICE_FLAGS_PCI, DEVICE_FLAGS_RESET, DeviceInfo, GROUP_FLAGS_VIABLE,
-    IRQ_SET_ACTION_TRIGGER, IRQ_SET_ACTION_UNMASK, PCI_CONFIG_REGION_INDEX, PCI_ERR_IRQ_INDEX,
-    PCI_INTX_IRQ_INDEX, PCI_MSI_IRQ_INDEX, PCI_MSIX_IRQ_INDEX, PCI_ROM_REGION_INDEX, RegionInfo,
-    TYPE1_IOMMU, TYPE1V2_IOMMU, VfioContainer, VfioDevice, VfioGroup,
+    IRQ_INFO_NORESIZE, IRQ_SET_ACTION_TRIGGER, IRQ_SET_ACTION_UNMASK, PCI_CONFIG_REGION_INDEX,
+    PCI_ERR_IRQ_INDEX, PCI_INTX_IRQ_INDEX, PCI_MSI_IRQ_INDEX, PCI_MSIX_IRQ_INDEX,
+    PCI_ROM_REGION_INDEX, RegionInfo, TYPE1_IOMMU, TYPE1V2_IOMMU, VfioContainer, VfioDevice,
+    VfioGroup,
 };
 
 use crate::{PCI_ANY_ID, VfioPciConf};
@@ -443,44 +446,72 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// One eventfd slot per interrupt, filled when the interrupt is set up.
+type Slots = Arc<Mutex<Vec<Option<Arc<OwnedFd>>>>>;
+
 /// Eventfds the kernel signals for a device's interrupts and a thread that waits on them, the
 /// part of `qemu_set_fd_handler()` vfio relies on. The handler runs with the index of each
-/// eventfd that fires, until the notifiers are dropped.
+/// eventfd that fires, until the notifiers are dropped. Slots can be filled later with
+/// [`Notifiers::init`], as MSI-X does when the guest unmasks a vector.
 #[derive(Debug)]
 struct Notifiers {
-    fds: Arc<Vec<OwnedFd>>,
-    stop: Arc<OwnedFd>,
+    name: String,
+    fds: Slots,
+    /// Signalled to make the thread look at the slots again, or to stop it.
+    wake: Arc<OwnedFd>,
+    stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Notifiers {
     /// `vfio_notifier_init()` for `n` eventfds called `name`, and the thread that serves them.
     fn new(name: &str, n: usize, handler: impl Fn(usize) + Send + 'static) -> Result<Notifiers> {
-        let failed = |e: io::Error| Error::from_io(format!("vfio_notifier_init {name} failed"), e);
-        let fds = (0..n)
-            .map(|_| eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK))
-            .collect::<rustix::io::Result<Vec<_>>>()
-            .map_err(|e| failed(e.into()))?;
-        let fds = Arc::new(fds);
-        let stop = Arc::new(eventfd(0, EventfdFlags::CLOEXEC).map_err(|e| failed(e.into()))?);
-        let thread = {
-            let (fds, stop) = (Arc::clone(&fds), Arc::clone(&stop));
-            thread::Builder::new()
-                .name(format!("vfio-{name}"))
-                .spawn(move || notifier_thread(&fds, &stop, &handler))
-                .map_err(failed)?
-        };
-        Ok(Notifiers { fds, stop, thread: Some(thread) })
+        let notifiers = Notifiers::empty(name, n, handler)?;
+        for i in 0..n {
+            notifiers.init(i)?;
+        }
+        Ok(notifiers)
     }
 
-    fn fd(&self, i: usize) -> BorrowedFd<'_> {
-        self.fds[i].as_fd()
+    /// `n` empty slots and the thread that serves them once they are filled.
+    fn empty(name: &str, n: usize, handler: impl Fn(usize) + Send + 'static) -> Result<Notifiers> {
+        let failed = |e: io::Error| Error::from_io(format!("vfio_notifier_init {name} failed"), e);
+        let fds: Slots = Arc::new(Mutex::new(vec![None; n]));
+        let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC).map_err(|e| failed(e.into()))?);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (fds, wake, stop) = (Arc::clone(&fds), Arc::clone(&wake), Arc::clone(&stop));
+            thread::Builder::new()
+                .name(format!("vfio-{name}"))
+                .spawn(move || notifier_thread(&fds, &wake, &stop, &handler))
+                .map_err(failed)?
+        };
+        Ok(Notifiers { name: name.to_string(), fds, wake, stop, thread: Some(thread) })
+    }
+
+    /// `vfio_notifier_init()` for slot `i`, which the thread then waits on as well.
+    fn init(&self, i: usize) -> Result<()> {
+        let fd = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).map_err(|e| {
+            Error::from_io(format!("vfio_notifier_init {} failed", self.name), e.into())
+        })?;
+        lock(&self.fds)[i] = Some(Arc::new(fd));
+        self.kick();
+        Ok(())
+    }
+
+    fn kick(&self) {
+        let _ = rustix::io::write(&*self.wake, &1u64.to_ne_bytes());
+    }
+
+    fn fd(&self, i: usize) -> Option<Arc<OwnedFd>> {
+        lock(&self.fds)[i].clone()
     }
 }
 
 impl Drop for Notifiers {
     fn drop(&mut self) {
-        let _ = rustix::io::write(&*self.stop, &1u64.to_ne_bytes());
+        self.stop.store(true, Ordering::Release);
+        self.kick();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -493,24 +524,31 @@ fn test_and_clear(fd: &OwnedFd) -> bool {
     matches!(rustix::io::read(fd, &mut b), Ok(8))
 }
 
-/// Waits on `fds` until `stop` is signalled, and calls `handler` for each one the kernel
-/// signals.
-fn notifier_thread(fds: &[OwnedFd], stop: &OwnedFd, handler: &dyn Fn(usize)) {
+/// Waits on the filled slots of `fds` until `stop` is set, and calls `handler` for each one the
+/// kernel signals. `wake` makes it look at the slots again.
+fn notifier_thread(fds: &Slots, wake: &OwnedFd, stop: &AtomicBool, handler: &dyn Fn(usize)) {
     loop {
-        let mut pfds: Vec<PollFd<'_>> = fds.iter().map(|f| PollFd::new(f, PollFlags::IN)).collect();
-        pfds.push(PollFd::new(stop, PollFlags::IN));
+        let live: Vec<(usize, Arc<OwnedFd>)> =
+            lock(fds).iter().enumerate().filter_map(|(i, f)| f.clone().map(|f| (i, f))).collect();
+        let mut pfds: Vec<PollFd<'_>> =
+            live.iter().map(|(_, f)| PollFd::new(&**f, PollFlags::IN)).collect();
+        pfds.push(PollFd::new(wake, PollFlags::IN));
         match poll(&mut pfds, None) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(_) => return,
         }
-        if !pfds[fds.len()].revents().is_empty() {
-            return;
+        if !pfds[live.len()].revents().is_empty() {
+            test_and_clear(wake);
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
         }
-        let ready: Vec<usize> = (0..fds.len()).filter(|&i| !pfds[i].revents().is_empty()).collect();
-        for i in ready {
-            if test_and_clear(&fds[i]) {
-                handler(i);
+        let ready: Vec<usize> =
+            (0..live.len()).filter(|&k| !pfds[k].revents().is_empty()).collect();
+        for k in ready {
+            if test_and_clear(&live[k].1) {
+                handler(live[k].0);
             }
         }
     }
@@ -536,6 +574,42 @@ enum Interrupt {
     Msi {
         _vectors: Notifiers,
     },
+    Msix(MsixVectors),
+}
+
+/// `VFIOPCIDevice::msi_vectors` while the device is in MSI-X mode.
+#[derive(Debug)]
+struct MsixVectors {
+    /// One slot per table entry, filled the first time the guest unmasks the vector.
+    notifiers: Notifiers,
+    /// `VFIOMSIVector::use`.
+    used: Vec<bool>,
+    /// `nr_vectors`: one past the highest vector in use.
+    nr_vectors: usize,
+    /// `defer_kvm_irq_routing`: set while `msix_set_vector_notifiers()` walks the unmasked
+    /// vectors, which are then handed to the kernel in one go.
+    batch: bool,
+    /// `VFIOMSIXInfo::noresize`: the kernel cannot add vectors while MSI-X is on.
+    noresize: bool,
+    /// `VFIOMSIXInfo::pending`: vectors that fired while masked, shared with the thread.
+    pending: Arc<Mutex<Vec<bool>>>,
+    pba: Pba,
+}
+
+/// The emulated PBA, `msix_pba_mmio`. vfio-pci only shows it while a vector that fired masked
+/// is pending, and lets reads go to the device otherwise.
+#[derive(Clone, Debug)]
+struct Pba {
+    memory: Weak<MemorySystem>,
+    region: Option<RegionId>,
+}
+
+impl Pba {
+    fn show(&self, on: bool) {
+        if let (Some(memory), Some(region)) = (self.memory.upgrade(), self.region) {
+            let _ = memory.set_enabled(region, on);
+        }
+    }
 }
 
 /// What the BAR, ROM and config callbacks share: the device, where its config space is and the
@@ -570,6 +644,81 @@ impl Shared {
         let mut b = [0u8; 4];
         self.config_read(addr, &mut b[..len])?;
         Ok(u32::from_le_bytes(b))
+    }
+
+    /// `VFIO_DEVICE_SET_IRQS` with the trigger eventfds of interrupts `start..` of `index`. An
+    /// empty slot is -1 to the kernel, which takes away the eventfd that interrupt had.
+    fn set_triggers(&self, index: u32, start: u32, fds: &[Option<Arc<OwnedFd>>]) -> io::Result<()> {
+        let fds: Vec<Option<BorrowedFd<'_>>> =
+            fds.iter().map(|f| f.as_deref().map(AsFd::as_fd)).collect();
+        self.device.set_irqs_eventfds(index, start, IRQ_SET_ACTION_TRIGGER, &fds)
+    }
+
+    /// `vfio_enable_msix_no_vec()`: MSI-X on in the device with no vector enabled, by giving
+    /// vector 0 an fd of -1.
+    fn msix_enable_no_vec(&self) -> io::Result<()> {
+        self.set_triggers(PCI_MSIX_IRQ_INDEX, 0, &[None])
+    }
+
+    /// `vfio_enable_vectors()` for MSI-X. When the kernel can add vectors later, MSI-X is
+    /// turned on first so that only the vectors in use get allocated.
+    fn msix_enable_vectors(&self, v: &MsixVectors) -> io::Result<()> {
+        if !v.noresize {
+            self.msix_enable_no_vec()?;
+        }
+        let fds: Vec<_> = (0..v.nr_vectors).map(|i| v.notifiers.fd(i)).collect();
+        self.set_triggers(PCI_MSIX_IRQ_INDEX, 0, &fds)
+    }
+
+    /// `vfio_msix_vector_do_use()`: the guest unmasked vector `nr`. Its eventfd is made the
+    /// first time, and the kernel is told about it unless the whole table is handed over in
+    /// one go afterwards.
+    fn msix_vector_use(&self, dev: &PciDevice, nr: usize) {
+        let mut interrupt = lock(&self.interrupt);
+        let Interrupt::Msix(v) = &mut *interrupt else {
+            return;
+        };
+        if !v.used[nr] {
+            // vfio_pci_vector_init().
+            if let Err(e) = v.notifiers.init(nr) {
+                report_error(&e);
+            }
+            v.used[nr] = true;
+            dev.msix_vector_use(nr as u32);
+        }
+        // Without dynamic allocation the kernel only has the vectors up to the highest one in
+        // use, so a new highest vector means turning MSI-X off and on again with one more.
+        let resizing = v.nr_vectors < nr + 1;
+        if resizing {
+            v.nr_vectors = nr + 1;
+        }
+        if !v.batch {
+            if v.noresize && resizing {
+                // vfio_device_irq_disable().
+                let _ = self.device.set_irqs(PCI_MSIX_IRQ_INDEX, 0, 0, IRQ_SET_ACTION_TRIGGER);
+                if let Err(e) = self.msix_enable_vectors(v) {
+                    error_report(&format!("vfio: failed to enable vectors, {}", strerror(&e)));
+                }
+            } else if let Err(e) =
+                self.set_triggers(PCI_MSIX_IRQ_INDEX, nr as u32, &[v.notifiers.fd(nr)])
+            {
+                // set_irq_signalling().
+                let e = Error::from_io("VFIO_DEVICE_SET_IRQS failure", e)
+                    .prepend(format_args!("MSIX-{nr}: "))
+                    .prepend("Failed to set up TRIGGER eventfd signaling for interrupt ")
+                    .prepend(format_args!("vfio {}: ", self.name));
+                report_error(&e);
+            }
+        }
+        // The PBA goes back to the device once nothing is pending.
+        let none = {
+            let mut p = lock(&v.pending);
+            p[nr] = false;
+            !p[..v.nr_vectors].contains(&true)
+        };
+        if none {
+            v.pba.show(false);
+        }
     }
 
     /// `vfio_pci_intx_eoi()`: QEMU takes any BAR access as the guest having serviced INTx.
@@ -625,24 +774,17 @@ impl Shared {
             })?
         };
         // vfio_device_irq_set_signaling().
-        self.device
-            .set_irqs_eventfds(
-                PCI_INTX_IRQ_INDEX,
-                0,
-                IRQ_SET_ACTION_TRIGGER,
-                &[Some(notifier.fd(0))],
-            )
-            .map_err(|e| {
-                Error::from_io("VFIO_DEVICE_SET_IRQS failure", e)
-                    .prepend("Failed to set up TRIGGER eventfd signaling for interrupt INTX-0: ")
-            })?;
+        self.set_triggers(PCI_INTX_IRQ_INDEX, 0, &[notifier.fd(0)]).map_err(|e| {
+            Error::from_io("VFIO_DEVICE_SET_IRQS failure", e)
+                .prepend("Failed to set up TRIGGER eventfd signaling for interrupt INTX-0: ")
+        })?;
         *lock(&self.interrupt) = Interrupt::Intx(Intx { pending, irq, _notifier: notifier });
         Ok(())
     }
 
-    /// `vfio_msi_disable_common()`.
+    /// `vfio_msi_disable_common()`, for MSI and MSI-X.
     fn msi_disable_common(&self) {
-        drop(self.take_interrupt(|i| matches!(i, Interrupt::Msi { .. })));
+        drop(self.take_interrupt(|i| matches!(i, Interrupt::Msi { .. } | Interrupt::Msix(_))));
     }
 }
 
@@ -801,6 +943,9 @@ struct VfioPciOps {
     /// The device itself, for the threads that send its MSI messages.
     dev: OnceLock<Weak<PciDevice>>,
     msi_cap_size: u8,
+    /// `VFIOMSIXInfo::noresize`.
+    msix_noresize: bool,
+    memory: Weak<MemorySystem>,
     /// `emulated_config_bits`: the bits QEMU answers itself instead of the device.
     emulated: Vec<u8>,
     pm_cap: u8,
@@ -828,14 +973,101 @@ impl VfioPciOps {
         self.shared.intx_start(dev.allocate_irq())
     }
 
-    /// `vfio_disable_interrupts()`. Turning MSI off goes back to INTx, so INTx is torn down
-    /// last.
+    /// `vfio_disable_interrupts()`. Turning MSI or MSI-X off goes back to INTx, so INTx is
+    /// torn down last.
     fn disable_interrupts(&self, dev: &PciDevice) {
-        let msi = matches!(*lock(&self.shared.interrupt), Interrupt::Msi { .. });
-        if msi {
+        let (msi, msix) = match *lock(&self.shared.interrupt) {
+            Interrupt::Msi { .. } => (true, false),
+            Interrupt::Msix(_) => (false, true),
+            _ => (false, false),
+        };
+        if msix {
+            self.msix_disable(dev);
+        } else if msi {
             self.msi_disable(dev);
         }
         self.shared.intx_disable();
+    }
+
+    /// `vfio_msix_enable()`. The guest's driver usually turns MSI-X on with every vector still
+    /// masked, so the device goes into MSI-X mode with no vector, and each vector gets its
+    /// eventfd when the guest unmasks it.
+    fn msix_enable(&self, dev: &PciDevice) {
+        self.disable_interrupts(dev);
+        let entries = dev.msix_nr_vectors_allocated() as usize;
+        let pending = Arc::new(Mutex::new(vec![false; entries]));
+        let pba = Pba { memory: self.memory.clone(), region: dev.msix_regions().map(|r| r.1) };
+        let handler = {
+            let (weak, pending, pba) =
+                (self.dev.get().cloned().unwrap_or_default(), Arc::clone(&pending), pba.clone());
+            // vfio_msi_interrupt(). A masked vector firing needs the PBA, so it is shown.
+            move |nr: usize| {
+                let Some(d) = weak.upgrade() else { return };
+                if d.msix_is_masked(nr as u32) {
+                    lock(&pending)[nr] = true;
+                    pba.show(true);
+                }
+                d.msix_notify(nr as u32);
+            }
+        };
+        let notifiers = match Notifiers::empty("interrupt", entries, handler) {
+            Ok(n) => n,
+            Err(e) => {
+                report_error(&e);
+                return;
+            }
+        };
+        *lock(&self.shared.interrupt) = Interrupt::Msix(MsixVectors {
+            notifiers,
+            used: vec![false; entries],
+            nr_vectors: 0,
+            batch: true,
+            noresize: self.msix_noresize,
+            pending,
+            pba,
+        });
+        let shared = Arc::clone(&self.shared);
+        dev.msix_set_vector_notifiers(
+            Arc::new(move |d: &PciDevice, nr: u32, _: MsiMessage| {
+                shared.msix_vector_use(d, nr as usize);
+            }),
+            // vfio_msix_vector_release() only has a KVM irqfd to undo.
+            Arc::new(|_: &PciDevice, _: u32| {}),
+        );
+        let mut interrupt = lock(&self.shared.interrupt);
+        let Interrupt::Msix(v) = &mut *interrupt else {
+            return;
+        };
+        v.batch = false;
+        if v.nr_vectors != 0 {
+            if let Err(e) = self.shared.msix_enable_vectors(v) {
+                error_report(&format!("vfio: failed to enable vectors, {}", strerror(&e)));
+            }
+        } else if let Err(e) = self.shared.msix_enable_no_vec() {
+            error_report(&format!("vfio: failed to enable MSI-X, {}", strerror(&e)));
+        }
+    }
+
+    /// `vfio_msix_disable()`: back to INTx.
+    fn msix_disable(&self, dev: &PciDevice) {
+        dev.msix_unset_vector_notifiers();
+        // MSI-X only releases vectors while it is still on, so the rest are let go here.
+        let used: Vec<u32> = match &*lock(&self.shared.interrupt) {
+            Interrupt::Msix(v) => {
+                (0..v.nr_vectors).filter(|&i| v.used[i]).map(|i| i as u32).collect()
+            }
+            _ => Vec::new(),
+        };
+        for nr in used {
+            dev.msix_vector_unuse(nr);
+        }
+        // The index is cleared even with no vector in use: the device may have MSI-X on with
+        // none, see msix_enable().
+        let _ = self.shared.device.set_irqs(PCI_MSIX_IRQ_INDEX, 0, 0, IRQ_SET_ACTION_TRIGGER);
+        self.shared.msi_disable_common();
+        if let Err(e) = self.intx_enable(dev) {
+            report_error(&e.prepend(format_args!("vfio {}: ", self.shared.name)));
+        }
     }
 
     /// `vfio_msi_enable()`: one eventfd per vector the guest enabled, each sending its vector
@@ -858,14 +1090,8 @@ impl VfioPciOps {
             }
         };
         // vfio_enable_vectors().
-        let fds: Vec<_> = (0..nr).map(|i| Some(notifiers.fd(i))).collect();
-        let r = self.shared.device.set_irqs_eventfds(
-            PCI_MSI_IRQ_INDEX,
-            0,
-            IRQ_SET_ACTION_TRIGGER,
-            &fds,
-        );
-        drop(fds);
+        let fds: Vec<_> = (0..nr).map(|i| notifiers.fd(i)).collect();
+        let r = self.shared.set_triggers(PCI_MSI_IRQ_INDEX, 0, &fds);
         match r {
             Ok(()) => *lock(&self.shared.interrupt) = Interrupt::Msi { _vectors: notifiers },
             Err(e) => {
@@ -950,8 +1176,8 @@ impl PciDeviceOps for VfioPciOps {
                 self.shared.name
             ));
         }
-        // MSI enabling and disabling. vfio_update_msi() only moves KVM routes, so a write that
-        // leaves MSI on needs nothing more.
+        // MSI and MSI-X enabling and disabling. vfio_update_msi() only moves KVM routes, so a
+        // write that leaves MSI on needs nothing more.
         let msi_cap = u32::from(dev.msi_cap());
         if dev.msi_present()
             && addr < msi_cap + u32::from(self.msi_cap_size)
@@ -964,6 +1190,18 @@ impl PciDeviceOps for VfioPciOps {
                 self.msi_enable(dev);
             } else if was_enabled && !is_enabled {
                 self.msi_disable(dev);
+            }
+        } else if dev.msix_present()
+            && addr < u32::from(dev.msix_cap()) + u32::from(MSIX_CAP_LENGTH)
+            && u32::from(dev.msix_cap()) < addr + len
+        {
+            let was_enabled = dev.msix_enabled();
+            dev.default_write_config(addr, val, len);
+            let is_enabled = dev.msix_enabled();
+            if !was_enabled && is_enabled {
+                self.msix_enable(dev);
+            } else if was_enabled && !is_enabled {
+                self.msix_disable(dev);
             }
         } else {
             dev.default_write_config(addr, val, len);
@@ -1016,6 +1254,8 @@ struct MsixInfo {
     pba_bar: usize,
     pba_offset: u32,
     entries: u32,
+    /// `VFIO_IRQ_INFO_NORESIZE`.
+    noresize: bool,
 }
 
 /// The device as `vfio_pci_populate_device()` and `vfio_pci_config_setup()` leave it, before
@@ -1237,6 +1477,8 @@ impl<'a> Setup<'a> {
             shared: Arc::clone(&self.shared),
             dev: OnceLock::new(),
             msi_cap_size: self.msi_cap_size,
+            msix_noresize: self.msix.is_some_and(|m| m.noresize),
+            memory: Arc::downgrade(self.bus.memory()),
             emulated: mem::take(&mut self.emulated),
             pm_cap: self.pm_cap,
             reset_works: self.reset_works,
@@ -1452,6 +1694,7 @@ impl<'a> Setup<'a> {
             pba_bar: (pba & PCI_MSIX_FLAGS_BIRMASK) as usize,
             pba_offset: pba & !PCI_MSIX_FLAGS_BIRMASK,
             entries: u32::from(ctrl & PCI_MSIX_FLAGS_QSIZE) + 1,
+            noresize: false,
         };
         if msix.table_bar >= NUM_BARS || msix.pba_bar >= NUM_BARS {
             return Err(Error::generic(format!(
@@ -1459,10 +1702,12 @@ impl<'a> Setup<'a> {
                 msix.table_bar, msix.pba_bar
             )));
         }
-        self.shared
+        let info = self
+            .shared
             .device
             .irq_info(PCI_MSIX_IRQ_INDEX)
             .map_err(|e| Error::from_io("failed to get MSI-X irq info", e))?;
+        msix.noresize = info.flags & IRQ_INFO_NORESIZE != 0;
         if u64::from(msix.pba_offset) >= self.bars[msix.pba_bar].size {
             if self.vendor_id == PCI_VENDOR_ID_CHELSIO && self.device_id & 0xff00 == 0x5800 {
                 // Chelsio T5 VFs report 0x8000 for a PBA at 0x1000 of an 8k BAR.
