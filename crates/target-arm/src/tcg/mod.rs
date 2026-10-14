@@ -145,6 +145,7 @@
 //!   returns with `LOG_GUEST_ERROR`; this crate has no logging and stays silent.
 
 mod a32_helper;
+mod a32_vfp;
 mod crypto;
 mod gic;
 mod gtimer;
