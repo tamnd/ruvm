@@ -1015,6 +1015,8 @@ pub struct VirtMachine {
     info: BootInfo,
     heap: Arc<Mutex<(u64, u64)>>,
     ram: Vec<RamRange>,
+    /// The RAM regions of the guest's memory and the secure RAM, in the order they were made.
+    ram_blocks: Vec<RegionId>,
     clock: Arc<Clock>,
     done: bool,
 }
@@ -1169,6 +1171,7 @@ impl VirtMachine {
         // machine_consume_memdev(): the backend's region, named after the backend. With
         // -numa memdev, numa_init_memdev_container() puts the backends of the nodes one after
         // the other in a container.
+        let mut ram_blocks = Vec::new();
         let ram = match (&cfg.numa, cfg.memdev.clone()) {
             (Some(numa), _) => {
                 let ram = mem.new_container(VIRT_RAM_ID, ram_size.into()).map_err(err)?;
@@ -1177,6 +1180,7 @@ impl VirtMachine {
                     if let Some(block) = block {
                         let seg = mem.new_ram_from_block(Arc::clone(block)).map_err(err)?;
                         mem.add_subregion(ram, addr, seg).map_err(err)?;
+                        ram_blocks.push(seg);
                         addr += size;
                     }
                 }
@@ -1186,6 +1190,9 @@ impl VirtMachine {
             (None, None) => mem.new_ram(VIRT_RAM_ID, ram_size),
         }
         .map_err(err)?;
+        if cfg.numa.is_none() {
+            ram_blocks.push(ram);
+        }
         mem.add_subregion(system, VIRT_MEM, ram).map_err(err)?;
 
         dt::virt_flash_fdt(&mut fdt, cfg.secure)?;
@@ -1357,6 +1364,7 @@ impl VirtMachine {
             // create_secure_ram(), in the one address space.
             let r = mem.new_ram("virt.secure-ram", VIRT_SECURE_MEM_SIZE).map_err(err)?;
             mem.add_subregion(system, VIRT_SECURE_MEM, r).map_err(err)?;
+            ram_blocks.push(r);
             dt::create_secure_ram(&mut fdt)?;
         }
 
@@ -1553,6 +1561,7 @@ impl VirtMachine {
             info,
             heap,
             ram: Vec::new(),
+            ram_blocks,
             clock,
             done: false,
         })
@@ -2196,6 +2205,17 @@ impl VirtMachine {
     /// The two flashes at 0, `virt.flash0` and `virt.flash1`.
     pub fn flash(&self) -> &[Arc<Pflash>; 2] {
         &self.flash
+    }
+
+    /// The RAM blocks a migration carries, in QEMU's order: `ram_block_add()` keeps the list
+    /// sorted from the biggest block to the smallest, and blocks of one size in the order they
+    /// were made. These are the RAM, the secure RAM and the two flashes.
+    pub fn migratable_ram_blocks(&self) -> Vec<Arc<RamBlock>> {
+        let flashes = self.flash.iter().map(|f| f.region());
+        let ids = self.ram_blocks.iter().copied().chain(flashes);
+        let mut blocks: Vec<_> = ids.filter_map(|id| self.mem.ram_block(id)).collect();
+        blocks.sort_by_key(|b| std::cmp::Reverse(b.len()));
+        blocks
     }
 
     /// The RTC.

@@ -65,6 +65,7 @@ use ruvm_hw_char::pl011::Pl011;
 use ruvm_hw_char::serial::SerialBackend;
 use ruvm_hw_core::timer::TimeSource;
 use ruvm_hw_core::{Clock, MachineClassInfo, register_machine_type};
+use ruvm_machine_arm::migration::virt_savevm;
 use ruvm_machine_arm::sbsa_ref::{SBSA_DEFAULT_CPUS, SbsaRefConfig, SbsaRefMachine};
 use ruvm_machine_arm::tcg_run::{
     SbsaRefTcgMachine, ShutdownReason, TcgBoard, TcgMachine, VirtEvent, VirtEventHandler,
@@ -75,6 +76,7 @@ use ruvm_machine_arm::virt::{
     CpuTopology, Highmem, VirtConfig, VirtGicVersion, VirtIommu, VirtMachine, VirtMsi, VirtNuma,
 };
 use ruvm_mem::AddressSpace;
+use ruvm_migration::Migration;
 use ruvm_qapi::events::event_reset;
 use ruvm_qapi::opts::{QemuOptDesc, QemuOptType, QemuOptsList};
 use ruvm_qapi::types::{
@@ -1156,6 +1158,8 @@ pub(crate) struct ArmArgs<'a> {
     pub drives: &'a [Drive],
     /// `-netdev`, `-nic` and `-net`.
     pub netdevs: &'a [(NetOption, String, Option<Location>)],
+    /// `qemu_uuid`, from `-uuid`.
+    pub uuid: Option<[u8; 16]>,
 }
 
 /// `qemu_semihosting_chardev_init()`: the chardev of `-semihosting-config chardev=`.
@@ -1215,7 +1219,24 @@ pub(crate) fn start_board_tcg(
     let threads = Threads::Tcg(Arc::clone(machine.vcpus()));
     let _ = vm.cpus.set(Cpus::new(slots, CpuInfoFastU::Aarch64, threads));
     set_cpu_hook(vm, &machine, net);
+    init_migration(vm, &machine, args.uuid);
     Ok(Running { machine: Machine::Virt(machine), console, _attachments: attachments })
+}
+
+/// `migration_object_init()` and the `register_savevm_live()` and `vmstate_register()` calls of
+/// virt on TCG.
+fn init_migration(vm: &Arc<Vm>, machine: &VirtTcgMachine, uuid: Option<[u8; 16]>) {
+    let q = virt_savevm(machine, VIRT_NAME, uuid);
+    let host = crate::migration::Host::new(
+        vm.runstate.clone(),
+        vm.qmp.clone(),
+        q.global_state,
+        vm.autostart.clone(),
+    );
+    let m = Migration::new(Arc::new(Mutex::new(q.savevm)), Some(q.ram_stats), Arc::new(host));
+    #[cfg(unix)]
+    crate::x86::monitor_fds(&m, &vm.qmp);
+    let _ = vm.migration.set(m);
 }
 
 /// [`start_board_tcg`] for virt under the qtest accelerator: the board is built the same way,

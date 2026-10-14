@@ -1,22 +1,143 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The migration sections of the devices on an Arm board, in QEMU's stream format.
+//! The migration sections of an Arm board, in QEMU's stream format.
 //!
-//! Each section carries the device's state field by field, as QEMU 11.1's `VMStateDescription`
+//! [`virt_savevm`] registers the sections of `virt` the way QEMU 11.1 lays them out. So far
+//! these are the `timer` section, RAM and `globalstate`; the CPUs, the GIC and the devices
+//! are not registered yet.
+//!
+//! The device sections carry the state field by field, as QEMU 11.1's `VMStateDescription`
 //! for it does: the PL011 UART (hw/char/pl011.c and hw/core/clock-vmstate.c), the PL031 RTC
 //! (hw/rtc/pl031.c), the PL061 GPIO controller (hw/gpio/pl061.c) and the GPIO power key
 //! (hw/gpio/gpio_key.c). The registers add no path prefix, as these are sysbus devices.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, LazyLock, PoisonError, Weak};
 
+use ruvm_accel::tcg::TcgVcpus;
+use ruvm_base::error_report;
 use ruvm_hw_char::pl011::{PL011_FIFO_DEPTH, Pl011, Pl011VmState};
 use ruvm_hw_core::timer::Clock;
 use ruvm_hw_misc::gpio_key::GpioKey;
 use ruvm_hw_misc::pl061::{Pl061, Pl061VmState};
 use ruvm_hw_timer::pl031::{Pl031, Pl031VmState};
-use ruvm_migration::SaveVm;
+use ruvm_jit::cputlb::tlb_flush;
+use ruvm_mem::{GLOBAL_DIRTY_MIGRATION, MemorySystem};
+use ruvm_migration::timers::{TimersState, VMSTATE_TIMERS};
+use ruvm_migration::{
+    EntryInfo, GlobalState, MachineConfig, RamHooks, RamSection, RamStats, SaveVm,
+};
 use ruvm_vmstate::info::Timer;
 use ruvm_vmstate::{VmStateDescription, VmStateField};
+
+use crate::tcg_run::VirtTcgMachine;
+
+/// The registered sections of a machine and the handles the migration code needs.
+#[derive(Debug)]
+pub struct ArmMigration {
+    /// The sections.
+    pub savevm: SaveVm,
+    /// The counters of the `ram` section.
+    pub ram_stats: Arc<RamStats>,
+    /// The `globalstate` section.
+    pub global_state: Arc<GlobalState>,
+}
+
+/// Registers the sections of `machine`, a virt board on TCG, for migration as machine type
+/// `machine_type`.
+pub fn virt_savevm(
+    machine: &VirtTcgMachine,
+    machine_type: &str,
+    uuid: Option<[u8; 16]>,
+) -> ArmMigration {
+    // The virt board's pages are 4 KiB, and the smallest Arm pages 1 KiB.
+    let mut savevm = SaveVm::new(MachineConfig {
+        name: machine_type.to_string(),
+        page_bits: 12,
+        legacy_page_bits: 10,
+        uuid,
+    });
+    let board = machine.board().lock().unwrap_or_else(PoisonError::into_inner);
+    register_timer(&mut savevm, board.clock());
+    let ram = RamSection::new(
+        board.migratable_ram_blocks(),
+        TcgHooks {
+            vcpus: Arc::downgrade(machine.vcpus()),
+            mem: Arc::downgrade(board.memory_system()),
+        },
+    );
+    drop(board);
+    let ram_stats = ram.stats();
+    savevm.register_live(EntryInfo::new("ram", 4).instance(0), ram);
+    // "dirty-bitmap": ruvm has no block dirty bitmaps to migrate.
+    savevm.reserve_section_id();
+    let global_state = GlobalState::register(&mut savevm);
+    ArmMigration { savevm, ram_stats, global_state }
+}
+
+/// The RAM hooks of a TCG machine. The dirty bitmaps are set by the TLB's not-dirty path, so
+/// after bits are taken out the TLBs must forget which pages were already written. Device
+/// writes go through the address spaces, which mark pages for migration only while global
+/// dirty logging is on.
+#[derive(Debug)]
+struct TcgHooks {
+    vcpus: Weak<TcgVcpus>,
+    mem: Weak<MemorySystem>,
+}
+
+impl RamHooks for TcgHooks {
+    fn log_start(&self) {
+        if let Some(m) = self.mem.upgrade() {
+            if let Err(e) = m.global_dirty_log_start(GLOBAL_DIRTY_MIGRATION) {
+                error_report(&format!("cannot start dirty logging: {e}"));
+            }
+        }
+    }
+
+    fn log_stop(&self) {
+        if let Some(m) = self.mem.upgrade() {
+            m.global_dirty_log_stop(GLOBAL_DIRTY_MIGRATION);
+        }
+    }
+
+    fn after_clear(&self) {
+        if let Some(v) = self.vcpus.upgrade() {
+            v.run_on_each(tlb_flush);
+        }
+    }
+
+    fn load_done(&self) {
+        if let Some(v) = self.vcpus.upgrade() {
+            v.jit().tb_flush_exclusive_or_serial();
+            v.run_on_each(tlb_flush);
+        }
+    }
+}
+
+/// Registers the `timer` section over `clock`, the virtual clock. Nothing on an Arm board
+/// reads `cpu_get_ticks()`, so `cpu_ticks_offset` goes out as it came in, 0 on a fresh start.
+/// QEMU registers the section first, so it gets section id 0.
+fn register_timer(savevm: &mut SaveVm, clock: &Arc<Clock>) {
+    let ticks = Arc::new(AtomicI64::new(0));
+    let (get_clock, put_clock) = (Arc::clone(clock), Arc::clone(clock));
+    let get_ticks = Arc::clone(&ticks);
+    savevm.register_vmsd(
+        "",
+        Some(0),
+        &VMSTATE_TIMERS,
+        move || {
+            Ok(TimersState {
+                cpu_ticks_offset: get_ticks.load(Ordering::Relaxed),
+                cpu_clock_offset: get_clock.get_ns(),
+            })
+        },
+        move |s| {
+            put_clock.set_ns(s.cpu_clock_offset);
+            ticks.store(s.cpu_ticks_offset, Ordering::Relaxed);
+            Ok(())
+        },
+    );
+}
 
 /// A `Clock` as `vmstate_clock` carries it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

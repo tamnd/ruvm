@@ -48,6 +48,7 @@ pub mod postcopy;
 pub mod ram;
 pub mod savevm;
 pub mod state;
+pub mod timers;
 pub mod write_tracking;
 pub mod xbzrle;
 
