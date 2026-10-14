@@ -13,8 +13,9 @@ use ruvm_base::err;
 use ruvm_hw_acpi::Ich9PmVmState;
 use ruvm_hw_acpi::ich9::{
     ACPI_PCIHP_MAX_HOTPLUG_BUS, AcpiPcihpPciStatusVmState, CpuHotplugDevVmState, CpuHotplugVmState,
-    MemHotplugDevVmState, MemHotplugVmState, TcoVmState,
+    TcoVmState,
 };
+use ruvm_hw_acpi::vmstate::VMSTATE_MEMORY_HOTPLUG;
 use ruvm_migration::SaveVm;
 use ruvm_vmstate::info::Timer;
 use ruvm_vmstate::{VmStateDescription, VmStateField};
@@ -30,39 +31,6 @@ static VMSTATE_APM: LazyLock<VmStateDescription<ApmVmState>> = LazyLock::new(|| 
         VmStateField::scalar("apms", |s: &mut S| &mut s.apms),
     ])
 });
-
-/// `vmstate_memhp_sts`.
-static VMSTATE_MEMHP_STS: LazyLock<VmStateDescription<MemHotplugDevVmState>> =
-    LazyLock::new(|| {
-        type S = MemHotplugDevVmState;
-        VmStateDescription::new("memory hotplug device state")
-            .version_id(1)
-            .minimum_version_id(1)
-            .fields([
-                VmStateField::scalar("is_enabled", |s: &mut S| &mut s.is_enabled),
-                VmStateField::scalar("is_inserting", |s: &mut S| &mut s.is_inserting),
-                VmStateField::scalar("ost_event", |s: &mut S| &mut s.ost_event),
-                VmStateField::scalar("ost_status", |s: &mut S| &mut s.ost_status),
-            ])
-    });
-
-/// `vmstate_memory_hotplug`. `devs` has `dev_count` entries, which is not in the stream: the
-/// local count is the one used.
-pub(crate) static VMSTATE_MEMORY_HOTPLUG: LazyLock<VmStateDescription<MemHotplugVmState>> =
-    LazyLock::new(|| {
-        type S = MemHotplugVmState;
-        VmStateDescription::new("memory hotplug state").version_id(1).minimum_version_id(1).fields(
-            [
-                VmStateField::scalar("selector", |s: &mut S| &mut s.selector),
-                VmStateField::struct_varray(
-                    "devs",
-                    |s: &S| s.devs.len(),
-                    &VMSTATE_MEMHP_STS,
-                    |s: &mut S| &mut s.devs,
-                ),
-            ],
-        )
-    });
 
 /// `vmstate_tco_io_sts`.
 static VMSTATE_TCO_IO_STS: LazyLock<VmStateDescription<TcoVmState>> = LazyLock::new(|| {
