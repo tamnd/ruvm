@@ -33,7 +33,7 @@
 //!   properties other than `sve`, `sve-max-vq`, the `sve<N>` lengths, `pmu`, `aarch64=on`,
 //!   `x-rme` and the `pauth` ones.
 //! - The machine properties are taken only where their value describes the board that exists:
-//!   `gic-version=2` or `3`, `its`, `secure`, `virtualization`, `mte`, `ras=off`, `acpi`,
+//!   `gic-version=2`, `3` or `max`, `its`, `secure`, `virtualization`, `mte`, `ras=off`, `acpi`,
 //!   `spcr`, `x-oem-id`, `x-oem-table-id`, `iommu`, `default-bus-bypass-iommu`, `msi`, 32
 //!   virtio-mmio transports and the `highmem*` properties. Other values fail with "... is not supported by ruvm yet". The
 //!   board behaves as with `dtb-randomness=off` whatever that property says.
@@ -294,6 +294,15 @@ impl Semihosting {
     }
 }
 
+/// A `gic-version` that names no version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GicAuto {
+    /// `max`: the newest version the accelerator has.
+    Max,
+    /// `host`: the one of the host, which KVM takes as `max` and the others refuse.
+    Host,
+}
+
 /// The generic machine properties and the virt properties, pulled out of the `-machine`
 /// options.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -323,9 +332,12 @@ pub(crate) struct BoardOptions {
     pub highmem: Highmem,
     /// `msi`, or `its`, whichever came last.
     pub msi: VirtMsi,
-    /// `gic-version`, `None` when it is not given: TCG and qtest then pick one with
-    /// [`VirtGicVersion::tcg_default`], and KVM uses a GICv3.
+    /// `gic-version`, `None` when it is not given or names no version: TCG and qtest then
+    /// pick one with [`VirtGicVersion::tcg_default`] or [`BoardOptions::gic_auto`], and KVM
+    /// uses a GICv3.
     pub gic_version: Option<VirtGicVersion>,
+    /// `gic-version=max` or `host`.
+    pub gic_auto: Option<GicAuto>,
     /// `iommu`.
     pub iommu: VirtIommu,
     /// `default-bus-bypass-iommu`.
@@ -410,9 +422,9 @@ fn check_virt_prop(name: &str, value: &str) -> Result<()> {
         // The board always behaves as with dtb-randomness=off.
         "dtb-randomness" | "dtb-kaslr-seed" => prop_bool(name, value).map(drop),
         "gic-version" => match value {
-            "4" | "5" | "host" | "max" => Err(not_supported(name, value)),
+            "4" | "x-5" => Err(not_supported(name, value)),
             _ => Err(Error::generic("Invalid gic-version value".to_string())
-                .hint("Valid values are 2, 3, 4, 5, host, and max.\n")),
+                .hint("Valid values are 2, 3, 4, x-5, host, and max.\n")),
         },
         "virtio-mmio-transports" => match value.parse::<u8>() {
             Ok(32) => Ok(()),
@@ -577,8 +589,10 @@ pub(crate) fn take_board_options(board: ArmBoard, machine: &QDict) -> Result<Boa
             }
             // virt_set_gic_version().
             "gic-version" => match prop_string(name, value)?.as_str() {
-                "2" => o.gic_version = Some(VirtGicVersion::V2),
-                "3" => o.gic_version = Some(VirtGicVersion::V3),
+                "2" => (o.gic_version, o.gic_auto) = (Some(VirtGicVersion::V2), None),
+                "3" => (o.gic_version, o.gic_auto) = (Some(VirtGicVersion::V3), None),
+                "max" => (o.gic_version, o.gic_auto) = (None, Some(GicAuto::Max)),
+                "host" => (o.gic_version, o.gic_auto) = (None, Some(GicAuto::Host)),
                 v => check_virt_prop(name, v)?,
             },
             // virt_set_msi() and virt_set_its(). its=off is the GICv2m with a GICv2 and no MSI
@@ -1182,7 +1196,7 @@ pub(crate) fn start_board_tcg(
     }
     let one = |e: Error| vec![Located(None, e)];
     let cpu = || parse_cpu(ArmBoard::Virt, args.cpu).map_err(one);
-    let opts = with_tcg_gic_version(opts);
+    let opts = with_tcg_gic_version(opts).map_err(one)?;
     let built = build_virt(vm, opts, args, serial_hds, cpu, |_| Ok(()))?;
     let BuiltVirt { mut board, console, attachments, clocks, dumpdtb: dtb_path, net } = built;
     board.machine_done().map_err(|e| one(Error::generic(e)))?;
@@ -1215,7 +1229,7 @@ pub(crate) fn start_board_qtest(
 ) -> std::result::Result<Running, Vec<Located>> {
     let one = |e: Error| vec![Located(None, e)];
     let cpu = || parse_cpu(ArmBoard::Virt, args.cpu).map_err(one);
-    let opts = with_tcg_gic_version(opts);
+    let opts = with_tcg_gic_version(opts).map_err(one)?;
     let built = build_virt(vm, opts, args, serial_hds, cpu, |cfg| {
         cfg.clock = Some(clock);
         Ok(())
@@ -1238,14 +1252,27 @@ pub(crate) fn start_board_qtest(
 }
 
 /// `finalize_gic_version()` for TCG and qtest, which can do a GICv2 and a GICv3: fills in the
-/// version when `gic-version` is not given.
-fn with_tcg_gic_version(mut opts: BoardOptions) -> BoardOptions {
-    if opts.gic_version.is_none() {
-        let max_cpus = opts.max_cpus as usize;
-        let v = VirtGicVersion::tcg_default(max_cpus, opts.secure, opts.virtualization);
-        opts.gic_version = Some(v);
+/// version when `gic-version` is not given or is `max`.
+fn with_tcg_gic_version(mut opts: BoardOptions) -> Result<BoardOptions> {
+    if opts.gic_version.is_some() {
+        return Ok(opts);
     }
-    opts
+    let v = match opts.gic_auto {
+        None => {
+            let max_cpus = opts.max_cpus as usize;
+            VirtGicVersion::tcg_default(max_cpus, opts.secure, opts.virtualization)
+        }
+        Some(GicAuto::Host) => return Err(Error::generic("gic-version=host requires KVM")),
+        // QEMU picks a GICv4 when the CPUs have EL2, and ruvm has no GICv4.
+        Some(GicAuto::Max) if opts.virtualization => {
+            return Err(Error::generic(
+                "gic-version=max with virtualization=on is not supported by ruvm yet",
+            ));
+        }
+        Some(GicAuto::Max) => VirtGicVersion::V3,
+    };
+    opts.gic_version = Some(v);
+    Ok(opts)
 }
 
 /// The CPUs of virt as `query-cpus-fast` lists them, with the props
@@ -1636,12 +1663,28 @@ mod tests {
         assert_eq!(o.gic_version, Some(VirtGicVersion::V2));
         let o = take_board_options(ArmBoard::Virt, &QDict::new()).unwrap();
         assert_eq!(o.gic_version, None);
-        let mut m = QDict::new();
-        m.put("gic-version", "max");
+        let gic = |v: &str, virtualization: &str| {
+            let mut m = QDict::new();
+            m.put("gic-version", v);
+            m.put("virtualization", virtualization);
+            let o = take_board_options(ArmBoard::Virt, &m)?;
+            with_tcg_gic_version(o).map(|o| o.gic_version)
+        };
+        assert_eq!(gic("max", "off").unwrap(), Some(VirtGicVersion::V3));
         assert_eq!(
-            take_board_options(ArmBoard::Virt, &m).unwrap_err().message(),
-            "gic-version=max is not supported by ruvm yet"
+            gic("max", "on").unwrap_err().message(),
+            "gic-version=max with virtualization=on is not supported by ruvm yet"
         );
+        assert_eq!(gic("host", "off").unwrap_err().message(), "gic-version=host requires KVM");
+        assert_eq!(
+            gic("4", "on").unwrap_err().message(),
+            "gic-version=4 is not supported by ruvm yet"
+        );
+        assert_eq!(
+            gic("x-5", "off").unwrap_err().message(),
+            "gic-version=x-5 is not supported by ruvm yet"
+        );
+        assert_eq!(gic("5", "off").unwrap_err().message(), "Invalid gic-version value");
         // msi and its set the same thing, and the last one wins.
         let msi = |props: &[(&str, &str)]| {
             let mut m = QDict::new();
