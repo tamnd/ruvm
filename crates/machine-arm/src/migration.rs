@@ -59,13 +59,15 @@ pub fn virt_savevm(
     });
     let board = machine.board().lock().unwrap_or_else(PoisonError::into_inner);
     register_timer(&mut savevm, board.clock());
+    let (blocks, addrs) = board.migratable_ram_blocks().into_iter().unzip();
     let ram = RamSection::new(
-        board.migratable_ram_blocks(),
+        blocks,
         TcgHooks {
             vcpus: Arc::downgrade(machine.vcpus()),
             mem: Arc::downgrade(board.memory_system()),
         },
-    );
+    )
+    .block_addrs(addrs);
     drop(board);
     let ram_stats = ram.stats();
     savevm.register_live(EntryInfo::new("ram", 4).instance(0), ram);

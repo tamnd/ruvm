@@ -2209,12 +2209,15 @@ impl VirtMachine {
 
     /// The RAM blocks a migration carries, in QEMU's order: `ram_block_add()` keeps the list
     /// sorted from the biggest block to the smallest, and blocks of one size in the order they
-    /// were made. These are the RAM, the secure RAM and the two flashes.
-    pub fn migratable_ram_blocks(&self) -> Vec<Arc<RamBlock>> {
+    /// were made. These are the RAM, the secure RAM and the two flashes, each with its address in
+    /// its container, which `x-ignore-shared` puts in the block list.
+    pub fn migratable_ram_blocks(&self) -> Vec<(Arc<RamBlock>, u64)> {
         let flashes = self.flash.iter().map(|f| f.region());
         let ids = self.ram_blocks.iter().copied().chain(flashes);
-        let mut blocks: Vec<_> = ids.filter_map(|id| self.mem.ram_block(id)).collect();
-        blocks.sort_by_key(|b| std::cmp::Reverse(b.len()));
+        let mut blocks: Vec<_> = ids
+            .filter_map(|id| Some((self.mem.ram_block(id)?, self.mem.region(id)?.addr)))
+            .collect();
+        blocks.sort_by_key(|(b, _)| std::cmp::Reverse(b.len()));
         blocks
     }
 

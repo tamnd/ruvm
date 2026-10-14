@@ -256,6 +256,8 @@ fn fault_thread(
 /// The `ram` live entry over the RAM blocks of a machine.
 pub struct RamSection {
     blocks: Vec<Arc<RamBlock>>,
+    // `RAMBlock.mr->addr` of each block, which the block list carries with `x-ignore-shared`.
+    addrs: Vec<u64>,
     hooks: Box<dyn RamHooks>,
     stats: Arc<RamStats>,
     // Prefixes of block names that are accepted and dropped when the source has them and this
@@ -292,9 +294,12 @@ pub struct RamSection {
     background: bool,
     // Every block is ignored (`cpr-transfer`): listed, but no page goes out.
     ignore: bool,
+    // The `x-ignore-shared` capability of the outgoing migration.
+    ignore_shared: bool,
     tracking: Option<WriteTracking>,
     // The same for a load: the pages are in the file the stream comes from.
     load_mapped_ram: bool,
+    load_ignore_shared: bool,
     load_file: Option<Arc<FileChannel>>,
     // Where each block starts in one address space over all of them, like `RAMBlock.offset`,
     // for the XBZRLE cache.
@@ -319,6 +324,7 @@ impl RamSection {
         let requests =
             PageRequests::new(blocks.iter().map(|b| (b.name().to_string(), b.len())).collect());
         RamSection {
+            addrs: vec![0; blocks.len()],
             blocks,
             hooks: Box::new(hooks),
             stats: Arc::new(RamStats::default()),
@@ -344,8 +350,10 @@ impl RamSection {
             file_blocks: Vec::new(),
             background: false,
             ignore: false,
+            ignore_shared: false,
             tracking: None,
             load_mapped_ram: false,
+            load_ignore_shared: false,
             load_file: None,
             block_base: Vec::new(),
             page_count: 0,
@@ -357,6 +365,14 @@ impl RamSection {
                 xbzrle_bytes: 0,
             },
         }
+    }
+
+    /// Sets the address of each block's region in its container, `RAMBlock.mr->addr`, in the
+    /// order of the blocks. They are 0 until this is called.
+    pub fn block_addrs(mut self, addrs: Vec<u64>) -> Self {
+        assert_eq!(addrs.len(), self.blocks.len(), "one address per RAM block");
+        self.addrs = addrs;
+        self
     }
 
     /// Blocks whose name starts with one of `prefixes` are dropped when the source sends them
@@ -872,6 +888,11 @@ impl RamSection {
                 }
                 None => bail!("Unknown ramblock \"{}\", cannot accept migration", id),
             };
+            if self.load_ignore_shared {
+                // The address of the block on the source. QEMU compares it for the blocks it
+                // ignores, the shared ones backed by a named file, which ruvm does not have.
+                f.get_be64();
+            }
             if self.load_mapped_ram {
                 self.parse_mapped_ram(f, target, length)?;
             }
@@ -1087,11 +1108,14 @@ impl LiveState for RamSection {
 
         f.put_be64(listed | RAM_SAVE_FLAG_MEM_SIZE);
         self.file_blocks.clear();
-        for b in &self.blocks {
+        for (b, &addr) in self.blocks.iter().zip(&self.addrs) {
             let name = b.name();
             f.put_byte(name.len() as u8);
             f.put_buffer(name.as_bytes());
             f.put_be64(b.len());
+            if self.ignore_shared {
+                f.put_be64(addr);
+            }
             if self.mapped_ram {
                 // mapped_ram_setup_ramblock(): the header, then room for the pages.
                 let fb = FileBlock::new(f.offset()? + HDR_LEN as u64, Self::pages(b));
@@ -1217,6 +1241,7 @@ impl LiveState for RamSection {
         self.mapped_ram = p.mapped_ram;
         self.background = p.background_snapshot;
         self.ignore = p.ignore_ram;
+        self.ignore_shared = p.ignore_shared;
     }
 
     /// `ram_write_tracking_start()`.
@@ -1236,6 +1261,7 @@ impl LiveState for RamSection {
     fn set_load_params(&mut self, p: &LoadParams) {
         self.multifd_recv = p.multifd.clone();
         self.load_mapped_ram = p.mapped_ram;
+        self.load_ignore_shared = p.ignore_shared;
         self.load_file = p.file.clone();
     }
 
@@ -1588,6 +1614,7 @@ mod tests {
             mapped_ram: false,
             background_snapshot: false,
             ignore_ram: true,
+            ignore_shared: false,
         });
         let mut out = Vec::new();
         {
@@ -1608,6 +1635,46 @@ mod tests {
     }
 
     #[test]
+    fn ignore_shared_lists_the_block_addresses() {
+        let src = block("mach-virt.ram", 16);
+        src.write(0x1000, b"virt").unwrap();
+        let mut s = SaveVm::new(config());
+        let ram = RamSection::new(vec![src.clone()], NoHooks).block_addrs(vec![0x4000_0000]);
+        s.register_live(EntryInfo::new("ram", RAM_SECTION_VERSION), ram);
+        s.capabilities.push(MigrationCapability::XIgnoreShared);
+        s.set_save_params(&SaveParams {
+            multifd: None,
+            zero_page_detection: ZeroPageDetection::Multifd,
+            xbzrle_cache_size: None,
+            mapped_ram: false,
+            background_snapshot: false,
+            ignore_ram: false,
+            ignore_shared: true,
+        });
+        let mut out = Vec::new();
+        {
+            let mut f = QemuFile::new(&mut out);
+            s.save_header(&mut f).unwrap();
+            s.save_setup(&mut f).unwrap();
+            while !s.save_iterate(&mut f, 1 << 20, false).unwrap() {}
+            s.save_complete(&mut f).unwrap();
+        }
+        // The length, then the address, as ram_save_setup() writes them.
+        let mut entry = vec![13];
+        entry.extend_from_slice(b"mach-virt.ram");
+        entry.extend_from_slice(&(16u64 << 12).to_be_bytes());
+        entry.extend_from_slice(&0x4000_0000u64.to_be_bytes());
+        assert!(out.windows(entry.len()).any(|w| w == entry));
+        let dst = block("mach-virt.ram", 16);
+        let mut d = vm(vec![dst.clone()]);
+        d.capabilities.push(MigrationCapability::XIgnoreShared);
+        d.load_state(&mut StreamReader::new(&out)).unwrap();
+        let mut b = [0; 4];
+        dst.read(0x1000, &mut b).unwrap();
+        assert_eq!(&b, b"virt");
+    }
+
+    #[test]
     fn xbzrle_pages() {
         let src = block("pc.ram", 64);
         for page in 0..32u64 {
@@ -1624,6 +1691,7 @@ mod tests {
             mapped_ram: false,
             background_snapshot: false,
             ignore_ram: false,
+            ignore_shared: false,
         });
         let dirty = |page: u64| src.set_dirty(page << 12, 4096, DirtyClient::Migration.mask());
         let x = &stats.xbzrle;
@@ -1782,6 +1850,7 @@ mod tests {
             mapped_ram: true,
             background_snapshot: false,
             ignore_ram: false,
+            ignore_shared: false,
         });
         let c = Channel::connect_socket(&parse_uri(&uri).unwrap(), None).unwrap();
         {
