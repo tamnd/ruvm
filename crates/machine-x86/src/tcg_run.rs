@@ -25,6 +25,14 @@
 //!   (`cpu_get_pic_interrupt()`).
 //! - The APIC timers run on the virtual clock, fired by the timer thread like the board's
 //!   timers.
+//! - On q35 an APM command at 0xb2 raises an SMI on the vCPU that wrote it, or on every vCPU
+//!   once the guest negotiated SMI broadcast (`ich9_apm_ctrl_changed()`).
+//!
+//! TCG runs System Management Mode as QEMU's does ([`TCG_SMM_AVAILABLE`]), so q35's `smm=auto`
+//! resolves to on. Each vCPU has q35's SMM address space, system memory with the MCH's SMRAM
+//! view on top, as its second address space (`X86ASIdx_SMM`), which the front end uses while
+//! in SMM. Without SMRAM (microvm, `smm=off`) SMM uses system memory, as QEMU's `cpu-smm`
+//! address space does when there is no `/machine/smram`.
 //!
 //! A change to the memory map, such as SeaBIOS moving the PAM registers to shadow the BIOS
 //! in RAM, queues a TLB flush on every vCPU (`tcg_commit()`), so no TLB entry keeps pointing
@@ -41,10 +49,6 @@
 //!   it for every possible CPU (`apic_id_limit`); there is no CPU hotplug here.
 //! - The vCPUs keep the CPUID of the `-cpu` model even where it names hardware the front end
 //!   does not have yet; see the `ruvm-target-x86` documentation.
-//! - The x86 front end has no System Management Mode, so TCG does not offer it
-//!   ([`TCG_SMM_AVAILABLE`]): q35's `smm=auto` resolves to off and `smm=on` fails with
-//!   "System Management Mode not supported by this hypervisor.", as on KVM without
-//!   `KVM_CAP_X86_SMM`. SeaBIOS then skips its SMM setup.
 //! - The PC `pc` (i440FX) board does not exist yet, so only microvm and q35 run here.
 //! - Writes to RAM that do not come from a vCPU (DMA) do not invalidate translated code.
 //! - Timers run on their own thread, woken when a timer becomes the first to expire as
@@ -65,6 +69,7 @@ use ruvm_hw_core::{Clock, IrqLine};
 use ruvm_hw_intc::apic::{
     APIC_DEFAULT_ADDRESS, APIC_SPACE_SIZE, Apic, ApicBus, ApicCpu, CpuIrq, set_current_apic,
 };
+use ruvm_jit::cpu_exec::current_cpu_index;
 use ruvm_jit::cputlb::tlb_flush;
 use ruvm_jit::native::{BackendKind, backend_of_kind};
 use ruvm_jit::translate::TbBuild;
@@ -84,6 +89,7 @@ use ruvm_target_x86::tcg::{
 };
 
 use crate::board::X86Board;
+use crate::ich9_lpc::SmiTarget;
 use crate::q35::CpuIdent;
 use crate::run_event::{EventHandler, GuestEvent, ShutdownReason};
 
@@ -95,9 +101,8 @@ const TIMER_IDLE: Duration = Duration::from_millis(100);
 /// x86 has `TARGET_SUPPORTS_MTTCG`, so `thread=multi` gives no warning.
 const X86_SUPPORTS_MTTCG: bool = true;
 
-/// Whether TCG can run SMM, the `smm_available` of the board. QEMU's TCG can; the x86 front
-/// end here has no SMM yet.
-pub const TCG_SMM_AVAILABLE: bool = false;
+/// Whether TCG can run SMM, the `smm_available` of the board. As in QEMU, it can.
+pub const TCG_SMM_AVAILABLE: bool = true;
 
 /// The `-cpu` model and features for TCG.
 #[derive(Debug)]
@@ -222,6 +227,10 @@ impl CpuOps for PcCpu {
         self.x86.cpu_exec_interrupt(cpu, interrupt_request)
     }
 
+    fn asidx_from_attrs(&self, attrs: MemTxAttrs) -> usize {
+        self.x86.asidx_from_attrs(attrs)
+    }
+
     fn cpu_exec_halt(&self, cpu: &mut Cpu<'_>) -> bool {
         self.x86.cpu_exec_halt(cpu)
     }
@@ -344,6 +353,17 @@ impl MemoryListener for TlbCommit {
         let Some(jit) = self.0.upgrade() else { return };
         for cpu in jit.cpu_list() {
             cpu.async_run_on_cpu(tlb_flush);
+        }
+    }
+}
+
+/// The SMI of an APM command, from `ich9_apm_ctrl_changed()`: every vCPU with broadcast,
+/// otherwise the vCPU that wrote the command.
+fn apm_smi(jit: &Jit, target: SmiTarget) {
+    let current = current_cpu_index();
+    for cpu in jit.cpu_list() {
+        if target == SmiTarget::Broadcast || Some(cpu.cpu_index) == current {
+            cpu.cpu_interrupt(CPU_INTERRUPT_SMI);
         }
     }
 }
@@ -658,6 +678,9 @@ impl TcgMachine {
                 Arc::new(X86::new(model).with_io(Arc::clone(&io)).with_ticks(Arc::clone(&ticks)));
             let ops = Arc::new(PcCpu { x86: Arc::clone(&x86), apic: OnceLock::new() });
             let mut v = jit.create_vcpu(ops.clone(), Arc::clone(&mem), env::ENV_SIZE);
+            if let Some(smm) = board.smm_as() {
+                v.core.set_address_space(1, Arc::clone(smm));
+            }
             env::load_state(&mut v.env, &state);
             v.shared().halted.store(u32::from(state.halted), Ordering::Release);
             let link =
@@ -713,11 +736,27 @@ impl TcgMachine {
             }));
         }
 
+        if let X86Board::Q35(q35, _) = &board {
+            let j = Arc::downgrade(&jit);
+            q35.set_smi_handler(Some(Arc::new(move |target| {
+                if let Some(jit) = j.upgrade() {
+                    apm_smi(&jit, target);
+                }
+            })));
+        }
+
         board.machine_done()?;
         board
             .memory_system()
             .register_listener(Arc::new(TlbCommit(Arc::downgrade(&jit))), board.memory_as())
             .map_err(|e| e.to_string())?;
+        // tcg_commit() is registered for every address space of a vCPU.
+        if let Some(smm) = board.smm_as().cloned() {
+            board
+                .memory_system()
+                .register_listener(Arc::new(TlbCommit(Arc::downgrade(&jit))), &smm)
+                .map_err(|e| e.to_string())?;
+        }
         let board = Arc::new(Mutex::new(board));
         let vcpus = Arc::new(TcgVcpus::start(&jit, vcpus));
 

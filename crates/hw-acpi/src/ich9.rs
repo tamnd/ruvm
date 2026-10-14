@@ -429,6 +429,12 @@ impl Ich9Pm {
         lock(&self.state).smi_en
     }
 
+    /// Makes GBL_SMI_EN (bit 0 of SMI_EN) read-only until reset, as QEMU's LPC bridge does when
+    /// the guest sets SMI_LOCK (`lpc->pm.smi_en_wmask &= ~1`).
+    pub fn lock_gbl_smi_en(&self) {
+        lock(&self.state).smi_en_wmask &= !1;
+    }
+
     /// SMI_STS.
     pub fn smi_sts(&self) -> u32 {
         lock(&self.state).smi_sts

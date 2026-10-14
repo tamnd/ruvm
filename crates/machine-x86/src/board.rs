@@ -391,6 +391,15 @@ impl X86Board {
         }
     }
 
+    /// The address space CPUs use in SMM, `None` where there is no SMRAM: on microvm and on
+    /// q35 with `smm=off`.
+    pub fn smm_as(&self) -> Option<&Arc<AddressSpace>> {
+        match self {
+            X86Board::Microvm(_) => None,
+            X86Board::Q35(m, _) => m.smm_as(),
+        }
+    }
+
     /// The APIC IDs of the possible CPUs that are present at startup.
     pub fn apic_ids(&self) -> Vec<u32> {
         match self {

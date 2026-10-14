@@ -375,6 +375,21 @@ fn rsm_relocates_smbase() {
 }
 
 #[test]
+fn smm_handler_runs_above_64k() {
+    let w = World::new();
+    // What the SMM relocation stub of OVMF does with CS limit 4 GiB: mov ebp, 0x20000;
+    // jmp ebp. EIP stays 32 bits wide in 16-bit code, as in QEMU's eip_next_tl().
+    w.smm_write(HANDLER, &[0x66, 0xbd, 0x00, 0x00, 0x02, 0x00, 0x66, 0xff, 0xe5]);
+    // At CS base + 0x20000: nop; hlt.
+    w.write(SMBASE + 0x2_0000, &[0x90, 0xf4]);
+    w.write(CODE, &[0xf4]);
+    let mut v = w.vcpu(&long64());
+    let s = smi(&mut v);
+    check_smm_entry(&s, SMBASE);
+    assert_eq!(s.rip, 0x2_0002);
+}
+
+#[test]
 fn smm_reads_smram_and_flushes_the_tlb() {
     let w = World::new();
     w.write(HANDLER, &0x1122_3344u32.to_le_bytes());

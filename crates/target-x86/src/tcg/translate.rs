@@ -564,15 +564,11 @@ impl S<'_, '_, '_> {
 
     // EIP.
 
+    /// EIP at `pc`, as `eip_next_tl()` and `eip_cur_tl()`: 32 bits wide outside 64-bit code,
+    /// also in 16-bit code, where an SMM handler with its 4 GiB CS limit runs above 64 KiB.
     fn eip_of(&self, pc: u64) -> u64 {
         let eip = pc.wrapping_sub(self.d.cs_base);
-        if self.code64() {
-            eip
-        } else if self.d.code32 {
-            eip & 0xffff_ffff
-        } else {
-            eip & 0xffff
-        }
+        if self.code64() { eip } else { eip & 0xffff_ffff }
     }
 
     fn eip_next(&self) -> u64 {
