@@ -2,16 +2,16 @@
 
 //! The A32 and T32 translator: the integer part of QEMU's `target/arm/tcg/translate.c`.
 //!
-//! The decoders come from a32.decode, a32-uncond.decode, t32.decode, t16.decode, vfp.decode
-//! and vfp-uncond.decode (see `build.rs`). [`S`] implements their `trans_` hooks for the
-//! integer instructions, the barriers and the cp15 thread ID registers; the `fp` module has
-//! the VFP ones. Every pattern left out returns false, which raises an Undefined Instruction
+//! The decoders come from a32.decode, a32-uncond.decode, t32.decode, t16.decode, vfp.decode,
+//! vfp-uncond.decode, neon-dp.decode and neon-ls.decode (see `build.rs`). [`S`] implements
+//! their `trans_` hooks for the integer instructions, the barriers and the cp15 thread ID
+//! registers; the `fp` module has the VFP ones and the `neon` module the Advanced SIMD ones. Every pattern left out returns false, which raises an Undefined Instruction
 //! exception as QEMU's `unallocated_encoding()` does.
 //!
 //! As in QEMU, R0 to R14, the PC and the NZCV flags are TCG globals. R15 is the PC field,
 //! which holds the zero extended 32-bit PC in AArch32 state.
 //!
-//! Not here yet, and so UNDEF: Neon, the BF16 VCVT, VJCVT, the M profile, SWP, and what
+//! Not here yet, and so UNDEF: the FP and crypto parts of Neon, the BF16 VCVT, VJCVT, the M profile, SWP, and what
 //! only AArch32 system mode needs (exception returns, banked registers, SPSR, RFE, SRS,
 //! CPS, LDM and STM of the User registers, and the coprocessor registers other than
 //! TPIDRURW, TPIDRURO and the CP15 barriers). Only the user mode emulator runs AArch32 code so far, so the
@@ -24,6 +24,7 @@ use ruvm_jit_core::{Func, Label, MemOp, Temp};
 use ruvm_mem::Endian;
 
 mod fp;
+mod neon;
 
 use super::a32_helper as h;
 use super::helpers::{self, Def};
@@ -2482,7 +2483,11 @@ impl S<'_, '_> {
         }
         if cond == 0xf {
             // Unconditional instructions.
-            if !a32_uncond::disas(self, insn) && !fp::disas_uncond(self, insn) {
+            if !a32_uncond::disas(self, insn)
+                && !fp::disas_uncond(self, insn)
+                && !neon::disas_dp(self, insn)
+                && !neon::disas_ls(self, insn)
+            {
                 self.unallocated_encoding();
             }
             return;
@@ -2550,7 +2555,16 @@ impl DisasContext {
         let ok = if is_16bit {
             t16::disas(&mut s, insn as u16)
         } else {
-            t32::disas(&mut s, insn)
+            // The Neon data processing and load/store encodings, rewritten as their A32
+            // forms.
+            (insn & 0xef00_0000 == 0xef00_0000
+                && neon::disas_dp(
+                    &mut s,
+                    (insn & 0xe2ff_ffff) | ((insn & (1 << 28)) >> 4) | (1 << 28),
+                ))
+                || (insn & 0xff10_0000 == 0xf900_0000
+                    && neon::disas_ls(&mut s, (insn & 0x00ff_ffff) | 0xf400_0000))
+                || t32::disas(&mut s, insn)
                 || fp::disas_uncond(&mut s, insn)
                 || (insn >> 28 == 0xe && fp::disas(&mut s, insn))
         };

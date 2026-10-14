@@ -179,6 +179,7 @@ pub(crate) fn register(r: &mut HelperRegistry) {
         super::a32_helper::PAR_GE,
         super::a32_helper::PAR,
         super::a32_vfp::ALL,
+        super::a32_neon::ALL,
     ];
     for d in lists.iter().copied().flatten() {
         r.register_info(&d.info(), d.f);

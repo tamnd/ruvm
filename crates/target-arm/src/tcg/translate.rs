@@ -71,6 +71,7 @@ mod simd;
 #[path = "translate_sve.rs"]
 mod sve;
 
+pub(super) use simd::asimd_imm_const;
 use simd::{Chk, Feat, Mov, RA, RF, RM, RN, RP, RZ, cop, fop, nop};
 
 use decode::{

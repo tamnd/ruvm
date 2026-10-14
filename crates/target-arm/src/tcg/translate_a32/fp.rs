@@ -9,8 +9,7 @@
 //! through the one `a32_vfp` helper, with the values in 64-bit temporaries whatever their
 //! size.
 //!
-//! Not here yet, and so UNDEF: VCVT to BFloat16, VJCVT, and the Advanced SIMD scalar moves
-//! (VMOV to and from a scalar, VDUP).
+//! Not here yet, and so UNDEF: VCVT to BFloat16 and VJCVT.
 
 use ruvm_jit_core::MemOp;
 use ruvm_jit_core::ir::{TempI32, TempI64};
@@ -53,7 +52,7 @@ const fn rm(m: RoundMode) -> u32 {
 
 /// `vfp_reg_offset()`: the `env` offset of D`reg`, or of S`reg` if not `dp`. D`n` is half of
 /// the AdvSIMD register Q`n/2`, and S`n` half of D`n/2`.
-fn vfp_reg_offset(dp: bool, reg: i32) -> usize {
+pub(super) fn vfp_reg_offset(dp: bool, reg: i32) -> usize {
     let reg = reg as usize;
     if dp {
         vreg_off(reg >> 1) + 8 * (reg & 1)
@@ -408,6 +407,55 @@ impl DisasVfp for S<'_, '_> {
             self.call(&h::VFP_SET_FPSCR, None, &[env.into(), t.into()]);
             self.gen_lookup_tb();
         }
+        true
+    }
+
+    fn trans_VMOV_to_gp(&mut self, a: &mut arg_VMOV_to_gp) -> bool {
+        // VMOV scalar to general purpose register
+        let off = (vfp_reg_offset(true, a.vn) + ((a.index as usize) << a.size)) as i64;
+        let t = self.new32();
+        let env = self.env();
+        let f = self.f();
+        match (a.size, a.u != 0) {
+            (0, false) => f.gen_ld8s_i32(t, env, off),
+            (0, true) => f.gen_ld8u_i32(t, env, off),
+            (1, false) => f.gen_ld16s_i32(t, env, off),
+            (1, true) => f.gen_ld16u_i32(t, env, off),
+            _ => f.gen_ld_i32(t, env, off),
+        }
+        self.store_reg(a.rt, t);
+        true
+    }
+
+    fn trans_VMOV_from_gp(&mut self, a: &mut arg_VMOV_from_gp) -> bool {
+        // VMOV general purpose register to scalar
+        let off = (vfp_reg_offset(true, a.vn) + ((a.index as usize) << a.size)) as i64;
+        let t = self.load_reg(a.rt);
+        let env = self.env();
+        let f = self.f();
+        match a.size {
+            0 => f.gen_st8_i32(t, env, off),
+            1 => f.gen_st16_i32(t, env, off),
+            _ => f.gen_st_i32(t, env, off),
+        }
+        true
+    }
+
+    fn trans_VDUP(&mut self, a: &mut arg_VDUP) -> bool {
+        // VDUP (general purpose register)
+        if (a.b != 0 && a.e != 0) || (a.q != 0 && a.vn & 1 != 0) {
+            return false;
+        }
+        let size = if a.b != 0 {
+            0
+        } else if a.e != 0 {
+            1
+        } else {
+            2
+        };
+        let t = self.load_reg(a.rt);
+        let x = self.dup64(t, size);
+        self.st_dreg_q(x, a.vn, a.q != 0);
         true
     }
 
