@@ -19,8 +19,13 @@
 //! [`GpexHost::set_irq_num`] records which interrupt controller input each line ends up on,
 //! as `gpex_set_irq_num()` does for ACPI and VFIO.
 //!
-//! Not ported: VMState and QOM registration, `pci_bus_set_route_irq_fn()` (the routing is
-//! kept and can be read with [`GpexHost::route_intx_pin_to_irq`]) and the ACPI DSDT builder of
+//! A board registers the migration sections: `gpex_root` for the root function
+//! ([`VMSTATE_GPEX_ROOT`](crate::vmstate::VMSTATE_GPEX_ROOT)) and `PCIHost` and `PCIBUS` for
+//! the host and its bus. Nothing on ECAM writes `config_reg`, so `PCIHost` sends 0 unless an
+//! earlier migration loaded something else, as in QEMU.
+//!
+//! Not ported: QOM registration, `pci_bus_set_route_irq_fn()` (the routing is kept and can be
+//! read with [`GpexHost::route_intx_pin_to_irq`]) and the ACPI DSDT builder of
 //! hw/pci-host/gpex-acpi.c.
 
 use std::fmt;
@@ -35,6 +40,7 @@ use ruvm_mem::{
 
 use crate::bus::PciBus;
 use crate::device::{PciDevice, PciDeviceInfo};
+use crate::host::PciHostState;
 use crate::pcie_host::{PCIE_MMCFG_SIZE_MAX, PcieHost};
 use crate::regs::*;
 
@@ -124,6 +130,7 @@ impl MmioOps for UnassignedIo {
 pub struct GpexHost {
     config: GpexConfig,
     bus: Arc<PciBus>,
+    host: Arc<PciHostState>,
     pcie: Arc<PcieHost>,
     io_mmio: RegionId,
     io_ioport: RegionId,
@@ -195,6 +202,7 @@ impl GpexHost {
             (i32::from(pci_slot(devfn)) + pin) % nirq.max(1)
         }));
 
+        let host = PciHostState::new(Arc::clone(&bus));
         let pcie =
             PcieHost::new(Arc::clone(&memory), system_memory, Arc::clone(&bus)).map_err(err)?;
         pcie.mmcfg_init(PCIE_MMCFG_SIZE_MAX);
@@ -213,6 +221,7 @@ impl GpexHost {
         Ok(GpexHost {
             config,
             bus,
+            host,
             pcie,
             io_mmio,
             io_ioport,
@@ -236,6 +245,11 @@ impl GpexHost {
     /// The root function, `gpex-root` at 00:00.0.
     pub fn root(&self) -> &Arc<PciDevice> {
         &self.root
+    }
+
+    /// The `PCIHostState` of the host, which only migration looks at.
+    pub fn host_state(&self) -> &Arc<PciHostState> {
+        &self.host
     }
 
     /// The ECAM part, `PCIExpressHost`.

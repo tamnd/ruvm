@@ -1907,6 +1907,7 @@ dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
  "ruvm-mem",
+ "ruvm-vmstate",
 ]
 
 [[package]]
