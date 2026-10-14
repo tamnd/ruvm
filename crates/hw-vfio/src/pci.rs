@@ -1804,10 +1804,8 @@ pub fn realize(
                 return Err(prefix(e));
             }
             lock(&DEVICES).push(Arc::downgrade(&ops));
-            // QEMU resets every device once before the guest runs, and a hotplugged one right
-            // after realize. The boards here are built in their reset state, so a passed through
-            // device has to be reset now or it keeps whatever the last user left in it.
-            dev.reset();
+            // No reset here. Like QEMU, the device is reset by the first system reset, which
+            // `machine_done()` runs once every device is plugged.
             Ok(dev)
         }
         Err(e) => {
