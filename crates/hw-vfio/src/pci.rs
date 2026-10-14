@@ -523,7 +523,7 @@ struct Intx {
     /// `pending`: the pin is raised and the host interrupt masked.
     pending: Arc<Mutex<bool>>,
     irq: IrqLine,
-    notifier: Notifiers,
+    _notifier: Notifiers,
 }
 
 /// `VFIOPCIDevice::interrupt`: which kind of interrupt the device uses, with the eventfds for
@@ -533,7 +533,9 @@ enum Interrupt {
     None,
     Intx(Intx),
     /// One eventfd per MSI vector the guest enabled.
-    Msi(Notifiers),
+    Msi {
+        _vectors: Notifiers,
+    },
 }
 
 /// What the BAR, ROM and config callbacks share: the device, where its config space is and the
@@ -634,13 +636,13 @@ impl Shared {
                 Error::from_io("VFIO_DEVICE_SET_IRQS failure", e)
                     .prepend("Failed to set up TRIGGER eventfd signaling for interrupt INTX-0: ")
             })?;
-        *lock(&self.interrupt) = Interrupt::Intx(Intx { pending, irq, notifier });
+        *lock(&self.interrupt) = Interrupt::Intx(Intx { pending, irq, _notifier: notifier });
         Ok(())
     }
 
     /// `vfio_msi_disable_common()`.
     fn msi_disable_common(&self) {
-        drop(self.take_interrupt(|i| matches!(i, Interrupt::Msi(_))));
+        drop(self.take_interrupt(|i| matches!(i, Interrupt::Msi { .. })));
     }
 }
 
@@ -829,7 +831,7 @@ impl VfioPciOps {
     /// `vfio_disable_interrupts()`. Turning MSI off goes back to INTx, so INTx is torn down
     /// last.
     fn disable_interrupts(&self, dev: &PciDevice) {
-        let msi = matches!(*lock(&self.shared.interrupt), Interrupt::Msi(_));
+        let msi = matches!(*lock(&self.shared.interrupt), Interrupt::Msi { .. });
         if msi {
             self.msi_disable(dev);
         }
@@ -865,7 +867,7 @@ impl VfioPciOps {
         );
         drop(fds);
         match r {
-            Ok(()) => *lock(&self.shared.interrupt) = Interrupt::Msi(notifiers),
+            Ok(()) => *lock(&self.shared.interrupt) = Interrupt::Msi { _vectors: notifiers },
             Err(e) => {
                 error_report(&format!("vfio: Error: Failed to setup MSI fds: {}", strerror(&e)));
                 drop(notifiers);
@@ -1235,7 +1237,7 @@ impl<'a> Setup<'a> {
             shared: Arc::clone(&self.shared),
             dev: OnceLock::new(),
             msi_cap_size: self.msi_cap_size,
-            emulated: std::mem::take(&mut self.emulated),
+            emulated: mem::take(&mut self.emulated),
             pm_cap: self.pm_cap,
             reset_works: self.reset_works,
             has_flr: self.has_flr,
