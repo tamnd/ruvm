@@ -4,8 +4,9 @@
 //!
 //! So far this is `vfio-pci` on Linux hosts, QEMU's hw/vfio/pci.c over the legacy container
 //! of hw/vfio/container-legacy.c: the config space, BARs and ROM of a host function bound to
-//! `vfio-pci` are given to the guest, with the parts QEMU emulates emulated the same way. DMA
-//! mapping, interrupts, iommufd and the device quirks come later. The plan for the rest of
+//! `vfio-pci` are given to the guest, with the parts QEMU emulates emulated the same way, and the
+//! guest's RAM is mapped for the device's DMA. Interrupts, DMA through a vIOMMU, iommufd and the
+//! device quirks come later. The plan for the rest of
 //! this crate is in `spec/24-workspace-layout.md`.
 
 mod host;

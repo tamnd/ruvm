@@ -1353,7 +1353,8 @@ pub(crate) fn plan(
         }
     }
 
-    // Nothing maps guest memory for the device's DMA through a vIOMMU yet.
+    // The container maps guest RAM at its guest physical address. Nothing follows a vIOMMU's
+    // mappings yet.
     let viommu = !p.iommus.is_empty() || p.virtio.iter().any(|v| v.iommu.is_some());
     if let (true, Some((_, plug))) = (viommu, p.vfio.first()) {
         return Err(vec![Located::new(
