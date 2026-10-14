@@ -1949,6 +1949,12 @@ version = "0.5.7"
 [[package]]
 name = "ruvm-hw-vfio"
 version = "0.5.7"
+dependencies = [
+ "ruvm-base",
+ "ruvm-hw-pci",
+ "ruvm-mem",
+ "ruvm-sys",
+]
 
 [[package]]
 name = "ruvm-hw-virtio"
@@ -2087,8 +2093,10 @@ dependencies = [
  "ruvm-hw-virtio",
  "ruvm-jit",
  "ruvm-mem",
+ "ruvm-migration",
  "ruvm-target-arm",
  "ruvm-virtio-queue",
+ "ruvm-vmstate",
 ]
 
 [[package]]
@@ -2329,6 +2337,7 @@ dependencies = [
  "ruvm-hw-pci",
  "ruvm-hw-storage",
  "ruvm-hw-tpm",
+ "ruvm-hw-vfio",
  "ruvm-hw-virtio",
  "ruvm-machine-arm",
  "ruvm-machine-riscv",

@@ -9,7 +9,7 @@
 //!
 //! Differences from QEMU:
 //!
-//! - Not ported: VMState and QOM registration.
+//! - Not ported: QOM registration.
 //! - The board calls [`GpioKey::reset`] for the legacy reset handler.
 
 use std::fmt;
@@ -77,6 +77,22 @@ impl GpioKey {
     fn timer_expired(&self) {
         self.irq.lower();
         self.timer.del();
+    }
+
+    /// The `timer` field of `vmstate_gpio_key`: when the key is let go on the virtual clock,
+    /// or -1 when it is not pressed.
+    pub fn vmstate_save(&self) -> i64 {
+        self.timer.expire_time().unwrap_or(-1)
+    }
+
+    /// Loads the `timer` field of `vmstate_gpio_key`. The output keeps its level, which the
+    /// PL061 it drives carries.
+    pub fn vmstate_load(&self, timer: i64) {
+        if timer == -1 {
+            self.timer.del();
+        } else {
+            self.timer.modify(timer);
+        }
     }
 
     /// `gpio_key_reset()`. Like QEMU it only stops the timer and leaves the output as it is.

@@ -32,8 +32,10 @@ ruvm-hw-tpm.workspace = true
 ruvm-hw-virtio.workspace = true
 ruvm-jit.workspace = true
 ruvm-mem.workspace = true
+ruvm-migration.workspace = true
 ruvm-target-arm.workspace = true
 ruvm-virtio-queue.workspace = true
+ruvm-vmstate.workspace = true
 
 [lints]
 workspace = true
