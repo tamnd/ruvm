@@ -71,7 +71,7 @@ pub use host::{
     pci_data_read, pci_data_write, pci_host_config_read_common, pci_host_config_write_common,
 };
 pub use msi::PCI_MSI_VECTORS_MAX;
-pub use msix::MsixLayout;
+pub use msix::{MsixLayout, MsixVectorRelease, MsixVectorUse};
 pub use pam::*;
 pub use pcie_host::{
     PCIE_BASE_ADDR_UNMAPPED, PCIE_MMCFG_BUS_BIT, PCIE_MMCFG_BUS_MASK, PCIE_MMCFG_CONFOFFSET_MASK,

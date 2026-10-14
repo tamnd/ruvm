@@ -23,7 +23,7 @@ use ruvm_hw_core::IrqLine;
 use ruvm_mem::{MemorySystem, RegionId};
 
 use crate::bus::PciBus;
-use crate::msix::Msix;
+use crate::msix::{Msix, MsixVectorRelease, MsixVectorUse};
 use crate::regs::*;
 
 /// Delivers one MSI or MSI-X message: a 32 bit little endian store of `data` at `addr`, what
@@ -134,6 +134,10 @@ pub(crate) enum Effect {
     Intx { pin: usize, change: i32 },
     /// `pci_msi_trigger()`.
     Msi { address: u64, data: u32 },
+    /// The MSI-X vector use notifier.
+    VectorUse { f: MsixVectorUse, vector: u32, msg: MsiMessage },
+    /// The MSI-X vector release notifier.
+    VectorRelease { f: MsixVectorRelease, vector: u32 },
 }
 
 pub(crate) type Effects = Vec<Effect>;
@@ -554,6 +558,8 @@ impl PciDevice {
             match e {
                 Effect::Intx { pin, change } => self.change_irq_level(pin, change),
                 Effect::Msi { address, data } => self.msi_deliver(address, data),
+                Effect::VectorUse { f, vector, msg } => f(self, vector, msg),
+                Effect::VectorRelease { f, vector } => f(self, vector),
             }
         }
     }

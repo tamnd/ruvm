@@ -873,6 +873,61 @@ fn msix_table_pba_and_masking() {
     assert_eq!(dev.msix_cap(), 0);
 }
 
+fn take_calls(calls: &Mutex<Vec<String>>) -> Vec<String> {
+    std::mem::take(&mut *calls.lock().unwrap())
+}
+
+#[test]
+fn msix_vector_notifiers() {
+    let env = Env::new();
+    let dev = env.device("msix", Some(pci_devfn(5, 0)));
+    let devfn = dev.devfn();
+    let cap = dev.msix_init_exclusive_bar(4, 1).unwrap();
+    assert_eq!(env.iomap(devfn, 1, 0xfe00_0000), 0x1000);
+    env.writew(devfn, PCI_COMMAND as u8, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+    let table = 0xfe00_0000u64;
+    let ctrl = cap + 3;
+    // Vector 1 is unmasked before MSI-X is turned on.
+    env.mem_writel(table + 16 + 8, 0x41);
+    env.mem_writel(table + 16 + 12, 0);
+    env.writeb(devfn, ctrl, 0x80);
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (u, r) = (Arc::clone(&calls), Arc::clone(&calls));
+    // The notifiers run with the device unlocked, so they can look at it.
+    dev.msix_set_vector_notifiers(
+        Arc::new(move |d: &PciDevice, v, msg: MsiMessage| {
+            assert!(!d.msix_is_masked(v));
+            u.lock().unwrap().push(format!("use {v} {:#x}", msg.data));
+        }),
+        Arc::new(move |d: &PciDevice, v| {
+            assert!(d.msix_is_masked(v));
+            r.lock().unwrap().push(format!("release {v}"));
+        }),
+    );
+    // Setting them reports the vectors that are unmasked already.
+    assert_eq!(take_calls(&calls), ["use 1 0x41"]);
+
+    // Writing a masked entry does nothing, unmasking and masking one in the table does.
+    env.mem_writel(table + 3 * 16 + 8, 0x43);
+    assert!(take_calls(&calls).is_empty());
+    env.mem_writel(table + 3 * 16 + 12, 0);
+    env.mem_writel(table + 16 + 12, 1);
+    assert_eq!(take_calls(&calls), ["use 3 0x43", "release 1"]);
+
+    // The function mask releases every unmasked vector, and clearing it uses them again.
+    env.writeb(devfn, ctrl, 0xc0);
+    assert_eq!(take_calls(&calls), ["release 3"]);
+    env.writeb(devfn, ctrl, 0x80);
+    assert_eq!(take_calls(&calls), ["use 3 0x43"]);
+
+    // Unsetting them releases what is still unmasked, and after that nothing is called.
+    dev.msix_unset_vector_notifiers();
+    assert_eq!(take_calls(&calls), ["release 3"]);
+    env.mem_writel(table + 12, 0);
+    assert!(take_calls(&calls).is_empty());
+}
+
 #[test]
 fn msix_layout_checks() {
     let env = Env::new();
