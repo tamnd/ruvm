@@ -171,6 +171,25 @@ fn ram_and_device_accesses_split_at_the_boundary() {
 }
 
 #[test]
+fn device_accesses_are_not_cut_by_an_overlap() {
+    // q35: the reset control register at 0xcf9 sits on top of CONFIG_ADDRESS at 0xcf8.
+    let (sys, root, space) = setup();
+    let conf = Arc::new(Dev::default());
+    let rcr = Arc::new(Dev::default());
+    let c = sys.new_io("pci-conf-idx", 4, conf.clone()).unwrap();
+    let r = sys.new_io("lpc-reset-control", 1, rcr.clone()).unwrap();
+    sys.add_subregion(root, 0xcf8, c).unwrap();
+    sys.add_subregion_overlap(root, 0xcf9, r, 1).unwrap();
+    assert_eq!(space.write_u32(0xcf8, U, 0x8000_0000), MemTxResult::OK);
+    assert_eq!(conf.take(), vec![('w', 0, 4, 0x8000_0000)]);
+    assert_eq!(space.read_u32(0xcf8, U), (0x40, MemTxResult::OK));
+    assert_eq!(conf.take(), vec![('r', 0, 4, 0)]);
+    assert_eq!(space.write(0xcf9, U, &[6]), MemTxResult::OK);
+    assert_eq!(rcr.take(), vec![('w', 0, 1, 6)]);
+    assert!(conf.take().is_empty());
+}
+
+#[test]
 fn holes_rom_and_memory_attribute() {
     let (sys, root, space) = setup();
     let rom = sys.new_rom("bios", 0x1000).unwrap();

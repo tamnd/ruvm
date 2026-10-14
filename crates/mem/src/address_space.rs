@@ -95,7 +95,16 @@ impl AddressSpace {
             // the next range. The access size rules keep it small anyway.
             return f(Resolved { range: None, offset: addr, len });
         };
-        let len = u128::from(len).min(left) as u64;
+        // address_space_translate_internal() only cuts the step at the end of the range for
+        // RAM. An MMIO access goes to the region whole even when another region covers part
+        // of it, so an outl to 0xcf8 on q35 reaches CONFIG_ADDRESS although the reset
+        // control register sits on top of 0xcf9.
+        let ram = match range.target.ty {
+            RegionType::Ram => true,
+            RegionType::RomDevice => range.romd_mode,
+            _ => false,
+        };
+        let len = if ram { u128::from(len).min(left) as u64 } else { len };
         let offset = range.offset_in_region + (addr - range.addr);
         let TargetKind::Iommu(ops) = &range.target.kind else {
             return f(Resolved { range: Some(range), offset, len });
