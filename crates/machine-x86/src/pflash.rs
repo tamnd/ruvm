@@ -14,14 +14,20 @@
 //! to 512 byte sectors like `pflash_update()` does. A read only backing sets `ro`: programs and
 //! erases then only set the error bits in the status register and change nothing.
 //!
+//! With `secure` set, only accesses with secure attrs (from a CPU in SMM on x86) reach the
+//! command state machine. Other writes are dropped with `MEMTX_ERROR`, and other reads return
+//! the array data whatever mode the flash is in (`pflash_mem_read_with_attrs()` and
+//! `pflash_mem_write_with_attrs()`). This is how OVMF built with SMM keeps its variable store
+//! writable only from SMM.
+//!
 //! [`pc_system_flash_map`] is the check and placement logic of `pc_system_firmware_init()` and
 //! `pc_system_flash_map()`: pflash0 ends at 4 GiB, pflash1 sits right below it, and the last
 //! 128 KiB of pflash0 are aliased read only at 0xe0000 as "isa-bios" (`x86_isa_bios_init()`,
 //! used since the 9.1 machine types). The board creates the devices with
 //! [`PflashProps::pc_system_flash`], which has the properties `pc_pflash_create()` sets.
 //!
-//! Not ported: VMState, trace points, the `secure` property, the unimplemented command log
-//! (`LOG_UNIMP`), and the isa-bios copy that machine types before 9.1 use (`pc_isa_bios_init()`).
+//! Not ported: VMState, trace points, the unimplemented command log (`LOG_UNIMP`), and the
+//! isa-bios copy that machine types before 9.1 use (`pc_isa_bios_init()`).
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -31,7 +37,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use ruvm_base::error::strerror;
 use ruvm_base::error_report;
-use ruvm_mem::{AccessCtx, AccessSize, MemResult, MemorySystem, MmioOps, RamBlock, RegionId};
+use ruvm_mem::{
+    AccessCtx, AccessSize, MemResult, MemTxResult, MemorySystem, MmioOps, RamBlock, RegionId,
+};
 
 /// `TYPE_PFLASH_CFI01`.
 pub const TYPE_PFLASH_CFI01: &str = "cfi.pflash01";
@@ -89,6 +97,8 @@ pub struct PflashProps {
     pub id2: u16,
     /// `id3`.
     pub id3: u16,
+    /// `secure`: only secure accesses may write, or read anything but the array data.
+    pub secure: bool,
 }
 
 impl PflashProps {
@@ -666,13 +676,22 @@ impl Pflash {
 }
 
 impl MmioOps for Pflash {
-    fn read(&self, _cx: &AccessCtx, offset: u64, size: AccessSize) -> MemResult<u64> {
-        let mut st = self.lock();
-        let v = self.pflash_read(&mut st, offset, size.bytes());
+    /// `pflash_mem_read_with_attrs()`.
+    fn read(&self, cx: &AccessCtx, offset: u64, size: AccessSize) -> MemResult<u64> {
+        let v = if self.props.secure && !cx.attrs.secure() {
+            self.data_read(offset, size.bytes())
+        } else {
+            let mut st = self.lock();
+            self.pflash_read(&mut st, offset, size.bytes())
+        };
         Ok(u64::from(v) & size.mask())
     }
 
-    fn write(&self, _cx: &AccessCtx, offset: u64, size: AccessSize, value: u64) -> MemResult<()> {
+    /// `pflash_mem_write_with_attrs()`.
+    fn write(&self, cx: &AccessCtx, offset: u64, size: AccessSize, value: u64) -> MemResult<()> {
+        if self.props.secure && !cx.attrs.secure() {
+            return Err(MemTxResult::ERROR);
+        }
         let mut st = self.lock();
         self.pflash_write(&mut st, offset, value as u32, size.bytes());
         Ok(())

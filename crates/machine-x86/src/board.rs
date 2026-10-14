@@ -579,6 +579,8 @@ pub struct BoardSpec {
     pub bios: Option<String>,
     /// The drives of pflash0 and pflash1 (q35 only).
     pub pflash: [Option<PflashDrive>; 2],
+    /// `secure` of the q35 system flashes, from `-global`.
+    pub pflash_secure: bool,
     /// `-uuid`, or the UUID of `-smbios type=1,uuid=`.
     pub uuid: Option<[u8; 16]>,
     /// The `-smbios` options (q35 only).
@@ -608,6 +610,7 @@ impl fmt::Debug for BoardSpec {
             .field("memdev", &self.memdev.as_ref().map(|b| b.name()))
             .field("aux_ram_share", &self.aux_ram_share)
             .field("virtio_force_legacy", &self.virtio_force_legacy)
+            .field("pflash_secure", &self.pflash_secure)
             .field("cpus", &self.cpus)
             .field("bios", &self.bios)
             .field("kernel", &self.kernel)
@@ -752,6 +755,7 @@ pub fn build_board(mut spec: BoardSpec) -> Result<(X86Board, Vec<String>), Strin
                 firmware: spec.pflash[0].is_none().then(|| spec.firmware.load(&name)).flatten(),
                 firmware_name: spec.bios.clone(),
                 pflash: spec.pflash,
+                pflash_secure: spec.pflash_secure,
                 smbios: spec.smbios,
                 topology: spec.topology,
                 props,
