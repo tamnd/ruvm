@@ -598,13 +598,17 @@ struct BarOps {
 }
 
 impl MmioOps for BarOps {
+    /// `vfio_region_read()`. Like every BAR access that reaches the device, a read is taken
+    /// as the EOI for a pending INTx once it is done, after the device has seen it.
     fn read(&self, _cx: &AccessCtx, addr: u64, size: AccessSize) -> MemResult<u64> {
-        self.shared.eoi();
         let n = size.bytes() as usize;
         let mut b = [0u8; 8];
         let r = self.shared.device.read_at(&mut b[..n], self.offset + addr);
         match check_rw(r, n, "short read") {
-            Ok(()) => Ok(u64::from_le_bytes(b)),
+            Ok(()) => {
+                self.shared.eoi();
+                Ok(u64::from_le_bytes(b))
+            }
             Err(e) => {
                 error_report(&format!(
                     "vfio_region_read({}:region{}+0x{addr:x}, {n}) failed: {e}",
@@ -615,8 +619,8 @@ impl MmioOps for BarOps {
         }
     }
 
+    /// `vfio_region_write()`, then the EOI.
     fn write(&self, _cx: &AccessCtx, addr: u64, size: AccessSize, value: u64) -> MemResult<()> {
-        self.shared.eoi();
         let n = size.bytes() as usize;
         let r = self.shared.device.write_at(&value.to_le_bytes()[..n], self.offset + addr);
         if let Err(e) = check_rw(r, n, "short write") {
@@ -625,6 +629,7 @@ impl MmioOps for BarOps {
                 self.shared.name, self.nr
             ));
         }
+        self.shared.eoi();
         Ok(())
     }
 
