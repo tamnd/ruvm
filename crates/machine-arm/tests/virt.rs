@@ -780,6 +780,27 @@ fn virtio_plugging() {
 }
 
 #[test]
+fn virtio_mmio_iommu_platform() {
+    let rng =
+        || Box::new(VirtioRng::new(Box::new(RandomFile::default()), VirtioRngConf::default()));
+    let mut m = VirtMachine::new(VirtConfig::default()).unwrap();
+    assert_eq!(m.attach_virtio_with(rng(), true).unwrap(), 31);
+    m.attach_virtio_at_with(30, rng(), false, true).unwrap();
+    m.attach_virtio_at_with(29, rng(), false, false).unwrap();
+    m.machine_done().unwrap();
+    // The high word of DEVICE_FEATURES: VIRTIO_F_IOMMU_PLATFORM is bit 33. The legacy
+    // transport shows nothing there, as in QEMU.
+    let high = |i: u64| {
+        let base = VIRT_MMIO + i * 0x200;
+        w(&m, base + 0x14, 4, 1);
+        r32(&m, base + 0x10)
+    };
+    assert_eq!(high(31), 0);
+    assert_eq!(high(30) & 3, 3);
+    assert_eq!(high(29) & 3, 1);
+}
+
+#[test]
 fn pcie_host() {
     let rng =
         || Box::new(VirtioRng::new(Box::new(RandomFile::default()), VirtioRngConf::default()));

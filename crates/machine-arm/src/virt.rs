@@ -49,12 +49,13 @@
 //! [`VirtMachine::new`] builds the board and loads the kernel. Plug virtio devices with
 //! [`VirtMachine::attach_virtio`] (virtio-mmio) or [`VirtMachine::attach_virtio_pci`] (a PCI
 //! function on the root bus), and root ports with [`VirtMachine::attach_pcie_root_port`] and
-//! functions behind them with [`VirtMachine::attach_virtio_pci_on`], then call [`VirtMachine::machine_done`], which finishes and
-//! loads the device tree and resets the board. [`VirtMachine::create_vcpus`] then makes the
-//! vCPUs on a [`Jit`], wired to the GIC, and resets them. On a guest reset request
-//! ([`VirtMachine::take_request`]) the runner calls [`VirtMachine::system_reset`] and, on each
-//! vCPU's thread, [`VirtMachine::reset_cpu`]. The runner also runs the timers of
-//! [`VirtMachine::clock`]: the generic timers arm their deadlines there.
+//! functions behind them with [`VirtMachine::attach_virtio_pci_on`], then call
+//! [`VirtMachine::machine_done`], which finishes and loads the device tree and resets the
+//! board. [`VirtMachine::create_vcpus`] then makes the vCPUs on a [`Jit`], wired to the GIC,
+//! and resets them. On a guest reset request ([`VirtMachine::take_request`]) the runner calls
+//! [`VirtMachine::system_reset`] and, on each vCPU's thread, [`VirtMachine::reset_cpu`]. The
+//! runner also runs the timers of [`VirtMachine::clock`]: the generic timers arm their
+//! deadlines there.
 //!
 //! # Not modelled yet
 //!
@@ -1690,11 +1691,20 @@ impl VirtMachine {
     /// does: the guest probes the transports from the top, so the first device plugged is
     /// found first. Returns the transport index.
     pub fn attach_virtio(&self, class: Box<dyn VirtioDeviceClass>) -> Result<usize, String> {
+        self.attach_virtio_with(class, false)
+    }
+
+    /// [`VirtMachine::attach_virtio`] with the `iommu_platform` property of the virtio device.
+    pub fn attach_virtio_with(
+        &self,
+        class: Box<dyn VirtioDeviceClass>,
+        iommu_platform: bool,
+    ) -> Result<usize, String> {
         let Some(index) = (0..self.virtio.len()).rev().find(|&i| !self.virtio[i].is_plugged())
         else {
             return Err("No 'virtio-bus' bus found for device".to_string());
         };
-        self.attach_virtio_at(index, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT)?;
+        self.attach_virtio_at_with(index, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT, iommu_platform)?;
         Ok(index)
     }
 
@@ -1705,6 +1715,21 @@ impl VirtMachine {
         index: usize,
         class: Box<dyn VirtioDeviceClass>,
         force_legacy: bool,
+    ) -> Result<(), String> {
+        self.attach_virtio_at_with(index, class, force_legacy, false)
+    }
+
+    /// [`VirtMachine::attach_virtio_at`] with the `iommu_platform` property of the virtio
+    /// device. A virtio-mmio transport has no IOMMU in front of it, so as in
+    /// `virtio_bus_device_plugged()` without `get_dma_as` the device offers
+    /// `VIRTIO_F_IOMMU_PLATFORM` and does its DMA in system memory. A legacy transport only
+    /// shows the low 32 feature bits, so the guest does not see it there.
+    pub fn attach_virtio_at_with(
+        &self,
+        index: usize,
+        class: Box<dyn VirtioDeviceClass>,
+        force_legacy: bool,
+        iommu_platform: bool,
     ) -> Result<(), String> {
         let force_legacy = force_legacy && self.virtio_force_legacy;
         if self.done {
@@ -1718,7 +1743,10 @@ impl VirtMachine {
         }
         let memory: Arc<dyn GuestMemory + Send + Sync> =
             Arc::new(WeakGuestMemory(Arc::downgrade(&self.memory_as)));
-        let backend = VirtioBackend::new(class, memory).map_err(err)?;
+        let mut backend = VirtioBackend::new(class, memory).map_err(err)?;
+        if iommu_platform {
+            backend.vdev_mut().set_host_feature(VIRTIO_F_IOMMU_PLATFORM, true);
+        }
         let t = VirtioMmio::new(Some(backend), force_legacy).map_err(err)?;
         t.irq().connect(slot.gsi.clone());
         *slot.transport.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(t);
