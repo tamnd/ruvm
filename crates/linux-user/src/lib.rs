@@ -50,12 +50,11 @@
 //! - On i386 the socket, System V IPC, POSIX timer and message queue calls, `vm86()` and
 //!   `modify_ldt()` are `ENOSYS`. There is no vDSO: the signal return trampolines are on a
 //!   page where QEMU loads it.
-//! - arm programs are EABI ones, little endian. They cannot set signal handlers yet:
-//!   `rt_sigaction()`, `sigaltstack()` and the old signal calls are `ENOSYS`, as are the calls
-//!   i386 does not have. An OABI call, an SVC with a nonzero immediate, is `ENOSYS` but for
-//!   the private calls (`set_tls` and the others). There is no commpage, so the kuser helpers
-//!   are not there, no FPA emulation, no FDPIC and no `-g`. The hardware capabilities leave
-//!   out Advanced SIMD and the crypto instructions.
+//! - arm programs are EABI ones, little endian. The calls i386 does not have are `ENOSYS`.
+//!   An OABI call, an SVC with a nonzero immediate, is `ENOSYS` but for the private calls
+//!   (`set_tls` and the others). There is no vDSO: the signal return trampolines are on a
+//!   page where QEMU loads it. There is no FPA emulation, no FDPIC and no `-g`. The hardware
+//!   capabilities leave out Advanced SIMD and the crypto instructions.
 //! - The guest space is a 64 TiB reservation, as QEMU lays it out with `-R`, so addresses
 //!   differ from QEMU's default layout. For i386 and arm it is the whole 4 GiB, as in QEMU.
 

@@ -5,31 +5,34 @@
 //! `target_proc.h`. The system calls are the EABI ones and go through
 //! [`compat`](crate::compat), with the EABI's register pairs and structures.
 //!
-//! There is no commpage: the kuser helpers at 0xffff0000 are not mapped, and a jump there is
-//! `SIGSEGV`. There is no vDSO either. Signal frames are not there yet: a signal with a
-//! handler kills the program with `SIGSEGV`, as a frame that does not fit on the stack would.
+//! The commpage at 0xffff0000 has the kuser helper version, 5, and a jump to one of its
+//! helpers runs it in `do_kernel_trap()`. There is no vDSO: the signal return trampolines,
+//! which QEMU has in it, are on a page of their own where QEMU loads it.
 
+mod sigframe;
 mod syscalls;
 
 use std::mem::offset_of;
+use std::sync::atomic::{Ordering, fence};
 use std::sync::{Arc, OnceLock};
 
 use ruvm_jit::cpu_exec::{cpu_exec_step_atomic, tcg_cpu_exec};
 use ruvm_jit::{Cpu, Jit, JitConfig, Vcpu, excp};
 use ruvm_mem::AddressSpace;
+use ruvm_sys::hostatomic;
 use ruvm_target_arm::cpu::{
-    ArmCpuModel, CpuArmState, ENV_SIZE, EXCP_BKPT, EXCP_DATA_ABORT, EXCP_KERNEL_TRAP,
+    ArmCpuModel, CF, CpuArmState, ENV_SIZE, EXCP_BKPT, EXCP_DATA_ABORT, EXCP_KERNEL_TRAP,
     EXCP_PREFETCH_ABORT, EXCP_SWI, EXCP_UDEF, PC, THUMB, env_off, reg_off,
 };
 use ruvm_target_arm::tcg::{Arm, helper_registry, jit_config, user};
-use ruvm_user_common::GuestSpace;
+use ruvm_user_common::{GuestSpace, MapKind, PAGE_SIZE, page};
 
 use crate::aarch64::{UserCpu, format_cpuinfo};
 use crate::compat;
 use crate::elf::{Arch, ImageInfo};
 use crate::gdb;
 use crate::guest::Guest;
-use crate::signal::{self, Sigaction, Task};
+use crate::signal::{self, Task};
 use crate::start;
 use crate::strace;
 use crate::syscall::{Proc, THREAD_EXIT};
@@ -239,25 +242,6 @@ fn cpuinfo() -> String {
     format_cpuinfo(&[(HWCAP_NAMES, h), (HWCAP2_NAMES, h2)], midr)
 }
 
-/// What an arm program's signal handler would be entered with; the frames are not written
-/// yet, so the program gets `SIGSEGV`.
-fn setup_rt_frame(
-    _space: &GuestSpace,
-    t: &mut Task,
-    _cpu: &mut Cpu<'_>,
-    sig: i32,
-    _sa: &Sigaction,
-    _info: &signal::Info,
-    _old: u64,
-) {
-    signal::force_sigsegv(t, sig);
-}
-
-fn do_rt_sigreturn(_space: &GuestSpace, t: &mut Task, _cpu: &mut Cpu<'_>) -> i64 {
-    signal::force_sig(t, signal::SIGSEGV);
-    signal::ESIGRETURN
-}
-
 /// The strace entry of arm call `nr`: the host's when the call is the host's, else the name.
 fn strace_entry(nr: u64) -> Option<&'static strace::Entry> {
     static NAMED: OnceLock<Vec<strace::Entry>> = OnceLock::new();
@@ -270,6 +254,12 @@ fn strace_entry(nr: u64) -> Option<&'static strace::Entry> {
 /// `do_syscall()` of arm EABI call `nr`.
 fn do_syscall(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>, nr: u64, a: [u64; 6]) -> i64 {
     let Some(&(name, host)) = SYSCALLS.get(nr as usize) else { return -ENOSYS };
+    if name == "sigreturn" {
+        if signal::block_signals(t) {
+            return signal::ERESTARTSYS;
+        }
+        return sigframe::do_sigreturn(p.space(), t, cpu);
+    }
     compat::do_syscall(p, t, cpu, name, (host >= 0).then_some(i64::from(host)), a)
 }
 
@@ -370,6 +360,94 @@ fn do_swi(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) -> bool {
     false
 }
 
+/// The commpage, `init_guest_commpage()`: one read-only page at the top with the kuser
+/// helper version, 5, in its last word. The helpers themselves are in `do_kernel_trap()`.
+fn map_commpage(space: &GuestSpace) -> Result<(), String> {
+    const COMMPAGE: u64 = 0xffff_0000;
+    let kind = MapKind { anon: true, fixed: true, ..MapKind::default() };
+    let err = |e| format!("Allocating guest commpage: {}", crate::strerror(e));
+    space.mmap(COMMPAGE, PAGE_SIZE, page::READ | page::WRITE, kind, None, 0).map_err(err)?;
+    space.write_raw(0xffff_0ffc, &5u32.to_le_bytes());
+    space.mprotect(COMMPAGE, PAGE_SIZE, page::READ | page::EXEC).map_err(err)
+}
+
+/// `atomic_mmu_lookup()`: the `size` bytes at `addr` for a host atomic operation, or `None`
+/// with the signal the access raises queued.
+fn atomic_bytes<'a>(
+    space: &'a GuestSpace,
+    t: &mut Task,
+    addr: u32,
+    size: u32,
+) -> Option<&'a [std::sync::atomic::AtomicU8]> {
+    let a = u64::from(addr);
+    if addr & (size - 1) != 0 {
+        signal::force_sig_fault(t, signal::SIGBUS, signal::BUS_ADRALN, a);
+        return None;
+    }
+    if !space.check(a, u64::from(size), page::READ | page::WRITE) {
+        let code = if space.page_flags(a) != 0 { signal::SEGV_ACCERR } else { signal::SEGV_MAPERR };
+        signal::force_sig_fault(t, signal::SIGSEGV, code, a);
+        return None;
+    }
+    Some(&space.block().atomic_bytes()[addr as usize..][..size as usize])
+}
+
+/// The result of a kuser compare and exchange: C and R0 say whether it stored.
+fn kernel_cmpxchg_result(cpu: &mut Cpu<'_>, ok: bool) {
+    cpu.env[CF..CF + 4].copy_from_slice(&u32::from(ok).to_le_bytes());
+    set_reg(cpu, 0, if ok { 0 } else { u32::MAX });
+}
+
+/// `arm_kernel_cmpxchg32_helper()`: `__kernel_cmpxchg`, of R0 for R1 at R2.
+fn kernel_cmpxchg32(space: &GuestSpace, t: &mut Task, cpu: &mut Cpu<'_>) {
+    let (old, new) = (reg(cpu, 0), reg(cpu, 1));
+    let Some(mem) = atomic_bytes(space, t, reg(cpu, 2), 4) else { return };
+    let val = hostatomic::cmpxchg(mem, old.into(), new.into()).expect("aligned");
+    kernel_cmpxchg_result(cpu, val == u64::from(old));
+}
+
+/// `arm_kernel_cmpxchg64_helper()`: `__kernel_cmpxchg64`, of the doubleword at R0 for that
+/// at R1, at R2.
+fn kernel_cmpxchg64(space: &GuestSpace, t: &mut Task, cpu: &mut Cpu<'_>) {
+    let mut v = [[0u8; 8]; 2];
+    for (i, b) in v.iter_mut().enumerate() {
+        let addr = reg(cpu, i);
+        if !space.read(u64::from(addr), b) {
+            let a = u64::from(addr);
+            let code =
+                if space.page_flags(a) != 0 { signal::SEGV_ACCERR } else { signal::SEGV_MAPERR };
+            signal::force_sig_fault(t, signal::SIGSEGV, code, a);
+            return;
+        }
+    }
+    let [old, new] = v.map(u64::from_le_bytes);
+    let Some(mem) = atomic_bytes(space, t, reg(cpu, 2), 8) else { return };
+    let val = hostatomic::cmpxchg(mem, old, new).expect("aligned");
+    kernel_cmpxchg_result(cpu, val == old);
+}
+
+/// `do_kernel_trap()`: the kuser helper at the PC, then back to LR. False for an address
+/// in the commpage that is not a helper.
+fn do_kernel_trap(space: &GuestSpace, t: &mut Task, cpu: &mut Cpu<'_>) -> bool {
+    match pc(cpu) {
+        // __kernel_memory_barrier
+        0xffff_0fa0 => fence(Ordering::SeqCst),
+        // __kernel_cmpxchg
+        0xffff_0fc0 => kernel_cmpxchg32(space, t, cpu),
+        // __kernel_get_tls
+        0xffff_0fe0 => set_reg(cpu, 0, ld64(cpu, TPIDRURO) as u32),
+        // __kernel_cmpxchg64
+        0xffff_0f60 => kernel_cmpxchg64(space, t, cpu),
+        _ => return false,
+    }
+    let lr = reg(cpu, 14);
+    if lr & 1 != 0 {
+        cpu.env[THUMB..THUMB + 4].copy_from_slice(&1u32.to_le_bytes());
+    }
+    set_pc(cpu, lr & !1);
+    true
+}
+
 /// The signal of a prefetch or data abort. QEMU reads the short-descriptor FSR; here EL1 is
 /// AArch64, so the fault status is that of the AArch64 syndrome.
 fn signal_for_abort(t: &mut Task, cpu: &Cpu<'_>) {
@@ -414,11 +492,7 @@ pub(crate) fn cpu_loop(p: &Arc<Proc>, t: &mut Task, cpu: &mut Cpu<'_>) {
                 let pc = pc(cpu);
                 signal::force_sig_fault(t, signal::SIGTRAP, signal::TRAP_BRKPT, u64::from(pc));
             }
-            // do_kernel_trap(): with no commpage, the kuser helpers are not there.
-            EXCP_KERNEL_TRAP => {
-                let pc = pc(cpu);
-                signal::force_sig_fault(t, signal::SIGSEGV, signal::SEGV_MAPERR, u64::from(pc));
-            }
+            EXCP_KERNEL_TRAP if do_kernel_trap(p.space(), t, cpu) => {}
             excp::ATOMIC => cpu_exec_step_atomic(cpu),
             _ => {
                 eprintln!(
@@ -459,9 +533,9 @@ pub(crate) static GUEST: Guest = Guest {
     },
     set_tls,
     cpu_loop,
-    setup_rt_frame,
-    setup_frame: None,
-    rt_sigreturn: do_rt_sigreturn,
+    setup_rt_frame: sigframe::setup_rt_frame,
+    setup_frame: Some(sigframe::setup_frame),
+    rt_sigreturn: sigframe::do_rt_sigreturn,
 };
 
 /// `qemu-arm`: the model `-cpu` names.
@@ -534,6 +608,8 @@ impl start::Target for Target {
         info: &ImageInfo,
     ) -> Result<Vcpu, String> {
         let model = self.model.take().expect("the CPU is selected first");
+        map_commpage(space)?;
+        sigframe::map_sigtramp(space)?;
         let arm = Arc::new(Arm::new(model).with_user_mode());
         // init_main_thread(): User mode, in Thumb state for an odd entry point. R0 is the
         // atexit() function, none, and R10 the start of the data for uClinux PIC programs.

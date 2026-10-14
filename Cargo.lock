@@ -2067,6 +2067,7 @@ dependencies = [
  "ruvm-jit",
  "ruvm-jit-core",
  "ruvm-mem",
+ "ruvm-sys",
  "ruvm-target-arm",
  "ruvm-target-riscv",
  "ruvm-target-x86",
