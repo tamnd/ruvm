@@ -494,6 +494,8 @@ pub struct SaveParams {
     /// `migrate_ram_is_ignored()` for every block, which `cpr-transfer` makes so: the next
     /// process maps the very same memory, so the block list goes out but no page does.
     pub ignore_ram: bool,
+    /// The `x-ignore-shared` capability: the block list gives the address of each block.
+    pub ignore_shared: bool,
 }
 
 impl std::fmt::Debug for SaveParams {
@@ -505,6 +507,7 @@ impl std::fmt::Debug for SaveParams {
             .field("mapped_ram", &self.mapped_ram)
             .field("background_snapshot", &self.background_snapshot)
             .field("ignore_ram", &self.ignore_ram)
+            .field("ignore_shared", &self.ignore_shared)
             .finish()
     }
 }
@@ -552,6 +555,8 @@ pub struct LoadParams {
     pub file: Option<Arc<FileChannel>>,
     /// The `mapped-ram` capability: the pages sit at fixed places in the file.
     pub mapped_ram: bool,
+    /// The `x-ignore-shared` capability: the block list gives the address of each block.
+    pub ignore_shared: bool,
 }
 
 /// `PostcopyState`, the destination's progress through the postcopy commands.
@@ -1317,6 +1322,7 @@ impl SaveVm {
             multifd: opts.multifd,
             file: opts.file,
             mapped_ram: self.capabilities.contains(&MigrationCapability::MappedRam),
+            ignore_shared: self.capabilities.contains(&MigrationCapability::XIgnoreShared),
         };
         for e in &mut self.entries {
             if let Kind::Live(l) = &mut e.kind {

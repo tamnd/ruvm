@@ -144,6 +144,7 @@ const SUPPORTED_CAPS: &[MigrationCapability] = &[
     MigrationCapability::MappedRam,
     MigrationCapability::BackgroundSnapshot,
     MigrationCapability::SwitchoverAck,
+    MigrationCapability::XIgnoreShared,
 ];
 
 /// `check_caps_background_snapshot`: what `background-snapshot` cannot go with.
@@ -753,6 +754,7 @@ impl Migration {
             mapped_ram: caps.contains(&MigrationCapability::MappedRam),
             background_snapshot: false,
             ignore_ram: false,
+            ignore_shared: caps.contains(&MigrationCapability::XIgnoreShared),
         };
         let mut f = QemuFile::new(out);
         let res = {
@@ -1863,6 +1865,7 @@ fn multifd_setup(
     let mapped_ram = caps.contains(&MigrationCapability::MappedRam);
     // migrate_ram_is_ignored(): the next process maps the same memory.
     let ignore_ram = params.mode == Some(MigMode::CprTransfer);
+    let ignore_shared = caps.contains(&MigrationCapability::XIgnoreShared);
     if !caps.contains(&MigrationCapability::Multifd) {
         return Ok(SaveParams {
             multifd: None,
@@ -1871,6 +1874,7 @@ fn multifd_setup(
             mapped_ram,
             background_snapshot: caps.contains(&MigrationCapability::BackgroundSnapshot),
             ignore_ram,
+            ignore_shared,
         });
     }
     let channels = params.multifd_channels.unwrap_or(2);
@@ -1912,6 +1916,7 @@ fn multifd_setup(
         mapped_ram,
         background_snapshot: false,
         ignore_ram,
+        ignore_shared,
     })
 }
 
