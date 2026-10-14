@@ -137,8 +137,12 @@ pub const ZMM_SIZE: usize = 64;
 pub const XMM_T0: usize = XMM_REGS + 32 * ZMM_SIZE;
 /// `mmx_t0`, the MMX operand loaded from memory.
 pub const MMX_T0: usize = XMM_T0 + ZMM_SIZE;
+/// `smbase`, 32 bits: where the SMM state save area and handler are.
+pub const SMBASE: usize = MMX_T0 + 8;
+/// `msr_smi_count`: how many SMIs the vCPU took.
+pub const SMI_COUNT: usize = SMBASE + 8;
 /// The size of the whole buffer.
-pub const ENV_SIZE: usize = MMX_T0 + 8;
+pub const ENV_SIZE: usize = SMI_COUNT + 8;
 
 /// The offset of general purpose register `r`.
 pub const fn reg(r: usize) -> usize {
@@ -235,6 +239,8 @@ pub const HF_UMIP_MASK: u32 = 1 << 27;
 pub const HF_AVX_EN_MASK: u32 = 1 << 28;
 /// `HF2_HIF_MASK`.
 pub const HF2_HIF_MASK: u32 = 1 << 1;
+/// `HF2_SMM_INSIDE_NMI_MASK`: the SMI came while an NMI was being handled.
+pub const HF2_SMM_INSIDE_NMI_MASK: u32 = 1 << 4;
 
 /// Read a little endian `u64`.
 pub fn ld64(env: &[u8], off: usize) -> u64 {
@@ -347,6 +353,8 @@ pub fn load_state(env: &mut [u8], s: &X86CpuState) {
             st64(env, zmm(i) + 8 * j, s.xmm_regs[i][j]);
         }
     }
+    st32(env, SMBASE, s.smbase);
+    st64(env, SMI_COUNT, s.msr_smi_count);
     // HF_AVX_EN_MASK is derived state, recomputed as cpu_sync_avx_hflag() does.
     let mut hf = s.hflags & !HF_AVX_EN_MASK;
     if avx_enabled(s.cr4, s.xcr0) {
@@ -423,6 +431,8 @@ pub fn save_state(env: &[u8], s: &mut X86CpuState) {
             s.xmm_regs[i][j] = ld64(env, zmm(i) + 8 * j);
         }
     }
+    s.smbase = ld32(env, SMBASE);
+    s.msr_smi_count = ld64(env, SMI_COUNT);
 }
 
 /// `cpu_cc_compute_all()`: the arithmetic flags.

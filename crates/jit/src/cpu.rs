@@ -243,6 +243,13 @@ pub trait CpuOps: Send + Sync + fmt::Debug {
         addr
     }
 
+    /// `asidx_from_attrs`: the index of the address space an access with `attrs` goes to,
+    /// see [`CpuCore::set_address_space`]. The default is the first one.
+    fn asidx_from_attrs(&self, attrs: MemTxAttrs) -> usize {
+        let _ = attrs;
+        0
+    }
+
     /// `guest_default_memory_order`, `TCG_MO_*` bits.
     fn guest_default_memory_order(&self) -> u32 {
         0
@@ -546,6 +553,8 @@ pub struct CpuCore {
     pub(crate) shared: Arc<CpuShared>,
     pub(crate) ops: Arc<dyn CpuOps>,
     pub(crate) as_: Arc<AddressSpace>,
+    /// `cpu_ases` after the first, which is `as_`.
+    more_as: Vec<Option<Arc<AddressSpace>>>,
     /// `exception_index`, -1 for none.
     pub exception_index: i32,
     /// `cflags_next_tb`, `u32::MAX` for QEMU's -1.
@@ -603,6 +612,7 @@ impl CpuCore {
             shared,
             ops,
             as_,
+            more_as: Vec::new(),
             exception_index: -1,
             cflags_next_tb: u32::MAX,
             tcg_cflags,
@@ -638,6 +648,35 @@ impl CpuCore {
     /// The address space the CPU's physical accesses go to.
     pub fn address_space(&self) -> &Arc<AddressSpace> {
         &self.as_
+    }
+
+    /// `cpu_address_space_init()` for `asidx` 1 and up: give the CPU another address space,
+    /// which accesses reach when [`CpuOps::asidx_from_attrs`] picks `asidx`. Index 0 is the
+    /// one the vCPU was created with. The TLB keeps entries filled from the old one, so the
+    /// caller flushes it if the vCPU already ran.
+    pub fn set_address_space(&mut self, asidx: usize, as_: Arc<AddressSpace>) {
+        assert!(asidx > 0, "address space 0 is set when the vCPU is created");
+        if self.more_as.len() < asidx {
+            self.more_as.resize(asidx, None);
+        }
+        self.more_as[asidx - 1] = Some(as_);
+    }
+
+    /// `cpu_get_address_space()`: the address space at `asidx`, if it was set.
+    pub fn address_space_at(&self, asidx: usize) -> Option<&Arc<AddressSpace>> {
+        match asidx {
+            0 => Some(&self.as_),
+            _ => self.more_as.get(asidx - 1).and_then(Option::as_ref),
+        }
+    }
+
+    /// The address space an access with `attrs` goes to, `cpu_asidx_from_attrs()`. QEMU
+    /// asserts that the index exists; here an index that was never set falls back to the
+    /// first address space, so a CPU without, say, an SMM address space sees the same memory
+    /// in both modes.
+    pub fn address_space_for(&self, attrs: MemTxAttrs) -> &Arc<AddressSpace> {
+        let asidx = self.ops.asidx_from_attrs(attrs);
+        self.address_space_at(asidx).unwrap_or(&self.as_)
     }
 
     /// The block that is running, if any.
