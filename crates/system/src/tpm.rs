@@ -10,13 +10,40 @@ use ruvm_base::report::{Location, error_report, push_location, report_error};
 use ruvm_chardev::Chardevs;
 use ruvm_hw_tpm::TpmBackend;
 #[cfg(unix)]
+use ruvm_monitor::{Commands, MonitorQmp};
+#[cfg(unix)]
+use ruvm_qapi::commands::{
+    register_query_tpm, register_query_tpm_models, register_query_tpm_types,
+};
+#[cfg(unix)]
 use ruvm_qapi::opts::{OptsHandle, is_help_option};
 use ruvm_qapi::opts::{QemuOptDesc, QemuOptType, QemuOpts, QemuOptsList};
+#[cfg(unix)]
+pub(crate) use ruvm_qapi::types::TpmModel;
+#[cfg(unix)]
+use ruvm_qapi::types::{
+    TPMEmulatorOptions, TPMEmulatorOptionsWrapper, TPMInfo, TpmType, TpmTypeOptions,
+    TpmTypeOptionsU,
+};
 
-/// A backend and its id, `TPMBackend`. The device that takes it leaves `None`.
+/// A backend and its id, `TPMBackend`. The device that takes it leaves `None` and its model.
+/// Only `query-tpm` reads the chardev and the model, and it is Unix only.
+#[cfg_attr(not(unix), allow(dead_code))]
 struct Backend {
     id: String,
+    /// The `chardev` of the emulator, for `query-tpm`.
+    chardev: String,
     be: Option<Box<dyn TpmBackend>>,
+    /// The model of the device that took it, `tpm_if_get_model(tpmif)`.
+    model: Option<TpmModel>,
+}
+
+/// `TpmModel`, which the QAPI schema has only with `CONFIG_TPM`, on POSIX hosts.
+#[cfg(not(unix))]
+#[derive(Clone, Copy)]
+pub(crate) enum TpmModel {
+    TpmTis,
+    TpmCrb,
 }
 
 /// `tpm_backends`.
@@ -103,7 +130,8 @@ fn init_tpmdev(chardevs: &Chardevs, opts: &mut QemuOpts) -> Result<(), String> {
         return Err(String::new());
     }
     let be = emulator_create(chardevs, opts)?;
-    backends().push(Backend { id, be: Some(be) });
+    let chardev = opts.get("chardev").unwrap_or_default().to_string();
+    backends().push(Backend { id, chardev, be: Some(be), model: None });
     Ok(())
 }
 
@@ -141,22 +169,80 @@ fn emulator_create(_: &Chardevs, _: &QemuOpts) -> Result<Box<dyn TpmBackend>, St
 }
 
 /// What the `tpmdev` property of a TPM device does with the id it is given, `set_tpm()` and
-/// `tpm_backend_init()`: takes the backend. `prop` is `<type>.tpmdev` for the error.
-fn take(prop: &str, id: &str) -> Result<Box<dyn TpmBackend>, String> {
+/// `tpm_backend_init()`: takes the backend for a device of `model`. `prop` is `<type>.tpmdev`
+/// for the error.
+fn take(model: TpmModel, prop: &str, id: &str) -> Result<Box<dyn TpmBackend>, String> {
     let mut all = backends();
     let Some(b) = all.iter_mut().find(|b| b.id == id) else {
         return Err(format!("Property '{prop}' can't find value '{id}'"));
     };
-    b.be.take().ok_or_else(|| format!("TPM backend '{id}' is already initialized"))
+    let be = b.be.take().ok_or_else(|| format!("TPM backend '{id}' is already initialized"))?;
+    b.model = Some(model);
+    Ok(be)
 }
 
-/// The start of a TPM device's realize, given its `tpmdev` property: takes the backend when
-/// the property is set, then does the `tpm_find()` check that this is the only TPM device and
-/// the check that it has a backend.
-pub(crate) fn realize(prop: &str, tpmdev: Option<&str>) -> Result<Box<dyn TpmBackend>, String> {
-    let be = tpmdev.map(|id| take(prop, id)).transpose()?;
+/// The start of the realize of a TPM device of `model`, given its `tpmdev` property: takes the
+/// backend when the property is set, then does the `tpm_find()` check that this is the only
+/// TPM device and the check that it has a backend.
+pub(crate) fn realize(
+    model: TpmModel,
+    prop: &str,
+    tpmdev: Option<&str>,
+) -> Result<Box<dyn TpmBackend>, String> {
+    let be = tpmdev.map(|id| take(model, prop, id)).transpose()?;
     if DEVICES.fetch_add(1, Ordering::AcqRel) != 0 {
         return Err("at most one TPM device is permitted".to_string());
     }
     be.ok_or_else(|| "'tpmdev' property is required".to_string())
+}
+
+/// The models of the TPM devices `target` has, in the order `qmp_query_tpm_models()` gives
+/// them. QEMU's aarch64 also has `tpm-tis-i2c`, a second `tpm-tis`, which ruvm does not.
+#[cfg(unix)]
+fn models(target: &str) -> Vec<TpmModel> {
+    if crate::x86::is_x86(target) {
+        vec![TpmModel::TpmCrb, TpmModel::TpmTis]
+    } else if crate::arm::is_arm(target) {
+        vec![TpmModel::TpmTis]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Registers `query-tpm`, `query-tpm-models` and `query-tpm-types`, which QEMU has with
+/// `CONFIG_TPM` only. `target` is the one of the personality.
+#[cfg(unix)]
+pub(crate) fn register(target: &str, cmds: &mut Commands) {
+    // qmp_query_tpm(): the backends a device has taken.
+    register_query_tpm(cmds, |_: &MonitorQmp| {
+        let info = backends()
+            .iter()
+            .filter_map(|b| {
+                let model = b.model?;
+                let data = TPMEmulatorOptions { chardev: b.chardev.clone() };
+                let u = TpmTypeOptionsU::Emulator(TPMEmulatorOptionsWrapper { data });
+                Some(TPMInfo { id: b.id.clone(), model, options: TpmTypeOptions { u } })
+            })
+            .collect();
+        Ok(info)
+    });
+    let models = models(target);
+    register_query_tpm_models(cmds, move |_: &MonitorQmp| Ok(models.clone()));
+    // qmp_query_tpm_types(): the types this build has, which leaves out passthrough.
+    register_query_tpm_types(cmds, |_: &MonitorQmp| {
+        Ok(TYPES.iter().filter_map(|(name, _)| TpmType::from_name(name)).collect())
+    });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_follow_the_target() {
+        assert_eq!(models("x86_64"), [TpmModel::TpmCrb, TpmModel::TpmTis]);
+        assert_eq!(models("i386"), [TpmModel::TpmCrb, TpmModel::TpmTis]);
+        assert_eq!(models("aarch64"), [TpmModel::TpmTis]);
+        assert!(models("riscv64").is_empty());
+    }
 }

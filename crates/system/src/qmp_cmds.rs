@@ -95,6 +95,8 @@ pub(crate) fn register(vm: &Arc<Vm>, target: &str, cmds: &mut Commands) {
     crate::audio::register(cmds);
     crate::display::register(cmds);
     crate::info::register(vm, target, cmds);
+    #[cfg(unix)]
+    crate::tpm::register(target, cmds);
     crate::hmp::register(vm, target, cmds);
     let v = vm.clone();
     register_query_status(cmds, move |_: &MonitorQmp| Ok(v.runstate.status()));
