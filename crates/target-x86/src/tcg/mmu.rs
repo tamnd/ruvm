@@ -7,12 +7,13 @@
 //! space. The accessed and dirty bits are set with a plain store rather than a compare and
 //! swap (see the module doc of `tcg`).
 
-use ruvm_jit::cputlb::tlb_set_page;
+use ruvm_jit::cputlb::tlb_set_page_with_attrs;
 use ruvm_jit::{Cpu, CpuLoopExit, MmuAccessType, Ra, page};
-use ruvm_mem::{Endian, MemTxAttrs};
+use ruvm_mem::Endian;
 
-use super::env::{A20_MASK, EFER, HFLAGS, PKRS, PKRU, cr, ld32, ld64, st64};
+use super::env::{EFER, HFLAGS, PKRS, PKRU, cr, ld32, ld64, st64};
 use super::seg::raise_exception_err_ra;
+use super::smm;
 use super::{
     EXCP0D_GPF, EXCP0E_PAGE, MMU_KSMAP32_IDX, MMU_KSMAP64_IDX, MMU_NESTED_IDX, MMU_PHYS_IDX,
     MMU_USER32_IDX, MMU_USER64_IDX, X86,
@@ -113,7 +114,8 @@ struct Fault {
 
 fn ptw_ld(cpu: &Cpu<'_>, addr: u64, size: u32) -> u64 {
     // A read of unassigned memory returns all ones, as in QEMU.
-    let (v, _) = cpu.core.address_space().load(addr, size, Endian::Little, MemTxAttrs::UNSPECIFIED);
+    let attrs = smm::mem_attrs(cpu.env);
+    let (v, _) = cpu.core.address_space_for(attrs).load(addr, size, Endian::Little, attrs);
     v
 }
 
@@ -121,13 +123,9 @@ fn ptw_ld(cpu: &Cpu<'_>, addr: u64, size: u32) -> u64 {
 fn ptw_setl(cpu: &Cpu<'_>, addr: u64, old: u64, set: u64) {
     if set & !old != 0 {
         let new = (old as u32) | (set as u32);
-        let _ = cpu.core.address_space().store(
-            addr,
-            4,
-            u64::from(new),
-            Endian::Little,
-            MemTxAttrs::UNSPECIFIED,
-        );
+        let attrs = smm::mem_attrs(cpu.env);
+        let _ =
+            cpu.core.address_space_for(attrs).store(addr, 4, u64::from(new), Endian::Little, attrs);
     }
 }
 
@@ -347,7 +345,7 @@ fn mmu_translate(
                         // Merge the offset within the page.
                         let paddr =
                             (pte & PG_ADDRESS_MASK & !(page_size - 1)) | (addr & (page_size - 1));
-                        let a20 = ld64(cpu.env, A20_MASK);
+                        let a20 = smm::a20_mask(cpu.env);
                         return Ok(Translation { paddr: paddr & a20, prot, page_size });
                     }
                 }
@@ -403,7 +401,7 @@ fn get_physical_address(
     }
     // No translation needed.
     Ok(Translation {
-        paddr: addr & ld64(cpu.env, A20_MASK),
+        paddr: addr & smm::a20_mask(cpu.env),
         prot: page::READ | page::WRITE | page::EXEC,
         page_size: 4096,
     })
@@ -425,7 +423,16 @@ pub(crate) fn tlb_fill(
         Ok(t) => {
             // Even for large pages only one 4 KiB page goes in the TLB, so it does not fill
             // too fast.
-            tlb_set_page(cpu, addr & !0xfff, t.paddr & !0xfff, t.prot, mmu_idx, t.page_size);
+            let attrs = smm::mem_attrs(cpu.env);
+            tlb_set_page_with_attrs(
+                cpu,
+                addr & !0xfff,
+                t.paddr & !0xfff,
+                attrs,
+                t.prot,
+                mmu_idx,
+                t.page_size,
+            );
             Ok(true)
         }
         Err(f) => {

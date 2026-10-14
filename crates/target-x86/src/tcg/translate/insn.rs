@@ -767,6 +767,17 @@ impl S<'_, '_, '_> {
                     self.b.is_jmp = DISAS_EOB_NEXT;
                 }
             }
+            0x1aa => {
+                // RSM is #UD outside SMM, so also under user mode emulation, which never
+                // enters SMM.
+                if self.d.flags & crate::state::HF_SMM_MASK == 0 {
+                    self.gen_illegal_opcode();
+                    return Ok(());
+                }
+                self.env_call(&helpers::RSM, None, &[]);
+                self.assume_cc_op(CC_OP_EFLAGS);
+                self.b.is_jmp = DISAS_EOB_ONLY;
+            }
             0x107 => {
                 if !self.d.pe || self.d.cpl != 0 {
                     self.gen_exception_gpf();

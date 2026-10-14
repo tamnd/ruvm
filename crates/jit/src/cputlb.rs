@@ -640,8 +640,9 @@ pub fn tlb_set_page_full(cpu: &mut Cpu<'_>, mmu_idx: usize, addr: u64, full: &Tl
     let paddr_page = full.phys_addr & jit.page_mask();
     let prot = full.prot;
 
-    // address_space_translate_for_iotlb(): only a range covering the whole page is RAM.
-    let fv = cpu.core.as_.flatview();
+    // address_space_translate_for_iotlb(): only a range covering the whole page is RAM, in
+    // the address space the attributes pick.
+    let fv = cpu.core.address_space_for(full.attrs).flatview();
     let mut section = TlbSection::Io;
     let mut readonly = false;
     let mut page_ram_addr = 0;
@@ -1062,7 +1063,7 @@ fn do_ld_piece(
     if p.flags & u64::from(tlb::MMIO) != 0 {
         io_prepare(cpu, ra)?;
         let jit = cpu.jit();
-        let as_ = cpu.core.as_.clone();
+        let as_ = cpu.core.address_space_for(p.full.attrs).clone();
         let mut phys = p.full.phys_addr | (p.addr & !jit.page_mask());
         let mut addr = p.addr;
         let mut done = 0;
@@ -1126,7 +1127,7 @@ fn do_st_piece(
     if p.flags & u64::from(tlb::MMIO) != 0 {
         io_prepare(cpu, ra)?;
         let jit = cpu.jit();
-        let as_ = cpu.core.as_.clone();
+        let as_ = cpu.core.address_space_for(p.full.attrs).clone();
         let mut phys = p.full.phys_addr | (p.addr & !jit.page_mask());
         let mut addr = p.addr;
         let mut done = 0;

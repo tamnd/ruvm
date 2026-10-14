@@ -9,7 +9,8 @@
 //! arithmetic flags lazy with the `cc_op` scheme of [`cc`]. Helpers called from generated code
 //! are in `helpers.rs` (arithmetic, CPUID, MSRs, control registers) and `seg.rs`
 //! (descriptors, far transfers, exceptions and interrupts through the IDT, SYSCALL and
-//! friends). The page walk used by `tlb_fill` is in `mmu.rs`.
+//! friends). The page walk used by `tlb_fill` is in `mmu.rs`, and system management mode in
+//! `smm.rs`.
 //!
 //! What is covered: every general purpose integer instruction in real, protected (16 and 32 bit)
 //! and long mode, including the string instructions with REP, the stack instructions (PUSH, POP,
@@ -19,11 +20,11 @@
 //! prefixed read-modify-write instructions done with atomic ops, the BCD instructions, CPUID (from
 //! the [`crate::cpuid`] model, `qemu64` by default), RDTSC and RDTSCP, RDMSR and WRMSR, IN and OUT,
 //! MOV to and from control and debug registers, the descriptor table instructions, LAR, LSL, VERR,
-//! VERW, INT, INT3, INTO, INT1, IRET, SYSCALL, SYSRET, SYSENTER, SYSEXIT, HLT, CLI, STI and INVLPG.
-//! Exceptions and interrupts are delivered through the IDT in all three modes, with double and
+//! VERW, INT, INT3, INTO, INT1, IRET, SYSCALL, SYSRET, SYSENTER, SYSEXIT, HLT, CLI, STI, INVLPG and
+//! RSM. Exceptions and interrupts are delivered through the IDT in all three modes, with double and
 //! triple fault detection. The page walk handles 32-bit paging (with PSE), PAE paging, and 4 and 5
-//! level long mode paging, with NX, WP, SMEP and SMAP, and in long mode the protection keys of
-//! PKRU (RDPKRU, WRPKRU) for user pages and `IA32_PKRS` for supervisor pages, as QEMU does.
+//! level long mode paging, with NX, WP, SMEP and SMAP, and in long mode the protection keys of PKRU
+//! (RDPKRU, WRPKRU) for user pages and `IA32_PKRS` for supervisor pages, as QEMU does.
 //!
 //! The x87 instructions (D8 to DF and FWAIT, `translate/x87.rs`) run on the 80-bit
 //! `floatx80` of `ruvm-softfloat`, with FPUC rounding and precision control and the FPUS
@@ -63,18 +64,22 @@
 //!   x86 host, so the guest TSC runs at the host TSC rate.
 //! - Unknown MSRs read as zero and ignore writes instead of raising #GP. Only the MSRs this
 //!   front end uses (EFER, STAR, LSTAR, CSTAR, FMASK, FS and GS base, KERNEL_GS_BASE, the
-//!   SYSENTER MSRs, TSC, TSC_AUX, PAT, APIC_BASE, MISC_ENABLE, PKRS) are kept.
+//!   SYSENTER MSRs, TSC, TSC_AUX, PAT, APIC_BASE, MISC_ENABLE, PKRS, and SMI_COUNT, which is
+//!   read only) are kept.
 //! - Debug registers are stored but hardware breakpoints and watchpoints are not armed.
 //!   Single stepping with TF works.
-//! - SVM, VMX, SMM, MPX, CET, FRED, LAM and nested paging are not modelled.
+//! - SVM, VMX, MPX, CET, FRED, LAM and nested paging are not modelled.
 //! - The local APIC, the PIC and system reset are reached through the [`X86Platform`] the
 //!   machine installs with [`X86::set_platform`], standing in for `cpu->apic_state`,
 //!   `isa_pic` and `qemu_system_reset_request()`. Without one, hardware interrupts come from
 //!   a small vector queue fed by [`X86::raise_irq`], the APIC base MSR and CR8 are plain
 //!   registers and the x2APIC MSRs raise #GP, as QEMU does without an APIC.
 //! - `x86_cpu_exec_interrupt()` follows QEMU's priority (POLL, SIPI, SMI, NMI, MCE, HARD), but
-//!   an SMI is dropped since there is no SMM, and a hardware interrupt for which the PIC and
-//!   APIC have no vector (-1) is not delivered, where QEMU would deliver vector -1.
+//!   a hardware interrupt for which the PIC and APIC have no vector (-1) is not delivered,
+//!   where QEMU would deliver vector -1.
+//! - SMI entry and RSM flush the TLB. QEMU relies on the CR0 and CR4 updates to flush it, so
+//!   an SMI taken in real mode keeps the entries filled outside SMM, which point at the normal
+//!   address space rather than SMRAM.
 //! - `x86_cpu_exec_halt()` clears `CPU_INTERRUPT_POLL` before polling the APIC rather than
 //!   after, since there is no big lock here to keep another thread from raising it in
 //!   between.
@@ -96,17 +101,17 @@
 //!   hardware do; LZCNT needs ABM and TZCNT needs BMI1 in the model (`qemu64` has neither,
 //!   so there they decode as BSR and BSF, as on hardware without them).
 //!
-//! Not translated yet (they raise #UD, and are left for a follow up): RSM, MONITOR and
-//! MWAIT, the SVM and VMX instructions, CMPccXADD, the MPX
-//! instructions, the AMD `lock mov cr0` alias for CR8, and the PCREL
-//! translation mode. I/O breakpoints (`bpt_io`) are not checked. Virtual 8086 mode decodes
-//! like real mode with the IOPL checks, but nothing enters it (see above).
+//! Not translated yet (they raise #UD, and are left for a follow up): MONITOR and MWAIT, the
+//! SVM and VMX instructions, CMPccXADD, the MPX instructions, the AMD `lock mov cr0` alias for
+//! CR8, and the PCREL translation mode. I/O breakpoints (`bpt_io`) are not checked. Virtual 8086
+//! mode decodes like real mode with the IOPL checks, but nothing enters it (see above).
 
 pub mod cc;
 pub mod env;
 mod helpers;
 mod mmu;
 mod seg;
+mod smm;
 mod translate;
 pub mod user;
 
@@ -122,7 +127,7 @@ use ruvm_jit::{
     TbCpuState, Vcpu, excp, interrupt, translator_loop,
 };
 use ruvm_jit_interp::HelperRegistry;
-use ruvm_mem::AddressSpace;
+use ruvm_mem::{AddressSpace, MemTxAttrs};
 use ruvm_sys::hostticks::Ticks;
 
 use crate::cpuid::X86Cpu;
@@ -522,6 +527,12 @@ impl CpuOps for X86 {
         ruvm_jit_core::types::mo::ALL & !ruvm_jit_core::types::mo::ST_LD
     }
 
+    /// `x86_asidx_from_attrs()`: secure accesses, the ones made in SMM, go to address space 1
+    /// (`X86ASIdx_SMM`).
+    fn asidx_from_attrs(&self, attrs: MemTxAttrs) -> usize {
+        usize::from(attrs.secure())
+    }
+
     fn set_pc(&self, cpu: &mut Cpu<'_>, pc: u64) {
         let base = ld64(cpu.env, seg(R_CS) + SEG_BASE);
         st64(cpu.env, EIP, pc.wrapping_sub(base));
@@ -550,8 +561,8 @@ impl CpuOps for X86 {
                 self.do_cpu_sipi(cpu);
             }
             CPU_INTERRUPT_SMI => {
-                // There is no SMM to enter.
                 shared.reset_interrupt(CPU_INTERRUPT_SMI);
+                smm::do_smm_enter(cpu, self);
             }
             CPU_INTERRUPT_NMI => {
                 shared.reset_interrupt(CPU_INTERRUPT_NMI);

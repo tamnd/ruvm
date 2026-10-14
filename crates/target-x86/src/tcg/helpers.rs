@@ -22,9 +22,9 @@ use super::cc::{CC_OP_EFLAGS, cc_op_has_eflags, cc_op_size, compute_all, compute
 use super::env::{
     APIC_BASE, CC_A, CC_C, CC_O, CC_OP, CC_SRC, CC_Z, CR8, CSTAR, EFER, EFLAGS, EIP, FMASK,
     HF_AVX_EN_MASK, HF_INHIBIT_IRQ_MASK, HF_OSFXSR_MASK, HF_SMAP_MASK, HF_UMIP_MASK, HFLAGS,
-    KERNELGSBASE, LSTAR, MISC_ENABLE, PAT, PKRS, PKRU, RF_MASK, SEG_BASE, STAR, SYSENTER_CS,
-    SYSENTER_EIP, SYSENTER_ESP, TF_MASK, TSC_AUX, TSC_OFFSET, XCR0, avx_enabled, cc_compute_all,
-    compute_eflags, cr, dr, ld32, ld64, load_eflags, reg, seg, st32, st64,
+    KERNELGSBASE, LSTAR, MISC_ENABLE, PAT, PKRS, PKRU, RF_MASK, SEG_BASE, SMI_COUNT, STAR,
+    SYSENTER_CS, SYSENTER_EIP, SYSENTER_ESP, TF_MASK, TSC_AUX, TSC_OFFSET, XCR0, avx_enabled,
+    cc_compute_all, compute_eflags, cr, dr, ld32, ld64, load_eflags, reg, seg, st32, st64,
 };
 use super::seg::{self as sh, raise_exception_err_ra, raise_exception_ra, raise_interrupt2};
 use super::{
@@ -36,7 +36,7 @@ use crate::msr::{
     MSR_IA32_APICBASE_BASE, MSR_IA32_APICBASE_BSP, MSR_IA32_APICBASE_ENABLE,
     MSR_IA32_APICBASE_EXTD, MSR_IA32_MISC_ENABLE, MSR_IA32_PKRS, MSR_IA32_SYSENTER_CS,
     MSR_IA32_SYSENTER_EIP, MSR_IA32_SYSENTER_ESP, MSR_IA32_TSC, MSR_KERNELGSBASE, MSR_LSTAR,
-    MSR_PAT, MSR_STAR, MSR_TSC_AUX,
+    MSR_PAT, MSR_SMI_COUNT, MSR_STAR, MSR_TSC_AUX,
 };
 use crate::state::{
     CR0_ET_MASK, CR0_PE_MASK, CR0_PG_MASK, CR0_TS_MASK, CR0_WP_MASK, CR4_CET_MASK, CR4_DE_MASK,
@@ -752,7 +752,7 @@ def!(RDMSR, "x86_rdmsr", 0, Void, [Ptr], h_rdmsr);
 def!(WRMSR, "x86_wrmsr", 0, Void, [Ptr], h_wrmsr);
 
 /// `cpu_load_efer()`.
-fn load_efer(cpu: &mut Cpu<'_>, val: u64) {
+pub(crate) fn load_efer(cpu: &mut Cpu<'_>, val: u64) {
     st64(cpu.env, EFER, val);
     let mut hf = hflags(cpu) & !HF_LMA_MASK;
     if val & MSR_EFER_LMA != 0 {
@@ -792,6 +792,7 @@ fn h_rdmsr(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
             MSR_IA32_TSC => tsc(cpu),
             MSR_IA32_MISC_ENABLE => ld64(env, MISC_ENABLE),
             MSR_IA32_PKRS => u64::from(ld32(env, PKRS)),
+            MSR_SMI_COUNT => ld64(env, SMI_COUNT),
             // QEMU reads the MSRs it does not know as zero.
             _ => 0,
         };
@@ -884,6 +885,7 @@ def!(SET_DR, "x86_set_dr", 0, Void, [Ptr, I32, I64], h_set_dr);
 def!(INVLPG, "x86_invlpg", 0, Void, [Ptr, I64], h_invlpg);
 def!(LMSW, "x86_lmsw", 0, Void, [Ptr, I64], h_lmsw);
 def!(CLTS, "x86_clts", 0, Void, [Ptr], h_clts);
+def!(RSM, "x86_rsm", 0, Void, [Ptr], h_rsm);
 
 fn h_read_crn(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
     run(h, |cpu| {
@@ -902,7 +904,7 @@ fn h_read_crn(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
 }
 
 /// `cpu_x86_update_cr0()`.
-fn update_cr0(cpu: &mut Cpu<'_>, new_cr0: u64) {
+pub(crate) fn update_cr0(cpu: &mut Cpu<'_>, new_cr0: u64) {
     let new_cr0 = new_cr0 & 0xffff_ffff;
     let old = ld64(cpu.env, cr(0));
     let m = CR0_PG_MASK | CR0_WP_MASK | CR0_PE_MASK;
@@ -943,7 +945,7 @@ fn update_cr0(cpu: &mut Cpu<'_>, new_cr0: u64) {
 }
 
 /// `cpu_x86_update_cr3()`.
-fn update_cr3(cpu: &mut Cpu<'_>, v: u64) {
+pub(crate) fn update_cr3(cpu: &mut Cpu<'_>, v: u64) {
     st64(cpu.env, cr(3), v);
     if ld64(cpu.env, cr(0)) & CR0_PG_MASK != 0 {
         tlb_flush(cpu);
@@ -1001,7 +1003,7 @@ fn cr4_reserved_bits(cpu: &Cpu<'_>) -> u64 {
 }
 
 /// `cpu_x86_update_cr4()`.
-fn update_cr4(cpu: &mut Cpu<'_>, new_cr4: u64) {
+pub(crate) fn update_cr4(cpu: &mut Cpu<'_>, new_cr4: u64) {
     let old = ld64(cpu.env, cr(4));
     let flush =
         CR4_PGE_MASK | CR4_PAE_MASK | CR4_PSE_MASK | CR4_SMEP_MASK | CR4_SMAP_MASK | CR4_LA57_MASK;
@@ -1150,6 +1152,13 @@ fn h_clts(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
         st64(cpu.env, cr(0), c);
         let hf = hflags(cpu) & !HF_TS_MASK;
         set_hflags(cpu, hf);
+        Ok(0)
+    })
+}
+
+fn h_rsm(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
+    run(h, |cpu| {
+        super::smm::helper_rsm(cpu);
         Ok(0)
     })
 }
@@ -1348,6 +1357,7 @@ const ALL: &[&Def] = &[
     &INVLPG,
     &LMSW,
     &CLTS,
+    &RSM,
     &READ_EFLAGS,
     &WRITE_EFLAGS,
     &LOAD_SEG,

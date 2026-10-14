@@ -7,7 +7,7 @@
 //! `op | a << 8 | b << 12 | imm16 << 16`, with `imm16` signed.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +24,7 @@ use ruvm_jit_core::{Func, HelperInfo, HelperType, MemOp, Temp};
 use ruvm_jit_interp::{HelperEnv, HelperRegistry, Unwind};
 use ruvm_mem::{
     AccessCtx, AccessSize, AddressSpace, Endian, MemResult, MemTxAttrs, MemorySystem, MmioOps,
+    RegionId,
 };
 
 const U: MemTxAttrs = MemTxAttrs::UNSPECIFIED;
@@ -137,6 +138,8 @@ struct ToyOps {
     swis: AtomicU64,
     irqs: AtomicU64,
     fills: AtomicU64,
+    /// Fill the TLB with secure accesses, which go to address space 1.
+    secure: AtomicBool,
 }
 
 impl ToyOps {
@@ -226,7 +229,8 @@ impl CpuOps for ToyOps {
         };
         match entry {
             Some((ppage, prot)) if prot & need != 0 => {
-                cpu.tlb_set_page(vpage, ppage, prot, mmu_idx, PAGE);
+                let attrs = MemTxAttrs::default().with_secure(self.secure.load(Ordering::Relaxed));
+                cputlb::tlb_set_page_with_attrs(cpu, vpage, ppage, attrs, prot, mmu_idx, PAGE);
                 Ok(true)
             }
             _ if probe => Ok(false),
@@ -250,6 +254,10 @@ impl CpuOps for ToyOps {
 
     fn mmu_index(&self, _cpu: &Cpu<'_>, _ifetch: bool) -> usize {
         0
+    }
+
+    fn asidx_from_attrs(&self, attrs: MemTxAttrs) -> usize {
+        usize::from(attrs.secure())
     }
 }
 
@@ -499,7 +507,8 @@ impl MmioOps for Dev {
 const DEV_BASE: u64 = 0x10_0000;
 
 struct World {
-    _sys: MemorySystem,
+    sys: MemorySystem,
+    root: RegionId,
     as_: Arc<AddressSpace>,
     jit: Arc<Jit>,
     ops: Arc<ToyOps>,
@@ -516,7 +525,7 @@ fn world(config: JitConfig) -> World {
     let io = sys.new_io("dev", 0x1000, dev.clone()).unwrap();
     sys.add_subregion(root, DEV_BASE, io).unwrap();
     let jit = Jit::new(config, backend());
-    World { _sys: sys, as_, jit, ops: Arc::new(ToyOps::default()), dev }
+    World { sys, root, as_, jit, ops: Arc::new(ToyOps::default()), dev }
 }
 
 impl World {
@@ -719,6 +728,52 @@ fn tlb_fill_fault_and_flush() {
     let (full, part) = cputlb::tlb_flush_counts(&v.cpu());
     cputlb::tlb_flush(&mut v.cpu());
     assert_eq!(cputlb::tlb_flush_counts(&v.cpu()), (full, part + 1));
+}
+
+/// Accesses whose attributes pick address space 1 see its memory, RAM and I/O, once the vCPU
+/// has one; before that they fall back to address space 0.
+#[test]
+fn attrs_pick_the_address_space() {
+    let w = world(JitConfig::default());
+    // Address space 1: the system memory, with other RAM at 0x5000 and a device at 0x6000
+    // on top, as x86 puts SMRAM over it.
+    let root1 = w.sys.new_container("secure", 1 << 64).unwrap();
+    let alias = w.sys.new_alias("secure-memory", w.root, 0, 1 << 64).unwrap();
+    w.sys.add_subregion_overlap(root1, 0, alias, 0).unwrap();
+    let ram1 = w.sys.new_ram("secure-ram", PAGE).unwrap();
+    w.sys.add_subregion_overlap(root1, 0x5000, ram1, 1).unwrap();
+    let dev1 = Arc::new(Dev::default());
+    let io1 = w.sys.new_io("secure-dev", 0x1000, dev1.clone()).unwrap();
+    w.sys.add_subregion_overlap(root1, 0x6000, io1, 1).unwrap();
+    let as1 = w.sys.address_space_init(root1, "secure").unwrap();
+    w.write32(0x5000, 1111);
+    assert!(as1.write_u32(0x5000, U, 2222).is_ok());
+
+    let mut a = Asm::new(0x1000);
+    a.li(5, 0x5000).i(LD, 1, 5, 0).li(5, 0x6000).i(LD, 2, 5, 8).stop();
+    a.load(&w.as_);
+    let mut v = w.vcpu(0x1000);
+    let rerun = |v: &mut Vcpu| {
+        cputlb::tlb_flush(&mut v.cpu());
+        wr64(&mut v.env, PC_OFF, 0x1000);
+        assert_eq!(run(v), excp::DEBUG);
+        (reg(v, 1), reg(v, 2))
+    };
+    assert_eq!(rerun(&mut v), (1111, 0));
+
+    // No address space 1 yet: secure accesses stay in address space 0.
+    w.ops.secure.store(true, Ordering::Relaxed);
+    assert_eq!(rerun(&mut v), (1111, 0));
+    assert!(v.core.address_space_at(1).is_none());
+
+    v.core.set_address_space(1, as1.clone());
+    assert!(Arc::ptr_eq(v.core.address_space_at(1).unwrap(), &as1));
+    assert_eq!(rerun(&mut v), (2222, 0x48));
+    assert_eq!(dev1.reads.load(Ordering::SeqCst), 1);
+
+    w.ops.secure.store(false, Ordering::Relaxed);
+    assert_eq!(rerun(&mut v), (1111, 0));
+    assert_eq!(dev1.reads.load(Ordering::SeqCst), 1);
 }
 
 #[test]
