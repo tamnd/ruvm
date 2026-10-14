@@ -3,20 +3,21 @@
 //! The migration sections of an Arm board, in QEMU's stream format.
 //!
 //! [`virt_savevm`] registers the sections of `virt` the way QEMU 11.1 lays them out. So far
-//! these are the `timer` section, RAM, the vCPUs, the GIC, the UARTs, the RTC, the GPIO
-//! controllers and the power key, and `globalstate`. The flash contents, the PCI host, the
-//! ACPI GED, `fw_cfg` and the ACPI tables only keep their section ids for now.
+//! these are the `timer` section, RAM, the flashes, the vCPUs, the GIC, the UARTs, the RTC,
+//! the GPIO controllers and the power key, and `globalstate`. The PCI host, the ACPI GED,
+//! `fw_cfg` and the ACPI tables only keep their section ids for now.
 //!
 //! The device sections carry the state field by field, as QEMU 11.1's `VMStateDescription`
-//! for it does: the PL011 UART (hw/char/pl011.c and hw/core/clock-vmstate.c), the PL031 RTC
-//! (hw/rtc/pl031.c), the PL061 GPIO controller (hw/gpio/pl061.c) and the GPIO power key
-//! (hw/gpio/gpio_key.c). The registers add no path prefix, as these are sysbus devices.
+//! for it does: the CFI01 flash (hw/block/pflash_cfi01.c), the PL011 UART (hw/char/pl011.c
+//! and hw/core/clock-vmstate.c), the PL031 RTC (hw/rtc/pl031.c), the PL061 GPIO controller
+//! (hw/gpio/pl061.c) and the GPIO power key (hw/gpio/gpio_key.c). The registers add no path
+//! prefix, as these are sysbus devices.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, Weak};
 
 use ruvm_accel::tcg::TcgVcpus;
-use ruvm_base::error_report;
+use ruvm_base::{Error, error_report};
 use ruvm_hw_char::pl011::{PL011_FIFO_DEPTH, Pl011, Pl011VmState};
 use ruvm_hw_core::timer::Clock;
 use ruvm_hw_misc::gpio_key::GpioKey;
@@ -31,6 +32,7 @@ use ruvm_migration::{
 use ruvm_vmstate::info::Timer;
 use ruvm_vmstate::{VmStateDescription, VmStateField};
 
+use crate::pflash::{Pflash, PflashVmState};
 use crate::tcg_run::VirtTcgMachine;
 use crate::virt::{VirtGic, VirtMachine};
 
@@ -78,9 +80,11 @@ pub fn virt_savevm(
     savevm.register_live(EntryInfo::new("ram", 4).instance(0), ram);
     // "dirty-bitmap": ruvm has no block dirty bitmaps to migrate.
     savevm.reserve_section_id();
-    // The two "pflash_cfi01" sections, which ruvm does not send yet.
-    savevm.reserve_section_id();
-    savevm.reserve_section_id();
+    let board = machine.board().lock().unwrap_or_else(PoisonError::into_inner);
+    for (instance, flash) in (0..).zip(board.flash()) {
+        register_pflash(&mut savevm, instance, flash);
+    }
+    drop(board);
     register_cpus(&mut savevm, machine);
     let board = machine.board().lock().unwrap_or_else(PoisonError::into_inner);
     if let VirtGic::V3(g) = board.gic() {
@@ -272,6 +276,51 @@ impl Pl011Section {
         let clk = ClockVmState { period: regs.clk_period, multiplier: 1, divider: 1 };
         Pl011Section { regs, clk }
     }
+}
+
+/// `vmstate_pflash_blk_write`: a write to buffer in progress.
+static VMSTATE_PFLASH_BLK_WRITE: LazyLock<VmStateDescription<PflashVmState>> =
+    LazyLock::new(|| {
+        type S = PflashVmState;
+        VmStateDescription::new("pflash_cfi01_blk_write")
+            .version_id(1)
+            .minimum_version_id(1)
+            .needed(|s: &S| s.blk_offset != u32::MAX)
+            .fields([
+                VmStateField::vbuffer(
+                    "blk_bytes",
+                    |s: &S| s.blk_bytes.len(),
+                    |s: &mut S| &mut s.blk_bytes,
+                ),
+                VmStateField::scalar("blk_offset", |s: &mut S| &mut s.blk_offset),
+            ])
+    });
+
+/// `vmstate_pflash`. `pflash_post_load()` is in [`Pflash::vmstate_load`].
+static VMSTATE_PFLASH: LazyLock<VmStateDescription<PflashVmState>> = LazyLock::new(|| {
+    type S = PflashVmState;
+    VmStateDescription::new("pflash_cfi01")
+        .version_id(1)
+        .minimum_version_id(1)
+        .fields([
+            VmStateField::scalar("wcycle", |s: &mut S| &mut s.wcycle),
+            VmStateField::scalar("cmd", |s: &mut S| &mut s.cmd),
+            VmStateField::scalar("status", |s: &mut S| &mut s.status),
+            VmStateField::scalar("counter", |s: &mut S| &mut s.counter),
+        ])
+        .subsection(&VMSTATE_PFLASH_BLK_WRITE)
+});
+
+/// Registers the `pflash_cfi01` section of `flash`, instance `instance` (0 for flash0).
+pub fn register_pflash(savevm: &mut SaveVm, instance: u32, flash: &Arc<Pflash>) {
+    let (get, put) = (Arc::clone(flash), Arc::clone(flash));
+    savevm.register_vmsd(
+        "",
+        Some(instance),
+        &VMSTATE_PFLASH,
+        move || Ok(get.vmstate_save()),
+        move |s| put.vmstate_load(&s).map_err(Error::generic),
+    );
 }
 
 /// `vmstate_pl011_clock`, always sent since `migrate-clk` is on for every machine version ruvm
@@ -559,6 +608,36 @@ mod tests {
         let mut back = Pl061VmState::default();
         load(&VMSTATE_PL061, &bytes, &mut back);
         assert_eq!(back, gpio.vmstate_save());
+    }
+
+    #[test]
+    fn pflash_layout_matches_qemu() {
+        let idle = PflashVmState {
+            wcycle: 0,
+            cmd: 0x70,
+            status: 0x80,
+            counter: 0x0102,
+            blk_bytes: vec![0; 4],
+            blk_offset: u32::MAX,
+        };
+        let bytes = save(&VMSTATE_PFLASH, idle.clone());
+        assert_eq!(bytes, [0, 0x70, 0x80, 0, 0, 0, 0, 0, 0, 1, 2]);
+
+        let busy = PflashVmState {
+            wcycle: 2,
+            cmd: 0xe8,
+            blk_bytes: vec![1, 2, 3, 4],
+            blk_offset: 0x40000,
+            ..idle
+        };
+        let bytes = save(&VMSTATE_PFLASH, busy.clone());
+        let mut want = vec![2, 0xe8, 0x80, 0, 0, 0, 0, 0, 0, 1, 2];
+        want.extend(subsection("pflash_cfi01_blk_write", 1, &[1, 2, 3, 4, 0, 4, 0, 0]));
+        assert_eq!(bytes, want);
+        let mut back =
+            PflashVmState { blk_bytes: vec![0; 4], blk_offset: u32::MAX, ..Default::default() };
+        load(&VMSTATE_PFLASH, &bytes, &mut back);
+        assert_eq!(back, busy);
     }
 
     #[test]
