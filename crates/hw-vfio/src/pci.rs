@@ -859,6 +859,30 @@ impl Mmaps {
             t.modify((clock.get_ms() + i64::from(self.timeout_ms)) * 1_000_000);
         }
     }
+
+    /// The mmap side of `vfio_intx_interrupt()`: the mmaps go off before `raise` puts the pin
+    /// up, so that the guest's first BAR access after it traps and is taken as the EOI, and
+    /// they stay locked until the pin is pending, so the timer cannot turn them on in between.
+    fn intx_fired(&self, raise: impl FnOnce()) {
+        let mut state = lock(&self.state);
+        self.set_enabled(&mut state, false);
+        raise();
+        drop(state);
+        if self.timeout_ms != 0 {
+            self.arm();
+        }
+    }
+
+    /// `vfio_intx_mmap_enable()`: the timer fired. The mmaps go back on unless INTx is still
+    /// `pending`, in which case the timer waits another timeout.
+    fn timer_fired(&self, pending: impl FnOnce() -> bool) {
+        let mut state = lock(&self.state);
+        if pending() {
+            self.arm();
+        } else {
+            self.set_enabled(&mut state, true);
+        }
+    }
 }
 
 /// What the BAR, ROM and config callbacks share: the device, where its config space is and the
@@ -1015,19 +1039,13 @@ impl Shared {
         self.mmaps.set_enabled(&mut lock(&self.mmaps.state), true);
     }
 
-    /// `vfio_intx_mmap_enable()`: the mmap timer fired. The mmaps go back on unless INTx is
-    /// still pending, in which case the timer waits another timeout.
+    /// `vfio_intx_mmap_enable()`, with the pending flag of INTx if that is what the device
+    /// uses.
     fn intx_mmap_enable(&self) {
-        let mut state = lock(&self.mmaps.state);
-        let pending = match &*lock(&self.interrupt) {
+        self.mmaps.timer_fired(|| match &*lock(&self.interrupt) {
             Interrupt::Intx(i) => *lock(&i.pending),
             _ => false,
-        };
-        if pending {
-            self.mmaps.arm();
-        } else {
-            self.mmaps.set_enabled(&mut state, true);
-        }
+        });
     }
 
     /// The part of `vfio_intx_enable()` after the pin is known: an eventfd for the kernel to
@@ -1037,23 +1055,14 @@ impl Shared {
         let notifier = {
             let (pending, irq) = (Arc::clone(&pending), irq.clone());
             let mmaps = Arc::clone(&self.mmaps);
-            // vfio_intx_interrupt(). The mmaps go off before the pin goes up, so that the
-            // guest's first BAR access after it traps and is taken as the EOI, and they stay
-            // locked until the pin is pending, so the timer cannot turn them on in between.
-            // The pending lock is held over the raise so that an EOI cannot lower the pin in
-            // between.
+            // vfio_intx_interrupt(). The pending lock is held over the raise so that an EOI
+            // cannot lower the pin in between.
             Notifiers::new("intx-interrupt", 1, move |_| {
-                let mut state = lock(&mmaps.state);
-                mmaps.set_enabled(&mut state, false);
-                {
+                mmaps.intx_fired(|| {
                     let mut p = lock(&pending);
                     *p = true;
                     irq.raise();
-                }
-                drop(state);
-                if mmaps.timeout_ms != 0 {
-                    mmaps.arm();
-                }
+                });
             })?
         };
         // vfio_device_irq_set_signaling().
@@ -2564,6 +2573,54 @@ mod tests {
         info.flags |= REGION_INFO_FLAG_MMAP;
         info.size = 0;
         assert!(region_mmaps(0, &info, &none, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn intx_turns_the_mmaps_off_until_it_is_quiet() {
+        use ruvm_base::ClockType;
+        let memory = Arc::new(MemorySystem::new());
+        let r = memory.new_container("BAR 0 mmaps[0]", 0x1000).unwrap();
+        let on = || memory.region(r).unwrap().enabled;
+        let clock = Clock::manual(ClockType::Virtual);
+        let mmaps = Arc::new(Mmaps::new(&memory, 1100));
+        lock(&mmaps.state).regions.push(r);
+        let pending = Arc::new(Mutex::new(false));
+        let timer = {
+            let (m, p) = (Arc::downgrade(&mmaps), Arc::clone(&pending));
+            clock.new_timer(move || {
+                if let Some(m) = m.upgrade() {
+                    m.timer_fired(|| *lock(&p));
+                }
+            })
+        };
+        mmaps.timer.set(timer).unwrap();
+
+        mmaps.intx_fired(|| *lock(&pending) = true);
+        assert!(!on());
+        // Still pending when the timer fires, so it waits another timeout.
+        clock.advance_to(1_100_000_000);
+        assert!(!on());
+        *lock(&pending) = false;
+        clock.advance_to(2_199_000_000);
+        assert!(!on());
+        clock.advance_to(2_200_000_000);
+        assert!(on());
+        // Each interrupt pushes the timeout out again.
+        mmaps.intx_fired(|| *lock(&pending) = true);
+        *lock(&pending) = false;
+        clock.advance_to(3_000_000_000);
+        mmaps.intx_fired(|| ());
+        clock.advance_to(3_300_000_000);
+        assert!(!on());
+        clock.advance_to(4_100_000_000);
+        assert!(on());
+
+        // With no timeout they stay off.
+        let off = Mmaps::new(&memory, 0);
+        lock(&off.state).regions.push(r);
+        off.intx_fired(|| ());
+        assert!(!on());
+        assert!(mmaps.timer.get().unwrap().expire_time().is_none());
     }
 
     #[test]
