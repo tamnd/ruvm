@@ -991,6 +991,8 @@ pub(crate) struct Plan {
     /// The `intel-iommu` and `amd-iommu` devices, each with the number of virtio plugs
     /// before it.
     pub iommus: Vec<(usize, X86Iommu, Option<Location>)>,
+    /// The `vfio-pci` devices, each with the number of virtio plugs before it.
+    pub vfio: Vec<(usize, crate::vfio::VfioPlug)>,
 }
 
 /// An x86 IOMMU of `-device`, planned.
@@ -1010,6 +1012,7 @@ enum Planned {
     Display(crate::display::DisplayPlug),
     Audio(crate::audio::AudioPlug),
     Iommu(X86Iommu),
+    Vfio(crate::vfio::VfioPlug),
 }
 
 impl Planned {
@@ -1312,6 +1315,7 @@ pub(crate) fn plan(
                 }
                 p.iommus.push((p.virtio.len(), iommu, loc.clone()));
             }
+            Planned::Vfio(plug) => p.vfio.push((p.virtio.len(), plug)),
             Planned::Audio(plug) => {
                 crate::audio::add_plug(&mut p.audio, p.virtio.len(), p.display.len(), plug)
                     .map_err(|e| vec![e])?;
@@ -1347,6 +1351,15 @@ pub(crate) fn plan(
                 p.ide_hd.push(plug);
             }
         }
+    }
+
+    // Nothing maps guest memory for the device's DMA through a vIOMMU yet.
+    let viommu = !p.iommus.is_empty() || p.virtio.iter().any(|v| v.iommu.is_some());
+    if let (true, Some((_, plug))) = (viommu, p.vfio.first()) {
+        return Err(vec![Located::new(
+            &plug.loc,
+            format!("{} with a vIOMMU is not supported by ruvm yet", crate::vfio::TYPE_VFIO_PCI),
+        )]);
     }
 
     let orphans: Vec<Located> = drives
@@ -1412,6 +1425,10 @@ fn plan_device(
     }
     if driver == TYPE_AMD_IOMMU_DEVICE {
         return plan_amd_iommu(kind, opts, loc).map(|c| Planned::Iommu(X86Iommu::Amd(c)));
+    }
+    if driver == crate::vfio::TYPE_VFIO_PCI && cfg!(target_os = "linux") {
+        return crate::vfio::plan_device(opts, loc, kind == Some(BoardKind::Q35))
+            .map(Planned::Vfio);
     }
     if driver == TYPE_VIRTCONSOLE {
         if let Some((k, _)) = opts.iter().find(|(k, _)| !matches!(*k, "driver" | "id" | "bus")) {
@@ -2314,9 +2331,18 @@ fn build(
         }
         Ok::<(), Vec<Located>>(())
     };
+    let mut vfio = p.vfio.iter().peekable();
+    // The vfio-pci devices that come before virtio plug `at`, or all that are left.
+    let mut plug_vfio = |board: &mut X86Board, at: Option<usize>| {
+        while let Some((_, plug)) = vfio.next_if(|(vi, _)| at.is_none_or(|i| *vi == i)) {
+            crate::vfio::realize_x86(board, plug, &firmware).map_err(one)?;
+        }
+        Ok::<(), Vec<Located>>(())
+    };
     for (i, plug) in p.virtio.into_iter().enumerate() {
         plug_iommus(&mut board, Some(i))?;
         plug_cards(&mut board, Some(i))?;
+        plug_vfio(&mut board, Some(i))?;
         if let Some(conf) = &plug.iommu {
             let attached = match plug.transport {
                 Transport::Pci => board.attach_virtio_iommu(conf, plug.id.clone()).map(drop),
@@ -2353,6 +2379,7 @@ fn build(
     }
     plug_iommus(&mut board, None)?;
     plug_cards(&mut board, None)?;
+    plug_vfio(&mut board, None)?;
     let mut attachments = Vec::new();
     for plug in &p.isa {
         realize_isa(vm, &board, plug, &mut attachments).map_err(one)?;
@@ -3192,6 +3219,54 @@ mod tests {
             "Parameter 'caching-mode' expects 'on' or 'off'"
         );
         assert_eq!(err(q, &["intel-iommu,version=-1"]), "Parameter 'version' expects uint32_t");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vfio_pci_properties() {
+        let q = Some(BoardKind::Q35);
+        let err = |kind, args: &[&str]| {
+            plan(kind, &[], &devices(args), true).unwrap_err()[0].1.message().to_string()
+        };
+        let args =
+            ["virtio-rng-pci", "vfio-pci,host=0000:00:04.0,addr=2,x-pci-device-id=0x10d4,ats=off"];
+        let p = plan(q, &[], &devices(&args), true).unwrap();
+        let (at, plug) = &p.vfio[0];
+        assert_eq!((*at, plug.devfn), (1, Some(0x10)));
+        assert_eq!(plug.conf.host.unwrap().to_string(), "0000:00:04.0");
+        assert_eq!((plug.conf.device_id, plug.conf.vendor_id), (0x10d4, ruvm_hw_vfio::PCI_ANY_ID));
+        assert_eq!(plug.conf.ats, Some(false));
+
+        let no_pci = "No 'PCI' bus found for device 'vfio-pci'";
+        assert_eq!(err(Some(BoardKind::Microvm), &["vfio-pci"]), no_pci);
+        assert_eq!(err(q, &["vfio-pci,bus=foo"]), "Bus 'foo' not found");
+        assert_eq!(
+            err(q, &["vfio-pci,host=zz"]),
+            "Property 'vfio-pci.host' doesn't take value 'zz'"
+        );
+        assert_eq!(
+            err(q, &["vfio-pci,addr=40"]),
+            "Property 'vfio-pci.addr' doesn't take value '40'"
+        );
+        assert_eq!(
+            err(q, &["vfio-pci,x-pci-vendor-id=abc"]),
+            "Parameter 'x-pci-vendor-id' expects integer"
+        );
+        assert_eq!(err(q, &["vfio-pci,rombar=x"]), "Parameter 'rombar' expects integer");
+        assert_eq!(err(q, &["vfio-pci,ats=x"]), "Parameter 'ats' does not accept value 'x'");
+        assert_eq!(err(q, &["vfio-pci,foo=1"]), "Property 'vfio-pci.foo' not found");
+        assert_eq!(
+            err(q, &["vfio-pci,iommufd=i"]),
+            "Property 'vfio-pci.iommufd' is not supported by ruvm yet"
+        );
+        assert_eq!(
+            err(q, &["vfio-pci,romfile=a.rom,rombar=0"]),
+            "romfile with rombar=0 is not supported by ruvm yet"
+        );
+        assert_eq!(
+            err(q, &["intel-iommu", "vfio-pci,host=00:04.0"]),
+            "vfio-pci with a vIOMMU is not supported by ruvm yet"
+        );
     }
 
     #[test]

@@ -2,11 +2,15 @@
 
 //! VFIO PCI, platform, AP and CCW devices, and the vfio-user client.
 //!
-//! So far this holds the properties of `vfio-pci`, QEMU's hw/vfio/pci.c, which a device on
-//! Linux hosts will be built from. The plan for the rest of this crate is in
-//! `spec/24-workspace-layout.md`.
+//! So far this is `vfio-pci` on Linux hosts, QEMU's hw/vfio/pci.c over the legacy container
+//! of hw/vfio/container-legacy.c: the config space, BARs and ROM of a host function bound to
+//! `vfio-pci` are given to the guest, with the parts QEMU emulates emulated the same way. DMA
+//! mapping, interrupts, iommufd and the device quirks come later. The plan for the rest of
+//! this crate is in `spec/24-workspace-layout.md`.
 
 mod host;
+#[cfg(target_os = "linux")]
+pub mod pci;
 
 pub use host::PciHostDeviceAddress;
 

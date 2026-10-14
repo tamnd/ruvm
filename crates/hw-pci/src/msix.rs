@@ -444,6 +444,12 @@ impl PciDevice {
         self.lock().msix.as_ref().map_or(0, |m| m.cap)
     }
 
+    /// The regions of the table and the PBA, `PCIDevice::msix_table_mmio` and
+    /// `msix_pba_mmio`, for a model that turns them off the way vfio-pci turns off the PBA.
+    pub fn msix_regions(&self) -> Option<(RegionId, RegionId)> {
+        self.lock().msix.as_ref().map(|m| (m.table_mmio, m.pba_mmio))
+    }
+
     /// `msix_nr_vectors_allocated()`.
     pub fn msix_nr_vectors_allocated(&self) -> u32 {
         self.lock().msix.as_ref().map_or(0, |m| m.entries)
