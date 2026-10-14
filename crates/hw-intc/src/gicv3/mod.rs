@@ -99,6 +99,7 @@
 mod cpuif;
 mod dist;
 mod its;
+pub mod migrate;
 mod redist;
 mod vcpuif;
 
@@ -112,7 +113,7 @@ use ruvm_mem::{
     AccessConstraints, AccessCtx, AccessSize, AddressSpace, MemResult, MemTxResult, MmioOps,
 };
 
-pub use its::{GicV3Its, ITS_CONTROL_SIZE, ITS_SIZE, ITS_TRANS_SIZE};
+pub use its::{GicV3Its, ITS_CONTROL_SIZE, ITS_SIZE, ITS_TRANS_SIZE, ItsVmState};
 
 /// The size of the distributor MMIO region.
 pub const GICV3_DIST_SIZE: u64 = 0x10000;
