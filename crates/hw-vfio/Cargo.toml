@@ -16,12 +16,13 @@ unsafe-budget = 1
 
 [dependencies]
 ruvm-base.workspace = true
+ruvm-hw-core.workspace = true
 ruvm-hw-pci.workspace = true
 ruvm-mem.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ruvm-sys.workspace = true
-rustix = { workspace = true, features = ["param"] }
+rustix = { workspace = true, features = ["event", "param"] }
 
 [lints]
 workspace = true

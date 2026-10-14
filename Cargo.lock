@@ -1952,6 +1952,7 @@ version = "0.5.7"
 dependencies = [
  "rustix",
  "ruvm-base",
+ "ruvm-hw-core",
  "ruvm-hw-pci",
  "ruvm-mem",
  "ruvm-sys",
