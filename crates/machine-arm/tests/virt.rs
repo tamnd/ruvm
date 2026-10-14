@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use ruvm_hw_iommu::{SmmuV3Props, VirtioIommuConf};
-use ruvm_hw_pci::MsiMessage;
+use ruvm_hw_pci::{MsiMessage, PcieRootPortConfig};
 use ruvm_hw_virtio::rng::{RandomFile, VirtioRng, VirtioRngConf};
 use ruvm_hw_virtio::{VirtioPci, VirtioPciProps};
 use ruvm_jit::cpu_exec::cpu_exec;
@@ -1218,6 +1218,142 @@ fn msi_through_the_smmuv3_device() {
     assert_eq!(iort[72..76], [4, 88, 0, 4]);
     assert_eq!([r(72 + 4), r(72 + 16), r(72 + 44)], [1, VIRT_PLATFORM_BUS as u32, 144]);
     assert_eq!([r(196), r(200), r(208)], [0, 0xff, 72]);
+}
+
+/// The contents of the fw_cfg file `name`, read a byte at a time from the data register.
+fn fw_cfg_file(m: &VirtMachine, name: &str) -> Vec<u8> {
+    let select = |key: u16| {
+        assert!(m.memory_as().write(VIRT_FW_CFG + 8, U, &key.to_be_bytes()).is_ok());
+    };
+    let data = |len: usize| (0..len).flat_map(|_| read(m, VIRT_FW_CFG, 1)).collect::<Vec<u8>>();
+    // FW_CFG_FILE_DIR: the number of files, then a size, a selector and a name for each.
+    select(0x19);
+    let count = u32::from_be_bytes(data(4).try_into().unwrap());
+    for _ in 0..count {
+        let e = data(64);
+        if cstr(&e, 8) == name {
+            let key = u16::from_be_bytes([e[4], e[5]]);
+            select(key);
+            return data(be32(&e, 0) as usize);
+        }
+    }
+    panic!("no fw_cfg file {name}");
+}
+
+/// The IORT in `tables`, and the input base and number of IDs of the root complex's mapping
+/// to the SMMU.
+fn iort_rc_to_smmu(tables: &[u8]) -> (u32, u32) {
+    let at = tables.windows(4).position(|w| w == b"IORT").unwrap();
+    let r = |o: usize| u32::from_le_bytes(tables[at + o..at + o + 4].try_into().unwrap());
+    assert_eq!(r(208), 72, "the mapping goes to the SMMU node");
+    (r(196), r(200) + 1)
+}
+
+/// A root port and a function behind it under `iommu=smmuv3`.
+fn root_port_machine() -> (VirtMachine, VirtioPci) {
+    let rng =
+        || Box::new(VirtioRng::new(Box::new(RandomFile::default()), VirtioRngConf::default()));
+    let cfg = VirtConfig { iommu: VirtIommu::SmmuV3, ..VirtConfig::default() };
+    let mut m = VirtMachine::new(cfg).unwrap();
+    let rp = PcieRootPortConfig {
+        id: Some("rp1".to_string()),
+        sec_bus_name: "rp1".to_string(),
+        chassis: 1,
+        ..PcieRootPortConfig::default()
+    };
+    m.attach_pcie_root_port(&rp, Some(2 << 3)).unwrap();
+    let props = VirtioPciProps::default();
+    let e = m.attach_virtio_pci_on(Some("rp2"), rng(), None, &props, false).unwrap_err();
+    assert_eq!(e, "Bus 'rp2' not found");
+    let dev = m.attach_virtio_pci_on(Some("rp1"), rng(), None, &props, false).unwrap();
+    m.machine_done().unwrap();
+    (m, dev)
+}
+
+/// Gives the secondary bus of the root port at 00:02.0 the number `sec`, with buses up to
+/// `sub` behind it, as firmware does.
+fn number_root_port(m: &VirtMachine, sec: u64, sub: u64) {
+    let ecam = m.memmap().ecam.base;
+    w(m, ecam + (2 << 15) + 0x19, 1, sec);
+    w(m, ecam + (2 << 15) + 0x1a, 1, sub);
+}
+
+/// A function behind a root port has the stream ID of the number its bus has when it sends,
+/// as `smmu_get_sid()` works it out, not the one it had when it was plugged: with the entry
+/// of stream 0 bypassing and the entry of stream 0x100 aborting, its MSIs are dropped once
+/// the bus is numbered 1.
+#[test]
+fn smmu_stream_id_behind_a_root_port() {
+    let (m, dev) = root_port_machine();
+    assert_eq!(dev.pci_dev().requester_id(), 0);
+    number_root_port(&m, 1, 1);
+    assert_eq!(dev.pci_dev().requester_id(), 0x100);
+    let lpi_pending = its_map_lpi(&m, 0x100);
+    let ecam = m.memmap().ecam.base;
+    w(&m, ecam + (2 << 15) + 4, 2, 0x6);
+    w(&m, ecam + (1 << 20) + 4, 2, 0x6);
+
+    // A linear stream table of 512 entries.
+    let strtab = VIRT_MEM + 0x150_0000;
+    w(&m, strtab, 8, 1 | (4 << 1));
+    w(&m, strtab + 0x100 * 64, 8, 1);
+    w(&m, VIRT_SMMU + 0x80, 8, strtab);
+    w(&m, VIRT_SMMU + 0x88, 4, 9);
+    w(&m, VIRT_SMMU + 0x20, 4, 1);
+    assert_eq!(r32(&m, VIRT_SMMU + 0x24), 1, "CR0ACK");
+    let msg = MsiMessage { address: VIRT_GIC_ITS + 0x1_0040, data: 0 };
+    dev.pci_dev().msi_send_message(msg);
+    assert!(!lpi_pending(&m));
+    w(&m, VIRT_SMMU + 0x20, 4, 0);
+    dev.pci_dev().msi_send_message(msg);
+    assert!(lpi_pending(&m));
+}
+
+/// The IORT maps the buses behind the root ports to the SMMU as `iort_host_bridges()` does,
+/// with the bus numbers they have when the firmware first reads the tables after a reset. The
+/// DSDT has the function in the device of the root port.
+#[test]
+fn iort_behind_a_root_port() {
+    let (mut m, _dev) = root_port_machine();
+    number_root_port(&m, 1, 1);
+    assert_eq!(iort_rc_to_smmu(&m.acpi_tables().table_data), (0, 0x200));
+    // The first read rebuilds the tables, and later ones keep them until the next reset.
+    m.system_reset().unwrap();
+    number_root_port(&m, 1, 1);
+    assert_eq!(iort_rc_to_smmu(&fw_cfg_file(&m, "etc/acpi/tables")), (0, 0x200));
+    number_root_port(&m, 1, 3);
+    assert_eq!(iort_rc_to_smmu(&fw_cfg_file(&m, "etc/acpi/tables")), (0, 0x200));
+    m.system_reset().unwrap();
+    number_root_port(&m, 1, 3);
+    let tables = fw_cfg_file(&m, "etc/acpi/tables");
+    assert_eq!(iort_rc_to_smmu(&tables), (0, 0x400));
+
+    // Device (S10) holds Device (S00).
+    let at = tables.windows(4).position(|w| w == b"DSDT").unwrap();
+    let len = u32::from_le_bytes(tables[at + 4..at + 8].try_into().unwrap()) as usize;
+    let dsdt = &tables[at..at + len];
+    let s10 = dsdt.windows(4).position(|w| w == b"S10_").unwrap();
+    assert!(dsdt[s10..].windows(4).any(|w| w == b"S00_"));
+}
+
+/// ruvm does not put the functions behind root ports under a virtio-iommu yet, so the two do
+/// not go together.
+#[test]
+fn root_port_and_virtio_iommu() {
+    let rp = PcieRootPortConfig {
+        id: Some("rp1".to_string()),
+        sec_bus_name: "rp1".to_string(),
+        chassis: 1,
+        ..PcieRootPortConfig::default()
+    };
+    let m = VirtMachine::new(VirtConfig::default()).unwrap();
+    m.attach_pcie_root_port(&rp, None).unwrap();
+    let e = m.attach_virtio_iommu(&VirtioIommuConf::default(), None, None).unwrap_err();
+    assert_eq!(e, "virtio-iommu with pcie-root-port is not supported by ruvm yet");
+    let m = VirtMachine::new(VirtConfig::default()).unwrap();
+    m.attach_virtio_iommu(&VirtioIommuConf::default(), None, None).unwrap();
+    let e = m.attach_pcie_root_port(&rp, None).unwrap_err();
+    assert_eq!(e, "pcie-root-port with virtio-iommu is not supported by ruvm yet");
 }
 
 /// `iommu_platform` offers VIRTIO_F_IOMMU_PLATFORM, which a legacy capable function refuses.
