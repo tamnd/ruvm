@@ -13,7 +13,7 @@ use ruvm_jit_interp::{HelperEnv, Unwind};
 
 use super::helpers::{Def, crc_update, def, run};
 use super::{arm_of, commit, vfp};
-use crate::cpu::{CF, CPSR_EXEC, CpuArmState, GE, QF};
+use crate::cpu::{ArmFeatures, CF, CPSR_EXEC, CpuArmState, GE, QF};
 
 use HelperType::{I32, Ptr, Void};
 
@@ -257,8 +257,18 @@ fn h_cpsr_write(h: &mut HelperEnv<'_>, a: &[u64]) -> H {
 
 /// `HELPER(vfp_get_fpscr)`.
 fn h_vfp_get_fpscr(h: &mut HelperEnv<'_>, _a: &[u64]) -> H {
-    let st = CpuArmState::load(h.env);
-    ret((vfp::get_fpcr(&st) & FPSCR_FPCR_MASK) | (vfp::get_fpsr(&st) & FPSCR_FPSR_MASK))
+    ret(get_fpscr(&CpuArmState::load(h.env)))
+}
+
+/// `vfp_get_fpscr()`.
+pub(crate) fn get_fpscr(st: &CpuArmState) -> u32 {
+    (vfp::get_fpcr(st) & FPSCR_FPCR_MASK) | (vfp::get_fpsr(st) & FPSCR_FPSR_MASK)
+}
+
+/// `vfp_set_fpscr()`.
+pub(crate) fn set_fpscr(st: &mut CpuArmState, val: u32, feat: &ArmFeatures) {
+    vfp::set_fpcr(st, val & FPSCR_FPCR_MASK, feat);
+    vfp::set_fpsr(st, val & FPSCR_FPSR_MASK);
 }
 
 /// `HELPER(vfp_set_fpscr)`.
@@ -268,8 +278,7 @@ fn h_vfp_set_fpscr(h: &mut HelperEnv<'_>, a: &[u64]) -> H {
         let ops = cpu.ops();
         let feat = *arm_of(&ops).features();
         let mut st = CpuArmState::load(cpu.env);
-        vfp::set_fpcr(&mut st, val & FPSCR_FPCR_MASK, &feat);
-        vfp::set_fpsr(&mut st, val & FPSCR_FPSR_MASK);
+        set_fpscr(&mut st, val, &feat);
         commit(cpu, &mut st);
         Ok(0)
     })

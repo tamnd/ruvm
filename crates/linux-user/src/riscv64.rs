@@ -687,6 +687,7 @@ pub(crate) static GUEST: Guest = Guest {
     },
     set_tls,
     cpu_loop,
+    setup_frame: None,
     setup_rt_frame,
     rt_sigreturn: do_rt_sigreturn,
 };

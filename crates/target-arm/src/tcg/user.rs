@@ -184,6 +184,17 @@ pub fn set_fpcr(cpu: &Cpu<'_>, st: &mut CpuArmState, val: u32) {
     super::vfp::set_fpcr(st, val, super::arm_of(&ops).features());
 }
 
+/// `vfp_get_fpscr()`, for the AArch32 VFP signal frame.
+pub fn vfp_get_fpscr(st: &CpuArmState) -> u32 {
+    super::a32_helper::get_fpscr(st)
+}
+
+/// `vfp_set_fpscr()`, as `restore_sigframe_vfp()` writes FPSCR.
+pub fn vfp_set_fpscr(cpu: &Cpu<'_>, st: &mut CpuArmState, val: u32) {
+    let ops = cpu.ops();
+    super::a32_helper::set_fpscr(st, val, super::arm_of(&ops).features());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

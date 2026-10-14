@@ -3285,7 +3285,7 @@ mod tests {
             "romfile with rombar=0 is not supported by ruvm yet"
         );
         assert_eq!(
-            err(q, &["intel-iommu", "vfio-pci,host=00:04.0"]),
+            err(q, &["amd-iommu", "vfio-pci,host=00:04.0"]),
             "vfio-pci with a vIOMMU is not supported by ruvm yet"
         );
     }
