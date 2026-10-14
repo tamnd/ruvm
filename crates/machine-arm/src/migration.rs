@@ -4,14 +4,16 @@
 //!
 //! [`virt_savevm`] registers the sections of `virt` the way QEMU 11.1 lays them out. So far
 //! these are the `timer` section, RAM, the flashes, the vCPUs, the GIC, the UARTs, the RTC,
-//! the GPIO controllers and the power key, and `globalstate`. The PCI host, the ACPI GED,
-//! `fw_cfg` and the ACPI tables only keep their section ids for now.
+//! the PCI host, the GPIO controllers and the power key, and `globalstate`. The ACPI GED,
+//! `fw_cfg` and the ACPI tables only keep their section ids for now. Devices plugged into
+//! the PCI bus are not sent yet.
 //!
 //! The device sections carry the state field by field, as QEMU 11.1's `VMStateDescription`
 //! for it does: the CFI01 flash (hw/block/pflash_cfi01.c), the PL011 UART (hw/char/pl011.c
 //! and hw/core/clock-vmstate.c), the PL031 RTC (hw/rtc/pl031.c), the PL061 GPIO controller
 //! (hw/gpio/pl061.c) and the GPIO power key (hw/gpio/gpio_key.c). The registers add no path
-//! prefix, as these are sysbus devices.
+//! prefix, as these are sysbus devices. The PCI host's sections are those of
+//! [`ruvm_hw_pci::vmstate`].
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, Weak};
@@ -22,6 +24,8 @@ use ruvm_hw_char::pl011::{PL011_FIFO_DEPTH, Pl011, Pl011VmState};
 use ruvm_hw_core::timer::Clock;
 use ruvm_hw_misc::gpio_key::GpioKey;
 use ruvm_hw_misc::pl061::{Pl061, Pl061VmState};
+use ruvm_hw_pci::GpexHost;
+use ruvm_hw_pci::vmstate::{VMSTATE_GPEX_ROOT, VMSTATE_PCIBUS, VMSTATE_PCIHOST};
 use ruvm_hw_timer::pl031::{Pl031, Pl031VmState};
 use ruvm_jit::cputlb::tlb_flush;
 use ruvm_mem::{GLOBAL_DIRTY_MIGRATION, MemorySystem};
@@ -115,10 +119,7 @@ fn register_devices(savevm: &mut SaveVm, board: &VirtMachine) {
         register_pl011(savevm, instance, uart);
     }
     register_pl031(savevm, board.rtc(), board.clock());
-    // "0000:00:00.0/gpex_root", "PCIHost" and "PCIBUS", which ruvm does not send yet.
-    savevm.reserve_section_id();
-    savevm.reserve_section_id();
-    savevm.reserve_section_id();
+    register_gpex(savevm, board.gpex());
     let mut pl061 = 0;
     if let (Some(gpio), Some(key)) = (board.gpio(), board.gpio_key()) {
         register_pl061(savevm, 0, gpio);
@@ -318,6 +319,42 @@ pub fn register_pflash(savevm: &mut SaveVm, instance: u32, flash: &Arc<Pflash>) 
         "",
         Some(instance),
         &VMSTATE_PFLASH,
+        move || Ok(get.vmstate_save()),
+        move |s| put.vmstate_load(&s).map_err(Error::generic),
+    );
+}
+
+/// Registers the sections of the PCI host in the order QEMU 11.1 realizes them: the root
+/// function as `0000:00:00.0/gpex_root`, then `PCIHost` and the root bus's `PCIBUS`, all
+/// instance 0. The last two have no path prefix, as QEMU registers them with a NULL device.
+pub fn register_gpex(savevm: &mut SaveVm, gpex: &GpexHost) {
+    let root = gpex.root();
+    let (get, put) = (Arc::clone(root), Arc::clone(root));
+    savevm.register_vmsd(
+        "0000:00:00.0/",
+        Some(0),
+        &VMSTATE_GPEX_ROOT,
+        move || Ok(get.vmstate_save()),
+        move |s| put.vmstate_load(&s).map_err(Error::generic),
+    );
+    let host = gpex.host_state();
+    let (get, put) = (Arc::clone(host), Arc::clone(host));
+    savevm.register_vmsd(
+        "",
+        Some(0),
+        &VMSTATE_PCIHOST,
+        move || Ok(get.vmstate_save()),
+        move |s| {
+            put.vmstate_load(&s);
+            Ok(())
+        },
+    );
+    let bus = gpex.bus();
+    let (get, put) = (Arc::clone(bus), Arc::clone(bus));
+    savevm.register_vmsd(
+        "",
+        Some(0),
+        &VMSTATE_PCIBUS,
         move || Ok(get.vmstate_save()),
         move |s| put.vmstate_load(&s).map_err(Error::generic),
     );
