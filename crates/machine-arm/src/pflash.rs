@@ -17,7 +17,10 @@
 //! This is the device machine-x86 has for the PC system flashes, without the PC placement logic;
 //! the two should become one shared device.
 //!
-//! Not ported: VMState, trace points, the `secure` property and the unimplemented command log
+//! [`Pflash::vmstate_save`] and [`Pflash::vmstate_load`] give the fields of `vmstate_pflash`.
+//! The contents travel in the RAM block, as in QEMU.
+//!
+//! Not ported: trace points, the `secure` property and the unimplemented command log
 //! (`LOG_UNIMP`).
 
 use std::fmt;
@@ -142,6 +145,24 @@ struct State {
     blk_offset: Option<u64>,
     /// The image when it is writable.
     file: Option<WriteBack>,
+}
+
+/// The migrated state of a flash, the fields of `vmstate_pflash` and its
+/// `pflash_cfi01_blk_write` subsection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PflashVmState {
+    /// 0 when the flash reads normally, else the cycle of the command sequence.
+    pub wcycle: u8,
+    /// The current command.
+    pub cmd: u8,
+    /// The status register.
+    pub status: u8,
+    /// The bytes left of a write to buffer.
+    pub counter: u64,
+    /// The write to buffer update buffer, `writeblock_size` bytes.
+    pub blk_bytes: Vec<u8>,
+    /// Where `blk_bytes` goes, or `u32::MAX` (QEMU's -1) without a write to buffer.
+    pub blk_offset: u32,
 }
 
 /// What a write does after the state machine ran, the labels at the end of `pflash_write()`.
@@ -311,6 +332,50 @@ impl Pflash {
         self.set_romd(true);
         st.status = STATUS_READY;
         st.blk_offset = None;
+    }
+
+    /// The state `vmstate_pflash` sends.
+    pub fn vmstate_save(&self) -> PflashVmState {
+        let st = self.lock();
+        PflashVmState {
+            wcycle: st.wcycle,
+            cmd: st.cmd,
+            status: st.status,
+            counter: st.counter,
+            blk_bytes: st.blk_bytes.clone(),
+            blk_offset: st.blk_offset.map_or(u32::MAX, |o| o as u32),
+        }
+    }
+
+    /// Takes a state from [`vmstate_save`](Self::vmstate_save) of the source. The write to
+    /// buffer must lie inside the flash. QEMU leaves the region in romd mode on the
+    /// destination even when the source was in a command, so that reads see the array until
+    /// the next write; here romd follows the command, so reads give what they gave on the
+    /// source. `pflash_post_load()` writes the whole flash back to a writable image once the
+    /// VM runs; here that happens right away.
+    pub fn vmstate_load(&self, s: &PflashVmState) -> Result<(), String> {
+        let blk_offset = match s.blk_offset {
+            u32::MAX => None,
+            o if u64::from(o) + u64::from(self.writeblock_size) <= self.total_len => {
+                Some(u64::from(o))
+            }
+            o => return Err(format!("{}: write buffer offset {o:#x} out of range", self.name)),
+        };
+        if s.blk_bytes.len() != self.writeblock_size as usize {
+            return Err(format!("{}: write buffer of {} bytes", self.name, s.blk_bytes.len()));
+        }
+        let mut st = self.lock();
+        st.wcycle = s.wcycle;
+        st.cmd = s.cmd;
+        st.status = s.status;
+        st.counter = s.counter;
+        st.blk_bytes.copy_from_slice(&s.blk_bytes);
+        st.blk_offset = blk_offset;
+        self.set_romd(st.cmd == 0x00);
+        if !self.ro {
+            self.update(&mut st, 0, self.total_len);
+        }
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
