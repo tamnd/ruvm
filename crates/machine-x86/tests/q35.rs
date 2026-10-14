@@ -372,7 +372,8 @@ fn bios_is_mapped_at_4g_and_below_1m() {
     assert!(m.memory_as().read(0xe0000, ATTRS, &mut b[..1]).is_ok());
     assert_eq!(b[0], 0xab);
 
-    // pc.bios is read-only to the guest, and a reset reloads it.
+    // pc.bios is read-only to the guest. As in QEMU, only the first reset writes a ROM, which
+    // machine_done() did, so a later change to it stays.
     let mut m = m;
     let _ = m.memory_as().write(0xffff_fff0, ATTRS, b"x");
     assert!(m.memory_as().read(0xffff_fff0, ATTRS, &mut b[..1]).is_ok());
@@ -383,7 +384,7 @@ fn bios_is_mapped_at_4g_and_below_1m() {
     assert_eq!(b[0], b'x');
     m.system_reset().unwrap();
     assert!(m.memory_as().read(0xffff_fff0, ATTRS, &mut b[..1]).is_ok());
-    assert_eq!(b[0], b'r');
+    assert_eq!(b[0], b'x');
 }
 
 #[test]
