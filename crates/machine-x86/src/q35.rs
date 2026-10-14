@@ -2017,6 +2017,16 @@ impl Q35 {
         let ops = Arc::clone(iommu);
         self.pci_dma
             .set_iommu(TYPE_INTEL_IOMMU_MEMORY_REGION, Box::new(move |bdf| ops.device_ops(bdf)));
+        // vtd_find_add_as(): each device sees system memory through `vtd-nodmar` while
+        // translation is off or its context entry is pass-through.
+        let ops = Arc::clone(iommu);
+        self.pci_dma.set_iommu_bypass("vtd-nodmar", Box::new(move |bdf| ops.use_iommu(bdf)));
+        let dma = Arc::downgrade(&self.pci_dma);
+        iommu.set_switcher(move |bdf, on| {
+            if let Some(dma) = dma.upgrade() {
+                dma.switch(bdf, on);
+            }
+        });
         if iommu.conf().intr_supported() {
             let ir = Arc::clone(iommu);
             let remap: MsiRemap = Arc::new(move |sid, addr, data| ir.remap_msi(sid, addr, data));
@@ -2027,6 +2037,22 @@ impl Q35 {
         self.add_reset_hook(Box::new(move || reset.system_reset()));
         let _ = self.acpi_src.intel_iommu.set(Arc::clone(iommu));
         Ok(())
+    }
+
+    /// `pci_device_set_iommu_device()` for the root bus: tells the vIOMMU that a host device
+    /// is assigned at `devfn`. Without an Intel IOMMU there is nothing to tell.
+    pub fn set_iommu_device(&self, devfn: u8) -> Result<(), String> {
+        match self.acpi_src.intel_iommu.get() {
+            Some(iommu) => iommu.set_iommu_device(u16::from(devfn)),
+            None => Ok(()),
+        }
+    }
+
+    /// `pci_device_unset_iommu_device()`.
+    pub fn unset_iommu_device(&self, devfn: u8) {
+        if let Some(iommu) = self.acpi_src.intel_iommu.get() {
+            iommu.unset_iommu_device(u16::from(devfn));
+        }
     }
 
     /// `amdvi_sysbus_realize()` with the `AMDVI-PCI` function it makes on the root bus. As in

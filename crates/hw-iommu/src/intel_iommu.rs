@@ -23,8 +23,14 @@
 //!   address space per PASID, and with `svm=on` takes ATS translation requests and page
 //!   requests into its page request queue. ruvm has the page request registers but never
 //!   queues a request.
-//! - There are no IOMMU notifiers and no replay, so nothing like vhost or VFIO can sit behind
-//!   the IOMMU, and `caching-mode` only sets the capability bit.
+//! - The IOMMU notifiers and replay are there for VFIO with `caching-mode=on`, with the
+//!   shadow page table sync after each invalidation, but there is no dirty tracking variant of
+//!   the unmap, no PASID cache sync and no first stage nesting with an iommufd backend. The
+//!   host address width check of `vtd_check_hiod()` never fails, since a legacy VFIO container
+//!   gives no IOVA ranges and so counts as 64 bits, as in QEMU.
+//! - The notifications and the address space switches of a register write or an invalidation
+//!   go out once the lock is dropped, in the order QEMU sends them, rather than in the middle
+//!   of the write. The page walk that decides them is done under the lock.
 //! - DMA to the interrupt range, 0xfee00000 to 0xfeefffff, is not translated. QEMU puts its
 //!   `vtd-ir` region over the IOMMU region there; ruvm delivers MSIs without a DMA write, and
 //!   the board hands them to [`IntelIommu::remap_msi`] instead. A plain DMA write there does
@@ -36,14 +42,15 @@
 //!   descriptor checks that use `error_report()` print the same lines.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use ruvm_base::report::error_report;
 use ruvm_mem::{
-    AccessConstraints, AccessCtx, AccessSize, AddressSpace, IommuAccessFlags, IommuOps,
-    IommuTlbEntry, MemResult, MemTxAttrs, MemTxResult, MmioOps,
+    AccessConstraints, AccessCtx, AccessSize, AddressSpace, IommuAccessFlags, IommuNotifier,
+    IommuNotifierFlag, IommuNotifiers, IommuOps, IommuTlbEntry, IommuTlbEvent, MemResult,
+    MemTxAttrs, MemTxResult, MmioOps,
 };
 
 /// `TYPE_INTEL_IOMMU_DEVICE`.
@@ -559,6 +566,124 @@ enum Walked {
     Fault { mask: u64 },
 }
 
+/// One mapping the notifiers of a device were told about, `DMAMap`. `size` is the mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DmaMap {
+    iova: u64,
+    size: u64,
+    translated: u64,
+    perm: u8,
+}
+
+/// The mapping of `iova_tree` that overlaps `first..=last`, `iova_tree_find()`.
+fn tree_find(t: &BTreeMap<u64, DmaMap>, first: u64, last: u64) -> Option<DmaMap> {
+    let (_, m) = t.range(..=last).next_back()?;
+    (m.iova.saturating_add(m.size) >= first).then_some(*m)
+}
+
+/// `iova_tree_remove()`: drops every mapping that overlaps `first..=last`.
+fn tree_remove(t: &mut BTreeMap<u64, DmaMap>, first: u64, last: u64) {
+    while let Some(m) = tree_find(t, first, last) {
+        t.remove(&m.iova);
+    }
+}
+
+/// `dma_aligned_pow2_mask()`: the largest power of two mask that starts at `start`, is
+/// aligned there and ends at or before `end`, within `bits` bits.
+fn dma_aligned_pow2_mask(start: u64, end: u64, bits: u32) -> u64 {
+    let max_mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let addr_mask = end - start;
+    let alignment = if start != 0 { (start & start.wrapping_neg()) - 1 } else { max_mask };
+    let alignment = alignment.min(max_mask);
+    if alignment <= addr_mask.min(max_mask) {
+        return alignment;
+    }
+    if addr_mask == u64::MAX {
+        return u64::MAX;
+    }
+    (1u64 << (63 - (addr_mask + 1).leading_zeros())) - 1
+}
+
+/// `IOMMU_ACCESS_FLAG()` from the access bits.
+fn perm_flags(perm: u8) -> IommuAccessFlags {
+    match perm & 3 {
+        1 => IommuAccessFlags::RO,
+        2 => IommuAccessFlags::WO,
+        3 => IommuAccessFlags::RW,
+        _ => IommuAccessFlags::NONE,
+    }
+}
+
+/// An event for the notifiers. The target address space is filled in when it goes out.
+fn tlb_event(iova: u64, mask: u64, translated: u64, perm: u8) -> IommuTlbEvent {
+    let ty = if perm != 0 { IommuNotifierFlag::MAP } else { IommuNotifierFlag::UNMAP };
+    IommuTlbEvent {
+        ty,
+        entry: IommuTlbEntry {
+            target_as: None,
+            iova,
+            translated_addr: translated,
+            addr_mask: mask,
+            perm: perm_flags(perm),
+        },
+    }
+}
+
+/// The notifier side of a `VTDAddressSpace`.
+struct VtdAs {
+    notifiers: Arc<IommuNotifiers>,
+    /// `notifier_flags`. The device is on `vtd_as_with_notifiers` while they are not NONE.
+    notifier_flags: IommuNotifierFlag,
+    /// `iova_tree`: what the notifiers were told is mapped, by IOVA.
+    iova_tree: BTreeMap<u64, DmaMap>,
+}
+
+/// What to do once the lock is dropped.
+enum Deferred {
+    /// `memory_region_notify_iommu()` with IOMMU index 0.
+    All(Arc<IommuNotifiers>, IommuTlbEvent),
+    /// `memory_region_notify_iommu_one()`, if the notifier is still on the list.
+    One(Arc<IommuNotifiers>, Arc<IommuNotifier>, IommuTlbEvent),
+    /// `memory_region_unmap_iommu_notifier_range()`, if the notifier is still on the list.
+    UnmapRange(Arc<IommuNotifiers>, Arc<IommuNotifier>),
+    /// `vtd_switch_address_space()`: whether the device now goes through the IOMMU region.
+    Switch(u16, bool),
+}
+
+/// A page walk in progress, `vtd_page_walk_info` with the device's IOVA tree.
+struct PageWalk {
+    tree: BTreeMap<u64, DmaMap>,
+    notify_unmap: bool,
+    out: Vec<IommuTlbEvent>,
+}
+
+impl PageWalk {
+    /// `vtd_page_walk_one()`: keeps the IOVA tree up to date and passes on what changed.
+    fn one(&mut self, iova: u64, mask: u64, translated: u64, perm: u8) {
+        let target = DmaMap { iova, size: mask, translated, perm };
+        let last = iova.saturating_add(mask);
+        let mapped = tree_find(&self.tree, iova, last);
+        if perm == 0 {
+            if !self.notify_unmap || mapped.is_none() {
+                return;
+            }
+            tree_remove(&mut self.tree, iova, last);
+        } else {
+            if let Some(m) = mapped {
+                if m == target {
+                    return;
+                }
+                // The translation changed under a mapping: unmap it first, as QEMU does,
+                // since VFIO cannot change a mapping in place.
+                self.out.push(tlb_event(iova, mask, translated, 0));
+                tree_remove(&mut self.tree, iova, last);
+            }
+            self.tree.insert(iova, target);
+        }
+        self.out.push(tlb_event(iova, mask, translated, perm));
+    }
+}
+
 /// The state of `IntelIOMMUState` that the lock covers.
 struct State {
     conf: IntelIommuConf,
@@ -593,6 +718,12 @@ struct State {
     fpte_rsvd_large: [u64; 5],
     /// MSIs to send once the lock is dropped, as (address, data).
     msis: Vec<(u64, u32)>,
+    /// The devices that have their IOMMU region, `vtd_address_spaces`, by source ID.
+    devices: BTreeMap<u16, VtdAs>,
+    /// The source IDs with a host IOMMU device, `vtd_host_iommu_dev`.
+    host_iommu_devs: BTreeSet<u16>,
+    /// Notifications and switches to do once the lock is dropped.
+    deferred: Vec<Deferred>,
 }
 
 macro_rules! reg_access {
@@ -647,6 +778,9 @@ impl State {
             fpte_rsvd: [0; 5],
             fpte_rsvd_large: [0; 5],
             msis: Vec::new(),
+            devices: BTreeMap::new(),
+            host_iommu_devs: BTreeSet::new(),
+            deferred: Vec::new(),
         };
         s.init();
         s
@@ -1445,6 +1579,11 @@ impl State {
             }
         };
         if self.dev_pt_enabled(m, &ce) {
+            // vtd_pt_enable_fast_path(): the device can skip the IOMMU region from now on,
+            // until a context invalidation brings it back.
+            if self.devices.contains_key(&sid) {
+                self.switch(m, sid);
+            }
             return Walked::PassThrough;
         }
         let st = self.stage(m, &ce);
@@ -1480,15 +1619,17 @@ impl State {
     }
 
     /// `vtd_context_global_invalidate()`.
-    fn context_global_invalidate(&mut self) {
+    fn context_global_invalidate(&mut self, m: &Dma<'_>) {
         self.context_cache_gen = self.context_cache_gen.wrapping_add(1);
         if self.context_cache_gen == CONTEXT_CACHE_GEN_MAX {
             self.reset_context_cache();
         }
+        self.refresh_all(m);
+        self.replay_all(m);
     }
 
     /// `vtd_context_device_invalidate()`.
-    fn context_device_invalidate(&mut self, source_id: u16, func_mask: u64) {
+    fn context_device_invalidate(&mut self, m: &Dma<'_>, source_id: u16, func_mask: u64) {
         let mask: u16 = !match func_mask & 3 {
             0 => 0,
             1 => 4,
@@ -1501,14 +1642,35 @@ impl State {
                 *generation = 0;
             }
         }
+        // The device may have moved in or out of pass-through or of a domain.
+        let sids: Vec<u16> = self
+            .devices
+            .keys()
+            .copied()
+            .filter(|sid| sid >> 8 == bus && (sid & 0xff & mask) == (devfn & mask))
+            .collect();
+        for sid in sids {
+            self.switch(m, sid);
+            self.address_space_sync(m, sid);
+        }
     }
 
-    fn iotlb_domain_invalidate(&mut self, domain_id: u16) {
+    /// `vtd_iotlb_global_invalidate()`.
+    fn iotlb_global_invalidate(&mut self, m: &Dma<'_>) {
+        self.iotlb.clear();
+        self.replay_all(m);
+    }
+
+    /// `vtd_iotlb_domain_invalidate()`.
+    fn iotlb_domain_invalidate(&mut self, m: &Dma<'_>, domain_id: u16) {
         self.iotlb.retain(|_, e| e.domain_id != domain_id);
+        for (sid, _) in self.notified_in_domain(m, domain_id) {
+            self.address_space_sync(m, sid);
+        }
     }
 
     /// `vtd_iotlb_page_invalidate()` with `vtd_hash_remove_by_page()`.
-    fn iotlb_page_invalidate(&mut self, domain_id: u16, addr: u64, am: u64) {
+    fn iotlb_page_invalidate(&mut self, m: &Dma<'_>, domain_id: u16, addr: u64, am: u64) {
         let mask = !((1u64 << am) - 1);
         let gfn = (addr >> 12) & mask;
         self.iotlb.retain(|_, e| {
@@ -1517,6 +1679,269 @@ impl State {
             !(e.domain_id == domain_id
                 && (e.pgtt == PGTT_FST || (e.gfn & mask) == gfn || e.gfn == gfn_tlb))
         });
+        self.page_invalidate_notify(m, domain_id, addr, am, 0);
+    }
+
+    /// Whether `vtd_switch_address_space()` picks the IOMMU region for `sid`:
+    /// translation is on and the context entry is not pass-through.
+    fn use_iommu(&self, m: &Dma<'_>, sid: u16) -> bool {
+        // vtd_as_pt_enabled() counts a context entry it cannot read as not pass-through.
+        let pt = self
+            .dev_to_context_entry(m, (sid >> 8) as u8, sid as u8)
+            .is_ok_and(|ce| self.dev_pt_enabled(m, &ce));
+        self.dmar_enabled && !pt
+    }
+
+    /// `vtd_switch_address_space()`, done once the lock is dropped.
+    fn switch(&mut self, m: &Dma<'_>, sid: u16) -> bool {
+        let on = self.use_iommu(m, sid);
+        self.deferred.push(Deferred::Switch(sid, on));
+        on
+    }
+
+    /// `vtd_switch_address_space_all()`.
+    fn switch_all(&mut self, m: &Dma<'_>) {
+        let sids: Vec<u16> = self.devices.keys().copied().collect();
+        for sid in sids {
+            self.switch(m, sid);
+        }
+    }
+
+    /// `vtd_as_with_notifiers`.
+    fn with_notifiers(&self) -> Vec<u16> {
+        self.devices
+            .iter()
+            .filter(|(_, a)| a.notifier_flags != IommuNotifierFlag::NONE)
+            .map(|(&sid, _)| sid)
+            .collect()
+    }
+
+    /// `vtd_as_has_map_notifier()`.
+    fn has_map_notifier(&self, sid: u16) -> bool {
+        self.devices.get(&sid).is_some_and(|a| a.notifier_flags.intersects(IommuNotifierFlag::MAP))
+    }
+
+    /// `vtd_address_space_unmap()`: unmaps the range of `n`, in aligned power of two pieces,
+    /// and forgets what is mapped there.
+    fn address_space_unmap(&mut self, sid: u16, n: &Arc<IommuNotifier>) {
+        let aw = self.conf.aw_bits;
+        let Some(a) = self.devices.get_mut(&sid) else {
+            return;
+        };
+        let start = n.start;
+        let end = n.end.min(haw_mask(aw));
+        if start > end {
+            return;
+        }
+        let total = end - start + 1;
+        let (mut iova, mut remain) = (start, total);
+        while remain >= 0x1000 {
+            let mask = dma_aligned_pow2_mask(iova, end, u32::from(aw));
+            let ev = tlb_event(iova, mask, 0, 0);
+            self.deferred.push(Deferred::One(Arc::clone(&a.notifiers), Arc::clone(n), ev));
+            iova = iova.wrapping_add(mask).wrapping_add(1);
+            remain = remain.wrapping_sub(mask).wrapping_sub(1);
+        }
+        tree_remove(&mut a.iova_tree, start, start + (total - 1));
+    }
+
+    /// `vtd_address_space_unmap_all()`.
+    fn unmap_all(&mut self) {
+        for sid in self.with_notifiers() {
+            for n in self.devices[&sid].notifiers.list() {
+                self.address_space_unmap(sid, &n);
+            }
+        }
+    }
+
+    /// `vtd_address_space_refresh_all()`.
+    fn refresh_all(&mut self, m: &Dma<'_>) {
+        self.unmap_all();
+        self.switch_all(m);
+    }
+
+    /// `vtd_iommu_replay_all()`.
+    fn replay_all(&mut self, m: &Dma<'_>) {
+        for sid in self.with_notifiers() {
+            self.address_space_sync(m, sid);
+        }
+    }
+
+    /// `vtd_page_walk()` of the table of `ce` over `start..end`, with the IOVA tree of `sid`.
+    fn page_walk(
+        &mut self,
+        m: &Dma<'_>,
+        sid: u16,
+        ce: &ContextEntry,
+        start: u64,
+        end: u64,
+        notify_unmap: bool,
+    ) -> Vec<IommuTlbEvent> {
+        let st = self.stage(m, ce);
+        let limit = 1u64 << st.agaw.min(u32::from(self.conf.aw_bits)).min(63);
+        // vtd_iova_ss_range_check()
+        if start & !(limit - 1) != 0 {
+            return Vec::new();
+        }
+        let end = if end & !(limit - 1) != 0 { limit } else { end };
+        let Some(a) = self.devices.get_mut(&sid) else {
+            return Vec::new();
+        };
+        let mut w =
+            PageWalk { tree: std::mem::take(&mut a.iova_tree), notify_unmap, out: Vec::new() };
+        self.page_walk_level(m, st.base, start, end, st.level, true, true, &mut w);
+        if let Some(a) = self.devices.get_mut(&sid) {
+            a.iova_tree = w.tree;
+        }
+        w.out
+    }
+
+    /// `vtd_page_walk_level()`.
+    #[allow(clippy::too_many_arguments)]
+    fn page_walk_level(
+        &self,
+        m: &Dma<'_>,
+        addr: u64,
+        start: u64,
+        end: u64,
+        level: u32,
+        read: bool,
+        write: bool,
+        w: &mut PageWalk,
+    ) {
+        let size = 1u64 << level_shift(level);
+        let mask = level_page_mask(level);
+        let aw = self.conf.aw_bits;
+        let mut iova = start;
+        while iova < end {
+            let next = (iova & mask).wrapping_add(size);
+            let pte = m.pte(addr, (iova >> level_shift(level)) & 0x1ff);
+            if pte != u64::MAX && !self.sspte_nonzero_rsvd(pte, level) {
+                let read_cur = read && pte & 1 != 0;
+                let write_cur = write && pte & 2 != 0;
+                let target = pte & !0xfff & haw_mask(aw);
+                let last = level == 1 || pte & PT_PAGE_SIZE_MASK != 0;
+                if !last && (read_cur || write_cur) {
+                    self.page_walk_level(
+                        m,
+                        target,
+                        iova,
+                        next.min(end),
+                        level - 1,
+                        read_cur,
+                        write_cur,
+                        w,
+                    );
+                } else {
+                    let perm = (u8::from(read_cur) * ACCESS_R) | (u8::from(write_cur) * ACCESS_W);
+                    w.one(iova & mask, !mask, target, perm);
+                }
+            }
+            if next == 0 {
+                break;
+            }
+            iova = next;
+        }
+    }
+
+    /// `vtd_sync_shadow_page_table_range()`.
+    fn sync_range(&mut self, m: &Dma<'_>, sid: u16, ce: &ContextEntry, addr: u64, size: u64) {
+        let Some(list) = self.devices.get(&sid).map(|a| Arc::clone(&a.notifiers)) else {
+            return;
+        };
+        for ev in self.page_walk(m, sid, ce, addr, addr.wrapping_add(size), true) {
+            self.deferred.push(Deferred::All(Arc::clone(&list), ev));
+        }
+    }
+
+    /// `vtd_address_space_sync()`.
+    fn address_space_sync(&mut self, m: &Dma<'_>, sid: u16) {
+        let Some(list) = self.devices.get(&sid).map(|a| Arc::clone(&a.notifiers)) else {
+            return;
+        };
+        if !self.has_map_notifier(sid) {
+            for n in list.list() {
+                self.deferred.push(Deferred::UnmapRange(Arc::clone(&list), n));
+            }
+            return;
+        }
+        match self.dev_to_context_entry(m, (sid >> 8) as u8, sid as u8) {
+            Ok(ce) => self.sync_range(m, sid, &ce, 0, u64::MAX),
+            // A device out of its domain: everything it had goes.
+            Err((FR_CONTEXT_ENTRY_P, _)) => {
+                for n in list.list() {
+                    self.address_space_unmap(sid, &n);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// The devices with notifiers whose context entry is good and whose PASID 0 stage is in
+    /// domain `did`, with that context entry.
+    fn notified_in_domain(&self, m: &Dma<'_>, did: u16) -> Vec<(u16, ContextEntry)> {
+        self.with_notifiers()
+            .into_iter()
+            .filter_map(|sid| {
+                let ce = self.dev_to_context_entry(m, (sid >> 8) as u8, sid as u8).ok()?;
+                (self.stage(m, &ce).did == did).then_some((sid, ce))
+            })
+            .collect()
+    }
+
+    /// `vtd_iotlb_page_invalidate_notify()`. Only the address spaces without a PASID have
+    /// notifiers.
+    fn page_invalidate_notify(&mut self, m: &Dma<'_>, did: u16, addr: u64, am: u64, pasid: u32) {
+        if pasid != 0 {
+            return;
+        }
+        let size = (1u64 << am) * 0x1000;
+        for (sid, ce) in self.notified_in_domain(m, did) {
+            if self.has_map_notifier(sid) {
+                if !self.conf.fsts || !self.root_scalable {
+                    self.sync_range(m, sid, &ce, addr, size);
+                }
+            } else {
+                let list = Arc::clone(&self.devices[&sid].notifiers);
+                self.deferred.push(Deferred::All(list, tlb_event(addr, size - 1, 0, 0)));
+            }
+        }
+    }
+
+    /// `vtd_iommu_replay()`: the mappings there are now, for one new notifier.
+    fn replay(&mut self, m: &Dma<'_>, sid: u16, n: &IommuNotifier) -> Vec<IommuTlbEvent> {
+        let Some(a) = self.devices.get_mut(&sid) else {
+            return Vec::new();
+        };
+        a.iova_tree.clear();
+        let Ok(ce) = self.dev_to_context_entry(m, (sid >> 8) as u8, sid as u8) else {
+            return Vec::new();
+        };
+        if !n.flags.intersects(IommuNotifierFlag::MAP) {
+            return Vec::new();
+        }
+        self.page_walk(m, sid, &ce, 0, u64::MAX, false)
+    }
+
+    /// `vtd_iommu_notify_flag_changed()`.
+    fn notify_flag_changed(&mut self, sid: u16, new: IommuNotifierFlag) -> Result<(), String> {
+        let dev = format!("device {:02x}.{:02x}.{:x}", sid >> 8, (sid >> 3) & 0x1f, sid & 7);
+        if self.conf.snoop_control {
+            return Err(
+                "Snoop Control with vhost or VFIO is not supported: Operation not supported"
+                    .to_string(),
+            );
+        }
+        if !self.conf.caching_mode && new.intersects(IommuNotifierFlag::MAP) {
+            return Err(format!("{dev} requires caching mode: Operation not supported"));
+        }
+        if !self.conf.device_iotlb && new.intersects(IommuNotifierFlag::DEVIOTLB_UNMAP) {
+            return Err(format!("{dev} requires device IOTLB mode: Operation not supported"));
+        }
+        if let Some(a) = self.devices.get_mut(&sid) {
+            a.notifier_flags = new;
+        }
+        Ok(())
     }
 
     /// `vtd_handle_gcmd_write()`.
@@ -1535,6 +1960,7 @@ impl State {
                     self.set_clear_mask_long(DMAR_GSTS_REG, GSTS_TES, 0);
                 }
                 self.reset_caches();
+                self.refresh_all(m);
             }
         }
         if val & GCMD_SRTP != 0 {
@@ -1545,6 +1971,7 @@ impl State {
             }
             self.set_clear_mask_long(DMAR_GSTS_REG, 0, GSTS_RTPS);
             self.reset_caches();
+            self.refresh_all(m);
         }
         if changed & GCMD_QIE != 0 {
             self.handle_gcmd_qie(m, val & GCMD_QIE != 0);
@@ -1590,18 +2017,18 @@ impl State {
     }
 
     /// `vtd_handle_ccmd_write()`.
-    fn handle_ccmd_write(&mut self) {
+    fn handle_ccmd_write(&mut self, m: &Dma<'_>) {
         let val = self.get_quad_raw(DMAR_CCMD_REG);
         if val & CCMD_ICC == 0 || self.qi_enabled {
             return;
         }
         let caig = match val & CCMD_CIRG_MASK {
             CCMD_DOMAIN_INVL | CCMD_GLOBAL_INVL => {
-                self.context_global_invalidate();
+                self.context_global_invalidate(m);
                 CCMD_GLOBAL_INVL_A
             }
             CCMD_DEVICE_INVL => {
-                self.context_device_invalidate(((val >> 16) & 0xffff) as u16, (val >> 32) & 3);
+                self.context_device_invalidate(m, ((val >> 16) & 0xffff) as u16, (val >> 32) & 3);
                 CCMD_DEVICE_INVL_A
             }
             _ => 0,
@@ -1611,7 +2038,7 @@ impl State {
     }
 
     /// `vtd_handle_iotlb_write()`.
-    fn handle_iotlb_write(&mut self) {
+    fn handle_iotlb_write(&mut self, m: &Dma<'_>) {
         let val = self.get_quad_raw(DMAR_IOTLB_REG);
         if val & TLB_IVT == 0 || self.qi_enabled {
             return;
@@ -1619,11 +2046,11 @@ impl State {
         let domain_id = ((val >> 32) & 0xffff) as u16;
         let iaig = match val & TLB_FLUSH_GRANU_MASK {
             TLB_GLOBAL_FLUSH => {
-                self.iotlb.clear();
+                self.iotlb_global_invalidate(m);
                 TLB_GLOBAL_FLUSH_A
             }
             TLB_DSI_FLUSH => {
-                self.iotlb_domain_invalidate(domain_id);
+                self.iotlb_domain_invalidate(m, domain_id);
                 TLB_DSI_FLUSH_A
             }
             TLB_PSI_FLUSH => {
@@ -1632,7 +2059,7 @@ impl State {
                 if am > MAMV {
                     0
                 } else {
-                    self.iotlb_page_invalidate(domain_id, iva & !0xfff, am);
+                    self.iotlb_page_invalidate(m, domain_id, iva & !0xfff, am);
                     TLB_PSI_FLUSH_A
                 }
             }
@@ -1716,10 +2143,10 @@ impl State {
         let ty = (((d[0] >> 5) & 0x70) | (d[0] & 0xf)) as u8;
         self.iq_last_desc_type = ty;
         let ok = match ty {
-            INV_DESC_CC => self.process_context_cache_desc(&d),
-            INV_DESC_IOTLB => self.process_iotlb_desc(&d),
+            INV_DESC_CC => self.process_context_cache_desc(m, &d),
+            INV_DESC_IOTLB => self.process_iotlb_desc(m, &d),
             INV_DESC_PC => self.process_pasid_desc(&d),
-            INV_DESC_PIOTLB => self.process_piotlb_desc(&d),
+            INV_DESC_PIOTLB => self.process_piotlb_desc(m, &d),
             INV_DESC_WAIT => self.process_wait_desc(m, &d),
             INV_DESC_IEC => self.inv_desc_reserved_check(
                 &d,
@@ -1761,16 +2188,16 @@ impl State {
     }
 
     /// `vtd_process_context_cache_desc()`.
-    fn process_context_cache_desc(&mut self, d: &[u64; 4]) -> bool {
+    fn process_context_cache_desc(&mut self, m: &Dma<'_>, d: &[u64; 4]) -> bool {
         let mask = [0xfffc_0000_0000_f1c0, INV_DESC_ALL_ONE, INV_DESC_ALL_ONE, INV_DESC_ALL_ONE];
         if !self.inv_desc_reserved_check(d, mask, false, "vtd_process_context_cache_desc", "cc inv")
         {
             return false;
         }
         match d[0] & 0x30 {
-            0x20 | 0x10 => self.context_global_invalidate(),
+            0x20 | 0x10 => self.context_global_invalidate(m),
             0x30 => {
-                self.context_device_invalidate(((d[0] >> 32) & 0xffff) as u16, (d[0] >> 48) & 3)
+                self.context_device_invalidate(m, ((d[0] >> 32) & 0xffff) as u16, (d[0] >> 48) & 3)
             }
             _ => return false,
         }
@@ -1778,21 +2205,21 @@ impl State {
     }
 
     /// `vtd_process_iotlb_desc()`.
-    fn process_iotlb_desc(&mut self, d: &[u64; 4]) -> bool {
+    fn process_iotlb_desc(&mut self, m: &Dma<'_>, d: &[u64; 4]) -> bool {
         let mask = [0xffff_ffff_0000_f100, 0xf80, INV_DESC_ALL_ONE, INV_DESC_ALL_ONE];
         if !self.inv_desc_reserved_check(d, mask, false, "vtd_process_iotlb_desc", "iotlb inv") {
             return false;
         }
         let domain_id = ((d[0] >> 16) & 0xffff) as u16;
         match d[0] & 0x30 {
-            0x10 => self.iotlb.clear(),
-            0x20 => self.iotlb_domain_invalidate(domain_id),
+            0x10 => self.iotlb_global_invalidate(m),
+            0x20 => self.iotlb_domain_invalidate(m, domain_id),
             0x30 => {
                 let am = d[1] & 0x3f;
                 if am > MAMV {
                     return false;
                 }
-                self.iotlb_page_invalidate(domain_id, d[1] & !0xfff, am);
+                self.iotlb_page_invalidate(m, domain_id, d[1] & !0xfff, am);
             }
             _ => return false,
         }
@@ -1811,7 +2238,7 @@ impl State {
     }
 
     /// `vtd_process_piotlb_desc()`.
-    fn process_piotlb_desc(&mut self, d: &[u64; 4]) -> bool {
+    fn process_piotlb_desc(&mut self, m: &Dma<'_>, d: &[u64; 4]) -> bool {
         let mask = [0xfff0_0000_0000_f1c0, 0xf80, INV_DESC_ALL_ONE, INV_DESC_ALL_ONE];
         if !self.inv_desc_reserved_check(d, mask, true, "vtd_process_piotlb_desc", "piotlb inv") {
             return false;
@@ -1820,7 +2247,16 @@ impl State {
         let pasid = ((d[0] >> 32) & 0xf_ffff) as u32;
         match d[0] & 0x30 {
             // vtd_piotlb_pasid_invalidate()
-            0x20 => self.iotlb.retain(|k, e| !(e.domain_id == domain_id && k.pasid == pasid)),
+            0x20 => {
+                self.iotlb.retain(|k, e| !(e.domain_id == domain_id && k.pasid == pasid));
+                if pasid == 0 {
+                    for (sid, _) in self.notified_in_domain(m, domain_id) {
+                        if !self.conf.fsts || !self.has_map_notifier(sid) {
+                            self.address_space_sync(m, sid);
+                        }
+                    }
+                }
+            }
             // vtd_piotlb_page_invalidate(), which leaves second stage and pass-through entries
             0x30 => {
                 let am = d[1] & 0x3f;
@@ -1837,6 +2273,7 @@ impl State {
                         && k.pasid == pasid
                         && ((e.gfn & mask) == gfn || e.gfn == gfn_tlb))
                 });
+                self.page_invalidate_notify(m, domain_id, addr, am, pasid);
             }
             _ => return false,
         }
@@ -1984,20 +2421,20 @@ impl State {
             DMAR_CCMD_REG if size == 4 => self.set_long(addr, long),
             DMAR_CCMD_REG => {
                 self.set_quad(addr, val);
-                self.handle_ccmd_write();
+                self.handle_ccmd_write(m);
             }
             DMAR_CCMD_REG_HI => {
                 self.set_long(addr, long);
-                self.handle_ccmd_write();
+                self.handle_ccmd_write(m);
             }
             DMAR_IOTLB_REG if size == 4 => self.set_long(addr, long),
             DMAR_IOTLB_REG => {
                 self.set_quad(addr, val);
-                self.handle_iotlb_write();
+                self.handle_iotlb_write(m);
             }
             DMAR_IOTLB_REG_HI => {
                 self.set_long(addr, long);
-                self.handle_iotlb_write();
+                self.handle_iotlb_write(m);
             }
             DMAR_FSTS_REG => {
                 self.set_long(addr, long);
@@ -2122,11 +2559,15 @@ fn engaged() -> bool {
 /// What the IOMMU sends its own interrupts with, as (address, data).
 type MsiSender = Box<dyn Fn(u64, u32) + Send + Sync>;
 
+/// What shows the IOMMU region of a source ID, with true, or the alias of system memory.
+type Switcher = Box<dyn Fn(u16, bool) + Send + Sync>;
+
 /// The `intel-iommu` device.
 pub struct IntelIommu {
     state: Mutex<State>,
     memory: Weak<AddressSpace>,
     msi: OnceLock<MsiSender>,
+    switcher: OnceLock<Switcher>,
 }
 
 impl fmt::Debug for IntelIommu {
@@ -2143,6 +2584,7 @@ impl IntelIommu {
             state: Mutex::new(State::new(conf)),
             memory: Arc::downgrade(memory),
             msi: OnceLock::new(),
+            switcher: OnceLock::new(),
         })
     }
 
@@ -2156,15 +2598,23 @@ impl IntelIommu {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Runs `f` on the state, then sends the MSIs it asked for once the lock is dropped.
+    /// Sets what switches the DMA address space of a device between its IOMMU region and
+    /// the alias of system memory, `vtd_switch_address_space()`.
+    pub fn set_switcher(&self, switch: impl Fn(u16, bool) + Send + Sync + 'static) {
+        let _ = self.switcher.set(Box::new(switch));
+    }
+
+    /// Runs `f` on the state, then sends the notifications, the switches and the MSIs it
+    /// asked for once the lock is dropped.
     fn with_state<R>(&self, f: impl FnOnce(&mut State, &Dma<'_>) -> R) -> R {
         let memory = self.memory.upgrade();
-        let (r, msis) = {
+        let (r, deferred, msis) = {
             let _engaged = Engaged::enter();
             let mut s = self.lock();
             let r = f(&mut s, &Dma(memory.as_deref()));
-            (r, std::mem::take(&mut s.msis))
+            (r, std::mem::take(&mut s.deferred), std::mem::take(&mut s.msis))
         };
+        self.dispatch(deferred, &memory);
         if let Some(send) = self.msi.get() {
             for (addr, data) in msis {
                 send(addr, data);
@@ -2173,9 +2623,76 @@ impl IntelIommu {
         r
     }
 
+    fn dispatch(&self, deferred: Vec<Deferred>, memory: &Option<Arc<AddressSpace>>) {
+        let target = |mut ev: IommuTlbEvent| {
+            ev.entry.target_as = memory.clone();
+            ev
+        };
+        let listed = |list: &IommuNotifiers, n: &Arc<IommuNotifier>| {
+            list.list().iter().any(|x| Arc::ptr_eq(x, n))
+        };
+        for d in deferred {
+            match d {
+                Deferred::All(list, ev) => list.notify(0, &target(ev)),
+                Deferred::One(list, n, ev) => {
+                    if listed(&list, &n) {
+                        n.notify_one(&target(ev));
+                    }
+                }
+                Deferred::UnmapRange(list, n) => {
+                    if listed(&list, &n) {
+                        n.unmap_range(memory.clone());
+                    }
+                }
+                Deferred::Switch(sid, on) => {
+                    if let Some(switch) = self.switcher.get() {
+                        switch(sid, on);
+                    }
+                }
+            }
+        }
+    }
+
     /// `vtd_reset_exit()`.
     pub fn system_reset(&self) {
-        self.lock().init();
+        self.with_state(|s, m| {
+            s.init();
+            s.refresh_all(m);
+        });
+    }
+
+    /// Whether the device with source ID `sid` goes through its IOMMU region now, rather
+    /// than the alias of system memory.
+    pub fn use_iommu(&self, sid: u16) -> bool {
+        let memory = self.memory.upgrade();
+        let _engaged = Engaged::enter();
+        self.lock().use_iommu(&Dma(memory.as_deref()), sid)
+    }
+
+    /// `vtd_dev_set_iommu_device()`: a host device is assigned at source ID `sid`.
+    pub fn set_iommu_device(&self, sid: u16) -> Result<(), String> {
+        let mut s = self.lock();
+        if !s.conf.caching_mode {
+            return Err(
+                "Device assignment is not allowed without enabling caching-mode=on for Intel IOMMU."
+                    .to_string(),
+            );
+        }
+        if s.host_iommu_devs.contains(&sid) {
+            return Err("Host IOMMU device already exist".to_string());
+        }
+        // vtd_check_hiod(): a legacy container has no IOVA ranges, which makes 64 bits, and
+        // first stage translation needs an iommufd backend.
+        if s.conf.fsts {
+            return Err("Need IOMMUFD backend when fsts=on".to_string());
+        }
+        s.host_iommu_devs.insert(sid);
+        Ok(())
+    }
+
+    /// `vtd_dev_unset_iommu_device()`.
+    pub fn unset_iommu_device(&self, sid: u16) {
+        self.lock().host_iommu_devs.remove(&sid);
     }
 
     /// The configuration, for the DMAR table.
@@ -2191,7 +2708,16 @@ impl IntelIommu {
     /// The IOMMU region callbacks of the device with source ID `sid`, which is
     /// `PCI_BUILD_BDF(bus, devfn)`.
     pub fn device_ops(self: &Arc<Self>, sid: u16) -> Arc<dyn IommuOps> {
-        Arc::new(VtdDevice { iommu: Arc::clone(self), sid })
+        let notifiers = {
+            let mut s = self.lock();
+            let a = s.devices.entry(sid).or_insert_with(|| VtdAs {
+                notifiers: Arc::new(IommuNotifiers::new()),
+                notifier_flags: IommuNotifierFlag::NONE,
+                iova_tree: BTreeMap::new(),
+            });
+            Arc::clone(&a.notifiers)
+        };
+        Arc::new(VtdDevice { iommu: Arc::clone(self), sid, notifiers })
     }
 
     /// `vtd_mem_ir_write()`: remaps an MSI from the device with source ID `sid`, or from the
@@ -2224,12 +2750,7 @@ impl IntelIommu {
             entry.iova = x.iova;
             entry.translated_addr = x.translated;
             entry.addr_mask = x.mask;
-            entry.perm = match x.perm & 3 {
-                1 => IommuAccessFlags::RO,
-                2 => IommuAccessFlags::WO,
-                3 => IommuAccessFlags::RW,
-                _ => IommuAccessFlags::NONE,
-            };
+            entry.perm = perm_flags(x.perm);
         }
         entry
     }
@@ -2239,11 +2760,33 @@ impl IntelIommu {
 struct VtdDevice {
     iommu: Arc<IntelIommu>,
     sid: u16,
+    notifiers: Arc<IommuNotifiers>,
 }
 
 impl IommuOps for VtdDevice {
     fn translate(&self, addr: u64, flag: IommuAccessFlags, _iommu_idx: u32) -> IommuTlbEntry {
         self.iommu.translate(self.sid, addr, flag)
+    }
+
+    fn notifiers(&self) -> Option<&IommuNotifiers> {
+        Some(&self.notifiers)
+    }
+
+    fn notify_flag_changed(
+        &self,
+        _old: IommuNotifierFlag,
+        new: IommuNotifierFlag,
+    ) -> Result<(), String> {
+        self.iommu.lock().notify_flag_changed(self.sid, new)
+    }
+
+    fn replay(&self, n: &IommuNotifier) {
+        let events = self.iommu.with_state(|s, m| s.replay(m, self.sid, n));
+        let memory = self.iommu.memory.upgrade();
+        for mut ev in events {
+            ev.entry.target_as = memory.clone();
+            n.notify_one(&ev);
+        }
     }
 }
 

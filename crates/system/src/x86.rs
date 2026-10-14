@@ -1353,9 +1353,10 @@ pub(crate) fn plan(
         }
     }
 
-    // The container maps guest RAM at its guest physical address. Nothing follows a vIOMMU's
-    // mappings yet.
-    let viommu = !p.iommus.is_empty() || p.virtio.iter().any(|v| v.iommu.is_some());
+    // The container follows the mappings of intel-iommu only. amd-iommu and virtio-iommu send
+    // it no notifications yet.
+    let viommu = p.iommus.iter().any(|(_, i, _)| matches!(i, X86Iommu::Amd(_)))
+        || p.virtio.iter().any(|v| v.iommu.is_some());
     if let (true, Some((_, plug))) = (viommu, p.vfio.first()) {
         return Err(vec![Located::new(
             &plug.loc,

@@ -404,6 +404,22 @@ impl PciBus {
 
     /// `do_pci_register_device()` plus `pci_init_multifunction()`: places a new function at
     /// `devfn`, or at the first free slot from `devfn_min` if `None`.
+    /// The devfn [`PciBus::register_device`] picks when it is given none, the first free and
+    /// unreserved slot at or after `devfn_min`, if there is one.
+    pub fn first_free_devfn(&self) -> Option<u8> {
+        self.free_devfn(&self.lock())
+    }
+
+    fn free_devfn(&self, g: &BusInner) -> Option<u8> {
+        (usize::from(self.devfn_min)..PCI_DEVFN_MAX)
+            .step_by(usize::from(PCI_FUNC_MAX))
+            .map(|d| d as u8)
+            .find(|&d| {
+                g.devices[usize::from(d)].is_none()
+                    && g.slot_reserved_mask & (1 << pci_slot(d)) == 0
+            })
+    }
+
     pub fn register_device(
         &self,
         info: &PciDeviceInfo,
@@ -413,15 +429,11 @@ impl PciBus {
         let mut g = self.lock();
         let reserved = |g: &BusInner, devfn: u8| g.slot_reserved_mask & (1 << pci_slot(devfn)) != 0;
         let devfn = match devfn {
-            None => (usize::from(self.devfn_min)..PCI_DEVFN_MAX)
-                .step_by(usize::from(PCI_FUNC_MAX))
-                .map(|d| d as u8)
-                .find(|&d| g.devices[usize::from(d)].is_none() && !reserved(&g, d))
-                .ok_or_else(|| {
-                    Error::generic(format!(
-                        "PCI: no slot/function available for {name}, all in use or reserved"
-                    ))
-                })?,
+            None => self.free_devfn(&g).ok_or_else(|| {
+                Error::generic(format!(
+                    "PCI: no slot/function available for {name}, all in use or reserved"
+                ))
+            })?,
             Some(d) if reserved(&g, d) => {
                 return Err(Error::generic(format!(
                     "PCI: slot {} function {} not available for {}, reserved",
