@@ -19,6 +19,7 @@ ruvm-hostmem.workspace = true
 ruvm-mem.workspace = true
 ruvm-qapi.workspace = true
 ruvm-qom.workspace = true
+ruvm-vmstate.workspace = true
 
 [lints]
 workspace = true

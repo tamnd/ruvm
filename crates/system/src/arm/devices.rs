@@ -15,7 +15,8 @@
 //! the root bus `pcie.0` (`virtio-*-pci`) or on a virtio-mmio transport (`virtio-*-device`).
 //! The other virtio types and `loader` fail with "... is not supported with this machine by
 //! ruvm yet". The PCI types take `addr`, `bus=pcie.0`, `disable-legacy`,
-//! `disable-modern` and `vectors`; the virtio-mmio ones take `bus=virtio-mmio-bus.<n>`.
+//! `disable-modern` and `vectors`; the virtio-mmio ones take `bus=virtio-mmio-bus.<n>`. Both
+//! take `iommu_platform`.
 //! On virt, `-device arm-smmuv3,primary-bus=pcie.0` is the SMMUv3 on the platform bus that
 //! translates the functions plugged after it.
 //! On virt, `-device pcie-root-port` with an `id` puts a root port on `pcie.0`, and the PCI
@@ -119,7 +120,8 @@ pub(crate) struct Plug {
     devfn: Option<u8>,
     /// `bus=virtio-mmio-bus.<n>` of a virtio-mmio device.
     mmio_bus: Option<usize>,
-    /// `iommu_platform` of a PCI function: its DMA goes through the SMMU.
+    /// `iommu_platform`: the DMA of a PCI function goes through the SMMU. A virtio-mmio
+    /// device only offers `VIRTIO_F_IOMMU_PLATFORM`, since no IOMMU is in front of it.
     iommu_platform: bool,
     /// The properties of a virtio-iommu.
     iommu: Option<VirtioIommuConf>,
@@ -280,7 +282,7 @@ fn plan_virtio(
             "disable-modern" if pci => {
                 plug.props.disable_modern = prop_bool(k, v).map_err(|_| bad_value(k, v))?;
             }
-            "iommu_platform" if pci => {
+            "iommu_platform" => {
                 plug.iommu_platform = prop_bool(k, v).map_err(|_| bad_value(k, v))?;
             }
             "vectors" if pci => {
@@ -933,12 +935,14 @@ pub(crate) fn plug(
                 Some(VirtioHandle::Pci(dev))
             }
             (Target::Virt(board), Transport::Mmio, Some(n)) => {
-                board.attach_virtio_at(n, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT).map_err(at)?;
+                board
+                    .attach_virtio_at_with(n, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT, iommu)
+                    .map_err(at)?;
                 board.virtio_transport(n).map(VirtioHandle::Mmio)
             }
             (Target::Virt(board), Transport::Mmio, None) => {
                 let n = board
-                    .attach_virtio(class)
+                    .attach_virtio_with(class, iommu)
                     .map_err(|e| at(format!("{e} '{}'", plug.typename)))?;
                 board.virtio_transport(n).map(VirtioHandle::Mmio)
             }
@@ -1048,6 +1052,8 @@ mod tests {
         assert_eq!(p.virtio[0].props.vectors, Some(0));
         assert_eq!(p.virtio[0].devfn, Some(0xff));
         let p = plan(V, &[], &[dev("virtio-rng-pci,iommu_platform=on")]).unwrap();
+        assert!(p.virtio[0].iommu_platform);
+        let p = plan(V, &[], &[dev("virtio-rng-device,iommu_platform=on")]).unwrap();
         assert!(p.virtio[0].iommu_platform);
 
         let err = |args: &[&str]| {
