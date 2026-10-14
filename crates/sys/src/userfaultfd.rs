@@ -27,6 +27,8 @@ const UFFDIO_WRITEPROTECT_MODE_WP: u64 = 1;
 const UFFDIO_WRITEPROTECT_NR: u64 = 0x06;
 /// `UFFD_FEATURE_PAGEFAULT_FLAG_WP`: write-protect faults.
 pub const FEATURE_PAGEFAULT_FLAG_WP: u64 = 1;
+/// `UFFD_FEATURE_THREAD_ID`: page faults carry the id of the thread that faulted.
+pub const FEATURE_THREAD_ID: u64 = 1 << 8;
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 const PAGE_SIZE: usize = 4096;
 
@@ -244,6 +246,12 @@ impl Userfaultfd {
     /// Waits up to `timeout_ms` for a page fault and returns the host address it hit, or `None`
     /// if nothing came. Messages other than page faults are skipped.
     pub fn wait_fault(&self, timeout_ms: i32) -> io::Result<Option<usize>> {
+        Ok(self.wait_fault_thread(timeout_ms)?.map(|(addr, _)| addr))
+    }
+
+    /// [`wait_fault`](Self::wait_fault), also returning the id of the thread that faulted,
+    /// which the kernel gives with [`FEATURE_THREAD_ID`] and leaves 0 without it.
+    pub fn wait_fault_thread(&self, timeout_ms: i32) -> io::Result<Option<(usize, u32)>> {
         let mut pfd = libc::pollfd { fd: self.fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         // SAFETY: `pfd` is one valid pollfd for the call.
         let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
@@ -254,8 +262,8 @@ impl Userfaultfd {
         if n == 0 {
             return Ok(None);
         }
-        // struct uffd_msg: the event in byte 0, and for a page fault the flags at 8 and the
-        // address at 16.
+        // struct uffd_msg: the event in byte 0, and for a page fault the flags at 8, the
+        // address at 16 and the thread id at 24.
         let mut msg = [0u8; 32];
         // SAFETY: `msg` is valid for writes of its length.
         let got = unsafe { libc::read(self.fd.as_raw_fd(), msg.as_mut_ptr().cast(), msg.len()) };
@@ -273,7 +281,8 @@ impl Userfaultfd {
             return Ok(None);
         }
         let addr = u64::from_ne_bytes(msg[16..24].try_into().expect("8 bytes"));
-        Ok(Some(addr as usize))
+        let tid = u32::from_ne_bytes(msg[24..28].try_into().expect("4 bytes"));
+        Ok(Some((addr as usize, tid)))
     }
 }
 
@@ -320,6 +329,32 @@ mod tests {
         });
         assert_eq!(mem.as_slice()[PAGE_SIZE + 9].load(Ordering::Relaxed), 7);
         assert!(uffd.copy(&mem, 4 * PAGE_SIZE, &[0; PAGE_SIZE]).is_err());
+        uffd.unregister(&mem).unwrap();
+    }
+
+    #[test]
+    fn fault_gives_the_thread() {
+        // Unprivileged userfaultfd may be off on the host running the tests.
+        if !Userfaultfd::features().is_ok_and(|f| f & FEATURE_THREAD_ID != 0) {
+            return;
+        }
+        let uffd = Userfaultfd::with_features(FEATURE_THREAD_ID).unwrap();
+        let mem = HostMemory::new(2 * PAGE_SIZE).unwrap();
+        uffd.register(&mem).unwrap();
+        std::thread::scope(|s| {
+            let t = s.spawn(|| {
+                let tid = crate::thread::thread_id();
+                (tid, mem.as_slice()[PAGE_SIZE].load(Ordering::Relaxed))
+            });
+            let (addr, tid) = loop {
+                if let Some(f) = uffd.wait_fault_thread(1000).unwrap() {
+                    break f;
+                }
+            };
+            assert_eq!(addr, mem.host_addr() + PAGE_SIZE);
+            uffd.zeropage(&mem, PAGE_SIZE, PAGE_SIZE).unwrap();
+            assert_eq!(t.join().unwrap(), (i64::from(tid), 0));
+        });
         uffd.unregister(&mem).unwrap();
     }
 
