@@ -456,7 +456,7 @@ fn group_owned(id: u32) -> bool {
     groups().iter().any(|g| g.id == id)
 }
 
-/// `vfio_device_reset_handler()`, which the board runs after it has reset its devices. Each
+/// `vfio_device_reset_handler()`, which the board runs before it resets its devices. Each
 /// device that only a bus or slot reset resets properly gets one, and so do the other devices
 /// in use here that the reset takes along. A device that was reset together with an earlier
 /// one is not reset again.

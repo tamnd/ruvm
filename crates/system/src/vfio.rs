@@ -187,9 +187,9 @@ pub(crate) fn realize_x86(
     )
     .map_err(|e| Located(plug.loc.clone(), e))?;
     // vfio_address_space_get() registers vfio_device_reset_handler() along with the first
-    // device, so it runs after the devices themselves are reset.
+    // device, before the system bus, so it runs before the devices themselves are reset.
     if first {
-        m.add_reset_hook(Box::new(ruvm_hw_vfio::pci::reset_handler));
+        m.add_early_reset_hook(Box::new(ruvm_hw_vfio::pci::reset_handler));
     }
     // pci_add_option_rom()
     if let Some(name) = plug.conf.romfile.as_deref().filter(|f| !f.is_empty()) {

@@ -846,6 +846,8 @@ pub struct Q35 {
     pci_dma: Arc<PciDma>,
     /// What devices outside the board reset with it.
     reset_hooks: Mutex<Vec<ResetHook>>,
+    /// The `qemu_register_reset()` handlers of devices, which run before any device is reset.
+    early_reset_hooks: Mutex<Vec<ResetHook>>,
 
     done: bool,
 }
@@ -1470,6 +1472,7 @@ impl Q35 {
             acpi_src,
             pci_dma,
             reset_hooks: Mutex::new(Vec::new()),
+            early_reset_hooks: Mutex::new(Vec::new()),
             done: false,
         })
     }
@@ -1673,6 +1676,9 @@ impl Q35 {
     /// rebuilt on their next read and reloads the firmware and PVH segments into RAM.
     pub fn system_reset(&mut self) -> Result<(), String> {
         // qemu_devices_reset()
+        for hook in self.early_reset_hooks.lock().unwrap_or_else(PoisonError::into_inner).iter() {
+            hook();
+        }
         if let Some(p) = &self.pic {
             p.master.reset();
             p.slave.reset();
@@ -2179,6 +2185,13 @@ impl Q35 {
     /// Has `hook` run on every system reset, after the board's own devices.
     pub fn add_reset_hook(&self, hook: ResetHook) {
         self.reset_hooks.lock().unwrap_or_else(PoisonError::into_inner).push(hook);
+    }
+
+    /// Has `hook` run on every system reset before any device is reset, as a handler a device
+    /// registers with `qemu_register_reset()` while it is realized does: QEMU only registers
+    /// the reset of the system bus once every device on the command line is realized.
+    pub fn add_early_reset_hook(&self, hook: ResetHook) {
+        self.early_reset_hooks.lock().unwrap_or_else(PoisonError::into_inner).push(hook);
     }
 
     /// The HPET, with `hpet=on`.
