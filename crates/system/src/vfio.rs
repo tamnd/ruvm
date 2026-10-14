@@ -144,13 +144,14 @@ pub(crate) fn plan_device(
     Ok(plug)
 }
 
-/// Realizes a planned `vfio-pci` on q35.
+/// Realizes a planned `vfio-pci` on q35. The `first` one also hooks the system reset.
 #[cfg(target_os = "linux")]
 pub(crate) fn realize_x86(
     board: &mut X86Board,
     plug: &VfioPlug,
     firmware: &FirmwareSearch,
     clock: &std::sync::Arc<ruvm_hw_core::timer::Clock>,
+    first: bool,
 ) -> Result<(), Located> {
     use std::sync::Arc;
 
@@ -185,6 +186,11 @@ pub(crate) fn realize_x86(
         &plug.conf,
     )
     .map_err(|e| Located(plug.loc.clone(), e))?;
+    // vfio_address_space_get() registers vfio_device_reset_handler() along with the first
+    // device, so it runs after the devices themselves are reset.
+    if first {
+        m.add_reset_hook(Box::new(ruvm_hw_vfio::pci::reset_handler));
+    }
     // pci_add_option_rom()
     if let Some(name) = plug.conf.romfile.as_deref().filter(|f| !f.is_empty()) {
         let at = |e: String| Located::new(&plug.loc, e);
@@ -224,6 +230,7 @@ pub(crate) fn realize_x86(
     plug: &VfioPlug,
     _firmware: &FirmwareSearch,
     _clock: &std::sync::Arc<ruvm_hw_core::timer::Clock>,
+    _first: bool,
 ) -> Result<(), Located> {
     Err(Located::new(&plug.loc, format!("'{TYPE_VFIO_PCI}' is not a valid device model name")))
 }

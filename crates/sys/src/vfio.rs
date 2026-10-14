@@ -89,6 +89,44 @@ pub const IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
 /// `VFIO_IRQ_INFO_NORESIZE`: the MSI-X vector count cannot change while enabled.
 pub const IRQ_INFO_NORESIZE: u32 = 1 << 3;
 
+/// A device a PCI hot reset resets too, `struct vfio_pci_dependent_device` as a device opened
+/// through its group sees it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DependentDevice {
+    /// The IOMMU group the device is in.
+    pub group_id: u32,
+    pub segment: u16,
+    pub bus: u8,
+    pub devfn: u8,
+}
+
+impl DependentDevice {
+    /// The device's name in sysfs, `0000:01:00.0`, which is what `vfio_pci_host_match()`
+    /// compares.
+    pub fn host_name(&self) -> String {
+        format!(
+            "{:04x}:{:02x}:{:02x}.{:x}",
+            self.segment,
+            self.bus,
+            self.devfn >> 3,
+            self.devfn & 7
+        )
+    }
+}
+
+/// The devices of a `vfio_pci_hot_reset_info` that `count` says were filled in: two words each,
+/// the group and then the segment, bus and devfn, after the three words of the header.
+fn dependent_devices(words: &[u32], count: u32) -> Vec<DependentDevice> {
+    words[3..]
+        .chunks_exact(2)
+        .take(count as usize)
+        .map(|d| {
+            let [s0, s1, bus, devfn] = d[1].to_ne_bytes();
+            DependentDevice { group_id: d[0], segment: u16::from_ne_bytes([s0, s1]), bus, devfn }
+        })
+        .collect()
+}
+
 /// `_IO(';', 100 + nr)`. Every VFIO ioctl is `_IO`, with the size in the `argsz` field instead.
 const fn io(nr: u64) -> u64 {
     ((b';' as u64) << 8) | (100 + nr)
@@ -105,6 +143,8 @@ const VFIO_DEVICE_GET_REGION_INFO: u64 = io(8);
 const VFIO_DEVICE_GET_IRQ_INFO: u64 = io(9);
 const VFIO_DEVICE_SET_IRQS: u64 = io(10);
 const VFIO_DEVICE_RESET: u64 = io(11);
+const VFIO_DEVICE_GET_PCI_HOT_RESET_INFO: u64 = io(12);
+const VFIO_DEVICE_PCI_HOT_RESET: u64 = io(13);
 const VFIO_IOMMU_MAP_DMA: u64 = io(13);
 const VFIO_IOMMU_UNMAP_DMA: u64 = io(14);
 const VFIO_DEVICE_FEATURE: u64 = io(17);
@@ -361,6 +401,13 @@ pub struct VfioGroup {
     file: File,
 }
 
+impl AsFd for VfioGroup {
+    /// The group descriptor, which a hot reset takes as proof that the group is owned.
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
 impl VfioGroup {
     /// Opens group `id`.
     pub fn open(id: u32) -> io::Result<Self> {
@@ -515,6 +562,28 @@ impl VfioDevice {
         ioctl_val(&self.file, VFIO_DEVICE_RESET, 0).map(drop)
     }
 
+    /// `VFIO_DEVICE_GET_PCI_HOT_RESET_INFO` with room for `room` devices: how many a hot reset
+    /// of this device would reset, and the devices. The kernel says how many there are even
+    /// when they do not fit, which it fails with `ENOSPC`.
+    pub fn pci_hot_reset_info(&self, room: u32) -> (u32, io::Result<Vec<DependentDevice>>) {
+        let mut buf = vec![0u32; 3 + 2 * room as usize];
+        buf[0] = 12 + 8 * room;
+        let r = ioctl_ptr(&self.file, VFIO_DEVICE_GET_PCI_HOT_RESET_INFO, buf.as_mut_ptr());
+        (buf[2], r.map(|_| dependent_devices(&buf, buf[2].min(room))))
+    }
+
+    /// `VFIO_DEVICE_PCI_HOT_RESET`: a bus or slot reset of this device and every device
+    /// [`VfioDevice::pci_hot_reset_info`] lists, with the descriptors of all of their groups as
+    /// proof that they are owned.
+    pub fn pci_hot_reset(&self, group_fds: &[BorrowedFd<'_>]) -> io::Result<()> {
+        let argsz = u32::try_from(12 + 4 * group_fds.len())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let mut buf = Vec::with_capacity(3 + group_fds.len());
+        buf.extend([argsz, 0, group_fds.len() as u32]);
+        buf.extend(group_fds.iter().map(|fd| fd.as_raw_fd() as u32));
+        ioctl_ptr(&self.file, VFIO_DEVICE_PCI_HOT_RESET, buf.as_mut_ptr()).map(drop)
+    }
+
     /// Reads at `offset` of the descriptor, which is a region's offset plus the offset inside
     /// it. Returns how many bytes were read.
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -538,6 +607,8 @@ mod tests {
         assert_eq!(VFIO_GROUP_GET_DEVICE_FD, 0x3b6a);
         assert_eq!(VFIO_DEVICE_SET_IRQS, 0x3b6e);
         assert_eq!(VFIO_DEVICE_RESET, 0x3b6f);
+        assert_eq!(VFIO_DEVICE_GET_PCI_HOT_RESET_INFO, 0x3b70);
+        assert_eq!(VFIO_DEVICE_PCI_HOT_RESET, 0x3b71);
         assert_eq!(size_of::<IrqSet>(), 20);
         assert_eq!(VFIO_IOMMU_MAP_DMA, 0x3b71);
         assert_eq!(VFIO_IOMMU_UNMAP_DMA, 0x3b72);
@@ -582,6 +653,22 @@ mod tests {
         let short = chain(&[(32, 1, 0, &sparse[..24])], 64);
         assert_eq!(RegionCaps::new(short, 32).sparse_mmap(), None);
         assert_eq!(word(1, 2).to_ne_bytes()[..4], 1u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn hot_reset_info() {
+        let dev = |segment: u16, bus: u8, devfn: u8| {
+            let [a, b] = segment.to_ne_bytes();
+            u32::from_ne_bytes([a, b, bus, devfn])
+        };
+        let words = [28, 0, 2, 7, dev(0, 1, 0), 9, dev(1, 0x3a, 0x1b)];
+        let devices = dependent_devices(&words, 2);
+        assert_eq!(devices[0], DependentDevice { group_id: 7, segment: 0, bus: 1, devfn: 0 });
+        assert_eq!(devices[0].host_name(), "0000:01:00.0");
+        assert_eq!(devices[1].host_name(), "0001:3a:03.3");
+        // The kernel never fills in more than there was room for.
+        assert_eq!(dependent_devices(&words, 1).len(), 1);
+        assert!(dependent_devices(&words[..3], 0).is_empty());
     }
 
     #[test]

@@ -19,8 +19,10 @@
 //! a BAR the kernel lets be mapped are mapped into the process and laid over the trapped BAR as
 //! RAM device regions, as `vfio_region_mmap()` does, leaving the MSI-X table trapped. While INTx
 //! is pending they are turned off, so that the guest's next BAR access traps and serves as the
-//! EOI, and a timer turns them on again once INTx has gone quiet. Hot reset and the device
-//! quirks are not here yet.
+//! EOI, and a timer turns them on again once INTx has gone quiet. A device without FLR gets a
+//! bus or slot reset when every device it would take along is in a group opened here, the way
+//! `vfio_legacy_pci_hot_reset()` does it, and on a system reset [`reset_handler`] resets the
+//! devices that share a bus together. The device quirks are not here yet.
 
 use std::fmt;
 use std::io;
@@ -65,10 +67,10 @@ use ruvm_mem::{
 };
 use ruvm_sys::HostMemory;
 use ruvm_sys::vfio::{
-    API_VERSION, DEVICE_FLAGS_PCI, DEVICE_FLAGS_RESET, DeviceInfo, GROUP_FLAGS_VIABLE,
-    IRQ_INFO_NORESIZE, IRQ_SET_ACTION_TRIGGER, IRQ_SET_ACTION_UNMASK, PCI_CONFIG_REGION_INDEX,
-    PCI_ERR_IRQ_INDEX, PCI_INTX_IRQ_INDEX, PCI_MSI_IRQ_INDEX, PCI_MSIX_IRQ_INDEX,
-    PCI_ROM_REGION_INDEX, REGION_INFO_CAP_MSIX_MAPPABLE, REGION_INFO_FLAG_MMAP,
+    API_VERSION, DEVICE_FLAGS_PCI, DEVICE_FLAGS_RESET, DependentDevice, DeviceInfo,
+    GROUP_FLAGS_VIABLE, IRQ_INFO_NORESIZE, IRQ_SET_ACTION_TRIGGER, IRQ_SET_ACTION_UNMASK,
+    PCI_CONFIG_REGION_INDEX, PCI_ERR_IRQ_INDEX, PCI_INTX_IRQ_INDEX, PCI_MSI_IRQ_INDEX,
+    PCI_MSIX_IRQ_INDEX, PCI_ROM_REGION_INDEX, REGION_INFO_CAP_MSIX_MAPPABLE, REGION_INFO_FLAG_MMAP,
     REGION_INFO_FLAG_READ, REGION_INFO_FLAG_WRITE, RegionCaps, RegionInfo, TYPE1_IOMMU,
     TYPE1V2_IOMMU, UNMAP_ALL, VfioContainer, VfioDevice, VfioGroup,
 };
@@ -100,6 +102,8 @@ const PCI_MSIX_ENTRY_SIZE: u64 = 16;
 const NUM_BARS: usize = PCI_ROM_SLOT;
 /// What `read()` gives back for a short config read, `EFAULT`.
 const EFAULT: i32 = 14;
+/// What `VFIO_DEVICE_GET_PCI_HOT_RESET_INFO` fails with when the devices do not fit.
+const ENOSPC: i32 = 28;
 /// How deep a capability chain is followed. A chain that loops would have QEMU recurse until
 /// it crashes; this stops early instead.
 const MAX_CAPS: u32 = 48;
@@ -425,6 +429,47 @@ static GROUPS: Mutex<Vec<Group>> = Mutex::new(Vec::new());
 
 fn groups() -> MutexGuard<'static, Vec<Group>> {
     GROUPS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `vfio_device_list`: the realized devices.
+static DEVICES: Mutex<Vec<Weak<VfioPciOps>>> = Mutex::new(Vec::new());
+
+/// The realized devices that are still there, each with its config callbacks.
+fn devices() -> Vec<(Arc<VfioPciOps>, Arc<PciDevice>)> {
+    let mut list = lock(&DEVICES);
+    list.retain(|w| w.strong_count() > 0);
+    list.iter()
+        .filter_map(|w| {
+            let ops = w.upgrade()?;
+            let dev = ops.dev.get()?.upgrade()?;
+            Some((ops, dev))
+        })
+        .collect()
+}
+
+/// The realized device that `host` names, a PCI address as in sysfs.
+fn device_in_use(host: &str) -> Option<(Arc<VfioPciOps>, Arc<PciDevice>)> {
+    devices().into_iter().find(|(ops, _)| ops.shared.name == host)
+}
+
+fn group_owned(id: u32) -> bool {
+    groups().iter().any(|g| g.id == id)
+}
+
+/// `vfio_device_reset_handler()`, which the board runs after it has reset its devices. Each
+/// device that only a bus or slot reset resets properly gets one, and so do the other devices
+/// in use here that the reset takes along. A device that was reset together with an earlier
+/// one is not reset again.
+pub fn reset_handler() {
+    let list = devices();
+    for (ops, _) in &list {
+        ops.compute_needs_reset();
+    }
+    for (ops, dev) in &list {
+        if ops.needs_reset.load(Ordering::Relaxed) {
+            ops.hot_reset(dev, false);
+        }
+    }
 }
 
 /// A device's place in its group. Dropping it is `vfio_device_put()` plus `vfio_group_put()`:
@@ -1244,6 +1289,8 @@ struct VfioPciOps {
     reset_works: bool,
     has_flr: bool,
     has_pm_reset: bool,
+    /// `VFIODevice::needs_reset`: the system reset still has to give the device a bus reset.
+    needs_reset: AtomicBool,
 }
 
 impl VfioPciOps {
@@ -1430,6 +1477,137 @@ impl VfioPciOps {
             error_report(&format!("vfio: Unable to power on device, stuck in D{state}"));
         }
     }
+
+    /// `vfio_pci_pre_reset()`: stops interrupts and DMA, puts INTx Disable in a known state and
+    /// brings the device to D0.
+    fn pre_reset(&self, dev: &PciDevice) {
+        self.disable_interrupts(dev);
+        let val = self.config_read(dev, PCI_COMMAND as u32, 2);
+        if val != u32::MAX {
+            let cmd = val as u16
+                & !(PCI_COMMAND_IO
+                    | PCI_COMMAND_MEMORY
+                    | PCI_COMMAND_MASTER
+                    | PCI_COMMAND_INTX_DISABLE);
+            self.config_write(dev, PCI_COMMAND as u32, u32::from(cmd), 2);
+        }
+        self.power_on(dev);
+    }
+
+    /// `vfio_pci_post_reset()`: INTx back on and the BARs of the device cleared.
+    fn post_reset(&self, dev: &PciDevice) {
+        if let Err(e) = self.intx_enable(dev) {
+            report_error(&e.prepend(format_args!("vfio {}: ", self.shared.name)));
+        }
+        for nr in 0..NUM_BARS {
+            if let Err(e) = self.shared.config_write(PCI_BASE_ADDRESS_0 + 4 * nr, &[0; 4]) {
+                error_report(&format!(
+                    "vfio_pci_post_reset({}) reset bar {nr} failed: {e}",
+                    self.shared.name
+                ));
+            }
+        }
+    }
+
+    /// `vfio_pci_compute_needs_reset()`: a device with no reset of its own, or with only a PM
+    /// reset, gets a bus reset on a system reset.
+    fn compute_needs_reset(&self) {
+        if !self.reset_works || (!self.has_flr && self.has_pm_reset) {
+            self.needs_reset.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// `vfio_pci_get_pci_hot_reset_info()`: the devices a hot reset of this one resets.
+    fn hot_reset_info(&self) -> Option<Vec<DependentDevice>> {
+        let device = &self.shared.device;
+        let (count, r) = device.pci_hot_reset_info(0);
+        match r {
+            Err(e) if e.raw_os_error() != Some(ENOSPC) => {
+                if !self.has_pm_reset {
+                    error_report(&format!(
+                        "vfio: Cannot reset device {}, no available reset mechanism.",
+                        self.shared.name
+                    ));
+                }
+                return None;
+            }
+            _ => {}
+        }
+        match device.pci_hot_reset_info(count).1 {
+            Ok(devices) => Some(devices),
+            Err(e) => {
+                error_report(&format!("vfio: hot reset info failed: {}", strerror(&e)));
+                None
+            }
+        }
+    }
+
+    /// `vfio_legacy_pci_hot_reset()`: a bus or slot reset of the device, which works when the
+    /// group of every device it takes along is open here. With `single`, the device's own reset
+    /// does it as long as no other device in use here is taken along. Otherwise the system
+    /// reset does it for all of them at once, and only when there is such a device, since the
+    /// device's own reset already did the rest. Says whether the reset was done.
+    fn hot_reset(&self, dev: &PciDevice, single: bool) -> bool {
+        if !single {
+            self.pre_reset(dev);
+        }
+        self.needs_reset.store(false, Ordering::Relaxed);
+        let done = self.hot_reset_info().is_some_and(|d| self.hot_reset_devices(single, &d));
+        if !single {
+            self.post_reset(dev);
+        }
+        done
+    }
+
+    /// The part of `vfio_legacy_pci_hot_reset()` once the affected devices are known.
+    fn hot_reset_devices(&self, single: bool, devices: &[DependentDevice]) -> bool {
+        let others: Vec<_> = devices.iter().filter(|d| d.host_name() != self.shared.name).collect();
+        let mut multi = false;
+        let done = 'reset: {
+            // Check that every group is owned here and ready the other devices in use.
+            for d in &others {
+                if !group_owned(d.group_id) {
+                    if !self.has_pm_reset {
+                        error_report(&format!(
+                            "vfio: Cannot reset device {}, depends on group {} which is not \
+                             owned.",
+                            self.shared.name, d.group_id
+                        ));
+                    }
+                    break 'reset false;
+                }
+                if let Some((ops, dev)) = device_in_use(&d.host_name()) {
+                    if single {
+                        return false;
+                    }
+                    ops.pre_reset(&dev);
+                    ops.needs_reset.store(false, Ordering::Relaxed);
+                    multi = true;
+                }
+            }
+            if !single && !multi {
+                return false;
+            }
+            // The descriptor of each group the reset reaches, in the order they were opened.
+            let groups = groups();
+            let fds: Vec<_> = groups
+                .iter()
+                .filter(|g| devices.iter().any(|d| d.group_id == g.id))
+                .map(|g| g.group.as_fd())
+                .collect();
+            self.shared.device.pci_hot_reset(&fds).is_ok()
+        };
+        // INTx back on for the other devices in use, up to the first group not owned here.
+        for d in &others {
+            if !group_owned(d.group_id) {
+                break;
+            }
+            if let Some((ops, dev)) = device_in_use(&d.host_name()) {
+                ops.post_reset(&dev);
+            }
+        }
+        done
+    }
 }
 
 impl PciDeviceOps for VfioPciOps {
@@ -1500,41 +1678,15 @@ impl PciDeviceOps for VfioPciOps {
         }
     }
 
-    /// `vfio_pci_reset()`.
+    /// `vfio_pci_reset()`: FLR, or whatever the kernel has when there is neither FLR nor a PM
+    /// reset, then a bus or slot reset, and a PM reset only when nothing else worked.
     fn reset(&self, dev: &PciDevice) {
-        // vfio_pci_pre_reset(): stop interrupts and DMA and put INTx Disable in a known state.
-        self.disable_interrupts(dev);
-        let val = self.config_read(dev, PCI_COMMAND as u32, 2);
-        if val != u32::MAX {
-            let cmd = val as u16
-                & !(PCI_COMMAND_IO
-                    | PCI_COMMAND_MEMORY
-                    | PCI_COMMAND_MASTER
-                    | PCI_COMMAND_INTX_DISABLE);
-            self.config_write(dev, PCI_COMMAND as u32, u32::from(cmd), 2);
-        }
-        self.power_on(dev);
-
-        let device = &self.shared.device;
-        let flr = self.reset_works && (self.has_flr || !self.has_pm_reset);
-        // The bus reset QEMU tries next is not done, so a device that only has a PM reset
-        // gets that.
-        if !(flr && device.reset().is_ok()) && self.reset_works && self.has_pm_reset {
-            let _ = device.reset();
-        }
-
-        // vfio_pci_post_reset().
-        if let Err(e) = self.intx_enable(dev) {
-            report_error(&e.prepend(format_args!("vfio {}: ", self.shared.name)));
-        }
-        for nr in 0..NUM_BARS {
-            if let Err(e) = self.shared.config_write(PCI_BASE_ADDRESS_0 + 4 * nr, &[0; 4]) {
-                error_report(&format!(
-                    "vfio_pci_post_reset({}) reset bar {nr} failed: {e}",
-                    self.shared.name
-                ));
-            }
-        }
+        self.pre_reset(dev);
+        let device_reset = |works: bool| works && self.shared.device.reset().is_ok();
+        let _ = device_reset(self.reset_works && (self.has_flr || !self.has_pm_reset))
+            || self.hot_reset(dev, true)
+            || device_reset(self.reset_works && self.has_pm_reset);
+        self.post_reset(dev);
     }
 }
 
@@ -1651,6 +1803,7 @@ pub fn realize(
                 bus.unregister_device(&dev);
                 return Err(prefix(e));
             }
+            lock(&DEVICES).push(Arc::downgrade(&ops));
             // QEMU resets every device once before the guest runs, and a hotplugged one right
             // after realize. The boards here are built in their reset state, so a passed through
             // device has to be reset now or it keeps whatever the last user left in it.
@@ -1839,6 +1992,7 @@ impl<'a> Setup<'a> {
             reset_works: self.reset_works,
             has_flr: self.has_flr,
             has_pm_reset: self.has_pm_reset,
+            needs_reset: AtomicBool::new(false),
         })
     }
 

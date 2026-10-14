@@ -2344,10 +2344,12 @@ fn build(
         Ok::<(), Vec<Located>>(())
     };
     let mut vfio = p.vfio.iter().peekable();
+    let mut vfio_first = true;
     // The vfio-pci devices that come before virtio plug `at`, or all that are left.
     let mut plug_vfio = |board: &mut X86Board, at: Option<usize>| {
         while let Some((_, plug)) = vfio.next_if(|(vi, _)| at.is_none_or(|i| *vi == i)) {
-            crate::vfio::realize_x86(board, plug, &firmware, &clock).map_err(one)?;
+            let first = std::mem::take(&mut vfio_first);
+            crate::vfio::realize_x86(board, plug, &firmware, &clock, first).map_err(one)?;
         }
         Ok::<(), Vec<Located>>(())
     };
