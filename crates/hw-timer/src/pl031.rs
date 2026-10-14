@@ -7,10 +7,12 @@
 //! raw interrupt bit when the counter reaches the match register. The register block is 0x1000
 //! bytes with the default access sizes, as `pl031_ops` has no constraints.
 //!
+//! [`Pl031::vmstate_save`] and [`Pl031::vmstate_load`] move the state the `pl031` VMState
+//! carries, as a [`Pl031VmState`] whose fields are named after QEMU's.
+//!
 //! Differences from QEMU:
 //!
-//! - Not ported: VMState (and so the `pl031/tick-offset` subsection and the conversion to and
-//!   from the old virtual clock relative offset), trace points and QOM registration.
+//! - Not ported: trace points and QOM registration.
 //! - The `qemu_log_mask()` guest error messages are not printed, since the workspace has no
 //!   `-d` log yet.
 //! - QEMU reads the start date from the global `-rtc base=` state with `qemu_get_timedate()`.
@@ -58,6 +60,23 @@ pub const RTC_PERIPHID0: u64 = 0xfe0;
 pub const PL031_ID: [u8; 8] = [0x31, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1];
 
 type Hook<T> = Arc<dyn Fn(T) + Send + Sync>;
+
+/// The fields of `vmstate_pl031` (version 1) and its `pl031/tick-offset` subsection, named as
+/// in QEMU.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pl031VmState {
+    /// The counter offset from the virtual clock, which older QEMU versions sent.
+    pub tick_offset_vmstate: u32,
+    pub mr: u32,
+    pub lr: u32,
+    pub cr: u32,
+    pub im: u32,
+    pub is: u32,
+    /// `pl031/tick-offset`: the offset from the RTC clock.
+    pub tick_offset: u32,
+    /// Whether the stream carried `pl031/tick-offset`, set by its `post_load`.
+    pub tick_offset_migrated: bool,
+}
 
 /// The register state of `PL031State`.
 struct Pl031State {
@@ -193,6 +212,43 @@ impl Pl031 {
             let now = self.clock.get_ns();
             self.timer.modify(now + i64::from(ticks) * NANOSECONDS_PER_SECOND);
         }
+    }
+
+    /// The state `vmstate_pl031` sends, with `pl031_pre_save()` applied. `virtual_ns` is the
+    /// time on the virtual clock.
+    pub fn vmstate_save(&self, virtual_ns: i64) -> Pl031VmState {
+        let s = self.lock();
+        let delta = self.clock.get_ns() - virtual_ns;
+        Pl031VmState {
+            tick_offset_vmstate: (i64::from(s.tick_offset) + delta / NANOSECONDS_PER_SECOND) as u32,
+            mr: s.mr,
+            lr: s.lr,
+            cr: s.cr,
+            im: s.im,
+            is: s.is,
+            tick_offset: s.tick_offset,
+            tick_offset_migrated: true,
+        }
+    }
+
+    /// Loads what `vmstate_pl031` carried and does `pl031_post_load()`: without the
+    /// `pl031/tick-offset` subsection the offset is converted back from the virtual clock one,
+    /// and the alarm is set again. `virtual_ns` is the time on the virtual clock.
+    pub fn vmstate_load(&self, v: &Pl031VmState, virtual_ns: i64) {
+        let mut guard = self.lock();
+        let s = &mut *guard;
+        s.mr = v.mr;
+        s.lr = v.lr;
+        s.cr = v.cr;
+        s.im = v.im;
+        s.is = v.is;
+        s.tick_offset = if v.tick_offset_migrated {
+            v.tick_offset
+        } else {
+            let delta = self.clock.get_ns() - virtual_ns;
+            (i64::from(v.tick_offset_vmstate) - delta / NANOSECONDS_PER_SECOND) as u32
+        };
+        self.set_alarm(s);
     }
 
     /// `pl031_read()`.

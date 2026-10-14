@@ -12,11 +12,15 @@
 //! line, a floating one keeps the level it had, which is what lets the `virt` and `sbsa-ref`
 //! boards wire a power button to a pin.
 //!
+//! [`Pl061::vmstate_save`] and [`Pl061::vmstate_load`] move the state the `pl061` VMState
+//! carries, as a [`Pl061VmState`] whose fields are named after QEMU's.
+//!
 //! Differences from QEMU:
 //!
 //! - Not ported: the Stellaris `pl061_luminary` variant with its extra drive, pull and lock
-//!   registers at 0x500 to 0x528, VMState, trace points and QOM registration. Those offsets
-//!   are bad offsets here, as they are on the plain PL061.
+//!   registers at 0x500 to 0x528, trace points and QOM registration. Those offsets are bad
+//!   offsets here, as they are on the plain PL061, so `vmstate_pl061` sends their reset values
+//!   and they are not loaded.
 //! - The `qemu_log_mask()` guest error messages are not printed, since the workspace has no
 //!   `-d` log yet.
 //! - `pl061_ops` is `DEVICE_NATIVE_ENDIAN`. Every Arm target QEMU builds is little endian, so
@@ -93,6 +97,32 @@ struct Pl061State {
     /// The commit register, which only the luminary variant lets a guest change, so it stays
     /// at 0xff and every AFSEL bit is writable.
     cr: u32,
+}
+
+/// The fields of `vmstate_pl061` (version 4), named as in QEMU.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pl061VmState {
+    pub locked: u32,
+    pub data: u32,
+    pub old_out_data: u32,
+    pub old_in_data: u32,
+    pub dir: u32,
+    pub isense: u32,
+    pub ibe: u32,
+    pub iev: u32,
+    pub im: u32,
+    pub istate: u32,
+    pub afsel: u32,
+    pub dr2r: u32,
+    pub dr4r: u32,
+    pub dr8r: u32,
+    pub odr: u32,
+    pub pur: u32,
+    pub pdr: u32,
+    pub slr: u32,
+    pub den: u32,
+    pub cr: u32,
+    pub amsel: u32,
 }
 
 /// `PL061State`, the `pl061` device.
@@ -266,6 +296,47 @@ impl Pl061 {
             }
             self.update(&mut s);
         }
+    }
+
+    /// The state `vmstate_pl061` sends. The registers of the luminary variant have the values
+    /// `pl061_enter_reset()` gives them.
+    pub fn vmstate_save(&self) -> Pl061VmState {
+        let s = self.lock();
+        Pl061VmState {
+            locked: 1,
+            data: s.data,
+            old_out_data: s.old_out_data,
+            old_in_data: s.old_in_data,
+            dir: s.dir,
+            isense: s.isense,
+            ibe: s.ibe,
+            iev: s.iev,
+            im: s.im,
+            istate: s.istate,
+            afsel: s.afsel,
+            dr2r: 0xff,
+            cr: s.cr,
+            ..Pl061VmState::default()
+        }
+    }
+
+    /// Loads what `vmstate_pl061` carried. As in QEMU nothing is updated afterwards: the pins
+    /// keep their levels and the interrupt controller carries its input level.
+    pub fn vmstate_load(&self, v: &Pl061VmState) {
+        let mut s = self.lock();
+        *s = Pl061State {
+            data: v.data,
+            old_out_data: v.old_out_data,
+            old_in_data: v.old_in_data,
+            dir: v.dir,
+            isense: v.isense,
+            ibe: v.ibe,
+            iev: v.iev,
+            im: v.im,
+            istate: v.istate,
+            afsel: v.afsel,
+            cr: v.cr,
+        };
     }
 
     /// `pl061_enter_reset()` then `pl061_hold_reset()`: the registers go back to their reset

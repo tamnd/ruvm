@@ -15,7 +15,7 @@
 //!
 //! Differences from QEMU:
 //!
-//! - Not ported: VMState (and so `pl011_post_load()` and the `migrate-clk` property), trace
+//! - Not ported: the `migrate-clk` property (the `pl011/clock` subsection is always sent), trace
 //!   points, QOM registration and `pl011_create()`.
 //! - The `qemu_log_mask()` guest error and unimplemented messages are not printed, since the
 //!   workspace has no `-d` log yet. The once-only "disabled UART" state is still tracked.
@@ -31,6 +31,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
+use ruvm_base::{Error, Result};
 use ruvm_hw_core::IrqPin;
 use ruvm_mem::{AccessConstraints, AccessCtx, AccessSize, MemResult, MmioOps};
 
@@ -148,6 +149,40 @@ const IRQMASK: [u32; PL011_NUM_IRQS] = [
     INT_MS,
     INT_E,
 ];
+
+/// The fields of `vmstate_pl011` (version 2) and its `pl011/clock` subsection, named as in
+/// QEMU.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pl011VmState {
+    pub flags: u32,
+    pub lcr: u32,
+    pub rsr: u32,
+    pub cr: u32,
+    pub dmacr: u32,
+    pub int_enabled: u32,
+    pub int_level: u32,
+    pub read_fifo: [u32; PL011_FIFO_DEPTH],
+    pub ilpr: u32,
+    pub ibrd: u32,
+    pub fbrd: u32,
+    pub ifl: u32,
+    pub read_pos: i32,
+    pub read_count: i32,
+    pub read_trigger: i32,
+    /// `clk`, `vmstate_clock`: the period of `UARTCLK` in units of 2^-32 ns, 0 when the clock
+    /// is not running.
+    pub clk_period: u64,
+}
+
+/// `CLOCK_PERIOD_FROM_HZ()`.
+fn clock_period_from_hz(hz: u64) -> u64 {
+    (1_000_000_000u64 << 32).checked_div(hz).unwrap_or(0)
+}
+
+/// `CLOCK_PERIOD_TO_HZ()`.
+fn clock_period_to_hz(period: u64) -> u64 {
+    (1_000_000_000u64 << 32).checked_div(period).unwrap_or(0)
+}
 
 /// The register state of `PL011State`.
 #[derive(Debug)]
@@ -525,6 +560,66 @@ impl Pl011 {
         if !s.loopback_enabled() {
             self.fifo_rx_put(s, DR_BE);
         }
+    }
+
+    /// The state `vmstate_pl011` sends.
+    pub fn vmstate_save(&self) -> Pl011VmState {
+        let s = self.lock();
+        Pl011VmState {
+            flags: s.flags,
+            lcr: s.lcr,
+            rsr: s.rsr,
+            cr: s.cr,
+            dmacr: s.dmacr,
+            int_enabled: s.int_enabled,
+            int_level: s.int_level,
+            read_fifo: s.read_fifo,
+            ilpr: s.ilpr,
+            ibrd: s.ibrd,
+            fbrd: s.fbrd,
+            ifl: s.ifl,
+            read_pos: s.read_pos,
+            read_count: s.read_count,
+            read_trigger: s.read_trigger,
+            clk_period: clock_period_from_hz(s.clk_hz),
+        }
+    }
+
+    /// Loads what `vmstate_pl011` carried and does `pl011_post_load()`. The interrupt lines are
+    /// left alone, as in QEMU: the interrupt controller carries its input levels.
+    pub fn vmstate_load(&self, v: &Pl011VmState) -> Result<()> {
+        if !(0..PL011_FIFO_DEPTH as i32).contains(&v.read_pos)
+            || !(0..=PL011_FIFO_DEPTH as i32).contains(&v.read_count)
+        {
+            return Err(Error::generic(format!(
+                "inconsistent state in pl011 device (read_pos={}, read_count={})",
+                v.read_pos, v.read_count
+            )));
+        }
+        let mut guard = self.lock();
+        let s = &mut *guard;
+        s.flags = v.flags;
+        s.lcr = v.lcr;
+        s.rsr = v.rsr;
+        s.cr = v.cr;
+        s.dmacr = v.dmacr;
+        s.int_enabled = v.int_enabled;
+        s.int_level = v.int_level;
+        s.read_fifo = v.read_fifo;
+        s.ilpr = v.ilpr;
+        s.ibrd = v.ibrd & IBRD_MASK;
+        s.fbrd = v.fbrd & FBRD_MASK;
+        s.ifl = v.ifl;
+        s.read_pos = v.read_pos;
+        s.read_count = v.read_count;
+        s.read_trigger = v.read_trigger;
+        s.clk_hz = clock_period_to_hz(v.clk_period);
+        // Older versions kept the one character of a disabled FIFO anywhere in the array.
+        if !s.is_fifo_enabled() && s.read_count > 0 && s.read_pos > 0 {
+            s.read_fifo[0] = s.read_fifo[s.read_pos as usize];
+            s.read_pos = 0;
+        }
+        Ok(())
     }
 
     /// `pl011_reset()`.

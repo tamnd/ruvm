@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod fdt;
+pub mod migration;
 pub mod pflash;
 pub mod sbsa_ref;
 pub mod tcg_run;
