@@ -100,7 +100,7 @@ impl AddressSpace {
         // of it, so an outl to 0xcf8 on q35 reaches CONFIG_ADDRESS although the reset
         // control register sits on top of 0xcf9.
         let ram = match range.target.ty {
-            RegionType::Ram => true,
+            RegionType::Ram | RegionType::RamDevice => true,
             RegionType::RomDevice => range.romd_mode,
             _ => false,
         };
@@ -252,7 +252,9 @@ fn slow_path(range: Option<&FlatRange>) -> (&dyn MmioOps, &str) {
     match range {
         None => (&UNASSIGNED, UNASSIGNED_NAME),
         Some(r) => match &r.target.kind {
-            TargetKind::Mmio(ops) | TargetKind::RomDevice(_, ops) => (ops.as_ref(), r.name()),
+            TargetKind::Mmio(ops)
+            | TargetKind::RomDevice(_, ops)
+            | TargetKind::RamDevice(_, ops) => (ops.as_ref(), r.name()),
             _ => (&UNASSIGNED, r.name()),
         },
     }
@@ -263,7 +265,7 @@ fn access_allowed(range: Option<&FlatRange>, offset: u64, len: u64, attrs: MemTx
     if !attrs.memory() {
         return true;
     }
-    if range.is_some_and(|r| r.target.ty == RegionType::Ram) {
+    if range.is_some_and(|r| matches!(r.target.ty, RegionType::Ram | RegionType::RamDevice)) {
         return true;
     }
     let name = range.map_or(UNASSIGNED_NAME, |r| r.name());

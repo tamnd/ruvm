@@ -141,6 +141,99 @@ impl HostMemory {
         Ok(HostMemory { ptr, len, fd })
     }
 
+    /// Maps the `areas` of a device region, each an offset and a size in the region, the way
+    /// `vfio_region_mmap()` does: the region of `size` bytes at `fd_offset` of `fd` gets an
+    /// address aligned to its size rounded up to a power of two, capped at 1 GiB, so the kernel
+    /// can use huge mappings, and each area is mapped shared at its place in it. The areas must
+    /// be sorted, apart and inside the region. Each one comes back as memory of its own, which
+    /// unmaps it when it goes. If one fails, none stay mapped.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn map_device(
+        fd: std::os::fd::BorrowedFd<'_>,
+        fd_offset: u64,
+        size: u64,
+        areas: &[(u64, u64)],
+        read: bool,
+        write: bool,
+    ) -> std::io::Result<Vec<HostMemory>> {
+        use std::os::fd::AsRawFd;
+
+        let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        let size = usize::try_from(size).map_err(|_| invalid())?;
+        let mut end = 0;
+        let mut spans = Vec::with_capacity(areas.len());
+        for &(off, len) in areas {
+            let off = usize::try_from(off).map_err(|_| invalid())?;
+            let len = usize::try_from(len).map_err(|_| invalid())?;
+            if off < end || len == 0 || off.checked_add(len).is_none_or(|e| e > size) {
+                return Err(invalid());
+            }
+            let file_off = fd_offset.checked_add(off as u64).ok_or_else(invalid)?;
+            let file_off = libc::off_t::try_from(file_off).map_err(|_| invalid())?;
+            spans.push((off, len, file_off));
+            end = off + len;
+        }
+        let align = size.checked_next_power_of_two().unwrap_or(usize::MAX).min(1 << 30);
+        let total = size.checked_add(align).ok_or_else(invalid)?;
+        // SAFETY: a new inaccessible mapping at an address the kernel picks aliases nothing in
+        // this process.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let base = base as usize;
+        let start = base.next_multiple_of(align);
+        unmap_reserved(base, start - base);
+        unmap_reserved(start + size, align - (start - base));
+
+        let mut prot = 0;
+        if read {
+            prot |= libc::PROT_READ;
+        }
+        if write {
+            prot |= libc::PROT_WRITE;
+        }
+        let mut out = Vec::with_capacity(spans.len());
+        let mut done = 0;
+        for (off, len, file_off) in spans {
+            unmap_reserved(start + done, off - done);
+            // SAFETY: the target is the part of the reservation above for this area, which
+            // nothing else in the process maps, and the device memory is only ever reached
+            // through the `AtomicU8` view.
+            let p = unsafe {
+                libc::mmap(
+                    (start + off) as *mut libc::c_void,
+                    len,
+                    prot,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    fd.as_raw_fd(),
+                    file_off,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                let err = std::io::Error::last_os_error();
+                // The areas mapped so far go with `out`.
+                unmap_reserved(start + off, size - off);
+                return Err(err);
+            }
+            let ptr =
+                std::ptr::NonNull::new(p.cast::<AtomicU8>()).expect("mmap never returns null");
+            out.push(HostMemory { ptr, len, fd: None });
+            done = off + len;
+        }
+        unmap_reserved(start + done, size - done);
+        Ok(out)
+    }
+
     /// The descriptor of shared memory, which another process can map.
     #[cfg(unix)]
     pub fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
@@ -392,6 +485,16 @@ impl HostMemory {
     }
 }
 
+/// Gives back `len` bytes at `addr` of a reservation [`HostMemory::map_device`] made and no
+/// [`HostMemory`] owns.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unmap_reserved(addr: usize, len: usize) {
+    if len != 0 {
+        // SAFETY: the range is part of an inaccessible reservation nothing points into.
+        unsafe { libc::munmap(addr as *mut libc::c_void, len) };
+    }
+}
+
 #[cfg(unix)]
 impl Drop for HostMemory {
     fn drop(&mut self) {
@@ -407,6 +510,34 @@ impl Drop for HostMemory {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn device_areas_are_aligned_and_shared() {
+        use std::os::fd::AsFd;
+
+        let file = HostMemory::shared("dev", 0x8000).unwrap();
+        file.as_slice()[0x5008].store(0x5a, Ordering::Relaxed);
+        let fd = file.fd().unwrap();
+        let areas = [(0, 0x2000), (0x5000, 0x1000)];
+        let maps = HostMemory::map_device(fd.as_fd(), 0, 0x8000, &areas, true, true).unwrap();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps[0].host_addr() % 0x8000, 0);
+        assert_eq!(maps[1].host_addr(), maps[0].host_addr() + 0x5000);
+        assert_eq!(maps[1].len(), 0x1000);
+        assert_eq!(maps[1].as_slice()[8].load(Ordering::Relaxed), 0x5a);
+        maps[0].as_slice()[1].store(3, Ordering::Relaxed);
+        assert_eq!(file.as_slice()[1].load(Ordering::Relaxed), 3);
+        // Out of order, overlapping and empty areas are refused.
+        for bad in [
+            [(0x5000, 0x1000), (0, 0x1000)],
+            [(0, 0x2000), (0x1000, 0x1000)],
+            [(0, 0), (0x1000, 0x1000)],
+        ] {
+            assert!(HostMemory::map_device(fd.as_fd(), 0, 0x8000, &bad, true, true).is_err());
+        }
+        assert!(HostMemory::map_device(fd.as_fd(), 0, 0x1000, &[(0, 0x2000)], true, true).is_err());
+    }
 
     #[test]
     fn zeroed_and_writable() {

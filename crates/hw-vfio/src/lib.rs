@@ -5,8 +5,9 @@
 //! So far this is `vfio-pci` on Linux hosts, QEMU's hw/vfio/pci.c over the legacy container
 //! of hw/vfio/container-legacy.c: the config space, BARs and ROM of a host function bound to
 //! `vfio-pci` are given to the guest, with the parts QEMU emulates emulated the same way, and the
-//! guest's RAM is mapped for the device's DMA, and INTx, MSI and MSI-X reach the guest. DMA
-//! through a vIOMMU, iommufd and the device quirks come later. The plan for the rest of this
+//! guest's RAM is mapped for the device's DMA, and INTx, MSI and MSI-X reach the guest. The BARs
+//! are mapped into the guest, and DMA can go through a vIOMMU. iommufd and the device quirks
+//! come later. The plan for the rest of this
 //! crate is in `spec/24-workspace-layout.md`.
 
 mod host;
@@ -46,6 +47,11 @@ pub struct VfioPciConf {
     pub multifunction: bool,
     /// `skip-vsc-check`.
     pub skip_vsc_check: bool,
+    /// `x-no-mmap`: every BAR access is trapped, none goes to a mapping of the BAR.
+    pub no_mmap: bool,
+    /// `x-intx-mmap-timeout-ms`: how long after an INTx the BAR mappings stay off, 0 for
+    /// until INTx is turned off.
+    pub intx_mmap_timeout_ms: u32,
 }
 
 impl Default for VfioPciConf {
@@ -65,6 +71,8 @@ impl Default for VfioPciConf {
             romfile: None,
             multifunction: false,
             skip_vsc_check: true,
+            no_mmap: false,
+            intx_mmap_timeout_ms: 1100,
         }
     }
 }

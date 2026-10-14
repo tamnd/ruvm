@@ -15,7 +15,7 @@
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
 /// `VFIO_API_VERSION`.
@@ -41,6 +41,17 @@ pub const REGION_INFO_FLAG_READ: u32 = 1;
 pub const REGION_INFO_FLAG_WRITE: u32 = 1 << 1;
 /// `VFIO_REGION_INFO_FLAG_MMAP`.
 pub const REGION_INFO_FLAG_MMAP: u32 = 1 << 2;
+/// `VFIO_REGION_INFO_FLAG_CAPS`: the region info has a capability chain.
+pub const REGION_INFO_FLAG_CAPS: u32 = 1 << 3;
+/// `VFIO_REGION_INFO_CAP_SPARSE_MMAP`: only the listed areas of the region can be mapped.
+pub const REGION_INFO_CAP_SPARSE_MMAP: u16 = 1;
+/// `VFIO_REGION_INFO_CAP_MSIX_MAPPABLE`: the MSI-X table of the BAR can be mapped too.
+pub const REGION_INFO_CAP_MSIX_MAPPABLE: u16 = 3;
+
+/// `VFIO_DEVICE_FEATURE_GET`.
+pub const DEVICE_FEATURE_GET: u32 = 1 << 16;
+/// `VFIO_DEVICE_FEATURE_DMA_BUF`.
+pub const DEVICE_FEATURE_DMA_BUF: u32 = 11;
 
 /// `VFIO_PCI_BAR0_REGION_INDEX`.
 pub const PCI_BAR0_REGION_INDEX: u32 = 0;
@@ -96,6 +107,7 @@ const VFIO_DEVICE_SET_IRQS: u64 = io(10);
 const VFIO_DEVICE_RESET: u64 = io(11);
 const VFIO_IOMMU_MAP_DMA: u64 = io(13);
 const VFIO_IOMMU_UNMAP_DMA: u64 = io(14);
+const VFIO_DEVICE_FEATURE: u64 = io(17);
 
 #[repr(C)]
 #[derive(Default)]
@@ -130,6 +142,54 @@ pub struct RegionInfo {
     pub size: u64,
     /// Where the region is in the device descriptor.
     pub offset: u64,
+}
+
+/// The capability chain of a region's info, the bytes `VFIO_DEVICE_GET_REGION_INFO` returned
+/// when its `argsz` was large enough for them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegionCaps {
+    buf: Vec<u8>,
+    first: u32,
+}
+
+impl RegionCaps {
+    /// A chain from the whole `vfio_region_info` buffer and its `cap_offset`.
+    pub fn new(buf: Vec<u8>, first: u32) -> Self {
+        RegionCaps { buf, first }
+    }
+
+    /// `vfio_get_cap()`: the capability `id`, from its header on. The chain ends at a `next`
+    /// of 0, which is where the info starts.
+    pub fn find(&self, id: u16) -> Option<&[u8]> {
+        let mut off = self.first as usize;
+        // A chain that loops back on itself would never reach 0.
+        for _ in 0..self.buf.len() / 8 {
+            if off == 0 {
+                return None;
+            }
+            let hdr = self.buf.get(off..off.checked_add(8)?)?;
+            if u16::from_ne_bytes([hdr[0], hdr[1]]) == id {
+                return Some(&self.buf[off..]);
+            }
+            off = u32::from_ne_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+        }
+        None
+    }
+
+    /// Whether the chain has capability `id`.
+    pub fn has(&self, id: u16) -> bool {
+        self.find(id).is_some()
+    }
+
+    /// The areas of `struct vfio_region_info_cap_sparse_mmap` as offset and size pairs, in the
+    /// order the kernel gave them.
+    pub fn sparse_mmap(&self) -> Option<Vec<(u64, u64)>> {
+        let cap = self.find(REGION_INFO_CAP_SPARSE_MMAP)?;
+        let nr = u32::from_ne_bytes(cap.get(8..12)?.try_into().ok()?) as usize;
+        let u64_at =
+            |o: usize| cap.get(o..o + 8).map(|b| u64::from_ne_bytes(b.try_into().unwrap()));
+        (0..nr).map(|i| Some((u64_at(16 + 16 * i)?, u64_at(24 + 16 * i)?))).collect()
+    }
 }
 
 /// `struct vfio_irq_info`.
@@ -177,8 +237,10 @@ struct IrqSet {
 }
 
 /// The argument structures of the ioctls this module issues. A `c_char` is the first byte of a
-/// string and a `u32` the first word of a `vfio_irq_set` followed by its eventfds.
+/// string, a `u32` the first word of a `vfio_irq_set` followed by its eventfds, and a `u64` the
+/// first word of a buffer as long as the `argsz` it starts with.
 trait Arg {}
+impl Arg for u64 {}
 impl Arg for IrqSet {}
 impl Arg for u32 {}
 impl Arg for GroupStatus {}
@@ -206,6 +268,13 @@ fn ioctl_ptr<T: Arg>(file: &File, req: u64, arg: *mut T) -> io::Result<i32> {
     // whole call.
     let ret = unsafe { libc::ioctl(file.as_raw_fd(), req as _, arg) };
     if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(ret) }
+}
+
+/// Two `u32` fields that follow each other in a structure, as the `u64` word they fill.
+fn word(first: u32, second: u32) -> u64 {
+    let [a, b, c, d] = first.to_ne_bytes();
+    let [e, f, g, h] = second.to_ne_bytes();
+    u64::from_ne_bytes([a, b, c, d, e, f, g, h])
 }
 
 fn argsz<T>() -> u32 {
@@ -328,6 +397,13 @@ pub struct VfioDevice {
     file: File,
 }
 
+impl AsFd for VfioDevice {
+    /// The device descriptor, which the regions that allow it are mapped from.
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
 impl VfioDevice {
     /// `VFIO_DEVICE_GET_INFO`.
     pub fn info(&self) -> io::Result<DeviceInfo> {
@@ -341,6 +417,59 @@ impl VfioDevice {
         let mut info = RegionInfo { argsz: argsz::<RegionInfo>(), index, ..RegionInfo::default() };
         ioctl_ptr(&self.file, VFIO_DEVICE_GET_REGION_INFO, &mut info)?;
         Ok(info)
+    }
+
+    /// `vfio_device_get_region_info()`: `VFIO_DEVICE_GET_REGION_INFO` for region `index` with
+    /// its capability chain, asking again with the `argsz` the kernel wants when the chain did
+    /// not fit.
+    pub fn region_info_caps(&self, index: u32) -> io::Result<(RegionInfo, RegionCaps)> {
+        let mut argsz = argsz::<RegionInfo>();
+        loop {
+            let mut buf = vec![0u64; (argsz as usize).div_ceil(8)];
+            buf[0] = word(argsz, 0);
+            buf[1] = word(index, 0);
+            ioctl_ptr(&self.file, VFIO_DEVICE_GET_REGION_INFO, buf.as_mut_ptr())?;
+            let bytes: Vec<u8> = buf.iter().flat_map(|w| w.to_ne_bytes()).collect();
+            let u32_at = |o: usize| u32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap());
+            let u64_at = |o: usize| u64::from_ne_bytes(bytes[o..o + 8].try_into().unwrap());
+            let want = u32_at(0);
+            if want > argsz {
+                argsz = want;
+                continue;
+            }
+            let info = RegionInfo {
+                argsz: want,
+                flags: u32_at(4),
+                index: u32_at(8),
+                cap_offset: u32_at(12),
+                size: u64_at(16),
+                offset: u64_at(24),
+            };
+            let first = if info.flags & REGION_INFO_FLAG_CAPS != 0 { info.cap_offset } else { 0 };
+            return Ok((info, RegionCaps::new(bytes, first)));
+        }
+    }
+
+    /// `VFIO_DEVICE_FEATURE` with `VFIO_DEVICE_FEATURE_DMA_BUF`: a dma-buf of the `ranges` of
+    /// region `index`, each an offset and a length, as `vfio_region_create_dma_buf()` asks for
+    /// one.
+    pub fn dma_buf(
+        &self,
+        index: u32,
+        open_flags: u32,
+        ranges: &[(u64, u64)],
+    ) -> io::Result<OwnedFd> {
+        let bytes = 8 + 16 + 16 * ranges.len();
+        let argsz =
+            u32::try_from(bytes).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let mut buf = Vec::with_capacity(bytes / 8);
+        buf.push(word(argsz, DEVICE_FEATURE_GET | DEVICE_FEATURE_DMA_BUF));
+        buf.push(word(index, open_flags));
+        buf.push(word(0, ranges.len() as u32));
+        buf.extend(ranges.iter().flat_map(|&(offset, length)| [offset, length]));
+        let fd = ioctl_ptr(&self.file, VFIO_DEVICE_FEATURE, buf.as_mut_ptr())?;
+        // SAFETY: the kernel just returned this descriptor and nothing else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     /// `VFIO_DEVICE_GET_IRQ_INFO` for interrupt `index`.
@@ -417,6 +546,42 @@ mod tests {
         assert_eq!(size_of::<DeviceInfo>(), 24);
         assert_eq!(size_of::<RegionInfo>(), 32);
         assert_eq!(size_of::<IrqInfo>(), 16);
+        assert_eq!(VFIO_DEVICE_FEATURE, 0x3b75);
+    }
+
+    /// A region info of 32 bytes followed by a chain at `first`.
+    fn chain(caps: &[(usize, u16, u32, &[u8])], len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        for &(off, id, next, body) in caps {
+            buf[off..off + 2].copy_from_slice(&id.to_ne_bytes());
+            buf[off + 2..off + 4].copy_from_slice(&1u16.to_ne_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&next.to_ne_bytes());
+            buf[off + 8..off + 8 + body.len()].copy_from_slice(body);
+        }
+        buf
+    }
+
+    #[test]
+    fn region_caps() {
+        let mut sparse = Vec::new();
+        sparse.extend(2u32.to_ne_bytes());
+        sparse.extend(0u32.to_ne_bytes());
+        for v in [0x3000u64, 0x1000, 0, 0x2000] {
+            sparse.extend(v.to_ne_bytes());
+        }
+        let buf = chain(&[(32, 3, 40, &[]), (40, 1, 0, &sparse)], 96);
+        let caps = RegionCaps::new(buf.clone(), 32);
+        assert!(caps.has(REGION_INFO_CAP_MSIX_MAPPABLE));
+        assert_eq!(caps.sparse_mmap(), Some(vec![(0x3000, 0x1000), (0, 0x2000)]));
+        assert!(!caps.has(2));
+        // No chain at all, and a chain that points back at itself.
+        assert_eq!(RegionCaps::new(buf, 0).sparse_mmap(), None);
+        let looped = chain(&[(32, 3, 32, &[])], 40);
+        assert!(!RegionCaps::new(looped, 32).has(1));
+        // A sparse cap cut short by the buffer.
+        let short = chain(&[(32, 1, 0, &sparse[..24])], 64);
+        assert_eq!(RegionCaps::new(short, 32).sparse_mmap(), None);
+        assert_eq!(word(1, 2).to_ne_bytes()[..4], 1u32.to_ne_bytes());
     }
 
     #[test]

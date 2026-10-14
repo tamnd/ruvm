@@ -15,8 +15,12 @@
 //! vector gets its eventfd when the guest first unmasks it, and one that fires while masked
 //! goes into the emulated PBA. Behind a vIOMMU the device's address space holds an IOMMU region,
 //! and the container follows it with a notifier the way `vfio_iommu_map_notify()` does, mapping
-//! each IOVA the guest maps and unmapping it again when the guest invalidates it. mmap of the
-//! BARs, hot reset and the device quirks are not here yet.
+//! each IOVA the guest maps and unmapping it again when the guest invalidates it. The parts of
+//! a BAR the kernel lets be mapped are mapped into the process and laid over the trapped BAR as
+//! RAM device regions, as `vfio_region_mmap()` does, leaving the MSI-X table trapped. While INTx
+//! is pending they are turned off, so that the guest's next BAR access traps and serves as the
+//! EOI, and a timer turns them on again once INTx has gone quiet. Hot reset and the device
+//! quirks are not here yet.
 
 use std::fmt;
 use std::io;
@@ -30,8 +34,9 @@ use std::thread::{self, JoinHandle};
 use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
 
 use ruvm_base::error::{Error, Result, strerror};
-use ruvm_base::report::{error_report, report_error, warn_report};
+use ruvm_base::report::{error_report, format_message, report_error, warn_report};
 use ruvm_hw_core::IrqLine;
+use ruvm_hw_core::timer::{Clock, Timer};
 use ruvm_hw_pci::pcie::{
     PCI_EXP_DEVCAP, PCI_EXP_FLAGS_TYPE, PCI_EXP_LNKCAP, PCI_EXP_LNKCAP2, PCI_EXP_LNKCTL,
     PCI_EXP_LNKCTL2, PCI_EXP_LNKSTA, PCI_EXP_LNKSTA2, PCI_EXP_TYPE_ENDPOINT, PCI_EXP_TYPE_LEG_END,
@@ -58,12 +63,14 @@ use ruvm_mem::{
     MemTxAttrs, MemoryListener, MemorySystem, MmioOps, RegionId, RegionType,
     register_iommu_notifier, unregister_iommu_notifier,
 };
+use ruvm_sys::HostMemory;
 use ruvm_sys::vfio::{
     API_VERSION, DEVICE_FLAGS_PCI, DEVICE_FLAGS_RESET, DeviceInfo, GROUP_FLAGS_VIABLE,
     IRQ_INFO_NORESIZE, IRQ_SET_ACTION_TRIGGER, IRQ_SET_ACTION_UNMASK, PCI_CONFIG_REGION_INDEX,
     PCI_ERR_IRQ_INDEX, PCI_INTX_IRQ_INDEX, PCI_MSI_IRQ_INDEX, PCI_MSIX_IRQ_INDEX,
-    PCI_ROM_REGION_INDEX, RegionInfo, TYPE1_IOMMU, TYPE1V2_IOMMU, UNMAP_ALL, VfioContainer,
-    VfioDevice, VfioGroup,
+    PCI_ROM_REGION_INDEX, REGION_INFO_CAP_MSIX_MAPPABLE, REGION_INFO_FLAG_MMAP,
+    REGION_INFO_FLAG_READ, REGION_INFO_FLAG_WRITE, RegionCaps, RegionInfo, TYPE1_IOMMU,
+    TYPE1V2_IOMMU, UNMAP_ALL, VfioContainer, VfioDevice, VfioGroup,
 };
 
 use crate::{PCI_ANY_ID, VfioPciConf};
@@ -87,6 +94,8 @@ const PCI_VENDOR_ID_CHELSIO: u16 = 0x1425;
 const PCI_VENDOR_ID_BAIDU: u16 = 0x1d22;
 const PCI_DEVICE_ID_KUNLUN_VF: u16 = 0x3685;
 const PCI_EXP_LNKCAP_X1_2_5GT: u32 = 0x11;
+/// `PCI_MSIX_ENTRY_SIZE`.
+const PCI_MSIX_ENTRY_SIZE: u64 = 16;
 /// Bars 0 to 5, `ARRAY_SIZE(vdev->bars)`.
 const NUM_BARS: usize = PCI_ROM_SLOT;
 /// What `read()` gives back for a short config read, `EFAULT`.
@@ -178,9 +187,11 @@ impl DmaListener {
     /// `vfio_listener_valid_section()` and `vfio_get_section_iova_range()`.
     fn section(&self, fr: &FlatRange) -> Option<(u64, u128)> {
         // vfio_listener_skipped_section(): ROM devices are not RAM to QEMU either, and an
-        // address with bit 63 set is a 64-bit BAR being sized.
+        // address with bit 63 set is a 64-bit BAR being sized. RAM devices, the mapped BARs of
+        // assigned devices, are RAM.
         let kind = fr.region_type();
-        if (kind != RegionType::Ram && kind != RegionType::Iommu) || fr.addr() & (1 << 63) != 0 {
+        let ram = matches!(kind, RegionType::Ram | RegionType::RamDevice);
+        if (!ram && kind != RegionType::Iommu) || fr.addr() & (1 << 63) != 0 {
             return None;
         }
         let off = self.page_size - 1;
@@ -242,7 +253,7 @@ impl DmaListener {
         let view = system.flatview();
         let fr = view.lookup(addr);
         let Some((fr, block)) = fr
-            .filter(|fr| fr.region_type() == RegionType::Ram)
+            .filter(|fr| matches!(fr.region_type(), RegionType::Ram | RegionType::RamDevice))
             .and_then(|fr| fr.ram_block().map(|b| (fr, b)))
         else {
             let xlat = fr.map_or(addr, |fr| fr.offset_in_region() + (addr - fr.addr()));
@@ -365,6 +376,8 @@ impl MemoryListener for DmaListener {
         };
         let size = size as u64;
         // memory_region_get_ram_ptr() + offset_within_region + (iova - offset_within_address_space).
+        // A RAM device is only mapped in whole IOMMU pages, which section() already cut it to,
+        // since the container takes the host page as its smallest one.
         let vaddr = block.host_addr() + (fr.offset_in_region() + (iova - fr.addr())) as usize;
         if let Err(e) = self.map(iova, size, vaddr, fr.readonly()) {
             let ret = -e.raw_os_error().unwrap_or(0);
@@ -372,6 +385,18 @@ impl MemoryListener for DmaListener {
                 "vfio_container_dma_map({self:p}, {iova:#x}, {size:#x}, {vaddr:#x}) = {ret} ({})",
                 strerror(&e)
             );
+            if fr.region_type() == RegionType::RamDevice {
+                // A BAR that cannot be mapped for DMA only breaks peer to peer DMA, so it is
+                // not fatal. vfio_device_error_append() names the device that owns the BAR,
+                // whose name is the start of every mmap region's name.
+                let owner = fr.name().rsplit_once(" BAR ").map_or(fr.name(), |(n, _)| n);
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                let e = Error::generic(msg).hint(format_args!(
+                    "{owner}: PCI peer-to-peer transactions on BARs are not supported.\n"
+                ));
+                warn_err_once(&WARNED, &e);
+                return;
+            }
             self.fail(fr.name(), Error::generic(msg));
         }
     }
@@ -603,6 +628,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// `warn_report_err_once()`: the warning and its hint, the first time `done` is seen clear.
+fn warn_err_once(done: &AtomicBool, e: &Error) {
+    if !done.swap(true, Ordering::Relaxed) {
+        let mut out = format_message("warning: ", e.message());
+        if let Some(h) = e.hint_text() {
+            out.push_str(h);
+        }
+        eprint!("{out}");
+    }
+}
+
 /// One eventfd slot per interrupt, filled when the interrupt is set up.
 type Slots = Arc<Mutex<Vec<Option<Arc<OwnedFd>>>>>;
 
@@ -769,6 +805,86 @@ impl Pba {
     }
 }
 
+/// The mapped parts of the BARs, the `mmaps` of each `VFIORegion`, and what turns them off and
+/// on around INTx.
+#[derive(Debug)]
+struct Mmaps {
+    memory: Weak<MemorySystem>,
+    /// Their regions. The lock is held over each switch and over what decides it, so that the
+    /// INTx thread and the timer do not undo each other.
+    state: Mutex<MmapState>,
+    /// The dma-bufs of the BARs, which live as long as the device.
+    dma_bufs: Mutex<Vec<OwnedFd>>,
+    /// `intx.mmap_timer`, made when the device has an INTx pin.
+    timer: OnceLock<Timer>,
+    /// `intx.mmap_timeout` in milliseconds, 0 to leave them off once INTx fired.
+    timeout_ms: u32,
+}
+
+#[derive(Debug)]
+struct MmapState {
+    regions: Vec<RegionId>,
+    enabled: bool,
+}
+
+impl Mmaps {
+    fn new(memory: &Arc<MemorySystem>, timeout_ms: u32) -> Self {
+        Mmaps {
+            memory: Arc::downgrade(memory),
+            state: Mutex::new(MmapState { regions: Vec::new(), enabled: true }),
+            dma_bufs: Mutex::new(Vec::new()),
+            timer: OnceLock::new(),
+            timeout_ms,
+        }
+    }
+
+    /// `vfio_mmap_set_enabled()`, with `state` locked. Setting the state the regions are
+    /// already in changes nothing.
+    fn set_enabled(&self, state: &mut MmapState, enabled: bool) {
+        if state.enabled == enabled {
+            return;
+        }
+        state.enabled = enabled;
+        if let Some(memory) = self.memory.upgrade() {
+            for &r in &state.regions {
+                let _ = memory.set_enabled(r, enabled);
+            }
+        }
+    }
+
+    /// `timer_mod()` of the mmap timer to the timeout from now on the virtual clock.
+    fn arm(&self) {
+        let Some(t) = self.timer.get() else { return };
+        if let Some(clock) = t.clock() {
+            t.modify((clock.get_ms() + i64::from(self.timeout_ms)) * 1_000_000);
+        }
+    }
+
+    /// The mmap side of `vfio_intx_interrupt()`: the mmaps go off before `raise` puts the pin
+    /// up, so that the guest's first BAR access after it traps and is taken as the EOI, and
+    /// they stay locked until the pin is pending, so the timer cannot turn them on in between.
+    fn intx_fired(&self, raise: impl FnOnce()) {
+        let mut state = lock(&self.state);
+        self.set_enabled(&mut state, false);
+        raise();
+        drop(state);
+        if self.timeout_ms != 0 {
+            self.arm();
+        }
+    }
+
+    /// `vfio_intx_mmap_enable()`: the timer fired. The mmaps go back on unless INTx is still
+    /// `pending`, in which case the timer waits another timeout.
+    fn timer_fired(&self, pending: impl FnOnce() -> bool) {
+        let mut state = lock(&self.state);
+        if pending() {
+            self.arm();
+        } else {
+            self.set_enabled(&mut state, true);
+        }
+    }
+}
+
 /// What the BAR, ROM and config callbacks share: the device, where its config space is and the
 /// state of its interrupts.
 #[derive(Debug)]
@@ -777,6 +893,7 @@ struct Shared {
     interrupt: Mutex<Interrupt>,
     device: VfioDevice,
     config_offset: u64,
+    mmaps: Arc<Mmaps>,
     _attachment: Attachment,
 }
 
@@ -910,10 +1027,25 @@ impl Shared {
         else {
             return;
         };
+        if let Some(t) = self.mmaps.timer.get() {
+            t.del();
+        }
         // vfio_device_irq_disable().
         let _ = self.device.set_irqs(PCI_INTX_IRQ_INDEX, 0, 0, IRQ_SET_ACTION_TRIGGER);
         *lock(&intx.pending) = false;
         intx.irq.lower();
+        // The thread has to be gone before the mmaps go back on, or it could turn them off.
+        drop(intx);
+        self.mmaps.set_enabled(&mut lock(&self.mmaps.state), true);
+    }
+
+    /// `vfio_intx_mmap_enable()`, with the pending flag of INTx if that is what the device
+    /// uses.
+    fn intx_mmap_enable(&self) {
+        self.mmaps.timer_fired(|| match &*lock(&self.interrupt) {
+            Interrupt::Intx(i) => *lock(&i.pending),
+            _ => false,
+        });
     }
 
     /// The part of `vfio_intx_enable()` after the pin is known: an eventfd for the kernel to
@@ -922,12 +1054,15 @@ impl Shared {
         let pending = Arc::new(Mutex::new(false));
         let notifier = {
             let (pending, irq) = (Arc::clone(&pending), irq.clone());
-            // vfio_intx_interrupt(). The lock is held over the raise so that an EOI cannot
-            // lower the pin in between.
+            let mmaps = Arc::clone(&self.mmaps);
+            // vfio_intx_interrupt(). The pending lock is held over the raise so that an EOI
+            // cannot lower the pin in between.
             Notifiers::new("intx-interrupt", 1, move |_| {
-                let mut p = lock(&pending);
-                *p = true;
-                irq.raise();
+                mmaps.intx_fired(|| {
+                    let mut p = lock(&pending);
+                    *p = true;
+                    irq.raise();
+                });
             })?
         };
         // vfio_device_irq_set_signaling().
@@ -1421,6 +1556,10 @@ struct MsixInfo {
 struct Populated {
     shared: Arc<Shared>,
     bars: [RegionInfo; NUM_BARS],
+    /// The capability chain of each BAR's info.
+    caps: [RegionCaps; NUM_BARS],
+    /// `VFIORegion::mmaps` of each BAR, offsets and sizes in it.
+    mmaps: [Vec<(u64, u64)>; NUM_BARS],
     express: bool,
     reset_works: bool,
     config: Vec<u8>,
@@ -1430,7 +1569,9 @@ struct Populated {
 /// free slot. `express_bus` says whether `bus` is PCI Express, `pci_bus_is_express()`, and
 /// `dma_as` is the address space the device's DMA goes to, `pci_device_iommu_address_space()`.
 /// `system` is the system memory address space, the only one an IOMMU in `dma_as` may map to,
-/// and `viommu` is the vIOMMU of the bus, if it wants to know about assigned devices.
+/// and `viommu` is the vIOMMU of the bus, if it wants to know about assigned devices. `clock` is
+/// the virtual clock, which times how long the BAR mmaps stay off after INTx.
+#[allow(clippy::too_many_arguments)]
 pub fn realize(
     bus: &Arc<PciBus>,
     devfn: Option<u8>,
@@ -1438,6 +1579,7 @@ pub fn realize(
     dma_as: &Arc<AddressSpace>,
     system: &Arc<AddressSpace>,
     viommu: Option<&dyn HostIommu>,
+    clock: &Arc<Clock>,
     conf: &VfioPciConf,
 ) -> Result<Arc<PciDevice>> {
     let sysfsdev = match (&conf.sysfsdev, conf.host) {
@@ -1467,7 +1609,7 @@ pub fn realize(
             "x-balloon-allowed only potentially compatible with mdev devices",
         )));
     }
-    let p = populate(&sysfsdev, &name, bus.memory(), dma_as, system).map_err(prefix)?;
+    let p = populate(&sysfsdev, &name, bus.memory(), dma_as, system, conf).map_err(prefix)?;
     let info = PciDeviceInfo {
         name: "vfio-pci".to_string(),
         id: conf.id.clone(),
@@ -1493,7 +1635,17 @@ pub fn realize(
             let ops = Arc::new(ops);
             let _ = ops.dev.set(Arc::downgrade(&dev));
             dev.set_ops(Arc::clone(&ops) as Arc<dyn PciDeviceOps>);
-            // vfio_pci_interrupt_setup().
+            // vfio_pci_interrupt_setup(): a device with an INTx pin gets the timer that maps
+            // its BARs again once INTx goes quiet.
+            if ops.config_read(&dev, PCI_INTERRUPT_PIN as u32, 1) != 0 {
+                let shared = Arc::downgrade(&ops.shared);
+                let timer = clock.new_timer(move || {
+                    if let Some(s) = shared.upgrade() {
+                        s.intx_mmap_enable();
+                    }
+                });
+                let _ = ops.shared.mmaps.timer.set(timer);
+            }
             if let Err(e) = ops.intx_enable(&dev) {
                 unset(s.idev_set);
                 bus.unregister_device(&dev);
@@ -1531,6 +1683,7 @@ fn populate(
     memory: &Arc<MemorySystem>,
     space: &Arc<AddressSpace>,
     system: &Arc<AddressSpace>,
+    conf: &VfioPciConf,
 ) -> Result<Populated> {
     let (attachment, device, info) = attach(sysfsdev, name, memory, space, system)?;
 
@@ -1546,11 +1699,15 @@ fn populate(
     if info.num_irqs < PCI_MSIX_IRQ_INDEX + 1 {
         return Err(Error::generic(format!("unexpected number of irqs {}", info.num_irqs)));
     }
+    // vfio_region_setup() for each BAR.
     let mut bars = [RegionInfo::default(); NUM_BARS];
-    for (i, bar) in bars.iter_mut().enumerate() {
-        *bar = device
-            .region_info(i as u32)
+    let mut caps: [RegionCaps; NUM_BARS] = Default::default();
+    let mut mmaps: [Vec<(u64, u64)>; NUM_BARS] = Default::default();
+    for i in 0..NUM_BARS {
+        (bars[i], caps[i]) = device
+            .region_info_caps(i as u32)
             .map_err(|e| Error::from_io(format_args!("failed to get region {i} info"), e))?;
+        mmaps[i] = region_mmaps(i, &bars[i], &caps[i], conf.no_mmap)?;
     }
     let config_info = device
         .region_info(PCI_CONFIG_REGION_INDEX)
@@ -1580,11 +1737,14 @@ fn populate(
         interrupt: Mutex::new(Interrupt::None),
         device,
         config_offset: config_info.offset,
+        mmaps: Arc::new(Mmaps::new(memory, conf.intx_mmap_timeout_ms)),
         _attachment: attachment,
     });
     Ok(Populated {
         shared,
         bars,
+        caps,
+        mmaps,
         express,
         reset_works: info.flags & DEVICE_FLAGS_RESET != 0,
         config,
@@ -1597,6 +1757,8 @@ struct Setup<'a> {
     bus: &'a PciBus,
     shared: Arc<Shared>,
     bars: [RegionInfo; NUM_BARS],
+    caps: [RegionCaps; NUM_BARS],
+    mmaps: [Vec<(u64, u64)>; NUM_BARS],
     reset_works: bool,
     express_bus: bool,
     conf: &'a VfioPciConf,
@@ -1629,6 +1791,8 @@ impl<'a> Setup<'a> {
             bus,
             shared: p.shared,
             bars: p.bars,
+            caps: p.caps,
+            mmaps: p.mmaps,
             reset_works: p.reset_works,
             express_bus,
             conf,
@@ -1859,8 +2023,75 @@ impl<'a> Setup<'a> {
             let region =
                 mem.new_io(&format!("{name} BAR {nr}"), size, Arc::new(ops)).map_err(mem_error)?;
             mem.add_subregion(bar, 0, region).map_err(mem_error)?;
+            if let Err(e) = self.bar_mmap(nr, region) {
+                if let Some(e) = e {
+                    report_error(&e);
+                }
+                error_report(&format!("Failed to mmap {name} BAR {nr}. Performance may be slow"));
+            }
             self.dev.register_bar(nr, type_, bar);
             self.containers[nr] = Some(bar);
+        }
+        Ok(())
+    }
+
+    /// `vfio_region_mmap()` for BAR `nr`, whose trapped region is `region`: each of its mmaps
+    /// is mapped and laid over it, then a dma-buf of them is asked for. An error that QEMU
+    /// only traces is `None`.
+    fn bar_mmap(&self, nr: usize, region: RegionId) -> std::result::Result<(), Option<Error>> {
+        let areas = &self.mmaps[nr];
+        if areas.is_empty() {
+            return Ok(());
+        }
+        let info = &self.bars[nr];
+        let maps = HostMemory::map_device(
+            self.shared.device.as_fd(),
+            info.offset,
+            info.size,
+            areas,
+            info.flags & REGION_INFO_FLAG_READ != 0,
+            info.flags & REGION_INFO_FLAG_WRITE != 0,
+        )
+        .map_err(|_| None)?;
+        let mem = self.bus.memory();
+        let name = &self.shared.name;
+        let mut regions = Vec::with_capacity(maps.len());
+        for (i, m) in maps.into_iter().enumerate() {
+            let r = mem
+                .new_ram_device_ptr(&format!("{name} BAR {nr} mmaps[{i}]"), m)
+                .map_err(|e| Some(mem_error(e)))?;
+            regions.push(r);
+        }
+        for (&r, &(offset, _)) in regions.iter().zip(areas) {
+            mem.add_subregion(region, offset, r).map_err(|e| Some(mem_error(e)))?;
+        }
+        lock(&self.shared.mmaps.state).regions.extend(regions);
+
+        // vfio_region_create_dma_buf(). The legacy container's device takes the ioctl, so it
+        // is always asked.
+        let open = rustix::fs::OFlags::RDWR.bits();
+        match self.shared.device.dma_buf(nr as u32, open, areas) {
+            Ok(fd) => lock(&self.shared.mmaps.dma_bufs).push(fd),
+            Err(e) if e.raw_os_error() == Some(rustix::io::Errno::NOTTY.raw_os_error()) => {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    warn_report(
+                        "VFIO dma-buf not supported in kernel, using mmap fallback, P2P DMA \
+                         will not work",
+                    );
+                }
+            }
+            Err(e) => {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                let e = Error::from_io(
+                    format_args!(
+                        "{name} BAR {nr}: dma-buf unavailable, using mmap fallback, P2P DMA \
+                         will not work"
+                    ),
+                    e,
+                );
+                warn_err_once(&WARNED, &e);
+            }
         }
         Ok(())
     }
@@ -1915,6 +2146,17 @@ impl<'a> Setup<'a> {
             }
         }
         self.msix = Some(msix);
+        // vfio_pci_fixup_msix_region(): unless the kernel lets the table be mapped, its host
+        // pages stay trapped.
+        if !self.caps[msix.table_bar].has(REGION_INFO_CAP_MSIX_MAPPABLE) {
+            fixup_msix_mmaps(
+                &mut self.mmaps[msix.table_bar],
+                self.bars[msix.table_bar].size,
+                msix.table_offset,
+                msix.entries,
+                rustix::param::page_size() as u64,
+            );
+        }
         Ok(())
     }
 
@@ -2225,9 +2467,184 @@ fn ext_cap_max_size(config: &[u8], pos: u16) -> u16 {
     next - pos
 }
 
+/// The mmaps `vfio_region_setup()` gives BAR `nr`, each an offset and a size in it, sorted.
+/// Without a sparse mmap capability the whole BAR is one.
+fn region_mmaps(
+    nr: usize,
+    info: &RegionInfo,
+    caps: &RegionCaps,
+    no_mmap: bool,
+) -> Result<Vec<(u64, u64)>> {
+    if info.size == 0 || no_mmap || info.flags & REGION_INFO_FLAG_MMAP == 0 {
+        return Ok(Vec::new());
+    }
+    let Some(areas) = caps.sparse_mmap() else {
+        return Ok(vec![(0, info.size)]);
+    };
+    // vfio_setup_region_sparse_mmaps().
+    let mut areas: Vec<(u64, u64)> = areas.into_iter().filter(|a| a.1 != 0).collect();
+    areas.sort_by_key(|a| a.0);
+    for w in areas.windows(2) {
+        let prev_end = w[0].0.wrapping_add(w[0].1);
+        if prev_end > w[1].0 {
+            return Err(Error::generic(format!(
+                "vfio_setup_region_sparse_mmaps: overlapping sparse mmap regions detected in \
+                 region {nr}: [0x{:x}-0x{:x}] overlaps with [0x{:x}-0x{:x}]",
+                w[0].0,
+                prev_end.wrapping_sub(1),
+                w[1].0,
+                w[1].0.wrapping_add(w[1].1).wrapping_sub(1)
+            )));
+        }
+    }
+    Ok(areas)
+}
+
+/// `vfio_pci_fixup_msix_region()`: when one mmap covers the whole BAR of the MSI-X table, the
+/// host pages of the table are cut out of it, which leaves the part before them, the part after
+/// them, both, or nothing. Any other layout is left as the kernel gave it.
+fn fixup_msix_mmaps(
+    mmaps: &mut Vec<(u64, u64)>,
+    size: u64,
+    table_offset: u32,
+    entries: u32,
+    page_size: u64,
+) {
+    if mmaps.len() != 1 || mmaps[0] != (0, size) {
+        return;
+    }
+    let start = u64::from(table_offset) & !(page_size - 1);
+    let end = (u64::from(table_offset) + u64::from(entries) * PCI_MSIX_ENTRY_SIZE)
+        .next_multiple_of(page_size);
+    if start == 0 {
+        if end >= size {
+            mmaps.clear();
+        } else {
+            mmaps[0] = (end, size - end);
+        }
+    } else if end >= size {
+        mmaps[0].1 = start;
+    } else {
+        *mmaps = vec![(0, start), (end, size - end)];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn region_mmaps_like_vfio_region_setup() {
+        let mut info = RegionInfo::default();
+        info.size = 0x4000;
+        info.flags = REGION_INFO_FLAG_READ | REGION_INFO_FLAG_WRITE | REGION_INFO_FLAG_MMAP;
+        // A sparse mmap capability at 32 with the areas given.
+        let sparse = |areas: &[(u64, u64)]| {
+            let mut b = vec![0u8; 32];
+            b.extend(1u16.to_ne_bytes());
+            b.extend(1u16.to_ne_bytes());
+            b.extend(0u32.to_ne_bytes());
+            b.extend((areas.len() as u32).to_ne_bytes());
+            b.extend(0u32.to_ne_bytes());
+            for &(o, s) in areas {
+                b.extend(o.to_ne_bytes());
+                b.extend(s.to_ne_bytes());
+            }
+            RegionCaps::new(b, 32)
+        };
+        let none = RegionCaps::default();
+        assert_eq!(region_mmaps(0, &info, &none, false).unwrap(), vec![(0, 0x4000)]);
+        assert!(region_mmaps(0, &info, &none, true).unwrap().is_empty());
+        // Empty areas go, and the rest are sorted.
+        let caps = sparse(&[(0x3000, 0x1000), (0x2000, 0), (0, 0x1000)]);
+        assert_eq!(
+            region_mmaps(0, &info, &caps, false).unwrap(),
+            vec![(0, 0x1000), (0x3000, 0x1000)]
+        );
+        assert!(region_mmaps(0, &info, &sparse(&[]), false).unwrap().is_empty());
+        let caps = sparse(&[(0x1000, 0x2000), (0, 0x1800)]);
+        assert_eq!(
+            region_mmaps(2, &info, &caps, false).unwrap_err().message(),
+            "vfio_setup_region_sparse_mmaps: overlapping sparse mmap regions detected in region \
+             2: [0x0-0x17ff] overlaps with [0x1000-0x2fff]"
+        );
+        info.flags &= !REGION_INFO_FLAG_MMAP;
+        assert!(region_mmaps(0, &info, &none, false).unwrap().is_empty());
+        info.flags |= REGION_INFO_FLAG_MMAP;
+        info.size = 0;
+        assert!(region_mmaps(0, &info, &none, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn intx_turns_the_mmaps_off_until_it_is_quiet() {
+        use ruvm_base::ClockType;
+        let memory = Arc::new(MemorySystem::new());
+        let r = memory.new_container("BAR 0 mmaps[0]", 0x1000).unwrap();
+        let on = || memory.region(r).unwrap().enabled;
+        let clock = Clock::manual(ClockType::Virtual);
+        let mmaps = Arc::new(Mmaps::new(&memory, 1100));
+        lock(&mmaps.state).regions.push(r);
+        let pending = Arc::new(Mutex::new(false));
+        let timer = {
+            let (m, p) = (Arc::downgrade(&mmaps), Arc::clone(&pending));
+            clock.new_timer(move || {
+                if let Some(m) = m.upgrade() {
+                    m.timer_fired(|| *lock(&p));
+                }
+            })
+        };
+        mmaps.timer.set(timer).unwrap();
+
+        mmaps.intx_fired(|| *lock(&pending) = true);
+        assert!(!on());
+        // Still pending when the timer fires, so it waits another timeout.
+        clock.advance_to(1_100_000_000);
+        assert!(!on());
+        *lock(&pending) = false;
+        clock.advance_to(2_199_000_000);
+        assert!(!on());
+        clock.advance_to(2_200_000_000);
+        assert!(on());
+        // Each interrupt pushes the timeout out again.
+        mmaps.intx_fired(|| *lock(&pending) = true);
+        *lock(&pending) = false;
+        clock.advance_to(3_000_000_000);
+        mmaps.intx_fired(|| ());
+        clock.advance_to(3_300_000_000);
+        assert!(!on());
+        clock.advance_to(4_100_000_000);
+        assert!(on());
+
+        // With no timeout they stay off.
+        let off = Mmaps::new(&memory, 0);
+        lock(&off.state).regions.push(r);
+        off.intx_fired(|| ());
+        assert!(!on());
+        assert!(mmaps.timer.get().unwrap().expire_time().is_none());
+    }
+
+    #[test]
+    fn msix_table_pages_are_cut_out_of_the_mmap() {
+        let fix = |size, offset, entries| {
+            let mut m = vec![(0, size)];
+            fixup_msix_mmaps(&mut m, size, offset, entries, 0x1000);
+            m
+        };
+        // e1000e: a 16k BAR 3 with the table at 0 and the PBA at 0x2000.
+        assert_eq!(fix(0x4000, 0, 5), vec![(0x1000, 0x3000)]);
+        assert_eq!(fix(0x1000, 0, 5), vec![]);
+        assert_eq!(fix(0x4000, 0x3000, 5), vec![(0, 0x3000)]);
+        assert_eq!(fix(0x4000, 0x2008, 64), vec![(0, 0x2000), (0x3000, 0x1000)]);
+        // A table that spills into the next page takes that page too.
+        assert_eq!(fix(0x8000, 0x1ff0, 2), vec![(0, 0x1000), (0x3000, 0x5000)]);
+        // Layouts that are not one mmap of the whole BAR stay as they are.
+        let mut m = vec![(0x1000, 0x3000)];
+        fixup_msix_mmaps(&mut m, 0x4000, 0, 5, 0x1000);
+        assert_eq!(m, vec![(0x1000, 0x3000)]);
+        let mut m = vec![];
+        fixup_msix_mmaps(&mut m, 0x4000, 0, 5, 0x1000);
+        assert!(m.is_empty());
+    }
 
     #[test]
     fn basename_like_glib() {
