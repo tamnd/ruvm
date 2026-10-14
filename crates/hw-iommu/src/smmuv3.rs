@@ -2,8 +2,9 @@
 
 //! The `arm-smmuv3` device, from hw/arm/smmuv3.c and hw/arm/smmuv3-internal.h.
 //!
-//! The SMMU translates the DMA of the PCI devices of one root bus. Each device gets an IOMMU
-//! region from [`SmmuV3::device_ops`], keyed by its stream ID, and does its DMA through an
+//! The SMMU translates the DMA of the PCI devices of one root bus and the buses below its
+//! bridges. Each device gets an IOMMU region from [`SmmuV3::device_ops_with`], which works out
+//! its stream ID at each translation as `smmu_get_sid()` does, and does its DMA through an
 //! address space over that region. The stream table, the context descriptors, the page tables
 //! and the queues are read from and written to the system address space given at creation.
 //!
@@ -17,8 +18,7 @@
 //! - There are no IOMMU notifiers and no replay, so nothing like vhost or VFIO can sit behind
 //!   the SMMU. The `accel` mode and CMDQV are not there either.
 //! - There is no secure state and no VMState.
-//! - The SMMU covers one root bus, and the stream ID of a device is fixed when its region is
-//!   made, where QEMU computes it from the bus number at each translation.
+//! - The SMMU covers one root bus, since there is no pxb-pcie to give it more.
 //! - Guest errors that QEMU logs with `LOG_GUEST_ERROR` are silent.
 
 use std::cell::Cell;
@@ -1346,7 +1346,17 @@ impl SmmuV3 {
     /// The IOMMU region callbacks of the device with stream ID `sid`, which is
     /// `PCI_BUILD_BDF(bus, devfn)`.
     pub fn device_ops(self: &Arc<Self>, sid: u32) -> Arc<dyn IommuOps> {
-        Arc::new(SmmuDevice { smmu: Arc::clone(self), sid })
+        self.device_ops_with(move || sid)
+    }
+
+    /// The IOMMU region callbacks of a device whose stream ID `sid` gives at each translation.
+    /// `smmu_get_sid()` builds it from the current number of the device's bus, which the
+    /// guest sets in the bridge above it, and its devfn.
+    pub fn device_ops_with(
+        self: &Arc<Self>,
+        sid: impl Fn() -> u32 + Send + Sync + 'static,
+    ) -> Arc<dyn IommuOps> {
+        Arc::new(SmmuDevice { smmu: Arc::clone(self), sid: Box::new(sid) })
     }
 
     /// `smmuv3_translate()`.
@@ -1413,12 +1423,12 @@ fn perm_flags(p: u8) -> IommuAccessFlags {
 /// The IOMMU region of one device, `SMMUDevice`.
 struct SmmuDevice {
     smmu: Arc<SmmuV3>,
-    sid: u32,
+    sid: Box<dyn Fn() -> u32 + Send + Sync>,
 }
 
 impl IommuOps for SmmuDevice {
     fn translate(&self, addr: u64, flag: IommuAccessFlags, _iommu_idx: u32) -> IommuTlbEntry {
-        self.smmu.translate(self.sid, addr, flag)
+        self.smmu.translate((self.sid)(), addr, flag)
     }
 }
 
