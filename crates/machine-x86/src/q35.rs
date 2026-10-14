@@ -238,9 +238,8 @@ pub struct Q35MachineConfig {
     pub max_cpus: u32,
     /// Whether the accelerator is KVM.
     pub kvm: bool,
-    /// Whether the accelerator can run SMM. KVM says so through `KVM_CAP_X86_SMM`. In QEMU
-    /// TCG always can; here it is [`crate::tcg_run::TCG_SMM_AVAILABLE`], since the x86 front
-    /// end has no SMM yet.
+    /// Whether the accelerator can run SMM. KVM says so through `KVM_CAP_X86_SMM`; TCG always
+    /// can ([`crate::tcg_run::TCG_SMM_AVAILABLE`]).
     pub smm_available: bool,
     /// `phys-bits` of the CPU model, for the address space check of `pc_memory_init()`.
     pub phys_bits: u32,

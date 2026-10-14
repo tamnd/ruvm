@@ -33,8 +33,6 @@
 //!   [`Ich9Lpc::route_intx_pin_to_irq`]; the PCI core has no `pci_route_intx_to_irq()` yet.
 //! - Resetting the bridge also runs `pm_reset()`, which QEMU registers as a separate reset
 //!   handler. The board should not reset the PM block on its own.
-//! - Setting SMI_LOCK in GEN_PMCON_1 locks the bit in config space but cannot lock GBL_SMI_EN in
-//!   SMI_EN, because [`Ich9Pm`] has no hook for its SMI_EN write mask.
 //! - The SMI feature negotiation (`smi_features_ok_callback()`) is ported as methods, but the
 //!   board adds the three `etc/smi/*` fw_cfg files itself: [`Ich9Lpc::smi_host_features_le`] is
 //!   the content of `etc/smi/supported-features`, [`Ich9Lpc::set_smi_guest_features`] receives
@@ -552,13 +550,14 @@ impl Inner {
         }
     }
 
-    /// `ich9_lpc_pmcon_update()`. Once SMI_LOCK is set it cannot be cleared.
+    /// `ich9_lpc_pmcon_update()`. Once SMI_LOCK is set neither it nor GBL_SMI_EN can be cleared.
     fn pmcon_update(&self, dev: &PciDevice) {
         dev.with_config(|c| {
             let gen_pmcon_1 = pci_get_word(c.config, ICH9_LPC_GEN_PMCON_1);
             if gen_pmcon_1 & ICH9_LPC_GEN_PMCON_1_SMI_LOCK != 0 {
                 let wmask = pci_get_word(c.wmask, ICH9_LPC_GEN_PMCON_1);
                 pci_set_word(c.wmask, ICH9_LPC_GEN_PMCON_1, wmask & !ICH9_LPC_GEN_PMCON_1_SMI_LOCK);
+                self.pm.lock_gbl_smi_en();
             }
         });
     }

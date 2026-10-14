@@ -36,6 +36,8 @@ use ruvm_machine_x86::board::{BoardKind, BoardSpec, KernelFiles, build_board};
 use ruvm_machine_x86::debugcon::{DebugconConfig, IsaDebugcon};
 use ruvm_machine_x86::run_event::GuestEvent;
 use ruvm_machine_x86::tcg_run::{TCG_SMM_AVAILABLE, TcgCpuModel, TcgMachine, TcgRunConfig};
+use ruvm_target_x86::state::X86CpuState;
+use ruvm_target_x86::tcg::env;
 
 /// How long one guest may run, `RUVM_TEST_TIMEOUT_SECS` or ten minutes. The memory test in a
 /// debug build on the interpreter is the slowest, at about four minutes on an idle machine.
@@ -132,13 +134,13 @@ impl Drop for TempFile {
 }
 
 /// Runs test kernel `name` on q35 the way tests/tcg/x86_64/Makefile.softmmu-target does and
-/// gives the debugcon output and how it ended.
+/// gives the debugcon output, how it ended and the SMBASE and SMI count of each vCPU.
 fn run(
     fw: FirmwareSearch,
     name: &str,
     backend: Option<BackendKind>,
     thread: Option<ThreadMode>,
-) -> (Vec<u8>, End) {
+) -> (Vec<u8>, End, Vec<(u32, u64)>) {
     let kernel = TempFile::new(name, &gunzip(&format!("{name}.gz")));
     let cpu = TcgCpuModel::new(None).unwrap();
     let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
@@ -234,9 +236,17 @@ fn run(
     }
     let end = outcome.wait(timeout());
     m.pause();
+    let smm = Arc::new(Mutex::new(Vec::new()));
+    let s = Arc::clone(&smm);
+    m.vcpus().run_on_each(move |cpu| {
+        let mut st = X86CpuState::default();
+        env::save_state(cpu.env, &mut st);
+        s.lock().unwrap().push((st.smbase, st.msr_smi_count));
+    });
     m.quit();
     let bytes = out.lock().unwrap().clone();
-    (bytes, end)
+    let smm = smm.lock().unwrap().clone();
+    (bytes, end, smm)
 }
 
 /// Prints where each vCPU is, for `RUVM_TCG_TRACE`.
@@ -255,10 +265,12 @@ fn dump_vcpus(m: &TcgMachine) {
 
 fn check(name: &str, want: &[u8], backend: Option<BackendKind>, thread: Option<ThreadMode>) {
     let Some(fw) = firmware() else { return };
-    let (got, end) = run(fw, name, backend, thread);
+    let (got, end, smm) = run(fw, name, backend, thread);
     let text = String::from_utf8_lossy(&got);
     assert_eq!(end, End::Shutdown, "{name}: output so far:\n{text}");
     assert!(got == want, "{name}: output differs from QEMU's:\n{text}");
+    // With smm=auto SeaBIOS raises one SMI through the APM port to move SMBASE to 0xa0000.
+    assert_eq!(smm, [(0xa0000, 1)], "{name}: SMBASE and SMI count");
 }
 
 fn memory_out() -> Vec<u8> {

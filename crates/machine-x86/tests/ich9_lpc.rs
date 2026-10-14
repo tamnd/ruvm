@@ -627,6 +627,22 @@ fn smi_lock_sticks() {
 }
 
 #[test]
+fn smi_lock_locks_gbl_smi_en() {
+    // What OVMF's SmmControl2Dxe checks: after SMI_LOCK, GBL_SMI_EN cannot be cleared.
+    let m = Machine::new();
+    m.enable_pm_and_rcba();
+    let smi_en = PM_IO_BASE_ADDR + 0x30;
+    m.outl(smi_en, ICH9_PMIO_SMI_EN_APMC_EN | 1);
+    m.outl(smi_en, 0);
+    assert_eq!(m.inl(smi_en), 0);
+    m.outl(smi_en, ICH9_PMIO_SMI_EN_APMC_EN | 1);
+    m.cfg_write(LPC, ICH9_LPC_GEN_PMCON_1, 2, 0x0010);
+    m.outl(smi_en, 0);
+    assert_eq!(m.inl(smi_en), 1);
+    assert_eq!(m.lpc.pm().smi_en(), 1);
+}
+
+#[test]
 fn reset_restores_routing() {
     let m = Machine::new();
     m.enable_pm_and_rcba();
