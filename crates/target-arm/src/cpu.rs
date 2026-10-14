@@ -1052,9 +1052,11 @@ pub struct ArmFeatures {
     /// FEAT_SVE2p1 (`aa64_sve2p1`). Only DUPQ looks at it; no model sets it, as the rest of
     /// SVE2.1 is not implemented, so it exists for testing DUPQ.
     pub sve2p1: bool,
-    /// The largest vector length in quadwords, QEMU's `sve-max-vq` (every length from 1 to
-    /// this is supported, as for TCG). Zero without SVE.
+    /// The largest vector length in quadwords, QEMU's `sve-max-vq`. Zero without SVE.
     pub sve_max_vq: u32,
+    /// The lengths below `sve_max_vq` that are not supported, one bit per quadword count less
+    /// one, which the `sve<N>` properties can leave out. Zero when every length is there.
+    pub sve_vq_gaps: u32,
     /// FEAT_TLBIOS: the Outer Shareable TLBI operations (`aa64_tlbios`).
     pub tlbios: bool,
     /// FEAT_XS: the TLBI nXS operations and DSB nXS (`aa64_xs`).
@@ -1529,7 +1531,42 @@ impl ArmCpuModel {
         assert!((1..=ARM_MAX_VQ as u32).contains(&vq), "sve-max-vq must be from 1 to 16");
         if self.features.sve {
             self.features.sve_max_vq = vq;
+            self.features.sve_vq_gaps = 0;
         }
+        self
+    }
+
+    /// The model with the vector lengths in `map`, one bit per quadword count less one, as
+    /// `arm_cpu_sve_finalize()` leaves `sve_vq.map`. It has no effect on a model without SVE.
+    pub fn with_sve_vq_map(mut self, map: u32) -> ArmCpuModel {
+        assert!(map & 1 != 0 && map < 1 << ARM_MAX_VQ, "sve128 must be in the map");
+        if self.features.sve {
+            let max_vq = 32 - map.leading_zeros();
+            self.features.sve_max_vq = max_vq;
+            self.features.sve_vq_gaps = !map & ((1 << max_vq) - 1);
+        }
+        self
+    }
+
+    /// The model without SVE, `sve=off`: ID_AA64PFR0_EL1.SVE and, with no SME either,
+    /// ID_AA64ZFR0_EL1 read as zero, as `aarch64_cpu_sme_finalize()` leaves them.
+    pub fn without_sve(mut self) -> ArmCpuModel {
+        let f = &mut self.features;
+        f.sve = false;
+        f.sve2 = false;
+        f.sve_aes = false;
+        f.sve_bitperm = false;
+        f.sve_sha3 = false;
+        f.sve_sm4 = false;
+        f.sve_f32mm = false;
+        f.sve_f64mm = false;
+        f.sve_bf16 = false;
+        f.sve_i8mm = false;
+        f.sve2p1 = false;
+        f.sve_max_vq = 0;
+        f.sve_vq_gaps = 0;
+        self.id_aa64pfr0 &= !(0xf << 32);
+        self.id_aa64zfr0 = 0;
         self
     }
 

@@ -30,7 +30,8 @@
 //!   is not modelled. The CPU models are `cortex-a57`, `cortex-a72`, `cortex-a76`, `neoverse-n1`
 //!   and `max`; the other
 //!   models virt accepts fail with "... is not supported by ruvm yet", and so do the CPU
-//!   properties other than `sve-max-vq` and `pmu`.
+//!   properties other than `sve`, `sve-max-vq`, the `sve<N>` lengths, `pmu`, `aarch64=on`,
+//!   `x-rme` and the `pauth` ones.
 //! - The machine properties are taken only where their value describes the board that exists:
 //!   `gic-version=2` or `3`, `its`, `secure`, `virtualization`, `mte`, `ras=off`, `acpi`,
 //!   `spcr`, `x-oem-id`, `x-oem-table-id`, `iommu`, `default-bus-bypass-iommu`, `msi`, 32
@@ -83,7 +84,7 @@ use ruvm_qapi::types::{
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit, Visitor};
 use ruvm_qapi::{QDict, QValue};
 use ruvm_qom::Registry;
-use ruvm_target_arm::cpu::{ARM_MAX_VQ, ArmCpuModel, PauthAlg};
+use ruvm_target_arm::cpu::{ARM_MAX_VQ, ArmCpuModel};
 use ruvm_target_arm::tcg::SemihostingHost;
 
 use crate::cpus::{CpuSlot, Cpus, Threads, topology_props};
@@ -92,7 +93,9 @@ use crate::net::{NetOption, Network, init_clients};
 use crate::runstate::{MachineReset, Runstate};
 use crate::vl::Vm;
 use crate::x86::{Drive, Located, MemdevRam};
+use cpu_props::ArmCpuProps;
 
+pub(crate) mod cpu_props;
 mod devices;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 mod kvm;
@@ -689,81 +692,58 @@ pub(crate) fn parse_cpu(board: ArmBoard, arg: Option<&str>) -> Result<ArmCpuMode
         }
         return Err(Error::generic(format!("unable to find CPU model '{name}'")));
     };
-    // arm_cpu_pauth_finalize() runs after every property is set.
-    let mut pauth = model.features.pauth != 0;
-    let (mut impdef, mut qarma3, mut qarma5) = (false, false, false);
-    for feat in parts.filter(|f| !f.is_empty()) {
-        let (prop, value) = match feat.split_once('=') {
-            Some((p, v)) => (p, v),
-            None => match feat.strip_prefix('-') {
-                Some(p) => (p, "off"),
-                None => (feat.strip_prefix('+').unwrap_or(feat), "on"),
+    // The properties of query-cpu-model-expansion; arm_cpu_finalize_features() runs after
+    // every property is set.
+    let mut props = ArmCpuProps::new(name, true).expect("a CPU type of qemu-system-aarch64");
+    let mut rme = None;
+    for (prop, value) in parts.filter(|f| !f.is_empty()).map(cpu_props::cpu_feature) {
+        let set = match prop {
+            "sve-max-vq" if name == "max" => match value.parse::<u64>() {
+                Err(_) => Err(Error::generic("Parameter 'sve-max-vq' expects uint64")),
+                Ok(vq) if vq > u64::from(u32::MAX) => {
+                    Err(Error::generic("Parameter 'sve-max-vq' expects uint32_t"))
+                }
+                Ok(vq) if vq == 0 || vq > ARM_MAX_VQ as u64 => {
+                    Err(Error::generic("unsupported SVE vector length")
+                        .hint(format!("Valid sve-max-vq in range [1-{ARM_MAX_VQ}]\n")))
+                }
+                Ok(vq) => {
+                    props.set_sve_max_vq(vq as u32);
+                    Ok(())
+                }
             },
-        };
-        match prop {
-            "sve-max-vq" if name == "max" => {
-                let vq: u32 = value.parse().map_err(|_| {
-                    Error::generic("Parameter 'sve-max-vq' expects uint32_t".to_string())
-                })?;
-                if vq == 0 || vq as usize > ARM_MAX_VQ {
-                    return Err(Error::generic("unsupported SVE vector length")
-                        .hint(format!("Valid sve-max-vq in range [1-{ARM_MAX_VQ}]\n")));
-                }
-                model = model.with_sve_max_vq(vq);
-            }
-            "sve" if model.features.sve && prop_bool(prop, value)? => {}
-            "aarch64" if prop_bool(prop, value)? => {}
-            "pauth" if name == "max" => pauth = prop_bool(prop, value)?,
             // FEAT_RME with FEAT_RME_GPC3; the board takes it away again without EL3.
-            "x-rme" if name == "max" => model = model.with_rme(prop_bool(prop, value)?),
-            "pauth-impdef" if name == "max" => impdef = prop_bool(prop, value)?,
-            "pauth-qarma3" if name == "max" => qarma3 = prop_bool(prop, value)?,
-            "pauth-qarma5" if name == "max" => qarma5 = prop_bool(prop, value)?,
-            "pmu" => {
-                if !prop_bool(prop, value)? {
-                    model = model.without_pmu();
-                }
-            }
-            "sve" | "sme" | "sme-fa64" | "pauth" | "pauth-impdef" | "pauth-qarma3"
-            | "pauth-qarma5" | "lpa2" | "aarch64" | "reset-cbar" | "rvbar" | "cntfrq"
-            | "has_el2" | "has_el3" | "sve128" | "sve256" | "sve512" | "sve1024" | "sve2048"
-            | "sme128" | "sme256" | "sme512" | "sme1024" | "sme2048" => {
+            "x-rme" if name == "max" => prop_bool(prop, value).map(|on| rme = Some(on)),
+            _ if props.has(prop) => prop_bool(prop, value).and_then(|on| props.set(prop, on)),
+            "sme" | "sme-fa64" | "lpa2" | "reset-cbar" | "rvbar" | "cntfrq" | "has_el2"
+            | "has_el3" | "sme128" | "sme256" | "sme512" | "sme1024" | "sme2048" => {
                 return Err(Error::generic(format!(
                     "CPU property {prop}={value} is not supported by ruvm yet"
                 )));
             }
-            _ => {
-                return Err(Error::generic(format!(
-                    "can't apply global {name}-arm-cpu.{prop}={value}: Property \
-                     '{name}-arm-cpu.{prop}' not found"
-                )));
-            }
+            _ => Err(Error::generic(format!("Property '{name}-arm-cpu.{prop}' not found"))),
+        };
+        set.map_err(|e| e.prepend(format!("can't apply global {name}-arm-cpu.{prop}={value}: ")))?;
+        // The CPUs ruvm models that can turn AArch64 off would run AArch32 at EL1.
+        if prop == "aarch64" && !props.aarch64() {
+            return Err(Error::generic(format!(
+                "CPU property {prop}={value} is not supported by ruvm yet"
+            )));
         }
     }
-    if name == "max" {
-        let alg = if pauth {
-            if u8::from(impdef) + u8::from(qarma3) + u8::from(qarma5) > 1 {
-                return Err(Error::generic(
-                    "cannot enable pauth-impdef, pauth-qarma3 and pauth-qarma5 at the same time",
-                ));
-            }
-            Some(if qarma5 {
-                PauthAlg::Qarma5
-            } else if qarma3 {
-                PauthAlg::Qarma3
-            } else {
-                PauthAlg::Impdef
-            })
-        } else {
-            if impdef || qarma3 || qarma5 {
-                return Err(Error::generic(
-                    "cannot enable pauth-impdef, pauth-qarma3 or pauth-qarma5 without pauth",
-                )
-                .hint("Add pauth=on to the CPU property list.\n"));
-            }
-            None
-        };
-        model = model.with_pauth(alg);
+    props.finalize()?;
+    if let Some(on) = rme {
+        model = model.with_rme(on);
+    }
+    if !props.pmu() {
+        model = model.without_pmu();
+    }
+    model = match props.sve_vq_map() {
+        None => model.without_sve(),
+        Some(map) => model.with_sve_vq_map(map),
+    };
+    if props.has("pauth") {
+        model = model.with_pauth(props.pauth_alg());
     }
     Ok(model)
 }
@@ -1614,11 +1594,27 @@ mod tests {
         );
         assert_eq!(
             parse_cpu(ArmBoard::Virt, Some("cortex-a57,pauth-qarma5=on")).unwrap_err().message(),
-            "CPU property pauth-qarma5=on is not supported by ruvm yet"
+            "can't apply global cortex-a57-arm-cpu.pauth-qarma5=on: Property \
+             'cortex-a57-arm-cpu.pauth-qarma5' not found"
         );
         assert_eq!(
             parse_cpu(ArmBoard::Virt, Some("max,sve-max-vq=0")).unwrap_err().message(),
-            "unsupported SVE vector length"
+            "can't apply global max-arm-cpu.sve-max-vq=0: unsupported SVE vector length"
+        );
+        let max = |opts| parse_cpu(ArmBoard::Virt, Some(opts));
+        let f = max("max,sve=off").unwrap().features;
+        assert!(!f.sve && !f.sve2 && f.sve_max_vq == 0);
+        let f = max("max,sve512=on").unwrap().features;
+        assert_eq!((f.sve_max_vq, f.sve_vq_gaps), (4, 0b100));
+        let f = max("max,sve-max-vq=8,sve1024=on").unwrap().features;
+        assert_eq!((f.sve_max_vq, f.sve_vq_gaps), (8, 0));
+        assert_eq!(max("max,sve256=off").unwrap().features.sve_max_vq, 1);
+        assert_eq!(max("max,sve128=off").unwrap_err().message(), "cannot disable sve128");
+        assert_eq!(max("max,pmu=off").unwrap().features.pmu, 0);
+        assert_eq!(
+            max("cortex-a76,aarch64=off").unwrap_err().message(),
+            "can't apply global cortex-a76-arm-cpu.aarch64=off: 'aarch64' feature cannot be disabled for this TCG CPU because it does not support \
+             32-bit execution at its highest implemented exception level"
         );
     }
 
