@@ -13,10 +13,14 @@
 //! invalidation commands including range invalidation, the event queue, GERROR, GBPA, and the
 //! four wired interrupts.
 //!
+//! The IOMMU region of a device takes notifiers for unmap events, which the TLB invalidation
+//! commands send as in QEMU. Like QEMU, it refuses MAP and DEVIOTLB_UNMAP notifiers, so VFIO
+//! cannot sit behind the SMMU, and it has no replay: only VFIO and vhost-vdpa replay, and both
+//! need MAP.
+//!
 //! # Differences from QEMU
 //!
-//! - There are no IOMMU notifiers and no replay, so nothing like vhost or VFIO can sit behind
-//!   the SMMU. The `accel` mode and CMDQV are not there either.
+//! - The `accel` mode and CMDQV are not there.
 //! - There is no secure state and no VMState.
 //! - The SMMU covers one root bus, since there is no pxb-pcie to give it more.
 //! - Guest errors that QEMU logs with `LOG_GUEST_ERROR` are silent.
@@ -28,13 +32,14 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use ruvm_hw_core::IrqLine;
 use ruvm_mem::{
-    AccessConstraints, AccessCtx, AccessSize, AddressSpace, IommuAccessFlags, IommuOps,
-    IommuTlbEntry, MemResult, MemTxAttrs, MemTxResult, MmioOps,
+    AccessConstraints, AccessCtx, AccessSize, AddressSpace, IommuAccessFlags, IommuNotifierFlag,
+    IommuNotifiers, IommuOps, IommuTlbEntry, IommuTlbEvent, MemResult, MemTxAttrs, MemTxResult,
+    MmioOps,
 };
 
 use crate::smmu_common::{
     Iotlb, PERM_RO, PERM_RW, PERM_WO, PtwError, PtwEventInfo, Stage, TlbEntry, TransCfg,
-    VMSA_MAX_S2_CONCAT, WalkMemory, extract64, get_start_level, mask64, pgd_concat_idx,
+    VMSA_MAX_S2_CONCAT, WalkMemory, extract64, get_start_level, mask64, pgd_concat_idx, select_tt,
     smmu_translate,
 };
 
@@ -432,6 +437,17 @@ fn cmd_addr(c: &Cmd) -> u64 {
     (u64::from(c[3]) << 32) | (u64::from(ex32(c[2], 12, 20)) << 12)
 }
 
+/// Gives the stream ID of a device at the time of the call.
+type SidFn = Arc<dyn Fn() -> u32 + Send + Sync>;
+
+/// An unmap for the notifiers of one device, sent once the lock is dropped.
+enum Unmap {
+    /// `smmu_inv_notifiers_mr()`: the whole range of each notifier.
+    All(Arc<IommuNotifiers>),
+    /// `smmuv3_notify_iova()`: the IOVA and the page offset mask.
+    Range(Arc<IommuNotifiers>, u64, u64),
+}
+
 /// The registers and caches of the SMMU, `SMMUv3State` with its `SMMUState`.
 struct State {
     idr: [u32; 6],
@@ -461,6 +477,11 @@ struct State {
     iotlb: Iotlb,
     /// The interrupt lines to pulse once the lock is dropped.
     pulses: Vec<usize>,
+    /// The stream IDs and notifiers of `devices_with_notifiers`, taken before the lock for a
+    /// register write.
+    notified: Vec<(u32, Arc<IommuNotifiers>)>,
+    /// The unmaps to send once the lock is dropped.
+    unmaps: Vec<Unmap>,
 }
 
 impl State {
@@ -512,6 +533,8 @@ impl State {
             configs: HashMap::new(),
             iotlb: Iotlb::new(),
             pulses: Vec::new(),
+            notified: Vec::new(),
+            unmaps: Vec::new(),
         };
         s.reset();
         s
@@ -969,8 +992,57 @@ impl State {
         }
     }
 
+    /// `smmu_inv_notifiers_all()`.
+    fn inv_notifiers_all(&mut self) {
+        for (_, list) in &self.notified {
+            self.unmaps.push(Unmap::All(Arc::clone(list)));
+        }
+    }
+
+    /// `smmuv3_inv_notifiers_iova()` with `smmuv3_notify_iova()`. `mask` is the page offset
+    /// mask of a range invalidation, and `None` stands for one page of the device's granule.
+    /// The checks depend on the device alone, so its notifiers all get the same unmap.
+    fn inv_notifiers_iova(
+        &mut self,
+        m: &Dma<'_>,
+        asid: i32,
+        vmid: i32,
+        iova: u64,
+        mask: Option<u64>,
+        stage: Stage,
+    ) {
+        for (sid, list) in self.notified.clone() {
+            let mut ev = EventInfo::default();
+            let Some(cfg) = self.get_config(m, sid, &mut ev) else {
+                continue;
+            };
+            // With nesting only stage 1 addresses are IOVAs.
+            if stage == Stage::S2 && cfg.stage == Stage::Nested {
+                continue;
+            }
+            let mask = match mask {
+                Some(mask) => mask,
+                None => {
+                    if (asid >= 0 && cfg.asid != asid) || (vmid >= 0 && cfg.s2cfg.vmid != vmid) {
+                        continue;
+                    }
+                    let granule = if stage == Stage::S1 {
+                        let Some(i) = select_tt(&cfg, iova) else {
+                            continue;
+                        };
+                        cfg.tt[i].granule_sz
+                    } else {
+                        cfg.s2cfg.granule_sz
+                    };
+                    (1u64 << granule) - 1
+                }
+            };
+            self.unmaps.push(Unmap::Range(list, iova, mask));
+        }
+    }
+
     /// `smmuv3_range_inval()`.
-    fn range_inval(&mut self, c: &Cmd, stage: Stage) {
+    fn range_inval(&mut self, m: &Dma<'_>, c: &Cmd, stage: Stage) {
         let mut addr = cmd_addr(c);
         let ty = cmd_type(c);
         let scale = ex32(c[0], 20, 5);
@@ -988,6 +1060,7 @@ impl State {
             }
         };
         if tg == 0 {
+            self.inv_notifiers_iova(m, asid, vmid, addr, None, stage);
             inv(&mut self.iotlb, addr, 1);
             return;
         }
@@ -998,6 +1071,8 @@ impl State {
         while addr != end.wrapping_add(1) {
             let mask = dma_aligned_pow2_mask(addr, end);
             let n = mask.wrapping_add(1) >> granule;
+            let pages_mask = (n << granule).wrapping_sub(1);
+            self.inv_notifiers_iova(m, asid, vmid, addr, Some(pages_mask), stage);
             inv(&mut self.iotlb, addr, n);
             addr = addr.wrapping_add(mask).wrapping_add(1);
         }
@@ -1018,7 +1093,7 @@ impl State {
                 cmd_error = CERROR_ABT;
                 break;
             };
-            cmd_error = self.exec_cmd(&c);
+            cmd_error = self.exec_cmd(m, &c);
             if cmd_error != 0 {
                 break;
             }
@@ -1034,7 +1109,7 @@ impl State {
     }
 
     /// One command of [`State::cmdq_consume`], giving the command error or 0.
-    fn exec_cmd(&mut self, c: &Cmd) -> u32 {
+    fn exec_cmd(&mut self, m: &Dma<'_>, c: &Cmd) -> u32 {
         let s1 = self.stage1_supported();
         let s2 = self.stage2_supported();
         match cmd_type(c) {
@@ -1071,6 +1146,7 @@ impl State {
                 }
                 // The VMID only counts when stage 2 is supported.
                 let vmid = if s2 { cmd_vmid(c) } else { -1 };
+                self.inv_notifiers_all();
                 self.iotlb.inv_asid_vmid(cmd_asid(c), vmid);
             }
             cmd::TLBI_NH_ALL | cmd::TLBI_NSNH_ALL => {
@@ -1085,25 +1161,27 @@ impl State {
                         return 0;
                     }
                 }
+                self.inv_notifiers_all();
                 self.iotlb.inv_all();
             }
             cmd::TLBI_NH_VAA | cmd::TLBI_NH_VA => {
                 if !s1 {
                     return CERROR_ILL;
                 }
-                self.range_inval(c, Stage::S1);
+                self.range_inval(m, c, Stage::S1);
             }
             cmd::TLBI_S12_VMALL => {
                 if !s2 {
                     return CERROR_ILL;
                 }
+                self.inv_notifiers_all();
                 self.iotlb.inv_vmid(cmd_vmid(c));
             }
             cmd::TLBI_S2_IPA => {
                 if !s2 {
                     return CERROR_ILL;
                 }
-                self.range_inval(c, Stage::S2);
+                self.range_inval(m, c, Stage::S2);
             }
             // ATS is not advertised, so there is nothing to invalidate.
             cmd::ATC_INV => {}
@@ -1291,6 +1369,9 @@ pub struct SmmuV3 {
     state: Mutex<State>,
     irqs: [IrqLine; SMMU_NUM_IRQS],
     memory: Weak<AddressSpace>,
+    /// `devices_with_notifiers`, newest first. It has its own lock, since the stream IDs are
+    /// worked out before the state is locked.
+    notified: Mutex<Vec<(SidFn, Arc<IommuNotifiers>)>>,
 }
 
 impl fmt::Debug for SmmuV3 {
@@ -1311,6 +1392,7 @@ impl SmmuV3 {
             state: Mutex::new(State::new(stages)),
             irqs,
             memory: Arc::downgrade(memory),
+            notified: Mutex::new(Vec::new()),
         })
     }
 
@@ -1318,15 +1400,61 @@ impl SmmuV3 {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn notified(&self) -> MutexGuard<'_, Vec<(SidFn, Arc<IommuNotifiers>)>> {
+        self.notified.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Runs `f` on the state, then pulses the lines it asked for once the lock is dropped.
     fn with_state<R>(&self, f: impl FnOnce(&mut State, &Dma<'_>) -> R) -> R {
+        self.run(Vec::new(), f)
+    }
+
+    /// [`SmmuV3::with_state`] for a register write, which may unmap for the notifiers. The
+    /// stream IDs come from the bus numbers on the PCI side, so they are worked out before the
+    /// lock, and the unmaps go out once it is dropped, before the interrupts.
+    fn with_state_notified<R>(&self, f: impl FnOnce(&mut State, &Dma<'_>) -> R) -> R {
+        let list = self.notified().clone();
+        self.run(list.into_iter().map(|(sid, n)| (sid(), n)).collect(), f)
+    }
+
+    fn run<R>(
+        &self,
+        notified: Vec<(u32, Arc<IommuNotifiers>)>,
+        f: impl FnOnce(&mut State, &Dma<'_>) -> R,
+    ) -> R {
         let memory = self.memory.upgrade();
-        let (r, pulses) = {
+        let (r, pulses, unmaps) = {
             let _engaged = Engaged::enter();
             let mut s = self.lock();
+            s.notified = notified;
             let r = f(&mut s, &Dma(memory.as_deref()));
-            (r, std::mem::take(&mut s.pulses))
+            s.notified.clear();
+            (r, std::mem::take(&mut s.pulses), std::mem::take(&mut s.unmaps))
         };
+        for u in unmaps {
+            match u {
+                Unmap::All(list) => {
+                    for n in list.list() {
+                        n.unmap_range(memory.clone());
+                    }
+                }
+                Unmap::Range(list, iova, mask) => {
+                    let ev = IommuTlbEvent {
+                        ty: IommuNotifierFlag::UNMAP,
+                        entry: IommuTlbEntry {
+                            target_as: memory.clone(),
+                            iova,
+                            translated_addr: 0,
+                            addr_mask: mask,
+                            perm: IommuAccessFlags::NONE,
+                        },
+                    };
+                    for n in list.list() {
+                        n.notify_one(&ev);
+                    }
+                }
+            }
+        }
         for irq in pulses {
             self.irqs[irq].pulse();
         }
@@ -1356,7 +1484,11 @@ impl SmmuV3 {
         self: &Arc<Self>,
         sid: impl Fn() -> u32 + Send + Sync + 'static,
     ) -> Arc<dyn IommuOps> {
-        Arc::new(SmmuDevice { smmu: Arc::clone(self), sid: Box::new(sid) })
+        Arc::new(SmmuDevice {
+            smmu: Arc::clone(self),
+            sid: Arc::new(sid),
+            notifiers: Arc::new(IommuNotifiers::new()),
+        })
     }
 
     /// `smmuv3_translate()`.
@@ -1423,12 +1555,45 @@ fn perm_flags(p: u8) -> IommuAccessFlags {
 /// The IOMMU region of one device, `SMMUDevice`.
 struct SmmuDevice {
     smmu: Arc<SmmuV3>,
-    sid: Box<dyn Fn() -> u32 + Send + Sync>,
+    sid: SidFn,
+    notifiers: Arc<IommuNotifiers>,
 }
 
 impl IommuOps for SmmuDevice {
     fn translate(&self, addr: u64, flag: IommuAccessFlags, _iommu_idx: u32) -> IommuTlbEntry {
         self.smmu.translate((self.sid)(), addr, flag)
+    }
+
+    fn notifiers(&self) -> Option<&IommuNotifiers> {
+        Some(&self.notifiers)
+    }
+
+    /// `smmuv3_notify_flag_changed()`.
+    fn notify_flag_changed(
+        &self,
+        old: IommuNotifierFlag,
+        new: IommuNotifierFlag,
+    ) -> Result<(), String> {
+        if new.intersects(IommuNotifierFlag::DEVIOTLB_UNMAP) {
+            return Err("SMMUv3 does not support dev-iotlb yet".to_string());
+        }
+        if new.intersects(IommuNotifierFlag::MAP) {
+            let sid = (self.sid)();
+            return Err(format!(
+                "device {:02x}.{:02x}.{:x} requires iommu MAP notifier which is not currently \
+                 supported",
+                sid >> 8,
+                (sid >> 3) & 0x1f,
+                sid & 7
+            ));
+        }
+        let mut list = self.smmu.notified();
+        if old == IommuNotifierFlag::NONE {
+            list.insert(0, (Arc::clone(&self.sid), Arc::clone(&self.notifiers)));
+        } else if new == IommuNotifierFlag::NONE {
+            list.retain(|(_, n)| !Arc::ptr_eq(n, &self.notifiers));
+        }
+        Ok(())
     }
 }
 
@@ -1463,7 +1628,7 @@ impl MmioOps for SmmuMmio {
         let offset = offset & !0x10000;
         match size.bytes() {
             8 => self.0.with_state(|s, _| s.writell(offset, value)),
-            4 => self.0.with_state(|s, m| s.writel(m, offset, value as u32)),
+            4 => self.0.with_state_notified(|s, m| s.writel(m, offset, value as u32)),
             _ => return Err(MemTxResult::ERROR),
         }
         Ok(())
