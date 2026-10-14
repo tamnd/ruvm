@@ -9,16 +9,18 @@
 //! `vfio_pci_add_capabilities()` rebuilds them. A container listens to the address space its
 //! devices DMA into and maps the guest's RAM for them, as hw/vfio/listener.c does. INTx comes
 //! in through an eventfd the kernel signals, which a thread of the device turns into a raised
-//! pin, and the first BAR access after it lowers the pin and unmasks the host interrupt. MSI and
-//! MSI-X delivery, DMA through a vIOMMU, mmap of the BARs, hot reset and the device quirks are
-//! not here yet.
+//! pin, and the first BAR access after it lowers the pin and unmasks the host interrupt. When the
+//! guest turns MSI on, each vector it enabled gets an eventfd of its own and the thread sends
+//! the vector's message when the kernel signals it. MSI-X delivery, DMA through a vIOMMU, mmap
+//! of the BARs, hot reset and the device quirks are not here yet.
 
 use std::fmt;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::mem;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
 
 use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
@@ -53,8 +55,8 @@ use ruvm_mem::{
 use ruvm_sys::vfio::{
     API_VERSION, DEVICE_FLAGS_PCI, DEVICE_FLAGS_RESET, DeviceInfo, GROUP_FLAGS_VIABLE,
     IRQ_SET_ACTION_TRIGGER, IRQ_SET_ACTION_UNMASK, PCI_CONFIG_REGION_INDEX, PCI_ERR_IRQ_INDEX,
-    PCI_INTX_IRQ_INDEX, PCI_MSIX_IRQ_INDEX, PCI_ROM_REGION_INDEX, RegionInfo, TYPE1_IOMMU,
-    TYPE1V2_IOMMU, VfioContainer, VfioDevice, VfioGroup,
+    PCI_INTX_IRQ_INDEX, PCI_MSI_IRQ_INDEX, PCI_MSIX_IRQ_INDEX, PCI_ROM_REGION_INDEX, RegionInfo,
+    TYPE1_IOMMU, TYPE1V2_IOMMU, VfioContainer, VfioDevice, VfioGroup,
 };
 
 use crate::{PCI_ANY_ID, VfioPciConf};
@@ -441,19 +443,42 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// INTx delivery, `VFIOINTx`. The kernel signals `trigger` when the device raises its pin and
-/// keeps the host interrupt masked until it is told to unmask it.
+/// Eventfds the kernel signals for a device's interrupts and a thread that waits on them, the
+/// part of `qemu_set_fd_handler()` vfio relies on. The handler runs with the index of each
+/// eventfd that fires, until the notifiers are dropped.
 #[derive(Debug)]
-struct Intx {
-    /// `pending`: the pin is raised and the host interrupt masked.
-    pending: Arc<Mutex<bool>>,
-    irq: IrqLine,
+struct Notifiers {
+    fds: Arc<Vec<OwnedFd>>,
     stop: Arc<OwnedFd>,
     thread: Option<JoinHandle<()>>,
-    _trigger: Arc<OwnedFd>,
 }
 
-impl Drop for Intx {
+impl Notifiers {
+    /// `vfio_notifier_init()` for `n` eventfds called `name`, and the thread that serves them.
+    fn new(name: &str, n: usize, handler: impl Fn(usize) + Send + 'static) -> Result<Notifiers> {
+        let failed = |e: io::Error| Error::from_io(format!("vfio_notifier_init {name} failed"), e);
+        let fds = (0..n)
+            .map(|_| eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK))
+            .collect::<rustix::io::Result<Vec<_>>>()
+            .map_err(|e| failed(e.into()))?;
+        let fds = Arc::new(fds);
+        let stop = Arc::new(eventfd(0, EventfdFlags::CLOEXEC).map_err(|e| failed(e.into()))?);
+        let thread = {
+            let (fds, stop) = (Arc::clone(&fds), Arc::clone(&stop));
+            thread::Builder::new()
+                .name(format!("vfio-{name}"))
+                .spawn(move || notifier_thread(&fds, &stop, &handler))
+                .map_err(failed)?
+        };
+        Ok(Notifiers { fds, stop, thread: Some(thread) })
+    }
+
+    fn fd(&self, i: usize) -> BorrowedFd<'_> {
+        self.fds[i].as_fd()
+    }
+}
+
+impl Drop for Notifiers {
     fn drop(&mut self) {
         let _ = rustix::io::write(&*self.stop, &1u64.to_ne_bytes());
         if let Some(t) = self.thread.take() {
@@ -468,26 +493,47 @@ fn test_and_clear(fd: &OwnedFd) -> bool {
     matches!(rustix::io::read(fd, &mut b), Ok(8))
 }
 
-/// Waits on the INTx eventfd until `stop` is signalled, and does `vfio_intx_interrupt()` each
-/// time the kernel signals it.
-fn intx_thread(trigger: &OwnedFd, stop: &OwnedFd, pending: &Mutex<bool>, irq: &IrqLine) {
+/// Waits on `fds` until `stop` is signalled, and calls `handler` for each one the kernel
+/// signals.
+fn notifier_thread(fds: &[OwnedFd], stop: &OwnedFd, handler: &dyn Fn(usize)) {
     loop {
-        let mut fds = [PollFd::new(trigger, PollFlags::IN), PollFd::new(stop, PollFlags::IN)];
-        match poll(&mut fds, None) {
+        let mut pfds: Vec<PollFd<'_>> = fds.iter().map(|f| PollFd::new(f, PollFlags::IN)).collect();
+        pfds.push(PollFd::new(stop, PollFlags::IN));
+        match poll(&mut pfds, None) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(_) => return,
         }
-        if !fds[1].revents().is_empty() {
+        if !pfds[fds.len()].revents().is_empty() {
             return;
         }
-        if test_and_clear(trigger) {
-            // The lock is held over the raise so that an EOI cannot lower the pin in between.
-            let mut p = lock(pending);
-            *p = true;
-            irq.raise();
+        let ready: Vec<usize> = (0..fds.len()).filter(|&i| !pfds[i].revents().is_empty()).collect();
+        for i in ready {
+            if test_and_clear(&fds[i]) {
+                handler(i);
+            }
         }
     }
+}
+
+/// INTx delivery, `VFIOINTx`. The kernel signals the eventfd when the device raises its pin and
+/// keeps the host interrupt masked until it is told to unmask it.
+#[derive(Debug)]
+struct Intx {
+    /// `pending`: the pin is raised and the host interrupt masked.
+    pending: Arc<Mutex<bool>>,
+    irq: IrqLine,
+    notifier: Notifiers,
+}
+
+/// `VFIOPCIDevice::interrupt`: which kind of interrupt the device uses, with the eventfds for
+/// it.
+#[derive(Debug)]
+enum Interrupt {
+    None,
+    Intx(Intx),
+    /// One eventfd per MSI vector the guest enabled.
+    Msi(Notifiers),
 }
 
 /// What the BAR, ROM and config callbacks share: the device, where its config space is and the
@@ -495,7 +541,7 @@ fn intx_thread(trigger: &OwnedFd, stop: &OwnedFd, pending: &Mutex<bool>, irq: &I
 #[derive(Debug)]
 struct Shared {
     name: String,
-    intx: Mutex<Option<Intx>>,
+    interrupt: Mutex<Interrupt>,
     device: VfioDevice,
     config_offset: u64,
     _attachment: Attachment,
@@ -526,8 +572,8 @@ impl Shared {
 
     /// `vfio_pci_intx_eoi()`: QEMU takes any BAR access as the guest having serviced INTx.
     fn eoi(&self) {
-        let intx = lock(&self.intx);
-        let Some(i) = intx.as_ref() else {
+        let interrupt = lock(&self.interrupt);
+        let Interrupt::Intx(i) = &*interrupt else {
             return;
         };
         let mut pending = lock(&i.pending);
@@ -540,10 +586,20 @@ impl Shared {
         let _ = self.device.set_irqs(PCI_INTX_IRQ_INDEX, 0, 1, IRQ_SET_ACTION_UNMASK);
     }
 
-    /// `vfio_intx_disable()`, which is all `vfio_disable_interrupts()` has to do while INTx is
-    /// the only interrupt there is.
+    /// Takes the interrupt state out if `pick` matches it. The caller drops it with the lock
+    /// released, since that waits for the notifier thread.
+    fn take_interrupt(&self, pick: fn(&Interrupt) -> bool) -> Option<Interrupt> {
+        let mut interrupt = lock(&self.interrupt);
+        if !pick(&interrupt) {
+            return None;
+        }
+        Some(mem::replace(&mut *interrupt, Interrupt::None))
+    }
+
+    /// `vfio_intx_disable()`.
     fn intx_disable(&self) {
-        let Some(intx) = lock(&self.intx).take() else {
+        let Some(Interrupt::Intx(intx)) = self.take_interrupt(|i| matches!(i, Interrupt::Intx(_)))
+        else {
             return;
         };
         // vfio_device_irq_disable().
@@ -555,37 +611,36 @@ impl Shared {
     /// The part of `vfio_intx_enable()` after the pin is known: an eventfd for the kernel to
     /// signal, the thread that waits on it, and the kernel told to use it.
     fn intx_start(&self, irq: IrqLine) -> Result<()> {
-        let notifier = |e: rustix::io::Errno| {
-            Error::from_io("vfio_notifier_init intx-interrupt failed", io::Error::from(e))
-        };
-        let trigger =
-            Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).map_err(notifier)?);
-        let stop = Arc::new(eventfd(0, EventfdFlags::CLOEXEC).map_err(notifier)?);
         let pending = Arc::new(Mutex::new(false));
-        let thread = {
-            let (trigger, stop, pending, irq) =
-                (Arc::clone(&trigger), Arc::clone(&stop), Arc::clone(&pending), irq.clone());
-            thread::Builder::new()
-                .name("vfio-intx".into())
-                .spawn(move || intx_thread(&trigger, &stop, &pending, &irq))
-                .map_err(|e| Error::from_io("vfio_notifier_init intx-interrupt failed", e))?
+        let notifier = {
+            let (pending, irq) = (Arc::clone(&pending), irq.clone());
+            // vfio_intx_interrupt(). The lock is held over the raise so that an EOI cannot
+            // lower the pin in between.
+            Notifiers::new("intx-interrupt", 1, move |_| {
+                let mut p = lock(&pending);
+                *p = true;
+                irq.raise();
+            })?
         };
-        let intx =
-            Intx { pending, irq, stop, thread: Some(thread), _trigger: Arc::clone(&trigger) };
         // vfio_device_irq_set_signaling().
         self.device
             .set_irqs_eventfds(
                 PCI_INTX_IRQ_INDEX,
                 0,
                 IRQ_SET_ACTION_TRIGGER,
-                &[Some(trigger.as_fd())],
+                &[Some(notifier.fd(0))],
             )
             .map_err(|e| {
                 Error::from_io("VFIO_DEVICE_SET_IRQS failure", e)
                     .prepend("Failed to set up TRIGGER eventfd signaling for interrupt INTX-0: ")
             })?;
-        *lock(&self.intx) = Some(intx);
+        *lock(&self.interrupt) = Interrupt::Intx(Intx { pending, irq, notifier });
         Ok(())
+    }
+
+    /// `vfio_msi_disable_common()`.
+    fn msi_disable_common(&self) {
+        drop(self.take_interrupt(|i| matches!(i, Interrupt::Msi(_))));
     }
 }
 
@@ -741,6 +796,9 @@ impl MmioOps for RomOps {
 #[derive(Debug)]
 struct VfioPciOps {
     shared: Arc<Shared>,
+    /// The device itself, for the threads that send its MSI messages.
+    dev: OnceLock<Weak<PciDevice>>,
+    msi_cap_size: u8,
     /// `emulated_config_bits`: the bits QEMU answers itself instead of the device.
     emulated: Vec<u8>,
     pm_cap: u8,
@@ -763,9 +821,69 @@ impl VfioPciOps {
         if usize::from(pin) > PCI_NUM_PINS {
             return Err(Error::generic(format!("invalid PCI interrupt pin {pin}")));
         }
-        self.shared.intx_disable();
+        self.disable_interrupts(dev);
         dev.with_config(|c| c.config[PCI_INTERRUPT_PIN] = pin);
         self.shared.intx_start(dev.allocate_irq())
+    }
+
+    /// `vfio_disable_interrupts()`. Turning MSI off goes back to INTx, so INTx is torn down
+    /// last.
+    fn disable_interrupts(&self, dev: &PciDevice) {
+        let msi = matches!(*lock(&self.shared.interrupt), Interrupt::Msi(_));
+        if msi {
+            self.msi_disable(dev);
+        }
+        self.shared.intx_disable();
+    }
+
+    /// `vfio_msi_enable()`: one eventfd per vector the guest enabled, each sending its vector
+    /// when the kernel signals it.
+    fn msi_enable(&self, dev: &PciDevice) {
+        self.disable_interrupts(dev);
+        let nr = dev.msi_nr_vectors_allocated() as usize;
+        let weak = self.dev.get().cloned().unwrap_or_default();
+        // vfio_msi_interrupt().
+        let notifiers = match Notifiers::new("interrupt", nr, move |i| {
+            if let Some(d) = weak.upgrade() {
+                d.msi_notify(i as u32);
+            }
+        }) {
+            Ok(n) => n,
+            Err(e) => {
+                report_error(&e);
+                error_report("vfio: Error: Failed to enable MSI");
+                return;
+            }
+        };
+        // vfio_enable_vectors().
+        let fds: Vec<_> = (0..nr).map(|i| Some(notifiers.fd(i))).collect();
+        let r = self.shared.device.set_irqs_eventfds(
+            PCI_MSI_IRQ_INDEX,
+            0,
+            IRQ_SET_ACTION_TRIGGER,
+            &fds,
+        );
+        drop(fds);
+        match r {
+            Ok(()) => *lock(&self.shared.interrupt) = Interrupt::Msi(notifiers),
+            Err(e) => {
+                error_report(&format!("vfio: Error: Failed to setup MSI fds: {}", strerror(&e)));
+                drop(notifiers);
+                // Failing to set up MSI is outside any spec, so interrupts stay off in the
+                // hope that the guest falls back to INTx.
+                error_report("vfio: Error: Failed to enable MSI");
+            }
+        }
+    }
+
+    /// `vfio_msi_disable()`: back to INTx.
+    fn msi_disable(&self, dev: &PciDevice) {
+        // vfio_device_irq_disable().
+        let _ = self.shared.device.set_irqs(PCI_MSI_IRQ_INDEX, 0, 0, IRQ_SET_ACTION_TRIGGER);
+        self.shared.msi_disable_common();
+        if let Err(e) = self.intx_enable(dev) {
+            report_error(&e.prepend(format_args!("vfio {}: ", self.shared.name)));
+        }
     }
 
     /// The device in D0, the second half of `vfio_pci_pre_reset()`.
@@ -830,13 +948,30 @@ impl PciDeviceOps for VfioPciOps {
                 self.shared.name
             ));
         }
-        dev.default_write_config(addr, val, len);
+        // MSI enabling and disabling. vfio_update_msi() only moves KVM routes, so a write that
+        // leaves MSI on needs nothing more.
+        let msi_cap = u32::from(dev.msi_cap());
+        if dev.msi_present()
+            && addr < msi_cap + u32::from(self.msi_cap_size)
+            && msi_cap < addr + len
+        {
+            let was_enabled = dev.msi_enabled();
+            dev.default_write_config(addr, val, len);
+            let is_enabled = dev.msi_enabled();
+            if !was_enabled && is_enabled {
+                self.msi_enable(dev);
+            } else if was_enabled && !is_enabled {
+                self.msi_disable(dev);
+            }
+        } else {
+            dev.default_write_config(addr, val, len);
+        }
     }
 
     /// `vfio_pci_reset()`.
     fn reset(&self, dev: &PciDevice) {
-        // vfio_pci_pre_reset(): stop DMA and put INTx Disable in a known state.
-        self.shared.intx_disable();
+        // vfio_pci_pre_reset(): stop interrupts and DMA and put INTx Disable in a known state.
+        self.disable_interrupts(dev);
         let val = self.config_read(dev, PCI_COMMAND as u32, 2);
         if val != u32::MAX {
             let cmd = val as u16
@@ -944,6 +1079,7 @@ pub fn realize(
     match s.run() {
         Ok(ops) => {
             let ops = Arc::new(ops);
+            let _ = ops.dev.set(Arc::downgrade(&dev));
             dev.set_ops(Arc::clone(&ops) as Arc<dyn PciDeviceOps>);
             // vfio_pci_interrupt_setup().
             if let Err(e) = ops.intx_enable(&dev) {
@@ -1016,7 +1152,7 @@ fn populate(
     }
     let shared = Arc::new(Shared {
         name: name.to_string(),
-        intx: Mutex::new(None),
+        interrupt: Mutex::new(Interrupt::None),
         device,
         config_offset: config_info.offset,
         _attachment: attachment,
@@ -1097,6 +1233,8 @@ impl<'a> Setup<'a> {
         }
         Ok(VfioPciOps {
             shared: Arc::clone(&self.shared),
+            dev: OnceLock::new(),
+            msi_cap_size: self.msi_cap_size,
             emulated: std::mem::take(&mut self.emulated),
             pm_cap: self.pm_cap,
             reset_works: self.reset_works,
