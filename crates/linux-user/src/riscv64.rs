@@ -674,6 +674,7 @@ pub(crate) static GUEST: Guest = Guest {
     env_size: ENV_SIZE,
     generic_abi: true,
     abi32: false,
+    eabi: false,
     sa_restorer: false,
     open_flags: &[],
     cpuinfo: Some(cpuinfo),

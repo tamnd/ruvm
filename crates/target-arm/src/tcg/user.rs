@@ -13,8 +13,8 @@ use ruvm_jit::{Cpu, CpuLoopExit, MmuAccessType, Ra};
 
 use super::{Arm, ptw};
 use crate::cpu::{
-    ArmCpuModel, ArmFeatures, CpuArmState, PSTATE_MODE_EL0T, SCTLR_ATA0, SCTLR_DZE, SCTLR_ENDA,
-    SCTLR_ENDB, SCTLR_ENIA, SCTLR_ENIB, SCTLR_UCI, SCTLR_UCT,
+    ARM_CPU_MODE_USR, ArmCpuModel, ArmFeatures, CpuArmState, PSTATE_MODE_EL0T, SCTLR_ATA0,
+    SCTLR_DZE, SCTLR_ENDA, SCTLR_ENDB, SCTLR_ENIA, SCTLR_ENIB, SCTLR_UCI, SCTLR_UCT,
 };
 use crate::syndrome::fsc;
 
@@ -62,6 +62,17 @@ pub fn user_reset(model: &ArmCpuModel) -> CpuArmState {
     // Enable FEAT_MOPS.
     s.sctlr_el[1] |= SCTLR_MSCEN;
     s.rebuild_hflags(f);
+    s
+}
+
+/// The registers of an AArch32 user mode CPU: [`user_reset`] with the CPU in User mode at
+/// AArch32 EL0, in Thumb state when `thumb`. EL1 stays AArch64, so FPEXC.EN does not apply
+/// and the FP instructions are enabled by CPACR_EL1 alone.
+pub fn user_reset_aa32(model: &ArmCpuModel, thumb: bool) -> CpuArmState {
+    let mut s = user_reset(model);
+    s.pstate = ARM_CPU_MODE_USR;
+    s.thumb = u32::from(thumb);
+    s.rebuild_hflags(&model.features);
     s
 }
 

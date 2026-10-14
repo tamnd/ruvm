@@ -144,6 +144,7 @@
 //! - QEMU logs accesses to unknown system registers with `LOG_UNIMP` and illegal exception
 //!   returns with `LOG_GUEST_ERROR`; this crate has no logging and stays silent.
 
+mod a32_helper;
 mod crypto;
 mod gic;
 mod gtimer;
@@ -160,6 +161,7 @@ mod sve_fp;
 mod sve_helper;
 mod sysreg;
 mod translate;
+mod translate_a32;
 pub mod user;
 mod vec_helper;
 mod vfp;
@@ -178,14 +180,14 @@ use ruvm_jit_interp::HelperRegistry;
 use ruvm_mem::{AddressSpace, MemTxAttrs, MemTxResult};
 
 use crate::cpu::{
-    ArmCpuModel, ArmFeatures, CpuArmState, ENV_SIZE, EXCP_BKPT, EXCP_DATA_ABORT, EXCP_FIQ,
-    EXCP_GPC, EXCP_HVC, EXCP_HYP_TRAP, EXCP_IRQ, EXCP_PREFETCH_ABORT, EXCP_SEMIHOST, EXCP_SMC,
-    EXCP_SWI, EXCP_UDEF, EXCP_VFIQ, EXCP_VIRQ, EXCP_VSERR, HCR_AMO, HCR_E2H, HCR_FMO, HCR_IMO,
-    HCR_TGE, HCR_VF, HCR_VI, HCR_VSE, HFLAGS, MMU_IDX_E2, MMU_IDX_E3, MMU_IDX_E10_1,
-    MMU_IDX_E10_1_PAN, MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NB_MMU_MODES, PC, PSTATE_A, PSTATE_DAIF,
-    PSTATE_F, PSTATE_I, PSTATE_IL, PSTATE_PAN, PSTATE_SP, PSTATE_SSBS, PSTATE_TCO, PSTATE_UAO,
-    SCR_EA, SCR_FIQ, SCR_IRQ, SCTLR_A, SCTLR_DSSBS_64, SCTLR_ENDA, SCTLR_ENDB, SCTLR_ENIA,
-    SCTLR_ENIB, SCTLR_SPAN, SCTLR_TCF, SCTLR_TCF0,
+    ArmCpuModel, ArmFeatures, CONDEXEC_BITS, CPSR_E, CpuArmState, ENV_SIZE, EXCP_BKPT,
+    EXCP_DATA_ABORT, EXCP_FIQ, EXCP_GPC, EXCP_HVC, EXCP_HYP_TRAP, EXCP_IRQ, EXCP_PREFETCH_ABORT,
+    EXCP_SEMIHOST, EXCP_SMC, EXCP_SWI, EXCP_UDEF, EXCP_VFIQ, EXCP_VIRQ, EXCP_VSERR, HCR_AMO,
+    HCR_E2H, HCR_FMO, HCR_IMO, HCR_TGE, HCR_VF, HCR_VI, HCR_VSE, HFLAGS, MMU_IDX_E2, MMU_IDX_E3,
+    MMU_IDX_E10_1, MMU_IDX_E10_1_PAN, MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NB_MMU_MODES, PC, PSTATE_A,
+    PSTATE_DAIF, PSTATE_F, PSTATE_I, PSTATE_IL, PSTATE_PAN, PSTATE_SP, PSTATE_SSBS, PSTATE_TCO,
+    PSTATE_UAO, SCR_EA, SCR_FIQ, SCR_IRQ, SCTLR_A, SCTLR_DSSBS_64, SCTLR_ENDA, SCTLR_ENDB,
+    SCTLR_ENIA, SCTLR_ENIB, SCTLR_SPAN, SCTLR_TCF, SCTLR_TCF0, THUMB,
 };
 use crate::syndrome::{EC_ADVSIMDFPACCESSTRAP, fsc, syn_get_ec, syn_serror};
 
@@ -236,6 +238,11 @@ pub const TB_MTE_ACTIVE: u32 = 1 << 25;
 pub const TB_MTE0_ACTIVE: u32 = 1 << 26;
 /// TB flags: the shift of the two TCMA bits of the regime (`TCMA`).
 pub const TB_TCMA_SHIFT: u32 = 27;
+/// TB flags: the block is AArch32 code. The other A64 only flags are then clear, and the
+/// Thumb and IT state are in `cs_base`.
+pub const TB_AARCH32: u32 = 1 << 31;
+/// TB flags: AArch32 data accesses are big endian, CPSR.E (`BE_DATA`).
+pub const TB_BE_DATA: u32 = 1 << 30;
 
 /// `CPU_INTERRUPT_FIQ`.
 pub const INTERRUPT_FIQ: u32 = 0x0010;
@@ -777,6 +784,9 @@ pub(crate) fn tbi_bits(tcr: u64, mmu_idx: usize) -> (u32, u32) {
 
 /// The TB flags of a state, the parts of `rebuild_hflags_a64()` this port uses.
 pub(crate) fn tb_flags(f: &ArmFeatures, st: &CpuArmState) -> u32 {
+    if !st.is_a64() {
+        return tb_flags_a32(f, st);
+    }
     let el = st.current_el();
     let mmu_idx = st.mmu_idx(f);
     let hcr = st.hcr_el2_eff(f);
@@ -829,6 +839,24 @@ pub(crate) fn tb_flags(f: &ArmFeatures, st: &CpuArmState) -> u32 {
         flags |= sve_el << TB_SVEEXC_EL_SHIFT;
     }
     flags | (tbii << TB_TBII_SHIFT) | (tbid << TB_TBID_SHIFT) | (fp_el << TB_FPEXC_EL_SHIFT)
+}
+
+/// The TB flags of an AArch32 state, the parts of `rebuild_hflags_a32()` this port uses.
+/// EL1 is AArch64, so the FP instructions are enabled (`VFPEN`) unless CPACR_EL1 traps them.
+fn tb_flags_a32(f: &ArmFeatures, st: &CpuArmState) -> u32 {
+    let el = st.current_el();
+    let mmu_idx = st.mmu_idx(f);
+    let mut flags = TB_AARCH32 | el | ((mmu_idx as u32) << TB_MMUIDX_SHIFT);
+    if st.pstate & PSTATE_IL != 0 {
+        flags |= TB_PSTATE_IL;
+    }
+    if st.sctlr_el[regime_el(mmu_idx) as usize] & SCTLR_A != 0 {
+        flags |= TB_ALIGN_MEM;
+    }
+    if st.pstate & CPSR_E != 0 {
+        flags |= TB_BE_DATA;
+    }
+    flags | (fp_exception_el(f, st) << TB_FPEXC_EL_SHIFT)
 }
 
 /// The MTE part of `rebuild_hflags_a64()`.
@@ -1168,6 +1196,10 @@ impl Arm {
 impl CpuOps for Arm {
     fn translate_code(&self, cpu: &mut Cpu<'_>, tb: &mut TbBuild) -> Result<(), CpuLoopExit> {
         let semihosting = self.semihost.as_ref().map(|s| s.userspace);
+        if tb.flags & TB_AARCH32 != 0 {
+            let mut dc = translate_a32::DisasContext::new(&self.model);
+            return translator_loop(cpu, tb, &mut dc);
+        }
         let mut dc = translate::DisasContext::new(&self.model, semihosting);
         translator_loop(cpu, tb, &mut dc)
     }
@@ -1182,11 +1214,20 @@ impl CpuOps for Arm {
             let want = tb_flags(self.features(), &st);
             assert_eq!(flags, want, "stale hflags {flags:#x}, want {want:#x} at pc {:#x}", st.pc);
         }
-        TbCpuState { pc: ld64(cpu.env, PC), flags, cflags: 0, cs_base: 0 }
+        let mut cs_base = 0;
+        if flags & TB_AARCH32 != 0 {
+            // QEMU keeps these in the AM32 flags.
+            cs_base = u64::from(ld32(cpu.env, THUMB) | (ld32(cpu.env, CONDEXEC_BITS) << 1));
+        }
+        TbCpuState { pc: ld64(cpu.env, PC), flags, cflags: 0, cs_base }
     }
 
-    fn restore_state_to_opc(&self, cpu: &mut Cpu<'_>, _tb: &Tb, data: &[u64; 3]) {
+    fn restore_state_to_opc(&self, cpu: &mut Cpu<'_>, tb: &Tb, data: &[u64; 3]) {
         st64(cpu.env, PC, data[0]);
+        if tb.flags & TB_AARCH32 != 0 {
+            let condexec = data[1] as u32;
+            cpu.env[CONDEXEC_BITS..CONDEXEC_BITS + 4].copy_from_slice(&condexec.to_le_bytes());
+        }
     }
 
     fn set_pc(&self, cpu: &mut Cpu<'_>, pc: u64) {

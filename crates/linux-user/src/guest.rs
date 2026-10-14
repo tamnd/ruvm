@@ -25,6 +25,10 @@ pub(crate) struct Guest {
     /// `TARGET_ABI32`: pointers and longs are 32 bits, so `struct iovec` and the `execve()`
     /// arrays are too.
     pub(crate) abi32: bool,
+    /// The ARM EABI, QEMU's `env->eabi`: 64-bit arguments start at an even register
+    /// (`regpairs_aligned()`), and `struct stat64`, `struct flock64` and `struct epoll_event`
+    /// align their 64-bit members to 8 bytes.
+    pub(crate) eabi: bool,
     /// Whether `struct sigaction` has `sa_restorer`, `TARGET_ARCH_HAS_SA_RESTORER`.
     pub(crate) sa_restorer: bool,
     /// The `O_` flags whose target value differs from the host's, as `(target, host)`.
