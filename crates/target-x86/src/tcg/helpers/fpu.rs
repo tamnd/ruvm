@@ -2465,6 +2465,33 @@ fn h_xrstor(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
 // The user mode signal frame, `cpu_x86_fxsave()` and friends: the same state to and from guest
 // memory at `ptr`, outside of any helper. A fault is the frame's, not an instruction's.
 
+/// `cpu_x86_fsave()`: the 32-bit FSAVE image, which leaves the FPU initialized.
+pub(crate) fn user_fsave(cpu: &mut Cpu<'_>, ptr: u64) -> R<()> {
+    let ac = Access::prepare_ra(cpu, ptr, 28 + 80, MmuAccessType::DataStore, Ra::None)?;
+    fstenv(cpu, &ac, ptr, 1)?;
+    let mut p = ptr.wrapping_add(28);
+    for i in 0..8 {
+        let x = get(cpu.env, i);
+        ac.stt(cpu, p, x)?;
+        p = p.wrapping_add(10);
+    }
+    fninit(cpu.env);
+    Ok(())
+}
+
+/// `cpu_x86_frstor()`.
+pub(crate) fn user_frstor(cpu: &mut Cpu<'_>, ptr: u64) -> R<()> {
+    let ac = Access::prepare_ra(cpu, ptr, 28 + 80, MmuAccessType::DataLoad, Ra::None)?;
+    fldenv(cpu, &ac, ptr, 1)?;
+    let mut p = ptr.wrapping_add(28);
+    for i in 0..8 {
+        let x = ac.ldt(cpu, p)?;
+        set(cpu.env, i, x);
+        p = p.wrapping_add(10);
+    }
+    Ok(())
+}
+
 /// `cpu_x86_fxsave()`.
 pub(crate) fn user_fxsave(cpu: &mut Cpu<'_>, ptr: u64) -> R<()> {
     let ac = Access::prepare_ra(cpu, ptr, LEGACY_SIZE, MmuAccessType::DataStore, Ra::None)?;

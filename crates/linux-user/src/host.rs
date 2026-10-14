@@ -223,6 +223,11 @@ pub(crate) fn online_cpus() -> u64 {
     std::fs::read_to_string("/sys/devices/system/cpu/online").map_or(1, |s| count_cpus(&s))
 }
 
+/// `sysconf(_SC_NPROCESSORS_CONF)`, which glibc counts from `/sys/devices/system/cpu/possible`.
+pub(crate) fn configured_cpus() -> u64 {
+    std::fs::read_to_string("/sys/devices/system/cpu/possible").map_or(1, |s| count_cpus(&s))
+}
+
 /// The CPUs in a sysfs list such as `0-3,8,10-11`, at least one.
 fn count_cpus(list: &str) -> u64 {
     let mut n = 0;

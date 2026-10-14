@@ -981,6 +981,7 @@ pub(crate) static GUEST: Guest = Guest {
     minsigstksz: 2048,
     env_size: ENV_SIZE,
     generic_abi: true,
+    abi32: false,
     sa_restorer: true,
     // O_DIRECTORY, O_NOFOLLOW, O_DIRECT and O_LARGEFILE.
     open_flags: &[
@@ -1040,7 +1041,13 @@ impl start::Target for Target {
 
     fn arch(&self) -> Arch {
         let (h, h2) = hwcaps(self.model());
-        Arch { machine: EM_AARCH64, platform: Some("aarch64"), hwcap: h, hwcap2: Some(h2) }
+        Arch {
+            machines: &[EM_AARCH64],
+            elf32: false,
+            platform: Some("aarch64"),
+            hwcap: h,
+            hwcap2: Some(h2),
+        }
     }
 
     fn new_jit(&self, config: &dyn Fn(&mut JitConfig)) -> Arc<Jit> {

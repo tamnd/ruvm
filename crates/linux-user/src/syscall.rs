@@ -49,7 +49,7 @@ mod nr {
 
 /// What a system call argument is.
 #[derive(Clone, Copy, Debug)]
-enum A {
+pub(crate) enum A {
     /// A value, passed as it is.
     V,
     /// A string the kernel reads, NULL allowed.
@@ -78,7 +78,7 @@ enum A {
     F(usize),
 }
 
-use A::*;
+pub(crate) use A::*;
 
 /// The arguments of the system calls that go to the host as they are, once their pointers
 /// are checked.
@@ -301,7 +301,7 @@ impl Proc {
     }
 
     /// The host address of `len` bytes at `addr` with the page bits `need`; NULL stays NULL.
-    fn buf(&self, addr: u64, len: u64, need: u32) -> Result<u64, i64> {
+    pub(crate) fn buf(&self, addr: u64, len: u64, need: u32) -> Result<u64, i64> {
         if addr == 0 {
             return Ok(0);
         }
@@ -311,7 +311,7 @@ impl Proc {
         Ok(self.space.g2h(addr) as u64)
     }
 
-    fn get_u32(&self, addr: u64) -> Result<u32, i64> {
+    pub(crate) fn get_u32(&self, addr: u64) -> Result<u32, i64> {
         let mut b = [0u8; 4];
         if self.space.read(addr, &mut b) { Ok(u32::from_le_bytes(b)) } else { Err(-EFAULT) }
     }
@@ -326,14 +326,14 @@ impl Proc {
     }
 
     /// A string argument, NUL terminated for the host.
-    fn cstr(&self, addr: u64) -> Result<Vec<u8>, i64> {
+    pub(crate) fn cstr(&self, addr: u64) -> Result<Vec<u8>, i64> {
         let mut s = self.space.read_cstr(addr, PATH_MAX).ok_or(-EFAULT)?;
         s.push(0);
         Ok(s)
     }
 
     /// Runs a call of [`spec`].
-    fn generic(&self, n: i64, args: [u64; 6], spec: &[A]) -> i64 {
+    pub(crate) fn generic(&self, n: i64, args: [u64; 6], spec: &[A]) -> i64 {
         match self.generic_inner(n, args, spec) {
             Ok(r) | Err(r) => r,
         }
@@ -478,8 +478,7 @@ fn iovecs(p: &Proc, addr: u64, cnt: u64, write: bool) -> Result<Vec<[u64; 2]>, i
     let mut v = Vec::with_capacity(cnt as usize);
     let mut bad = false;
     for i in 0..cnt {
-        let base = p.get_u64(addr + 16 * i)?;
-        let len = p.get_u64(addr + 16 * i + 8)?;
+        let (base, len) = iovec(p, addr, i)?;
         if len as i64 & i64::MIN != 0 {
             return Err(-EINVAL);
         }
@@ -500,6 +499,19 @@ fn iovecs(p: &Proc, addr: u64, cnt: u64, write: bool) -> Result<Vec<[u64; 2]>, i
     Ok(v)
 }
 
+/// The `struct iovec` `i` of the array at `addr`, with the guest's word size.
+fn iovec(p: &Proc, addr: u64, i: u64) -> Result<(u64, u64), i64> {
+    if guest().abi32 {
+        let at = addr.wrapping_add(8 * i);
+        // iov_len is a signed long there too.
+        let len = p.get_u32(at.wrapping_add(4))? as i32;
+        Ok((u64::from(p.get_u32(at)?), i64::from(len) as u64))
+    } else {
+        let at = addr.wrapping_add(16 * i);
+        Ok((p.get_u64(at)?, p.get_u64(at.wrapping_add(8))?))
+    }
+}
+
 /// `readv()`, `writev()` and their positioned forms: `iov` is argument 1, the count argument 2.
 fn do_iov(p: &Proc, n: i64, a: [u64; 6], write_mem: bool) -> i64 {
     let v = match iovecs(p, a[1], a[2], write_mem) {
@@ -515,7 +527,7 @@ fn do_iov(p: &Proc, n: i64, a: [u64; 6], write_mem: bool) -> i64 {
             if left == 0 {
                 break;
             }
-            let base = p.get_u64(a[1] + 16 * i).unwrap_or(0);
+            let base = iovec(p, a[1], i).map_or(0, |(b, _)| b);
             let l = v[i as usize][1].min(left);
             p.space.notify_write(base, l);
             left -= l;
@@ -531,15 +543,16 @@ fn str_array(p: &Proc, mut addr: u64, keep: &mut Vec<Vec<u8>>) -> Result<Vec<u64
         v.push(0);
         return Ok(v);
     }
+    let abi32 = guest().abi32;
     loop {
-        let s = p.get_u64(addr)?;
+        let s = if abi32 { u64::from(p.get_u32(addr)?) } else { p.get_u64(addr)? };
         if s == 0 {
             break;
         }
         let c = p.cstr(s)?;
         v.push(c.as_ptr() as u64);
         keep.push(c);
-        addr += 8;
+        addr += if abi32 { 4 } else { 8 };
     }
     v.push(0);
     Ok(v)
@@ -906,7 +919,7 @@ fn do_uname(p: &Proc, a: [u64; 6]) -> i64 {
 
 /// `setrlimit()` and `prlimit64()`: the limits that would bind the emulator rather than the
 /// program are not set.
-fn ignored_rlimit(res: u64) -> bool {
+pub(crate) fn ignored_rlimit(res: u64) -> bool {
     res == libc::RLIMIT_AS as u64
         || res == libc::RLIMIT_DATA as u64
         || res == libc::RLIMIT_STACK as u64

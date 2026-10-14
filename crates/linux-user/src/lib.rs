@@ -11,7 +11,9 @@
 //! - `start` is `main()`, the same for every target.
 //! - `x86_64` and `aarch64` are the targets: the CPU state a program starts with,
 //!   `cpu_loop()`, the signal frames and what else differs between them, behind `guest`.
-//!   `generic` numbers the system calls of aarch64 as the host does.
+//!   `generic` numbers the system calls of aarch64 as the host does. `i386` is the 32-bit
+//!   x86 target, whose system calls `compat` converts to the host's, as the kernel's compat
+//!   layer does.
 //!
 //! The guest's address space is one reservation of host memory ([`ruvm_user_common::GuestSpace`])
 //! with guest address `g` at offset `g`, always mapped readable and writable on the host.
@@ -19,9 +21,9 @@
 //! flags, and every pointer a system call passes to the host kernel is checked against them and
 //! against the size of the reservation first, so the kernel only ever sees memory inside it.
 //!
-//! What this version runs: x86_64 and aarch64 programs on an x86_64 Linux host, static or
-//! dynamic, threaded or not, with the system calls of files, memory, processes, time and signals. The
-//! differences from QEMU are:
+//! What this version runs: x86_64, aarch64, riscv64 and i386 programs on an x86_64 Linux host,
+//! static or dynamic, threaded or not, with the system calls of files, memory, processes, time
+//! and signals. The differences from QEMU are:
 //!
 //! - There is no vDSO; the C library falls back to system calls.
 //! - Signals are delivered as QEMU delivers them: host signals are queued and run on the
@@ -44,8 +46,11 @@
 //!   FPMR signal frame records, and `rt_sigreturn()` keeps the program at EL0t whatever the
 //!   frame says. Handlers without `SA_RESTORER` return through a page QEMU maps when it has
 //!   no vDSO.
+//! - i386 programs cannot set signal handlers yet: `rt_sigaction()`, `sigaltstack()` and the
+//!   old signal calls are `ENOSYS`, as are the socket, System V IPC, POSIX timer and message
+//!   queue calls, `vm86()` and `modify_ldt()`.
 //! - The guest space is a 64 TiB reservation, as QEMU lays it out with `-R`, so addresses
-//!   differ from QEMU's default layout.
+//!   differ from QEMU's default layout. For i386 it is the whole 4 GiB, as in QEMU.
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod elf;
@@ -54,6 +59,8 @@ pub mod opts;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod aarch64;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod compat;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod gdb;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod generic;
@@ -61,6 +68,8 @@ mod generic;
 mod guest;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod host;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod i386;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod procfs;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -103,6 +112,7 @@ pub fn run(target: &str, argv0: &str, args: &[String]) -> Option<ExitCode> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     match target {
         "x86_64" => return Some(start::main(argv0, args, &mut x86_64::Target::default())),
+        "i386" => return Some(start::main(argv0, args, &mut i386::Target::default())),
         "aarch64" => return Some(start::main(argv0, args, &mut aarch64::Target::default())),
         "riscv64" => return Some(start::main(argv0, args, &mut riscv64::Target::default())),
         _ => {}

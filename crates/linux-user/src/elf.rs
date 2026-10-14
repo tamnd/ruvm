@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! The ELF loader, `linux-user/elfload.c`: `load_elf_image()`, `load_elf_binary()`,
-//! `setup_arg_pages()`, `copy_elf_strings()` and `create_elf_tables()` for a 64-bit little
-//! endian guest.
+//! `setup_arg_pages()`, `copy_elf_strings()` and `create_elf_tables()` for a little endian
+//! guest, 64-bit or 32-bit.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -27,15 +27,19 @@ const PF_W: u32 = 2;
 /// `PF_R`.
 const PF_R: u32 = 4;
 /// `sizeof(struct elf64_phdr)`.
-const PHENT: u64 = 56;
+const PHENT64: u64 = 56;
+/// `sizeof(struct elf32_phdr)`.
+const PHENT32: u64 = 32;
 /// `STACK_LOWER_LIMIT`: the smallest stack, 32 pages.
 const STACK_LOWER_LIMIT: u64 = 32 * PAGE_SIZE;
 
 /// What a target tells the loader, `ELF_MACHINE` and friends.
 #[derive(Clone, Copy, Debug)]
 pub struct Arch {
-    /// `ELF_MACHINE`.
-    pub machine: u16,
+    /// The machines `elf_check_machine()` takes, `ELF_MACHINE` first.
+    pub machines: &'static [u16],
+    /// `ELF_CLASS` is `ELFCLASS32`: the headers and the auxiliary vector have 32-bit words.
+    pub elf32: bool,
     /// `ELF_PLATFORM`, if the target has one.
     pub platform: Option<&'static str>,
     /// `ELF_HWCAP`.
@@ -91,6 +95,8 @@ struct Ehdr {
     e_entry: u64,
     e_phoff: u64,
     e_phnum: u16,
+    /// `e_phentsize`, which the loader requires to be the class's.
+    phent: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -136,35 +142,68 @@ fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> Result<(), String> {
 /// `elf_check_ident()` and `elf_check_ehdr()`, then the header.
 fn read_ehdr(f: &File, arch: &Arch) -> Result<Ehdr, String> {
     let mut b = [0u8; 64];
-    read_exact_at(f, &mut b, 0)?;
-    // ELFCLASS64, ELFDATA2LSB, EV_CURRENT.
-    if !is_elf(&b) || b[4] != 2 || b[5] != 1 || b[6] != 1 {
+    let len = if arch.elf32 { 52 } else { 64 };
+    read_exact_at(f, &mut b[..len], 0)?;
+    // ELFCLASS32 or ELFCLASS64, ELFDATA2LSB, EV_CURRENT.
+    let class = if arch.elf32 { 1 } else { 2 };
+    if !is_elf(&b) || b[4] != class || b[5] != 1 || b[6] != 1 {
         return Err(INVALID.into());
     }
     let e_type = u16_at(&b, 16);
     let machine = u16_at(&b, 18);
-    let phentsize = u16_at(&b, 54);
-    if machine != arch.machine
-        || phentsize as u64 != PHENT
+    let eh = if arch.elf32 {
+        Ehdr {
+            e_type,
+            e_entry: u32_at(&b, 24).into(),
+            e_phoff: u32_at(&b, 28).into(),
+            e_phnum: u16_at(&b, 44),
+            phent: PHENT32,
+        }
+    } else {
+        Ehdr {
+            e_type,
+            e_entry: u64_at(&b, 24),
+            e_phoff: u64_at(&b, 32),
+            e_phnum: u16_at(&b, 56),
+            phent: PHENT64,
+        }
+    };
+    let phentsize = u16_at(&b, if arch.elf32 { 42 } else { 54 });
+    if !arch.machines.contains(&machine)
+        || u64::from(phentsize) != eh.phent
         || (e_type != ET_EXEC && e_type != ET_DYN)
     {
         return Err(INVALID.into());
     }
-    Ok(Ehdr { e_type, e_entry: u64_at(&b, 24), e_phoff: u64_at(&b, 32), e_phnum: u16_at(&b, 56) })
+    Ok(eh)
 }
 
 fn read_phdrs(f: &File, eh: &Ehdr) -> Result<Vec<Phdr>, String> {
-    let mut b = vec![0u8; eh.e_phnum as usize * PHENT as usize];
+    let mut b = vec![0u8; eh.e_phnum as usize * eh.phent as usize];
     read_exact_at(f, &mut b, eh.e_phoff)?;
-    Ok(b.chunks_exact(PHENT as usize)
-        .map(|p| Phdr {
-            p_type: u32_at(p, 0),
-            p_flags: u32_at(p, 4),
-            p_offset: u64_at(p, 8),
-            p_vaddr: u64_at(p, 16),
-            p_filesz: u64_at(p, 32),
-            p_memsz: u64_at(p, 40),
-            p_align: u64_at(p, 48),
+    Ok(b.chunks_exact(eh.phent as usize)
+        .map(|p| {
+            if eh.phent == PHENT32 {
+                Phdr {
+                    p_type: u32_at(p, 0),
+                    p_flags: u32_at(p, 24),
+                    p_offset: u32_at(p, 4).into(),
+                    p_vaddr: u32_at(p, 8).into(),
+                    p_filesz: u32_at(p, 16).into(),
+                    p_memsz: u32_at(p, 20).into(),
+                    p_align: u32_at(p, 28).into(),
+                }
+            } else {
+                Phdr {
+                    p_type: u32_at(p, 0),
+                    p_flags: u32_at(p, 4),
+                    p_offset: u64_at(p, 8),
+                    p_vaddr: u64_at(p, 16),
+                    p_filesz: u64_at(p, 32),
+                    p_memsz: u64_at(p, 40),
+                    p_align: u64_at(p, 48),
+                }
+            }
         })
         .collect())
 }
@@ -367,8 +406,9 @@ fn copy_elf_strings(space: &GuestSpace, strings: &[Vec<u8>], p: u64, limit: u64)
     Some(at)
 }
 
-fn put_u64(space: &GuestSpace, addr: u64, v: u64) {
-    space.write_raw(addr, &v.to_le_bytes());
+/// Stores the `n`-byte word `v` at `addr`.
+fn put_word(space: &GuestSpace, addr: u64, v: u64, n: u64) {
+    space.write_raw(addr, &v.to_le_bytes()[..n as usize]);
 }
 
 /// The program's credentials and random bytes, what `create_elf_tables()` asks the host for.
@@ -396,14 +436,14 @@ fn create_elf_tables(
     interp: Option<&ImageInfo>,
     creds: &Creds,
 ) -> u64 {
-    const N: u64 = 8;
+    let n = if arch.elf32 { 4 } else { 8 };
     let argc = argv.len() as u64;
     let envc = envp.len() as u64;
     let mut sp = p;
     let mut u_platform = 0;
     if let Some(plat) = arch.platform {
         let len = plat.len() as u64 + 1;
-        sp -= (len + N - 1) & !(N - 1);
+        sp -= (len + n - 1) & !(n - 1);
         u_platform = sp;
         let mut b = plat.as_bytes().to_vec();
         b.push(0);
@@ -422,22 +462,22 @@ fn create_elf_tables(
     if arch.hwcap2.is_some() {
         size += 2;
     }
-    info.auxv_len = size * N;
+    info.auxv_len = size * n;
     size += envc + argc + 2;
     size += 1;
-    size *= N;
+    size *= n;
     let u_argc = (sp - size) & !15;
-    let u_argv = u_argc + N;
-    let u_envp = u_argv + (argc + 1) * N;
-    let mut u_auxv = u_envp + (envc + 1) * N;
+    let u_argv = u_argc + n;
+    let u_envp = u_argv + (argc + 1) * n;
+    let mut u_auxv = u_envp + (envc + 1) * n;
     info.saved_auxv = u_auxv;
     let mut aux = |id: u64, v: u64| {
-        put_u64(space, u_auxv, id);
-        put_u64(space, u_auxv + N, v);
-        u_auxv += 2 * N;
+        put_word(space, u_auxv, id, n);
+        put_word(space, u_auxv + n, v, n);
+        u_auxv += 2 * n;
     };
     aux(3, info.phdr_addr); // AT_PHDR
-    aux(4, PHENT); // AT_PHENT
+    aux(4, if arch.elf32 { PHENT32 } else { PHENT64 }); // AT_PHENT
     aux(5, info.phnum); // AT_PHNUM
     aux(6, PAGE_SIZE); // AT_PAGESZ
     aux(7, interp.map_or(0, |i| i.load_addr)); // AT_BASE
@@ -460,14 +500,14 @@ fn create_elf_tables(
     }
     aux(0, 0); // AT_NULL
 
-    put_u64(space, u_argc, argc);
+    put_word(space, u_argc, argc, n);
     let strings = |mut at: u64, mut s: u64, list: &[Vec<u8>]| {
         for item in list {
-            put_u64(space, at, s);
-            at += N;
+            put_word(space, at, s, n);
+            at += n;
             s += item.len() as u64 + 1;
         }
-        put_u64(space, at, 0);
+        put_word(space, at, 0, n);
     };
     strings(u_argv, info.arg_start, argv);
     strings(u_envp, info.env_start, envp);

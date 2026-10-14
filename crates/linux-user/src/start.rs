@@ -27,6 +27,11 @@ pub(crate) trait Target {
     fn name(&self) -> &'static str;
     /// `TASK_UNMAPPED_BASE` and `ELF_ET_DYN_BASE`.
     fn layout(&self) -> (u64, u64);
+    /// `MAX_RESERVED_VA + 1` for a guest with 32-bit addresses, which `main()` reserves
+    /// whole when `-R` does not say; 0 for no limit.
+    fn max_reserve(&self) -> u64 {
+        0
+    }
     /// `cpu_create()` of the model `-cpu` names, with its features.
     fn select_cpu(&mut self, cpu: &str) -> Result<(), String>;
     /// `ELF_MACHINE`, `ELF_PLATFORM` and the hardware capabilities of the model.
@@ -131,8 +136,16 @@ pub(crate) fn main(argv0: &str, args: &[String], target: &mut dyn Target) -> Exi
         return ExitCode::FAILURE;
     }
 
-    let want =
-        if o.reserved_va != 0 { o.reserved_va } else { ruvm_user_common::space::DEFAULT_RESERVE };
+    let max = target.max_reserve();
+    if max != 0 && o.reserved_va > max {
+        eprintln!("Reserved virtual address too big");
+        return ExitCode::FAILURE;
+    }
+    let want = match (o.reserved_va, max) {
+        (0, 0) => ruvm_user_common::space::DEFAULT_RESERVE,
+        (0, max) => max,
+        (r, _) => r,
+    };
     let (unmapped_base, et_dyn_base) = target.layout();
     let space = match GuestSpace::new(want, unmapped_base, et_dyn_base) {
         Ok(s) => Arc::new(s),
