@@ -92,18 +92,8 @@ pub(crate) fn recalc(arm: &Arm, cpu: &Cpu<'_>, st: &mut CpuArmState, timer: usiz
         let cval = st.gt_cval[timer];
         let istatus = count.wrapping_sub(offset) >= cval;
         st.gt_ctl[timer] = (ctl & !4) | (u64::from(istatus) << 2);
-        let nexttick = if istatus {
-            // Next transition is when (count - offset) rolls back over to 0. If offset >
-            // count then this is when count == offset; if offset <= count then this is
-            // when count wraps around 2^64, which is never.
-            if offset > count { Some(offset) } else { None }
-        } else {
-            // Next transition is when (count - offset) == cval, i.e. when count == (cval
-            // + offset). If that would overflow, then again we set up the next timer for
-            // the distant future.
-            cval.checked_add(offset)
-        };
-        deadline = nexttick.and_then(|t| arm.counter_deadline(st.cntfrq_el0, t));
+        deadline = nexttick(count, offset, cval, istatus)
+            .and_then(|t| arm.counter_deadline(st.cntfrq_el0, t));
     } else {
         // Timer disabled: ISTATUS and timer output always clear.
         st.gt_ctl[timer] = ctl & !4;
@@ -111,6 +101,33 @@ pub(crate) fn recalc(arm: &Arm, cpu: &Cpu<'_>, st: &mut CpuArmState, timer: usiz
     if let Some(board) = &arm.board {
         board.gt_timer_update(cpu.core.shared(), timer, level(st, timer), deadline);
     }
+}
+
+/// The count at which the output of an enabled timer next changes, or `None` for never.
+fn nexttick(count: u64, offset: u64, cval: u64, istatus: bool) -> Option<u64> {
+    if istatus {
+        // Next transition is when (count - offset) rolls back over to 0. If offset > count
+        // then this is when count == offset; if offset <= count then this is when count
+        // wraps around 2^64, which is never.
+        if offset > count { Some(offset) } else { None }
+    } else {
+        // Next transition is when (count - offset) == cval, i.e. when count == (cval +
+        // offset). If that would overflow, then again we set up the next timer for the
+        // distant future.
+        cval.checked_add(offset)
+    }
+}
+
+/// When `timer` next needs recalculating, in nanoseconds of the counter's time base, or -1
+/// when it is off or will not change: the expiry time of QEMU's `gt_timer[timer]`.
+pub(crate) fn expiry_ns(arm: &Arm, st: &CpuArmState, timer: usize) -> i64 {
+    if st.gt_ctl[timer] & 1 == 0 || st.cntfrq_el0 == 0 {
+        return -1;
+    }
+    let (offset, count, cval) = (indirect_offset(st, timer), count(arm, st), st.gt_cval[timer]);
+    nexttick(count, offset, cval, count.wrapping_sub(offset) >= cval)
+        .and_then(|t| i64::try_from(u128::from(t) * 1_000_000_000 / u128::from(st.cntfrq_el0)).ok())
+        .unwrap_or(-1)
 }
 
 /// The timer output: ISTATUS and ENABLE with IMASK clear.

@@ -148,6 +148,7 @@ mod crypto;
 mod gic;
 mod gtimer;
 mod helpers;
+pub mod migrate;
 mod mte;
 mod pauth;
 mod pmu;

@@ -3,8 +3,8 @@
 //! The migration sections of an Arm board, in QEMU's stream format.
 //!
 //! [`virt_savevm`] registers the sections of `virt` the way QEMU 11.1 lays them out. So far
-//! these are the `timer` section, RAM and `globalstate`; the CPUs, the GIC and the devices
-//! are not registered yet.
+//! these are the `timer` section, RAM, the vCPUs and `globalstate`; the flash contents, the
+//! GIC and the devices are not registered yet.
 //!
 //! The device sections carry the state field by field, as QEMU 11.1's `VMStateDescription`
 //! for it does: the PL011 UART (hw/char/pl011.c and hw/core/clock-vmstate.c), the PL031 RTC
@@ -31,6 +31,8 @@ use ruvm_vmstate::info::Timer;
 use ruvm_vmstate::{VmStateDescription, VmStateField};
 
 use crate::tcg_run::VirtTcgMachine;
+
+mod cpu;
 
 /// The registered sections of a machine and the handles the migration code needs.
 #[derive(Debug)]
@@ -73,8 +75,35 @@ pub fn virt_savevm(
     savevm.register_live(EntryInfo::new("ram", 4).instance(0), ram);
     // "dirty-bitmap": ruvm has no block dirty bitmaps to migrate.
     savevm.reserve_section_id();
+    // The two "pflash_cfi01" sections, which ruvm does not send yet.
+    savevm.reserve_section_id();
+    savevm.reserve_section_id();
+    register_cpus(&mut savevm, machine);
     let global_state = GlobalState::register(&mut savevm);
     ArmMigration { savevm, ram_stats, global_state }
+}
+
+/// The `cpu_common` and `cpu` sections of each vCPU.
+fn register_cpus(savevm: &mut SaveVm, machine: &VirtTcgMachine) {
+    for shared in machine.vcpus().cpus() {
+        let index = shared.cpu_index as u32;
+        let (get, put) = (Arc::clone(shared), Arc::clone(shared));
+        savevm.register_vmsd(
+            "",
+            Some(index),
+            &cpu::VMSTATE_CPU_COMMON,
+            move || cpu::get_common(&get),
+            move |c| cpu::put_common(&put, c),
+        );
+        let (get, put) = (Arc::clone(shared), Arc::clone(shared));
+        savevm.register_vmsd(
+            "",
+            Some(index),
+            &cpu::VMSTATE_ARM_CPU,
+            move || cpu::get_cpu(&get),
+            move |c| cpu::put_cpu(&put, c),
+        );
+    }
 }
 
 /// The RAM hooks of a TCG machine. The dirty bitmaps are set by the TLB's not-dirty path, so

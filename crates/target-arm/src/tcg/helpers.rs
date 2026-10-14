@@ -372,7 +372,7 @@ fn h_exception_return(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> 
 
 /// `daif_check()`: a DAIF update from EL0 is allowed only if SCTLR.UMA is set.
 fn daif_check(cpu: &mut Cpu<'_>, op: u32, imm: u32) -> R<()> {
-    let st = CpuArmState::load(cpu.env);
+    let st = CpuArmState::load_system(cpu.env);
     let ops = cpu.ops();
     if st.current_el() == 0 && sysreg::sctlr_el0(arm_of(&ops).features(), &st) & SCTLR_UMA == 0 {
         let syn = syn_aa64_sysregtrap(0, op & 7, (op >> 3) & 7, 4, imm, 0x1f, false);
@@ -425,7 +425,7 @@ fn h_access_check_cp_reg(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwin
         let syndrome = a[2] as u32;
         let isread = a[3] != 0;
         let ri = sysreg::lookup(key, feat).expect("the translator checked the register");
-        let st = CpuArmState::load(cpu.env);
+        let st = CpuArmState::load_system(cpu.env);
         let access = if ri.trap == sysreg::Trap::Gic {
             let index = cpu.core.shared().cpu_index;
             match arm_of(&ops).gic_access(index, key, &st, isread) {
@@ -472,7 +472,7 @@ fn h_dc_zva(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
         let blocklen = 4u64 << bs;
         let vaddr_in = a[1];
         let vaddr = vaddr_in & !(blocklen - 1);
-        let mmu_idx = CpuArmState::load(cpu.env).mmu_idx(arm_of(&ops).features()) as u32;
+        let mmu_idx = CpuArmState::load_system(cpu.env).mmu_idx(arm_of(&ops).features()) as u32;
         // Fault on the original address first, as QEMU's probe_write() of it does, so that
         // FAR reports it.
         cpu_st_mmu(cpu, vaddr_in, 0, MemOpIdx::new(MemOp::UB, mmu_idx), Ra::Tb)?;
@@ -495,7 +495,7 @@ fn h_pre_hvc(h: &mut HelperEnv<'_>, _a: &[u64]) -> Result<u128, Unwind> {
             // the architecturally mandated HVC behaviour.
             return Ok(0);
         }
-        let st = CpuArmState::load(cpu.env);
+        let st = CpuArmState::load_system(cpu.env);
         let mut undef = if !f.el2 {
             // If EL2 doesn't exist, HVC always UNDEFs.
             true
@@ -525,7 +525,7 @@ fn h_pre_smc(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
         let arm = arm_of(&ops);
         let f = arm.features();
         let syndrome = a[1] as u32;
-        let st = CpuArmState::load(cpu.env);
+        let st = CpuArmState::load_system(cpu.env);
         let cur_el = st.current_el();
         let hcr = st.hcr_el2_eff(f);
         let smd = st.scr_el3 & SCR_SMD != 0;

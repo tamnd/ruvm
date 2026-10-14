@@ -1133,6 +1133,20 @@ pub(crate) fn lookup_user(key_: u32, model: &ArmCpuModel) -> Option<Option<Reg>>
     }
 }
 
+/// The registers of every CPU, for the migration tests.
+#[cfg(test)]
+pub(crate) fn common_regs() -> &'static [Reg] {
+    REGS
+}
+
+/// The keys of the EL2 and EL3 registers the CPU has, which the migration code adds to the
+/// register list when EL2 or EL3 is on.
+pub(crate) fn el2_el3_keys(feat: &ArmFeatures) -> impl Iterator<Item = u32> + '_ {
+    let el2 = EL2_REGS.iter().filter(|_| feat.el2);
+    let el3 = EL3_REGS.iter().filter(|_| feat.el3);
+    el2.chain(el3).filter(|r| (r.feat)(feat)).map(|r| r.key)
+}
+
 /// The register with encoding `key` on a CPU with `feat`, as `get_arm_cp_reginfo()` finds
 /// it. The ID register space that is not listed reads as zero at EL1.
 pub(crate) fn lookup(key_: u32, feat: &ArmFeatures) -> Option<Reg> {
