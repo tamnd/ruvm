@@ -24,6 +24,8 @@ pub const API_VERSION: i32 = 0;
 pub const TYPE1_IOMMU: u32 = 1;
 /// `VFIO_TYPE1v2_IOMMU`.
 pub const TYPE1V2_IOMMU: u32 = 3;
+/// `VFIO_UNMAP_ALL`: the extension for [`VfioContainer::unmap_dma_all`].
+pub const UNMAP_ALL: u32 = 9;
 
 /// `VFIO_GROUP_FLAGS_VIABLE`: every device in the group is bound to a VFIO driver.
 pub const GROUP_FLAGS_VIABLE: u32 = 1;
@@ -59,6 +61,8 @@ pub const PCI_ERR_IRQ_INDEX: u32 = 3;
 pub const DMA_MAP_FLAG_READ: u32 = 1;
 /// `VFIO_DMA_MAP_FLAG_WRITE`: the device may write the mapping.
 pub const DMA_MAP_FLAG_WRITE: u32 = 1 << 1;
+/// `VFIO_DMA_UNMAP_FLAG_ALL`: the unmap covers every mapping.
+pub const DMA_UNMAP_FLAG_ALL: u32 = 1 << 1;
 
 /// `VFIO_IRQ_SET_DATA_NONE`: the call carries no data.
 pub const IRQ_SET_DATA_NONE: u32 = 1;
@@ -268,6 +272,15 @@ impl VfioContainer {
     /// bytes were unmapped.
     pub fn unmap_dma(&self, iova: u64, size: u64) -> io::Result<u64> {
         let mut unmap = DmaUnmap { argsz: argsz::<DmaUnmap>(), flags: 0, iova, size };
+        ioctl_ptr(&self.file, VFIO_IOMMU_UNMAP_DMA, &mut unmap)?;
+        Ok(unmap.size)
+    }
+
+    /// `VFIO_IOMMU_UNMAP_DMA` with `VFIO_DMA_UNMAP_FLAG_ALL`: removes every mapping, where
+    /// [`UNMAP_ALL`] is supported. Returns how many bytes were unmapped.
+    pub fn unmap_dma_all(&self) -> io::Result<u64> {
+        let flags = DMA_UNMAP_FLAG_ALL;
+        let mut unmap = DmaUnmap { argsz: argsz::<DmaUnmap>(), flags, iova: 0, size: 0 };
         ioctl_ptr(&self.file, VFIO_IOMMU_UNMAP_DMA, &mut unmap)?;
         Ok(unmap.size)
     }

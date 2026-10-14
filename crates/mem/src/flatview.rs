@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::dirty::{DirtyClient, DirtyMask};
+use crate::iommu::IommuOps;
 use crate::ram::RamBlock;
-use crate::region::{Arena, Node, RegionId, RegionTarget, RegionType};
+use crate::region::{Arena, Node, RegionId, RegionTarget, RegionType, TargetKind};
 
 /// 2^64, the end of every address space.
 pub(crate) const SPACE_END: u128 = 1 << 64;
@@ -105,6 +106,14 @@ impl FlatRange {
     /// The RAM block behind the range, for RAM, ROM and ROM devices.
     pub fn ram_block(&self) -> Option<&Arc<RamBlock>> {
         self.target.ram_block()
+    }
+
+    /// The callbacks of an IOMMU region, `IOMMU_MEMORY_REGION()`.
+    pub fn iommu(&self) -> Option<&Arc<dyn IommuOps>> {
+        match &self.target.kind {
+            TargetKind::Iommu(ops) => Some(ops),
+            _ => None,
+        }
     }
 
     /// `flatrange_equal()`: same place, same region, same attributes. The dirty log mask is left

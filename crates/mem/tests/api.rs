@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use ruvm_mem::{
     AccessConstraints, AccessCtx, AccessSize, AddressSpace, DirtyClient, DirtyMask, Endian,
-    FlatRange, GLOBAL_DIRTY_MIGRATION, IommuAccessFlags, IommuOps, IommuTlbEntry, MemError,
-    MemResult, MemTxAttrs, MemTxResult, MemoryConfig, MemoryListener, MemorySystem, MmioOps,
-    RegionId,
+    FlatRange, GLOBAL_DIRTY_MIGRATION, IommuAccessFlags, IommuNotifier, IommuNotifierFlag,
+    IommuNotifiers, IommuOps, IommuTlbEntry, IommuTlbEvent, MemError, MemResult, MemTxAttrs,
+    MemTxResult, MemoryConfig, MemoryListener, MemorySystem, MmioOps, RegionId,
+    register_iommu_notifier, unregister_iommu_notifier,
 };
 
 const U: MemTxAttrs = MemTxAttrs::UNSPECIFIED;
@@ -282,6 +283,98 @@ fn iommu_translates_into_the_target_space() {
     assert_eq!(dma.read(0xffe, U, &mut b), MemTxResult::DECODE_ERROR);
     assert_eq!(b, [1, 2, 0, 0]);
     assert_eq!(dma.write(0x10, U, &[1]), MemTxResult::DECODE_ERROR);
+}
+
+/// An IOMMU that takes notifiers and refuses MAP ones while `refuse` is set.
+#[derive(Default)]
+struct Notifying {
+    list: IommuNotifiers,
+    refuse: std::sync::atomic::AtomicBool,
+    changes: Mutex<Vec<(IommuNotifierFlag, IommuNotifierFlag)>>,
+}
+
+impl IommuOps for Notifying {
+    fn translate(&self, addr: u64, _flag: IommuAccessFlags, _idx: u32) -> IommuTlbEntry {
+        IommuTlbEntry {
+            target_as: None,
+            iova: addr & !0xfff,
+            translated_addr: 0,
+            addr_mask: 0xfff,
+            perm: IommuAccessFlags::NONE,
+        }
+    }
+
+    fn notifiers(&self) -> Option<&IommuNotifiers> {
+        Some(&self.list)
+    }
+
+    fn notify_flag_changed(
+        &self,
+        old: IommuNotifierFlag,
+        new: IommuNotifierFlag,
+    ) -> Result<(), String> {
+        if self.refuse.load(std::sync::atomic::Ordering::Relaxed)
+            && new.intersects(IommuNotifierFlag::MAP)
+        {
+            return Err("requires caching mode".to_string());
+        }
+        self.changes.lock().unwrap().push((old, new));
+        Ok(())
+    }
+}
+
+#[test]
+fn iommu_notifiers_follow_flags_and_crop_events() {
+    let iommu = Notifying::default();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = Arc::clone(&seen);
+    let map = IommuNotifier::new(
+        move |e: &IommuTlbEntry| s.lock().unwrap().push((e.iova, e.addr_mask, e.perm)),
+        IommuNotifierFlag::IOTLB_EVENTS,
+        0x2000,
+        0x5fff,
+        0,
+    );
+    iommu.refuse.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(register_iommu_notifier(&iommu, &map), Err("requires caching mode".to_string()));
+    assert!(iommu.list.list().is_empty());
+    iommu.refuse.store(false, std::sync::atomic::Ordering::Relaxed);
+    register_iommu_notifier(&iommu, &map).unwrap();
+    let unmap = IommuNotifier::new(|_: &IommuTlbEntry| {}, IommuNotifierFlag::UNMAP, 0, 0xfff, 0);
+    register_iommu_notifier(&iommu, &unmap).unwrap();
+    assert_eq!(
+        *iommu.changes.lock().unwrap(),
+        vec![(IommuNotifierFlag::NONE, IommuNotifierFlag::IOTLB_EVENTS)]
+    );
+
+    let event = |ty, iova, addr_mask, perm| IommuTlbEvent {
+        ty,
+        entry: IommuTlbEntry { target_as: None, iova, translated_addr: 0, addr_mask, perm },
+    };
+    // Cropped to the notifier's range, and nothing for a range outside it.
+    iommu.list.notify(0, &event(IommuNotifierFlag::MAP, 0x1000, 0x1fff, IommuAccessFlags::RW));
+    iommu.list.notify(0, &event(IommuNotifierFlag::MAP, 0x8000, 0xfff, IommuAccessFlags::RW));
+    iommu.list.notify(1, &event(IommuNotifierFlag::MAP, 0x3000, 0xfff, IommuAccessFlags::RW));
+    iommu.list.notify(0, &event(IommuNotifierFlag::UNMAP, 0, u64::MAX, IommuAccessFlags::NONE));
+    map.unmap_range(None);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (0x2000, 0xfff, IommuAccessFlags::RW),
+            (0x2000, 0x3fff, IommuAccessFlags::NONE),
+            (0x2000, 0x3fff, IommuAccessFlags::NONE),
+        ]
+    );
+
+    unregister_iommu_notifier(&iommu, &map);
+    unregister_iommu_notifier(&iommu, &unmap);
+    assert_eq!(
+        iommu.changes.lock().unwrap()[1..],
+        [
+            (IommuNotifierFlag::IOTLB_EVENTS, IommuNotifierFlag::UNMAP),
+            (IommuNotifierFlag::UNMAP, IommuNotifierFlag::NONE),
+        ]
+    );
 }
 
 #[test]

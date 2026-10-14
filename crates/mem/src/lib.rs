@@ -41,7 +41,7 @@
 //!
 //! Incremental rendering, the per thread lookup cache, ioeventfd and coalesced MMIO, RAM device
 //! regions, host mapped RAM with the guest pointer types of spec/05, bounce buffers and the
-//! reentrancy guard for devices all come later. IOMMU regions translate but have no notifiers.
+//! reentrancy guard for devices all come later. IOMMU regions have no generic replay.
 
 #![forbid(unsafe_code)]
 
@@ -71,7 +71,10 @@ pub use attrs::{
 pub use dirty::{DirtyClient, DirtyMask, DirtySnapshot};
 pub use error::MemError;
 pub use flatview::{EYTZINGER_THRESHOLD, FlatRange, FlatView};
-pub use iommu::{IommuAccessFlags, IommuOps, IommuTlbEntry};
+pub use iommu::{
+    IommuAccessFlags, IommuNotifier, IommuNotifierFlag, IommuNotifiers, IommuNotify, IommuOps,
+    IommuTlbEntry, IommuTlbEvent, register_iommu_notifier, unregister_iommu_notifier,
+};
 pub use listener::{ListenerId, MemoryListener};
 pub use ram::{RamBlock, buffer_is_zero};
 pub use region::{RegionId, RegionInfo, RegionType};

@@ -13,8 +13,10 @@
 //! guest turns MSI on, each vector it enabled gets an eventfd of its own and the thread sends
 //! the vector's message when the kernel signals it. MSI-X works the same way, except that a
 //! vector gets its eventfd when the guest first unmasks it, and one that fires while masked
-//! goes into the emulated PBA. DMA through a vIOMMU, mmap of the BARs, hot reset and the device
-//! quirks are not here yet.
+//! goes into the emulated PBA. Behind a vIOMMU the device's address space holds an IOMMU region,
+//! and the container follows it with a notifier the way `vfio_iommu_map_notify()` does, mapping
+//! each IOVA the guest maps and unmapping it again when the guest invalidates it. mmap of the
+//! BARs, hot reset and the device quirks are not here yet.
 
 use std::fmt;
 use std::io;
@@ -51,15 +53,17 @@ use ruvm_hw_pci::regs::{
 };
 use ruvm_hw_pci::{MsiMessage, MsixLayout, PciBus, PciDevice, PciDeviceInfo, PciDeviceOps};
 use ruvm_mem::{
-    AccessConstraints, AccessCtx, AccessSize, AddressSpace, FlatRange, ListenerId, MemError,
-    MemResult, MemoryListener, MemorySystem, MmioOps, RegionId, RegionType,
+    AccessConstraints, AccessCtx, AccessSize, AddressSpace, FlatRange, IommuAccessFlags,
+    IommuNotifier, IommuNotifierFlag, IommuOps, IommuTlbEntry, ListenerId, MemError, MemResult,
+    MemTxAttrs, MemoryListener, MemorySystem, MmioOps, RegionId, RegionType,
+    register_iommu_notifier, unregister_iommu_notifier,
 };
 use ruvm_sys::vfio::{
     API_VERSION, DEVICE_FLAGS_PCI, DEVICE_FLAGS_RESET, DeviceInfo, GROUP_FLAGS_VIABLE,
     IRQ_INFO_NORESIZE, IRQ_SET_ACTION_TRIGGER, IRQ_SET_ACTION_UNMASK, PCI_CONFIG_REGION_INDEX,
     PCI_ERR_IRQ_INDEX, PCI_INTX_IRQ_INDEX, PCI_MSI_IRQ_INDEX, PCI_MSIX_IRQ_INDEX,
-    PCI_ROM_REGION_INDEX, RegionInfo, TYPE1_IOMMU, TYPE1V2_IOMMU, VfioContainer, VfioDevice,
-    VfioGroup,
+    PCI_ROM_REGION_INDEX, RegionInfo, TYPE1_IOMMU, TYPE1V2_IOMMU, UNMAP_ALL, VfioContainer,
+    VfioDevice, VfioGroup,
 };
 
 use crate::{PCI_ANY_ID, VfioPciConf};
@@ -133,34 +137,50 @@ impl Drop for Container {
 }
 
 /// `vfio_memory_listener`: maps each page aligned RAM range of the address space into the
-/// container with the same bus address as the guest physical one.
+/// container with the same bus address as the guest physical one, and follows each IOMMU range
+/// with a notifier.
 struct DmaListener {
+    me: Weak<DmaListener>,
     fd: VfioContainer,
     page_size: u64,
+    /// `address_space_memory`, the only place an IOMMU may translate to.
+    system: Weak<AddressSpace>,
+    /// `bcontainer->giommu_list`, newest first.
+    giommus: Mutex<Vec<Giommu>>,
+    /// `container->unmap_all_supported`.
+    unmap_all: bool,
     /// `bcontainer->error`: the first failure while the listener is registered.
     error: Mutex<Option<Error>>,
     /// `bcontainer->initialized`: registration is over, so a failure is fatal.
     initialized: AtomicBool,
 }
 
+/// `VFIOGuestIOMMU`: the notifier on one IOMMU range of the address space.
+struct Giommu {
+    ops: Arc<dyn IommuOps>,
+    region: RegionId,
+    n: Arc<IommuNotifier>,
+}
+
 /// `vfio_get_section_iova_range()`: the part of `addr..addr + size` made of whole host pages,
-/// as start and length, if there is one.
-fn section_iova_range(addr: u64, size: u128, page_size: u64) -> Option<(u64, u64)> {
+/// as start and length, if there is one. The length is 2^64 for a range covering everything.
+fn section_iova_range(addr: u64, size: u128, page_size: u64) -> Option<(u64, u128)> {
     let mask = !u128::from(page_size - 1);
     let iova = (u128::from(addr) + u128::from(page_size - 1)) & mask;
     let llend = (u128::from(addr) + size) & mask;
     if iova >= llend {
         return None;
     }
-    Some((u64::try_from(iova).ok()?, u64::try_from(llend - iova).ok()?))
+    Some((u64::try_from(iova).ok()?, llend - iova))
 }
 
 impl DmaListener {
     /// `vfio_listener_valid_section()` and `vfio_get_section_iova_range()`.
-    fn section(&self, fr: &FlatRange) -> Option<(u64, u64)> {
+    fn section(&self, fr: &FlatRange) -> Option<(u64, u128)> {
         // vfio_listener_skipped_section(): ROM devices are not RAM to QEMU either, and an
         // address with bit 63 set is a 64-bit BAR being sized.
-        if fr.region_type() != RegionType::Ram || fr.addr() & (1 << 63) != 0 {
+        let kind = fr.region_type();
+        if (kind != RegionType::Ram && kind != RegionType::Iommu) || fr.addr() & (1 << 63) != 0 {
             return None;
         }
         let off = self.page_size - 1;
@@ -195,6 +215,125 @@ impl DmaListener {
         }
     }
 
+    /// `vfio_container_dma_unmap()` with the legacy container. An unmap of everything uses
+    /// `VFIO_DMA_UNMAP_FLAG_ALL` if the kernel has it, and two halves if not, since the ioctl
+    /// takes no 2^64 long range.
+    fn unmap(&self, iova: u64, size: u128) -> io::Result<()> {
+        if size == 1 << 64 {
+            if self.unmap_all {
+                return self.fd.unmap_dma_all().map(|_| ());
+            }
+            let half = 1u64 << 63;
+            self.fd.unmap_dma(0, half)?;
+            return self.fd.unmap_dma(half, half).map(|_| ());
+        }
+        self.fd.unmap_dma(iova, size as u64).map(|_| ())
+    }
+
+    /// `memory_translate_iotlb()`: the host address and writability of the system memory
+    /// `entry` maps to.
+    fn translate_iotlb(
+        &self,
+        system: &AddressSpace,
+        entry: &IommuTlbEntry,
+    ) -> Result<(usize, bool)> {
+        let writable = entry.perm.allows(IommuAccessFlags::WO);
+        let addr = entry.translated_addr;
+        let view = system.flatview();
+        let fr = view.lookup(addr);
+        let Some((fr, block)) = fr
+            .filter(|fr| fr.region_type() == RegionType::Ram)
+            .and_then(|fr| fr.ram_block().map(|b| (fr, b)))
+        else {
+            let xlat = fr.map_or(addr, |fr| fr.offset_in_region() + (addr - fr.addr()));
+            return Err(Error::generic(format!("iommu map to non memory area {xlat:x}")));
+        };
+        let xlat = fr.offset_in_region() + (addr - fr.addr());
+        // address_space_translate() clips the length to the end of the range.
+        let len = (u128::from(entry.addr_mask) + 1).min(fr.end() - u128::from(addr));
+        if len & u128::from(entry.addr_mask) != 0 {
+            return Err(Error::generic("iommu has granularity incompatible with target AS"));
+        }
+        Ok((block.host_addr() + xlat as usize, !writable || fr.readonly()))
+    }
+
+    /// `vfio_iommu_map_notify()`: `offset` turns the IOVA of an event into a bus address,
+    /// `giommu->iommu_offset`.
+    fn map_notify(&self, offset: u64, entry: &IommuTlbEntry) {
+        let iova = entry.iova.wrapping_add(offset);
+        let size = entry.addr_mask.wrapping_add(1);
+        let system = self.system.upgrade();
+        let target = entry.target_as.as_ref();
+        let Some(system) = system.filter(|s| target.is_some_and(|t| Arc::ptr_eq(t, s))) else {
+            error_report(&format!(
+                "Wrong target AS \"{}\", only system memory is allowed",
+                target.map_or("none", |t| t.name())
+            ));
+            return;
+        };
+        if entry.perm != IommuAccessFlags::NONE {
+            let (vaddr, readonly) = match self.translate_iotlb(&system, entry) {
+                Ok(x) => x,
+                Err(e) => {
+                    report_error(&e);
+                    return;
+                }
+            };
+            if let Err(e) = self.map(iova, size, vaddr, readonly) {
+                let ret = -e.raw_os_error().unwrap_or(0);
+                error_report(&format!(
+                    "vfio_container_dma_map({self:p}, {iova:#x}, {size:#x}, {vaddr:#x}) = {ret} ({})",
+                    strerror(&e)
+                ));
+            }
+        } else if let Err(e) = self.fd.unmap_dma(iova, size) {
+            let ret = -e.raw_os_error().unwrap_or(0);
+            error_report(&format!(
+                "vfio_container_dma_unmap({self:p}, {iova:#x}, {size:#x}) = {ret} ({})",
+                strerror(&e)
+            ));
+        }
+    }
+
+    /// The IOMMU part of `vfio_container_region_add()`: a notifier for the range, which the
+    /// IOMMU then replays its mappings to.
+    fn iommu_add(&self, fr: &FlatRange, ops: &Arc<dyn IommuOps>) {
+        let offset = fr.addr().wrapping_sub(fr.offset_in_region());
+        let end = u128::from(fr.offset_in_region()) + fr.size() - 1;
+        let me = self.me.clone();
+        let n = IommuNotifier::new(
+            move |entry| {
+                if let Some(me) = me.upgrade() {
+                    me.map_notify(offset, entry);
+                }
+            },
+            IommuNotifierFlag::IOTLB_EVENTS,
+            fr.offset_in_region(),
+            end as u64,
+            ops.attrs_to_index(MemTxAttrs::UNSPECIFIED),
+        );
+        if let Err(e) = register_iommu_notifier(ops.as_ref(), &n) {
+            self.fail(fr.name(), Error::generic(e));
+            return;
+        }
+        lock(&self.giommus)
+            .insert(0, Giommu { ops: Arc::clone(ops), region: fr.region(), n: Arc::clone(&n) });
+        ops.replay(&n);
+    }
+
+    /// The IOMMU part of `vfio_listener_region_del()`. The one big unmap after it takes away
+    /// whatever the notifier mapped.
+    fn iommu_del(&self, fr: &FlatRange) {
+        let mut giommus = lock(&self.giommus);
+        let found = giommus
+            .iter()
+            .position(|g| g.region == fr.region() && g.n.start == fr.offset_in_region());
+        if let Some(g) = found.map(|i| giommus.remove(i)) {
+            drop(giommus);
+            unregister_iommu_notifier(g.ops.as_ref(), &g.n);
+        }
+    }
+
     /// The `fail:` path of `vfio_container_region_add()`.
     fn fail(&self, name: &str, err: Error) {
         if self.initialized.load(Ordering::Acquire) {
@@ -217,9 +356,14 @@ impl MemoryListener for DmaListener {
         let Some((iova, size)) = self.section(fr) else {
             return;
         };
+        if let Some(ops) = fr.iommu() {
+            self.iommu_add(fr, ops);
+            return;
+        }
         let Some(block) = fr.ram_block() else {
             return;
         };
+        let size = size as u64;
         // memory_region_get_ram_ptr() + offset_within_region + (iova - offset_within_address_space).
         let vaddr = block.host_addr() + (fr.offset_in_region() + (iova - fr.addr())) as usize;
         if let Err(e) = self.map(iova, size, vaddr, fr.readonly()) {
@@ -236,8 +380,13 @@ impl MemoryListener for DmaListener {
         let Some((iova, size)) = self.section(fr) else {
             return;
         };
-        if let Err(e) = self.fd.unmap_dma(iova, size) {
+        if fr.iommu().is_some() {
+            self.iommu_del(fr);
+        }
+        if let Err(e) = self.unmap(iova, size) {
             let ret = -e.raw_os_error().unwrap_or(0);
+            // An unmap of everything has a size of zero.
+            let size = size as u64;
             error_report(&format!(
                 "vfio_container_dma_unmap({self:p}, {iova:#x}, {size:#x}) = {ret} ({})",
                 strerror(&e)
@@ -294,6 +443,7 @@ fn container_connect(
     group: &VfioGroup,
     memory: &Arc<MemorySystem>,
     space: &Arc<AddressSpace>,
+    system: &Arc<AddressSpace>,
 ) -> Result<Arc<Container>> {
     let mut tried: Vec<&Arc<Container>> = Vec::new();
     for g in groups {
@@ -326,10 +476,15 @@ fn container_connect(
     container
         .set_iommu(model)
         .map_err(|e| Error::from_io("Failed to set iommu for container", e))?;
+    let unmap_all = container.check_extension(UNMAP_ALL).unwrap_or(false);
     // vfio_listener_register().
-    let dma = Arc::new(DmaListener {
+    let dma = Arc::new_cyclic(|me| DmaListener {
+        me: me.clone(),
         fd: container,
         page_size: rustix::param::page_size() as u64,
+        system: Arc::downgrade(system),
+        giommus: Mutex::new(Vec::new()),
+        unmap_all,
         error: Mutex::new(None),
         initialized: AtomicBool::new(false),
     });
@@ -353,6 +508,7 @@ fn group_get(
     id: u32,
     memory: &Arc<MemorySystem>,
     space: &Arc<AddressSpace>,
+    system: &Arc<AddressSpace>,
 ) -> Result<usize> {
     if let Some(i) = groups.iter().position(|g| g.id == id) {
         return Ok(i);
@@ -368,7 +524,7 @@ fn group_get(
              driver.\n",
         ));
     }
-    let container = container_connect(groups, &group, memory, space)
+    let container = container_connect(groups, &group, memory, space, system)
         .map_err(|e| e.prepend(format_args!("failed to setup container for group {id}: ")))?;
     groups.push(Group { id, container, group, devices: Vec::new() });
     Ok(groups.len() - 1)
@@ -381,10 +537,11 @@ fn attach(
     name: &str,
     memory: &Arc<MemorySystem>,
     space: &Arc<AddressSpace>,
+    system: &Arc<AddressSpace>,
 ) -> Result<(Attachment, VfioDevice, DeviceInfo)> {
     let id = group_id(sysfsdev)?;
     let mut groups = groups();
-    let i = group_get(&mut groups, id, memory, space)?;
+    let i = group_get(&mut groups, id, memory, space, system)?;
     let g = &groups[i];
     let got = if g.devices.iter().any(|d| d == name) {
         Err(Error::generic("device is already attached"))
@@ -1272,11 +1429,15 @@ struct Populated {
 /// `vfio_pci_realize()`: puts the host function of `conf` on `bus` at `devfn`, or the first
 /// free slot. `express_bus` says whether `bus` is PCI Express, `pci_bus_is_express()`, and
 /// `dma_as` is the address space the device's DMA goes to, `pci_device_iommu_address_space()`.
+/// `system` is the system memory address space, the only one an IOMMU in `dma_as` may map to,
+/// and `viommu` is the vIOMMU of the bus, if it wants to know about assigned devices.
 pub fn realize(
     bus: &Arc<PciBus>,
     devfn: Option<u8>,
     express_bus: bool,
     dma_as: &Arc<AddressSpace>,
+    system: &Arc<AddressSpace>,
+    viommu: Option<&dyn HostIommu>,
     conf: &VfioPciConf,
 ) -> Result<Arc<PciDevice>> {
     let sysfsdev = match (&conf.sysfsdev, conf.host) {
@@ -1306,7 +1467,7 @@ pub fn realize(
             "x-balloon-allowed only potentially compatible with mdev devices",
         )));
     }
-    let p = populate(&sysfsdev, &name, bus.memory(), dma_as).map_err(prefix)?;
+    let p = populate(&sysfsdev, &name, bus.memory(), dma_as, system).map_err(prefix)?;
     let info = PciDeviceInfo {
         name: "vfio-pci".to_string(),
         id: conf.id.clone(),
@@ -1318,13 +1479,23 @@ pub fn realize(
     };
     let dev = bus.register_device(&info, devfn)?;
     let mut s = Setup::new(&dev, bus, p, express_bus, conf);
-    match s.run() {
+    // pci_device_set_iommu_device() is skipped for mdev, and so is the unset.
+    let viommu = viommu.filter(|_| !mdev);
+    let r = s.run(viommu);
+    // out_unset_idev.
+    let unset = |set: bool| {
+        if let Some(v) = viommu.filter(|_| set) {
+            v.unset_iommu_device(dev.devfn());
+        }
+    };
+    match r {
         Ok(ops) => {
             let ops = Arc::new(ops);
             let _ = ops.dev.set(Arc::downgrade(&dev));
             dev.set_ops(Arc::clone(&ops) as Arc<dyn PciDeviceOps>);
             // vfio_pci_interrupt_setup().
             if let Err(e) = ops.intx_enable(&dev) {
+                unset(s.idev_set);
                 bus.unregister_device(&dev);
                 return Err(prefix(e));
             }
@@ -1335,10 +1506,21 @@ pub fn realize(
             Ok(dev)
         }
         Err(e) => {
+            unset(s.idev_set);
             bus.unregister_device(&dev);
             Err(prefix(e))
         }
     }
+}
+
+/// The part of a vIOMMU that is told about assigned devices, `pci_device_set_iommu_device()`
+/// and `pci_device_unset_iommu_device()` with the bus's `PCIIOMMUOps`.
+pub trait HostIommu: Send + Sync {
+    /// Takes the device at `devfn`, or says why the vIOMMU cannot have it.
+    fn set_iommu_device(&self, devfn: u8) -> std::result::Result<(), String>;
+
+    /// Lets the device at `devfn` go.
+    fn unset_iommu_device(&self, devfn: u8);
 }
 
 /// `vfio_device_attach()`, `vfio_pci_populate_device()` and the config read of
@@ -1348,8 +1530,9 @@ fn populate(
     name: &str,
     memory: &Arc<MemorySystem>,
     space: &Arc<AddressSpace>,
+    system: &Arc<AddressSpace>,
 ) -> Result<Populated> {
-    let (attachment, device, info) = attach(sysfsdev, name, memory, space)?;
+    let (attachment, device, info) = attach(sysfsdev, name, memory, space, system)?;
 
     if info.flags & DEVICE_FLAGS_PCI == 0 {
         return Err(Error::generic("this isn't a PCI device"));
@@ -1428,6 +1611,8 @@ struct Setup<'a> {
     pm_cap: u8,
     has_flr: bool,
     has_pm_reset: bool,
+    /// The vIOMMU took the device, so a later failure has to unset it.
+    idev_set: bool,
 }
 
 impl<'a> Setup<'a> {
@@ -1458,11 +1643,17 @@ impl<'a> Setup<'a> {
             pm_cap: 0,
             has_flr: false,
             has_pm_reset: false,
+            idev_set: false,
         }
     }
 
-    fn run(&mut self) -> Result<VfioPciOps> {
+    fn run(&mut self, viommu: Option<&dyn HostIommu>) -> Result<VfioPciOps> {
         self.config_setup()?;
+        if let Some(v) = viommu {
+            v.set_iommu_device(self.dev.devfn())
+                .map_err(|e| Error::generic(e).prepend("Failed to set vIOMMU: "))?;
+            self.idev_set = true;
+        }
         self.add_capabilities()?;
         // vfio_pci_interrupt_setup(): QEMU emulates all of MSI and MSI-X.
         if self.msix_cap != 0 {
@@ -2074,6 +2265,7 @@ mod tests {
         assert_eq!(section_iova_range(0x800, 0x2000, 0x1000), Some((0x1000, 0x1000)));
         assert_eq!(section_iova_range(0x800, 0x1000, 0x1000), None);
         assert_eq!(section_iova_range(0xfee00000, 0x10, 0x1000), None);
-        assert_eq!(section_iova_range(0, 0x1_0000_0000_0000_0000, 0x1000), None);
+        // A whole IOMMU region is an unmap of everything.
+        assert_eq!(section_iova_range(0, 1 << 64, 0x1000), Some((0, 1 << 64)));
     }
 }

@@ -5,7 +5,7 @@
 
 use std::sync::Mutex as StdMutex;
 
-use ruvm_mem::{Endian, MemorySystem};
+use ruvm_mem::{Endian, MemorySystem, register_iommu_notifier, unregister_iommu_notifier};
 
 use super::*;
 
@@ -737,4 +737,73 @@ fn page_request_registers() {
     let r = Rig::scalable(true);
     r.w64(DMAR_PQA_REG, u64::MAX);
     assert_eq!(r.r64(DMAR_PQA_REG), 0);
+}
+
+/// The events a notifier saw, as `(iova, translated_addr, addr_mask, perm)`.
+type Seen = Arc<StdMutex<Vec<(u64, u64, u64, u8)>>>;
+
+/// A notifier on the device of the rig that keeps every event in [`Seen`].
+fn recorder(r: &Rig) -> (Arc<dyn IommuOps>, Arc<IommuNotifier>, Seen) {
+    let ops = r.iommu.device_ops(SID);
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let n = IommuNotifier::new(
+        move |e: &IommuTlbEntry| {
+            let perm = u8::from(e.perm.allows(IommuAccessFlags::RO))
+                | u8::from(e.perm.allows(IommuAccessFlags::WO)) << 1;
+            sink.lock().unwrap().push((e.iova, e.translated_addr, e.addr_mask, perm));
+        },
+        IommuNotifierFlag::IOTLB_EVENTS,
+        0,
+        u64::MAX,
+        0,
+    );
+    (ops, n, seen)
+}
+
+#[test]
+fn map_notifiers_need_caching_mode() {
+    let r = Rig::new(IntelIommuConf::default());
+    let (ops, n, _) = recorder(&r);
+    assert_eq!(
+        register_iommu_notifier(ops.as_ref(), &n),
+        Err("device 00.01.0 requires caching mode: Operation not supported".to_string())
+    );
+    assert_eq!(
+        r.iommu.set_iommu_device(SID),
+        Err("Device assignment is not allowed without enabling caching-mode=on for Intel IOMMU."
+            .to_string())
+    );
+    let r = Rig::new(IntelIommuConf { caching_mode: true, ..IntelIommuConf::default() });
+    assert_eq!(r.iommu.set_iommu_device(SID), Ok(()));
+    assert_eq!(r.iommu.set_iommu_device(SID), Err("Host IOMMU device already exist".to_string()));
+    r.iommu.unset_iommu_device(SID);
+    assert_eq!(r.iommu.set_iommu_device(SID), Ok(()));
+}
+
+#[test]
+fn notifiers_follow_replay_and_invalidations() {
+    let r = Rig::new(IntelIommuConf { caching_mode: true, ..IntelIommuConf::default() });
+    r.map(0x5000, DATA, 3);
+    r.enable(CONTEXT_TT_MULTI_LEVEL);
+    let (ops, n, seen) = recorder(&r);
+    register_iommu_notifier(ops.as_ref(), &n).unwrap();
+    ops.replay(&n);
+    assert_eq!(std::mem::take(&mut *seen.lock().unwrap()), vec![(0x5000, DATA, 0xfff, 3)]);
+    // A new read only page shows up with the domain invalidation, the old one is not sent
+    // again.
+    r.map(0x6000, DATA + 0x1000, 1);
+    r.w64(DMAR_IOTLB_REG, TLB_IVT | TLB_DSI_FLUSH | 5 << 32);
+    assert_eq!(std::mem::take(&mut *seen.lock().unwrap()), vec![(0x6000, DATA + 0x1000, 0xfff, 1)]);
+    // A page taken out of the table is unmapped.
+    r.wq(PT + 5 * 8, 0);
+    r.w64(DMAR_IOTLB_REG, TLB_IVT | TLB_DSI_FLUSH | 5 << 32);
+    assert_eq!(std::mem::take(&mut *seen.lock().unwrap()), vec![(0x5000, 0, 0xfff, 0)]);
+    // Another domain's invalidation sends nothing.
+    r.wq(PT + 6 * 8, 0);
+    r.w64(DMAR_IOTLB_REG, TLB_IVT | TLB_DSI_FLUSH | 6 << 32);
+    assert!(seen.lock().unwrap().is_empty());
+    unregister_iommu_notifier(ops.as_ref(), &n);
+    r.w64(DMAR_IOTLB_REG, TLB_IVT | TLB_DSI_FLUSH | 5 << 32);
+    assert!(seen.lock().unwrap().is_empty());
 }

@@ -2,8 +2,8 @@
 
 //! `-device vfio-pci` on q35: the properties of hw/vfio/pci.c and the plug.
 //!
-//! Only the root bus `pcie.0` takes the device, and not with a vIOMMU yet, since the container
-//! maps guest RAM at its guest physical address and nothing follows a vIOMMU's mappings.
+//! Only the root bus `pcie.0` takes the device. Behind intel-iommu the device does DMA into its
+//! own address space, and the vIOMMU is told about it so it can refuse it without caching mode.
 
 use ruvm_base::error::Error;
 use ruvm_base::report::Location;
@@ -154,6 +154,8 @@ pub(crate) fn realize_x86(
     plug: &VfioPlug,
     firmware: &FirmwareSearch,
 ) -> Result<(), Located> {
+    use std::sync::Arc;
+
     use ruvm_hw_pci::regs::PCI_ROM_SLOT;
 
     let X86Board::Q35(m, _) = board else {
@@ -162,8 +164,24 @@ pub(crate) fn realize_x86(
             format!("No 'PCI' bus found for device '{TYPE_VFIO_PCI}'"),
         ));
     };
-    let dev = ruvm_hw_vfio::pci::realize(m.pci_bus(), plug.devfn, true, m.memory_as(), &plug.conf)
-        .map_err(|e| Located(plug.loc.clone(), e))?;
+    // pci_device_iommu_address_space() needs the devfn before the device is on the bus.
+    let bus = m.pci_bus();
+    let dma_as = plug
+        .devfn
+        .or_else(|| bus.first_free_devfn())
+        .and_then(|devfn| m.pci_dma().address_space(u16::from(devfn)))
+        .unwrap_or_else(|| Arc::clone(m.memory_as()));
+    let viommu = Q35Viommu(m);
+    let dev = ruvm_hw_vfio::pci::realize(
+        bus,
+        plug.devfn,
+        true,
+        &dma_as,
+        m.memory_as(),
+        Some(&viommu),
+        &plug.conf,
+    )
+    .map_err(|e| Located(plug.loc.clone(), e))?;
     // pci_add_option_rom()
     if let Some(name) = plug.conf.romfile.as_deref().filter(|f| !f.is_empty()) {
         let at = |e: String| Located::new(&plug.loc, e);
@@ -179,6 +197,21 @@ pub(crate) fn realize_x86(
         dev.register_bar(PCI_ROM_SLOT, 0, rom);
     }
     Ok(())
+}
+
+/// The vIOMMU of the q35 root bus as vfio-pci sees it.
+#[cfg(target_os = "linux")]
+struct Q35Viommu<'a>(&'a ruvm_machine_x86::Q35);
+
+#[cfg(target_os = "linux")]
+impl ruvm_hw_vfio::pci::HostIommu for Q35Viommu<'_> {
+    fn set_iommu_device(&self, devfn: u8) -> Result<(), String> {
+        self.0.set_iommu_device(devfn)
+    }
+
+    fn unset_iommu_device(&self, devfn: u8) {
+        self.0.unset_iommu_device(devfn);
+    }
 }
 
 /// Realizes a planned `vfio-pci`, which only Linux plans.
