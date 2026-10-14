@@ -3,8 +3,9 @@
 //! The migration sections of an Arm board, in QEMU's stream format.
 //!
 //! [`virt_savevm`] registers the sections of `virt` the way QEMU 11.1 lays them out. So far
-//! these are the `timer` section, RAM, the vCPUs and `globalstate`; the flash contents, the
-//! GIC and the devices are not registered yet.
+//! these are the `timer` section, RAM, the vCPUs, the GIC, the UARTs, the RTC, the GPIO
+//! controllers and the power key, and `globalstate`. The flash contents, the PCI host, the
+//! ACPI GED, `fw_cfg` and the ACPI tables only keep their section ids for now.
 //!
 //! The device sections carry the state field by field, as QEMU 11.1's `VMStateDescription`
 //! for it does: the PL011 UART (hw/char/pl011.c and hw/core/clock-vmstate.c), the PL031 RTC
@@ -31,7 +32,7 @@ use ruvm_vmstate::info::Timer;
 use ruvm_vmstate::{VmStateDescription, VmStateField};
 
 use crate::tcg_run::VirtTcgMachine;
-use crate::virt::VirtGic;
+use crate::virt::{VirtGic, VirtMachine};
 
 mod cpu;
 mod gic;
@@ -88,9 +89,51 @@ pub fn virt_savevm(
     if let Some(its) = board.its() {
         gic::register_its(&mut savevm, its);
     }
+    register_devices(&mut savevm, &board);
     drop(board);
     let global_state = GlobalState::register(&mut savevm);
     ArmMigration { savevm, ram_stats, global_state }
+}
+
+/// The sections of the devices, in the order QEMU 11.1's `machvirt_init()` creates them.
+/// Sysbus devices take the next free instance of their name, so a non-secure second UART,
+/// which is created first, is `pl011` instance 0.
+fn register_devices(savevm: &mut SaveVm, board: &VirtMachine) {
+    let mut uarts = vec![board.uart()];
+    if let Some(u) = board.uart1() {
+        if board.uart1_ns() {
+            uarts.insert(0, u);
+        } else {
+            uarts.push(u);
+        }
+    }
+    for (instance, uart) in (0..).zip(uarts) {
+        register_pl011(savevm, instance, uart);
+    }
+    register_pl031(savevm, board.rtc(), board.clock());
+    // "0000:00:00.0/gpex_root", "PCIHost" and "PCIBUS", which ruvm does not send yet.
+    savevm.reserve_section_id();
+    savevm.reserve_section_id();
+    savevm.reserve_section_id();
+    let mut pl061 = 0;
+    if let (Some(gpio), Some(key)) = (board.gpio(), board.gpio_key()) {
+        register_pl061(savevm, 0, gpio);
+        register_gpio_key(savevm, key);
+        pl061 = 1;
+    }
+    if board.ged().is_some() {
+        // "acpi-ged", which ruvm does not send yet.
+        savevm.reserve_section_id();
+    }
+    if let Some(gpio) = board.secure_gpio() {
+        register_pl061(savevm, pl061, gpio);
+    }
+    // "fw_cfg", and "virt_acpi_build" when the board has ACPI tables. ruvm does not send
+    // them yet.
+    savevm.reserve_section_id();
+    if board.acpi() {
+        savevm.reserve_section_id();
+    }
 }
 
 /// The `cpu_common` and `cpu` sections of each vCPU.
@@ -366,12 +409,12 @@ static VMSTATE_PL061: LazyLock<VmStateDescription<Pl061VmState>> = LazyLock::new
     ])
 });
 
-/// Registers the `pl061` section of `gpio`.
-pub fn register_pl061(savevm: &mut SaveVm, gpio: &Arc<Pl061>) {
+/// Registers the `pl061` section of `gpio`, instance `instance`.
+pub fn register_pl061(savevm: &mut SaveVm, instance: u32, gpio: &Arc<Pl061>) {
     let (get, put) = (Arc::clone(gpio), Arc::clone(gpio));
     savevm.register_vmsd(
         "",
-        Some(0),
+        Some(instance),
         &VMSTATE_PL061,
         move || Ok(get.vmstate_save()),
         move |s| {
