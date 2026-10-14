@@ -45,6 +45,7 @@ use ruvm_qapi::visit::{Visitor, VisitorExt};
 use super::{ArmBoard, prop_bool};
 use crate::drives::{DriveDev, Plugged, device_image, peripheral_path, resize_cb};
 use crate::net::Network;
+use crate::tpm::TpmModel;
 use crate::x86::{Drive, DriveIf, KeepRam, Located, Transport, drive_opts, parse_drive, parse_mac};
 
 /// The virtio device models virt can plug.
@@ -712,7 +713,8 @@ pub(crate) fn plug(
                 let (tpmdev, irq, ppi) = plug.tpm.as_ref().expect("planned with properties");
                 let Target::Virt(board) = board else { unreachable!("planned only on virt") };
                 let prop = format!("{TYPE_TPM_TIS_SYSBUS}.tpmdev");
-                let be = crate::tpm::realize(&prop, tpmdev.as_deref()).map_err(at)?;
+                let be =
+                    crate::tpm::realize(TpmModel::TpmTis, &prop, tpmdev.as_deref()).map_err(at)?;
                 board.attach_tpm_tis_device(be, *irq, *ppi).map_err(at)?;
                 continue;
             }

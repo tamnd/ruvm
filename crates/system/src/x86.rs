@@ -72,6 +72,7 @@ use ruvm_qapi::visit::{QObjectInputVisitor, StringInputVisitor, Visit, Visitor, 
 use ruvm_qapi::{QDict, QValue};
 
 use crate::net::{NetOption, Network, NicPort, qmp_events};
+use crate::tpm::TpmModel;
 use crate::vl::Vm;
 
 /// Whether `target` is one the x86 boards exist for.
@@ -2421,7 +2422,8 @@ fn realize_isa(
         }
         IsaModel::TpmTis { tpmdev, irq } => {
             let located = |e: String| Located::new(&plug.loc, e);
-            let be = crate::tpm::realize("tpm-tis.tpmdev", tpmdev.as_deref()).map_err(located)?;
+            let be = crate::tpm::realize(TpmModel::TpmTis, "tpm-tis.tpmdev", tpmdev.as_deref())
+                .map_err(located)?;
             if *irq > 15 {
                 return Err(located(format!("IRQ {irq} is outside valid range of 0 to 15")));
             }
@@ -2429,7 +2431,8 @@ fn realize_isa(
         }
         IsaModel::TpmCrb { tpmdev, cap_chunk } => {
             let located = |e: String| Located::new(&plug.loc, e);
-            let be = crate::tpm::realize("tpm-crb.tpmdev", tpmdev.as_deref()).map_err(located)?;
+            let be = crate::tpm::realize(TpmModel::TpmCrb, "tpm-crb.tpmdev", tpmdev.as_deref())
+                .map_err(located)?;
             board.attach_tpm_crb(be, *cap_chunk).map_err(located)?;
         }
     }
