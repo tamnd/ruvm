@@ -46,11 +46,16 @@ pub(crate) struct Guest {
     pub(crate) cpu_loop: fn(&Arc<Proc>, &mut Task, &mut Cpu<'_>),
     /// `setup_rt_frame()`: the frame for the handler of a signal on the guest stack, and the
     /// registers that enter it. The last argument is the guest mask to return to.
-    pub(crate) setup_rt_frame:
-        fn(&GuestSpace, &mut Task, &mut Cpu<'_>, i32, &Sigaction, &Info, u64),
+    pub(crate) setup_rt_frame: SetupFrame,
+    /// `setup_frame()`, for handlers without `SA_SIGINFO`, on the targets that have the old
+    /// frame.
+    pub(crate) setup_frame: Option<SetupFrame>,
     /// `do_rt_sigreturn()`.
     pub(crate) rt_sigreturn: fn(&GuestSpace, &mut Task, &mut Cpu<'_>) -> i64,
 }
+
+/// `setup_frame()` and `setup_rt_frame()`.
+pub(crate) type SetupFrame = fn(&GuestSpace, &mut Task, &mut Cpu<'_>, i32, &Sigaction, &Info, u64);
 
 static GUEST: OnceLock<&'static Guest> = OnceLock::new();
 

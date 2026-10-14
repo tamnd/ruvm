@@ -13,7 +13,7 @@ use std::sync::Arc;
 use ruvm_jit::Cpu;
 use ruvm_user_common::page;
 
-use crate::signal::{self, Task, get32, get64, guest_sys, put32, put64};
+use crate::signal::{self, Sigaction, Task, get32, get64, guest_sys, put32, put64};
 use crate::syscall::{self, A, Proc};
 use crate::syscall::{M, MN, P, R, S, V};
 
@@ -211,6 +211,67 @@ fn wait4(p: &Proc, pid: u64, status: u64, options: u64, ru: u64) -> Res {
         p.put(ru, &rusage32(&hru))?;
     }
     Ok(r)
+}
+
+/// `waitid()`, with the 32-bit `siginfo_t` and `struct rusage`.
+fn waitid(p: &Proc, a: [u64; 6]) -> Res {
+    let mut info = [0u8; 128];
+    let mut hru = [0u8; 144];
+    let hr = if a[4] != 0 { hru.as_mut_ptr() as u64 } else { 0 };
+    let r = host(libc::SYS_waitid, &[a[0], a[1], info.as_mut_ptr() as u64, a[3], hr]);
+    if r < 0 {
+        return Err(r);
+    }
+    if a[2] != 0 {
+        p.put(a[2], &signal::guest_siginfo(&signal::host_to_target_siginfo(&info)))?;
+    }
+    if a[4] != 0 {
+        p.put(a[4], &rusage32(&hru))?;
+    }
+    Ok(r)
+}
+
+/// `sigaction()` with the old `struct sigaction`: handler, a one-word mask, flags and
+/// restorer.
+fn old_sigaction(p: &Proc, t: &mut Task, a: [u64; 6]) -> Res {
+    let act = if a[1] != 0 {
+        let b: [u8; 16] = read(p, a[1])?;
+        let f = |i: usize| u64::from(get32(&b, 4 * i));
+        Some(Sigaction { handler: f(0), mask: f(1), flags: f(2), restorer: f(3) })
+    } else {
+        None
+    };
+    let old = signal::do_sigaction(t, a[0] as i32, act)?;
+    if a[2] != 0 {
+        let mut b = [0u8; 16];
+        for (i, v) in [old.handler, old.mask, old.flags, old.restorer].into_iter().enumerate() {
+            put32(&mut b, 4 * i, v as u32);
+        }
+        p.put(a[2], &b)?;
+    }
+    Ok(0)
+}
+
+/// `sigprocmask()` with one-word masks, which are read and written as `target_sigset_t`.
+fn old_sigprocmask(p: &Proc, t: &mut Task, a: [u64; 6]) -> Res {
+    let (how, set) = if a[1] != 0 {
+        let b: [u8; 8] = read(p, a[1])?;
+        let how = a[0] as i32;
+        if !matches!(how, libc::SIG_BLOCK | libc::SIG_UNBLOCK | libc::SIG_SETMASK) {
+            return Err(-EINVAL);
+        }
+        (how, Some(u64::from(get32(&b, 0))))
+    } else {
+        (0, None)
+    };
+    let old = signal::old_sigprocmask(t, how, set)?;
+    if a[2] != 0 {
+        if !p.space().check(a[2], 8, page::WRITE) {
+            return Err(-EFAULT);
+        }
+        p.put(a[2], &(old as u32).to_le_bytes())?;
+    }
+    Ok(0)
 }
 
 /// The `fd_set` of `n` descriptors at `addr`, in the host's longs, `copy_from_user_fdset()`.
@@ -840,6 +901,50 @@ pub(crate) fn do_syscall(
                     .collect();
                 host(libc::SYS_setgroups, &[n as u64, g.as_ptr() as u64])
             }
+            "waitid" => return waitid(p, a),
+            "sigaction" => return old_sigaction(p, t, a),
+            "sigprocmask" => return old_sigprocmask(p, t, a),
+            "sgetmask" | "ssetmask" => {
+                let (how, set) =
+                    if name == "sgetmask" { (0, None) } else { (libc::SIG_SETMASK, Some(a[0])) };
+                return signal::old_sigprocmask(t, how, set).map(|m| i64::from(m as u32 as i32));
+            }
+            "sigpending" => {
+                let mut set = 0u64;
+                let r = host(libc::SYS_rt_sigpending, &[(&raw mut set) as u64, 8]);
+                if r < 0 {
+                    return Err(r);
+                }
+                if !p.space().check(a[0], 8, page::WRITE) {
+                    return Err(-EFAULT);
+                }
+                p.put(a[0], &(signal::h2t_set(set) as u32).to_le_bytes())?;
+                r
+            }
+            // QEMU reads a whole target_sigset_t at the first argument, rather than the mask
+            // in the third the kernel takes.
+            "sigsuspend" => signal::sigsuspend(p.space(), t, a[0], 8),
+            "rt_sigtimedwait" | "rt_sigtimedwait_time64" => {
+                if a[3] != 8 {
+                    return Err(-EINVAL);
+                }
+                let mut ts = [0u8; 16];
+                if a[2] != 0 {
+                    if name == "rt_sigtimedwait" {
+                        let v = get_time32(p, a[2])?;
+                        put64(&mut ts, 0, v[0] as u64);
+                        put64(&mut ts, 8, v[1] as u64);
+                    } else if !p.space().read(a[2], &mut ts) {
+                        return Err(-EFAULT);
+                    }
+                }
+                signal::sigtimedwait(p.space(), a[0], a[1], (a[2] != 0).then_some(&ts), a[3])
+            }
+            "rt_sigreturn" => call(p, t, cpu, libc::SYS_rt_sigreturn, a),
+            "rt_sigaction" => call(p, t, cpu, libc::SYS_rt_sigaction, a),
+            "rt_sigqueueinfo" => call(p, t, cpu, libc::SYS_rt_sigqueueinfo, a),
+            "rt_tgsigqueueinfo" => call(p, t, cpu, libc::SYS_rt_tgsigqueueinfo, a),
+            "sigaltstack" => call(p, t, cpu, libc::SYS_sigaltstack, a),
             _ => match host_nr {
                 Some(n) => call(p, t, cpu, n, a),
                 None => -ENOSYS,

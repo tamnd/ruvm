@@ -244,8 +244,47 @@ pub(crate) fn host_to_target_siginfo(h: &Info) -> Info {
 fn target_to_host_siginfo(t: &Info) -> Info {
     let mut h = [0u8; 128];
     h[..12].copy_from_slice(&t[..12]);
-    h[16..32].copy_from_slice(&t[16..32]);
+    if crate::guest::guest().abi32 {
+        // pid, uid and a 32-bit sigval, after three ints rather than four.
+        put32(&mut h, 16, get32(t, 12));
+        put32(&mut h, 20, get32(t, 16));
+        put64(&mut h, 24, u64::from(get32(t, 20)));
+    } else {
+        h[16..32].copy_from_slice(&t[16..32]);
+    }
     h
+}
+
+/// The guest's `siginfo_t` of `info`, which has the layout of a 64-bit one: on a 32-bit
+/// target the union starts at 12 and its longs and pointers are 32 bits.
+pub(crate) fn guest_siginfo(info: &Info) -> Info {
+    if !crate::guest::guest().abi32 {
+        return *info;
+    }
+    let (sig, code) = (get32(info, 0) as i32, get32(info, 8) as i32);
+    let mut t = [0u8; 128];
+    t[..12].copy_from_slice(&info[..12]);
+    // The ints at 16 and 20 move down by 4 whatever the union member is: pid and uid,
+    // the timer id and overrun, or a fault address of 32 bits and its zero top half.
+    put32(&mut t, 12, get32(info, 16));
+    put32(&mut t, 16, get32(info, 20));
+    let sifields = !matches!(code, SI_USER | SI_TKILL | SI_KERNEL);
+    match sig {
+        SIGCHLD if sifields => {
+            // status, utime and stime.
+            put32(&mut t, 20, get32(info, 24));
+            put32(&mut t, 24, get64(info, 32) as u32);
+            put32(&mut t, 28, get64(info, 40) as u32);
+        }
+        // A long band and the fd.
+        SIGIO if sifields => {
+            put32(&mut t, 12, get64(info, 16) as u32);
+            put32(&mut t, 16, get32(info, 24));
+        }
+        // The value of sigqueue() and the like.
+        _ => put32(&mut t, 20, get64(info, 24) as u32),
+    }
+    t
 }
 
 /// One entry of `sigtab`: a pending signal and its information.
@@ -661,7 +700,13 @@ fn handle_pending_signal(
             let blocked = if t.in_sigsuspend { t.sigsuspend_mask } else { t.signal_mask };
             t.signal_mask = blocked | set;
             t.in_sigsuspend = false;
-            (crate::guest::guest().setup_rt_frame)(space, t, cpu, sig, &sa, info, old);
+            let g = crate::guest::guest();
+            match g.setup_frame {
+                Some(setup_frame) if sa.flags & SA_SIGINFO == 0 => {
+                    setup_frame(space, t, cpu, sig, &sa, info, old);
+                }
+                _ => (g.setup_rt_frame)(space, t, cpu, sig, &sa, info, old),
+            }
             if sa.flags & SA_RESETHAND != 0 {
                 sigact()[sig as usize - 1].handler = SIG_DFL;
             }
@@ -737,18 +782,33 @@ pub(crate) fn target_sigsp(t: &Task, sp: u64, sa: &Sigaction) -> u64 {
     sp
 }
 
-/// `target_save_altstack()`: the guest `stack_t` at `sp`.
+/// The size of the guest `stack_t`: a pointer, an int and a `size_t`.
+pub(crate) fn stack_t_size() -> usize {
+    if crate::guest::guest().abi32 { 12 } else { 24 }
+}
+
+/// `target_save_altstack()`: the guest `stack_t` at `sp`, in the first [`stack_t_size`] bytes.
 pub(crate) fn save_altstack(t: &Task, sp: u64) -> [u8; 24] {
     let mut b = [0u8; 24];
-    put64(&mut b, 0, t.altstack.0);
-    put32(&mut b, 8, sas_ss_flags(t, sp) as u32);
-    put64(&mut b, 16, t.altstack.1);
+    if crate::guest::guest().abi32 {
+        put32(&mut b, 0, t.altstack.0 as u32);
+        put32(&mut b, 4, sas_ss_flags(t, sp) as u32);
+        put32(&mut b, 8, t.altstack.1 as u32);
+    } else {
+        put64(&mut b, 0, t.altstack.0);
+        put32(&mut b, 8, sas_ss_flags(t, sp) as u32);
+        put64(&mut b, 16, t.altstack.1);
+    }
     b
 }
 
 /// `target_restore_altstack()` from the guest `stack_t` `uss`.
 pub(crate) fn restore_altstack(t: &mut Task, uss: &[u8], sp: u64) -> i64 {
-    let (ss_sp, flags, mut size) = (get64(uss, 0), get32(uss, 8) as i32, get64(uss, 16));
+    let (ss_sp, flags, mut size) = if crate::guest::guest().abi32 {
+        (u64::from(get32(uss, 0)), get32(uss, 4) as i32, u64::from(get32(uss, 8)))
+    } else {
+        (get64(uss, 0), get32(uss, 8) as i32, get64(uss, 16))
+    };
     if on_sig_stack(t, sp) {
         return -i64::from(libc::EPERM);
     }
@@ -771,13 +831,14 @@ pub(crate) fn restore_altstack(t: &mut Task, uss: &[u8], sp: u64) -> i64 {
 
 /// `do_sigaltstack()`.
 fn do_sigaltstack(space: &GuestSpace, t: &mut Task, uss: u64, uoss: u64, sp: u64) -> i64 {
-    if uoss != 0 && !space.check(uoss, 24, ruvm_user_common::page::WRITE) {
+    let size = stack_t_size();
+    if uoss != 0 && !space.check(uoss, size as u64, ruvm_user_common::page::WRITE) {
         return -EFAULT;
     }
     let old = save_altstack(t, sp);
     if uss != 0 {
         let mut b = [0u8; 24];
-        if !space.read(uss, &mut b) {
+        if !space.read(uss, &mut b[..size]) {
             return -EFAULT;
         }
         let r = restore_altstack(t, &b, sp);
@@ -785,21 +846,30 @@ fn do_sigaltstack(space: &GuestSpace, t: &mut Task, uss: u64, uoss: u64, sp: u64
             return r;
         }
     }
-    if uoss != 0 && !space.write(uoss, &old) {
+    if uoss != 0 && !space.write(uoss, &old[..size]) {
         return -EFAULT;
     }
     0
 }
 
+/// An `abi_ulong` of the guest at `off`.
+fn get_ulong(b: &[u8], off: usize) -> u64 {
+    if crate::guest::guest().abi32 { u64::from(get32(b, off)) } else { get64(b, off) }
+}
+
+fn put_ulong(b: &mut [u8], off: usize, v: u64) {
+    if crate::guest::guest().abi32 { put32(b, off, v as u32) } else { put64(b, off, v) }
+}
+
 /// `do_sigaction()` for `rt_sigaction(sig, act, oact, sigsetsize)`.
-fn do_sigaction(space: &GuestSpace, t: &Task, a: [u64; 6]) -> i64 {
-    let sig = a[0] as i32;
+fn do_rt_sigaction(space: &GuestSpace, t: &Task, a: [u64; 6]) -> i64 {
     if a[3] != 8 {
         return -EINVAL;
     }
     // handler, flags, restorer when the target has it, and mask.
-    let restorer = crate::guest::guest().sa_restorer;
-    let size = if restorer { 32 } else { 24 };
+    let g = crate::guest::guest();
+    let w = if g.abi32 { 4 } else { 8 };
+    let size = if g.sa_restorer { 3 * w + 8 } else { 2 * w + 8 };
     let mut act = [0u8; 32];
     if a[1] != 0 && !space.read(a[1], &mut act[..size]) {
         return -EFAULT;
@@ -807,53 +877,117 @@ fn do_sigaction(space: &GuestSpace, t: &Task, a: [u64; 6]) -> i64 {
     if a[2] != 0 && !space.check(a[2], size as u64, ruvm_user_common::page::WRITE) {
         return -EFAULT;
     }
-    if !(1..=NSIG).contains(&sig) {
-        return -EINVAL;
-    }
-    if a[1] != 0 && (sig == SIGKILL || sig == SIGSTOP) {
-        return -EINVAL;
-    }
-    if block_signals(t) {
-        return ERESTARTSYS;
-    }
-    let mut tab = sigact();
-    let k = &mut tab[sig as usize - 1];
+    let new = (a[1] != 0).then(|| Sigaction {
+        handler: get_ulong(&act, 0),
+        flags: get_ulong(&act, w),
+        restorer: if g.sa_restorer { get_ulong(&act, 2 * w) } else { 0 },
+        mask: get64(&act, size - 8),
+    });
+    let old = match do_sigaction(t, a[0] as i32, new) {
+        Ok(old) => old,
+        Err(e) => return e,
+    };
     if a[2] != 0 {
         let mut b = [0u8; 32];
-        put64(&mut b, 0, k.handler);
-        put64(&mut b, 8, k.flags);
-        if restorer {
-            put64(&mut b, 16, k.restorer);
+        put_ulong(&mut b, 0, old.handler);
+        put_ulong(&mut b, w, old.flags);
+        if g.sa_restorer {
+            put_ulong(&mut b, 2 * w, old.restorer);
         }
-        put64(&mut b, size - 8, k.mask);
+        put64(&mut b, size - 8, old.mask);
         if !space.write(a[2], &b[..size]) {
             return -EFAULT;
         }
     }
-    if a[1] == 0 {
-        return 0;
+    0
+}
+
+/// `do_sigaction()`: makes `act` the action of `sig`, when there is one, and returns the
+/// action before.
+pub(crate) fn do_sigaction(t: &Task, sig: i32, act: Option<Sigaction>) -> Result<Sigaction, i64> {
+    if !(1..=NSIG).contains(&sig) {
+        return Err(-EINVAL);
     }
-    *k = Sigaction {
-        handler: get64(&act, 0),
-        flags: get64(&act, 8),
-        restorer: if restorer { get64(&act, 16) } else { 0 },
-        mask: get64(&act, size - 8),
-    };
+    if act.is_some() && (sig == SIGKILL || sig == SIGSTOP) {
+        return Err(-EINVAL);
+    }
+    if block_signals(t) {
+        return Err(ERESTARTSYS);
+    }
+    let mut tab = sigact();
+    let k = &mut tab[sig as usize - 1];
+    let old = *k;
+    let Some(act) = act else { return Ok(old) };
+    *k = act;
     let host_sig = t2h(sig);
-    if host_sig > NSIG {
-        // Not enough host signals for every target one; programs that register handlers for
-        // all of them must not fail.
-        return 0;
+    // Not enough host signals for every target one; programs that register handlers for all
+    // of them must not fail.
+    if host_sig > NSIG || host_sig == libc::SIGSEGV || host_sig == libc::SIGBUS {
+        return Ok(old);
     }
-    if host_sig == libc::SIGSEGV || host_sig == libc::SIGBUS {
-        return 0;
-    }
-    match k.handler {
+    let r = match k.handler {
         SIG_IGN => host::set_disposition(host_sig, SIG_IGN),
         SIG_DFL if !core_dump_signal(sig) => host::set_disposition(host_sig, SIG_DFL),
         SIG_DFL => host::install_handler(host_sig, false),
         _ => host::install_handler(host_sig, k.flags & SA_RESTART != 0),
+    };
+    if r < 0 { Err(r) } else { Ok(old) }
+}
+
+/// `do_sigprocmask()` for the calls of the old one-word masks, `sigprocmask()`, `sgetmask()`
+/// and `ssetmask()`: the old guest mask, as one.
+pub(crate) fn old_sigprocmask(t: &mut Task, how: i32, set: Option<u64>) -> Result<u64, i64> {
+    let old = t.signal_mask;
+    let r = do_sigprocmask(t, how, set.map(t2h_set));
+    if r < 0 { Err(r) } else { Ok(h2t_set(old) & 0xffff_ffff) }
+}
+
+/// `sigsuspend()` with the guest mask at `set`, which is `size` bytes.
+pub(crate) fn sigsuspend(space: &GuestSpace, t: &mut Task, set: u64, size: u64) -> i64 {
+    if let Err(e) = sigsuspend_mask(space, t, set, size) {
+        return e;
     }
+    let mask = t.sigsuspend_mask;
+    let r = guest_sys(libc::SYS_rt_sigsuspend, &[(&raw const mask) as u64, 8]);
+    finish_sigsuspend(t, r);
+    r
+}
+
+/// `rt_sigtimedwait()` with the guest mask at `set` and the host `timespec` `ts`, which
+/// writes the guest's `siginfo_t` to `uinfo`.
+pub(crate) fn sigtimedwait(
+    space: &GuestSpace,
+    set: u64,
+    uinfo: u64,
+    ts: Option<&[u8; 16]>,
+    size: u64,
+) -> i64 {
+    if size != 8 {
+        return -EINVAL;
+    }
+    let set = match read_u64(space, set) {
+        Ok(s) => t2h_set(s),
+        Err(e) => return e,
+    };
+    let mut hinfo = [0u64; 16];
+    let tsp = ts.map_or(0, |ts| ts.as_ptr() as u64);
+    let r = guest_sys(
+        libc::SYS_rt_sigtimedwait,
+        &[(&raw const set) as u64, hinfo.as_mut_ptr() as u64, tsp, 8],
+    );
+    if r < 0 {
+        return r;
+    }
+    if uinfo != 0 {
+        let mut b = [0u8; 128];
+        for (i, w) in hinfo.iter().enumerate() {
+            put64(&mut b, 8 * i, *w);
+        }
+        if !space.write(uinfo, &guest_siginfo(&host_to_target_siginfo(&b))) {
+            return -EFAULT;
+        }
+    }
+    i64::from(h2t(r as i32))
 }
 
 /// `process_sigsuspend_mask()`: the host form of the guest mask at `set`, `size` bytes.
@@ -922,7 +1056,7 @@ pub(crate) fn do_signal_syscall(
     a: [u64; 6],
 ) -> Option<i64> {
     let r = match n {
-        libc::SYS_rt_sigaction => do_sigaction(space, t, a),
+        libc::SYS_rt_sigaction => do_rt_sigaction(space, t, a),
         libc::SYS_rt_sigprocmask => {
             if a[3] != 8 {
                 return Some(-EINVAL);
@@ -961,15 +1095,7 @@ pub(crate) fn do_signal_syscall(
             }
             r
         }
-        libc::SYS_rt_sigsuspend => {
-            if let Err(e) = sigsuspend_mask(space, t, a[0], a[1]) {
-                return Some(e);
-            }
-            let mask = t.sigsuspend_mask;
-            let r = guest_sys(libc::SYS_rt_sigsuspend, &[(&raw const mask) as u64, 8]);
-            finish_sigsuspend(t, r);
-            r
-        }
+        libc::SYS_rt_sigsuspend => sigsuspend(space, t, a[0], a[1]),
         libc::SYS_pause => {
             if !block_signals(t) {
                 let mask = t.signal_mask;
@@ -981,33 +1107,11 @@ pub(crate) fn do_signal_syscall(
             if a[3] != 8 {
                 return Some(-EINVAL);
             }
-            let set = match read_u64(space, a[0]) {
-                Ok(s) => t2h_set(s),
-                Err(e) => return Some(e),
-            };
             let mut ts = [0u8; 16];
             if a[2] != 0 && !space.read(a[2], &mut ts) {
                 return Some(-EFAULT);
             }
-            let mut hinfo = [0u64; 16];
-            let tsp = if a[2] != 0 { ts.as_ptr() as u64 } else { 0 };
-            let r = guest_sys(
-                libc::SYS_rt_sigtimedwait,
-                &[(&raw const set) as u64, hinfo.as_mut_ptr() as u64, tsp, 8],
-            );
-            if r < 0 {
-                return Some(r);
-            }
-            if a[1] != 0 {
-                let mut b = [0u8; 128];
-                for (i, w) in hinfo.iter().enumerate() {
-                    put64(&mut b, 8 * i, *w);
-                }
-                if !space.write(a[1], &host_to_target_siginfo(&b)) {
-                    return Some(-EFAULT);
-                }
-            }
-            i64::from(h2t(r as i32))
+            sigtimedwait(space, a[0], a[1], (a[2] != 0).then_some(&ts), a[3])
         }
         libc::SYS_rt_sigqueueinfo | libc::SYS_rt_tgsigqueueinfo => {
             let at = if n == libc::SYS_rt_sigqueueinfo { 2 } else { 3 };
