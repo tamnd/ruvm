@@ -154,8 +154,12 @@ pub(crate) fn realize_x86(
 ) -> Result<(), Located> {
     use std::sync::Arc;
 
+    use ruvm_base::report::push_location;
     use ruvm_hw_pci::regs::PCI_ROM_SLOT;
 
+    // qdev_device_add() runs realize with the option's location current, so what realize
+    // reports itself, such as the dma-buf warning, starts with "-device vfio-pci,...: ".
+    let _loc = plug.loc.clone().map(push_location);
     let X86Board::Q35(m, _) = board else {
         return Err(Located::new(
             &plug.loc,
