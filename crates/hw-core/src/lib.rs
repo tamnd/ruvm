@@ -12,6 +12,7 @@ pub mod fw_cfg;
 pub mod irq;
 pub mod machine;
 pub mod timer;
+pub mod vmstate;
 
 pub use irq::{IrqLine, IrqPin};
 pub use machine::{
