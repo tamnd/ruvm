@@ -171,7 +171,7 @@ pub(crate) fn realize_x86(
         .or_else(|| bus.first_free_devfn())
         .and_then(|devfn| m.pci_dma().address_space(u16::from(devfn)))
         .unwrap_or_else(|| Arc::clone(m.memory_as()));
-    let viommu = Q35Viommu(&**m);
+    let viommu = Q35Viommu(m);
     let dev = ruvm_hw_vfio::pci::realize(
         bus,
         plug.devfn,
