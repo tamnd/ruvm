@@ -791,8 +791,9 @@ pub struct Q35 {
     io_as: Arc<AddressSpace>,
     smm_root: Option<RegionId>,
     smm_as: Option<Arc<AddressSpace>>,
-    /// `pc.bios`, when the firmware is ROM rather than pflash.
-    bios: Option<(RegionId, Vec<u8>)>,
+    /// `pc.bios`, when the firmware is ROM rather than pflash, with its contents until the
+    /// first reset writes them.
+    bios: Option<(RegionId, Option<Vec<u8>>)>,
     /// pflash0 and pflash1, when pflash0 has a drive.
     flashes: Vec<Arc<Pflash>>,
     roms: Vec<RomBlob>,
@@ -1412,7 +1413,7 @@ impl Q35 {
             io_as,
             smm_root,
             smm_as,
-            bios,
+            bios: bios.map(|(r, data)| (r, Some(data))),
             flashes,
             roms,
             fw_cfg,
@@ -1689,10 +1690,13 @@ impl Q35 {
         for f in &self.flashes {
             f.reset();
         }
-        // rom_reset()
-        if let Some((bios, data)) = &self.bios {
-            let block = self.mem.ram_block(*bios).ok_or("pc.bios has no RAM block")?;
-            block.write(0, data).map_err(err)?;
+        // rom_reset(). As in QEMU, a ROM is written once, so a PPI memory clear that zeroed
+        // pc.bios lasts.
+        if let Some((bios, data)) = &mut self.bios {
+            if let Some(data) = data.take() {
+                let block = self.mem.ram_block(*bios).ok_or("pc.bios has no RAM block")?;
+                block.write(0, &data).map_err(err)?;
+            }
         }
         for rom in &self.roms {
             let mut data = rom.data.clone();
@@ -2049,9 +2053,9 @@ impl Q35 {
     }
 
     /// `tpm_tis_isa_realizefn()`: maps the TIS over `be` and its PPI memory, wires its
-    /// interrupt to ISA IRQ `irq` and gives the ACPI tables the TPM. The TIS starts the TPM on
-    /// every reset and, as in QEMU, the process exits when that fails. The PPI memory clear
-    /// on reset is not done yet.
+    /// interrupt to ISA IRQ `irq` and gives the ACPI tables the TPM. Every reset does the PPI
+    /// memory clear the guest asked for and starts the TPM, and, as in QEMU, the process exits
+    /// when that fails.
     pub fn attach_tpm_tis(&self, be: Box<dyn TpmBackend>, irq: u32) -> Result<Arc<TpmTis>, String> {
         let version = be.version();
         let tis = TpmTis::new(be, irq);
@@ -2059,11 +2063,11 @@ impl Q35 {
         let ops: Arc<dyn MmioOps> = tis.clone();
         let r = self.mem.new_io("tpm-tis-mmio", u128::from(TPM_TIS_ADDR_SIZE), ops).map_err(err)?;
         self.mem.add_subregion(self.system, TPM_TIS_ADDR_BASE, r).map_err(err)?;
-        let ppi: Arc<dyn MmioOps> = Arc::new(TpmPpi::default());
-        let r = self.mem.new_io("tpm-ppi", TPM_PPI_ADDR_SIZE as u128, ppi).map_err(err)?;
-        self.mem.add_subregion(self.system, TPM_PPI_ADDR_BASE, r).map_err(err)?;
+        let ppi = self.map_tpm_ppi()?;
         let reset = Arc::clone(&tis);
+        let space = Arc::clone(&self.memory_as);
         self.add_reset_hook(Box::new(move || {
+            ppi.reset(&space);
             if let Err(e) = reset.reset() {
                 error_report(&e);
                 std::process::exit(1);
@@ -2074,9 +2078,8 @@ impl Q35 {
     }
 
     /// `tpm_crb_realize()`: maps the CRB registers and command buffer over `be` and the PPI
-    /// memory, and gives the ACPI tables the TPM. The CRB starts the TPM on every reset and,
-    /// as in QEMU, the process exits when that fails. The PPI memory clear on reset is not
-    /// done yet.
+    /// memory, and gives the ACPI tables the TPM. Every reset does the PPI memory clear the
+    /// guest asked for and starts the TPM, and, as in QEMU, the process exits when that fails.
     pub fn attach_tpm_crb(
         &self,
         be: Box<dyn TpmBackend>,
@@ -2095,11 +2098,11 @@ impl Q35 {
         self.mem
             .add_subregion(self.system, TPM_CRB_ADDR_BASE + TPM_CRB_DATA_BUFFER, r)
             .map_err(err)?;
-        let ppi: Arc<dyn MmioOps> = Arc::new(TpmPpi::default());
-        let r = self.mem.new_io("tpm-ppi", TPM_PPI_ADDR_SIZE as u128, ppi).map_err(err)?;
-        self.mem.add_subregion(self.system, TPM_PPI_ADDR_BASE, r).map_err(err)?;
+        let ppi = self.map_tpm_ppi()?;
         let reset = Arc::clone(&crb);
+        let space = Arc::clone(&self.memory_as);
         self.add_reset_hook(Box::new(move || {
+            ppi.reset(&space);
             if let Err(e) = reset.reset() {
                 error_report(&e);
                 std::process::exit(1);
@@ -2107,6 +2110,15 @@ impl Q35 {
         }));
         self.set_tpm(version, TpmInterface::Crb);
         Ok(crb)
+    }
+
+    /// `tpm_ppi_init()`: maps the PPI memory at `TPM_PPI_ADDR_BASE`.
+    fn map_tpm_ppi(&self) -> Result<Arc<TpmPpi>, String> {
+        let ppi = Arc::new(TpmPpi::default());
+        let ops: Arc<dyn MmioOps> = ppi.clone();
+        let r = self.mem.new_io("tpm-ppi", TPM_PPI_ADDR_SIZE as u128, ops).map_err(err)?;
+        self.mem.add_subregion(self.system, TPM_PPI_ADDR_BASE, r).map_err(err)?;
+        Ok(ppi)
     }
 
     /// Gives the ACPI tables the TPM, which has the PPI.
