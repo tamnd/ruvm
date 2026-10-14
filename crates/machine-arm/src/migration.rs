@@ -4,23 +4,26 @@
 //!
 //! [`virt_savevm`] registers the sections of `virt` the way QEMU 11.1 lays them out. So far
 //! these are the `timer` section, RAM, the flashes, the vCPUs, the GIC, the UARTs, the RTC,
-//! the PCI host, the GPIO controllers and the power key, `fw_cfg`, the state of the ACPI
-//! tables and `globalstate`. The ACPI GED only keeps its section id for now, and devices
-//! plugged into the PCI bus are not sent yet. Neither are the ACPI tables themselves, which
-//! QEMU sends as the three `/rom@etc` RAM blocks.
+//! the PCI host, the GPIO controllers and the power key, the ACPI GED, `fw_cfg`, the state of
+//! the ACPI tables and `globalstate`. Devices plugged into the PCI bus are not sent yet.
+//! Neither are the ACPI tables themselves, which QEMU sends as the three `/rom@etc` RAM blocks.
 //!
 //! The device sections carry the state field by field, as QEMU 11.1's `VMStateDescription`
 //! for it does: the CFI01 flash (hw/block/pflash_cfi01.c), the PL011 UART (hw/char/pl011.c
 //! and hw/core/clock-vmstate.c), the PL031 RTC (hw/rtc/pl031.c), the PL061 GPIO controller
 //! (hw/gpio/pl061.c) and the GPIO power key (hw/gpio/gpio_key.c). The registers add no path
 //! prefix, as these are sysbus devices. The PCI host's sections are those of
-//! [`ruvm_hw_pci::vmstate`], and `fw_cfg` is [`ruvm_hw_core::vmstate`]'s.
+//! [`ruvm_hw_pci::vmstate`], the GED's is [`ruvm_hw_acpi::vmstate`]'s and `fw_cfg` is
+//! [`ruvm_hw_core::vmstate`]'s.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, Weak};
 
 use ruvm_accel::tcg::TcgVcpus;
 use ruvm_base::{Error, error_report};
+use ruvm_hw_acpi::AcpiGed;
+use ruvm_hw_acpi::ich9::MemHotplugVmState;
+use ruvm_hw_acpi::vmstate::{AcpiGedVmState, VMSTATE_ACPI_GED};
 use ruvm_hw_char::pl011::{PL011_FIFO_DEPTH, Pl011, Pl011VmState};
 use ruvm_hw_core::fw_cfg::FwCfgState;
 use ruvm_hw_core::timer::Clock;
@@ -129,9 +132,8 @@ fn register_devices(savevm: &mut SaveVm, board: &VirtMachine) {
         register_gpio_key(savevm, key);
         pl061 = 1;
     }
-    if board.ged().is_some() {
-        // "acpi-ged", which ruvm does not send yet.
-        savevm.reserve_section_id();
+    if let Some(ged) = board.ged() {
+        register_ged(savevm, ged);
     }
     if let Some(gpio) = board.secure_gpio() {
         register_pl061(savevm, pl061, gpio);
@@ -530,6 +532,22 @@ pub fn register_gpio_key(savevm: &mut SaveVm, key: &Arc<GpioKey>) {
         move || Ok(get.vmstate_save()),
         move |t| {
             put.vmstate_load(t);
+            Ok(())
+        },
+    );
+}
+
+/// Registers the `acpi-ged` section of `ged`, instance 0 with no path prefix as in QEMU. virt
+/// has no memory hotplug, so its memory hotplug state has no slots.
+pub fn register_ged(savevm: &mut SaveVm, ged: &Arc<AcpiGed>) {
+    let (get, put) = (Arc::clone(ged), Arc::clone(ged));
+    savevm.register_vmsd(
+        "",
+        Some(0),
+        &VMSTATE_ACPI_GED,
+        move || Ok(AcpiGedVmState { sel: get.sel(), memhp: MemHotplugVmState::default() }),
+        move |s| {
+            put.set_sel(s.sel);
             Ok(())
         },
     );
