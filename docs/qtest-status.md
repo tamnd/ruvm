@@ -29,7 +29,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | migration-test | 12 | 1 | analyze-script passes, then the multifd case hangs: the destination runs its CPUs from reset, since ruvm does not migrate the CPU state yet |
 | boot-serial-test | 1 | 1 | |
 | test-hmp | 90 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
-| qmp-cmd-test | 59 | 17 | stops at `query-vnc`, see below |
+| qmp-cmd-test | 61 | 64 | ruvm also has the three TPM queries, see below |
 | qos-test | 90 (5 skipped) | 16 (3 skipped) | runs the virtio-rng, virtio-blk, virtio-balloon and virtio-net cases only, see below |
 | xlnx-canfd-test | 3 | 0 | no `xlnx-zcu102` board |
 | xlnx-versal-trng-test | 5 | 0 | no `xlnx-versal-virt` board |
@@ -48,7 +48,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 1 | |
 | netdev-socket | 10 | 10 | |
-| Total | 447 | 77 | |
+| Total | 449 | 124 | |
 
 ## qtest-riscv64
 
@@ -59,7 +59,7 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | device-introspect-test | 6 | 6 | |
 | cdrom-test | 1 | 1 | |
 | test-hmp | 13 | 3 | one case per machine: ruvm has `none` and `virt`, and passes both |
-| qmp-cmd-test | 59 | 17 | stops at `query-vnc`, see below |
+| qmp-cmd-test | 61 | 64 | ruvm also has the three TPM queries, see below |
 | qos-test | 113 (5 skipped) | 27 (3 skipped) | runs the virtio-rng, virtio-blk, virtio-balloon and virtio-net cases only, see below |
 | riscv-csr-test | 1 | 0 | no `veyron-v1` CPU model |
 | iommu-riscv-test | 4 | 0 | no `riscv-iommu-pci` or `iommu-testdev` |
@@ -68,11 +68,11 @@ The riscv64 host was tested in #176 by running ruvm, built for riscv64gc Linux, 
 | qmp-test | 9 | 9 | |
 | readconfig-test | 1 | 1 | |
 | netdev-socket | 10 | 10 | |
-| Total | 241 | 79 | |
+| Total | 243 | 126 | |
 
 ## qmp-cmd-test and VNC
 
-The QEMU build used for the tests has no VNC, so `qmp-cmd-test` is compiled to expect `query-vnc` to fail. ruvm has VNC and answers it, so the stock test stops at its 18th case. To compare the rest, the test was rebuilt from a copy of its source with the `#ifndef CONFIG_VNC` block turned off, because `config-host.h` undefines `CONFIG_VNC` and a `-D` on the command line does not reach it. With that variant ruvm passes 61 of 61 on both targets and QEMU passes 59 of 59. The two extra cases are `query-vnc` and `query-vnc-servers`, which QEMU without VNC does not have in its schema.
+The QEMU build used for the other tests has no VNC, so its `qmp-cmd-test` is compiled to expect `query-vnc` to fail, and ruvm, which has VNC and answers it, stopped at the 18th case. The qmp-cmd-test rows now come from a second QEMU build from the same tree with `--enable-vnc --enable-pixman` added and `--disable-docs --disable-werror --disable-rust`. The stock `qmp-cmd-test` of that build passes 61 of 61 with its own QEMU and 64 of 64 with ruvm on both targets. The three extra cases are `query-tpm`, `query-tpm-models` and `query-tpm-types`, which ruvm answers and which a QEMU built with `--without-default-features` leaves out of its schema. ruvm was a debug build of main at #307 for these rows.
 
 ## tests/tcg for riscv64
 
