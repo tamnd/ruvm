@@ -1232,7 +1232,8 @@ fn init_migration(vm: &Arc<Vm>, machine: &VirtTcgMachine, uuid: Option<[u8; 16]>
         vm.qmp.clone(),
         q.global_state,
         vm.autostart.clone(),
-    );
+    )
+    .with_vcpus(vm);
     let m = Migration::new(Arc::new(Mutex::new(q.savevm)), Some(q.ram_stats), Arc::new(host));
     #[cfg(unix)]
     crate::x86::monitor_fds(&m, &vm.qmp);

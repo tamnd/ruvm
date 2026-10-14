@@ -2597,7 +2597,8 @@ fn init_migration(
         q.global_state,
         vm.autostart.clone(),
     )
-    .with_snapshot_hooks(hooks);
+    .with_snapshot_hooks(hooks)
+    .with_vcpus(vm);
     let m = Migration::new(Arc::new(Mutex::new(q.savevm)), Some(q.ram_stats), Arc::new(host));
     #[cfg(unix)]
     monitor_fds(&m, &vm.qmp);

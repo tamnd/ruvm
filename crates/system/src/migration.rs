@@ -6,7 +6,7 @@
 //! and virtual clock that snapshots need.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use ruvm_base::report::report_error;
 use ruvm_base::{Error, Result};
@@ -22,6 +22,7 @@ use ruvm_qapi::types::{
 use ruvm_qapi::visit::{QObjectInputVisitor, Visit};
 
 use crate::runstate::{Runstate, is_live};
+use crate::vl::Vm;
 
 /// `qemu_system_reset()` done right away, for `loadvm`.
 pub(crate) type ResetFn = Box<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
@@ -51,6 +52,7 @@ pub(crate) struct Host {
     /// `MigrationState.vm_old_state`.
     old_state: Mutex<RunState>,
     snapshot: Option<SnapshotHooks>,
+    vm: Weak<Vm>,
 }
 
 impl Host {
@@ -67,7 +69,14 @@ impl Host {
             autostart,
             old_state: Mutex::new(RunState::Running),
             snapshot: None,
+            vm: Weak::new(),
         }
+    }
+
+    /// The host that finds the vCPU threads of `vm` for the postcopy blocktime.
+    pub(crate) fn with_vcpus(mut self, vm: &Arc<Vm>) -> Self {
+        self.vm = Arc::downgrade(vm);
+        self
     }
 
     /// The host with the reset and clock `savevm` and `loadvm` use.
@@ -187,6 +196,10 @@ impl MigrationHost for Host {
 
     fn vm_clock_ns(&self) -> u64 {
         self.snapshot.as_ref().map_or(0, |h| (h.vm_clock_ns)())
+    }
+
+    fn vcpu_thread_ids(&self) -> Vec<i64> {
+        self.vm.upgrade().and_then(|vm| vm.cpus.get().map(|c| c.thread_ids())).unwrap_or_default()
     }
 }
 
