@@ -932,6 +932,29 @@ struct AcpiState {
     rsdp: Vec<u8>,
 }
 
+/// The `AcpiBuildState` of a board with ACPI tables, which the `virt_acpi_build` section
+/// carries.
+#[derive(Clone)]
+pub struct AcpiBuild(Arc<Mutex<AcpiState>>);
+
+impl AcpiBuild {
+    /// `patched`: whether the tables were rebuilt since the last reset.
+    pub fn patched(&self) -> bool {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).patched
+    }
+
+    /// Sets `patched`, as loading `virt_acpi_build` does.
+    pub fn set_patched(&self, patched: bool) {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).patched = patched;
+    }
+}
+
+impl fmt::Debug for AcpiBuild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcpiBuild").field("patched", &self.patched()).finish()
+    }
+}
+
 /// Which blob a select callback copies.
 #[derive(Copy, Clone)]
 enum AcpiBlob {
@@ -2420,6 +2443,11 @@ impl VirtMachine {
     /// Whether the board builds ACPI tables for the firmware.
     pub fn acpi(&self) -> bool {
         self.acpi
+    }
+
+    /// The state of the ACPI tables, from machine_done on, unless `acpi=off`.
+    pub fn acpi_build(&self) -> Option<AcpiBuild> {
+        self.acpi_state.get().map(|s| AcpiBuild(Arc::clone(s)))
     }
 
     /// Connect the chardev of the second UART.

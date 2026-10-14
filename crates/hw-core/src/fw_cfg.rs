@@ -15,8 +15,9 @@
 //! the same device.
 //!
 //! [`FwCfgState::vmstate_save`] and [`FwCfgState::vmstate_load`] move what the `fw_cfg` VMState
-//! carries. The ACPI MR sizes are only kept so that a stream from QEMU can be sent on again;
-//! there are no resizable ACPI ROM regions here to resize.
+//! carries, and [`crate::vmstate::VMSTATE_FW_CFG`] describes it. The ACPI MR sizes are the
+//! lengths of the three ACPI files, as `fw_cfg_acpi_mr_save()` records them, or what a stream
+//! brought; there are no resizable ACPI ROM regions here to resize.
 //!
 //! Trace points, QOM registration and the machine wiring are left out; the `fw_cfg_init_*`
 //! constructors only build the device and its ops.
@@ -302,10 +303,14 @@ struct FwCfgInner {
     cur_entry: u16,
     cur_offset: u32,
     dma_addr: u64,
-    // `table_mr_size`, `linker_mr_size` and `rsdp_mr_size`, as the `fw_cfg/acpi_mr` subsection
-    // last brought them.
+    // `table_mr_size`, `linker_mr_size` and `rsdp_mr_size`: the lengths of the ACPI files, or
+    // what the `fw_cfg/acpi_mr` subsection last brought.
     acpi_mr_sizes: [u64; 3],
 }
+
+/// `ACPI_BUILD_TABLE_FILE`, `ACPI_BUILD_LOADER_FILE` and `ACPI_BUILD_RSDP_FILE`, in the order
+/// of the ACPI MR sizes.
+const ACPI_MR_FILES: [&str; 3] = ["etc/acpi/tables", "etc/table-loader", "etc/acpi/rsdp"];
 
 /// The page size `fw_cfg_acpi_mr_restore()` checks the ACPI MR sizes against,
 /// `qemu_real_host_page_size()` on the x86 Linux hosts QEMU migrates with.
@@ -521,7 +526,15 @@ impl FwCfgInner {
         files[o..o + 4].copy_from_slice(&len.to_be_bytes());
         files[o + 4..o + 6].copy_from_slice(&key.to_be_bytes());
         files[0..4].copy_from_slice(&(count as u32 + 1).to_be_bytes());
+        self.acpi_mr_save(filename, len);
         Ok(())
+    }
+
+    /// `fw_cfg_acpi_mr_save()`: keeps the length of an ACPI file for `fw_cfg/acpi_mr`.
+    fn acpi_mr_save(&mut self, filename: &str, len: u32) {
+        if let Some(i) = ACPI_MR_FILES.iter().position(|&f| f == filename) {
+            self.acpi_mr_sizes[i] = u64::from(len);
+        }
     }
 }
 
@@ -933,6 +946,7 @@ impl FwCfgState {
             let old = s.modify_bytes_read(FW_CFG_FILE_FIRST + i as u16, data);
             let o = file_off(i);
             s.files_mut()[o..o + 4].copy_from_slice(&len.to_be_bytes());
+            s.acpi_mr_save(filename, len);
             return Ok(old);
         }
 

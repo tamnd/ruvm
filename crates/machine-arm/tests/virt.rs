@@ -1336,6 +1336,29 @@ fn iort_behind_a_root_port() {
     assert!(dsdt[s10..].windows(4).any(|w| w == b"S00_"));
 }
 
+/// What the `virt_acpi_build` and `fw_cfg` sections carry: the first read of a table after a
+/// reset sets `patched` and a reset clears it, and fw_cfg keeps the lengths of the three ACPI
+/// files for `fw_cfg/acpi_mr`.
+#[test]
+fn acpi_build_state_for_migration() {
+    let mut m = VirtMachine::new(a57()).unwrap();
+    m.machine_done().unwrap();
+    let acpi = m.acpi_build().unwrap();
+    assert!(!acpi.patched());
+    let tables = fw_cfg_file(&m, "etc/acpi/tables");
+    assert!(acpi.patched());
+    m.system_reset().unwrap();
+    assert!(!acpi.patched());
+    acpi.set_patched(true);
+    assert!(m.acpi_build().unwrap().patched());
+
+    let v = m.fw_cfg().state().vmstate_save();
+    let [loader, rsdp] = ["etc/table-loader", "etc/acpi/rsdp"].map(|f| fw_cfg_file(&m, f).len());
+    let lens = [tables.len(), loader, rsdp].map(|n| n as u64);
+    assert_eq!([v.table_mr_size, v.linker_mr_size, v.rsdp_mr_size], lens);
+    assert!(v.acpi_mr_needed());
+}
+
 /// ruvm does not put the functions behind root ports under a virtio-iommu yet, so the two do
 /// not go together.
 #[test]
