@@ -33,6 +33,10 @@ pub enum RegionType {
     /// A RAM block read directly in romd mode and a device otherwise, and always a device for
     /// writes.
     RomDevice,
+    /// Host memory of a device, `memory_region_init_ram_device_ptr()`: a mapped BAR of a
+    /// passthrough device. A memory listener sees it as RAM, but the CPU reaches it through
+    /// sized callbacks so that each access is one load or store of its width.
+    RamDevice,
     /// A device.
     Mmio,
     /// A window onto another region.
@@ -59,6 +63,7 @@ pub(crate) struct RegionTarget {
 pub(crate) enum TargetKind {
     Ram(Arc<RamBlock>),
     RomDevice(Arc<RamBlock>, Arc<dyn MmioOps>),
+    RamDevice(Arc<RamBlock>, Arc<dyn MmioOps>),
     Mmio(Arc<dyn MmioOps>),
     Iommu(Arc<dyn IommuOps>),
     /// Containers and aliases, which never appear in a FlatView.
@@ -68,7 +73,9 @@ pub(crate) enum TargetKind {
 impl RegionTarget {
     pub(crate) fn ram_block(&self) -> Option<&Arc<RamBlock>> {
         match &self.kind {
-            TargetKind::Ram(b) | TargetKind::RomDevice(b, _) => Some(b),
+            TargetKind::Ram(b) | TargetKind::RomDevice(b, _) | TargetKind::RamDevice(b, _) => {
+                Some(b)
+            }
             _ => None,
         }
     }

@@ -247,6 +247,33 @@ fn rom_device_switches_between_ram_and_callbacks() {
     assert!(matches!(sys.set_romd(root, false), Err(MemError::WrongKind(_))));
 }
 
+#[test]
+fn ram_device_is_ram_for_listeners_and_sized_for_the_cpu() {
+    let (sys, root, space) = setup();
+    let bar = sys.new_ram_device_ptr("bar", ruvm_sys::HostMemory::new(0x1000).unwrap()).unwrap();
+    sys.add_subregion(root, 0x4000, bar).unwrap();
+    assert_eq!(sys.region(bar).unwrap().ty, ruvm_mem::RegionType::RamDevice);
+    assert_eq!(space.write_u32(0x4010, U, 0x1122_3344), MemTxResult::OK);
+    let mut b = [0; 4];
+    sys.ram_block(bar).unwrap().read(0x10, &mut b).unwrap();
+    assert_eq!(b, 0x1122_3344u32.to_ne_bytes());
+    assert_eq!(space.load(0x4010, 8, Endian::HOST, U), (0x1122_3344, MemTxResult::OK));
+    // Unaligned accesses are allowed and copied a byte at a time.
+    assert_eq!(space.store(0x4021, 4, 0xa1b2_c3d4, Endian::Little, U), MemTxResult::OK);
+    assert_eq!(space.load(0x4021, 4, Endian::Little, U), (0xa1b2_c3d4, MemTxResult::OK));
+    assert_eq!(space.load(0x4022, 2, Endian::Little, U), (0xb2c3, MemTxResult::OK));
+    // The memory attribute lets it through, like RAM.
+    let mem = MemTxAttrs::new().with_memory(true);
+    assert_eq!(space.read_u32(0x4010, mem), (0x1122_3344, MemTxResult::OK));
+    // A mapped BAR is never migrated, so migration does not log it.
+    sys.global_dirty_log_start(GLOBAL_DIRTY_MIGRATION).unwrap();
+    let fv = space.flatview();
+    let r = fv.ranges().iter().find(|r| r.name() == "bar").unwrap();
+    assert!(!r.dirty_log_mask().contains(DirtyClient::Migration));
+    assert!(r.ram_block().is_some());
+    sys.global_dirty_log_stop(GLOBAL_DIRTY_MIGRATION);
+}
+
 struct Iommu {
     target: Arc<AddressSpace>,
 }

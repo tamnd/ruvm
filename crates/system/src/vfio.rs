@@ -25,7 +25,6 @@ const UNSUPPORTED: &[&str] = &[
     "display",
     "xres",
     "yres",
-    "x-intx-mmap-timeout-ms",
     "x-vga",
     "x-req",
     "x-igd-opregion",
@@ -107,10 +106,8 @@ pub(crate) fn plan_device(
             "x-balloon-allowed" => conf.balloon_allowed = boolean(k, v)?,
             "skip-vsc-check" => conf.skip_vsc_check = boolean(k, v)?,
             "multifunction" => conf.multifunction = boolean(k, v)?,
-            // The BARs are always trapped.
-            "x-no-mmap" => {
-                boolean(k, v)?;
-            }
+            "x-no-mmap" => conf.no_mmap = boolean(k, v)?,
+            "x-intx-mmap-timeout-ms" => conf.intx_mmap_timeout_ms = uint32(k, v)?,
             "ats" => {
                 let ats = OnOffAuto::parse(v).ok_or_else(|| {
                     Located::new(loc, format!("Parameter '{k}' does not accept value '{v}'"))
@@ -153,6 +150,7 @@ pub(crate) fn realize_x86(
     board: &mut X86Board,
     plug: &VfioPlug,
     firmware: &FirmwareSearch,
+    clock: &std::sync::Arc<ruvm_hw_core::timer::Clock>,
 ) -> Result<(), Located> {
     use std::sync::Arc;
 
@@ -179,6 +177,7 @@ pub(crate) fn realize_x86(
         &dma_as,
         m.memory_as(),
         Some(&viommu),
+        clock,
         &plug.conf,
     )
     .map_err(|e| Located(plug.loc.clone(), e))?;
@@ -220,6 +219,7 @@ pub(crate) fn realize_x86(
     _board: &mut X86Board,
     plug: &VfioPlug,
     _firmware: &FirmwareSearch,
+    _clock: &std::sync::Arc<ruvm_hw_core::timer::Clock>,
 ) -> Result<(), Located> {
     Err(Located::new(&plug.loc, format!("'{TYPE_VFIO_PCI}' is not a valid device model name")))
 }

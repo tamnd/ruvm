@@ -176,7 +176,9 @@ pub(crate) struct RenderFlags {
 pub(crate) fn dirty_log_mask(n: &Node, flags: RenderFlags) -> DirtyMask {
     let mut mask = n.dirty_log_mask;
     let ram = n.target.ram_block().is_some();
-    if flags.global_dirty_log && (ram || n.ty() == RegionType::Iommu) {
+    // A RAM device block is never migratable, so migration does not log it.
+    let migratable = ram && n.ty() != RegionType::RamDevice;
+    if flags.global_dirty_log && (migratable || n.ty() == RegionType::Iommu) {
         mask = mask.with(DirtyClient::Migration);
     }
     if flags.code_dirty_log && ram {
