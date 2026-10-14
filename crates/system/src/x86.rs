@@ -2607,7 +2607,7 @@ fn init_migration(
 /// Where `fd:` channels and `/dev/fdset/N` files of a migration come from: the descriptors
 /// `getfd` gave the monitor whose command is running, and the fd sets of `add-fd`.
 #[cfg(unix)]
-fn monitor_fds(m: &Migration, qmp: &Arc<ruvm_monitor::Qmp>) {
+pub(crate) fn monitor_fds(m: &Migration, qmp: &Arc<ruvm_monitor::Qmp>) {
     use std::os::fd::AsRawFd;
 
     let w = Arc::downgrade(qmp);

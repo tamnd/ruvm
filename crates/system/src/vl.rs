@@ -1479,6 +1479,7 @@ fn start(p: &Personality<'_>, b: Backends, mut cfg: Config) -> Flow<(Arc<Vm>, Ke
             devices: &cfg.x86.devices,
             drives: &drives,
             netdevs: &cfg.x86.netdevs,
+            uuid: cfg.x86.uuid,
         };
         let running = match accel {
             Accel::Tcg(tcg) => arm::start_board_tcg(&vm, tcg, opts, &args, &serial_hds),
