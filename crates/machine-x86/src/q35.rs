@@ -112,7 +112,7 @@ use crate::pc::{
     hd_geometry_guess, pci_hole64_start, rtc_ref_date, rtc_set_cpus_count, set_boot_dev,
 };
 use crate::pci_dma::PciDma;
-use crate::pflash::{FlashDrive, Pflash, PflashBacking, pc_system_flash_map};
+use crate::pflash::{FlashDrive, Pflash, PflashBacking, PflashProps, pc_system_flash_map};
 
 pub use props::{Q35Props, SmbiosEntryPointType};
 
@@ -238,9 +238,8 @@ pub struct Q35MachineConfig {
     pub max_cpus: u32,
     /// Whether the accelerator is KVM.
     pub kvm: bool,
-    /// Whether the accelerator can run SMM. KVM says so through `KVM_CAP_X86_SMM`. In QEMU
-    /// TCG always can; here it is [`crate::tcg_run::TCG_SMM_AVAILABLE`], since the x86 front
-    /// end has no SMM yet.
+    /// Whether the accelerator can run SMM. KVM says so through `KVM_CAP_X86_SMM`; TCG always
+    /// can ([`crate::tcg_run::TCG_SMM_AVAILABLE`]).
     pub smm_available: bool,
     /// `phys-bits` of the CPU model, for the address space check of `pc_memory_init()`.
     pub phys_bits: u32,
@@ -258,6 +257,9 @@ pub struct Q35MachineConfig {
     /// `-drive if=pflash`. With a pflash0 drive the board maps CFI01 flashes below 4 GiB
     /// instead of loading the BIOS as ROM, which is how OVMF boots.
     pub pflash: [Option<PflashDrive>; 2],
+    /// `secure` of both flashes, which only `-global cfi.pflash01.secure=on` sets: the flashes
+    /// then take writes from SMM only.
+    pub pflash_secure: bool,
     /// `-kernel` and friends.
     pub kernel: Option<KernelConfig>,
     /// `-option-rom`, in command line order.
@@ -308,6 +310,7 @@ impl fmt::Debug for Q35MachineConfig {
             .field("props", &self.props)
             .field("firmware_name", &self.firmware_name)
             .field("pflash", &self.pflash)
+            .field("pflash_secure", &self.pflash_secure)
             .field("kernel", &self.kernel.as_ref().map(|k| &k.filename))
             .field("option_roms", &self.option_roms)
             .field("serial_hds", &self.serial_hds)
@@ -333,6 +336,7 @@ impl Default for Q35MachineConfig {
             firmware_name: None,
             firmware: None,
             pflash: [None, None],
+            pflash_secure: false,
             kernel: None,
             option_roms: Vec::new(),
             rom_files: BTreeMap::new(),
@@ -353,7 +357,8 @@ impl Default for Q35MachineConfig {
 
 /// `pc_system_firmware_init()` for q35: the CFI01 flashes when pflash0 has a drive, else the
 /// BIOS as ROM (`x86_bios_rom_init()`). Either way the top 128 KiB are aliased read only
-/// below 1 MiB as "isa-bios". Returns `pc.bios` with its contents, or the flashes.
+/// below 1 MiB as "isa-bios". Returns `pc.bios` with its contents, or the flashes, which get
+/// `secure` from `pflash_secure`.
 ///
 /// QEMU refuses pflash under KVM without `KVM_CAP_READONLY_MEM`. Every kernel ruvm runs on
 /// has it (Linux 3.7 and later), so that check is left out.
@@ -364,6 +369,7 @@ fn pc_system_firmware_init(
     firmware_name: Option<String>,
     firmware: Option<Vec<u8>>,
     pflash: [Option<PflashDrive>; 2],
+    pflash_secure: bool,
     props: &Q35Props,
 ) -> Result<(Option<(RegionId, Vec<u8>)>, Vec<Arc<Pflash>>), String> {
     let drives = [0, 1]
@@ -396,7 +402,8 @@ fn pc_system_firmware_init(
     let mut flashes = Vec::new();
     for f in &map.flashes {
         let backing = pflash[f.index].take().map_or(PflashBacking::None, |d| d.backing);
-        let dev = Pflash::new(mem, f.name, f.props, backing)?;
+        let props = PflashProps { secure: pflash_secure, ..f.props };
+        let dev = Pflash::new(mem, f.name, props, backing)?;
         mem.add_subregion(rom_memory, f.base, dev.region()).map_err(err)?;
         flashes.push(dev);
     }
@@ -878,6 +885,7 @@ impl Q35 {
             firmware_name,
             firmware,
             pflash,
+            pflash_secure,
             kernel,
             option_roms,
             rom_files,
@@ -983,8 +991,15 @@ impl Q35 {
             e820.add_entry(above_4g_mem_start, above_4g_mem_size, E820_RAM);
         }
 
-        let (bios, flashes) =
-            pc_system_firmware_init(&mem, pci, firmware_name, firmware, pflash, &props)?;
+        let (bios, flashes) = pc_system_firmware_init(
+            &mem,
+            pci,
+            firmware_name,
+            firmware,
+            pflash,
+            pflash_secure,
+            &props,
+        )?;
 
         let option_rom_mr = mem.new_ram("pc.rom", PC_ROM_SIZE).map_err(err)?;
         mem.set_readonly(option_rom_mr, true).map_err(err)?;

@@ -144,6 +144,7 @@
 //! - QEMU logs accesses to unknown system registers with `LOG_UNIMP` and illegal exception
 //!   returns with `LOG_GUEST_ERROR`; this crate has no logging and stays silent.
 
+mod a32_helper;
 mod crypto;
 mod gic;
 mod gtimer;
@@ -160,6 +161,7 @@ mod sve_fp;
 mod sve_helper;
 mod sysreg;
 mod translate;
+mod translate_a32;
 pub mod user;
 mod vec_helper;
 mod vfp;
@@ -178,14 +180,14 @@ use ruvm_jit_interp::HelperRegistry;
 use ruvm_mem::{AddressSpace, MemTxAttrs, MemTxResult};
 
 use crate::cpu::{
-    ArmCpuModel, ArmFeatures, CpuArmState, ENV_SIZE, EXCP_BKPT, EXCP_DATA_ABORT, EXCP_FIQ,
-    EXCP_GPC, EXCP_HVC, EXCP_HYP_TRAP, EXCP_IRQ, EXCP_PREFETCH_ABORT, EXCP_SEMIHOST, EXCP_SMC,
-    EXCP_SWI, EXCP_UDEF, EXCP_VFIQ, EXCP_VIRQ, EXCP_VSERR, HCR_AMO, HCR_E2H, HCR_FMO, HCR_IMO,
-    HCR_TGE, HCR_VF, HCR_VI, HCR_VSE, HFLAGS, MMU_IDX_E2, MMU_IDX_E3, MMU_IDX_E10_1,
-    MMU_IDX_E10_1_PAN, MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NB_MMU_MODES, PC, PSTATE_A, PSTATE_DAIF,
-    PSTATE_F, PSTATE_I, PSTATE_IL, PSTATE_PAN, PSTATE_SP, PSTATE_SSBS, PSTATE_TCO, PSTATE_UAO,
-    SCR_EA, SCR_FIQ, SCR_IRQ, SCTLR_A, SCTLR_DSSBS_64, SCTLR_ENDA, SCTLR_ENDB, SCTLR_ENIA,
-    SCTLR_ENIB, SCTLR_SPAN, SCTLR_TCF, SCTLR_TCF0,
+    ArmCpuModel, ArmFeatures, CONDEXEC_BITS, CPSR_E, CpuArmState, ENV_SIZE, EXCP_BKPT,
+    EXCP_DATA_ABORT, EXCP_FIQ, EXCP_GPC, EXCP_HVC, EXCP_HYP_TRAP, EXCP_IRQ, EXCP_PREFETCH_ABORT,
+    EXCP_SEMIHOST, EXCP_SMC, EXCP_SWI, EXCP_UDEF, EXCP_VFIQ, EXCP_VIRQ, EXCP_VSERR, HCR_AMO,
+    HCR_E2H, HCR_FMO, HCR_IMO, HCR_TGE, HCR_VF, HCR_VI, HCR_VSE, HFLAGS, MMU_IDX_E2, MMU_IDX_E3,
+    MMU_IDX_E10_1, MMU_IDX_E10_1_PAN, MMU_IDX_E20_2, MMU_IDX_E20_2_PAN, NB_MMU_MODES, PC, PSTATE_A,
+    PSTATE_DAIF, PSTATE_F, PSTATE_I, PSTATE_IL, PSTATE_PAN, PSTATE_SP, PSTATE_SSBS, PSTATE_TCO,
+    PSTATE_UAO, SCR_EA, SCR_FIQ, SCR_IRQ, SCTLR_A, SCTLR_DSSBS_64, SCTLR_ENDA, SCTLR_ENDB,
+    SCTLR_ENIA, SCTLR_ENIB, SCTLR_SPAN, SCTLR_TCF, SCTLR_TCF0, THUMB,
 };
 use crate::syndrome::{EC_ADVSIMDFPACCESSTRAP, fsc, syn_get_ec, syn_serror};
 
@@ -236,6 +238,11 @@ pub const TB_MTE_ACTIVE: u32 = 1 << 25;
 pub const TB_MTE0_ACTIVE: u32 = 1 << 26;
 /// TB flags: the shift of the two TCMA bits of the regime (`TCMA`).
 pub const TB_TCMA_SHIFT: u32 = 27;
+/// TB flags: the block is AArch32 code. The other A64 only flags are then clear, and the
+/// Thumb and IT state are in `cs_base`.
+pub const TB_AARCH32: u32 = 1 << 31;
+/// TB flags: AArch32 data accesses are big endian, CPSR.E (`BE_DATA`).
+pub const TB_BE_DATA: u32 = 1 << 30;
 
 /// `CPU_INTERRUPT_FIQ`.
 pub const INTERRUPT_FIQ: u32 = 0x0010;
@@ -264,14 +271,15 @@ pub enum PsciConduit {
 pub trait ArmBoard: Send + Sync {
     /// The output of generic timer `timer` (a `GTIMER_*` index) of the vCPU `shared` is now
     /// `level`, as `gt_update_irq()` drives `gt_timer_outputs[]`. `deadline` is when the
-    /// timer next needs recalculating, as QEMU arms `gt_timer[]`; the board calls
+    /// timer next needs recalculating, in nanoseconds of [`ArmBoard::clock_ns`], as QEMU
+    /// arms `gt_timer[]`; the board calls
     /// [`Arm::gt_timer_expired`] then. `None` means the timer is off or will not change.
     fn gt_timer_update(
         &self,
         shared: &CpuShared,
         timer: usize,
         level: bool,
-        deadline: Option<Instant>,
+        deadline: Option<i64>,
     ) {
         let _ = (shared, timer, level, deadline);
     }
@@ -290,12 +298,19 @@ pub trait ArmBoard: Send + Sync {
         let _ = (shared, level);
     }
 
-    /// A PMU counter of the vCPU `shared` may overflow at `deadline`:
-    /// `timer_mod_anticipate()` on `pmu_timer`, so the board moves its timer to `deadline`
-    /// if that is earlier than the one it has (or it has none), and calls
-    /// [`Arm::pmu_timer_expired`] then.
-    fn pmu_timer_anticipate(&self, shared: &CpuShared, deadline: Instant) {
+    /// A PMU counter of the vCPU `shared` may overflow at `deadline`, in nanoseconds of
+    /// [`ArmBoard::clock_ns`]: `timer_mod_anticipate()` on `pmu_timer`, so the board moves
+    /// its timer to `deadline` if that is earlier than the one it has (or it has none), and
+    /// calls [`Arm::pmu_timer_expired`] then.
+    fn pmu_timer_anticipate(&self, shared: &CpuShared, deadline: i64) {
         let _ = (shared, deadline);
+    }
+
+    /// `qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)`: the time the generic timers and the PMU
+    /// cycle counter count, which stops while the VM is stopped and which migration carries.
+    /// The default, `None`, makes them count host time since the [`Arm`] was made.
+    fn clock_ns(&self) -> Option<i64> {
+        None
     }
 
     /// PSCI CPU_ON, `arm_set_cpu_on()`: start the CPU whose MPIDR is `mpidr` at `entry` in
@@ -678,21 +693,30 @@ impl Arm {
         });
     }
 
-    /// The generic timer count at `freq` Hz: host time since the CPU was made.
+    /// The time the generic timers count, in nanoseconds: [`ArmBoard::clock_ns`], or host
+    /// time since the CPU was made when the board has no clock.
+    pub(crate) fn now_ns(&self) -> i64 {
+        match self.board.as_ref().and_then(|b| b.clock_ns()) {
+            Some(ns) => ns,
+            None => i64::try_from(self.start.elapsed().as_nanos()).unwrap_or(i64::MAX),
+        }
+    }
+
+    /// The generic timer count at `freq` Hz, `gt_get_countervalue()`.
     pub(crate) fn counter(&self, freq: u64) -> u64 {
-        let ns = self.start.elapsed().as_nanos();
+        let ns = u128::from(self.now_ns().max(0) as u64);
         (ns * u128::from(freq) / 1_000_000_000) as u64
     }
 
-    /// The host time at which the counter at `freq` Hz reaches `count`, or `None` when that
-    /// is too far away to represent.
-    pub(crate) fn counter_deadline(&self, freq: u64, count: u64) -> Option<Instant> {
+    /// The time, as [`Arm::now_ns`] gives it, at which the counter at `freq` Hz reaches
+    /// `count`, or `None` when that is too far away to represent. It is rounded up, so the
+    /// counter has reached `count` by then.
+    pub(crate) fn counter_deadline(&self, freq: u64, count: u64) -> Option<i64> {
         if freq == 0 {
             return None;
         }
-        let ns = u128::from(count) * 1_000_000_000 / u128::from(freq);
-        let ns = u64::try_from(ns).ok()?;
-        self.start.checked_add(std::time::Duration::from_nanos(ns))
+        let ns = (u128::from(count) * 1_000_000_000).div_ceil(u128::from(freq));
+        i64::try_from(ns).ok()
     }
 }
 
@@ -760,6 +784,9 @@ pub(crate) fn tbi_bits(tcr: u64, mmu_idx: usize) -> (u32, u32) {
 
 /// The TB flags of a state, the parts of `rebuild_hflags_a64()` this port uses.
 pub(crate) fn tb_flags(f: &ArmFeatures, st: &CpuArmState) -> u32 {
+    if !st.is_a64() {
+        return tb_flags_a32(f, st);
+    }
     let el = st.current_el();
     let mmu_idx = st.mmu_idx(f);
     let hcr = st.hcr_el2_eff(f);
@@ -812,6 +839,24 @@ pub(crate) fn tb_flags(f: &ArmFeatures, st: &CpuArmState) -> u32 {
         flags |= sve_el << TB_SVEEXC_EL_SHIFT;
     }
     flags | (tbii << TB_TBII_SHIFT) | (tbid << TB_TBID_SHIFT) | (fp_el << TB_FPEXC_EL_SHIFT)
+}
+
+/// The TB flags of an AArch32 state, the parts of `rebuild_hflags_a32()` this port uses.
+/// EL1 is AArch64, so the FP instructions are enabled (`VFPEN`) unless CPACR_EL1 traps them.
+fn tb_flags_a32(f: &ArmFeatures, st: &CpuArmState) -> u32 {
+    let el = st.current_el();
+    let mmu_idx = st.mmu_idx(f);
+    let mut flags = TB_AARCH32 | el | ((mmu_idx as u32) << TB_MMUIDX_SHIFT);
+    if st.pstate & PSTATE_IL != 0 {
+        flags |= TB_PSTATE_IL;
+    }
+    if st.sctlr_el[regime_el(mmu_idx) as usize] & SCTLR_A != 0 {
+        flags |= TB_ALIGN_MEM;
+    }
+    if st.pstate & CPSR_E != 0 {
+        flags |= TB_BE_DATA;
+    }
+    flags | (fp_exception_el(f, st) << TB_FPEXC_EL_SHIFT)
 }
 
 /// The MTE part of `rebuild_hflags_a64()`.
@@ -1151,6 +1196,10 @@ impl Arm {
 impl CpuOps for Arm {
     fn translate_code(&self, cpu: &mut Cpu<'_>, tb: &mut TbBuild) -> Result<(), CpuLoopExit> {
         let semihosting = self.semihost.as_ref().map(|s| s.userspace);
+        if tb.flags & TB_AARCH32 != 0 {
+            let mut dc = translate_a32::DisasContext::new(&self.model);
+            return translator_loop(cpu, tb, &mut dc);
+        }
         let mut dc = translate::DisasContext::new(&self.model, semihosting);
         translator_loop(cpu, tb, &mut dc)
     }
@@ -1165,11 +1214,20 @@ impl CpuOps for Arm {
             let want = tb_flags(self.features(), &st);
             assert_eq!(flags, want, "stale hflags {flags:#x}, want {want:#x} at pc {:#x}", st.pc);
         }
-        TbCpuState { pc: ld64(cpu.env, PC), flags, cflags: 0, cs_base: 0 }
+        let mut cs_base = 0;
+        if flags & TB_AARCH32 != 0 {
+            // QEMU keeps these in the AM32 flags.
+            cs_base = u64::from(ld32(cpu.env, THUMB) | (ld32(cpu.env, CONDEXEC_BITS) << 1));
+        }
+        TbCpuState { pc: ld64(cpu.env, PC), flags, cflags: 0, cs_base }
     }
 
-    fn restore_state_to_opc(&self, cpu: &mut Cpu<'_>, _tb: &Tb, data: &[u64; 3]) {
+    fn restore_state_to_opc(&self, cpu: &mut Cpu<'_>, tb: &Tb, data: &[u64; 3]) {
         st64(cpu.env, PC, data[0]);
+        if tb.flags & TB_AARCH32 != 0 {
+            let condexec = data[1] as u32;
+            cpu.env[CONDEXEC_BITS..CONDEXEC_BITS + 4].copy_from_slice(&condexec.to_le_bytes());
+        }
     }
 
     fn set_pc(&self, cpu: &mut Cpu<'_>, pc: u64) {
@@ -1378,4 +1436,50 @@ pub fn vfp_set_fpcr(st: &mut CpuArmState, val: u32, f: &ArmFeatures) {
 /// Whether `v` is halted in WFI.
 pub fn vcpu_halted(v: &Vcpu) -> bool {
     v.shared().halted.load(Ordering::Acquire) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use super::*;
+
+    /// A board whose clock reads what the test stores.
+    #[derive(Default)]
+    struct Clocked(AtomicI64);
+
+    impl ArmBoard for Clocked {
+        fn clock_ns(&self) -> Option<i64> {
+            Some(self.0.load(Ordering::Relaxed))
+        }
+    }
+
+    /// The counter counts the board's clock, as QEMU's counts `QEMU_CLOCK_VIRTUAL`.
+    #[test]
+    fn counter_follows_the_board_clock() {
+        let board = Arc::new(Clocked::default());
+        let arm = Arm::new(ArmCpuModel::cortex_a57()).with_board(board.clone());
+        board.0.store(2_000_000_000, Ordering::Relaxed);
+        assert_eq!(arm.counter(62_500_000), 125_000_000);
+        // A destination whose clock the migration set carries on from the source's count.
+        board.0.store(5_000_000_016, Ordering::Relaxed);
+        assert_eq!(arm.counter(62_500_000), 312_500_001);
+        assert_eq!(arm.counter_deadline(62_500_000, 312_500_001), Some(5_000_000_016));
+    }
+
+    /// The deadline is rounded up, so the counter has reached the count by then.
+    #[test]
+    fn counter_deadline_rounds_up() {
+        let board = Arc::new(Clocked::default());
+        let arm = Arm::new(ArmCpuModel::cortex_a57()).with_board(board.clone());
+        let freq = 24_000_000;
+        let ns = arm.counter_deadline(freq, 7).unwrap();
+        assert_eq!(ns, 292);
+        board.0.store(ns, Ordering::Relaxed);
+        assert_eq!(arm.counter(freq), 7);
+        board.0.store(ns - 1, Ordering::Relaxed);
+        assert_eq!(arm.counter(freq), 6);
+        assert_eq!(arm.counter_deadline(0, 7), None);
+        assert_eq!(arm.counter_deadline(1, u64::MAX), None);
+    }
 }

@@ -175,6 +175,9 @@ pub(crate) fn register(r: &mut HelperRegistry) {
         super::sve_helper::ALL,
         super::pauth::ALL,
         super::mte::ALL,
+        super::a32_helper::BASE,
+        super::a32_helper::PAR_GE,
+        super::a32_helper::PAR,
     ];
     for d in lists.iter().copied().flatten() {
         r.register_info(&d.info(), d.f);
@@ -555,7 +558,7 @@ fn h_pre_smc(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
 
 /// A raw reflected CRC over the low `bytes` bytes of `val`, little endian first, starting from
 /// `acc`, with no inversion of the input or output; this is what the CRC32 instructions do.
-fn crc_update(poly: u32, acc: u32, val: u64, bytes: u32) -> u32 {
+pub(crate) fn crc_update(poly: u32, acc: u32, val: u64, bytes: u32) -> u32 {
     let mut crc = acc;
     for i in 0..bytes {
         crc ^= u32::from((val >> (8 * i)) as u8);

@@ -11,7 +11,6 @@
 //! the vCPU because no interrupt is pending, and the test then looks at the registers.
 
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Instant;
 
 use ruvm_jit::cpu_exec::cpu_exec;
 use ruvm_jit::{CpuShared, Jit, Vcpu, excp};
@@ -142,7 +141,7 @@ impl ArmBoard for Board {
         shared: &CpuShared,
         timer: usize,
         level: bool,
-        deadline: Option<Instant>,
+        deadline: Option<i64>,
     ) {
         self.armed.lock().unwrap()[timer] = deadline.is_some();
         self.gt_timer_set_level(shared, timer, level);

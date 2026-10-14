@@ -17,12 +17,15 @@
 //!
 //! [`ReturnPath`] is the destination end of it, [`PageRequests`] the queue of requested pages on
 //! the source, and [`source_return_path`] the source thread that reads the messages.
+//!
+//! With the `postcopy-blocktime` capability the destination also keeps [`Blocktime`], how long
+//! its vCPUs waited for pages, which `query-migrate` reports once the migration completed.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ruvm_base::{Error, Result, bail};
 
@@ -84,7 +87,7 @@ pub(crate) mod uffd {
     pub(crate) use ruvm_sys::userfaultfd::Userfaultfd as Uffd;
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub(crate) use ruvm_sys::userfaultfd::FEATURE_PAGEFAULT_FLAG_WP;
+    pub(crate) use ruvm_sys::userfaultfd::{FEATURE_PAGEFAULT_FLAG_WP, FEATURE_THREAD_ID};
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub(crate) use stub::Uffd;
@@ -92,6 +95,10 @@ pub(crate) mod uffd {
     /// `UFFD_FEATURE_PAGEFAULT_FLAG_WP`.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub(crate) const FEATURE_PAGEFAULT_FLAG_WP: u64 = 1;
+
+    /// `UFFD_FEATURE_THREAD_ID`.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) const FEATURE_THREAD_ID: u64 = 1 << 8;
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     mod stub {
@@ -148,6 +155,10 @@ pub(crate) mod uffd {
             }
 
             pub(crate) fn wait_fault(&self, _: i32) -> io::Result<Option<usize>> {
+                match self.0 {}
+            }
+
+            pub(crate) fn wait_fault_thread(&self, _: i32) -> io::Result<Option<(usize, u32)>> {
                 match self.0 {}
             }
         }
@@ -470,6 +481,191 @@ fn handle_req_pages(
     }
 }
 
+/// `BLOCKTIME_LATENCY_BUCKET_N`: bucket `n` of the latency distribution counts the faults that
+/// took from 2^n to 2^(n+1) microseconds, and the last one also all the longer ones.
+pub const LATENCY_BUCKETS: usize = 24;
+
+/// `PostcopyBlocktimeContext`: how long the threads of the destination waited for the pages
+/// they faulted on in postcopy. The times are host nanoseconds, `QEMU_CLOCK_REALTIME`.
+#[derive(Debug)]
+pub struct Blocktime {
+    /// `tid_to_vcpu_hash`: the vCPU index of each vCPU thread.
+    vcpus: HashMap<u32, usize>,
+    /// `smp.cpus`.
+    cpus: usize,
+    start: Instant,
+    /// `page_request_mutex`, which also covers the received bitmap the faults are checked
+    /// against.
+    inner: Mutex<BlocktimeInner>,
+}
+
+#[derive(Debug)]
+struct BlocktimeInner {
+    /// `vcpu_blocktime_total`.
+    vcpu_total: Vec<u64>,
+    /// `vcpu_faults_count`.
+    vcpu_faults: Vec<u64>,
+    /// `vcpu_faults_current`: the faults of each vCPU still waiting.
+    vcpu_waiting: Vec<u8>,
+    /// `vcpu_addr_hash`: the faults waiting on each page, oldest first, with the vCPU (`None`
+    /// for another thread) and the time.
+    pages: HashMap<usize, Vec<(Option<usize>, u64)>>,
+    /// `latency_buckets`.
+    buckets: [u64; LATENCY_BUCKETS],
+    /// `total_blocktime`: the time all vCPUs waited at once.
+    total: u64,
+    /// `last_begin`.
+    last_begin: u64,
+    /// `smp_cpus_down`.
+    cpus_down: usize,
+    /// `non_vcpu_faults`.
+    other_faults: u64,
+    /// `non_vcpu_blocktime_total`.
+    other_total: u64,
+}
+
+/// The `postcopy-*` members of `MigrationInfo` that `fill_destination_postcopy_migration_info()`
+/// sets. The blocktimes are in milliseconds and the latencies in nanoseconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlocktimeInfo {
+    /// `postcopy-blocktime`.
+    pub blocktime: u32,
+    /// `postcopy-vcpu-blocktime`.
+    pub vcpu_blocktime: Vec<u32>,
+    /// `postcopy-latency`.
+    pub latency: u64,
+    /// `postcopy-latency-dist`.
+    pub latency_dist: Vec<u64>,
+    /// `postcopy-vcpu-latency`.
+    pub vcpu_latency: Vec<u64>,
+    /// `postcopy-non-vcpu-latency`.
+    pub non_vcpu_latency: u64,
+}
+
+/// `SCALE_MS`.
+const NS_PER_MS: u64 = 1_000_000;
+
+impl Blocktime {
+    /// `blocktime_context_new()` for vCPUs whose threads have the ids `thread_ids`, by vCPU
+    /// index. Where vCPUs share a thread, the thread counts as the last of them, as in QEMU.
+    pub fn new(thread_ids: &[i64]) -> Self {
+        let cpus = thread_ids.len();
+        Blocktime {
+            vcpus: thread_ids.iter().enumerate().map(|(i, &t)| (t as u32, i)).collect(),
+            cpus,
+            start: Instant::now(),
+            inner: Mutex::new(BlocktimeInner {
+                vcpu_total: vec![0; cpus],
+                vcpu_faults: vec![0; cpus],
+                vcpu_waiting: vec![0; cpus],
+                pages: HashMap::new(),
+                buckets: [0; LATENCY_BUCKETS],
+                total: 0,
+                last_begin: 0,
+                cpus_down: 0,
+                other_faults: 0,
+                other_total: 0,
+            }),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// The part of `migrate_send_rp_req_pages()` under `page_request_mutex`: if `missing`
+    /// says the page at `addr` is not here yet, `mark_postcopy_blocktime_begin()` records the
+    /// fault of thread `tid` (0 when the kernel does not say) and this returns true.
+    pub fn begin(&self, addr: usize, tid: u32, missing: impl FnOnce() -> bool) -> bool {
+        self.begin_at(addr, tid, missing, || self.now())
+    }
+
+    fn begin_at(
+        &self,
+        addr: usize,
+        tid: u32,
+        missing: impl FnOnce() -> bool,
+        now: impl FnOnce() -> u64,
+    ) -> bool {
+        let mut g = lock(&self.inner);
+        if !missing() {
+            return false;
+        }
+        if tid == 0 {
+            return true;
+        }
+        let now = now();
+        let cpu = self.vcpus.get(&tid).copied();
+        match cpu {
+            Some(c) => {
+                g.vcpu_faults[c] += 1;
+                if g.vcpu_waiting[c] == 0 {
+                    g.cpus_down += 1;
+                    g.last_begin = now;
+                }
+                g.vcpu_waiting[c] = g.vcpu_waiting[c].saturating_add(1);
+            }
+            None => g.other_faults += 1,
+        }
+        g.pages.entry(addr).or_default().push((cpu, now));
+        true
+    }
+
+    /// The page at `addr` is in place: `mark`, which sets it in the received bitmap, and
+    /// `mark_postcopy_blocktime_end()`, both under `page_request_mutex`.
+    pub fn end(&self, addr: usize, mark: impl FnOnce()) {
+        self.end_at(addr, mark, || self.now());
+    }
+
+    fn end_at(&self, addr: usize, mark: impl FnOnce(), now: impl FnOnce() -> u64) {
+        let mut g = lock(&self.inner);
+        mark();
+        let Some(faults) = g.pages.remove(&addr) else { return };
+        let now = now();
+        let mut freed = 0;
+        // blocktime_cpu_list_iter_fn(), newest first.
+        for (cpu, at) in faults.into_iter().rev() {
+            let passed = now.saturating_sub(at);
+            let us = passed / 1000;
+            let bucket = if us == 0 { 0 } else { 63 - us.leading_zeros() as usize };
+            g.buckets[bucket.min(LATENCY_BUCKETS - 1)] += 1;
+            match cpu {
+                Some(c) => {
+                    g.vcpu_waiting[c] -= 1;
+                    if g.vcpu_waiting[c] == 0 {
+                        g.vcpu_total[c] += passed;
+                        freed += 1;
+                    }
+                }
+                None => g.other_total += passed,
+            }
+        }
+        // If all vCPUs waited, the time they all did ends here.
+        if g.cpus_down == self.cpus && freed > 0 {
+            g.total += now.saturating_sub(g.last_begin);
+        }
+        g.cpus_down -= freed;
+    }
+
+    /// `fill_destination_postcopy_migration_info()`.
+    pub fn info(&self) -> BlocktimeInfo {
+        let g = lock(&self.inner);
+        let (mut latency_total, mut faults) = (g.other_total, g.other_faults);
+        let mut info = BlocktimeInfo::default();
+        for (&total, &count) in g.vcpu_total.iter().zip(&g.vcpu_faults) {
+            info.vcpu_blocktime.push((total / NS_PER_MS) as u32);
+            info.vcpu_latency.push(total.checked_div(count).unwrap_or(0));
+            latency_total += total;
+            faults += count;
+        }
+        info.blocktime = (g.total / NS_PER_MS) as u32;
+        info.latency = latency_total.checked_div(faults).unwrap_or(0);
+        info.latency_dist = g.buckets.to_vec();
+        info.non_vcpu_latency = g.other_total.checked_div(g.other_faults).unwrap_or(0);
+        info
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,6 +757,52 @@ mod tests {
     }
 
     #[test]
+    fn blocktime_follows_qemu() {
+        // Two vCPUs on threads 10 and 11, and thread 99 that is no vCPU.
+        let bt = Blocktime::new(&[10, 11]);
+        let begin = |addr, tid, ns| assert!(bt.begin_at(addr, tid, || true, || ns));
+        let end = |addr, ns| bt.end_at(addr, || {}, || ns);
+        // vCPU 0 waits on page A from 1000, vCPU 1 on page B from 3000: both are down from
+        // 3000 until A comes at 5000.
+        begin(0xa000, 10, 1000);
+        begin(0xb000, 11, 3000);
+        begin(0xb000, 99, 3500);
+        end(0xa000, 5000);
+        // vCPU 0 then faults twice on B, which comes at 2_003_000.
+        begin(0xb000, 10, 6000);
+        begin(0xb000, 10, 7000);
+        end(0xb000, 2_003_000);
+        // A page nobody waited on, and a fault without a thread id, change nothing.
+        end(0xc000, 2_004_000);
+        begin(0xd000, 0, 2_005_000);
+        let info = bt.info();
+        // vCPU 0: 4000 on A, then 1_997_000 from its first fault on B. vCPU 1: 2_000_000.
+        assert_eq!(info.vcpu_latency, vec![(4000 + 1_997_000) / 3, 2_000_000]);
+        assert_eq!(info.vcpu_blocktime, vec![2, 2]);
+        // Both were down from 3000 to 5000 and from 6000 to 2_003_000.
+        assert_eq!(info.blocktime, 1);
+        assert_eq!(info.non_vcpu_latency, 1_999_500);
+        assert_eq!(info.latency, (4000 + 1_997_000 + 2_000_000 + 1_999_500) / 5);
+        // 4 us goes in bucket 2, the waits of about 2 ms in bucket 10.
+        let mut dist = vec![0; LATENCY_BUCKETS];
+        dist[2] = 1;
+        dist[10] = 4;
+        assert_eq!(info.latency_dist, dist);
+    }
+
+    #[test]
+    fn blocktime_checks_the_page_under_its_lock() {
+        let bt = Blocktime::new(&[10]);
+        assert!(!bt.begin(0x1000, 10, || false));
+        assert_eq!(bt.info().vcpu_latency, vec![0]);
+        assert!(bt.begin(0x1000, 10, || true));
+        let mut marked = false;
+        bt.end(0x1000, || marked = true);
+        assert!(marked);
+        assert_eq!(bt.info().latency_dist.iter().sum::<u64>(), 1);
+    }
+
+    #[test]
     fn wait_returns_on_request() {
         let r = std::sync::Arc::new(requests());
         let r2 = r.clone();
@@ -568,7 +810,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             r2.queue(Some("pc.ram"), 0, 0x1000).unwrap();
         });
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         r.wait(Duration::from_secs(10));
         assert!(start.elapsed() < Duration::from_secs(5));
         t.join().unwrap();

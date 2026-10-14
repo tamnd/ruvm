@@ -48,13 +48,17 @@ impl Cpus {
         Cpus { slots, target, threads }
     }
 
-    /// `qmp_query_cpus_fast()`.
-    pub(crate) fn query(&self) -> Vec<CpuInfoFast> {
-        let thread_ids: Vec<i64> = match &self.threads {
+    /// `CPUState.thread_id` of each vCPU.
+    pub(crate) fn thread_ids(&self) -> Vec<i64> {
+        match &self.threads {
             Threads::Tcg(v) => v.cpus().iter().map(|c| c.thread_id()).collect(),
             Threads::Dummy(d) => d.thread_ids().to_vec(),
-        };
-        let slots = self.slots.iter().zip(thread_ids);
+        }
+    }
+
+    /// `qmp_query_cpus_fast()`.
+    pub(crate) fn query(&self) -> Vec<CpuInfoFast> {
+        let slots = self.slots.iter().zip(self.thread_ids());
         (0..)
             .zip(slots)
             .map(|(cpu_index, (s, thread_id))| CpuInfoFast {

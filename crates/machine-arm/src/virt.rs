@@ -83,7 +83,6 @@
 //! - The default CPU is cortex-a57; QEMU's is the 32-bit cortex-a15, which is not modelled.
 //! - A gzip stream that ends early reports `inflate()` error -5 and corrupt data reports -3,
 //!   as zlib would, but other zlib codes are not reproduced.
-//! - The generic timer deadlines are host [`Instant`]s converted onto the board clock.
 //! - Cache sizes in the CPU nodes come from the legacy CCSIDR layout of each model, which is
 //!   what the four models use.
 
@@ -1954,6 +1953,11 @@ impl VirtMachine {
         self.gpio.as_ref().map(|(p, _)| p)
     }
 
+    /// The power key on the PL061, there when the GED is not.
+    pub fn gpio_key(&self) -> Option<&Arc<GpioKey>> {
+        self.gpio.as_ref().map(|(_, k)| k)
+    }
+
     /// The secure PL061 of `secure=on`.
     pub fn secure_gpio(&self) -> Option<&Arc<Pl061>> {
         self.secure_gpio.as_ref()
@@ -2198,6 +2202,16 @@ impl VirtMachine {
     /// one a second `-serial` adds.
     pub fn uart1(&self) -> Option<&Arc<Pl011>> {
         self.uart1.as_ref()
+    }
+
+    /// Whether UART1 is the non-secure second UART, which is created before UART0.
+    pub fn uart1_ns(&self) -> bool {
+        self.uart1_ns
+    }
+
+    /// Whether the board builds ACPI tables for the firmware.
+    pub fn acpi(&self) -> bool {
+        self.acpi
     }
 
     /// Connect the chardev of the second UART.

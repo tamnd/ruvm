@@ -12,11 +12,13 @@
 //! `gt_timer[]` QEMU timers do.
 //!
 //! Differences from QEMU: there is no FEAT_ECV (CNTPOFF_EL2, the CNTHCTL_EL2 mask bits) and
-//! no event stream. The counter is host time since the [`Arm`] was made, scaled to
-//! CNTFRQ_EL0; it is not stopped while the VM is paused. CNTV_TVAL_EL02 and the other
-//! EL02 aliases use the offset of the EL1 view of the timer.
+//! no event stream. The counter is the board's [`ArmBoard::clock_ns`] scaled to CNTFRQ_EL0,
+//! so it stops while the VM is stopped and migration carries it, as QEMU counts
+//! `QEMU_CLOCK_VIRTUAL`. CNTV_TVAL_EL02 and the other EL02 aliases use the offset of the EL1
+//! view of the timer.
 //!
 //! [`ArmBoard::gt_timer_update`]: super::ArmBoard::gt_timer_update
+//! [`ArmBoard::clock_ns`]: super::ArmBoard::clock_ns
 //! [`ArmBoard::gt_timer_set_level`]: super::ArmBoard::gt_timer_set_level
 
 use ruvm_jit::Cpu;
@@ -121,12 +123,12 @@ fn nexttick(count: u64, offset: u64, cval: u64, istatus: bool) -> Option<u64> {
 /// When `timer` next needs recalculating, in nanoseconds of the counter's time base, or -1
 /// when it is off or will not change: the expiry time of QEMU's `gt_timer[timer]`.
 pub(crate) fn expiry_ns(arm: &Arm, st: &CpuArmState, timer: usize) -> i64 {
-    if st.gt_ctl[timer] & 1 == 0 || st.cntfrq_el0 == 0 {
+    if st.gt_ctl[timer] & 1 == 0 {
         return -1;
     }
     let (offset, count, cval) = (indirect_offset(st, timer), count(arm, st), st.gt_cval[timer]);
     nexttick(count, offset, cval, count.wrapping_sub(offset) >= cval)
-        .and_then(|t| i64::try_from(u128::from(t) * 1_000_000_000 / u128::from(st.cntfrq_el0)).ok())
+        .and_then(|t| arm.counter_deadline(st.cntfrq_el0, t))
         .unwrap_or(-1)
 }
 

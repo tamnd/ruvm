@@ -128,6 +128,12 @@ pub trait MigrationHost: Send + Sync {
     fn vm_clock_ns(&self) -> u64 {
         0
     }
+
+    /// `CPUState.thread_id` of each vCPU by index, which the postcopy blocktime tells the
+    /// vCPUs by.
+    fn vcpu_thread_ids(&self) -> Vec<i64> {
+        Vec::new()
+    }
 }
 
 /// The capabilities this side implements. The others are refused, so that a management tool
@@ -138,6 +144,7 @@ const SUPPORTED_CAPS: &[MigrationCapability] = &[
     MigrationCapability::LateBlockActivate,
     MigrationCapability::PauseBeforeSwitchover,
     MigrationCapability::PostcopyRam,
+    MigrationCapability::PostcopyBlocktime,
     MigrationCapability::ReturnPath,
     MigrationCapability::Multifd,
     MigrationCapability::Xbzrle,
@@ -975,6 +982,18 @@ impl Migration {
             info.status = Some(s.incoming_state);
             info.error_desc = s.error.clone();
         }
+        if s.incoming_state == MigrationStatus::Completed {
+            // fill_destination_postcopy_migration_info()
+            let bt = inner.ram.as_ref().and_then(|r| lock(&r.blocktime).clone());
+            if let Some(bt) = bt.map(|bt| bt.info()) {
+                info.postcopy_blocktime = Some(bt.blocktime);
+                info.postcopy_vcpu_blocktime = Some(bt.vcpu_blocktime);
+                info.postcopy_latency = Some(bt.latency);
+                info.postcopy_latency_dist = Some(bt.latency_dist);
+                info.postcopy_vcpu_latency = Some(bt.vcpu_latency);
+                info.postcopy_non_vcpu_latency = Some(bt.non_vcpu_latency);
+            }
+        }
 
         // fill_source_migration_info()
         let blocked = inner.blockers(s.params.mode.unwrap_or_default());
@@ -1336,6 +1355,12 @@ impl Migration {
                     let mut f = StreamReader::from_reader(ch.main);
                     let mut vm = lock(&thread_inner.savevm);
                     vm.capabilities = lock(&thread_inner.shared).caps.clone();
+                    if let Some(ram) = &thread_inner.ram {
+                        let on = vm.capabilities.contains(&MigrationCapability::PostcopyBlocktime);
+                        *lock(&ram.blocktime_threads) =
+                            on.then(|| thread_inner.host.vcpu_thread_ids());
+                        *lock(&ram.blocktime) = None;
+                    }
                     let recv = match (&mf, &file) {
                         (Some(((n, _), _)), Some(fc)) => {
                             // file_recv_channel_create()

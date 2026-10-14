@@ -648,6 +648,11 @@ const DRIVE_IGNORED: &[&str] =
 /// The error for a `null-co` image on a flash, which reads its image from a file.
 pub(crate) const NULL_CO_PFLASH: &str = "a null-co image is not supported for pflash by ruvm yet";
 
+/// KVM exits do not say whether the vCPU was in SMM, so a `secure` flash would refuse the
+/// firmware's own writes from SMM.
+pub(crate) const PFLASH_SECURE_KVM: &str =
+    "cfi.pflash01 secure=on is not supported with KVM by ruvm yet";
+
 /// The options of the `null-co` protocol, block/null.c, that ruvm takes.
 const NULL_CO_OPTS: &[&str] = &["size", "read-zeroes"];
 
@@ -2222,6 +2227,10 @@ fn build(
     let clock = Clock::new(ClockType::Virtual, TimeSource::Monotonic(Instant::now()));
     let rtc_clock = Clock::new(ClockType::Host, TimeSource::Wall);
     let pflash = pflash_drives(kind, &opts, drives).map_err(one)?;
+    let pflash_secure = crate::global::pflash_secure();
+    if pflash_secure && accel.kvm {
+        return Err(one(Located::bare(PFLASH_SECURE_KVM)));
+    }
     let spec = BoardSpec {
         kind,
         machine_type: opts.machine_type,
@@ -2247,6 +2256,7 @@ fn build(
         memdev: opts.memdev.map(|m| m.0),
         aux_ram_share: opts.aux_ram_share,
         virtio_force_legacy: crate::global::virtio_mmio_force_legacy(),
+        pflash_secure,
     };
     let (mut board, warnings) = build_board(spec).map_err(board_error)?;
     for w in warnings.iter().chain(board.warnings()) {
@@ -2598,7 +2608,8 @@ fn init_migration(
         q.global_state,
         vm.autostart.clone(),
     )
-    .with_snapshot_hooks(hooks);
+    .with_snapshot_hooks(hooks)
+    .with_vcpus(vm);
     let m = Migration::new(Arc::new(Mutex::new(q.savevm)), Some(q.ram_stats), Arc::new(host));
     #[cfg(unix)]
     monitor_fds(&m, &vm.qmp);

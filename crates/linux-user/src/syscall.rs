@@ -146,6 +146,7 @@ fn spec(n: i64) -> Option<&'static [A]> {
         | libc::SYS_setresuid
         | libc::SYS_setresgid
         | libc::SYS_fadvise64
+        | libc::SYS_readahead
         | libc::SYS_socket => &[V, V, V],
         libc::SYS_nanosleep => &[R(16), W(16)],
         libc::SYS_getitimer => &[V, W(24)],
@@ -212,7 +213,7 @@ fn spec(n: i64) -> Option<&'static [A]> {
         libc::SYS_fchmodat => &[V, S, V],
         libc::SYS_faccessat => &[V, P, V],
         libc::SYS_utimensat => &[V, S, R(32), V],
-        libc::SYS_fallocate => &[V, V, V, V],
+        libc::SYS_fallocate | libc::SYS_sync_file_range => &[V, V, V, V],
         libc::SYS_pipe2 => &[W(8), V],
         libc::SYS_epoll_ctl => &[V, V, V, R(12)],
         libc::SYS_epoll_wait => &[V, WN(2, 12), V, V],
@@ -976,8 +977,8 @@ fn stat_to_generic(h: &[u8; 144]) -> [u8; 128] {
 /// The size of the target's `struct epoll_event`, which is not packed as the host's is.
 const EPOLL_EVENT_SIZE: u64 = 16;
 
-/// The calls of a target whose structures or flags are not the host's: `struct stat` and
-/// `struct epoll_event` of `asm-generic`, and the `O_` flags. `None` goes on with the host's
+/// The calls of a target whose structures or flags are not the host's: `struct stat` of
+/// `asm-generic`, `struct epoll_event` of `asm-generic` and the ARM EABI, and the `O_` flags. `None` goes on with the host's
 /// call, with the flags in `a` converted.
 fn do_target_abi(p: &Proc, t: &mut Task, n: i64, a: &mut [u64; 6]) -> Option<i64> {
     let g = guest();
@@ -996,7 +997,7 @@ fn do_target_abi(p: &Proc, t: &mut Task, n: i64, a: &mut [u64; 6]) -> Option<i64
             }
             r
         }
-        libc::SYS_epoll_ctl if g.generic_abi => {
+        libc::SYS_epoll_ctl if g.generic_abi || g.eabi => {
             const EPOLL_CTL_DEL: u64 = 2;
             let mut ev = [0u8; 12];
             if a[3] != 0 && a[1] != EPOLL_CTL_DEL {
@@ -1010,7 +1011,7 @@ fn do_target_abi(p: &Proc, t: &mut Task, n: i64, a: &mut [u64; 6]) -> Option<i64
             let h = if a[3] != 0 { ev.as_ptr() as u64 } else { 0 };
             guest_sys(n, &[a[0], a[1], a[2], h])
         }
-        libc::SYS_epoll_pwait if g.generic_abi => {
+        libc::SYS_epoll_pwait if g.generic_abi || g.eabi => {
             let max = a[2] as i32;
             if max <= 0 || max as u64 > i32::MAX as u64 / EPOLL_EVENT_SIZE {
                 return Some(-EINVAL);
@@ -1035,6 +1036,10 @@ fn do_target_abi(p: &Proc, t: &mut Task, n: i64, a: &mut [u64; 6]) -> Option<i64
                 }
             }
             r
+        }
+        libc::SYS_open => {
+            a[1] = guest::open_flags_to_host(a[1]);
+            return None;
         }
         libc::SYS_openat => {
             a[2] = guest::open_flags_to_host(a[2]);

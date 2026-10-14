@@ -224,7 +224,7 @@ const OPEN: &[Flag] = &[
     f("O_TMPFILE", 0o20000000 | 0o200000),
     f("__O_TMPFILE", 0o20000000),
 ];
-/// aarch64 moves four of them.
+/// aarch64 and arm move four of them.
 const OPEN_AARCH64: &[Flag] = &[
     f("O_APPEND", 0o2000),
     f("O_CREAT", 0o100),
@@ -926,7 +926,11 @@ impl Out<'_> {
             return;
         }
         self.str("|");
-        let table = if crate::guest::guest().machine == "aarch64" { OPEN_AARCH64 } else { OPEN };
+        let table = if matches!(crate::guest::guest().machine, "aarch64" | "armv7l") {
+            OPEN_AARCH64
+        } else {
+            OPEN
+        };
         self.flags(table, v, last);
     }
 

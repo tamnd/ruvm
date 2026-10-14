@@ -220,6 +220,7 @@ fn spec(kind: BoardKind, firmware: FirmwareSearch) -> BoardSpec {
         memdev: None,
         aux_ram_share: false,
         virtio_force_legacy: true,
+        pflash_secure: false,
         cpus: 1,
         max_cpus: 0,
         kvm: true,

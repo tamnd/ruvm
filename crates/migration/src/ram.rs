@@ -23,8 +23,8 @@
 //! sends them once more each, the ones the destination asks for first. The destination fills
 //! them in with userfaultfd, which wakes whoever touched such a page before it came.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use ruvm_base::{Error, Result, bail, error_report, warn_report};
@@ -35,8 +35,8 @@ use ruvm_vmstate::StreamReader;
 use crate::channel::FileChannel;
 use crate::mapped_ram::{self, FileBlock, HDR_LEN, HDR_VERSION, Header, LOAD_BUF_SIZE};
 use crate::multifd::{MultifdRecv, MultifdSend};
-use crate::postcopy::uffd::Uffd;
-use crate::postcopy::{PageRequests, ReturnPath};
+use crate::postcopy::uffd::{FEATURE_THREAD_ID, Uffd};
+use crate::postcopy::{Blocktime, PageRequests, ReturnPath};
 use crate::savevm::{LiveState, LoadParams, QemuFile, SaveParams};
 use crate::write_tracking::WriteTracking;
 use crate::xbzrle::{self, ENCODING_FLAG_XBZRLE, Encoded, PageCache, XbzrleCounters};
@@ -122,6 +122,11 @@ pub struct RamStats {
     /// Whether the guest runs, `runstate_is_running()`, which decides where the bytes sent
     /// count. The migration thread keeps it up to date.
     pub guest_running: AtomicBool,
+    /// The `postcopy-blocktime` capability of an incoming migration: the thread ids of the
+    /// vCPUs, which [`blocktime`](Self::blocktime) watches once postcopy listens.
+    pub blocktime_threads: Mutex<Option<Vec<i64>>>,
+    /// `MigrationIncomingState.blocktime_ctx`.
+    pub blocktime: Mutex<Option<Arc<Blocktime>>>,
 }
 
 impl RamStats {
@@ -211,6 +216,11 @@ struct Listening {
     uffd: Arc<Uffd>,
     quit: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    blocktime: Option<Arc<Blocktime>>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// `postcopy_ram_fault_thread()`: asks the source for every page someone touches before it is
@@ -220,12 +230,13 @@ fn fault_thread(
     blocks: &[Arc<RamBlock>],
     recv: &RecvMap,
     rp: &ReturnPath,
+    blocktime: Option<&Blocktime>,
     quit: &AtomicBool,
 ) {
     let mut last = None;
     while !quit.load(Ordering::Acquire) {
-        let addr = match uffd.wait_fault(100) {
-            Ok(Some(addr)) => addr,
+        let (addr, tid) = match uffd.wait_fault_thread(100) {
+            Ok(Some(fault)) => fault,
             Ok(None) => continue,
             Err(e) => {
                 error_report(&format!("postcopy_ram_fault_thread: userfault poll: {e}"));
@@ -241,7 +252,12 @@ fn fault_thread(
         };
         let offset = ((addr - blocks[b].host_addr()) & !(PAGE_SIZE - 1)) as u64;
         // migrate_send_rp_req_pages(): the page may have come since the fault.
-        if recv.test(b, offset >> PAGE_BITS) {
+        let missing = || !recv.test(b, offset >> PAGE_BITS);
+        let missing = match blocktime {
+            Some(bt) => bt.begin(addr & !(PAGE_SIZE - 1), tid, missing),
+            None => missing(),
+        };
+        if !missing {
             continue;
         }
         let name = (last != Some(b)).then(|| blocks[b].name());
@@ -793,8 +809,11 @@ impl RamSection {
     }
 
     fn mark_received(&self, i: usize, addr: u64) {
-        if let Some(r) = &self.recv_map {
-            r.set(i, addr >> PAGE_BITS);
+        let Some(r) = &self.recv_map else { return };
+        let mark = || r.set(i, addr >> PAGE_BITS);
+        match self.listening.as_ref().and_then(|l| l.blocktime.as_ref()) {
+            Some(bt) => bt.end(self.blocks[i].host_addr() + addr as usize, mark),
+            None => mark(),
         }
     }
 
@@ -1344,7 +1363,11 @@ impl LiveState for RamSection {
         let Some(recv) = self.recv_map.clone() else {
             bail!("Postcopy RAM was not advised");
         };
-        let uffd = Uffd::new().map_err(|e| Error::from_io("Userfaultfd not available", e))?;
+        // ufd_check_and_apply(): faults carry the thread when the kernel can say, which the
+        // blocktime needs.
+        let features = Uffd::features().unwrap_or(0) & FEATURE_THREAD_ID;
+        let uffd = Uffd::with_features(features)
+            .map_err(|e| Error::from_io("Userfaultfd not available", e))?;
         for b in &self.blocks {
             // Closing the descriptor on failure unregisters what went before.
             uffd.register(b.host_memory())
@@ -1354,12 +1377,18 @@ impl LiveState for RamSection {
         self.hooks.load_done();
         let uffd = Arc::new(uffd);
         let quit = Arc::new(AtomicBool::new(false));
-        let (u, q, blocks) = (uffd.clone(), quit.clone(), self.blocks.clone());
+        let blocktime = lock(&self.stats.blocktime_threads).take().map(|threads| {
+            let bt = Arc::new(Blocktime::new(&threads));
+            *lock(&self.stats.blocktime) = Some(bt.clone());
+            bt
+        });
+        let (u, q, blocks, bt) =
+            (uffd.clone(), quit.clone(), self.blocks.clone(), blocktime.clone());
         let thread = std::thread::Builder::new()
             .name("mig/dst/fault".to_string())
-            .spawn(move || fault_thread(&u, &blocks, &recv, &rp, &q))
+            .spawn(move || fault_thread(&u, &blocks, &recv, &rp, bt.as_deref(), &q))
             .map_err(|e| Error::from_io("failed to create the postcopy fault thread", e))?;
-        self.listening = Some(Listening { uffd, quit, thread: Some(thread) });
+        self.listening = Some(Listening { uffd, quit, thread: Some(thread), blocktime });
         Ok(())
     }
 

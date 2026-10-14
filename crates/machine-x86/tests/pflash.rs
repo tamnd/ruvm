@@ -673,3 +673,43 @@ fn device_width_queries() {
     space.store(0, 4, 0x0070_0070, Endian::Little, U);
     assert_eq!(space.load(0, 4, Endian::Little, U).0, 0x0080_0080);
 }
+
+/// With `secure`, accesses without secure attrs only see the array data and cannot write.
+#[test]
+fn secure_flash_takes_commands_from_secure_accesses_only() {
+    let image = pattern(VARS_SIZE, 13);
+    let mem = Arc::new(MemorySystem::new());
+    let props = PflashProps { secure: true, ..PflashProps::pc_system_flash(VARS_SIZE) };
+    let dev =
+        Pflash::new(&mem, PC_FLASH_NAMES[1], props, PflashBacking::Bytes(image.clone())).unwrap();
+    let root = mem.new_container("system", 1 << 64).unwrap();
+    let space = mem.address_space_init(root, "memory").unwrap();
+    mem.add_subregion(root, 0, dev.region()).unwrap();
+    let s = MemTxAttrs::new().with_secure(true);
+    let ns = MemTxAttrs::new();
+    let first = u64::from(image[0x10]);
+
+    // Commands and programs from outside are dropped with an error.
+    for attrs in [U, ns] {
+        assert_eq!(space.store(0, 1, 0x98, Endian::Little, attrs), MemTxResult::ERROR);
+        assert_eq!(space.store(0x10, 1, 0x40, Endian::Little, attrs), MemTxResult::ERROR);
+        assert!(romd(&mem, dev.region()));
+        assert_eq!(space.load(0x10, 1, Endian::Little, attrs).0, first);
+    }
+
+    // A secure query leaves romd mode, but only secure reads see the query data.
+    assert_eq!(space.store(0, 1, 0x98, Endian::Little, s), MemTxResult::OK);
+    assert!(!romd(&mem, dev.region()));
+    assert_eq!(space.load(0x10, 1, Endian::Little, s).0, u64::from(b'Q'));
+    assert_eq!(space.load(0x10, 1, Endian::Little, ns), (first, MemTxResult::OK));
+
+    // A secure program goes in; the same program from outside does not.
+    space.store(0, 1, 0xff, Endian::Little, s);
+    space.store(0x20, 1, 0x40, Endian::Little, s);
+    space.store(0x20, 1, 0x00, Endian::Little, s);
+    space.store(0x21, 1, 0x40, Endian::Little, ns);
+    space.store(0x21, 1, 0x00, Endian::Little, ns);
+    space.store(0, 1, 0xff, Endian::Little, s);
+    assert_eq!(space.load(0x20, 1, Endian::Little, ns).0, 0);
+    assert_eq!(space.load(0x21, 1, Endian::Little, ns).0, u64::from(image[0x21]));
+}

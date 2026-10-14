@@ -9,9 +9,10 @@
 //! the properties of those objects. A global that reaches a board object is checked against
 //! them and fails with QEMU's error when the property or the value is wrong. A good one that
 //! ruvm would not act on is refused rather than dropped. ruvm takes `force-legacy` and
-//! `ioeventfd` of `virtio-mmio`, and the properties of the NIC models a board only makes while
-//! it lists them. On `-device` and `-drive if=virtio`, the globals go in front of the device's
-//! own properties, so the device code sees what `object_apply_global_props()` leaves.
+//! `ioeventfd` of `virtio-mmio`, `secure` of the q35 system flashes (`cfi.pflash01`), and the
+//! properties of the NIC models a board only makes while it lists them. On `-device` and
+//! `-drive if=virtio`, the globals go in front of the device's own properties, so the device
+//! code sees what `object_apply_global_props()` leaves.
 //!
 //! The tables follow the default machine options. Options that change which objects a board
 //! makes, such as `gic-version` or the microvm `pit`, `pic` and `rtc`, are not taken into
@@ -385,8 +386,12 @@ fn boards() -> &'static HashMap<&'static str, Vec<BoardObject>> {
 }
 
 /// The board properties ruvm acts on.
-fn takes(ty: &str, property: &str) -> bool {
-    ty == "virtio-mmio" && matches!(property, "force-legacy" | "ioeventfd")
+fn takes(board: &Board<'_>, ty: &str, property: &str) -> bool {
+    match ty {
+        "virtio-mmio" => matches!(property, "force-legacy" | "ioeventfd"),
+        "cfi.pflash01" => board.arch == Arch::X86 && property == "secure",
+        _ => false,
+    }
 }
 
 /// Devices that a board makes in a form the tables do not follow: which one depends on the
@@ -468,7 +473,7 @@ fn apply_board_to(globals: &mut [Global], board: &Board<'_>) -> Result<()> {
             let looked_up = kind == Kind::Str
                 && PARSED_STRINGS.contains(&g.property.as_str())
                 && !matches!(g.property.as_str(), "mac" | "fp_start_macaddr");
-            if (flag != Some('t') || looked_up) && !takes(ty, &g.property) {
+            if (flag != Some('t') || looked_up) && !takes(board, ty, &g.property) {
                 return Err(g.unsupported(&format!("property '{ty}.{}' is", g.property)));
             }
         }
@@ -499,6 +504,17 @@ pub(crate) fn virtio_mmio_force_legacy() -> bool {
         .find(|g| g.property == "force-legacy" && is_a("virtio-mmio", &g.driver))
         .and_then(|g| qapi_bool_parse("force-legacy", &g.value).ok())
         .unwrap_or(VIRTIO_MMIO_FORCE_LEGACY_DEFAULT)
+}
+
+/// `secure` of the q35 system flashes: the last global that the flashes took. [`apply_board`]
+/// has checked the value.
+pub(crate) fn pflash_secure() -> bool {
+    globals()
+        .iter()
+        .rev()
+        .find(|g| g.used && g.property == "secure" && is_a("cfi.pflash01", &g.driver))
+        .and_then(|g| qapi_bool_parse("secure", &g.value).ok())
+        .unwrap_or(false)
 }
 
 /// `qdev_prop_check_globals()`, when the machine is created: warns about the globals no device
@@ -864,6 +880,22 @@ mod tests {
         assert!(!gs[0].used);
         let serial = Board { serial: true, ..board(Arch::X86, "microvm") };
         assert!(apply(&serial, &[g("isa-serial", "bogus", "1")]).is_err());
+    }
+
+    #[test]
+    fn q35_flashes_take_secure() {
+        let q35 = board(Arch::X86, "q35");
+        let gs = apply(&q35, &[g("cfi.pflash01", "secure", "on")]).unwrap();
+        assert!(gs[0].used);
+        assert_eq!(
+            apply(&q35, &[g("cfi.pflash01", "secure", "x")]).unwrap_err(),
+            "can't apply global cfi.pflash01.secure=x: Parameter 'secure' expects 'on' or 'off'"
+        );
+        assert_eq!(
+            apply(&q35, &[g("cfi.pflash01", "width", "4")]).unwrap_err(),
+            "can't apply global cfi.pflash01.width=4: property 'cfi.pflash01.width' is not supported by ruvm yet"
+        );
+        assert!(apply(&board(Arch::Arm, "virt"), &[g("cfi.pflash01", "secure", "on")]).is_err());
     }
 
     #[test]
