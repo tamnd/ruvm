@@ -15,7 +15,7 @@
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
 /// `VFIO_API_VERSION`.
@@ -60,6 +60,17 @@ pub const DMA_MAP_FLAG_READ: u32 = 1;
 /// `VFIO_DMA_MAP_FLAG_WRITE`: the device may write the mapping.
 pub const DMA_MAP_FLAG_WRITE: u32 = 1 << 1;
 
+/// `VFIO_IRQ_SET_DATA_NONE`: the call carries no data.
+pub const IRQ_SET_DATA_NONE: u32 = 1;
+/// `VFIO_IRQ_SET_DATA_EVENTFD`: the call carries one eventfd per interrupt.
+pub const IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
+/// `VFIO_IRQ_SET_ACTION_MASK`.
+pub const IRQ_SET_ACTION_MASK: u32 = 1 << 3;
+/// `VFIO_IRQ_SET_ACTION_UNMASK`.
+pub const IRQ_SET_ACTION_UNMASK: u32 = 1 << 4;
+/// `VFIO_IRQ_SET_ACTION_TRIGGER`.
+pub const IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
+
 /// `VFIO_IRQ_INFO_NORESIZE`: the MSI-X vector count cannot change while enabled.
 pub const IRQ_INFO_NORESIZE: u32 = 1 << 3;
 
@@ -77,6 +88,7 @@ const VFIO_GROUP_GET_DEVICE_FD: u64 = io(6);
 const VFIO_DEVICE_GET_INFO: u64 = io(7);
 const VFIO_DEVICE_GET_REGION_INFO: u64 = io(8);
 const VFIO_DEVICE_GET_IRQ_INFO: u64 = io(9);
+const VFIO_DEVICE_SET_IRQS: u64 = io(10);
 const VFIO_DEVICE_RESET: u64 = io(11);
 const VFIO_IOMMU_MAP_DMA: u64 = io(13);
 const VFIO_IOMMU_UNMAP_DMA: u64 = io(14);
@@ -149,8 +161,22 @@ struct DmaUnmap {
     size: u64,
 }
 
-/// The argument structures of the ioctls this module issues.
+/// `struct vfio_irq_set` without its data.
+#[repr(C)]
+#[derive(Default)]
+struct IrqSet {
+    argsz: u32,
+    flags: u32,
+    index: u32,
+    start: u32,
+    count: u32,
+}
+
+/// The argument structures of the ioctls this module issues. A `c_char` is the first byte of a
+/// string and a `u32` the first word of a `vfio_irq_set` followed by its eventfds.
 trait Arg {}
+impl Arg for IrqSet {}
+impl Arg for u32 {}
 impl Arg for GroupStatus {}
 impl Arg for DeviceInfo {}
 impl Arg for RegionInfo {}
@@ -311,6 +337,37 @@ impl VfioDevice {
         Ok(info)
     }
 
+    /// `VFIO_DEVICE_SET_IRQS` without data: `action` on interrupts `start..start + count` of
+    /// `index`. A trigger with a count of 0 turns the whole index off.
+    pub fn set_irqs(&self, index: u32, start: u32, count: u32, action: u32) -> io::Result<()> {
+        let mut set = IrqSet {
+            argsz: argsz::<IrqSet>(),
+            flags: IRQ_SET_DATA_NONE | action,
+            index,
+            start,
+            count,
+        };
+        ioctl_ptr(&self.file, VFIO_DEVICE_SET_IRQS, &mut set).map(drop)
+    }
+
+    /// `VFIO_DEVICE_SET_IRQS` with eventfds: interrupt `start + i` of `index` gets `fds[i]` for
+    /// `action`, and a `None` takes the one it had away.
+    pub fn set_irqs_eventfds(
+        &self,
+        index: u32,
+        start: u32,
+        action: u32,
+        fds: &[Option<BorrowedFd<'_>>],
+    ) -> io::Result<()> {
+        let words = size_of::<IrqSet>() / 4 + fds.len();
+        let argsz =
+            u32::try_from(4 * words).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let mut set = Vec::with_capacity(words);
+        set.extend([argsz, IRQ_SET_DATA_EVENTFD | action, index, start, fds.len() as u32]);
+        set.extend(fds.iter().map(|fd| fd.map_or(-1, |fd| fd.as_raw_fd()) as u32));
+        ioctl_ptr(&self.file, VFIO_DEVICE_SET_IRQS, set.as_mut_ptr()).map(drop)
+    }
+
     /// `VFIO_DEVICE_RESET`.
     pub fn reset(&self) -> io::Result<()> {
         ioctl_val(&self.file, VFIO_DEVICE_RESET, 0).map(drop)
@@ -337,7 +394,9 @@ mod tests {
         // From linux/vfio.h on x86_64.
         assert_eq!(VFIO_GET_API_VERSION, 0x3b64);
         assert_eq!(VFIO_GROUP_GET_DEVICE_FD, 0x3b6a);
+        assert_eq!(VFIO_DEVICE_SET_IRQS, 0x3b6e);
         assert_eq!(VFIO_DEVICE_RESET, 0x3b6f);
+        assert_eq!(size_of::<IrqSet>(), 20);
         assert_eq!(VFIO_IOMMU_MAP_DMA, 0x3b71);
         assert_eq!(VFIO_IOMMU_UNMAP_DMA, 0x3b72);
         assert_eq!(size_of::<DmaMap>(), 32);
