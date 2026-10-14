@@ -2,15 +2,16 @@
 
 //! The A32 and T32 translator: the integer part of QEMU's `target/arm/tcg/translate.c`.
 //!
-//! The decoders come from a32.decode, a32-uncond.decode, t32.decode and t16.decode (see
-//! `build.rs`). [`S`] implements their `trans_` hooks for the integer instructions, the
-//! barriers and the cp15 thread ID registers; every pattern left out returns false, which
-//! raises an Undefined Instruction exception as QEMU's `unallocated_encoding()` does.
+//! The decoders come from a32.decode, a32-uncond.decode, t32.decode, t16.decode and vfp.decode
+//! (see `build.rs`). [`S`] implements their `trans_` hooks for the integer instructions, the
+//! barriers, the cp15 thread ID registers and the VFP register moves, loads and stores; every
+//! pattern left out returns false, which raises an Undefined Instruction exception as QEMU's
+//! `unallocated_encoding()` does.
 //!
 //! As in QEMU, R0 to R14, the PC and the NZCV flags are TCG globals. R15 is the PC field,
 //! which holds the zero extended 32-bit PC in AArch32 state.
 //!
-//! Not here yet, and so UNDEF: VFP and Neon, the M profile, SWP, and what only AArch32
+//! Not here yet, and so UNDEF: the VFP arithmetic and Neon, the M profile, SWP, and what only AArch32
 //! system mode needs (exception returns, banked registers, SPSR, RFE, SRS, CPS, LDM and STM
 //! of the User registers, and the coprocessor registers other than TPIDRURW, TPIDRURO and
 //! the CP15 barriers). Only the user mode emulator runs AArch32 code so far, so the
@@ -28,7 +29,7 @@ use super::{TB_ALIGN_MEM, TB_BE_DATA, TB_EL_MASK, TB_MMUIDX_SHIFT, TB_PSTATE_IL}
 use crate::cpu::{
     ArmCpuModel, CF, CONDEXEC_BITS, CPSR_EXEC, CPSR_NZCV, CPSR_USER, CpuArmState, EXCLUSIVE_ADDR,
     EXCLUSIVE_VAL, EXCP_BKPT, EXCP_KERNEL_TRAP, EXCP_SWI, EXCP_UDEF, GE, NF, PC, QF, THUMB, VF, ZF,
-    env_off, reg_off,
+    env_off, reg_off, vreg_off,
 };
 use crate::syndrome::{syn_aa32_bkpt, syn_aa32_svc, syn_illegalstate, syn_uncategorized};
 
@@ -81,6 +82,16 @@ mod t16 {
     }
 }
 
+#[allow(missing_docs, unreachable_pub, clippy::pedantic, clippy::nursery)]
+mod vfp {
+    include!(concat!(env!("OUT_DIR"), "/vfp_decode.rs"));
+
+    /// Decode and translate one VFP instruction.
+    pub(super) fn disas(ctx: &mut impl DisasVfp, insn: u32) -> bool {
+        disas_vfp(ctx, insn)
+    }
+}
+
 use a32::{
     DisasA32, arg_bfi, arg_bfx, arg_empty, arg_i, arg_ldrex, arg_ldst_block, arg_ldst_ri,
     arg_ldst_rr, arg_mcr, arg_mrs_reg, arg_msr_i, arg_msr_reg, arg_pkh, arg_r, arg_ri, arg_rr,
@@ -90,6 +101,10 @@ use a32::{
 use a32_uncond::{DisasA32Uncond, arg_cps, arg_setend};
 use t16::{DisasT16, arg_disas_t1617, arg_disas_t1618};
 use t32::{DisasT32, arg_ci, arg_ldst_ri2, arg_tbranch};
+use vfp::{
+    DisasVfp, arg_VLDM_VSTM_dp, arg_VLDM_VSTM_sp, arg_VLDR_VSTR_dp, arg_VLDR_VSTR_sp,
+    arg_VMOV_64_dp, arg_VMOV_64_sp, arg_VMOV_single, arg_VMSR_VMRS,
+};
 
 /// `DISAS_JUMP`: the PC (and maybe the Thumb bit) is written; look the next block up.
 const DISAS_JUMP: DisasJumpType = DisasJumpType::Target(0);
@@ -2451,6 +2466,248 @@ impl DisasT16 for S<'_, '_> {
     }
 }
 
+/// `vfp_reg_offset()`: the `env` offset of D`reg`, or of S`reg` if not `dp`. D`n` is half of
+/// the AdvSIMD register Q`n/2`, and S`n` half of D`n/2`.
+fn vfp_reg_offset(dp: bool, reg: i32) -> usize {
+    let reg = reg as usize;
+    if dp {
+        vreg_off(reg >> 1) + 8 * (reg & 1)
+    } else {
+        vreg_off(reg >> 2) + 8 * ((reg >> 1) & 1) + 4 * (reg & 1)
+    }
+}
+
+impl S<'_, '_> {
+    /// `gen_aa32_ld_i64()`.
+    fn ld64(&mut self, val: TempI64, addr: TempI32, op: MemOp) {
+        let op = self.finalize_memop(op);
+        let idx = self.d.mmu_idx;
+        let a = self.aa32_addr(addr);
+        self.f().gen_qemu_ld_i64(val, a, idx, op);
+    }
+
+    /// `gen_aa32_st_i64()`.
+    fn st64(&mut self, val: TempI64, addr: TempI32, op: MemOp) {
+        let op = self.finalize_memop(op);
+        let idx = self.d.mmu_idx;
+        let a = self.aa32_addr(addr);
+        self.f().gen_qemu_st_i64(val, a, idx, op);
+    }
+
+    /// `vfp_load_reg32()`.
+    fn vfp_load_reg32(&mut self, reg: i32) -> TempI32 {
+        self.ld_env32(vfp_reg_offset(false, reg))
+    }
+
+    /// `vfp_store_reg32()`.
+    fn vfp_store_reg32(&mut self, t: TempI32, reg: i32) {
+        self.st_env32(t, vfp_reg_offset(false, reg));
+    }
+
+    /// `gen_set_nzcv()`: NZCV from bits 31 to 28 of `t`.
+    fn set_nzcv(&mut self, t: TempI32) {
+        self.set_cpsr(t, CPSR_NZCV);
+    }
+
+    /// `trans_VLDM_VSTM_sp()` and `trans_VLDM_VSTM_dp()`, with `n` registers of `size`
+    /// bytes.
+    fn vldm_vstm(&mut self, a: &arg_VLDM_VSTM_dp, dp: bool, n: i32) -> bool {
+        // For thumb, use of PC is UNPREDICTABLE.
+        let addr = self.add_reg_for_lit(a.rn, 0);
+        if a.p != 0 {
+            // pre-decrement
+            self.f().gen_addi_i32(addr, addr, -(a.imm << 2));
+        }
+        let size = if dp { 8 } else { 4 };
+        for i in 0..n {
+            let off = vfp_reg_offset(dp, a.vd + i);
+            if dp {
+                let mop = MemOp::UQ | MemOp::ALIGN_4;
+                if a.l != 0 {
+                    let t = self.new64();
+                    self.ld64(t, addr, mop);
+                    self.st_env64(t, off);
+                } else {
+                    let t = self.ld_env64(off);
+                    self.st64(t, addr, mop);
+                }
+            } else {
+                let idx = self.d.mmu_idx;
+                if a.l != 0 {
+                    let t = self.new32();
+                    self.ld32(t, addr, idx, MemOp::UL | MemOp::ALIGN);
+                    self.st_env32(t, off);
+                } else {
+                    let t = self.ld_env32(off);
+                    self.st32(t, addr, idx, MemOp::UL | MemOp::ALIGN);
+                }
+            }
+            self.f().gen_addi_i32(addr, addr, size);
+        }
+        if a.w != 0 {
+            // writeback
+            let offset = if a.p != 0 {
+                -size * n
+            } else if dp && a.imm & 1 != 0 {
+                // FLDMX and FSTMX
+                4
+            } else {
+                0
+            };
+            if offset != 0 {
+                self.f().gen_addi_i32(addr, addr, offset);
+            }
+            self.store_reg(a.rn, addr);
+        }
+        true
+    }
+}
+
+/// The VFP register moves, loads and stores of `translate-vfp.c`. The FP enable checks of
+/// `vfp_access_check()` always pass: only the user mode emulator runs AArch32 code, with FP
+/// enabled.
+impl DisasVfp for S<'_, '_> {
+    fn trans_VMSR_VMRS(&mut self, a: &mut arg_VMSR_VMRS) -> bool {
+        // Only FPSCR: FPSID, FPEXC and the MVFRs are UNDEF in User mode, and VPR and P0 are
+        // M profile.
+        if a.reg != 1 {
+            return false;
+        }
+        let env = self.env();
+        if a.l != 0 {
+            // VMRS, move VFP reg to gp reg
+            let t = self.new32();
+            self.call(&h::VFP_GET_FPSCR, Some(t.into()), &[env.into()]);
+            if a.rt == 15 {
+                // Set the 4 flag bits in the CPSR.
+                self.f().gen_andi_i32(t, t, 0xf000_0000_u32 as i32);
+                self.set_nzcv(t);
+            } else {
+                self.store_reg(a.rt, t);
+            }
+        } else {
+            // VMSR, move gp reg to VFP reg
+            let t = self.load_reg(a.rt);
+            self.call(&h::VFP_SET_FPSCR, None, &[env.into(), t.into()]);
+            self.gen_lookup_tb();
+        }
+        true
+    }
+
+    fn trans_VMOV_single(&mut self, a: &mut arg_VMOV_single) -> bool {
+        if a.l != 0 {
+            // VFP to general purpose register
+            let t = self.vfp_load_reg32(a.vn);
+            if a.rt == 15 {
+                // Set the 4 flag bits in the CPSR.
+                self.set_nzcv(t);
+            } else {
+                self.store_reg(a.rt, t);
+            }
+        } else {
+            // general purpose register to VFP
+            let t = self.load_reg(a.rt);
+            self.vfp_store_reg32(t, a.vn);
+        }
+        true
+    }
+
+    fn trans_VMOV_64_sp(&mut self, a: &mut arg_VMOV_64_sp) -> bool {
+        if a.op != 0 {
+            // fpreg to gpreg
+            let t = self.vfp_load_reg32(a.vm);
+            self.store_reg(a.rt, t);
+            let t = self.vfp_load_reg32(a.vm + 1);
+            self.store_reg(a.rt2, t);
+        } else {
+            // gpreg to fpreg
+            let t = self.load_reg(a.rt);
+            self.vfp_store_reg32(t, a.vm);
+            let t = self.load_reg(a.rt2);
+            self.vfp_store_reg32(t, a.vm + 1);
+        }
+        true
+    }
+
+    fn trans_VMOV_64_dp(&mut self, a: &mut arg_VMOV_64_dp) -> bool {
+        // D16-D31 exist: the model has 32 double registers.
+        if a.op != 0 {
+            // fpreg to gpreg
+            let t = self.vfp_load_reg32(a.vm * 2);
+            self.store_reg(a.rt, t);
+            let t = self.vfp_load_reg32(a.vm * 2 + 1);
+            self.store_reg(a.rt2, t);
+        } else {
+            // gpreg to fpreg
+            let t = self.load_reg(a.rt);
+            self.vfp_store_reg32(t, a.vm * 2);
+            let t = self.load_reg(a.rt2);
+            self.vfp_store_reg32(t, a.vm * 2 + 1);
+        }
+        true
+    }
+
+    fn trans_VLDR_VSTR_sp(&mut self, a: &mut arg_VLDR_VSTR_sp) -> bool {
+        let offset = if a.u != 0 { a.imm << 2 } else { -(a.imm << 2) };
+        // For thumb, use of PC is UNPREDICTABLE.
+        let addr = self.add_reg_for_lit(a.rn, offset);
+        let idx = self.d.mmu_idx;
+        if a.l != 0 {
+            let t = self.new32();
+            self.ld32(t, addr, idx, MemOp::UL | MemOp::ALIGN);
+            self.vfp_store_reg32(t, a.vd);
+        } else {
+            let t = self.vfp_load_reg32(a.vd);
+            self.st32(t, addr, idx, MemOp::UL | MemOp::ALIGN);
+        }
+        true
+    }
+
+    fn trans_VLDR_VSTR_dp(&mut self, a: &mut arg_VLDR_VSTR_dp) -> bool {
+        let offset = if a.u != 0 { a.imm << 2 } else { -(a.imm << 2) };
+        // For thumb, use of PC is UNPREDICTABLE.
+        let addr = self.add_reg_for_lit(a.rn, offset);
+        let off = vfp_reg_offset(true, a.vd);
+        if a.l != 0 {
+            let t = self.new64();
+            self.ld64(t, addr, MemOp::UQ | MemOp::ALIGN_4);
+            self.st_env64(t, off);
+        } else {
+            let t = self.ld_env64(off);
+            self.st64(t, addr, MemOp::UQ | MemOp::ALIGN_4);
+        }
+        true
+    }
+
+    fn trans_VLDM_VSTM_sp(&mut self, a: &mut arg_VLDM_VSTM_sp) -> bool {
+        let n = a.imm;
+        if n == 0 || a.vd + n > 32 {
+            // UNPREDICTABLE cases for bad immediates: we choose to UNDEF to avoid generating
+            // huge numbers of TCG ops.
+            return false;
+        }
+        if a.rn == 15 && a.w != 0 {
+            // writeback to PC is UNPREDICTABLE, we choose to UNDEF
+            return false;
+        }
+        self.vldm_vstm(a, false, n)
+    }
+
+    fn trans_VLDM_VSTM_dp(&mut self, a: &mut arg_VLDM_VSTM_dp) -> bool {
+        let n = a.imm >> 1;
+        if n == 0 || a.vd + n > 32 || n > 16 {
+            // UNPREDICTABLE cases for bad immediates: we choose to UNDEF to avoid generating
+            // huge numbers of TCG ops.
+            return false;
+        }
+        if a.rn == 15 && a.w != 0 {
+            // writeback to PC is UNPREDICTABLE, we choose to UNDEF
+            return false;
+        }
+        self.vldm_vstm(a, true, n)
+    }
+}
+
 impl S<'_, '_> {
     /// `arm_check_kernelpage()`: in user mode, a jump to the kernel helper page raises
     /// `EXCP_KERNEL_TRAP`.
@@ -2489,7 +2746,7 @@ impl S<'_, '_> {
             // passes.
             self.skip_unless(cond);
         }
-        if !a32::disas(self, insn) {
+        if !a32::disas(self, insn) && !vfp::disas(self, insn) {
             self.unallocated_encoding();
         }
     }
@@ -2544,7 +2801,11 @@ impl DisasContext {
                 s.skip_unless(cond);
             }
         }
-        let ok = if is_16bit { t16::disas(&mut s, insn as u16) } else { t32::disas(&mut s, insn) };
+        let ok = if is_16bit {
+            t16::disas(&mut s, insn as u16)
+        } else {
+            t32::disas(&mut s, insn) || (insn >> 28 == 0xe && vfp::disas(&mut s, insn))
+        };
         if !ok {
             s.unallocated_encoding();
         }

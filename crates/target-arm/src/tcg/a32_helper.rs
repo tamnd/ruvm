@@ -11,13 +11,18 @@ use ruvm_jit_core::HelperType;
 use ruvm_jit_core::types::call_flags::{NO_RWG, NO_RWG_SE};
 use ruvm_jit_interp::{HelperEnv, Unwind};
 
-use super::commit;
 use super::helpers::{Def, crc_update, def, run};
+use super::{arm_of, commit, vfp};
 use crate::cpu::{CF, CPSR_EXEC, CpuArmState, GE, QF};
 
 use HelperType::{I32, Ptr, Void};
 
 type H = Result<u128, Unwind>;
+
+/// `FPSCR_FPSR_MASK`: the FPSCR bits kept in FPSR, NZCV, QC and the cumulative exceptions.
+const FPSCR_FPSR_MASK: u32 = 0xf800_009f;
+/// `FPSCR_FPCR_MASK`: the FPSCR bits kept in FPCR.
+const FPSCR_FPCR_MASK: u32 = 0x07ff_9f00;
 
 fn st32(env: &mut [u8], off: usize, v: u32) {
     env[off..off + 4].copy_from_slice(&v.to_le_bytes());
@@ -250,6 +255,26 @@ fn h_cpsr_write(h: &mut HelperEnv<'_>, a: &[u64]) -> H {
     })
 }
 
+/// `HELPER(vfp_get_fpscr)`.
+fn h_vfp_get_fpscr(h: &mut HelperEnv<'_>, _a: &[u64]) -> H {
+    let st = CpuArmState::load(h.env);
+    ret((vfp::get_fpcr(&st) & FPSCR_FPCR_MASK) | (vfp::get_fpsr(&st) & FPSCR_FPSR_MASK))
+}
+
+/// `HELPER(vfp_set_fpscr)`.
+fn h_vfp_set_fpscr(h: &mut HelperEnv<'_>, a: &[u64]) -> H {
+    let val = a[1] as u32;
+    run(h, |cpu| {
+        let ops = cpu.ops();
+        let feat = *arm_of(&ops).features();
+        let mut st = CpuArmState::load(cpu.env);
+        vfp::set_fpcr(&mut st, val & FPSCR_FPCR_MASK, &feat);
+        vfp::set_fpsr(&mut st, val & FPSCR_FPSR_MASK);
+        commit(cpu, &mut st);
+        Ok(0)
+    })
+}
+
 // The parallel additions and subtractions of `op_addsub.h`.
 
 /// What a parallel add or subtract does with each lane's result.
@@ -436,6 +461,8 @@ def!(CRC32, "crc32", NO_RWG_SE, I32, [I32, I32, I32], h_crc32);
 def!(CRC32C, "crc32c", NO_RWG_SE, I32, [I32, I32, I32], h_crc32c);
 def!(CPSR_READ, "cpsr_read", 0, I32, [Ptr], h_cpsr_read);
 def!(CPSR_WRITE, "cpsr_write", 0, Void, [Ptr, I32, I32], h_cpsr_write);
+def!(VFP_GET_FPSCR, "vfp_get_fpscr", 0, I32, [Ptr], h_vfp_get_fpscr);
+def!(VFP_SET_FPSCR, "vfp_set_fpscr", 0, Void, [Ptr, I32], h_vfp_set_fpscr);
 
 /// The helpers other than the parallel add and subtract ones.
 pub(crate) const BASE: &[Def] = &[
@@ -461,6 +488,8 @@ pub(crate) const BASE: &[Def] = &[
     CRC32C,
     CPSR_READ,
     CPSR_WRITE,
+    VFP_GET_FPSCR,
+    VFP_SET_FPSCR,
 ];
 
 #[cfg(test)]

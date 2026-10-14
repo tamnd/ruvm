@@ -29,6 +29,7 @@ fn main() {
     for (name, opt, out) in [
         ("a64.decode", "--static-decode=disas_a64", "a64_decode.rs"),
         ("sve.decode", "--decode=disas_sve", "sve_decode.rs"),
+        ("vfp.decode", "--decode=disas_vfp", "vfp_decode.rs"),
     ] {
         let rust = generate(&manifest, name, &[opt]);
         write_if_changed(&dir.join(out), &default_trans(&rust));
