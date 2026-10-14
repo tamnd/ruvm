@@ -609,6 +609,16 @@ impl GuestSpace {
         fixed: bool,
         new_addr: u64,
     ) -> Result<u64, i32> {
+        // QEMU checks the guest ranges before the host checks the flags and alignment: a bad
+        // new range is EINVAL, a bad old range EFAULT.
+        if (fixed && !self.range_valid(new_addr, new_size))
+            || (!maymove && !self.range_valid(old, new_size))
+        {
+            return Err(EINVAL);
+        }
+        if old_size != 0 && !self.range_valid(old, old_size) {
+            return Err(14); // EFAULT
+        }
         if old % PAGE_SIZE != 0 || (fixed && (!maymove || new_addr % PAGE_SIZE != 0)) {
             return Err(EINVAL);
         }

@@ -86,6 +86,18 @@ pub(crate) fn entry(nr: i64) -> Option<&'static Entry> {
     Some(&table::ENTRIES[i].1)
 }
 
+/// Entries with only the names of `names`, for calls the host's table does not describe:
+/// their arguments print as numbers.
+pub(crate) fn named(names: impl Iterator<Item = &'static str>) -> Vec<Entry> {
+    names.map(|name| Entry { name, format: None, call: None, result: None }).collect()
+}
+
+impl Entry {
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
 /// The entry of `riscv_hwprobe`, which the host does not have.
 pub(crate) fn riscv_hwprobe() -> &'static Entry {
     &table::RISCV_HWPROBE

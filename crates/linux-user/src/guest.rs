@@ -22,6 +22,9 @@ pub(crate) struct Guest {
     /// Whether the target has the system call numbers and structures of `asm-generic`
     /// (`struct stat`, `struct epoll_event`), which the host's differ from.
     pub(crate) generic_abi: bool,
+    /// `TARGET_ABI32`: pointers and longs are 32 bits, so `struct iovec` and the `execve()`
+    /// arrays are too.
+    pub(crate) abi32: bool,
     /// Whether `struct sigaction` has `sa_restorer`, `TARGET_ARCH_HAS_SA_RESTORER`.
     pub(crate) sa_restorer: bool,
     /// The `O_` flags whose target value differs from the host's, as `(target, host)`.

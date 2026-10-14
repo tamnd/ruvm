@@ -53,17 +53,17 @@ const EM_X86_64: u16 = 62;
 /// `__USER_CS`.
 const USER_CS: u32 = 0x33;
 /// `__USER_DS`.
-const USER_DS: u32 = 0x2b;
+pub(crate) const USER_DS: u32 = 0x2b;
 /// `TARGET_GDT_ENTRIES`.
 const GDT_ENTRIES: u64 = 16;
 /// `IF_MASK`.
-const IF_MASK: u64 = 1 << 9;
+pub(crate) const IF_MASK: u64 = 1 << 9;
 
 /// The vCPU of a user mode guest: the x86 front end, with guest pages checked against the
 /// guest's mappings instead of page tables.
-struct UserCpu {
-    x86: Arc<X86>,
-    space: Arc<GuestSpace>,
+pub(crate) struct UserCpu {
+    pub(crate) x86: Arc<X86>,
+    pub(crate) space: Arc<GuestSpace>,
 }
 
 impl fmt::Debug for UserCpu {
@@ -281,7 +281,7 @@ fn set_tls(cpu: &mut Cpu<'_>, tls: u64) {
 }
 
 /// `set_gate64()` for an interrupt gate with no handler, which is all user mode needs.
-fn gate64(dpl: u32) -> [u8; 16] {
+pub(crate) fn gate64(dpl: u32) -> [u8; 16] {
     let e2: u32 = 0x8000 | (dpl << 13);
     let mut b = [0u8; 16];
     b[4..8].copy_from_slice(&e2.to_le_bytes());
@@ -289,13 +289,13 @@ fn gate64(dpl: u32) -> [u8; 16] {
 }
 
 /// `write_dt()` for a flat 4 GiB segment.
-fn flat_descriptor(flags: u32) -> u64 {
+pub(crate) fn flat_descriptor(flags: u32) -> u64 {
     let e1: u32 = 0xffff;
     let e2: u32 = 0x000f_0000 | flags;
     u64::from(e1) | (u64::from(e2) << 32)
 }
 
-fn map_rw(space: &GuestSpace, len: u64) -> Result<u64, String> {
+pub(crate) fn map_rw(space: &GuestSpace, len: u64) -> Result<u64, String> {
     let kind = MapKind { anon: true, ..MapKind::default() };
     space
         .mmap(0, len, page::READ | page::WRITE, kind, None, 0)
@@ -303,7 +303,7 @@ fn map_rw(space: &GuestSpace, len: u64) -> Result<u64, String> {
 }
 
 /// `cpuid(index, 0)` of the model as `[eax, ebx, ecx, edx]`.
-fn cpuid(model: &X86Cpu, index: u32, count: u32) -> [u32; 4] {
+pub(crate) fn cpuid(model: &X86Cpu, index: u32, count: u32) -> [u32; 4] {
     model.cpuid(index, count)
 }
 
@@ -684,6 +684,7 @@ pub(crate) static GUEST: Guest = Guest {
     minsigstksz: 2048,
     env_size: env::ENV_SIZE,
     generic_abi: false,
+    abi32: false,
     sa_restorer: true,
     open_flags: &[],
     cpuinfo: None,
@@ -738,7 +739,8 @@ impl start::Target for Target {
 
     fn arch(&self) -> Arch {
         Arch {
-            machine: EM_X86_64,
+            machines: &[EM_X86_64],
+            elf32: false,
             platform: Some("x86_64"),
             hwcap: u64::from(cpuid(self.model(), 1, 0)[3]),
             hwcap2: None,

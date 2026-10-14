@@ -673,6 +673,7 @@ pub(crate) static GUEST: Guest = Guest {
     minsigstksz: 2048,
     env_size: ENV_SIZE,
     generic_abi: true,
+    abi32: false,
     sa_restorer: false,
     open_flags: &[],
     cpuinfo: Some(cpuinfo),
@@ -756,7 +757,13 @@ impl start::Target for Target {
     }
 
     fn arch(&self) -> Arch {
-        Arch { machine: EM_RISCV, platform: None, hwcap: hwcap(self.cfg()), hwcap2: None }
+        Arch {
+            machines: &[EM_RISCV],
+            elf32: false,
+            platform: None,
+            hwcap: hwcap(self.cfg()),
+            hwcap2: None,
+        }
     }
 
     fn new_jit(&self, config: &dyn Fn(&mut JitConfig)) -> Arc<Jit> {

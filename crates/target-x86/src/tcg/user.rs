@@ -82,6 +82,17 @@ pub fn record_sigsegv(
     cpu.cpu_loop_exit_restore(ra)
 }
 
+/// `cpu_x86_fsave()`: the 32-bit FSAVE image of the x87 state to guest memory at `ptr`, for
+/// an i386 signal frame. Like the instruction, it leaves the FPU initialized.
+pub fn cpu_x86_fsave(cpu: &mut Cpu<'_>, ptr: u64) -> Result<(), CpuLoopExit> {
+    super::helpers::fpu::user_fsave(cpu, ptr)
+}
+
+/// `cpu_x86_frstor()`: the reverse of [`cpu_x86_fsave`].
+pub fn cpu_x86_frstor(cpu: &mut Cpu<'_>, ptr: u64) -> Result<(), CpuLoopExit> {
+    super::helpers::fpu::user_frstor(cpu, ptr)
+}
+
 /// `cpu_x86_fxsave()`: the FXSAVE image of the vCPU's x87 and SSE state to guest memory at
 /// `ptr`, for a signal frame.
 pub fn cpu_x86_fxsave(cpu: &mut Cpu<'_>, ptr: u64) -> Result<(), CpuLoopExit> {
