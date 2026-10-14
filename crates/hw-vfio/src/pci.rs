@@ -602,6 +602,10 @@ pub fn realize(
     match s.run() {
         Ok(ops) => {
             dev.set_ops(Arc::new(ops));
+            // QEMU resets every device once before the guest runs, and a hotplugged one right
+            // after realize. The boards here are built in their reset state, so a passed through
+            // device has to be reset now or it keeps whatever the last user left in it.
+            dev.reset();
             Ok(dev)
         }
         Err(e) => {
