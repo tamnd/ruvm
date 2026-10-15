@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Save and load of the state `vmstate_fw_cfg` carries.
+//! Save and load of the state `vmstate_fw_cfg` carries, and the ACPI file sizes it records.
 
 use ruvm_hw_core::fw_cfg::*;
 
@@ -45,4 +45,19 @@ fn acpi_mr_sizes_are_kept() {
     assert!(v.acpi_mr_needed());
     a.vmstate_load(&v);
     assert_eq!(a.vmstate_save(), v);
+}
+
+#[test]
+fn acpi_files_give_the_mr_sizes() {
+    // The sizes QEMU 11.1 sends for `virt`.
+    let a = device(true);
+    a.add_file("etc/acpi/tables", vec![0; 0x20000]).unwrap();
+    a.add_file("etc/table-loader", vec![0; 0xc80]).unwrap();
+    a.add_file("etc/acpi/rsdp", vec![0; 36]).unwrap();
+    let v = a.vmstate_save();
+    assert_eq!((v.table_mr_size, v.linker_mr_size, v.rsdp_mr_size), (0x20000, 0xc80, 36));
+    assert!(v.acpi_mr_needed());
+
+    a.modify_file("etc/acpi/rsdp", vec![0; 20]).unwrap();
+    assert_eq!(a.vmstate_save().rsdp_mr_size, 20);
 }

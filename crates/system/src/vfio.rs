@@ -25,7 +25,6 @@ const UNSUPPORTED: &[&str] = &[
     "display",
     "xres",
     "yres",
-    "x-intx-mmap-timeout-ms",
     "x-vga",
     "x-req",
     "x-igd-opregion",
@@ -107,10 +106,8 @@ pub(crate) fn plan_device(
             "x-balloon-allowed" => conf.balloon_allowed = boolean(k, v)?,
             "skip-vsc-check" => conf.skip_vsc_check = boolean(k, v)?,
             "multifunction" => conf.multifunction = boolean(k, v)?,
-            // The BARs are always trapped.
-            "x-no-mmap" => {
-                boolean(k, v)?;
-            }
+            "x-no-mmap" => conf.no_mmap = boolean(k, v)?,
+            "x-intx-mmap-timeout-ms" => conf.intx_mmap_timeout_ms = uint32(k, v)?,
             "ats" => {
                 let ats = OnOffAuto::parse(v).ok_or_else(|| {
                     Located::new(loc, format!("Parameter '{k}' does not accept value '{v}'"))
@@ -147,17 +144,23 @@ pub(crate) fn plan_device(
     Ok(plug)
 }
 
-/// Realizes a planned `vfio-pci` on q35.
+/// Realizes a planned `vfio-pci` on q35. The `first` one also hooks the system reset.
 #[cfg(target_os = "linux")]
 pub(crate) fn realize_x86(
     board: &mut X86Board,
     plug: &VfioPlug,
     firmware: &FirmwareSearch,
+    clock: &std::sync::Arc<ruvm_hw_core::timer::Clock>,
+    first: bool,
 ) -> Result<(), Located> {
     use std::sync::Arc;
 
+    use ruvm_base::report::push_location;
     use ruvm_hw_pci::regs::PCI_ROM_SLOT;
 
+    // qdev_device_add() runs realize with the option's location current, so what realize
+    // reports itself, such as the dma-buf warning, starts with "-device vfio-pci,...: ".
+    let _loc = plug.loc.clone().map(push_location);
     let X86Board::Q35(m, _) = board else {
         return Err(Located::new(
             &plug.loc,
@@ -179,9 +182,15 @@ pub(crate) fn realize_x86(
         &dma_as,
         m.memory_as(),
         Some(&viommu),
+        clock,
         &plug.conf,
     )
     .map_err(|e| Located(plug.loc.clone(), e))?;
+    // vfio_address_space_get() registers vfio_device_reset_handler() along with the first
+    // device, before the system bus, so it runs before the devices themselves are reset.
+    if first {
+        m.add_early_reset_hook(Box::new(ruvm_hw_vfio::pci::reset_handler));
+    }
     // pci_add_option_rom()
     if let Some(name) = plug.conf.romfile.as_deref().filter(|f| !f.is_empty()) {
         let at = |e: String| Located::new(&plug.loc, e);
@@ -220,6 +229,8 @@ pub(crate) fn realize_x86(
     _board: &mut X86Board,
     plug: &VfioPlug,
     _firmware: &FirmwareSearch,
+    _clock: &std::sync::Arc<ruvm_hw_core::timer::Clock>,
+    _first: bool,
 ) -> Result<(), Located> {
     Err(Located::new(&plug.loc, format!("'{TYPE_VFIO_PCI}' is not a valid device model name")))
 }

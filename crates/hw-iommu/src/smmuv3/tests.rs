@@ -5,7 +5,9 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use ruvm_mem::{Endian, MemorySystem};
+use ruvm_mem::{
+    Endian, IommuNotifier, MemorySystem, register_iommu_notifier, unregister_iommu_notifier,
+};
 
 use super::*;
 
@@ -25,6 +27,7 @@ struct Rig {
     space: Arc<AddressSpace>,
     smmu: Arc<SmmuV3>,
     irqs: Arc<[AtomicU32; 4]>,
+    ops: Arc<dyn IommuOps>,
     dma: Arc<AddressSpace>,
     prod: u32,
 }
@@ -48,9 +51,10 @@ impl Rig {
         let smmu = SmmuV3::new(stages, &space, lines);
         let mmio = sys.new_io("smmuv3", u128::from(SMMU_SIZE), smmu.mmio_ops()).unwrap();
         sys.add_subregion(root, BASE, mmio).unwrap();
-        let iommu = sys.new_iommu("smmuv3-iommu", 1 << 64, smmu.device_ops(SID)).unwrap();
+        let ops = smmu.device_ops(SID);
+        let iommu = sys.new_iommu("smmuv3-iommu", 1 << 64, Arc::clone(&ops)).unwrap();
         let dma = sys.address_space_init(iommu, "dma").unwrap();
-        Rig { _sys: sys, space, smmu, irqs, dma, prod: 0 }
+        Rig { _sys: sys, space, smmu, irqs, ops, dma, prod: 0 }
     }
 
     fn w32(&self, off: u64, v: u32) {
@@ -400,15 +404,120 @@ fn range_invalidation_splits_into_powers_of_two() {
     }
     // TG = 4K, NUM = 2 and SCALE = 0: three pages from 0x1000.
     s.range_inval(
+        &Dma(None),
         &[u32::from(cmd::TLBI_NH_VA) | (2 << 12), 3 << 16, 0x1000 | (1 << 10), 0],
         Stage::S1,
     );
     assert_eq!(s.iotlb.len(), 5);
     // Another ASID is not touched by NH_VA, but NH_VAA covers every ASID.
-    s.range_inval(&[u32::from(cmd::TLBI_NH_VA), 4 << 16, 0x6000 | (1 << 10), 0], Stage::S1);
+    s.range_inval(
+        &Dma(None),
+        &[u32::from(cmd::TLBI_NH_VA), 4 << 16, 0x6000 | (1 << 10), 0],
+        Stage::S1,
+    );
     assert_eq!(s.iotlb.len(), 5);
-    s.range_inval(&[u32::from(cmd::TLBI_NH_VAA), 4 << 16, 0x6000 | (1 << 10), 0], Stage::S1);
+    s.range_inval(
+        &Dma(None),
+        &[u32::from(cmd::TLBI_NH_VAA), 4 << 16, 0x6000 | (1 << 10), 0],
+        Stage::S1,
+    );
     assert_eq!(s.iotlb.len(), 4);
+}
+
+type Log = Arc<Mutex<Vec<(u64, u64)>>>;
+
+/// An UNMAP notifier over the whole region of `SID` that logs the IOVA and the mask of each
+/// event.
+fn unmap_log(r: &Rig) -> (Arc<IommuNotifier>, Log) {
+    let log = Log::default();
+    let l = Arc::clone(&log);
+    let n = IommuNotifier::new(
+        move |e: &IommuTlbEntry| {
+            assert!(e.target_as.is_some());
+            assert_eq!(e.perm, IommuAccessFlags::NONE);
+            l.lock().unwrap().push((e.iova, e.addr_mask));
+        },
+        IommuNotifierFlag::UNMAP,
+        0,
+        u64::MAX,
+        0,
+    );
+    register_iommu_notifier(r.ops.as_ref(), &n).unwrap();
+    (n, log)
+}
+
+fn take(log: &Log) -> Vec<(u64, u64)> {
+    std::mem::take(&mut log.lock().unwrap())
+}
+
+#[test]
+fn notifiers_take_unmap_only() {
+    let r = Rig::new(Stage::Nested);
+    let n = |flags| IommuNotifier::new(|_: &IommuTlbEntry| {}, flags, 0, u64::MAX, 0);
+    let map = n(IommuNotifierFlag::IOTLB_EVENTS);
+    let msg = "device 00.01.0 requires iommu MAP notifier which is not currently supported";
+    assert_eq!(register_iommu_notifier(r.ops.as_ref(), &map), Err(msg.to_string()));
+    let dev = n(IommuNotifierFlag::DEVIOTLB_UNMAP);
+    let msg = "SMMUv3 does not support dev-iotlb yet";
+    assert_eq!(register_iommu_notifier(r.ops.as_ref(), &dev), Err(msg.to_string()));
+    assert!(r.smmu.notified().is_empty());
+    let unmap = n(IommuNotifierFlag::UNMAP);
+    register_iommu_notifier(r.ops.as_ref(), &unmap).unwrap();
+    assert_eq!(r.smmu.notified().len(), 1);
+    unregister_iommu_notifier(r.ops.as_ref(), &unmap);
+    assert!(r.smmu.notified().is_empty());
+}
+
+#[test]
+fn stage1_invalidations_unmap_for_the_notifiers() {
+    let mut r = Rig::new(Stage::Nested);
+    r.enable();
+    r.ste(5, [0; 8]);
+    r.cd();
+    let (n, log) = unmap_log(&r);
+    // Without a range, one page of the CD's 4K granule, and only for ASID 7.
+    r.cmd([u32::from(cmd::TLBI_NH_VA), 7 << 16, 0x1000, 0]);
+    r.cmd([u32::from(cmd::TLBI_NH_VA), 8 << 16, 0x1000, 0]);
+    assert_eq!(take(&log), [(0x1000, 0xfff)]);
+    // Three 4K pages from 0x1000 go out in the pieces the range is split into.
+    r.cmd([u32::from(cmd::TLBI_NH_VAA) | (2 << 12), 0, 0x1000 | (1 << 10), 0]);
+    assert_eq!(take(&log), [(0x1000, 0xfff), (0x2000, 0x1fff)]);
+    // The ASID and global invalidations unmap the whole range.
+    r.cmd([u32::from(cmd::TLBI_NH_ASID), 7 << 16, 0, 0]);
+    r.cmd([u32::from(cmd::TLBI_NSNH_ALL), 0, 0, 0]);
+    assert_eq!(take(&log), [(0, u64::MAX), (0, u64::MAX)]);
+    // Configuration invalidations unmap nothing, and nothing goes to a removed notifier.
+    r.cmd([u32::from(cmd::CFGI_STE), SID, 0, 0]);
+    unregister_iommu_notifier(r.ops.as_ref(), &n);
+    r.cmd([u32::from(cmd::TLBI_NSNH_ALL), 0, 0, 0]);
+    assert!(take(&log).is_empty());
+    assert_eq!(r.r32(A_CMDQ_CONS), 7);
+}
+
+#[test]
+fn stage2_invalidations_unmap_for_the_notifiers() {
+    let mut r = Rig::new(Stage::Nested);
+    r.enable();
+    r.ste(6, s2_words());
+    let (_n, log) = unmap_log(&r);
+    // Without a range, one page of the 4K stage 2 granule, and only for VMID 1.
+    r.cmd([u32::from(cmd::TLBI_S2_IPA), 1, 0x20_0000, 0]);
+    r.cmd([u32::from(cmd::TLBI_S2_IPA), 2, 0x20_0000, 0]);
+    assert_eq!(take(&log), [(0x20_0000, 0xfff)]);
+    // TLBI_NH_ALL with stage 2 leaves the notifiers alone, TLBI_S12_VMALL does not.
+    r.cmd([u32::from(cmd::TLBI_NH_ALL), 1, 0, 0]);
+    assert!(take(&log).is_empty());
+    r.cmd([u32::from(cmd::TLBI_S12_VMALL), 1, 0, 0]);
+    assert_eq!(take(&log), [(0, u64::MAX)]);
+    // With nesting only stage 1 addresses are IOVAs, so stage 2 invalidations unmap nothing.
+    r.wq(VTTB, AF | (3 << 6) | 1);
+    r.cd();
+    r.ste(7, s2_words());
+    r.cmd([u32::from(cmd::CFGI_STE), SID, 0, 0]);
+    r.cmd([u32::from(cmd::TLBI_S2_IPA), 1, 0x3000, 0]);
+    assert!(take(&log).is_empty());
+    r.cmd([u32::from(cmd::TLBI_NH_VA), (7 << 16) | 1, 0x3000, 0]);
+    assert_eq!(take(&log), [(0x3000, 0xfff)]);
 }
 
 #[test]

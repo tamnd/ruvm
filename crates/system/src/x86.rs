@@ -2344,10 +2344,12 @@ fn build(
         Ok::<(), Vec<Located>>(())
     };
     let mut vfio = p.vfio.iter().peekable();
+    let mut vfio_first = true;
     // The vfio-pci devices that come before virtio plug `at`, or all that are left.
     let mut plug_vfio = |board: &mut X86Board, at: Option<usize>| {
         while let Some((_, plug)) = vfio.next_if(|(vi, _)| at.is_none_or(|i| *vi == i)) {
-            crate::vfio::realize_x86(board, plug, &firmware).map_err(one)?;
+            let first = std::mem::take(&mut vfio_first);
+            crate::vfio::realize_x86(board, plug, &firmware, &clock, first).map_err(one)?;
         }
         Ok::<(), Vec<Located>>(())
     };
@@ -3249,6 +3251,10 @@ mod tests {
         assert_eq!(plug.conf.host.unwrap().to_string(), "0000:00:04.0");
         assert_eq!((plug.conf.device_id, plug.conf.vendor_id), (0x10d4, ruvm_hw_vfio::PCI_ANY_ID));
         assert_eq!(plug.conf.ats, Some(false));
+        assert_eq!((plug.conf.no_mmap, plug.conf.intx_mmap_timeout_ms), (false, 1100));
+        let args = ["vfio-pci,host=0000:00:04.0,x-no-mmap=on,x-intx-mmap-timeout-ms=0"];
+        let p = plan(q, &[], &devices(&args), true).unwrap();
+        assert_eq!((p.vfio[0].1.conf.no_mmap, p.vfio[0].1.conf.intx_mmap_timeout_ms), (true, 0));
 
         let no_pci = "No 'PCI' bus found for device 'vfio-pci'";
         assert_eq!(err(Some(BoardKind::Microvm), &["vfio-pci"]), no_pci);
@@ -3266,6 +3272,10 @@ mod tests {
             "Parameter 'x-pci-vendor-id' expects integer"
         );
         assert_eq!(err(q, &["vfio-pci,rombar=x"]), "Parameter 'rombar' expects integer");
+        assert_eq!(
+            err(q, &["vfio-pci,x-intx-mmap-timeout-ms=x"]),
+            "Parameter 'x-intx-mmap-timeout-ms' expects integer"
+        );
         assert_eq!(err(q, &["vfio-pci,ats=x"]), "Parameter 'ats' does not accept value 'x'");
         assert_eq!(err(q, &["vfio-pci,foo=1"]), "Property 'vfio-pci.foo' not found");
         assert_eq!(

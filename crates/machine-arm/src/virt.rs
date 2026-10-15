@@ -18,7 +18,9 @@
 //! 0x09050000 (SPIs 74 to 77) in front of the root bus: each PCIe function does its DMA and
 //! sends its MSIs through an address space of its own that the SMMU translates. A
 //! `-device arm-smmuv3,primary-bus=pcie.0` goes on the platform bus instead, at 0x0c000000
-//! (SPIs 112 to 115), and translates the functions plugged after it. A
+//! (SPIs 112 to 115), and translates the functions plugged after it. The SMMU also covers the
+//! functions behind the `pcie-root-port`s on the root bus, each with the stream ID of the bus
+//! number the firmware or the guest gave its bus. A
 //! second `-serial` adds the second PL011 at 0x09040000 (SPI 8). `virtualization=on` keeps EL2
 //! and `secure=on` keeps EL3 and adds the secure UART at 0x09040000 and the secure RAM at
 //! 0x0e000000. `gic-version=2` puts a GICv2 in place of the GICv3, its distributor at
@@ -35,6 +37,8 @@
 //! Unless `acpi=off`, `etc/acpi/tables`, `etc/table-loader`, an empty `etc/tpm/log` and
 //! `etc/acpi/rsdp` in fw_cfg carry the tables of hw/arm/virt-acpi-build.c (see
 //! [`ruvm_firmware::acpi::arm_virt`]): DSDT, FADT, MADT, PPTT, GTDT, MCFG, SPCR, DBG2 and IORT.
+//! As `virt_acpi_build_update()` does, they are built again on the first read after each
+//! reset, so the IORT maps the bus numbers the firmware gave the root ports.
 //! When firmware boots with ACPI, the ACPI GED at 0x09080000 (SPI 9) carries the power down
 //! and error events. Otherwise the PL061 GPIO at 0x09030000 (SPI 7) has the power key
 //! (`gpio-keys`) on pin 3. `secure=on` adds the secure PL061 at 0x090b0000, whose pins 0 and 1
@@ -44,12 +48,14 @@
 //!
 //! [`VirtMachine::new`] builds the board and loads the kernel. Plug virtio devices with
 //! [`VirtMachine::attach_virtio`] (virtio-mmio) or [`VirtMachine::attach_virtio_pci`] (a PCI
-//! function on the root bus), then call [`VirtMachine::machine_done`], which finishes and
-//! loads the device tree and resets the board. [`VirtMachine::create_vcpus`] then makes the
-//! vCPUs on a [`Jit`], wired to the GIC, and resets them. On a guest reset request
-//! ([`VirtMachine::take_request`]) the runner calls [`VirtMachine::system_reset`] and, on each
-//! vCPU's thread, [`VirtMachine::reset_cpu`]. The runner also runs the timers of
-//! [`VirtMachine::clock`]: the generic timers arm their deadlines there.
+//! function on the root bus), and root ports with [`VirtMachine::attach_pcie_root_port`] and
+//! functions behind them with [`VirtMachine::attach_virtio_pci_on`], then call
+//! [`VirtMachine::machine_done`], which finishes and loads the device tree and resets the
+//! board. [`VirtMachine::create_vcpus`] then makes the vCPUs on a [`Jit`], wired to the GIC,
+//! and resets them. On a guest reset request ([`VirtMachine::take_request`]) the runner calls
+//! [`VirtMachine::system_reset`] and, on each vCPU's thread, [`VirtMachine::reset_cpu`]. The
+//! runner also runs the timers of [`VirtMachine::clock`]: the generic timers arm their
+//! deadlines there.
 //!
 //! # Not modelled yet
 //!
@@ -133,8 +139,11 @@ use ruvm_hw_iommu::{
 };
 use ruvm_hw_misc::pl061::PL061_MMIO_SIZE;
 use ruvm_hw_misc::{GpioKey, Pl061, Pl061Props};
-use ruvm_hw_pci::regs::PCI_NUM_PINS;
-use ruvm_hw_pci::{GpexConfig, GpexHost, GpexWindow, MsiTrigger};
+use ruvm_hw_pci::regs::{PCI_NUM_PINS, PCI_SECONDARY_BUS, PCI_SUBORDINATE_BUS};
+use ruvm_hw_pci::{
+    GpexConfig, GpexHost, GpexWindow, MsiTrigger, PciBus, PciDevice, PcieChassisRegistry,
+    PcieRootPort, PcieRootPortConfig,
+};
 use ruvm_hw_timer::pl031::{PL031_MMIO_SIZE, Pl031};
 use ruvm_hw_tpm::TpmBackend;
 use ruvm_hw_tpm::ppi::{TPM_PPI_ADDR_SIZE, TpmPpi};
@@ -800,12 +809,11 @@ pub(crate) fn msi_store(
 /// The bus master address space of a PCI function, set once it is known.
 pub(crate) type LateSpace = Arc<OnceLock<Weak<AddressSpace>>>;
 
-/// What plugging a PCI function needs from the board: the PCIe host, and the SMMU in front of
-/// its root bus with the address spaces it gives the functions.
+/// What plugging a PCI function needs from the board: the SMMU in front of the root bus with
+/// the address spaces it gives the functions.
 pub(crate) struct PciPlug<'a> {
     pub(crate) mem: &'a Arc<MemorySystem>,
     pub(crate) memory_as: &'a Arc<AddressSpace>,
-    pub(crate) gpex: &'a GpexHost,
     /// The SMMU, unless there is none or the root bus bypasses it.
     pub(crate) smmu: Option<&'a Arc<SmmuV3>>,
     pub(crate) iommu_spaces: &'a Mutex<Vec<Arc<AddressSpace>>>,
@@ -815,12 +823,13 @@ pub(crate) struct PciPlug<'a> {
 }
 
 impl PciPlug<'_> {
-    /// Plug a virtio device into a new function on the root bus, at `devfn` or the first free
-    /// slot. As in `virtio_bus_device_plugged()`, only a device with `iommu_platform` on does
-    /// its DMA through the IOMMU; the others use system memory, and only their MSIs go through
-    /// the IOMMU.
+    /// Plug a virtio device into a new function on `bus`, at `devfn` or the first free slot.
+    /// As in `virtio_bus_device_plugged()`, only a device with `iommu_platform` on does its
+    /// DMA through the IOMMU; the others use system memory, and only their MSIs go through the
+    /// IOMMU.
     pub(crate) fn virtio_pci(
         &self,
+        bus: &Arc<PciBus>,
         class: Box<dyn VirtioDeviceClass>,
         devfn: Option<u8>,
         props: &VirtioPciProps,
@@ -837,25 +846,38 @@ impl PciPlug<'_> {
         if iommu_platform {
             backend.vdev_mut().set_host_feature(VIRTIO_F_IOMMU_PLATFORM, true);
         }
-        self.plug(backend, devfn, props, late)
+        self.plug(bus, backend, devfn, props, late)
     }
 
-    /// Plug `backend` into a new function, whose bus master address space goes into `late`.
+    /// Plug `backend` into a new function on `bus`, whose bus master address space goes into
+    /// `late`.
     pub(crate) fn plug(
         &self,
+        bus: &Arc<PciBus>,
         backend: VirtioBackend,
         devfn: Option<u8>,
         props: &VirtioPciProps,
         late: LateSpace,
     ) -> Result<VirtioPci, String> {
-        let dev = VirtioPci::new(self.gpex.bus(), devfn, backend, props).map_err(err)?;
-        let devfn = dev.pci_dev().devfn();
+        let dev = VirtioPci::new(bus, devfn, backend, props).map_err(err)?;
+        self.bus_master(dev.pci_dev(), late)?;
+        Ok(dev)
+    }
+
+    /// `pci_init_bus_master()` for `dev`: its bus master address space, which goes into
+    /// `late`, and its MSIs.
+    pub(crate) fn bus_master(&self, dev: &Arc<PciDevice>, late: LateSpace) -> Result<(), String> {
+        let devfn = dev.devfn();
         if let Some(smmu) = self.smmu {
             // smmu_find_add_as(): an IOMMU region and an address space of the same name for
-            // the function, whose stream ID is its requester ID on bus 0.
+            // the function. smmu_get_sid() makes its stream ID from the number its bus has
+            // at each translation, so it follows the bus numbers the guest gives the bridges.
             let mut spaces = self.iommu_spaces.lock().unwrap_or_else(PoisonError::into_inner);
             let name = format!("smmuv3-iommu-memory-region-{devfn}-{}", spaces.len());
-            let ops = smmu.device_ops(u32::from(devfn));
+            let weak = Arc::downgrade(dev);
+            let ops = smmu.device_ops_with(move || {
+                weak.upgrade().map_or(u32::from(devfn), |d| u32::from(d.requester_id()))
+            });
             let r = self.mem.new_iommu(&name, 1 << 64, ops).map_err(err)?;
             let space = self.mem.address_space_init(r, &name).map_err(err)?;
             let _ = late.set(Arc::downgrade(&space));
@@ -866,9 +888,9 @@ impl PciPlug<'_> {
         }
         // msi_send_message() stores with the function's requester ID, which is the device ID
         // the ITS translates, into the function's address space.
-        let pci_dev = Arc::downgrade(dev.pci_dev());
+        let pci_dev = Arc::downgrade(dev);
         let system = Arc::downgrade(self.memory_as);
-        dev.pci_dev().set_msi_trigger(Some(Arc::new(move |address, data| {
+        dev.set_msi_trigger(Some(Arc::new(move |address, data| {
             let Some(d) = pci_dev.upgrade() else { return };
             let Some(a) = late.get().map_or_else(|| system.upgrade(), Weak::upgrade) else {
                 return;
@@ -876,8 +898,98 @@ impl PciPlug<'_> {
             let attrs = MemTxAttrs::new().with_requester_id(d.requester_id());
             let _ = a.store(address, 4, data.into(), Endian::Little, attrs);
         })));
-        Ok(dev)
+        Ok(())
     }
+}
+
+/// `pci_bus_range()`: the bus numbers of `bus` and of the buses behind its bridges, as the
+/// firmware or the guest set them.
+fn pci_bus_range(bus: &PciBus) -> (u8, u8) {
+    let num = bus.bus_num();
+    bus.devices().iter().filter(|d| d.is_bridge()).fold((num, num), |(min, max), d| {
+        d.with_config(|c| {
+            (min.min(c.config[PCI_SECONDARY_BUS]), max.max(c.config[PCI_SUBORDINATE_BUS]))
+        })
+    })
+}
+
+/// `iort_host_bridges()`: the requester IDs of the root bus and the buses below it, as the
+/// input base and the number of IDs of an IORT ID mapping.
+fn iort_rc_id_map(bus: &PciBus) -> (u32, u32) {
+    let (min, max) = pci_bus_range(bus);
+    let (min, max) = (u32::from(min), u32::from(max));
+    (min << 8, (max - min + 1) << 8)
+}
+
+/// `AcpiBuildState`: what the tables are built from, whether they were rebuilt since the last
+/// reset, and the blobs.
+struct AcpiState {
+    input: ArmVirtAcpi,
+    /// The root bus, whose bus numbers go into the IORT.
+    bus: Weak<PciBus>,
+    patched: bool,
+    table: Vec<u8>,
+    loader: Vec<u8>,
+    rsdp: Vec<u8>,
+}
+
+/// The `AcpiBuildState` of a board with ACPI tables, which the `virt_acpi_build` section
+/// carries.
+#[derive(Clone)]
+pub struct AcpiBuild(Arc<Mutex<AcpiState>>);
+
+impl AcpiBuild {
+    /// `patched`: whether the tables were rebuilt since the last reset.
+    pub fn patched(&self) -> bool {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).patched
+    }
+
+    /// Sets `patched`, as loading `virt_acpi_build` does.
+    pub fn set_patched(&self, patched: bool) {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).patched = patched;
+    }
+}
+
+impl fmt::Debug for AcpiBuild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcpiBuild").field("patched", &self.patched()).finish()
+    }
+}
+
+/// Which blob a select callback copies.
+#[derive(Copy, Clone)]
+enum AcpiBlob {
+    Table,
+    Loader,
+    Rsdp,
+}
+
+/// `virt_acpi_build_update()` for one of the three files: rebuilds all three once after each
+/// reset, with the bus numbers the firmware has given the bridges by then, and copies the one
+/// that was selected.
+fn acpi_build_update(state: &Mutex<AcpiState>, which: AcpiBlob, buf: &mut [u8]) {
+    let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
+    if !st.patched {
+        st.patched = true;
+        let mut input = st.input.clone();
+        if let Some(bus) = st.bus.upgrade() {
+            for s in input.smmus.iter_mut().filter(|s| !s.rc_id_maps.is_empty()) {
+                s.rc_id_maps = vec![iort_rc_id_map(&bus)];
+            }
+        }
+        let t = arm_virt::build(&input);
+        st.table = t.table_data;
+        st.loader = t.linker.cmd_blob().to_vec();
+        st.rsdp = t.rsdp;
+    }
+    let data = match which {
+        AcpiBlob::Table => &st.table,
+        AcpiBlob::Loader => &st.loader,
+        AcpiBlob::Rsdp => &st.rsdp,
+    };
+    // acpi_ram_update() resizes the blob, but the bus numbers do not change its size.
+    let n = buf.len().min(data.len());
+    buf[..n].copy_from_slice(&data[..n]);
 }
 
 /// The RAM ranges the system address space renders to, for the ROM copies and semihosting.
@@ -1006,6 +1118,12 @@ pub struct VirtMachine {
     /// The functions whose bus master address space is picked at machine done.
     pci_pending: Mutex<Vec<(u8, LateSpace)>>,
     pci_devices: Mutex<Vec<VirtioPci>>,
+    /// The `-device pcie-root-port`s on the root bus.
+    root_ports: Mutex<Vec<PcieRootPort>>,
+    /// The chassis and slot numbers the root ports took.
+    chassis: Arc<PcieChassisRegistry>,
+    /// The ACPI tables as the firmware reads them, set at machine done.
+    acpi_state: OnceLock<Arc<Mutex<AcpiState>>>,
     virtio: Vec<Arc<VirtioSlot>>,
     virtio_force_legacy: bool,
     fw_cfg: FwCfgMem,
@@ -1552,6 +1670,9 @@ impl VirtMachine {
             viommu: OnceLock::new(),
             pci_pending: Mutex::new(Vec::new()),
             pci_devices: Mutex::new(Vec::new()),
+            root_ports: Mutex::new(Vec::new()),
+            chassis: Arc::new(PcieChassisRegistry::new()),
+            acpi_state: OnceLock::new(),
             virtio,
             virtio_force_legacy: cfg.virtio_force_legacy,
             fw_cfg,
@@ -1570,11 +1691,20 @@ impl VirtMachine {
     /// does: the guest probes the transports from the top, so the first device plugged is
     /// found first. Returns the transport index.
     pub fn attach_virtio(&self, class: Box<dyn VirtioDeviceClass>) -> Result<usize, String> {
+        self.attach_virtio_with(class, false)
+    }
+
+    /// [`VirtMachine::attach_virtio`] with the `iommu_platform` property of the virtio device.
+    pub fn attach_virtio_with(
+        &self,
+        class: Box<dyn VirtioDeviceClass>,
+        iommu_platform: bool,
+    ) -> Result<usize, String> {
         let Some(index) = (0..self.virtio.len()).rev().find(|&i| !self.virtio[i].is_plugged())
         else {
             return Err("No 'virtio-bus' bus found for device".to_string());
         };
-        self.attach_virtio_at(index, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT)?;
+        self.attach_virtio_at_with(index, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT, iommu_platform)?;
         Ok(index)
     }
 
@@ -1585,6 +1715,21 @@ impl VirtMachine {
         index: usize,
         class: Box<dyn VirtioDeviceClass>,
         force_legacy: bool,
+    ) -> Result<(), String> {
+        self.attach_virtio_at_with(index, class, force_legacy, false)
+    }
+
+    /// [`VirtMachine::attach_virtio_at`] with the `iommu_platform` property of the virtio
+    /// device. A virtio-mmio transport has no IOMMU in front of it, so as in
+    /// `virtio_bus_device_plugged()` without `get_dma_as` the device offers
+    /// `VIRTIO_F_IOMMU_PLATFORM` and does its DMA in system memory. A legacy transport only
+    /// shows the low 32 feature bits, so the guest does not see it there.
+    pub fn attach_virtio_at_with(
+        &self,
+        index: usize,
+        class: Box<dyn VirtioDeviceClass>,
+        force_legacy: bool,
+        iommu_platform: bool,
     ) -> Result<(), String> {
         let force_legacy = force_legacy && self.virtio_force_legacy;
         if self.done {
@@ -1598,7 +1743,10 @@ impl VirtMachine {
         }
         let memory: Arc<dyn GuestMemory + Send + Sync> =
             Arc::new(WeakGuestMemory(Arc::downgrade(&self.memory_as)));
-        let backend = VirtioBackend::new(class, memory).map_err(err)?;
+        let mut backend = VirtioBackend::new(class, memory).map_err(err)?;
+        if iommu_platform {
+            backend.vdev_mut().set_host_feature(VIRTIO_F_IOMMU_PLATFORM, true);
+        }
         let t = VirtioMmio::new(Some(backend), force_legacy).map_err(err)?;
         t.irq().connect(slot.gsi.clone());
         *slot.transport.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(t);
@@ -1608,6 +1756,7 @@ impl VirtMachine {
 
     /// Plug a virtio device into a new function on the PCIe root bus, as
     /// `-device virtio-*-pci` does, at `devfn` or the first free slot. Gives the function.
+    /// [`VirtMachine::attach_virtio_pci_on`] plugs it behind a root port instead.
     pub fn attach_virtio_pci(
         &self,
         class: Box<dyn VirtioDeviceClass>,
@@ -1627,19 +1776,80 @@ impl VirtMachine {
         props: &VirtioPciProps,
         iommu_platform: bool,
     ) -> Result<VirtioPci, String> {
+        self.attach_virtio_pci_on(None, class, devfn, props, iommu_platform)
+    }
+
+    /// [`VirtMachine::attach_virtio_pci_with`] on the bus named `bus`, the root bus `pcie.0`
+    /// when it is `None` or the secondary bus of a root port, which has the port's id as its
+    /// name. As `pcie_cap_slot_plug_cb()` does for a cold plugged function, the port then
+    /// shows its slot as occupied.
+    pub fn attach_virtio_pci_on(
+        &self,
+        bus: Option<&str>,
+        class: Box<dyn VirtioDeviceClass>,
+        devfn: Option<u8>,
+        props: &VirtioPciProps,
+        iommu_platform: bool,
+    ) -> Result<VirtioPci, String> {
         if self.done {
             return Err("PCI devices must be plugged before machine_done".to_string());
         }
-        let dev = self.pci_plug().virtio_pci(class, devfn, props, iommu_platform)?;
+        let ports = self.root_ports.lock().unwrap_or_else(PoisonError::into_inner);
+        let port = match bus {
+            None => None,
+            Some(name) if name == self.gpex.bus().name() => None,
+            Some(name) => match ports.iter().find(|p| p.sec_bus().name() == name) {
+                Some(p) => Some(p),
+                None => return Err(format!("Bus '{name}' not found")),
+            },
+        };
+        let dev = match port {
+            None => {
+                self.pci_plug().virtio_pci(self.gpex.bus(), class, devfn, props, iommu_platform)?
+            }
+            Some(p) => {
+                p.pre_plug(false).map_err(err)?;
+                let dev =
+                    self.pci_plug().virtio_pci(p.sec_bus(), class, devfn, props, iommu_platform)?;
+                p.plug(dev.pci_dev(), false);
+                dev
+            }
+        };
         self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).push(dev.clone());
         Ok(dev)
+    }
+
+    /// Plug a `-device pcie-root-port` into the root bus at `devfn` or the first free slot,
+    /// `rp_realize()`. Its secondary bus is named after its id. Like the other functions, its
+    /// MSIs go through the SMMU when there is one.
+    pub fn attach_pcie_root_port(
+        &self,
+        cfg: &PcieRootPortConfig,
+        devfn: Option<u8>,
+    ) -> Result<(), String> {
+        if self.done {
+            return Err("PCI devices must be plugged before machine_done".to_string());
+        }
+        if self.viommu.get().is_some() {
+            return Err("pcie-root-port with virtio-iommu is not supported by ruvm yet".to_string());
+        }
+        let cfg =
+            PcieRootPortConfig { chassis_registry: Some(Arc::clone(&self.chassis)), ..cfg.clone() };
+        let port = PcieRootPort::new(self.gpex.bus(), &cfg, devfn).map_err(err)?;
+        self.pci_plug().bus_master(port.device(), Arc::new(OnceLock::new()))?;
+        self.root_ports.lock().unwrap_or_else(PoisonError::into_inner).push(port);
+        Ok(())
+    }
+
+    /// The root ports plugged with [`VirtMachine::attach_pcie_root_port`].
+    pub fn with_root_ports<R>(&self, f: impl FnOnce(&[PcieRootPort]) -> R) -> R {
+        f(&self.root_ports.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     fn pci_plug(&self) -> PciPlug<'_> {
         PciPlug {
             mem: &self.mem,
             memory_as: &self.memory_as,
-            gpex: &self.gpex,
             smmu: self.smmu.as_ref().filter(|_| !self.iommu_bypass).or(self.dev_smmu.get()),
             iommu_spaces: &self.iommu_spaces,
             pending: (self.smmu.is_none() && self.dev_smmu.get().is_none())
@@ -1663,6 +1873,9 @@ impl VirtMachine {
         if self.smmu.is_some() || self.dev_smmu.get().is_some() || self.viommu.get().is_some() {
             return Err("virt machine does not support multiple IOMMUs".to_string());
         }
+        if !self.root_ports.lock().unwrap_or_else(PoisonError::into_inner).is_empty() {
+            return Err("virtio-iommu with pcie-root-port is not supported by ruvm yet".to_string());
+        }
         let doorbell = if self.its.is_some() {
             // The GITS_TRANSLATER page.
             Some((VIRT_GIC_ITS + ITS_CONTROL_SIZE, VIRT_GIC_ITS + ITS_SIZE - 1))
@@ -1684,7 +1897,8 @@ impl VirtMachine {
         let backend = VirtioBackend::new(class, mem).map_err(err)?;
         // virtio_pci_force_virtio_1()
         let props = VirtioPciProps { disable_legacy: Some(true), id, ..VirtioPciProps::default() };
-        let dev = self.pci_plug().plug(backend, devfn, &props, Arc::new(OnceLock::new()))?;
+        let late = Arc::new(OnceLock::new());
+        let dev = self.pci_plug().plug(self.gpex.bus(), backend, devfn, &props, late)?;
 
         let bus = Arc::downgrade(self.gpex.bus());
         viommu.set_endpoint_check(move |sid| {
@@ -1813,18 +2027,42 @@ impl VirtMachine {
 
     /// `virt_acpi_build()`: the ACPI tables of the board as it is now.
     pub fn acpi_tables(&self) -> BuildTables {
+        arm_virt::build(&self.acpi_input())
+    }
+
+    /// What `virt_acpi_build()` builds the tables from.
+    fn acpi_input(&self) -> ArmVirtAcpi {
         let w = |base, size| Window { base, size };
         let e = |m: MemMapEntry| w(m.base, m.size);
         let spi = |irq| irq + ARM_SPI_BASE;
         let topo = &self.topology;
+        // build_append_pci_bus_devices(): a root port nests the functions behind it, which
+        // were all cold plugged.
+        let ports = self.root_ports.lock().unwrap_or_else(PoisonError::into_inner);
+        let plain = |d: &Arc<PciDevice>| AcpiPciDevice {
+            devfn: d.devfn(),
+            acpi_index: None,
+            aml: PciDeviceAml::Plain,
+        };
         let pci_devices = self
             .gpex
             .bus()
             .devices()
             .iter()
-            .map(|d| AcpiPciDevice { devfn: d.devfn(), acpi_index: None, aml: PciDeviceAml::Plain })
+            .map(|d| match ports.iter().find(|p| Arc::ptr_eq(p.device(), d)) {
+                Some(p) => AcpiPciDevice {
+                    devfn: d.devfn(),
+                    acpi_index: None,
+                    aml: PciDeviceAml::Bridge {
+                        devices: p.sec_bus().devices().iter().map(plain).collect(),
+                    },
+                },
+                None => plain(d),
+            })
             .collect();
-        let acpi = ArmVirtAcpi {
+        drop(ports);
+        let rc_id_map = iort_rc_id_map(self.gpex.bus());
+        ArmVirtAcpi {
             oem_id: self.oem_id.clone(),
             oem_table_id: self.oem_table_id.clone(),
             memmap: AcpiMemmap {
@@ -1898,21 +2136,22 @@ impl VirtMachine {
                     })
                 })
                 .collect(),
-            // populate_smmuv3_legacy_dev(): the bus range of the root bus, which has no bridges
-            // under it, goes through the SMMU unless the bus bypasses it. populate_smmuv3_dev()
-            // gives the same range for the device, whose identifier counts the ITS node.
+            // populate_smmuv3_legacy_dev(): the bus range of the root bus and the buses behind
+            // its root ports goes through the SMMU unless the bus bypasses it.
+            // populate_smmuv3_dev() gives the same range for the device, whose identifier
+            // counts the ITS node.
             smmus: match (&self.smmu, self.dev_smmu.get()) {
                 (Some(_), _) => vec![IortSmmu {
                     id: 0,
                     base: VIRT_SMMU,
                     gsi: spi(VIRT_SMMU_IRQ),
-                    rc_id_maps: if self.iommu_bypass { Vec::new() } else { vec![(0, 0x100)] },
+                    rc_id_maps: if self.iommu_bypass { Vec::new() } else { vec![rc_id_map] },
                 }],
                 (None, Some(_)) => vec![IortSmmu {
                     id: u32::from(self.its.is_some()),
                     base: VIRT_PLATFORM_BUS,
                     gsi: spi(VIRT_PLATFORM_BUS_IRQ),
-                    rc_id_maps: vec![(0, 0x100)],
+                    rc_id_maps: vec![rc_id_map],
                 }],
                 (None, None) => Vec::new(),
             },
@@ -1929,8 +2168,7 @@ impl VirtMachine {
                 base: VIRT_PLATFORM_BUS + t.base,
                 ppi_base: t.ppi_base.map(|b| VIRT_PLATFORM_BUS + b),
             }),
-        };
-        arm_virt::build(&acpi)
+        }
     }
 
     /// The ACPI GED, there when firmware boots with ACPI.
@@ -2016,16 +2254,33 @@ impl VirtMachine {
         )? {
             self.fdt = fdt;
         }
-        // virt_acpi_setup(). The tables never change, so unlike QEMU they are not rebuilt
-        // when the firmware first reads them.
+        // virt_acpi_setup(). The tables, the loader and the RSDP are rebuilt when the firmware
+        // first reads one of them after a reset, by when it has numbered the buses behind the
+        // root ports for the IORT.
         if self.acpi {
-            let tables = self.acpi_tables();
+            let input = self.acpi_input();
+            let tables = arm_virt::build(&input);
+            let loader = tables.linker.cmd_blob().to_vec();
+            let state = Arc::new(Mutex::new(AcpiState {
+                input,
+                bus: Arc::downgrade(self.gpex.bus()),
+                patched: false,
+                table: tables.table_data.clone(),
+                loader: loader.clone(),
+                rsdp: tables.rsdp.clone(),
+            }));
             let fwc = self.fw_cfg.state();
-            fwc.add_file(TABLE_FILE, tables.table_data).map_err(err)?;
-            fwc.add_file(LOADER_FILE, tables.linker.cmd_blob().to_vec()).map_err(err)?;
+            let add = |name: &str, which: AcpiBlob, data: Vec<u8>| {
+                let st = Arc::clone(&state);
+                let cb = Box::new(move |buf: &mut [u8]| acpi_build_update(&st, which, buf));
+                fwc.add_file_callback(name, Some(cb), None, data, true).map_err(err)
+            };
+            add(TABLE_FILE, AcpiBlob::Table, tables.table_data)?;
+            add(LOADER_FILE, AcpiBlob::Loader, loader)?;
             // The TPM log, empty without a TPM.
             fwc.add_file(TPMLOG_FILE, tables.tcpalog).map_err(err)?;
-            fwc.add_file(RSDP_FILE, tables.rsdp).map_err(err)?;
+            add(RSDP_FILE, AcpiBlob::Rsdp, tables.rsdp)?;
+            let _ = self.acpi_state.set(state);
         }
         self.ram = ram_ranges(&self.mem, self.system)?;
         // common_semi_find_bases(): the largest gap in the largest RAM region.
@@ -2087,6 +2342,10 @@ impl VirtMachine {
         let fwc = self.fw_cfg.state();
         fwc.reset();
         fwc.machine_reset(Vec::new(), Vec::new()).map_err(err)?;
+        // virt_acpi_build_reset()
+        if let Some(st) = self.acpi_state.get() {
+            st.lock().unwrap_or_else(PoisonError::into_inner).patched = false;
+        }
         boot::rom_reset(&self.loader.roms, &self.ram);
         Ok(())
     }
@@ -2212,6 +2471,11 @@ impl VirtMachine {
     /// Whether the board builds ACPI tables for the firmware.
     pub fn acpi(&self) -> bool {
         self.acpi
+    }
+
+    /// The state of the ACPI tables, from machine_done on, unless `acpi=off`.
+    pub fn acpi_build(&self) -> Option<AcpiBuild> {
+        self.acpi_state.get().map(|s| AcpiBuild(Arc::clone(s)))
     }
 
     /// Connect the chardev of the second UART.

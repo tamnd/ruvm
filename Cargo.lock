@@ -1789,6 +1789,7 @@ dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
  "ruvm-mem",
+ "ruvm-vmstate",
 ]
 
 [[package]]
@@ -1825,6 +1826,7 @@ dependencies = [
  "ruvm-mem",
  "ruvm-qapi",
  "ruvm-qom",
+ "ruvm-vmstate",
 ]
 
 [[package]]
@@ -1907,6 +1909,7 @@ dependencies = [
  "ruvm-base",
  "ruvm-hw-core",
  "ruvm-mem",
+ "ruvm-vmstate",
 ]
 
 [[package]]

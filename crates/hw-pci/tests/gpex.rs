@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Tests of the generic PCIe host: the root function through ECAM, the windows that read as
-//! all ones where nothing is mapped, BARs in the MMIO window and the INTx swizzle, with the
-//! host mapped the way hw/riscv/virt.c maps it.
+//! all ones where nothing is mapped, BARs in the MMIO window, the INTx swizzle and migration,
+//! with the host mapped the way hw/riscv/virt.c maps it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use ruvm_hw_core::IrqLine;
 use ruvm_hw_pci::regs::*;
+use ruvm_hw_pci::vmstate::{VMSTATE_GPEX_ROOT, VMSTATE_PCIBUS, VMSTATE_PCIHOST};
 use ruvm_hw_pci::*;
 use ruvm_mem::{AddressSpace, Endian, MemTxAttrs, MemorySystem};
+use ruvm_vmstate::{
+    StreamReader, StreamWriter, VmStateDescription, vmstate_load_state, vmstate_save_state,
+};
 
 const ATTRS: MemTxAttrs = MemTxAttrs::UNSPECIFIED;
 const ECAM: u64 = 0x3000_0000;
@@ -117,4 +121,45 @@ fn bar_and_intx_swizzle() {
     // Slot 2, INTC wraps around to line 0.
     dev.irq_handler(2, 1);
     assert_eq!(v.levels(), [1, 0, 0, 0]);
+}
+
+/// `s` sent in the section `vmsd` and read back into `back`.
+fn round_trip<T>(vmsd: &VmStateDescription<T>, mut s: T, mut back: T) -> T {
+    let mut f = StreamWriter::new();
+    vmstate_save_state(&mut f, vmsd, &mut s).unwrap();
+    let mut b = f.into_inner();
+    // The section footer, which a nested description peeks at for subsections.
+    b.push(0x7e);
+    vmstate_load_state(&mut StreamReader::new(&b), vmsd, &mut back, vmsd.version_id).unwrap();
+    back
+}
+
+#[test]
+fn migration_moves_the_root_function_and_the_bus() {
+    let src = Virt::new();
+    let info = PciDeviceInfo { name: "test".to_string(), class_id: 0x00ff, ..Default::default() };
+    let dev = src.gpex.bus().register_device(&info, Some(pci_devfn(2, 0))).unwrap();
+    src.write(Virt::ecam(0, 0, PCI_COMMAND as u32), u32::from(PCI_COMMAND_MEMORY));
+    // Slot 2, INTA swizzles to line 2.
+    dev.irq_handler(0, 1);
+    assert_eq!(src.levels(), [0, 0, 1, 0]);
+
+    let dst = Virt::new();
+    let root = src.gpex.root().vmstate_save();
+    let root = round_trip(&VMSTATE_GPEX_ROOT, root, dst.gpex.root().vmstate_save());
+    assert_eq!(root.config.len(), 256);
+    dst.gpex.root().vmstate_load(&root).unwrap();
+    assert_eq!(dst.read(Virt::ecam(0, 0, PCI_COMMAND as u32)), u32::from(PCI_COMMAND_MEMORY));
+
+    let host = src.gpex.host_state().vmstate_save();
+    let host = round_trip(&VMSTATE_PCIHOST, host, PciHostVmState::default());
+    assert_eq!(host.config_reg, 0);
+    dst.gpex.host_state().vmstate_load(&host);
+
+    let bus = src.gpex.bus().vmstate_save();
+    assert_eq!((bus.nirq, &bus.irq_count[..]), (4, &[0, 0, 1, 0][..]));
+    let empty = dst.gpex.bus().vmstate_save();
+    let back = round_trip(&VMSTATE_PCIBUS, bus.clone(), empty);
+    dst.gpex.bus().vmstate_load(&back).unwrap();
+    assert_eq!(dst.gpex.bus().vmstate_save(), bus);
 }

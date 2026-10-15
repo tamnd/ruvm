@@ -12,8 +12,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::access::MmioOps;
+use crate::access::{AccessConstraints, AccessSize, Endian, MmioOps};
 use crate::address_space::AddressSpace;
+use crate::attrs::{AccessCtx, MemResult, MemTxResult};
 use crate::dirty::{DirtyClient, DirtySnapshot};
 use crate::error::MemError;
 use crate::flatview::{FlatView, RenderFlags, SPACE_END, dirty_log_mask, render};
@@ -21,6 +22,7 @@ use crate::iommu::IommuOps;
 use crate::listener::{ListenerId, MemoryListener};
 use crate::ram::RamBlock;
 use crate::region::{Arena, Node, RegionId, RegionInfo, RegionTarget, RegionType, TargetKind};
+use ruvm_sys::{HostMemory, hostatomic};
 
 /// `GLOBAL_DIRTY_MIGRATION`: global dirty tracking for live migration.
 pub const GLOBAL_DIRTY_MIGRATION: u32 = 1 << 0;
@@ -301,6 +303,21 @@ impl MemorySystem {
             u128::from(size),
             RegionType::RomDevice,
             TargetKind::RomDevice(block, ops),
+        )
+    }
+
+    /// Host memory of a device, `memory_region_init_ram_device_ptr()`. The region takes `mem`,
+    /// which is usually a mapped BAR, and unmaps it when the region goes. CPU accesses go
+    /// through [`RamDeviceOps`] so the device sees each one at its width.
+    pub fn new_ram_device_ptr(&self, name: &str, mem: HostMemory) -> Result<RegionId, MemError> {
+        let size = mem.len() as u64;
+        let block = Self::track(RamBlock::from_memory(name, mem, self.config.page_bits));
+        let ops: Arc<dyn MmioOps> = Arc::new(RamDeviceOps(Arc::clone(&block)));
+        self.create(
+            name,
+            u128::from(size),
+            RegionType::RamDevice,
+            TargetKind::RamDevice(block, ops),
         )
     }
 
@@ -951,5 +968,58 @@ fn topology_pass(
             }
             _ => break,
         }
+    }
+}
+
+/// `ram_device_mem_ops`: each access is one host load or store of its width, in host byte
+/// order, so a device register sees the size the guest used. Unaligned accesses are allowed
+/// and copied a byte at a time, as `ldl_he_p()` would.
+pub(crate) struct RamDeviceOps(Arc<RamBlock>);
+
+impl RamDeviceOps {
+    fn bytes(&self, offset: u64, size: AccessSize) -> MemResult<&[std::sync::atomic::AtomicU8]> {
+        let start = usize::try_from(offset).map_err(|_| MemTxResult::ERROR)?;
+        let end = start.checked_add(size.bytes() as usize).ok_or(MemTxResult::ERROR)?;
+        self.0.atomic_bytes().get(start..end).ok_or(MemTxResult::ERROR)
+    }
+}
+
+impl MmioOps for RamDeviceOps {
+    fn read(&self, _cx: &AccessCtx, offset: u64, size: AccessSize) -> MemResult<u64> {
+        let mem = self.bytes(offset, size)?;
+        if let Some(v) = hostatomic::load(mem) {
+            return Ok(v);
+        }
+        let mut b = [0u8; 8];
+        let n = mem.len();
+        self.0.read(offset, &mut b[..n]).map_err(|_| MemTxResult::ERROR)?;
+        Ok(if cfg!(target_endian = "big") {
+            u64::from_be_bytes(b) >> (64 - 8 * n)
+        } else {
+            u64::from_le_bytes(b)
+        })
+    }
+
+    fn write(&self, _cx: &AccessCtx, offset: u64, size: AccessSize, value: u64) -> MemResult<()> {
+        let mem = self.bytes(offset, size)?;
+        if hostatomic::store(mem, value) {
+            return Ok(());
+        }
+        let n = mem.len();
+        let b = value.to_ne_bytes();
+        let b = if cfg!(target_endian = "big") { &b[8 - n..] } else { &b[..n] };
+        self.0.write(offset, b).map_err(|_| MemTxResult::ERROR)
+    }
+
+    fn valid(&self) -> AccessConstraints {
+        AccessConstraints::any_size(1, 8).allow_unaligned()
+    }
+
+    fn impl_constraints(&self) -> AccessConstraints {
+        AccessConstraints::any_size(1, 8).allow_unaligned()
+    }
+
+    fn endianness(&self) -> Endian {
+        Endian::HOST
     }
 }

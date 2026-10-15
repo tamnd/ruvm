@@ -732,12 +732,11 @@ impl SbsaRefMachine {
         let plug = PciPlug {
             mem: &self.mem,
             memory_as: &self.memory_as,
-            gpex: &self.gpex,
             smmu: Some(&self.smmu),
             iommu_spaces: &self.iommu_spaces,
             pending: None,
         };
-        let dev = plug.virtio_pci(class, devfn, props, iommu_platform)?;
+        let dev = plug.virtio_pci(self.gpex.bus(), class, devfn, props, iommu_platform)?;
         self.pci_devices.lock().unwrap_or_else(PoisonError::into_inner).push(dev.clone());
         Ok(dev)
     }

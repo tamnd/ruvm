@@ -4,24 +4,34 @@
 //!
 //! [`virt_savevm`] registers the sections of `virt` the way QEMU 11.1 lays them out. So far
 //! these are the `timer` section, RAM, the flashes, the vCPUs, the GIC, the UARTs, the RTC,
-//! the GPIO controllers and the power key, and `globalstate`. The PCI host, the ACPI GED,
-//! `fw_cfg` and the ACPI tables only keep their section ids for now.
+//! the PCI host, the GPIO controllers and the power key, the ACPI GED, `fw_cfg`, the state of
+//! the ACPI tables and `globalstate`. Devices plugged into the PCI bus are not sent yet.
+//! Neither are the ACPI tables themselves, which QEMU sends as the three `/rom@etc` RAM blocks.
 //!
 //! The device sections carry the state field by field, as QEMU 11.1's `VMStateDescription`
 //! for it does: the CFI01 flash (hw/block/pflash_cfi01.c), the PL011 UART (hw/char/pl011.c
 //! and hw/core/clock-vmstate.c), the PL031 RTC (hw/rtc/pl031.c), the PL061 GPIO controller
 //! (hw/gpio/pl061.c) and the GPIO power key (hw/gpio/gpio_key.c). The registers add no path
-//! prefix, as these are sysbus devices.
+//! prefix, as these are sysbus devices. The PCI host's sections are those of
+//! [`ruvm_hw_pci::vmstate`], the GED's is [`ruvm_hw_acpi::vmstate`]'s and `fw_cfg` is
+//! [`ruvm_hw_core::vmstate`]'s.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, Weak};
 
 use ruvm_accel::tcg::TcgVcpus;
 use ruvm_base::{Error, error_report};
+use ruvm_hw_acpi::AcpiGed;
+use ruvm_hw_acpi::ich9::MemHotplugVmState;
+use ruvm_hw_acpi::vmstate::{AcpiGedVmState, VMSTATE_ACPI_GED};
 use ruvm_hw_char::pl011::{PL011_FIFO_DEPTH, Pl011, Pl011VmState};
+use ruvm_hw_core::fw_cfg::FwCfgState;
 use ruvm_hw_core::timer::Clock;
+use ruvm_hw_core::vmstate::VMSTATE_FW_CFG;
 use ruvm_hw_misc::gpio_key::GpioKey;
 use ruvm_hw_misc::pl061::{Pl061, Pl061VmState};
+use ruvm_hw_pci::GpexHost;
+use ruvm_hw_pci::vmstate::{VMSTATE_GPEX_ROOT, VMSTATE_PCIBUS, VMSTATE_PCIHOST};
 use ruvm_hw_timer::pl031::{Pl031, Pl031VmState};
 use ruvm_jit::cputlb::tlb_flush;
 use ruvm_mem::{GLOBAL_DIRTY_MIGRATION, MemorySystem};
@@ -34,7 +44,7 @@ use ruvm_vmstate::{VmStateDescription, VmStateField};
 
 use crate::pflash::{Pflash, PflashVmState};
 use crate::tcg_run::VirtTcgMachine;
-use crate::virt::{VirtGic, VirtMachine};
+use crate::virt::{AcpiBuild, VirtGic, VirtMachine};
 
 mod cpu;
 mod gic;
@@ -115,28 +125,23 @@ fn register_devices(savevm: &mut SaveVm, board: &VirtMachine) {
         register_pl011(savevm, instance, uart);
     }
     register_pl031(savevm, board.rtc(), board.clock());
-    // "0000:00:00.0/gpex_root", "PCIHost" and "PCIBUS", which ruvm does not send yet.
-    savevm.reserve_section_id();
-    savevm.reserve_section_id();
-    savevm.reserve_section_id();
+    register_gpex(savevm, board.gpex());
     let mut pl061 = 0;
     if let (Some(gpio), Some(key)) = (board.gpio(), board.gpio_key()) {
         register_pl061(savevm, 0, gpio);
         register_gpio_key(savevm, key);
         pl061 = 1;
     }
-    if board.ged().is_some() {
-        // "acpi-ged", which ruvm does not send yet.
-        savevm.reserve_section_id();
+    if let Some(ged) = board.ged() {
+        register_ged(savevm, ged);
     }
     if let Some(gpio) = board.secure_gpio() {
         register_pl061(savevm, pl061, gpio);
     }
-    // "fw_cfg", and "virt_acpi_build" when the board has ACPI tables. ruvm does not send
-    // them yet.
-    savevm.reserve_section_id();
-    if board.acpi() {
-        savevm.reserve_section_id();
+    register_fw_cfg(savevm, board.fw_cfg().state());
+    // virt_acpi_setup() registers it at machine_done, unless `acpi=off`.
+    if let Some(acpi) = board.acpi_build() {
+        register_acpi_build(savevm, acpi);
     }
 }
 
@@ -323,6 +328,42 @@ pub fn register_pflash(savevm: &mut SaveVm, instance: u32, flash: &Arc<Pflash>) 
     );
 }
 
+/// Registers the sections of the PCI host in the order QEMU 11.1 realizes them: the root
+/// function as `0000:00:00.0/gpex_root`, then `PCIHost` and the root bus's `PCIBUS`, all
+/// instance 0. The last two have no path prefix, as QEMU registers them with a NULL device.
+pub fn register_gpex(savevm: &mut SaveVm, gpex: &GpexHost) {
+    let root = gpex.root();
+    let (get, put) = (Arc::clone(root), Arc::clone(root));
+    savevm.register_vmsd(
+        "0000:00:00.0/",
+        Some(0),
+        &VMSTATE_GPEX_ROOT,
+        move || Ok(get.vmstate_save()),
+        move |s| put.vmstate_load(&s).map_err(Error::generic),
+    );
+    let host = gpex.host_state();
+    let (get, put) = (Arc::clone(host), Arc::clone(host));
+    savevm.register_vmsd(
+        "",
+        Some(0),
+        &VMSTATE_PCIHOST,
+        move || Ok(get.vmstate_save()),
+        move |s| {
+            put.vmstate_load(&s);
+            Ok(())
+        },
+    );
+    let bus = gpex.bus();
+    let (get, put) = (Arc::clone(bus), Arc::clone(bus));
+    savevm.register_vmsd(
+        "",
+        Some(0),
+        &VMSTATE_PCIBUS,
+        move || Ok(get.vmstate_save()),
+        move |s| put.vmstate_load(&s).map_err(Error::generic),
+    );
+}
+
 /// `vmstate_pl011_clock`, always sent since `migrate-clk` is on for every machine version ruvm
 /// has.
 static VMSTATE_PL011_CLOCK: LazyLock<VmStateDescription<Pl011Section>> = LazyLock::new(|| {
@@ -496,6 +537,60 @@ pub fn register_gpio_key(savevm: &mut SaveVm, key: &Arc<GpioKey>) {
     );
 }
 
+/// Registers the `acpi-ged` section of `ged`, instance 0 with no path prefix as in QEMU. virt
+/// has no memory hotplug, so its memory hotplug state has no slots.
+pub fn register_ged(savevm: &mut SaveVm, ged: &Arc<AcpiGed>) {
+    let (get, put) = (Arc::clone(ged), Arc::clone(ged));
+    savevm.register_vmsd(
+        "",
+        Some(0),
+        &VMSTATE_ACPI_GED,
+        move || Ok(AcpiGedVmState { sel: get.sel(), memhp: MemHotplugVmState::default() }),
+        move |s| {
+            put.set_sel(s.sel);
+            Ok(())
+        },
+    );
+}
+
+/// Registers the `fw_cfg` section of `fw_cfg`, instance 0 with no path prefix as in QEMU.
+pub fn register_fw_cfg(savevm: &mut SaveVm, fw_cfg: &Arc<FwCfgState>) {
+    let (get, put) = (Arc::clone(fw_cfg), Arc::clone(fw_cfg));
+    savevm.register_vmsd(
+        "",
+        Some(0),
+        &VMSTATE_FW_CFG,
+        move || Ok(get.vmstate_save()),
+        move |s| {
+            put.vmstate_load(&s);
+            Ok(())
+        },
+    );
+}
+
+/// `vmstate_virt_acpi_build`, from hw/arm/virt-acpi-build.c.
+static VMSTATE_VIRT_ACPI_BUILD: LazyLock<VmStateDescription<bool>> = LazyLock::new(|| {
+    VmStateDescription::new("virt_acpi_build")
+        .version_id(1)
+        .minimum_version_id(1)
+        .field(VmStateField::scalar("patched", |s: &mut bool| s))
+});
+
+/// Registers the `virt_acpi_build` section of the ACPI tables, instance 0.
+pub fn register_acpi_build(savevm: &mut SaveVm, acpi: AcpiBuild) {
+    let get = acpi.clone();
+    savevm.register_vmsd(
+        "",
+        Some(0),
+        &VMSTATE_VIRT_ACPI_BUILD,
+        move || Ok(get.patched()),
+        move |patched| {
+            acpi.set_patched(patched);
+            Ok(())
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use ruvm_vmstate::{StreamReader, StreamWriter, vmstate_load_state, vmstate_save_state};
@@ -646,5 +741,13 @@ mod tests {
         let mut back = 0;
         load(&VMSTATE_GPIO_KEY, &1234i64.to_be_bytes(), &mut back);
         assert_eq!(back, 1234);
+    }
+
+    #[test]
+    fn virt_acpi_build_layout_matches_qemu() {
+        assert_eq!(save(&VMSTATE_VIRT_ACPI_BUILD, false), [0]);
+        let mut back = false;
+        load(&VMSTATE_VIRT_ACPI_BUILD, &[1], &mut back);
+        assert!(back);
     }
 }

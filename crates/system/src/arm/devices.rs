@@ -15,9 +15,12 @@
 //! the root bus `pcie.0` (`virtio-*-pci`) or on a virtio-mmio transport (`virtio-*-device`).
 //! The other virtio types and `loader` fail with "... is not supported with this machine by
 //! ruvm yet". The PCI types take `addr`, `bus=pcie.0`, `disable-legacy`,
-//! `disable-modern` and `vectors`; the virtio-mmio ones take `bus=virtio-mmio-bus.<n>`.
+//! `disable-modern` and `vectors`; the virtio-mmio ones take `bus=virtio-mmio-bus.<n>`. Both
+//! take `iommu_platform`.
 //! On virt, `-device arm-smmuv3,primary-bus=pcie.0` is the SMMUv3 on the platform bus that
 //! translates the functions plugged after it.
+//! On virt, `-device pcie-root-port` with an `id` puts a root port on `pcie.0`, and the PCI
+//! types plug behind it with `bus=<id>`.
 //! `-drive if=pflash` with unit 0 or 1 on bus 0 is the drive of the flash of that number, as
 //! `pflash_cfi01_legacy_drive()` takes it.
 
@@ -29,6 +32,7 @@ use ruvm_base::report::Location;
 use ruvm_block::BlockGraph;
 use ruvm_hw_iommu::smmuv3::OAS_MODES;
 use ruvm_hw_iommu::{SmmuV3Props, VirtioIommuConf};
+use ruvm_hw_pci::PcieRootPortConfig;
 use ruvm_hw_storage::{BlockBackend, DriveConfig};
 use ruvm_hw_virtio::mmio::VIRTIO_MMIO_FORCE_LEGACY_DEFAULT;
 use ruvm_hw_virtio::pci::virtio_pci_optimal_num_queues;
@@ -61,6 +65,8 @@ enum Model {
     Smmu,
     /// `tpm-tis-device`, a dynamic sysbus device.
     Tpm,
+    /// `pcie-root-port` on the root bus.
+    RootPort,
 }
 
 /// The device types, with the bus they plug into.
@@ -114,7 +120,8 @@ pub(crate) struct Plug {
     devfn: Option<u8>,
     /// `bus=virtio-mmio-bus.<n>` of a virtio-mmio device.
     mmio_bus: Option<usize>,
-    /// `iommu_platform` of a PCI function: its DMA goes through the SMMU.
+    /// `iommu_platform`: the DMA of a PCI function goes through the SMMU. A virtio-mmio
+    /// device only offers `VIRTIO_F_IOMMU_PLATFORM`, since no IOMMU is in front of it.
     iommu_platform: bool,
     /// The properties of a virtio-iommu.
     iommu: Option<VirtioIommuConf>,
@@ -122,6 +129,10 @@ pub(crate) struct Plug {
     smmu: Option<(SmmuV3Props, bool)>,
     /// The `tpmdev`, `irq` and `ppi` properties of a tpm-tis-device.
     tpm: Option<(Option<String>, u32, bool)>,
+    /// The properties of a pcie-root-port.
+    root_port: Option<RootPortConf>,
+    /// The `bus` of a PCI function, `None` for the root bus.
+    bus: Option<String>,
     /// virtio-net `netdev`.
     netdev: Option<String>,
     /// virtio-net `mac`.
@@ -183,7 +194,7 @@ fn parse_devfn(v: &str) -> Option<u8> {
 }
 
 /// One `-device` that is not `loader`. `mmio` says whether the board has virtio-mmio
-/// transports.
+/// transports, and `buses` are the names of the buses behind the root ports.
 fn plan_virtio(
     drives: &[Drive],
     used: &mut HashSet<usize>,
@@ -191,6 +202,7 @@ fn plan_virtio(
     opts: &QemuOpts,
     loc: &Option<Location>,
     mmio: bool,
+    buses: &[String],
 ) -> Result<Plug, Located> {
     let name = DEVICE_ALIASES.iter().find(|(a, _)| *a == driver).map_or(driver, |(_, t)| *t);
     let Some(&(typename, model, transport)) = DEVICE_TYPES.iter().find(|(t, ..)| *t == name) else {
@@ -219,6 +231,8 @@ fn plan_virtio(
             .then(|| VirtioIommuConf { aw_bits: 48, ..Default::default() }),
         smmu: None,
         tpm: None,
+        root_port: None,
+        bus: None,
         netdev: None,
         mac: None,
         props: VirtioPciProps::default(),
@@ -245,7 +259,10 @@ fn plan_virtio(
             "id" => plug.props.id = Some(v.to_string()),
             "bus" => {
                 let found = if pci {
-                    v == PCIE_ROOT_BUS
+                    if v != PCIE_ROOT_BUS {
+                        plug.bus = Some(v.to_string());
+                    }
+                    v == PCIE_ROOT_BUS || buses.iter().any(|b| b == v)
                 } else {
                     let n = v.strip_prefix("virtio-mmio-bus.").and_then(|n| n.parse().ok());
                     plug.mmio_bus = n;
@@ -265,7 +282,7 @@ fn plan_virtio(
             "disable-modern" if pci => {
                 plug.props.disable_modern = prop_bool(k, v).map_err(|_| bad_value(k, v))?;
             }
-            "iommu_platform" if pci => {
+            "iommu_platform" => {
                 plug.iommu_platform = prop_bool(k, v).map_err(|_| bad_value(k, v))?;
             }
             "vectors" if pci => {
@@ -403,6 +420,8 @@ fn plan_smmuv3(board: ArmBoard, opts: &QemuOpts, loc: &Option<Location>) -> Resu
         iommu: None,
         smmu: Some((props, primary_bus)),
         tpm: None,
+        root_port: None,
+        bus: None,
         netdev: None,
         mac: None,
         props: VirtioPciProps::default(),
@@ -471,6 +490,151 @@ fn plan_tpm_tis_device(
         iommu: None,
         smmu: None,
         tpm: Some((tpmdev, irq, ppi)),
+        root_port: None,
+        bus: None,
+        netdev: None,
+        mac: None,
+        props: VirtioPciProps::default(),
+        path: String::new(),
+        loc: loc.clone(),
+    })
+}
+
+/// `TYPE_GEN_PCIE_ROOT_PORT`.
+const TYPE_GEN_PCIE_ROOT_PORT: &str = "pcie-root-port";
+
+/// The `pcie-root-port` properties ruvm takes. The secondary bus is named after `id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RootPortConf {
+    id: String,
+    chassis: u8,
+    slot: u16,
+    port: u8,
+    hotplug: bool,
+    multifunction: bool,
+}
+
+/// The `pcie-root-port` properties QEMU has that ruvm does not take yet.
+const ROOT_PORT_UNSUPPORTED: &[&str] = &[
+    "acpi-index",
+    "aer_log_max",
+    "bus-reserve",
+    "busnr",
+    "failover_pair_id",
+    "io-reserve",
+    "mem-reserve",
+    "power_controller_present",
+    "pref32-reserve",
+    "pref64-reserve",
+    "rombar",
+    "romfile",
+    "romsize",
+    "sriov-pf",
+    "x-do-not-expose-native-hotplug-cap",
+    "x-max-bounce-buffer-size",
+    "x-pci-express-writeable-slt-bug",
+    "x-pcie-ari-nextfn-1",
+    "x-pcie-err-unc-mask",
+    "x-pcie-ext-tag",
+    "x-pcie-lnksta-dllla",
+    "x-speed",
+    "x-width",
+];
+
+/// The `pcie-root-port` properties, on the root bus of virt. `buses` are the names of the
+/// buses behind the root ports planned before it.
+fn plan_root_port(
+    board: ArmBoard,
+    opts: &QemuOpts,
+    loc: &Option<Location>,
+    buses: &[String],
+) -> Result<Plug, Located> {
+    if board != ArmBoard::Virt {
+        let msg = "-device pcie-root-port is not supported with machine sbsa-ref by ruvm yet";
+        return Err(Located::new(loc, msg));
+    }
+    let at = |e: Error| Located(loc.clone(), e);
+    let bad_value = |k: &str, v: &str| {
+        Located::new(
+            loc,
+            format!("Property '{TYPE_GEN_PCIE_ROOT_PORT}.{k}' doesn't take value '{v}'"),
+        )
+    };
+    let mut conf = RootPortConf {
+        id: opts.id().unwrap_or_default().to_string(),
+        chassis: 0,
+        slot: 0,
+        port: 0,
+        hotplug: true,
+        multifunction: false,
+    };
+    let mut devfn = None;
+    for (k, v) in opts.iter() {
+        match k {
+            "driver" => {}
+            "bus" if v == PCIE_ROOT_BUS => {}
+            "bus" if buses.iter().any(|b| b == v) => {
+                let msg = "-device pcie-root-port behind a root port is not supported by ruvm yet";
+                return Err(Located::new(loc, msg));
+            }
+            "bus" => return Err(Located::new(loc, format!("Bus '{v}' not found"))),
+            "addr" => devfn = Some(parse_devfn(v).ok_or_else(|| bad_value(k, v))?),
+            "chassis" | "port" => {
+                let n = crate::display::prop(k, v, |vi, n, out| vi.type_uint8(Some(n), out))
+                    .map_err(at)?;
+                if k == "chassis" {
+                    conf.chassis = n;
+                } else {
+                    conf.port = n;
+                }
+            }
+            "slot" => {
+                conf.slot = crate::display::prop(k, v, |vi, n, out| vi.type_uint16(Some(n), out))
+                    .map_err(at)?;
+            }
+            "hotplug" | "multifunction" => {
+                let b = crate::display::prop(k, v, |vi, n, out| vi.type_bool(Some(n), out))
+                    .map_err(at)?;
+                if k == "hotplug" {
+                    conf.hotplug = b;
+                } else {
+                    conf.multifunction = b;
+                }
+            }
+            _ if ROOT_PORT_UNSUPPORTED.contains(&k) => {
+                let msg = format!(
+                    "Property '{TYPE_GEN_PCIE_ROOT_PORT}.{k}' is not supported by ruvm yet"
+                );
+                return Err(Located::new(loc, msg));
+            }
+            _ => {
+                return Err(Located::new(
+                    loc,
+                    format!("Property '{TYPE_GEN_PCIE_ROOT_PORT}.{k}' not found"),
+                ));
+            }
+        }
+    }
+    if conf.id.is_empty() {
+        // QEMU names the bus of a root port without an id "pcie.<n>", with an n that depends on
+        // the other buses, so nothing could plug behind it.
+        let msg = "-device pcie-root-port without id is not supported by ruvm yet";
+        return Err(Located::new(loc, msg));
+    }
+    Ok(Plug {
+        typename: TYPE_GEN_PCIE_ROOT_PORT,
+        model: Model::RootPort,
+        transport: Transport::Pci,
+        drive: None,
+        serial: None,
+        devfn,
+        mmio_bus: None,
+        iommu_platform: false,
+        iommu: None,
+        smmu: None,
+        tpm: None,
+        root_port: Some(conf),
+        bus: None,
         netdev: None,
         mac: None,
         props: VirtioPciProps::default(),
@@ -490,6 +654,7 @@ fn plan_device(
     board: ArmBoard,
     drives: &[Drive],
     used: &mut HashSet<usize>,
+    buses: &[String],
     arg: &str,
     loc: &Option<Location>,
 ) -> Result<Planned, Located> {
@@ -518,8 +683,11 @@ fn plan_device(
     if driver == TYPE_TPM_TIS_SYSBUS {
         return plan_tpm_tis_device(board, opts, loc).map(Planned::Virtio);
     }
+    if driver == TYPE_GEN_PCIE_ROOT_PORT {
+        return plan_root_port(board, opts, loc, buses).map(Planned::Virtio);
+    }
     let mmio = board == ArmBoard::Virt;
-    plan_virtio(drives, used, driver, opts, loc, mmio).map(Planned::Virtio)
+    plan_virtio(drives, used, driver, opts, loc, mmio, buses).map(Planned::Virtio)
 }
 
 /// Works out what `-drive` and `-device` plug into `board`. The errors are those of
@@ -548,19 +716,26 @@ pub(crate) fn plan(
         queue.push((format!("virtio-blk,drive={}", d.id), d.loc.clone()));
     }
     let mut anon = 0;
+    // The secondary buses of the root ports planned so far.
+    let mut buses: Vec<String> = Vec::new();
     for (arg, loc) in &queue {
         let path = peripheral_path(arg, &mut anon);
         let plan = |arg: &str, trial: bool| {
             if trial {
-                plan_device(board, drives, &mut used.clone(), arg, loc)
+                plan_device(board, drives, &mut used.clone(), &buses, arg, loc)
             } else {
-                plan_device(board, drives, &mut used, arg, loc)
+                plan_device(board, drives, &mut used, &buses, arg, loc)
             }
         };
         let planned = crate::global::plan_device(arg, loc, plan, |_, e| Err(e));
         match planned.map_err(|e| vec![e])? {
             Planned::Display(plug) => p.display.push((p.virtio.len(), plug)),
-            Planned::Virtio(plug) => p.virtio.push(Plug { path, ..plug }),
+            Planned::Virtio(plug) => {
+                if let Some(rp) = &plug.root_port {
+                    buses.push(rp.id.clone());
+                }
+                p.virtio.push(Plug { path, ..plug });
+            }
         }
     }
 
@@ -709,6 +884,22 @@ pub(crate) fn plug(
                 }
                 continue;
             }
+            Model::RootPort => {
+                let rp = plug.root_port.as_ref().expect("planned with properties");
+                let Target::Virt(board) = board else { unreachable!("planned only on virt") };
+                let cfg = PcieRootPortConfig {
+                    id: Some(rp.id.clone()),
+                    sec_bus_name: rp.id.clone(),
+                    chassis: rp.chassis,
+                    slot: rp.slot,
+                    port: rp.port,
+                    hotplug: rp.hotplug,
+                    multifunction: rp.multifunction,
+                    ..PcieRootPortConfig::default()
+                };
+                board.attach_pcie_root_port(&cfg, plug.devfn).map_err(at)?;
+                continue;
+            }
             Model::Tpm => {
                 let (tpmdev, irq, ppi) = plug.tpm.as_ref().expect("planned with properties");
                 let Target::Virt(board) = board else { unreachable!("planned only on virt") };
@@ -732,8 +923,10 @@ pub(crate) fn plug(
         let (devfn, iommu) = (plug.devfn, plug.iommu_platform);
         let handle = match (board, plug.transport, plug.mmio_bus) {
             (Target::Virt(board), Transport::Pci, _) => {
-                let dev =
-                    board.attach_virtio_pci_with(class, devfn, &plug.props, iommu).map_err(at)?;
+                let bus = plug.bus.as_deref();
+                let dev = board
+                    .attach_virtio_pci_on(bus, class, devfn, &plug.props, iommu)
+                    .map_err(at)?;
                 Some(VirtioHandle::Pci(dev))
             }
             (Target::SbsaRef(board), Transport::Pci, _) => {
@@ -742,12 +935,14 @@ pub(crate) fn plug(
                 Some(VirtioHandle::Pci(dev))
             }
             (Target::Virt(board), Transport::Mmio, Some(n)) => {
-                board.attach_virtio_at(n, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT).map_err(at)?;
+                board
+                    .attach_virtio_at_with(n, class, VIRTIO_MMIO_FORCE_LEGACY_DEFAULT, iommu)
+                    .map_err(at)?;
                 board.virtio_transport(n).map(VirtioHandle::Mmio)
             }
             (Target::Virt(board), Transport::Mmio, None) => {
                 let n = board
-                    .attach_virtio(class)
+                    .attach_virtio_with(class, iommu)
                     .map_err(|e| at(format!("{e} '{}'", plug.typename)))?;
                 board.virtio_transport(n).map(VirtioHandle::Mmio)
             }
@@ -858,6 +1053,8 @@ mod tests {
         assert_eq!(p.virtio[0].devfn, Some(0xff));
         let p = plan(V, &[], &[dev("virtio-rng-pci,iommu_platform=on")]).unwrap();
         assert!(p.virtio[0].iommu_platform);
+        let p = plan(V, &[], &[dev("virtio-rng-device,iommu_platform=on")]).unwrap();
+        assert!(p.virtio[0].iommu_platform);
 
         let err = |args: &[&str]| {
             let devs: Vec<_> = args.iter().map(|a| dev(a)).collect();
@@ -881,6 +1078,51 @@ mod tests {
         assert_eq!(
             err(&["loader,addr=0x40000000,data=1,data-len=4"]),
             "-device loader is not supported with this machine by ruvm yet"
+        );
+    }
+
+    #[test]
+    fn pcie_root_port() {
+        let devs = [
+            dev("pcie-root-port,id=rp1,chassis=1,slot=2,port=3,addr=4,hotplug=off"),
+            dev("virtio-rng-pci,bus=rp1"),
+            dev("virtio-rng-pci,bus=pcie.0"),
+        ];
+        let p = plan(V, &[], &devs).unwrap();
+        let rp = p.virtio[0].root_port.clone().unwrap();
+        assert_eq!((rp.id.as_str(), rp.chassis, rp.slot, rp.port), ("rp1", 1, 2, 3));
+        assert!(!rp.hotplug);
+        assert_eq!(p.virtio[0].devfn, Some(4 << 3));
+        assert_eq!(p.virtio[1].bus.as_deref(), Some("rp1"));
+        assert_eq!(p.virtio[2].bus, None);
+
+        let err = |board, args: &[&str]| {
+            let devs: Vec<_> = args.iter().map(|a| dev(a)).collect();
+            plan(board, &[], &devs).unwrap_err()[0].1.message().to_string()
+        };
+        // A bus is there only once its root port is.
+        let e = err(V, &["virtio-rng-pci,bus=rp1", "pcie-root-port,id=rp1"]);
+        assert_eq!(e, "Bus 'rp1' not found");
+        assert_eq!(err(V, &["pcie-root-port,id=rp1,bus=rp0"]), "Bus 'rp0' not found");
+        assert_eq!(
+            err(V, &["pcie-root-port,id=rp1", "pcie-root-port,id=rp2,bus=rp1"]),
+            "-device pcie-root-port behind a root port is not supported by ruvm yet"
+        );
+        assert_eq!(
+            err(V, &["pcie-root-port,id=rp1,io-reserve=0"]),
+            "Property 'pcie-root-port.io-reserve' is not supported by ruvm yet"
+        );
+        assert_eq!(
+            err(V, &["pcie-root-port,id=rp1,foo=1"]),
+            "Property 'pcie-root-port.foo' not found"
+        );
+        assert_eq!(
+            err(V, &["pcie-root-port,chassis=1"]),
+            "-device pcie-root-port without id is not supported by ruvm yet"
+        );
+        assert_eq!(
+            err(S, &["pcie-root-port,id=rp1"]),
+            "-device pcie-root-port is not supported with machine sbsa-ref by ruvm yet"
         );
     }
 

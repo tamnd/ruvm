@@ -32,8 +32,9 @@
 //! stub there.
 //!
 //! VMState: [`PciDeviceVmState`] is the `PCIDevice` section, [`PciBusVmState`] the `PCIBUS`
-//! one, [`PciHostVmState`] `PCIHost` and [`MchVmState`] the Q35 `mch`. The descriptions
-//! themselves live with the machine.
+//! one, [`PciHostVmState`] `PCIHost` and [`MchVmState`] the Q35 `mch`. The descriptions that
+//! every board shares, including the generic host's `gpex_root`, are in [`vmstate`]; the
+//! Q35 `mch` one lives with the machine.
 //!
 //! Not ported: trace points, QOM registration and properties, SHPC and ACPI hotplug,
 //! error injection, SR-IOV, ATS, IOMMU and bus master address spaces, VGA
@@ -55,6 +56,7 @@ mod pcie_host;
 mod pcie_root_port;
 pub mod q35;
 pub mod regs;
+pub mod vmstate;
 
 pub use bridge::{PciBridge, PciBridgeWindow, pci_bridge_get_base, pci_bridge_get_limit};
 pub use bus::{PciBus, PciBusVmState, PciMapIrqFn, PciSetIrqFn, pci_swizzle_map_irq_fn};

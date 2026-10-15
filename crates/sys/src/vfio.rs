@@ -15,7 +15,7 @@
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
 /// `VFIO_API_VERSION`.
@@ -41,6 +41,17 @@ pub const REGION_INFO_FLAG_READ: u32 = 1;
 pub const REGION_INFO_FLAG_WRITE: u32 = 1 << 1;
 /// `VFIO_REGION_INFO_FLAG_MMAP`.
 pub const REGION_INFO_FLAG_MMAP: u32 = 1 << 2;
+/// `VFIO_REGION_INFO_FLAG_CAPS`: the region info has a capability chain.
+pub const REGION_INFO_FLAG_CAPS: u32 = 1 << 3;
+/// `VFIO_REGION_INFO_CAP_SPARSE_MMAP`: only the listed areas of the region can be mapped.
+pub const REGION_INFO_CAP_SPARSE_MMAP: u16 = 1;
+/// `VFIO_REGION_INFO_CAP_MSIX_MAPPABLE`: the MSI-X table of the BAR can be mapped too.
+pub const REGION_INFO_CAP_MSIX_MAPPABLE: u16 = 3;
+
+/// `VFIO_DEVICE_FEATURE_GET`.
+pub const DEVICE_FEATURE_GET: u32 = 1 << 16;
+/// `VFIO_DEVICE_FEATURE_DMA_BUF`.
+pub const DEVICE_FEATURE_DMA_BUF: u32 = 11;
 
 /// `VFIO_PCI_BAR0_REGION_INDEX`.
 pub const PCI_BAR0_REGION_INDEX: u32 = 0;
@@ -78,6 +89,44 @@ pub const IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
 /// `VFIO_IRQ_INFO_NORESIZE`: the MSI-X vector count cannot change while enabled.
 pub const IRQ_INFO_NORESIZE: u32 = 1 << 3;
 
+/// A device a PCI hot reset resets too, `struct vfio_pci_dependent_device` as a device opened
+/// through its group sees it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DependentDevice {
+    /// The IOMMU group the device is in.
+    pub group_id: u32,
+    pub segment: u16,
+    pub bus: u8,
+    pub devfn: u8,
+}
+
+impl DependentDevice {
+    /// The device's name in sysfs, `0000:01:00.0`, which is what `vfio_pci_host_match()`
+    /// compares.
+    pub fn host_name(&self) -> String {
+        format!(
+            "{:04x}:{:02x}:{:02x}.{:x}",
+            self.segment,
+            self.bus,
+            self.devfn >> 3,
+            self.devfn & 7
+        )
+    }
+}
+
+/// The devices of a `vfio_pci_hot_reset_info` that `count` says were filled in: two words each,
+/// the group and then the segment, bus and devfn, after the three words of the header.
+fn dependent_devices(words: &[u32], count: u32) -> Vec<DependentDevice> {
+    words[3..]
+        .chunks_exact(2)
+        .take(count as usize)
+        .map(|d| {
+            let [s0, s1, bus, devfn] = d[1].to_ne_bytes();
+            DependentDevice { group_id: d[0], segment: u16::from_ne_bytes([s0, s1]), bus, devfn }
+        })
+        .collect()
+}
+
 /// `_IO(';', 100 + nr)`. Every VFIO ioctl is `_IO`, with the size in the `argsz` field instead.
 const fn io(nr: u64) -> u64 {
     ((b';' as u64) << 8) | (100 + nr)
@@ -94,8 +143,11 @@ const VFIO_DEVICE_GET_REGION_INFO: u64 = io(8);
 const VFIO_DEVICE_GET_IRQ_INFO: u64 = io(9);
 const VFIO_DEVICE_SET_IRQS: u64 = io(10);
 const VFIO_DEVICE_RESET: u64 = io(11);
+const VFIO_DEVICE_GET_PCI_HOT_RESET_INFO: u64 = io(12);
+const VFIO_DEVICE_PCI_HOT_RESET: u64 = io(13);
 const VFIO_IOMMU_MAP_DMA: u64 = io(13);
 const VFIO_IOMMU_UNMAP_DMA: u64 = io(14);
+const VFIO_DEVICE_FEATURE: u64 = io(17);
 
 #[repr(C)]
 #[derive(Default)]
@@ -130,6 +182,54 @@ pub struct RegionInfo {
     pub size: u64,
     /// Where the region is in the device descriptor.
     pub offset: u64,
+}
+
+/// The capability chain of a region's info, the bytes `VFIO_DEVICE_GET_REGION_INFO` returned
+/// when its `argsz` was large enough for them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegionCaps {
+    buf: Vec<u8>,
+    first: u32,
+}
+
+impl RegionCaps {
+    /// A chain from the whole `vfio_region_info` buffer and its `cap_offset`.
+    pub fn new(buf: Vec<u8>, first: u32) -> Self {
+        RegionCaps { buf, first }
+    }
+
+    /// `vfio_get_cap()`: the capability `id`, from its header on. The chain ends at a `next`
+    /// of 0, which is where the info starts.
+    pub fn find(&self, id: u16) -> Option<&[u8]> {
+        let mut off = self.first as usize;
+        // A chain that loops back on itself would never reach 0.
+        for _ in 0..self.buf.len() / 8 {
+            if off == 0 {
+                return None;
+            }
+            let hdr = self.buf.get(off..off.checked_add(8)?)?;
+            if u16::from_ne_bytes([hdr[0], hdr[1]]) == id {
+                return Some(&self.buf[off..]);
+            }
+            off = u32::from_ne_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+        }
+        None
+    }
+
+    /// Whether the chain has capability `id`.
+    pub fn has(&self, id: u16) -> bool {
+        self.find(id).is_some()
+    }
+
+    /// The areas of `struct vfio_region_info_cap_sparse_mmap` as offset and size pairs, in the
+    /// order the kernel gave them.
+    pub fn sparse_mmap(&self) -> Option<Vec<(u64, u64)>> {
+        let cap = self.find(REGION_INFO_CAP_SPARSE_MMAP)?;
+        let nr = u32::from_ne_bytes(cap.get(8..12)?.try_into().ok()?) as usize;
+        let u64_at =
+            |o: usize| cap.get(o..o + 8).map(|b| u64::from_ne_bytes(b.try_into().unwrap()));
+        (0..nr).map(|i| Some((u64_at(16 + 16 * i)?, u64_at(24 + 16 * i)?))).collect()
+    }
 }
 
 /// `struct vfio_irq_info`.
@@ -177,8 +277,10 @@ struct IrqSet {
 }
 
 /// The argument structures of the ioctls this module issues. A `c_char` is the first byte of a
-/// string and a `u32` the first word of a `vfio_irq_set` followed by its eventfds.
+/// string, a `u32` the first word of a `vfio_irq_set` followed by its eventfds, and a `u64` the
+/// first word of a buffer as long as the `argsz` it starts with.
 trait Arg {}
+impl Arg for u64 {}
 impl Arg for IrqSet {}
 impl Arg for u32 {}
 impl Arg for GroupStatus {}
@@ -206,6 +308,13 @@ fn ioctl_ptr<T: Arg>(file: &File, req: u64, arg: *mut T) -> io::Result<i32> {
     // whole call.
     let ret = unsafe { libc::ioctl(file.as_raw_fd(), req as _, arg) };
     if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(ret) }
+}
+
+/// Two `u32` fields that follow each other in a structure, as the `u64` word they fill.
+fn word(first: u32, second: u32) -> u64 {
+    let [a, b, c, d] = first.to_ne_bytes();
+    let [e, f, g, h] = second.to_ne_bytes();
+    u64::from_ne_bytes([a, b, c, d, e, f, g, h])
 }
 
 fn argsz<T>() -> u32 {
@@ -292,6 +401,13 @@ pub struct VfioGroup {
     file: File,
 }
 
+impl AsFd for VfioGroup {
+    /// The group descriptor, which a hot reset takes as proof that the group is owned.
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
 impl VfioGroup {
     /// Opens group `id`.
     pub fn open(id: u32) -> io::Result<Self> {
@@ -328,6 +444,13 @@ pub struct VfioDevice {
     file: File,
 }
 
+impl AsFd for VfioDevice {
+    /// The device descriptor, which the regions that allow it are mapped from.
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
 impl VfioDevice {
     /// `VFIO_DEVICE_GET_INFO`.
     pub fn info(&self) -> io::Result<DeviceInfo> {
@@ -341,6 +464,59 @@ impl VfioDevice {
         let mut info = RegionInfo { argsz: argsz::<RegionInfo>(), index, ..RegionInfo::default() };
         ioctl_ptr(&self.file, VFIO_DEVICE_GET_REGION_INFO, &mut info)?;
         Ok(info)
+    }
+
+    /// `vfio_device_get_region_info()`: `VFIO_DEVICE_GET_REGION_INFO` for region `index` with
+    /// its capability chain, asking again with the `argsz` the kernel wants when the chain did
+    /// not fit.
+    pub fn region_info_caps(&self, index: u32) -> io::Result<(RegionInfo, RegionCaps)> {
+        let mut argsz = argsz::<RegionInfo>();
+        loop {
+            let mut buf = vec![0u64; (argsz as usize).div_ceil(8)];
+            buf[0] = word(argsz, 0);
+            buf[1] = word(index, 0);
+            ioctl_ptr(&self.file, VFIO_DEVICE_GET_REGION_INFO, buf.as_mut_ptr())?;
+            let bytes: Vec<u8> = buf.iter().flat_map(|w| w.to_ne_bytes()).collect();
+            let u32_at = |o: usize| u32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap());
+            let u64_at = |o: usize| u64::from_ne_bytes(bytes[o..o + 8].try_into().unwrap());
+            let want = u32_at(0);
+            if want > argsz {
+                argsz = want;
+                continue;
+            }
+            let info = RegionInfo {
+                argsz: want,
+                flags: u32_at(4),
+                index: u32_at(8),
+                cap_offset: u32_at(12),
+                size: u64_at(16),
+                offset: u64_at(24),
+            };
+            let first = if info.flags & REGION_INFO_FLAG_CAPS != 0 { info.cap_offset } else { 0 };
+            return Ok((info, RegionCaps::new(bytes, first)));
+        }
+    }
+
+    /// `VFIO_DEVICE_FEATURE` with `VFIO_DEVICE_FEATURE_DMA_BUF`: a dma-buf of the `ranges` of
+    /// region `index`, each an offset and a length, as `vfio_region_create_dma_buf()` asks for
+    /// one.
+    pub fn dma_buf(
+        &self,
+        index: u32,
+        open_flags: u32,
+        ranges: &[(u64, u64)],
+    ) -> io::Result<OwnedFd> {
+        let bytes = 8 + 16 + 16 * ranges.len();
+        let argsz =
+            u32::try_from(bytes).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let mut buf = Vec::with_capacity(bytes / 8);
+        buf.push(word(argsz, DEVICE_FEATURE_GET | DEVICE_FEATURE_DMA_BUF));
+        buf.push(word(index, open_flags));
+        buf.push(word(0, ranges.len() as u32));
+        buf.extend(ranges.iter().flat_map(|&(offset, length)| [offset, length]));
+        let fd = ioctl_ptr(&self.file, VFIO_DEVICE_FEATURE, buf.as_mut_ptr())?;
+        // SAFETY: the kernel just returned this descriptor and nothing else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     /// `VFIO_DEVICE_GET_IRQ_INFO` for interrupt `index`.
@@ -386,6 +562,28 @@ impl VfioDevice {
         ioctl_val(&self.file, VFIO_DEVICE_RESET, 0).map(drop)
     }
 
+    /// `VFIO_DEVICE_GET_PCI_HOT_RESET_INFO` with room for `room` devices: how many a hot reset
+    /// of this device would reset, and the devices. The kernel says how many there are even
+    /// when they do not fit, which it fails with `ENOSPC`.
+    pub fn pci_hot_reset_info(&self, room: u32) -> (u32, io::Result<Vec<DependentDevice>>) {
+        let mut buf = vec![0u32; 3 + 2 * room as usize];
+        buf[0] = 12 + 8 * room;
+        let r = ioctl_ptr(&self.file, VFIO_DEVICE_GET_PCI_HOT_RESET_INFO, buf.as_mut_ptr());
+        (buf[2], r.map(|_| dependent_devices(&buf, buf[2].min(room))))
+    }
+
+    /// `VFIO_DEVICE_PCI_HOT_RESET`: a bus or slot reset of this device and every device
+    /// [`VfioDevice::pci_hot_reset_info`] lists, with the descriptors of all of their groups as
+    /// proof that they are owned.
+    pub fn pci_hot_reset(&self, group_fds: &[BorrowedFd<'_>]) -> io::Result<()> {
+        let argsz = u32::try_from(12 + 4 * group_fds.len())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let mut buf = Vec::with_capacity(3 + group_fds.len());
+        buf.extend([argsz, 0, group_fds.len() as u32]);
+        buf.extend(group_fds.iter().map(|fd| fd.as_raw_fd() as u32));
+        ioctl_ptr(&self.file, VFIO_DEVICE_PCI_HOT_RESET, buf.as_mut_ptr()).map(drop)
+    }
+
     /// Reads at `offset` of the descriptor, which is a region's offset plus the offset inside
     /// it. Returns how many bytes were read.
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -409,6 +607,8 @@ mod tests {
         assert_eq!(VFIO_GROUP_GET_DEVICE_FD, 0x3b6a);
         assert_eq!(VFIO_DEVICE_SET_IRQS, 0x3b6e);
         assert_eq!(VFIO_DEVICE_RESET, 0x3b6f);
+        assert_eq!(VFIO_DEVICE_GET_PCI_HOT_RESET_INFO, 0x3b70);
+        assert_eq!(VFIO_DEVICE_PCI_HOT_RESET, 0x3b71);
         assert_eq!(size_of::<IrqSet>(), 20);
         assert_eq!(VFIO_IOMMU_MAP_DMA, 0x3b71);
         assert_eq!(VFIO_IOMMU_UNMAP_DMA, 0x3b72);
@@ -417,6 +617,58 @@ mod tests {
         assert_eq!(size_of::<DeviceInfo>(), 24);
         assert_eq!(size_of::<RegionInfo>(), 32);
         assert_eq!(size_of::<IrqInfo>(), 16);
+        assert_eq!(VFIO_DEVICE_FEATURE, 0x3b75);
+    }
+
+    /// A region info of 32 bytes followed by a chain at `first`.
+    fn chain(caps: &[(usize, u16, u32, &[u8])], len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        for &(off, id, next, body) in caps {
+            buf[off..off + 2].copy_from_slice(&id.to_ne_bytes());
+            buf[off + 2..off + 4].copy_from_slice(&1u16.to_ne_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&next.to_ne_bytes());
+            buf[off + 8..off + 8 + body.len()].copy_from_slice(body);
+        }
+        buf
+    }
+
+    #[test]
+    fn region_caps() {
+        let mut sparse = Vec::new();
+        sparse.extend(2u32.to_ne_bytes());
+        sparse.extend(0u32.to_ne_bytes());
+        for v in [0x3000u64, 0x1000, 0, 0x2000] {
+            sparse.extend(v.to_ne_bytes());
+        }
+        let buf = chain(&[(32, 3, 40, &[]), (40, 1, 0, &sparse)], 96);
+        let caps = RegionCaps::new(buf.clone(), 32);
+        assert!(caps.has(REGION_INFO_CAP_MSIX_MAPPABLE));
+        assert_eq!(caps.sparse_mmap(), Some(vec![(0x3000, 0x1000), (0, 0x2000)]));
+        assert!(!caps.has(2));
+        // No chain at all, and a chain that points back at itself.
+        assert_eq!(RegionCaps::new(buf, 0).sparse_mmap(), None);
+        let looped = chain(&[(32, 3, 32, &[])], 40);
+        assert!(!RegionCaps::new(looped, 32).has(1));
+        // A sparse cap cut short by the buffer.
+        let short = chain(&[(32, 1, 0, &sparse[..24])], 64);
+        assert_eq!(RegionCaps::new(short, 32).sparse_mmap(), None);
+        assert_eq!(word(1, 2).to_ne_bytes()[..4], 1u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn hot_reset_info() {
+        let dev = |segment: u16, bus: u8, devfn: u8| {
+            let [a, b] = segment.to_ne_bytes();
+            u32::from_ne_bytes([a, b, bus, devfn])
+        };
+        let words = [28, 0, 2, 7, dev(0, 1, 0), 9, dev(1, 0x3a, 0x1b)];
+        let devices = dependent_devices(&words, 2);
+        assert_eq!(devices[0], DependentDevice { group_id: 7, segment: 0, bus: 1, devfn: 0 });
+        assert_eq!(devices[0].host_name(), "0000:01:00.0");
+        assert_eq!(devices[1].host_name(), "0001:3a:03.3");
+        // The kernel never fills in more than there was room for.
+        assert_eq!(dependent_devices(&words, 1).len(), 1);
+        assert!(dependent_devices(&words[..3], 0).is_empty());
     }
 
     #[test]

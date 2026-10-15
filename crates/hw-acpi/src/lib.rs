@@ -7,14 +7,16 @@
 //! from hw/acpi/generic_event_device.c. ACPI table building lives in ruvm-firmware.
 //!
 //! CPU and memory hotplug registers, ACPI PCI hotplug, the ICH9 TCO watchdog and PIIX4 PM are
-//! not ported yet; the ICH9 block keeps their migrated state (see [`ich9`]). Only the ICH9 block
-//! has VMState support. Trace points and QOM registration are not ported for any device here.
+//! not ported yet; the ICH9 block keeps their migrated state (see [`ich9`]). [`vmstate`] has the
+//! VMState descriptions of the GED and of the memory hotplug state. Trace points and QOM
+//! registration are not ported for any device here.
 
 #![forbid(unsafe_code)]
 
 pub mod core;
 pub mod ged;
 pub mod ich9;
+pub mod vmstate;
 
 pub use crate::core::{
     AcpiPm, AcpiPmConfig, AcpiRegs, PmTimerWidth, SystemRequest, SystemRequestHandler, WakeupReason,
