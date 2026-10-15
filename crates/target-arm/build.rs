@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Generates the A64 decoders from QEMU's a64.decode and sve.decode, and the AArch32 ones from
-//! vfp.decode, vfp-uncond.decode, a32.decode, a32-uncond.decode, t32.decode and t16.decode,
-//! run with the options target/arm/tcg's meson.build passes (`--static-decode=disas_a64`,
-//! `--decode=disas_sve`, `--decode=disas_vfp`, `--decode=disas_vfp_uncond`,
-//! `--static-decode=disas_a32`, `--static-decode=disas_a32_uncond`,
+//! vfp.decode, vfp-uncond.decode, neon-dp.decode, neon-ls.decode, a32.decode,
+//! a32-uncond.decode, t32.decode and t16.decode, run with the options target/arm/tcg's
+//! meson.build passes (`--static-decode=disas_a64`, `--decode=disas_sve`,
+//! `--decode=disas_vfp`, `--decode=disas_vfp_uncond`, `--decode=disas_neon_dp`,
+//! `--decode=disas_neon_ls`, `--static-decode=disas_a32`, `--static-decode=disas_a32_uncond`,
 //! `--static-decode=disas_t32` and `--static-decode=disas_t16 --insnwidth=16`).
 //!
 //! ruvm-decode makes every `trans_` method a required trait method. Not every pattern is
@@ -32,6 +33,8 @@ fn main() {
         ("sve.decode", "--decode=disas_sve", "sve_decode.rs"),
         ("vfp.decode", "--decode=disas_vfp", "vfp_decode.rs"),
         ("vfp-uncond.decode", "--decode=disas_vfp_uncond", "vfp_uncond_decode.rs"),
+        ("neon-dp.decode", "--decode=disas_neon_dp", "neon_dp_decode.rs"),
+        ("neon-ls.decode", "--decode=disas_neon_ls", "neon_ls_decode.rs"),
     ] {
         let rust = generate(&manifest, name, &[opt]);
         write_if_changed(&dir.join(out), &default_trans(&rust));

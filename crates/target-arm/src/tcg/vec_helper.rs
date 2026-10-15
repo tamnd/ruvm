@@ -625,7 +625,7 @@ fn h_neon(h: &mut HelperEnv<'_>, a: &[u64]) -> Result<u128, Unwind> {
 
 /// Compute the result of the integer operation `desc` on the sources.
 #[allow(clippy::too_many_lines)]
-fn neon(desc: &Desc, r: Regs, env: &[u8], n: &V, m: &V, d: &V, sat: &mut bool) -> V {
+pub(crate) fn neon(desc: &Desc, r: Regs, env: &[u8], n: &V, m: &V, d: &V, sat: &mut bool) -> V {
     let esz = desc.esz;
     let oprsz = desc.oprsz;
     let elems = oprsz >> esz;

@@ -126,7 +126,7 @@ fn decode_esz_idx(imm: i32) -> Option<(i32, i32)> {
 }
 
 /// `asimd_imm_const()`: AdvSIMDExpandImm, with the inversion of the op=1 forms.
-pub(super) fn asimd_imm_const(imm: u32, cmode: i32, op: i32) -> u64 {
+pub(in crate::tcg) fn asimd_imm_const(imm: u32, cmode: i32, op: i32) -> u64 {
     let mut imm = imm;
     match cmode {
         0 | 1 => {}
