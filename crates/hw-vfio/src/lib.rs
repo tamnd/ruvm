@@ -6,8 +6,8 @@
 //! of hw/vfio/container-legacy.c: the config space, BARs and ROM of a host function bound to
 //! `vfio-pci` are given to the guest, with the parts QEMU emulates emulated the same way, and the
 //! guest's RAM is mapped for the device's DMA, and INTx, MSI and MSI-X reach the guest. The BARs
-//! are mapped into the guest, and DMA can go through a vIOMMU. iommufd and the device quirks
-//! come later. The plan for the rest of this
+//! are mapped into the guest, and DMA can go through a vIOMMU. The RTL8168 quirk is the first of
+//! the device quirks. iommufd and the other quirks come later. The plan for the rest of this
 //! crate is in `spec/24-workspace-layout.md`.
 
 mod host;

@@ -863,6 +863,14 @@ fn msix_table_pba_and_masking() {
     assert_eq!(env.mem_readl(table + 3 * 16 + 12), Some(0));
     assert_eq!(dev.msix_get_message(3).address, 0xfee0_f000);
 
+    // The dispatch helpers reach the same table, and only take what the table's MMIO takes.
+    dev.msix_table_dispatch_write(3 * 16 + 8, 4, 0x77, Endian::Little);
+    assert_eq!(env.mem_readl(table + 3 * 16 + 8), Some(0x77));
+    assert_eq!(dev.msix_table_dispatch_read(3 * 16, 4, Endian::Little), 0xfee0_f000);
+    assert_eq!(dev.msix_table_dispatch_read(3 * 16 + 8, 2, Endian::Little), 0);
+    dev.msix_table_dispatch_write(3 * 16 + 8, 1, 0x55, Endian::Little);
+    assert_eq!(dev.msix_get_message(3).data, 0x77);
+
     // Reset disables MSI-X and masks every vector.
     dev.reset();
     assert!(!dev.msix_enabled());

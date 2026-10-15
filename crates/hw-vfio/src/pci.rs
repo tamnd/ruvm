@@ -22,7 +22,8 @@
 //! EOI, and a timer turns them on again once INTx has gone quiet. A device without FLR gets a
 //! bus or slot reset when every device it would take along is in a group opened here, the way
 //! `vfio_legacy_pci_hot_reset()` does it, and on a system reset [`reset_handler`] resets the
-//! devices that share a bus together. The device quirks are not here yet.
+//! devices that share a bus together. The device quirks lie over the trapped BARs, and are in
+//! [`quirks`].
 
 use std::fmt;
 use std::io;
@@ -76,6 +77,8 @@ use ruvm_sys::vfio::{
 };
 
 use crate::{PCI_ANY_ID, VfioPciConf};
+
+mod quirks;
 
 const PCI_EXP_FLAGS_VERS: u16 = 0x000f;
 const PCI_EXP_DEVCAP_FLR: u32 = 0x1000_0000;
@@ -943,6 +946,39 @@ struct Shared {
 }
 
 impl Shared {
+    /// `vfio_region_read()` of `n` bytes at `addr` in BAR `nr`, whose region is at `offset` in
+    /// the device fd. Like every BAR access that reaches the device, a read is taken as the EOI
+    /// for a pending INTx once it is done, after the device has seen it.
+    fn region_read(&self, nr: usize, offset: u64, addr: u64, n: usize) -> u64 {
+        let mut b = [0u8; 8];
+        let r = self.device.read_at(&mut b[..n], offset + addr);
+        match check_rw(r, n, "short read") {
+            Ok(()) => {
+                self.eoi();
+                u64::from_le_bytes(b)
+            }
+            Err(e) => {
+                error_report(&format!(
+                    "vfio_region_read({}:region{nr}+0x{addr:x}, {n}) failed: {e}",
+                    self.name
+                ));
+                u64::MAX >> (64 - 8 * n)
+            }
+        }
+    }
+
+    /// `vfio_region_write()`, then the EOI.
+    fn region_write(&self, nr: usize, offset: u64, addr: u64, value: u64, n: usize) {
+        let r = self.device.write_at(&value.to_le_bytes()[..n], offset + addr);
+        if let Err(e) = check_rw(r, n, "short write") {
+            error_report(&format!(
+                "vfio_region_write({}:region{nr}+0x{addr:x}, 0x{value:x},{n}) failed: {e}",
+                self.name
+            ));
+        }
+        self.eoi();
+    }
+
     /// `vfio_pci_config_space_read()`.
     fn config_read(&self, addr: usize, buf: &mut [u8]) -> Result<(), String> {
         let n = buf.len();
@@ -1134,38 +1170,12 @@ struct BarOps {
 }
 
 impl MmioOps for BarOps {
-    /// `vfio_region_read()`. Like every BAR access that reaches the device, a read is taken
-    /// as the EOI for a pending INTx once it is done, after the device has seen it.
     fn read(&self, _cx: &AccessCtx, addr: u64, size: AccessSize) -> MemResult<u64> {
-        let n = size.bytes() as usize;
-        let mut b = [0u8; 8];
-        let r = self.shared.device.read_at(&mut b[..n], self.offset + addr);
-        match check_rw(r, n, "short read") {
-            Ok(()) => {
-                self.shared.eoi();
-                Ok(u64::from_le_bytes(b))
-            }
-            Err(e) => {
-                error_report(&format!(
-                    "vfio_region_read({}:region{}+0x{addr:x}, {n}) failed: {e}",
-                    self.shared.name, self.nr
-                ));
-                Ok(u64::MAX >> (64 - 8 * n))
-            }
-        }
+        Ok(self.shared.region_read(self.nr, self.offset, addr, size.bytes() as usize))
     }
 
-    /// `vfio_region_write()`, then the EOI.
     fn write(&self, _cx: &AccessCtx, addr: u64, size: AccessSize, value: u64) -> MemResult<()> {
-        let n = size.bytes() as usize;
-        let r = self.shared.device.write_at(&value.to_le_bytes()[..n], self.offset + addr);
-        if let Err(e) = check_rw(r, n, "short write") {
-            error_report(&format!(
-                "vfio_region_write({}:region{}+0x{addr:x}, 0x{value:x},{n}) failed: {e}",
-                self.shared.name, self.nr
-            ));
-        }
-        self.shared.eoi();
+        self.shared.region_write(self.nr, self.offset, addr, value, size.bytes() as usize);
         Ok(())
     }
 
@@ -1904,7 +1914,7 @@ fn populate(
 
 /// The rest of `vfio_pci_realize()`, once the function is on the bus.
 struct Setup<'a> {
-    dev: &'a PciDevice,
+    dev: &'a Arc<PciDevice>,
     bus: &'a PciBus,
     shared: Arc<Shared>,
     bars: [RegionInfo; NUM_BARS],
@@ -1917,6 +1927,8 @@ struct Setup<'a> {
     vendor_id: u16,
     device_id: u16,
     containers: [Option<RegionId>; NUM_BARS],
+    /// The trapped region of each BAR, `VFIOBAR::region.mem`, which the quirks lie over.
+    regions: [Option<RegionId>; NUM_BARS],
     msix: Option<MsixInfo>,
     msix_cap: u8,
     msi_cap: u8,
@@ -1930,7 +1942,7 @@ struct Setup<'a> {
 
 impl<'a> Setup<'a> {
     fn new(
-        dev: &'a PciDevice,
+        dev: &'a Arc<PciDevice>,
         bus: &'a PciBus,
         p: Populated,
         express_bus: bool,
@@ -1951,6 +1963,7 @@ impl<'a> Setup<'a> {
             vendor_id: 0,
             device_id: 0,
             containers: [None; NUM_BARS],
+            regions: [None; NUM_BARS],
             msix: None,
             msix_cap: 0,
             msi_cap: 0,
@@ -1970,6 +1983,9 @@ impl<'a> Setup<'a> {
             self.idev_set = true;
         }
         self.add_capabilities()?;
+        for nr in 0..NUM_BARS {
+            quirks::bar_quirk_setup(self, nr)?;
+        }
         // vfio_pci_interrupt_setup(): QEMU emulates all of MSI and MSI-X.
         if self.msix_cap != 0 {
             let c = usize::from(self.msix_cap);
@@ -2183,6 +2199,7 @@ impl<'a> Setup<'a> {
             }
             self.dev.register_bar(nr, type_, bar);
             self.containers[nr] = Some(bar);
+            self.regions[nr] = Some(region);
         }
         Ok(())
     }

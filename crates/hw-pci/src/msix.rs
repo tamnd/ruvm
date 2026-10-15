@@ -19,7 +19,10 @@ use std::fmt;
 use std::sync::{Arc, Weak};
 
 use ruvm_base::Error;
-use ruvm_mem::{AccessConstraints, AccessCtx, AccessSize, Endian, MemResult, MmioOps, RegionId};
+use ruvm_mem::{
+    AccessConstraints, AccessCtx, AccessSize, Endian, MemResult, MemTxAttrs, MmioOps, RegionId,
+    dispatch_read, dispatch_write,
+};
 
 use crate::device::{DevState, Effect, Effects, MsiMessage, PciDevice};
 use crate::regs::*;
@@ -477,6 +480,28 @@ impl PciDevice {
     /// `msix_pba_mmio`, for a model that turns them off the way vfio-pci turns off the PBA.
     pub fn msix_regions(&self) -> Option<(RegionId, RegionId)> {
         self.lock().msix.as_ref().map(|m| (m.table_mmio, m.pba_mmio))
+    }
+
+    /// `memory_region_dispatch_read()` on `msix_table_mmio`, for a model with a back door into
+    /// the table, such as the RTL8168 quirk of vfio-pci. A device without MSI-X reads 0.
+    pub fn msix_table_dispatch_read(&self, offset: u64, size: u32, endian: Endian) -> u64 {
+        let ops = TableOps(self.weak());
+        dispatch_read(&ops, "msix-table", offset, size, endian, MemTxAttrs::UNSPECIFIED).0
+    }
+
+    /// `memory_region_dispatch_write()` on `msix_table_mmio`, the write side of
+    /// [`PciDevice::msix_table_dispatch_read`].
+    pub fn msix_table_dispatch_write(&self, offset: u64, size: u32, value: u64, endian: Endian) {
+        let ops = TableOps(self.weak());
+        let _ = dispatch_write(
+            &ops,
+            "msix-table",
+            offset,
+            size,
+            value,
+            endian,
+            MemTxAttrs::UNSPECIFIED,
+        );
     }
 
     /// `msix_nr_vectors_allocated()`.
