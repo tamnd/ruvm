@@ -9,9 +9,17 @@
 //! implements. The rules are those of `memory_access_size()` in system/physmem.c and of
 //! `memory_region_access_valid()` and `access_with_adjusted_size()` in system/memory.c, and the
 //! addresses a device sees are the same, including the unaligned widened access QEMU makes.
+//!
+//! Around the split sits the reentrancy guard of `access_with_adjusted_size()`: an access to a
+//! region whose owner is already in the callbacks of one of its regions is blocked with
+//! `MEMTX_ACCESS_ERROR`, see [`MemReentrancyGuard`].
 
+use std::cell::RefCell;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+
+use ruvm_base::report::warn_report;
 
 use crate::attrs::{AccessCtx, MemResult, MemTxAttrs, MemTxResult};
 
@@ -137,6 +145,79 @@ pub trait MmioOps: Send + Sync {
     fn endianness(&self) -> Endian {
         Endian::Little
     }
+}
+
+/// The device that owns a set of regions, as far as the reentrancy guard goes: what
+/// `DeviceState::mem_reentrancy_guard` is to the regions whose `mr->dev` is that device. Clones
+/// stand for the same device.
+///
+/// While the callbacks of an owned region run, an access to any region of the same owner is
+/// blocked: it returns `MEMTX_ACCESS_ERROR` without calling the device, a read gives 0, and the
+/// first block in the process prints QEMU's warning. This is what stops a device from reaching
+/// its own registers through DMA in the middle of an access.
+///
+/// QEMU keeps one `engaged_in_io` flag per device and relies on the BQL to keep accesses from
+/// different threads apart. Here several threads dispatch at once, so the devices in I/O are
+/// kept per thread. A nested access always runs on the thread of the access it is nested in, so
+/// it is blocked just as in QEMU, and two vCPUs reaching the same device at the same time don't
+/// block each other.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MemReentrancyGuard(u64);
+
+impl MemReentrancyGuard {
+    /// A guard for a new device.
+    pub fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        MemReentrancyGuard(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for MemReentrancyGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+thread_local! {
+    /// The owners this thread is in the callbacks of, innermost last.
+    static ENGAGED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The `print_once_` of the one `warn_report_once()` in the guard.
+static BLOCK_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Keeps an owner engaged until dropped, so a callback that panics does not leave it engaged.
+struct Engaged(Option<u64>);
+
+impl Drop for Engaged {
+    fn drop(&mut self) {
+        if let Some(id) = self.0 {
+            ENGAGED.with(|e| {
+                let mut e = e.borrow_mut();
+                if let Some(at) = e.iter().rposition(|&x| x == id) {
+                    e.remove(at);
+                }
+            });
+        }
+    }
+}
+
+/// The guard check at the top of `access_with_adjusted_size()`. `None` means the access is
+/// blocked.
+fn engage(guard: Option<&MemReentrancyGuard>, name: &str, offset: u64) -> Option<Engaged> {
+    let Some(&MemReentrancyGuard(id)) = guard else { return Some(Engaged(None)) };
+    if ENGAGED.with(|e| e.borrow().contains(&id)) {
+        if !BLOCK_WARNED.swap(true, Ordering::Relaxed) {
+            warn_report(&blocked_message(name, offset));
+        }
+        return None;
+    }
+    ENGAGED.with(|e| e.borrow_mut().push(id));
+    Some(Engaged(Some(id)))
+}
+
+fn blocked_message(name: &str, offset: u64) -> String {
+    format!("Blocked re-entrant IO on MemoryRegion: {name} at addr: 0x{offset:X}")
 }
 
 /// `unassigned_mem_ops`: accepts nothing, so every access is a decode error that reads as 0.
@@ -275,10 +356,15 @@ fn pieces(size: u32, access: u32, endian: Endian) -> impl Iterator<Item = (u32, 
 /// back in the device's byte order, masked to `size` bytes.
 fn read_adjusted(
     ops: &dyn MmioOps,
+    name: &str,
+    guard: Option<&MemReentrancyGuard>,
     offset: u64,
     size: u32,
     attrs: MemTxAttrs,
 ) -> (u64, MemTxResult) {
+    let Some(_engaged) = engage(guard, name, offset) else {
+        return (0, MemTxResult::ACCESS_ERROR);
+    };
     let (min, max) = impl_sizes(ops);
     let access = size.min(max).max(min);
     let access_size = AccessSize::new(access).unwrap_or(AccessSize::B4);
@@ -298,11 +384,16 @@ fn read_adjusted(
 
 fn write_adjusted(
     ops: &dyn MmioOps,
+    name: &str,
+    guard: Option<&MemReentrancyGuard>,
     offset: u64,
     size: u32,
     value: u64,
     attrs: MemTxAttrs,
 ) -> MemTxResult {
+    let Some(_engaged) = engage(guard, name, offset) else {
+        return MemTxResult::ACCESS_ERROR;
+    };
     let (min, max) = impl_sizes(ops);
     let access = size.min(max).max(min);
     let access_size = AccessSize::new(access).unwrap_or(AccessSize::B4);
@@ -319,7 +410,8 @@ fn write_adjusted(
 
 /// `memory_region_dispatch_read()`: validates, then reads `size` bytes (1, 2, 4 or 8) at `offset`
 /// and returns the value in `endian` byte order. A rejected read returns 0 with
-/// `MEMTX_DECODE_ERROR`.
+/// `MEMTX_DECODE_ERROR`. The callbacks are taken as those of a region with no owner, which the
+/// reentrancy guard leaves alone. [`crate::MemorySystem::dispatch_read`] dispatches to a region.
 pub fn dispatch_read(
     ops: &dyn MmioOps,
     name: &str,
@@ -328,18 +420,47 @@ pub fn dispatch_read(
     endian: Endian,
     attrs: MemTxAttrs,
 ) -> (u64, MemTxResult) {
+    dispatch_read_guarded(ops, name, None, offset, size, endian, attrs)
+}
+
+/// [`dispatch_read`] for a region that `guard` applies to.
+pub(crate) fn dispatch_read_guarded(
+    ops: &dyn MmioOps,
+    name: &str,
+    guard: Option<&MemReentrancyGuard>,
+    offset: u64,
+    size: u32,
+    endian: Endian,
+    attrs: MemTxAttrs,
+) -> (u64, MemTxResult) {
     if !access_valid(ops, name, offset, size, false, attrs) {
         return (0, MemTxResult::DECODE_ERROR);
     }
-    let (v, r) = read_adjusted(ops, offset, size, attrs);
+    let (v, r) = read_adjusted(ops, name, guard, offset, size, attrs);
     (swap_if(v, size, endian != ops.endianness()), r)
 }
 
 /// `memory_region_dispatch_write()`: validates, then writes the low `size` bytes of `value`, which
 /// is in `endian` byte order, at `offset`. A rejected write is dropped with `MEMTX_DECODE_ERROR`.
+/// As with [`dispatch_read`], the callbacks are taken as those of a region with no owner.
 pub fn dispatch_write(
     ops: &dyn MmioOps,
     name: &str,
+    offset: u64,
+    size: u32,
+    value: u64,
+    endian: Endian,
+    attrs: MemTxAttrs,
+) -> MemTxResult {
+    dispatch_write_guarded(ops, name, None, offset, size, value, endian, attrs)
+}
+
+/// [`dispatch_write`] for a region that `guard` applies to.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_write_guarded(
+    ops: &dyn MmioOps,
+    name: &str,
+    guard: Option<&MemReentrancyGuard>,
     offset: u64,
     size: u32,
     value: u64,
@@ -350,7 +471,7 @@ pub fn dispatch_write(
         return MemTxResult::DECODE_ERROR;
     }
     let value = swap_if(value & mask_bytes(size), size, endian != ops.endianness());
-    write_adjusted(ops, offset, size, value, attrs)
+    write_adjusted(ops, name, guard, offset, size, value, attrs)
 }
 
 fn swap_if(v: u64, size: u32, swap: bool) -> u64 {
@@ -580,5 +701,37 @@ mod tests {
         assert!(seen.contains(
             &"Invalid write at addr 0x20, size 4, region 'pc.bios', reason: rejected\n".to_string()
         ));
+    }
+
+    #[test]
+    fn blocked_message_matches_qemu() {
+        assert_eq!(
+            blocked_message("msix-table", 0),
+            "Blocked re-entrant IO on MemoryRegion: msix-table at addr: 0x0"
+        );
+        assert_eq!(
+            blocked_message("regs", 0xab),
+            "Blocked re-entrant IO on MemoryRegion: regs at addr: 0xAB"
+        );
+    }
+
+    #[test]
+    fn guards_nest_per_owner() {
+        let (a, b) = (MemReentrancyGuard::new(), MemReentrancyGuard::new());
+        assert_ne!(a, b);
+        let outer = engage(Some(&a), "a", 0).unwrap();
+        let inner = engage(Some(&b), "b", 0).unwrap();
+        assert!(engage(Some(&a), "a", 4).is_none());
+        assert!(engage(Some(&b), "b", 4).is_none());
+        assert!(engage(None, "none", 0).is_some());
+        drop(inner);
+        assert!(engage(Some(&b), "b", 4).is_some());
+        assert!(engage(Some(&a), "a", 4).is_none());
+        drop(outer);
+        assert!(engage(Some(&a), "a", 4).is_some());
+        // Another thread starts with nothing engaged.
+        let _held = engage(Some(&a), "a", 0).unwrap();
+        let a2 = a.clone();
+        assert!(std::thread::spawn(move || engage(Some(&a2), "a", 0).is_some()).join().unwrap());
     }
 }

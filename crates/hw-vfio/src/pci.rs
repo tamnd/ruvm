@@ -2136,8 +2136,9 @@ impl<'a> Setup<'a> {
             state: Mutex::new(RomState::default()),
         };
         let mem = self.bus.memory();
+        let guard = self.dev.mem_reentrancy_guard();
         let rom = mem
-            .new_io(&format!("vfio[{name}].rom"), u128::from(size), Arc::new(ops))
+            .new_io_owned(&format!("vfio[{name}].rom"), u128::from(size), Arc::new(ops), guard)
             .map_err(mem_error)?;
         self.dev.register_bar(PCI_ROM_SLOT, PCI_BASE_ADDRESS_SPACE_MEMORY, rom);
         Ok(())
@@ -2172,8 +2173,14 @@ impl<'a> Setup<'a> {
             let bar =
                 mem.new_container(&format!("{name} base BAR {nr}"), size).map_err(mem_error)?;
             let ops = BarOps { shared: Arc::clone(&self.shared), nr, offset: self.bars[nr].offset };
-            let region =
-                mem.new_io(&format!("{name} BAR {nr}"), size, Arc::new(ops)).map_err(mem_error)?;
+            let region = mem
+                .new_io_owned(
+                    &format!("{name} BAR {nr}"),
+                    size,
+                    Arc::new(ops),
+                    self.dev.mem_reentrancy_guard(),
+                )
+                .map_err(mem_error)?;
             mem.add_subregion(bar, 0, region).map_err(mem_error)?;
             if let Err(e) = self.bar_mmap(nr, region) {
                 if let Some(e) = e {

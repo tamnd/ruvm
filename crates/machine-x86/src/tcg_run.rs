@@ -706,6 +706,8 @@ impl TcgMachine {
             let r = ms
                 .new_io("apic-msi", APIC_SPACE_SIZE.into(), bus.mmio())
                 .map_err(|e| e.to_string())?;
+            // apic_realize(): a write here can EOI the IOAPIC, which writes back to apic-msi.
+            ms.set_disable_reentrancy_guard(r, true).map_err(|e| e.to_string())?;
             ms.add_subregion_overlap(board.system_memory(), APIC_DEFAULT_ADDRESS, r, 0x1000)
                 .map_err(|e| e.to_string())?;
         }

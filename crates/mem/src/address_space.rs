@@ -17,8 +17,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use crate::access::{
-    Endian, MmioOps, Unassigned, dispatch_read, dispatch_write, guest_error, load_bytes,
-    memory_access_size, store_bytes,
+    Endian, MemReentrancyGuard, MmioOps, Unassigned, dispatch_read_guarded, dispatch_write_guarded,
+    guest_error, load_bytes, memory_access_size, store_bytes,
 };
 use crate::attrs::{MemTxAttrs, MemTxResult};
 use crate::flatview::{FlatRange, FlatView};
@@ -183,8 +183,8 @@ impl AddressSpace {
                     };
                 }
             }
-            let (ops, name) = slow_path(res.range);
-            dispatch_read(ops, name, res.offset, size, endian, attrs)
+            let (ops, name, guard) = slow_path(res.range);
+            dispatch_read_guarded(ops, name, guard, res.offset, size, endian, attrs)
         })
     }
 
@@ -207,8 +207,8 @@ impl AddressSpace {
                     return write_ram(range, res.offset, bytes);
                 }
             }
-            let (ops, name) = slow_path(res.range);
-            dispatch_write(ops, name, res.offset, size, value, endian, attrs)
+            let (ops, name, guard) = slow_path(res.range);
+            dispatch_write_guarded(ops, name, guard, res.offset, size, value, endian, attrs)
         })
     }
 
@@ -245,17 +245,20 @@ fn is_direct(range: &FlatRange, is_write: bool, attrs: MemTxAttrs) -> bool {
     }
 }
 
-/// The callbacks and name used when an access is not direct. RAM and reservations have the
-/// unassigned callbacks, as in QEMU, so a write to ROM is rejected with the ROM's name.
-fn slow_path(range: Option<&FlatRange>) -> (&dyn MmioOps, &str) {
+/// The callbacks, name and reentrancy guard used when an access is not direct. RAM and
+/// reservations have the unassigned callbacks, as in QEMU, so a write to ROM is rejected with the
+/// ROM's name.
+fn slow_path(range: Option<&FlatRange>) -> (&dyn MmioOps, &str, Option<&MemReentrancyGuard>) {
     static UNASSIGNED: Unassigned = Unassigned;
     match range {
-        None => (&UNASSIGNED, UNASSIGNED_NAME),
+        None => (&UNASSIGNED, UNASSIGNED_NAME, None),
         Some(r) => match &r.target.kind {
             TargetKind::Mmio(ops)
             | TargetKind::RomDevice(_, ops)
-            | TargetKind::RamDevice(_, ops) => (ops.as_ref(), r.name()),
-            _ => (&UNASSIGNED, r.name()),
+            | TargetKind::RamDevice(_, ops) => {
+                (ops.as_ref(), r.name(), r.target.reentrancy_guard(r.region_readonly))
+            }
+            _ => (&UNASSIGNED, r.name(), None),
         },
     }
 }
@@ -301,9 +304,9 @@ fn read_step(res: Resolved<'_>, attrs: MemTxAttrs, buf: &mut [u8]) -> (usize, Me
             };
         }
     }
-    let (ops, name) = slow_path(res.range);
+    let (ops, name, guard) = slow_path(res.range);
     let l = memory_access_size(ops, l, res.offset);
-    let (v, r) = dispatch_read(ops, name, res.offset, l, Endian::HOST, attrs);
+    let (v, r) = dispatch_read_guarded(ops, name, guard, res.offset, l, Endian::HOST, attrs);
     store_bytes(&mut buf[..l as usize], v, Endian::HOST);
     (l as usize, r)
 }
@@ -319,8 +322,9 @@ fn write_step(res: Resolved<'_>, attrs: MemTxAttrs, buf: &[u8]) -> (usize, MemTx
             return (l as usize, write_ram(range, res.offset, &buf[..l as usize]));
         }
     }
-    let (ops, name) = slow_path(res.range);
+    let (ops, name, guard) = slow_path(res.range);
     let l = memory_access_size(ops, l, res.offset);
     let v = load_bytes(&buf[..l as usize], Endian::HOST);
-    (l as usize, dispatch_write(ops, name, res.offset, l, v, Endian::HOST, attrs))
+    let r = dispatch_write_guarded(ops, name, guard, res.offset, l, v, Endian::HOST, attrs);
+    (l as usize, r)
 }

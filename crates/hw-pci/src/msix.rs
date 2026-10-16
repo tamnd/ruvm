@@ -367,10 +367,20 @@ impl PciDevice {
             s.wmask[c + MSIX_CONTROL_OFFSET] |= MSIX_ENABLE_MASK | MSIX_MASKALL_MASK;
 
             let table_mmio = mem
-                .new_io("msix-table", table_size.into(), Arc::new(TableOps(self.weak())))
+                .new_io_owned(
+                    "msix-table",
+                    table_size.into(),
+                    Arc::new(TableOps(self.weak())),
+                    self.mem_reentrancy_guard(),
+                )
                 .map_err(|e| Error::generic(e.to_string()))?;
             let pba_mmio = mem
-                .new_io("msix-pba", pba_size.into(), Arc::new(PbaOps(self.weak())))
+                .new_io_owned(
+                    "msix-pba",
+                    pba_size.into(),
+                    Arc::new(PbaOps(self.weak())),
+                    self.mem_reentrancy_guard(),
+                )
                 .map_err(|e| Error::generic(e.to_string()))?;
             s.msix = Some(Msix {
                 cap,

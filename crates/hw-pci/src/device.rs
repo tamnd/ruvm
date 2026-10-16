@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 
 use ruvm_base::Error;
 use ruvm_hw_core::IrqLine;
-use ruvm_mem::{MemorySystem, RegionId};
+use ruvm_mem::{MemReentrancyGuard, MemorySystem, RegionId};
 
 use crate::bus::PciBus;
 use crate::msix::{Msix, MsixVectorRelease, MsixVectorUse};
@@ -384,6 +384,7 @@ pub struct PciDevice {
     state: Mutex<DevState>,
     ops: RwLock<Option<Arc<dyn PciDeviceOps>>>,
     msi_trigger: RwLock<Option<MsiTrigger>>,
+    mem_reentrancy_guard: MemReentrancyGuard,
 }
 
 impl fmt::Debug for PciDevice {
@@ -468,6 +469,7 @@ impl PciDevice {
             state: Mutex::new(s),
             ops: RwLock::new(None),
             msi_trigger: RwLock::new(None),
+            mem_reentrancy_guard: MemReentrancyGuard::new(),
         })
     }
 
@@ -481,6 +483,13 @@ impl PciDevice {
 
     pub(crate) fn memory(&self) -> &Arc<MemorySystem> {
         &self.memory
+    }
+
+    /// `DeviceState::mem_reentrancy_guard`. Regions made with `new_io_owned()` and this guard
+    /// belong to the device, so an access from inside one of its callbacks to any of them is
+    /// blocked.
+    pub fn mem_reentrancy_guard(&self) -> &MemReentrancyGuard {
+        &self.mem_reentrancy_guard
     }
 
     /// `PCIDevice::name`.

@@ -12,9 +12,12 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::access::{AccessConstraints, AccessSize, Endian, MmioOps};
+use crate::access::{
+    AccessConstraints, AccessSize, Endian, MemReentrancyGuard, MmioOps, Unassigned,
+    dispatch_read_guarded, dispatch_write_guarded,
+};
 use crate::address_space::AddressSpace;
-use crate::attrs::{AccessCtx, MemResult, MemTxResult};
+use crate::attrs::{AccessCtx, MemResult, MemTxAttrs, MemTxResult};
 use crate::dirty::{DirtyClient, DirtySnapshot};
 use crate::error::MemError;
 use crate::flatview::{FlatView, RenderFlags, SPACE_END, dirty_log_mask, render};
@@ -145,6 +148,21 @@ impl fmt::Debug for MemorySystem {
     }
 }
 
+/// The callbacks `memory_region_dispatch_read()` calls for a region, and the reentrancy guard they
+/// run under. RAM, containers and reservations have `unassigned_mem_ops`.
+fn dispatch_ops(
+    target: &RegionTarget,
+    readonly: bool,
+) -> (&dyn MmioOps, Option<&MemReentrancyGuard>) {
+    static UNASSIGNED: Unassigned = Unassigned;
+    match &target.kind {
+        TargetKind::Mmio(ops) | TargetKind::RomDevice(_, ops) | TargetKind::RamDevice(_, ops) => {
+            (ops.as_ref(), target.reentrancy_guard(readonly))
+        }
+        _ => (&UNASSIGNED, None),
+    }
+}
+
 fn check_size(size: u128) -> Result<(), MemError> {
     if size > SPACE_END { Err(MemError::TooLarge(size)) } else { Ok(()) }
 }
@@ -208,10 +226,21 @@ impl MemorySystem {
         ty: RegionType,
         kind: TargetKind,
     ) -> Result<RegionId, MemError> {
+        self.create_owned(name, size, ty, kind, None)
+    }
+
+    fn create_owned(
+        &self,
+        name: &str,
+        size: u128,
+        ty: RegionType,
+        kind: TargetKind,
+        owner: Option<MemReentrancyGuard>,
+    ) -> Result<RegionId, MemError> {
         check_size(size)?;
         let mut g = self.lock();
         let id = g.arena.next_id();
-        let target = Arc::new(RegionTarget { id, name: name.to_string(), ty, kind });
+        let target = Arc::new(RegionTarget::new(id, name, ty, kind, owner));
         Ok(g.arena.insert(Node::new(target, size)))
     }
 
@@ -331,6 +360,86 @@ impl MemorySystem {
         self.create(name, size, RegionType::Mmio, TargetKind::Mmio(ops))
     }
 
+    /// A device region with an owner, `memory_region_init_io()` with the device as `owner`. While
+    /// a callback of one of the owner's regions runs, an access on the same thread to any region
+    /// with the same owner is blocked by the reentrancy guard.
+    pub fn new_io_owned(
+        &self,
+        name: &str,
+        size: u128,
+        ops: Arc<dyn MmioOps>,
+        owner: &MemReentrancyGuard,
+    ) -> Result<RegionId, MemError> {
+        self.create_owned(name, size, RegionType::Mmio, TargetKind::Mmio(ops), Some(owner.clone()))
+    }
+
+    /// Lets the callbacks of a region run while its owner is already in I/O, which is what
+    /// setting `mr->disable_reentrancy_guard` does.
+    pub fn set_disable_reentrancy_guard(
+        &self,
+        id: RegionId,
+        disable: bool,
+    ) -> Result<(), MemError> {
+        self.lock()
+            .arena
+            .node(id)?
+            .target
+            .disable_reentrancy_guard
+            .store(disable, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// `memory_region_dispatch_read()`: reads `size` bytes (1, 2, 4 or 8) at `offset` in a region,
+    /// through the region's checks and its reentrancy guard, and returns the value in `endian`
+    /// byte order. An alias reads its target. A region with no callbacks reads as unassigned.
+    pub fn dispatch_read(
+        &self,
+        id: RegionId,
+        offset: u64,
+        size: u32,
+        endian: Endian,
+        attrs: MemTxAttrs,
+    ) -> Result<(u64, MemTxResult), MemError> {
+        let (target, offset, readonly) = self.dispatch_target(id, offset)?;
+        let (ops, guard) = dispatch_ops(&target, readonly);
+        Ok(dispatch_read_guarded(ops, &target.name, guard, offset, size, endian, attrs))
+    }
+
+    /// `memory_region_dispatch_write()`, the write side of [`MemorySystem::dispatch_read`].
+    pub fn dispatch_write(
+        &self,
+        id: RegionId,
+        offset: u64,
+        size: u32,
+        value: u64,
+        endian: Endian,
+        attrs: MemTxAttrs,
+    ) -> Result<MemTxResult, MemError> {
+        let (target, offset, readonly) = self.dispatch_target(id, offset)?;
+        let (ops, guard) = dispatch_ops(&target, readonly);
+        Ok(dispatch_write_guarded(ops, &target.name, guard, offset, size, value, endian, attrs))
+    }
+
+    /// The region an access to `id` at `offset` ends up in, with aliases followed, and its own
+    /// readonly flag. The lock is not held while the callbacks run.
+    fn dispatch_target(
+        &self,
+        mut id: RegionId,
+        mut offset: u64,
+    ) -> Result<(Arc<RegionTarget>, u64, bool), MemError> {
+        let g = self.lock();
+        loop {
+            let n = g.arena.node(id)?;
+            match n.alias {
+                Some((target, alias_offset)) => {
+                    id = target;
+                    offset = alias_offset.wrapping_add(offset);
+                }
+                None => return Ok((Arc::clone(&n.target), offset, n.readonly)),
+            }
+        }
+    }
+
     /// A reservation, `memory_region_init_io()` with no callbacks: the range is claimed and
     /// accesses behave as unassigned.
     pub fn new_reservation(&self, name: &str, size: u128) -> Result<RegionId, MemError> {
@@ -359,12 +468,7 @@ impl MemorySystem {
         let mut g = self.lock();
         g.arena.node_mut(target)?.alias_users += 1;
         let id = g.arena.next_id();
-        let t = Arc::new(RegionTarget {
-            id,
-            name: name.to_string(),
-            ty: RegionType::Alias,
-            kind: TargetKind::Nothing,
-        });
+        let t = Arc::new(RegionTarget::new(id, name, RegionType::Alias, TargetKind::Nothing, None));
         let mut node = Node::new(t, size);
         node.alias = Some((target, offset));
         Ok(g.arena.insert(node))

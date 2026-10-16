@@ -4,8 +4,9 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::access::MmioOps;
+use crate::access::{MemReentrancyGuard, MmioOps};
 use crate::dirty::DirtyMask;
 use crate::error::MemError;
 use crate::iommu::IommuOps;
@@ -58,6 +59,10 @@ pub(crate) struct RegionTarget {
     pub(crate) name: String,
     pub(crate) ty: RegionType,
     pub(crate) kind: TargetKind,
+    /// The device the region belongs to, `mr->dev`.
+    pub(crate) owner: Option<MemReentrancyGuard>,
+    /// `mr->disable_reentrancy_guard`.
+    pub(crate) disable_reentrancy_guard: AtomicBool,
 }
 
 pub(crate) enum TargetKind {
@@ -71,6 +76,37 @@ pub(crate) enum TargetKind {
 }
 
 impl RegionTarget {
+    pub(crate) fn new(
+        id: RegionId,
+        name: &str,
+        ty: RegionType,
+        kind: TargetKind,
+        owner: Option<MemReentrancyGuard>,
+    ) -> Self {
+        RegionTarget {
+            id,
+            name: name.to_string(),
+            ty,
+            kind,
+            owner,
+            disable_reentrancy_guard: AtomicBool::new(false),
+        }
+    }
+
+    /// The guard an access to the region goes through, if any. As in `access_with_adjusted_size()`,
+    /// that is the owner's guard unless the region opted out or is RAM, a RAM device, a ROM
+    /// device or readonly.
+    pub(crate) fn reentrancy_guard(&self, readonly: bool) -> Option<&MemReentrancyGuard> {
+        let owner = self.owner.as_ref()?;
+        if self.ty != RegionType::Mmio
+            || readonly
+            || self.disable_reentrancy_guard.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        Some(owner)
+    }
+
     pub(crate) fn ram_block(&self) -> Option<&Arc<RamBlock>> {
         match &self.kind {
             TargetKind::Ram(b) | TargetKind::RomDevice(b, _) | TargetKind::RamDevice(b, _) => {
