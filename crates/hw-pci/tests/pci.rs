@@ -5,7 +5,7 @@
 //! accesses to the mapped BARs.
 
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use ruvm_hw_pci::regs::*;
 use ruvm_hw_pci::*;
@@ -933,6 +933,55 @@ fn msix_regions_belong_to_the_device() {
     env.mem_writel(0xfe00_1000, 0xfe00_0800);
     assert_eq!(own.take(), vec![(0, MemTxResult::ACCESS_ERROR)]);
     assert_eq!(env.mem_readl(0xfe00_000c), Some(1));
+}
+
+/// A BAR whose write of `n` reads vector `n`'s data word through the table back door, then
+/// writes 0x5a there.
+struct BackDoor {
+    dev: Weak<PciDevice>,
+    seen: Mutex<Vec<u64>>,
+}
+
+impl MmioOps for BackDoor {
+    fn read(&self, _cx: &AccessCtx, _offset: u64, _size: AccessSize) -> MemResult<u64> {
+        Ok(0)
+    }
+
+    fn write(&self, _cx: &AccessCtx, _offset: u64, _size: AccessSize, value: u64) -> MemResult<()> {
+        let dev = self.dev.upgrade().unwrap();
+        let v = dev.msix_table_dispatch_read(value * 16 + 8, 4, Endian::Little);
+        self.seen.lock().unwrap().push(v);
+        dev.msix_table_dispatch_write(value * 16 + 8, 4, 0x5a, Endian::Little);
+        Ok(())
+    }
+}
+
+#[test]
+fn msix_table_back_door_is_guarded() {
+    let env = Env::new();
+    let dev = env.device("msix", Some(pci_devfn(5, 0)));
+    let devfn = dev.devfn();
+    dev.msix_init_exclusive_bar(4, 1).unwrap();
+    dev.msix_set_message(1, MsiMessage { address: 0xfee0_1000, data: 0x31 });
+    let door = || Arc::new(BackDoor { dev: Arc::downgrade(&dev), seen: Mutex::default() });
+    let (own, other) = (door(), door());
+    let guard = dev.mem_reentrancy_guard();
+    let r0 = env.mem.new_io_owned("own", 0x1000, own.clone(), guard).unwrap();
+    let r3 = env.mem.new_io("other", 0x1000, other.clone()).unwrap();
+    dev.register_bar(0, PCI_BASE_ADDRESS_SPACE_MEMORY, r0);
+    dev.register_bar(3, PCI_BASE_ADDRESS_SPACE_MEMORY, r3);
+    env.iomap(devfn, 0, 0xfe00_1000);
+    env.iomap(devfn, 3, 0xfe00_2000);
+    env.writew(devfn, PCI_COMMAND as u8, PCI_COMMAND_MEMORY);
+
+    // From a region the device owns the table is out of reach, as for the RTL8168 quirk in
+    // QEMU: the read gives 0 and the write is dropped.
+    env.mem_writel(0xfe00_1000, 1);
+    assert_eq!(std::mem::take(&mut *own.seen.lock().unwrap()), vec![0]);
+    assert_eq!(dev.msix_get_message(1).data, 0x31);
+    env.mem_writel(0xfe00_2000, 1);
+    assert_eq!(std::mem::take(&mut *other.seen.lock().unwrap()), vec![0x31]);
+    assert_eq!(dev.msix_get_message(1).data, 0x5a);
 }
 
 fn take_calls(calls: &Mutex<Vec<String>>) -> Vec<String> {

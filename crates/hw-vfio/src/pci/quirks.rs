@@ -35,7 +35,8 @@ fn pci_is(s: &Setup<'_>, vendor: u16, device: u16) -> bool {
     s.vendor_id == vendor && s.device_id == device
 }
 
-/// Lays `ops` over BAR `nr` at `offset` as a region of `size` bytes with priority 1.
+/// Lays `ops` over BAR `nr` at `offset` as a region of `size` bytes with priority 1. The region
+/// belongs to the device, as `vfio_quirk_alloc()` regions do.
 fn add_quirk(
     s: &Setup<'_>,
     nr: usize,
@@ -48,7 +49,8 @@ fn add_quirk(
     // gets no quirk.
     let Some(bar) = s.regions[nr] else { return Ok(()) };
     let mem = s.bus.memory();
-    let region = mem.new_io(name, size, ops).map_err(mem_error)?;
+    let region =
+        mem.new_io_owned(name, size, ops, s.dev.mem_reentrancy_guard()).map_err(mem_error)?;
     mem.add_subregion_overlap(bar, offset, region, 1).map_err(mem_error)
 }
 
@@ -127,6 +129,11 @@ impl Rtl8168 {
 }
 
 /// `vfio_rtl_address_quirk`.
+///
+/// The two registers and the MSI-X table all belong to the device, so the table access a quirk
+/// makes from inside its own callback is blocked by the reentrancy guard, in QEMU 11.1 as here: a
+/// table write is dropped and a table read gives 0. The guest's write still never reaches the
+/// device.
 #[derive(Debug)]
 struct RtlAddress(Arc<Rtl8168>);
 

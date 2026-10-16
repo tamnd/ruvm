@@ -21,7 +21,6 @@ use std::sync::{Arc, Weak};
 use ruvm_base::Error;
 use ruvm_mem::{
     AccessConstraints, AccessCtx, AccessSize, Endian, MemResult, MemTxAttrs, MmioOps, RegionId,
-    dispatch_read, dispatch_write,
 };
 
 use crate::device::{DevState, Effect, Effects, MsiMessage, PciDevice};
@@ -493,25 +492,24 @@ impl PciDevice {
     }
 
     /// `memory_region_dispatch_read()` on `msix_table_mmio`, for a model with a back door into
-    /// the table, such as the RTL8168 quirk of vfio-pci. A device without MSI-X reads 0.
+    /// the table, such as the RTL8168 quirk of vfio-pci. The access goes through the region, so
+    /// from inside a callback of a region the device owns it is blocked and reads 0. A device
+    /// without MSI-X reads 0 too.
     pub fn msix_table_dispatch_read(&self, offset: u64, size: u32, endian: Endian) -> u64 {
-        let ops = TableOps(self.weak());
-        dispatch_read(&ops, "msix-table", offset, size, endian, MemTxAttrs::UNSPECIFIED).0
+        let table = self.lock().msix.as_ref().map(|m| m.table_mmio);
+        let Some(table) = table else { return 0 };
+        let r = self.memory().dispatch_read(table, offset, size, endian, MemTxAttrs::UNSPECIFIED);
+        r.map_or(0, |(v, _)| v)
     }
 
     /// `memory_region_dispatch_write()` on `msix_table_mmio`, the write side of
     /// [`PciDevice::msix_table_dispatch_read`].
     pub fn msix_table_dispatch_write(&self, offset: u64, size: u32, value: u64, endian: Endian) {
-        let ops = TableOps(self.weak());
-        let _ = dispatch_write(
-            &ops,
-            "msix-table",
-            offset,
-            size,
-            value,
-            endian,
-            MemTxAttrs::UNSPECIFIED,
-        );
+        let table = self.lock().msix.as_ref().map(|m| m.table_mmio);
+        if let Some(table) = table {
+            let attrs = MemTxAttrs::UNSPECIFIED;
+            let _ = self.memory().dispatch_write(table, offset, size, value, endian, attrs);
+        }
     }
 
     /// `msix_nr_vectors_allocated()`.
