@@ -237,11 +237,13 @@ impl Ich9Ahci {
         });
 
         let mem = bus.memory();
+        let guard = dev.mem_reentrancy_guard();
         let idp = mem
-            .new_io("ahci-idp", ICH9_IDP_SIZE, Arc::new(IdpOps(Arc::clone(&shared))))
+            .new_io_owned("ahci-idp", ICH9_IDP_SIZE, Arc::new(IdpOps(Arc::clone(&shared))), guard)
             .map_err(|e| Error::generic(format!("ahci-idp: {e}")))?;
+        let abar = Arc::new(AbarOps(Arc::clone(&shared)));
         let abar = mem
-            .new_io("ahci", u128::from(AHCI_MEM_BAR_SIZE), Arc::new(AbarOps(Arc::clone(&shared))))
+            .new_io_owned("ahci", u128::from(AHCI_MEM_BAR_SIZE), abar, guard)
             .map_err(|e| Error::generic(format!("ahci: {e}")))?;
         dev.register_bar(ICH9_IDP_BAR, PCI_BASE_ADDRESS_SPACE_IO, idp);
         dev.register_bar(ICH9_MEM_BAR, PCI_BASE_ADDRESS_SPACE_MEMORY, abar);

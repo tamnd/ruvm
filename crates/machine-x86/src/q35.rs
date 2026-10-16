@@ -99,7 +99,10 @@ use ruvm_hw_tpm::TpmBackend;
 use ruvm_hw_tpm::crb::{TPM_CRB_ADDR_BASE, TPM_CRB_CMD_SIZE, TPM_CRB_DATA_BUFFER, TpmCrb};
 use ruvm_hw_tpm::ppi::{TPM_PPI_ADDR_BASE, TPM_PPI_ADDR_SIZE, TpmPpi};
 use ruvm_hw_tpm::tis::{TPM_TIS_ADDR_BASE, TPM_TIS_ADDR_SIZE, TpmTis};
-use ruvm_mem::{AddressSpace, MemTxAttrs, MemorySystem, MmioOps, RamBlock, RegionId, RegionType};
+use ruvm_mem::{
+    AddressSpace, MemReentrancyGuard, MemTxAttrs, MemorySystem, MmioOps, RamBlock, RegionId,
+    RegionType,
+};
 
 use crate::ich9_lpc::{Ich9Lpc, Ich9LpcConfig, SmiHandler};
 use crate::microvm::props::OnOffAuto;
@@ -1014,13 +1017,16 @@ impl Q35 {
         let dma: Arc<dyn DmaMemory> = Arc::new(WeakDma(Arc::downgrade(&memory_as)));
         let fw_cfg = fw_cfg_init_io_dma(FW_CFG_IO_BASE, dma, &fw_cfg_cfg).map_err(err)?;
         {
+            // fw_cfg's DMA can reach its own registers, so its regions have an owner.
+            let g = MemReentrancyGuard::new();
             let comb = mem
-                .new_io("fwcfg", FW_CFG_CTL_SIZE.into(), fw_cfg.comb_ops().clone())
+                .new_io_owned("fwcfg", FW_CFG_CTL_SIZE.into(), fw_cfg.comb_ops().clone(), &g)
                 .map_err(err)?;
             mem.add_subregion(io, FW_CFG_IO_BASE.into(), comb).map_err(err)?;
             if let Some(d) = fw_cfg.dma_ops() {
-                let dma =
-                    mem.new_io("fwcfg.dma", FW_CFG_DMA_SIZE.into(), d.clone()).map_err(err)?;
+                let dma = mem
+                    .new_io_owned("fwcfg.dma", FW_CFG_DMA_SIZE.into(), d.clone(), &g)
+                    .map_err(err)?;
                 mem.add_subregion(io, u64::from(FW_CFG_IO_BASE) + 4, dma).map_err(err)?;
             }
         }
@@ -2032,7 +2038,12 @@ impl Q35 {
     pub fn attach_intel_iommu(&self, iommu: &Arc<IntelIommu>) -> Result<(), String> {
         let r = self
             .mem
-            .new_io("intel_iommu", u128::from(DMAR_REG_SIZE), iommu.mmio_ops())
+            .new_io_owned(
+                "intel_iommu",
+                u128::from(DMAR_REG_SIZE),
+                iommu.mmio_ops(),
+                &MemReentrancyGuard::new(),
+            )
             .map_err(err)?;
         self.mem.add_subregion(self.system, DMAR_REG_BASE, r).map_err(err)?;
         let msi = Arc::clone(&self.msi);
@@ -2088,7 +2099,12 @@ impl Q35 {
         iommu.set_pci(Arc::new(AmdviPciFunction { dev, iommu: Arc::downgrade(iommu) }));
         let r = self
             .mem
-            .new_io("amdvi-mmio", u128::from(AMDVI_MMIO_SIZE), iommu.mmio_ops())
+            .new_io_owned(
+                "amdvi-mmio",
+                u128::from(AMDVI_MMIO_SIZE),
+                iommu.mmio_ops(),
+                &MemReentrancyGuard::new(),
+            )
             .map_err(err)?;
         self.mem.add_subregion(self.system, AMDVI_BASE_ADDR, r).map_err(err)?;
         let msi = Arc::clone(&self.msi);
