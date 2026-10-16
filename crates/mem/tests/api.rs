@@ -3,14 +3,14 @@
 //! End to end tests of the memory API: rendering rules, dispatch through address spaces,
 //! listener ordering and dirty tracking.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ruvm_mem::{
     AccessConstraints, AccessCtx, AccessSize, AddressSpace, DirtyClient, DirtyMask, Endian,
     FlatRange, GLOBAL_DIRTY_MIGRATION, IommuAccessFlags, IommuNotifier, IommuNotifierFlag,
-    IommuNotifiers, IommuOps, IommuTlbEntry, IommuTlbEvent, MemError, MemResult, MemTxAttrs,
-    MemTxResult, MemoryConfig, MemoryListener, MemorySystem, MmioOps, RegionId,
-    register_iommu_notifier, unregister_iommu_notifier,
+    IommuNotifiers, IommuOps, IommuTlbEntry, IommuTlbEvent, MemError, MemReentrancyGuard,
+    MemResult, MemTxAttrs, MemTxResult, MemoryConfig, MemoryListener, MemorySystem, MmioOps,
+    RegionId, register_iommu_notifier, unregister_iommu_notifier,
 };
 
 const U: MemTxAttrs = MemTxAttrs::UNSPECIFIED;
@@ -230,6 +230,130 @@ fn load_and_store_do_not_split() {
     assert_eq!(dev.take(), vec![('r', 8, 8, 0)]);
     // Past the end of RAM the whole access goes to the unassigned callbacks.
     assert_eq!(space.load(0xffe, 4, Endian::Little, U), (0, MemTxResult::DECODE_ERROR));
+}
+
+/// A device whose register write is a DMA address: it loads 4 bytes from there, stores 0x99 four
+/// bytes on, and keeps what both returned.
+#[derive(Default)]
+struct Dma {
+    space: OnceLock<Arc<AddressSpace>>,
+    seen: Mutex<Vec<(u64, MemTxResult, MemTxResult)>>,
+}
+
+impl Dma {
+    fn take(&self) -> Vec<(u64, MemTxResult, MemTxResult)> {
+        std::mem::take(&mut self.seen.lock().unwrap())
+    }
+}
+
+impl MmioOps for Dma {
+    fn read(&self, _cx: &AccessCtx, offset: u64, _size: AccessSize) -> MemResult<u64> {
+        Ok(0x40 + offset)
+    }
+    fn write(&self, _cx: &AccessCtx, _offset: u64, _size: AccessSize, value: u64) -> MemResult<()> {
+        let space = self.space.get().unwrap();
+        let (v, r) = space.load(value, 4, Endian::Little, U);
+        let w = space.store(value + 4, 4, 0x99, Endian::Little, U);
+        self.seen.lock().unwrap().push((v, r, w));
+        Ok(())
+    }
+}
+
+#[test]
+fn reentrancy_guard_blocks_the_owner_only() {
+    let (sys, root, space) = setup();
+    let (a, b) = (MemReentrancyGuard::new(), MemReentrancyGuard::new());
+    let dma = Arc::new(Dma::default());
+    let _ = dma.space.set(Arc::clone(&space));
+    let devs: Vec<Arc<Dev>> = (0..5).map(|_| Arc::new(Dev::default())).collect();
+    let regs = sys.new_io_owned("regs", 0x100, dma.clone(), &a).unwrap();
+    let same = sys.new_io_owned("same", 0x100, devs[0].clone(), &a).unwrap();
+    let open = sys.new_io_owned("open", 0x100, devs[1].clone(), &a).unwrap();
+    sys.set_disable_reentrancy_guard(open, true).unwrap();
+    let ro = sys.new_io_owned("ro", 0x100, devs[2].clone(), &a).unwrap();
+    sys.set_readonly(ro, true).unwrap();
+    let other = sys.new_io_owned("other", 0x100, devs[3].clone(), &b).unwrap();
+    let plain = sys.new_io("plain", 0x100, devs[4].clone()).unwrap();
+    let ram = sys.new_ram("ram", 0x1000).unwrap();
+    for (n, r) in [regs, same, open, ro, other, plain, ram].into_iter().enumerate() {
+        sys.add_subregion(root, 0x1000 * (n as u64 + 1), r).unwrap();
+    }
+    for n in 1..=7 {
+        assert_eq!(space.store(0x1000, 4, 0x1000 * n + 8, Endian::Little, U), MemTxResult::OK);
+    }
+    // The device's own region and its sibling are blocked both ways, and a blocked read is 0.
+    // A region that opted out, a readonly one, another device's, one with no owner and RAM are
+    // reached as usual.
+    let (ok, blocked) = (MemTxResult::OK, MemTxResult::ACCESS_ERROR);
+    assert_eq!(
+        dma.take(),
+        vec![
+            (0, blocked, blocked),
+            (0, blocked, blocked),
+            (0x48, ok, ok),
+            (0x48, ok, ok),
+            (0x48, ok, ok),
+            (0x48, ok, ok),
+            (0, ok, ok),
+        ]
+    );
+    assert!(devs[0].take().is_empty());
+    for d in &devs[1..] {
+        assert_eq!(d.take(), vec![('r', 8, 4, 0), ('w', 12, 4, 0x99)]);
+    }
+    // The guard lets go once the access is over, also through the buffer path.
+    assert_eq!(space.load(0x1004, 4, Endian::Little, U), (0x44, ok));
+    assert_eq!(space.write(0x1000, U, &0x2008u32.to_le_bytes()), ok);
+    assert_eq!(dma.take(), vec![(0, blocked, blocked)]);
+    assert_eq!(space.read_u32(0x2004, U), (0x44, ok));
+}
+
+#[test]
+fn region_dispatch_follows_aliases_and_the_guard() {
+    let (sys, root, space) = setup();
+    let g = MemReentrancyGuard::new();
+    let dev = Arc::new(Dev::default());
+    let regs = sys.new_io_owned("regs", 0x100, dev.clone(), &g).unwrap();
+    let alias = sys.new_alias("regs-alias", regs, 0x10, 0x20).unwrap();
+    assert_eq!(sys.dispatch_read(alias, 4, 4, Endian::Little, U).unwrap(), (0x54, MemTxResult::OK));
+    assert_eq!(sys.dispatch_write(regs, 8, 2, 0x1234, Endian::Big, U).unwrap(), MemTxResult::OK);
+    assert_eq!(dev.take(), vec![('r', 0x14, 4, 0), ('w', 8, 2, 0x3412)]);
+    // A region with no callbacks reads as unassigned, and a stale id is refused.
+    let ram = sys.new_ram("ram", 0x1000).unwrap();
+    let r = sys.dispatch_read(ram, 0, 4, Endian::Little, U).unwrap();
+    assert_eq!(r, (0, MemTxResult::DECODE_ERROR));
+    let gone = sys.new_io_owned("gone", 0x100, dev.clone(), &g).unwrap();
+    sys.destroy_region(gone).unwrap();
+    assert!(sys.dispatch_read(gone, 0, 4, Endian::Little, U).is_err());
+
+    // From inside a callback of the same owner, region dispatch is blocked too.
+    struct Back(Arc<MemorySystem>, RegionId, Mutex<Vec<(u64, MemTxResult)>>);
+    impl MmioOps for Back {
+        fn read(&self, _cx: &AccessCtx, offset: u64, _size: AccessSize) -> MemResult<u64> {
+            let r = self.0.dispatch_read(self.1, offset, 4, Endian::Little, U).unwrap();
+            self.2.lock().unwrap().push(r);
+            Ok(r.0)
+        }
+        fn write(
+            &self,
+            _cx: &AccessCtx,
+            _offset: u64,
+            _size: AccessSize,
+            _v: u64,
+        ) -> MemResult<()> {
+            Ok(())
+        }
+    }
+    let sys = Arc::new(sys);
+    let back = Arc::new(Back(Arc::clone(&sys), regs, Mutex::new(Vec::new())));
+    let front = sys.new_io_owned("front", 0x100, back.clone(), &g).unwrap();
+    sys.add_subregion(root, 0x1000, front).unwrap();
+    assert_eq!(space.load(0x1004, 4, Endian::Little, U), (0, MemTxResult::OK));
+    assert_eq!(std::mem::take(&mut *back.2.lock().unwrap()), vec![(0, MemTxResult::ACCESS_ERROR)]);
+    assert!(dev.take().is_empty());
+    sys.set_disable_reentrancy_guard(regs, true).unwrap();
+    assert_eq!(space.load(0x1004, 4, Endian::Little, U), (0x44, MemTxResult::OK));
+    assert_eq!(dev.take(), vec![('r', 4, 4, 0)]);
 }
 
 #[test]

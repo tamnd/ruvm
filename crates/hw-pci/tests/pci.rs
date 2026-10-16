@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use ruvm_hw_pci::regs::*;
 use ruvm_hw_pci::*;
 use ruvm_mem::{
-    AccessCtx, AccessSize, AddressSpace, Endian, MemResult, MemTxAttrs, MemorySystem, MmioOps,
-    RegionId,
+    AccessCtx, AccessSize, AddressSpace, Endian, MemResult, MemTxAttrs, MemTxResult, MemorySystem,
+    MmioOps, RegionId,
 };
 
 const ATTRS: MemTxAttrs = MemTxAttrs::UNSPECIFIED;
@@ -879,6 +879,60 @@ fn msix_table_pba_and_masking() {
     dev.msix_uninit();
     assert!(!dev.msix_present());
     assert_eq!(dev.msix_cap(), 0);
+}
+
+/// A BAR whose write loads the 32 bit word at the address written, as a device doing DMA to its
+/// own MSI-X table would.
+struct Peek {
+    space: Arc<AddressSpace>,
+    seen: Mutex<Vec<(u64, MemTxResult)>>,
+}
+
+impl Peek {
+    fn take(&self) -> Vec<(u64, MemTxResult)> {
+        std::mem::take(&mut *self.seen.lock().unwrap())
+    }
+}
+
+impl MmioOps for Peek {
+    fn read(&self, _cx: &AccessCtx, _offset: u64, _size: AccessSize) -> MemResult<u64> {
+        Ok(0)
+    }
+
+    fn write(&self, _cx: &AccessCtx, _offset: u64, _size: AccessSize, value: u64) -> MemResult<()> {
+        let r = self.space.load(value, 4, Endian::Little, ATTRS);
+        self.seen.lock().unwrap().push(r);
+        Ok(())
+    }
+}
+
+#[test]
+fn msix_regions_belong_to_the_device() {
+    let env = Env::new();
+    let dev = env.device("msix", Some(pci_devfn(5, 0)));
+    let devfn = dev.devfn();
+    dev.msix_init_exclusive_bar(4, 1).unwrap();
+    let peek = || Arc::new(Peek { space: Arc::clone(&env.mem_as), seen: Mutex::default() });
+    let (own, other) = (peek(), peek());
+    let guard = dev.mem_reentrancy_guard();
+    let r0 = env.mem.new_io_owned("own", 0x1000, own.clone(), guard).unwrap();
+    let r3 = env.mem.new_io("other", 0x1000, other.clone()).unwrap();
+    dev.register_bar(0, PCI_BASE_ADDRESS_SPACE_MEMORY, r0);
+    dev.register_bar(3, PCI_BASE_ADDRESS_SPACE_MEMORY, r3);
+    env.iomap(devfn, 1, 0xfe00_0000);
+    env.iomap(devfn, 0, 0xfe00_1000);
+    env.iomap(devfn, 3, 0xfe00_2000);
+    env.writew(devfn, PCI_COMMAND as u8, PCI_COMMAND_MEMORY);
+
+    // Vector 0's control word, masked, through a region the device owns and one it does not.
+    env.mem_writel(0xfe00_1000, 0xfe00_000c);
+    env.mem_writel(0xfe00_2000, 0xfe00_000c);
+    assert_eq!(own.take(), vec![(0, MemTxResult::ACCESS_ERROR)]);
+    assert_eq!(other.take(), vec![(1, MemTxResult::OK)]);
+    // The PBA is the device's too.
+    env.mem_writel(0xfe00_1000, 0xfe00_0800);
+    assert_eq!(own.take(), vec![(0, MemTxResult::ACCESS_ERROR)]);
+    assert_eq!(env.mem_readl(0xfe00_000c), Some(1));
 }
 
 fn take_calls(calls: &Mutex<Vec<String>>) -> Vec<String> {

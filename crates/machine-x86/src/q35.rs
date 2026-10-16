@@ -1296,6 +1296,8 @@ impl Q35 {
             let hp = HpetProperties { intcap: Q35_HPET_INTCAP, ..HpetProperties::default() };
             let h = Hpet::realize(&clock, hp, &mut hpet_fw, HPET_BASE).map_err(err)?;
             let r = mem.new_io("hpet", HPET_LEN.into(), h.clone()).map_err(err)?;
+            // hpet_init() calls memory_region_enable_lockless_io(), which drops the guard.
+            mem.set_disable_reentrancy_guard(r, true).map_err(err)?;
             mem.add_subregion(system, HPET_BASE, r).map_err(err)?;
             for (i, line) in gsi.iter().enumerate() {
                 h.irq(i).connect(line.clone());

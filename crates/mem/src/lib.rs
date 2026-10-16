@@ -40,8 +40,10 @@
 //! # Not done yet
 //!
 //! Incremental rendering, the per thread lookup cache, ioeventfd and coalesced MMIO, RAM device
-//! regions, host mapped RAM with the guest pointer types of spec/05, bounce buffers and the
-//! reentrancy guard for devices all come later. IOMMU regions have no generic replay.
+//! regions, host mapped RAM with the guest pointer types of spec/05 and bounce buffers all come
+//! later. IOMMU regions have no generic replay. The reentrancy guard covers MMIO dispatch, as
+//! `access_with_adjusted_size()` does. Guarding bottom halves, timers and network delivery
+//! comes later too.
 
 #![forbid(unsafe_code)]
 
@@ -60,8 +62,8 @@ mod region;
 mod system;
 
 pub use access::{
-    AccessConstraints, AccessSize, Endian, GuestErrorSink, MmioOps, access_valid, dispatch_read,
-    dispatch_write, memory_access_size, set_guest_error_log,
+    AccessConstraints, AccessSize, Endian, GuestErrorSink, MemReentrancyGuard, MmioOps,
+    access_valid, dispatch_read, dispatch_write, memory_access_size, set_guest_error_log,
 };
 pub use address_space::AddressSpace;
 pub use attrs::{

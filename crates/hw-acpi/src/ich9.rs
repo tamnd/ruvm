@@ -365,6 +365,8 @@ impl Ich9Pm {
     ) -> Result<RegionId, MemError> {
         let c = mem.new_container("ich9-pm", u128::from(ICH9_PMIO_SIZE))?;
         let tmr = mem.new_io("acpi-tmr", u128::from(ACPI_PM_TMR_LEN), self.acpi.tmr_ops())?;
+        // acpi_pm_tmr_init() makes the timer lockless, which drops the guard.
+        mem.set_disable_reentrancy_guard(tmr, true)?;
         mem.add_subregion(c, ICH9_PMIO_PM1_TMR, tmr)?;
         let evt = mem.new_io("acpi-evt", u128::from(ACPI_PM1_EVT_LEN), self.acpi.evt_ops())?;
         mem.add_subregion(c, ICH9_PMIO_PM1_STS, evt)?;
