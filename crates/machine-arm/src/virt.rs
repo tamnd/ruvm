@@ -153,8 +153,8 @@ use ruvm_hw_virtio::virtio::VIRTIO_F_IOMMU_PLATFORM;
 use ruvm_hw_virtio::{VirtioBackend, VirtioDeviceClass, VirtioMmio, VirtioPci, VirtioPciProps};
 use ruvm_jit::{Cpu, CpuShared, Jit, Vcpu};
 use ruvm_mem::{
-    AccessConstraints, AccessCtx, AccessSize, AddressSpace, Endian, MemResult, MemTxAttrs,
-    MemorySystem, MmioOps, RamBlock, RegionId, RegionType,
+    AccessConstraints, AccessCtx, AccessSize, AddressSpace, Endian, MemReentrancyGuard, MemResult,
+    MemTxAttrs, MemorySystem, MmioOps, RamBlock, RegionId, RegionType,
 };
 use ruvm_target_arm::cpu::{ArmCpuModel, CpuArmState};
 use ruvm_target_arm::tcg::{Arm, PsciConduit, SemihostingHost, TagMemory, create_vcpu};
@@ -1354,15 +1354,18 @@ impl VirtMachine {
                 },
                 Some(&memory_as),
             )?;
-            let r =
-                mem.new_io("gicv3_dist", GICV3_DIST_SIZE.into(), gic.dist_ops()).map_err(err)?;
+            // The redistributors read the LPI tables, so the GIC's regions have an owner.
+            let g = MemReentrancyGuard::new();
+            let r = mem
+                .new_io_owned("gicv3_dist", GICV3_DIST_SIZE.into(), gic.dist_ops(), &g)
+                .map_err(err)?;
             mem.add_subregion(system, VIRT_GIC_DIST, r).map_err(err)?;
             let redist_bases = [Some(VIRT_GIC_REDIST), redist2.map(|r| r.base)];
             for (i, base) in redist_bases.into_iter().enumerate() {
                 let Some(base) = base else { continue };
                 let name = format!("gicv3_redist_region[{i}]");
                 let r = mem
-                    .new_io(&name, gic.redist_region_size(i).into(), gic.redist_ops(i))
+                    .new_io_owned(&name, gic.redist_region_size(i).into(), gic.redist_ops(i), &g)
                     .map_err(err)?;
                 mem.add_subregion(system, base, r).map_err(err)?;
             }
@@ -1375,11 +1378,13 @@ impl VirtMachine {
         let (its, msi_phandle) = if let (true, VirtGic::V3(g)) = (its_on, &gic) {
             let its = GicV3Its::new(g)?;
             let main = mem.new_container("gicv3_its", ITS_SIZE.into()).map_err(err)?;
-            let r =
-                mem.new_io("control", ITS_CONTROL_SIZE.into(), its.control_ops()).map_err(err)?;
+            let owner = MemReentrancyGuard::new();
+            let r = mem
+                .new_io_owned("control", ITS_CONTROL_SIZE.into(), its.control_ops(), &owner)
+                .map_err(err)?;
             mem.add_subregion(main, 0, r).map_err(err)?;
             let r = mem
-                .new_io("translation", ITS_TRANS_SIZE.into(), its.translation_ops())
+                .new_io_owned("translation", ITS_TRANS_SIZE.into(), its.translation_ops(), &owner)
                 .map_err(err)?;
             mem.add_subregion(main, ITS_CONTROL_SIZE, r).map_err(err)?;
             mem.add_subregion(system, VIRT_GIC_ITS, main).map_err(err)?;
@@ -1514,7 +1519,9 @@ impl VirtMachine {
         let smmu = if cfg.iommu == VirtIommu::SmmuV3 {
             let irqs = std::array::from_fn(|i| spi(VIRT_SMMU_IRQ + i as u32));
             let smmu = SmmuV3::new(SmmuStage::Nested, &memory_as, irqs);
-            let r = mem.new_io("smmuv3", SMMU_SIZE.into(), smmu.mmio_ops()).map_err(err)?;
+            let g = MemReentrancyGuard::new();
+            let r =
+                mem.new_io_owned("smmuv3", SMMU_SIZE.into(), smmu.mmio_ops(), &g).map_err(err)?;
             mem.add_subregion(system, VIRT_SMMU, r).map_err(err)?;
             let iommu_map = !cfg.default_bus_bypass_iommu;
             dt::create_smmu(&mut fdt, VIRT_SMMU, VIRT_SMMU_IRQ, iommu_map)?;
@@ -1587,8 +1594,9 @@ impl VirtMachine {
                 transport: RwLock::new(Arc::new(t)),
                 plugged: RwLock::new(false),
             });
+            let g = MemReentrancyGuard::new();
             let r = mem
-                .new_io("virtio-mmio", VIRTIO_MMIO_REGION_SIZE.into(), slot.clone())
+                .new_io_owned("virtio-mmio", VIRTIO_MMIO_REGION_SIZE.into(), slot.clone(), &g)
                 .map_err(err)?;
             mem.add_subregion(system, VIRT_MMIO + i as u64 * VIRT_MMIO_SIZE, r).map_err(err)?;
             virtio.push(slot);
@@ -1600,13 +1608,16 @@ impl VirtMachine {
         let fw_cfg = fw_cfg_init_mem_dma(VIRT_FW_CFG, dma, &cfg.fw_cfg).map_err(err)?;
         fw_cfg.state().add_i16(FW_CFG_NB_CPUS, smp as u16);
         let (ctl, data, dma_addr) = fw_cfg.addrs();
-        let r = mem.new_io("fwcfg.ctl", FW_CFG_CTL_SIZE.into(), fw_cfg.ctl_ops().clone());
+        let g = MemReentrancyGuard::new();
+        let r = mem.new_io_owned("fwcfg.ctl", FW_CFG_CTL_SIZE.into(), fw_cfg.ctl_ops().clone(), &g);
         mem.add_subregion(system, ctl, r.map_err(err)?).map_err(err)?;
         let data_size = fw_cfg.data_ops().region_size();
-        let r = mem.new_io("fwcfg.data", data_size.into(), fw_cfg.data_ops().clone());
+        let r = mem.new_io_owned("fwcfg.data", data_size.into(), fw_cfg.data_ops().clone(), &g);
         mem.add_subregion(system, data, r.map_err(err)?).map_err(err)?;
         if let Some(d) = fw_cfg.dma_ops() {
-            let r = mem.new_io("fwcfg.dma", FW_CFG_DMA_SIZE.into(), d.clone()).map_err(err)?;
+            let r = mem
+                .new_io_owned("fwcfg.dma", FW_CFG_DMA_SIZE.into(), d.clone(), &g)
+                .map_err(err)?;
             mem.add_subregion(system, dma_addr, r).map_err(err)?;
         }
         dt::add_fw_cfg_node(&mut fdt)?;
@@ -1952,7 +1963,9 @@ impl VirtMachine {
             spi_line(&self.gic, self.spi_sink.as_ref(), VIRT_PLATFORM_BUS_IRQ + i as u32)
         });
         let smmu = SmmuV3::new(props.stages(), &self.memory_as, irqs);
-        let r = self.mem.new_io("arm-smmuv3", SMMU_SIZE.into(), smmu.mmio_ops()).map_err(err)?;
+        let g = MemReentrancyGuard::new();
+        let r = self.mem.new_io_owned("arm-smmuv3", SMMU_SIZE.into(), smmu.mmio_ops(), &g);
+        let r = r.map_err(err)?;
         self.mem.add_subregion(self.pbus, 0, r).map_err(err)?;
         let _ = self.dev_smmu.set(smmu);
         Ok(())

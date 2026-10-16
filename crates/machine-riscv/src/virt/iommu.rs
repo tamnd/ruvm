@@ -13,7 +13,7 @@ use ruvm_hw_pci::regs::{
     PCI_BASE_ADDRESS_MEM_TYPE_64, PCI_BASE_ADDRESS_SPACE_MEMORY, PCI_VENDOR_ID_REDHAT,
 };
 use ruvm_hw_pci::{MsixLayout, PciBus, PciDevice, PciDeviceInfo};
-use ruvm_mem::AddressSpace;
+use ruvm_mem::{AddressSpace, MemReentrancyGuard};
 
 /// `TYPE_RISCV_IOMMU_PCI`.
 pub const TYPE_RISCV_IOMMU_PCI: &str = "riscv-iommu-pci";
@@ -87,7 +87,12 @@ pub(crate) fn riscv_iommu_pci_realize(
     let bar0 =
         mem.new_container("riscv-iommu-bar0", RISCV_IOMMU_REG_SIZE.into()).map_err(mem_err)?;
     let regs = mem
-        .new_io("riscv-iommu-regs", RISCV_IOMMU_REG_SIZE.into(), iommu.mmio_ops())
+        .new_io_owned(
+            "riscv-iommu-regs",
+            RISCV_IOMMU_REG_SIZE.into(),
+            iommu.mmio_ops(),
+            &MemReentrancyGuard::new(),
+        )
         .map_err(mem_err)?;
     mem.add_subregion(bar0, 0, regs).map_err(mem_err)?;
 

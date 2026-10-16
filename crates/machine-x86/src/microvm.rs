@@ -58,8 +58,8 @@ use ruvm_hw_timer::mc146818::{Mc146818Props, Mc146818Rtc};
 use ruvm_hw_virtio::mmio::{VIRTIO_MMIO_FORCE_LEGACY_DEFAULT, VIRTIO_MMIO_REGION_SIZE};
 use ruvm_hw_virtio::{VirtioBackend, VirtioDeviceClass, VirtioMmio};
 use ruvm_mem::{
-    AccessConstraints, AccessCtx, AccessSize, AddressSpace, Endian, MemResult, MemTxAttrs,
-    MemorySystem, MmioOps, RamBlock, RegionId, RegionType,
+    AccessConstraints, AccessCtx, AccessSize, AddressSpace, Endian, MemReentrancyGuard, MemResult,
+    MemTxAttrs, MemorySystem, MmioOps, RamBlock, RegionId, RegionType,
 };
 use ruvm_virtio_queue::{GuestMemory, MemoryError};
 
@@ -468,13 +468,16 @@ impl Microvm {
         let dma: Arc<dyn DmaMemory> = Arc::new(WeakDma(Arc::downgrade(&memory_as)));
         let fw_cfg = fw_cfg_init_io_dma(FW_CFG_IO_BASE, dma, &fw_cfg_cfg).map_err(err)?;
         {
+            // fw_cfg's DMA can reach its own registers, so its regions have an owner.
+            let g = MemReentrancyGuard::new();
             let comb = mem
-                .new_io("fwcfg", FW_CFG_CTL_SIZE.into(), fw_cfg.comb_ops().clone())
+                .new_io_owned("fwcfg", FW_CFG_CTL_SIZE.into(), fw_cfg.comb_ops().clone(), &g)
                 .map_err(err)?;
             mem.add_subregion(io, FW_CFG_IO_BASE.into(), comb).map_err(err)?;
             if let Some(d) = fw_cfg.dma_ops() {
-                let dma =
-                    mem.new_io("fwcfg.dma", FW_CFG_DMA_SIZE.into(), d.clone()).map_err(err)?;
+                let dma = mem
+                    .new_io_owned("fwcfg.dma", FW_CFG_DMA_SIZE.into(), d.clone(), &g)
+                    .map_err(err)?;
                 mem.add_subregion(io, u64::from(FW_CFG_IO_BASE) + 4, dma).map_err(err)?;
             }
         }
@@ -638,8 +641,9 @@ impl Microvm {
                 transport: RwLock::new(Arc::new(t)),
                 plugged: RwLock::new(false),
             });
+            let g = MemReentrancyGuard::new();
             let r = mem
-                .new_io("virtio-mmio", VIRTIO_MMIO_REGION_SIZE.into(), slot.clone())
+                .new_io_owned("virtio-mmio", VIRTIO_MMIO_REGION_SIZE.into(), slot.clone(), &g)
                 .map_err(err)?;
             mem.add_subregion(system, VIRTIO_MMIO_BASE + u64::from(i) * VIRTIO_MMIO_STRIDE, r)
                 .map_err(err)?;

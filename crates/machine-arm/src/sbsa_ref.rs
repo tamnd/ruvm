@@ -71,8 +71,8 @@ use ruvm_hw_timer::pl031::{PL031_MMIO_SIZE, Pl031};
 use ruvm_hw_virtio::{VirtioDeviceClass, VirtioPci, VirtioPciProps};
 use ruvm_jit::{Cpu, Jit, Vcpu};
 use ruvm_mem::{
-    AccessConstraints, AccessCtx, AccessSize, AddressSpace, MemResult, MemTxAttrs, MemorySystem,
-    MmioOps, RegionId,
+    AccessConstraints, AccessCtx, AccessSize, AddressSpace, MemReentrancyGuard, MemResult,
+    MemTxAttrs, MemorySystem, MmioOps, RegionId,
 };
 use ruvm_target_arm::cpu::{ArmCpuModel, CpuArmState};
 use ruvm_target_arm::tcg::{Arm, PsciConduit, create_vcpu};
@@ -506,18 +506,20 @@ impl SbsaRefMachine {
             },
             Some(&memory_as),
         )?;
-        let r = mem.new_io("gicv3_dist", GICV3_DIST_SIZE.into(), gic.dist_ops()).map_err(err)?;
-        mem.add_subregion(system, SBSA_GIC_DIST, r).map_err(err)?;
-        let r = mem
-            .new_io("gicv3_redist_region[0]", gic.redist_region_size(0).into(), gic.redist_ops(0))
-            .map_err(err)?;
+        let g = MemReentrancyGuard::new();
+        let r = mem.new_io_owned("gicv3_dist", GICV3_DIST_SIZE.into(), gic.dist_ops(), &g);
+        mem.add_subregion(system, SBSA_GIC_DIST, r.map_err(err)?).map_err(err)?;
+        let size = gic.redist_region_size(0).into();
+        let r = mem.new_io_owned("gicv3_redist_region[0]", size, gic.redist_ops(0), &g);
+        let r = r.map_err(err)?;
         mem.add_subregion(system, SBSA_GIC_REDIST, r).map_err(err)?;
         let its = GicV3Its::new(&gic)?;
         let main = mem.new_container("gicv3_its", ITS_SIZE.into()).map_err(err)?;
-        let r = mem.new_io("control", ITS_CONTROL_SIZE.into(), its.control_ops()).map_err(err)?;
-        mem.add_subregion(main, 0, r).map_err(err)?;
-        let r =
-            mem.new_io("translation", ITS_TRANS_SIZE.into(), its.translation_ops()).map_err(err)?;
+        let g = MemReentrancyGuard::new();
+        let r = mem.new_io_owned("control", ITS_CONTROL_SIZE.into(), its.control_ops(), &g);
+        mem.add_subregion(main, 0, r.map_err(err)?).map_err(err)?;
+        let r = mem.new_io_owned("translation", ITS_TRANS_SIZE.into(), its.translation_ops(), &g);
+        let r = r.map_err(err)?;
         mem.add_subregion(main, ITS_CONTROL_SIZE, r).map_err(err)?;
         mem.add_subregion(system, SBSA_GIC_ITS, main).map_err(err)?;
 
@@ -616,7 +618,9 @@ impl SbsaRefMachine {
         // create_ahci().
         let dma: Arc<dyn DmaMemory> = Arc::new(WeakAhciDma(Arc::downgrade(&memory_as)));
         let ahci = SysbusAhci::new(NUM_SATA_PORTS, dma);
-        let r = mem.new_io("ahci", SYSBUS_AHCI_MMIO_SIZE.into(), ahci.mmio_ops()).map_err(err)?;
+        let g = MemReentrancyGuard::new();
+        let r = mem.new_io_owned("ahci", SYSBUS_AHCI_MMIO_SIZE.into(), ahci.mmio_ops(), &g);
+        let r = r.map_err(err)?;
         mem.add_subregion(system, SBSA_AHCI, r).map_err(err)?;
         ahci.irq().connect(gic.spi(SBSA_AHCI_IRQ));
 
@@ -640,7 +644,8 @@ impl SbsaRefMachine {
         let gpex = create_pcie(&mem, system, &layout, &|n| gic.spi(n), &memory_as)?;
         let irqs = std::array::from_fn(|i| gic.spi(SBSA_SMMU_IRQ + i as u32));
         let smmu = SmmuV3::new(SmmuStage::Nested, &memory_as, irqs);
-        let r = mem.new_io("smmuv3", SMMU_SIZE.into(), smmu.mmio_ops()).map_err(err)?;
+        let g = MemReentrancyGuard::new();
+        let r = mem.new_io_owned("smmuv3", SMMU_SIZE.into(), smmu.mmio_ops(), &g).map_err(err)?;
         mem.add_subregion(system, SBSA_SMMU, r).map_err(err)?;
 
         // create_secure_ec().

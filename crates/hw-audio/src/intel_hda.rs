@@ -750,7 +750,12 @@ impl IntelHda {
         });
         let mmio = bus
             .memory()
-            .new_io(name, 0x4000, Arc::new(Mmio(Arc::clone(&inner))))
+            .new_io_owned(
+                name,
+                0x4000,
+                Arc::new(Mmio(Arc::clone(&inner))),
+                dev.mem_reentrancy_guard(),
+            )
             .map_err(|e| Error::generic(e.to_string()))?;
         dev.register_bar(0, PCI_BASE_ADDRESS_SPACE_MEMORY, mmio);
         dev.set_ops(Arc::new(Ops(Arc::downgrade(&inner))));

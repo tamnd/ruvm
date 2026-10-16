@@ -1109,9 +1109,10 @@ impl VirtioPci {
         });
 
         let mem = Arc::clone(bus.memory());
+        let guard = dev.mem_reentrancy_guard().clone();
         let region = |name: &str, size: u64, r: Region| -> Result<RegionId> {
             let ops = Arc::new(RegionOps { inner: Arc::clone(&inner), region: r });
-            mem.new_io(name, u128::from(size), ops).map_err(mem_err)
+            mem.new_io_owned(name, u128::from(size), ops, &guard).map_err(mem_err)
         };
 
         if modern {

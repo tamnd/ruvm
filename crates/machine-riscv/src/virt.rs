@@ -155,8 +155,8 @@ use ruvm_jit::{Cpu, CpuShared, Jit, Vcpu};
 use ruvm_machine_arm::fdt::Fdt;
 use ruvm_machine_arm::pflash::{Pflash, PflashBacking, PflashProps};
 use ruvm_mem::{
-    AccessConstraints, AccessCtx, AccessSize, AddressSpace, Endian, MemResult, MemTxAttrs,
-    MemorySystem, MmioOps, RegionId, RegionType,
+    AccessConstraints, AccessCtx, AccessSize, AddressSpace, Endian, MemReentrancyGuard, MemResult,
+    MemTxAttrs, MemorySystem, MmioOps, RegionId, RegionType,
 };
 use ruvm_target_riscv::cfg::{VM_SV39, VM_SV48, VM_SV57};
 use ruvm_target_riscv::cpu::{
@@ -700,6 +700,21 @@ fn map_io(
     mem.add_subregion(system, addr, r).map_err(err)
 }
 
+/// [`map_io`] for a device that can do DMA, so the region carries the device's reentrancy
+/// guard.
+fn map_io_owned(
+    mem: &MemorySystem,
+    system: RegionId,
+    name: &str,
+    addr: u64,
+    size: u64,
+    ops: Arc<dyn MmioOps>,
+    owner: &MemReentrancyGuard,
+) -> Result<(), String> {
+    let r = mem.new_io_owned(name, size.into(), ops, owner).map_err(err)?;
+    mem.add_subregion(system, addr, r).map_err(err)
+}
+
 /// `gpex_pcie_init()`: the generic PCIe host bridge with its ECAM, the low and high MMIO
 /// windows and the I/O port window, its INTx lines on sources 32 to 35 of the irqchip.
 fn gpex_pcie_init(
@@ -907,11 +922,15 @@ impl VirtMachine {
         let fw_cfg = fw_cfg_init_mem_dma(VIRT_FW_CFG, dma, &cfg.fw_cfg).map_err(err)?;
         fw_cfg.state().add_i16(FW_CFG_NB_CPUS, smp as u16);
         let (ctl, data, dma_addr) = fw_cfg.addrs();
-        map_io(&mem, system, "fwcfg.ctl", ctl, FW_CFG_CTL_SIZE, fw_cfg.ctl_ops().clone())?;
+        let g = MemReentrancyGuard::new();
+        let ops = fw_cfg.ctl_ops().clone();
+        map_io_owned(&mem, system, "fwcfg.ctl", ctl, FW_CFG_CTL_SIZE, ops, &g)?;
         let data_size = fw_cfg.data_ops().region_size();
-        map_io(&mem, system, "fwcfg.data", data, data_size, fw_cfg.data_ops().clone())?;
+        let ops = fw_cfg.data_ops().clone();
+        map_io_owned(&mem, system, "fwcfg.data", data, data_size, ops, &g)?;
         if let Some(d) = fw_cfg.dma_ops() {
-            map_io(&mem, system, "fwcfg.dma", dma_addr, FW_CFG_DMA_SIZE, d.clone())?;
+            let ops = d.clone();
+            map_io_owned(&mem, system, "fwcfg.dma", dma_addr, FW_CFG_DMA_SIZE, ops, &g)?;
         }
 
         // sifive_test_create().
@@ -938,7 +957,8 @@ impl VirtMachine {
                 plugged: RwLock::new(false),
             });
             let base = VIRT_VIRTIO + i as u64 * VIRT_VIRTIO_SIZE;
-            map_io(&mem, system, "virtio-mmio", base, VIRTIO_MMIO_REGION_SIZE, slot.clone())?;
+            let (g, size) = (MemReentrancyGuard::new(), VIRTIO_MMIO_REGION_SIZE);
+            map_io_owned(&mem, system, "virtio-mmio", base, size, slot.clone(), &g)?;
             virtio.push(slot);
         }
 

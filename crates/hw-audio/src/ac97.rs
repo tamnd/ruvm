@@ -948,10 +948,11 @@ impl Ac97 {
         });
         let mem = bus.memory();
         let mem_err = |e: ruvm_mem::MemError| Error::generic(e.to_string());
-        let nam =
-            mem.new_io("ac97-nam", 1024, Arc::new(Nam(Arc::clone(&inner)))).map_err(mem_err)?;
-        let nabm =
-            mem.new_io("ac97-nabm", 256, Arc::new(Nabm(Arc::clone(&inner)))).map_err(mem_err)?;
+        let guard = dev.mem_reentrancy_guard();
+        let nam = Arc::new(Nam(Arc::clone(&inner)));
+        let nam = mem.new_io_owned("ac97-nam", 1024, nam, guard).map_err(mem_err)?;
+        let nabm = Arc::new(Nabm(Arc::clone(&inner)));
+        let nabm = mem.new_io_owned("ac97-nabm", 256, nabm, guard).map_err(mem_err)?;
         dev.register_bar(0, PCI_BASE_ADDRESS_SPACE_IO, nam);
         dev.register_bar(1, PCI_BASE_ADDRESS_SPACE_IO, nabm);
         dev.set_ops(Arc::new(Ops(Arc::downgrade(&inner))));
